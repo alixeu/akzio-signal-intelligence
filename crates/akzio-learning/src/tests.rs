@@ -66,7 +66,7 @@ fn materialization() -> OutcomeMaterializationInput {
     let outcome_id = OutcomeId::new();
     OutcomeMaterializationInput {
         schedule: OutcomeSchedule {
-            schema_version: V2_SCHEMA_VERSION,
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
             outcome_id,
             decision: reference(ArtifactKind::Decision, b"decision"),
             decision_context: reference(ArtifactKind::DecisionContext, b"decision-context"),
@@ -259,7 +259,7 @@ fn fixture_workflow(
         })
         .collect::<Vec<_>>();
     let graph = WorkflowGraph {
-        schema_version: V2_SCHEMA_VERSION,
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
         topology_id: topology_id.clone(),
         nodes: nodes.clone(),
     };
@@ -413,7 +413,7 @@ impl RuntimeFixture {
         );
         let verdict_ref = artifact_reference(&verdict);
         let parent_schedule = OutcomeSchedule {
-            schema_version: V2_SCHEMA_VERSION,
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
             outcome_id: OutcomeId::new(),
             decision: artifact_reference(&parent_decision),
             decision_context: artifact_reference(&decision_context),
@@ -466,7 +466,7 @@ impl RuntimeFixture {
             .iter()
             .map(|candidate_decision| {
                 let schedule = OutcomeSchedule {
-                    schema_version: V2_SCHEMA_VERSION,
+                    schema_version: V2_DOMAIN_SCHEMA_VERSION,
                     outcome_id: OutcomeId::new(),
                     decision: artifact_reference(candidate_decision),
                     decision_context: artifact_reference(&decision_context),

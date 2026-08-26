@@ -12,16 +12,6 @@ use crate::{content_hash_json, BlobRef, ContentHash, DomainError, RunId, TaskId}
 #[serde(transparent)]
 pub struct ArtifactId(pub ContentHash);
 
-impl ArtifactId {
-    pub fn as_hash(&self) -> &ContentHash {
-        &self.0
-    }
-
-    pub fn short_id(&self) -> &str {
-        self.0.short_id()
-    }
-}
-
 impl fmt::Display for ArtifactId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
@@ -73,13 +63,6 @@ pub enum ArtifactKind {
 }
 
 impl ArtifactKind {
-    pub const fn is_evidence(self) -> bool {
-        matches!(
-            self,
-            Self::RawEvidence | Self::NormalizedEvidence | Self::SemanticDetail
-        )
-    }
-
     pub const fn can_be_canonical(self) -> bool {
         matches!(
             self,

@@ -2,6 +2,7 @@
 //!
 //! The crate exposes only the typed evaluation runtime and immutable policy history.
 
+mod campaign;
 mod evaluation;
 mod frozen_eval;
 mod outcome_schedule;
@@ -24,9 +25,13 @@ pub(crate) fn trusted_learning_provenance(
 }
 
 pub use akzio_domain::{OutcomeCostModel, PolicySubject};
+pub use campaign::{
+    CanaryBundleComparison, CanaryCampaignRuntime, CanaryError, CanaryHorizonMetrics,
+    CanarySubjectComparison,
+};
 pub use evaluation::{
-    materialize_outcome, materialize_partial_outcome, CandidatePolicyInput, EvaluationError,
-    EvaluationInput, EvaluationPolicy, EvaluationResult, EvaluationRuntime,
+    horizon_observations, materialize_outcome, materialize_partial_outcome, CandidatePolicyInput,
+    EvaluationError, EvaluationInput, EvaluationPolicy, EvaluationResult, EvaluationRuntime,
     EvaluationRuntimeResult, GovernedHorizonObservation, OutcomeMaterializationInput,
     ShadowObservation,
 };

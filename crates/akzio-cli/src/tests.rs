@@ -154,7 +154,6 @@ fn observatory_configuration_and_credentials_live_in_private_toml() {
         &ObservatoryConfigCommand::Init {
             template,
             store_root: store_root.clone(),
-            legacy_store: None,
         },
     )
     .unwrap();

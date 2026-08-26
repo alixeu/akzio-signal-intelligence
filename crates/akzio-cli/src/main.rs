@@ -10,13 +10,12 @@ use std::{
 
 use akzio_daemon::{
     fixture_model_client, AlpacaMarketDataFeed, AlpacaPaperSessionClock, Daemon, DaemonConfig,
-    DaemonHealth, PaperWorkflowSource, ReplayReport, RetrospectiveView, RunCancellationResponse,
-    RunRetryResponse, RunSubmissionResponse,
+    DaemonHealth, PaperApprovalRequest, PaperApprovalResponse, PaperWorkflowSource, ReplayReport,
+    RetrospectiveView, RunCancellationResponse, RunRetryResponse, RunSubmissionResponse,
 };
 use akzio_domain::{
-    content_hash_json, Artifact, ArtifactKind, ArtifactLifecycle, ArtifactProvenance, ArtifactRef,
-    Asset, ContentHash, MoneyMicros, PaperApprovalScope, PaperLaunchApproval, Retrospective, RunId,
-    RunPurpose, RuntimeIdentity, RuntimeManifest, WorkflowStatus, V2_DOMAIN_SCHEMA_VERSION,
+    content_hash_json, ArtifactKind, Asset, CanaryCampaignSpec, ContentHash, Retrospective, RunId,
+    RunPurpose, RuntimeIdentity, WorkflowStatus,
 };
 use akzio_execution::{paper::AlpacaPaper, DecisionPolicy, ExecutionPolicy};
 use akzio_learning::{
@@ -25,7 +24,7 @@ use akzio_learning::{
 };
 use akzio_model::ModelConfig;
 use akzio_store::{
-    v2::{SessionSlot, StoredRun, TrajectoryEntry},
+    v2::{CanaryCampaignHead, SessionSlot, StoredRun, TrajectoryEntry},
     V2Store,
 };
 use anyhow::{bail, Context, Result};
@@ -69,6 +68,22 @@ enum Command {
         #[command(subcommand)]
         command: StoreCommand,
     },
+    Canary {
+        #[command(subcommand)]
+        command: CanaryCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CanaryCommand {
+    Stage {
+        #[arg(long)]
+        spec: PathBuf,
+    },
+    Status,
+    Resume {
+        campaign_id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -78,8 +93,6 @@ enum ObservatoryConfigCommand {
         template: PathBuf,
         #[arg(long)]
         store_root: PathBuf,
-        #[arg(long)]
-        legacy_store: Option<PathBuf>,
     },
     Get,
     Set,
@@ -169,6 +182,10 @@ enum StoreCommand {
         target: PathBuf,
         #[arg(long)]
         include_raw_model: bool,
+    },
+    Lesson {
+        #[command(subcommand)]
+        command: lesson::LessonCommand,
     },
 }
 
@@ -298,6 +315,7 @@ struct FreezeRequest<'a> {
 }
 
 mod http_client;
+mod lesson;
 use http_client::ControlApiClient;
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -310,125 +328,121 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::ObservatoryConfig { .. } => unreachable!("handled before config loading"),
-        Command::Daemon {
-            command: DaemonAction::Serve,
-        } => serve(config, &config_path).await,
-        Command::Daemon {
-            command: DaemonAction::Health,
-        } => print_json(&ControlApiClient::from_config(&config)?.health().await?),
-        Command::Daemon {
-            command: DaemonAction::Ready,
-        } => print_json(&ControlApiClient::from_config(&config)?.ready().await?),
-        Command::Daemon {
-            command: DaemonAction::Freeze { reason },
-        } => print_json(
-            &ControlApiClient::from_config(&config)?
-                .set_freeze(true, &reason)
-                .await?,
-        ),
-        Command::Daemon {
-            command: DaemonAction::Unfreeze { reason },
-        } => print_json(
-            &ControlApiClient::from_config(&config)?
-                .set_freeze(false, &reason)
-                .await?,
-        ),
-        Command::Run {
-            command: RunCommand::Submit { purpose },
-        } => print_json(
-            &ControlApiClient::from_config(&config)?
-                .submit(purpose.into())
-                .await?,
-        ),
-        Command::Run {
-            command: RunCommand::Replay { run_id },
-        } => print_json(
-            &ControlApiClient::from_config(&config)?
-                .replay(&run_id)
-                .await?,
-        ),
-        Command::Run {
-            command: RunCommand::Retrospectives { run_id },
-        } => print_json(
-            &ControlApiClient::from_config(&config)?
-                .retrospectives(&run_id)
-                .await?,
-        ),
-        Command::Run {
-            command: RunCommand::Trajectory { run_id },
-        } => print_json(
-            &ControlApiClient::from_config(&config)?
-                .trajectory(&run_id)
-                .await?,
-        ),
-        Command::Run {
-            command: RunCommand::Events { run_id, after },
-        } => {
-            ControlApiClient::from_config(&config)?
-                .events(&run_id, after)
-                .await
+        Command::Daemon { command } => {
+            dispatch_control(Command::Daemon { command }, &config, &config_path).await
         }
-        Command::Run {
-            command: RunCommand::Cancel { run_id },
-        } => print_json(
-            &ControlApiClient::from_config(&config)?
-                .cancel(&run_id)
-                .await?,
-        ),
-        Command::Run {
-            command: RunCommand::Retry { run_id },
-        } => print_json(
-            &ControlApiClient::from_config(&config)?
-                .retry(&run_id)
-                .await?,
-        ),
-        Command::Run {
-            command: RunCommand::FixtureDebug,
-        } => fixture_debug(config).await,
-        Command::Run {
-            command: RunCommand::PaperDryRun,
-        } => paper_dry_run(config).await,
-        Command::Test { command } => diagnostic_test(config, command).await,
-        Command::Store {
-            command: StoreCommand::Doctor,
-        } => {
-            V2Store::open_existing(&config.daemon.store_root)?.verify_integrity()?;
-            println!("{{\"ok\":true}}");
-            Ok(())
+        Command::Run { command }
+            if matches!(command, RunCommand::FixtureDebug | RunCommand::PaperDryRun) =>
+        {
+            dispatch_fixture(command, config).await
         }
-        Command::Store {
-            command: StoreCommand::Inventory,
-        } => print_json(&V2Store::open_existing(&config.daemon.store_root)?.storage_inventory()?),
-        Command::Store {
-            command: StoreCommand::Metrics,
-        } => print_json(&V2Store::open_existing(&config.daemon.store_root)?.metrics(Utc::now())?),
-        Command::Store {
-            command: StoreCommand::Alerts,
-        } => {
-            let metrics = V2Store::open_existing(&config.daemon.store_root)?.metrics(Utc::now())?;
-            print_json(&metrics.alerts())
+        Command::Run { command } => {
+            dispatch_control(Command::Run { command }, &config, &config_path).await
         }
-        Command::Store {
-            command: StoreCommand::PaperSession { session_key },
-        } => {
-            let slot = V2Store::open_existing(&config.daemon.store_root)?
-                .session_slot(&session_key)?
-                .map(PaperSessionView::from);
-            print_json(&slot)
+        Command::Test { command } => dispatch_diagnostics(command, config).await,
+        Command::Store { command } => dispatch_store(command, &config, &config_path).await,
+        Command::Canary { command } => {
+            dispatch_control(Command::Canary { command }, &config, &config_path).await
         }
-        Command::Store {
-            command:
-                StoreCommand::ApprovePaper {
-                    session_key,
-                    operator,
-                    reason,
-                    max_notional_usd_cents,
-                    valid_hours,
-                },
+    }
+}
+
+async fn dispatch_control(command: Command, config: &Config, config_path: &Path) -> Result<()> {
+    match command {
+        Command::Daemon { command } => match command {
+            DaemonAction::Serve => serve(config, config_path).await,
+            DaemonAction::Health => {
+                print_json(&ControlApiClient::from_config(config)?.health().await?)
+            }
+            DaemonAction::Ready => {
+                print_json(&ControlApiClient::from_config(config)?.ready().await?)
+            }
+            DaemonAction::Freeze { reason } => print_json(
+                &ControlApiClient::from_config(config)?
+                    .set_freeze(true, &reason)
+                    .await?,
+            ),
+            DaemonAction::Unfreeze { reason } => print_json(
+                &ControlApiClient::from_config(config)?
+                    .set_freeze(false, &reason)
+                    .await?,
+            ),
+        },
+        Command::Run { command } => {
+            let client = ControlApiClient::from_config(config)?;
+            match command {
+                RunCommand::Submit { purpose } => print_json(&client.submit(purpose.into()).await?),
+                RunCommand::Replay { run_id } => print_json(&client.replay(&run_id).await?),
+                RunCommand::Retrospectives { run_id } => {
+                    print_json(&client.retrospectives(&run_id).await?)
+                }
+                RunCommand::Trajectory { run_id } => print_json(&client.trajectory(&run_id).await?),
+                RunCommand::Events { run_id, after } => client.events(&run_id, after).await,
+                RunCommand::Cancel { run_id } => print_json(&client.cancel(&run_id).await?),
+                RunCommand::Retry { run_id } => print_json(&client.retry(&run_id).await?),
+                RunCommand::FixtureDebug | RunCommand::PaperDryRun => {
+                    bail!("fixture commands must be dispatched through the fixture handler")
+                }
+            }
+        }
+        Command::Canary { command } => {
+            let client = ControlApiClient::from_config(config)?;
+            match command {
+                CanaryCommand::Stage { spec } => {
+                    let payload = fs::read_to_string(spec).context("read canary campaign spec")?;
+                    let spec: CanaryCampaignSpec = serde_json::from_str(&payload)
+                        .context("parse canary campaign spec JSON")?;
+                    print_json(&client.canary_stage(&spec).await?)
+                }
+                CanaryCommand::Status => print_json(&client.canary_status().await?),
+                CanaryCommand::Resume { campaign_id } => {
+                    let campaign_id =
+                        ContentHash::new(campaign_id).context("parse campaign hash")?;
+                    print_json(&client.canary_resume(&campaign_id).await?)
+                }
+            }
+        }
+        Command::ObservatoryConfig { .. } => {
+            bail!("ObservatoryConfig is handled before control dispatch")
+        }
+        Command::Test { .. } => {
+            bail!("diagnostic commands must be dispatched through the diagnostics handler")
+        }
+        Command::Store { .. } => {
+            bail!("store commands must be dispatched through the store handler")
+        }
+    }
+}
+
+async fn dispatch_diagnostics(command: TestCommand, config: Config) -> Result<()> {
+    diagnostic_test(config, command).await
+}
+
+async fn dispatch_fixture(command: RunCommand, config: Config) -> Result<()> {
+    match command {
+        RunCommand::FixtureDebug => fixture_debug(config).await,
+        RunCommand::PaperDryRun => paper_dry_run(config).await,
+        _ => bail!("non-fixture run command must be dispatched through the control handler"),
+    }
+}
+
+async fn dispatch_store(command: StoreCommand, config: &Config, config_path: &Path) -> Result<()> {
+    match command {
+        StoreCommand::Doctor => admin_verify_store(config),
+        StoreCommand::Inventory => admin_print_inventory(config),
+        StoreCommand::Metrics => admin_print_metrics(config),
+        StoreCommand::Alerts => admin_print_alerts(config),
+        StoreCommand::PaperSession { session_key } => admin_print_session(config, &session_key),
+        StoreCommand::ApprovePaper {
+            session_key,
+            operator,
+            reason,
+            max_notional_usd_cents,
+            valid_hours,
         } => {
             approve_paper(
-                &config,
-                &config_path,
+                config,
+                config_path,
                 &session_key,
                 &operator,
                 &reason,
@@ -437,30 +451,63 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Command::Store {
-            command: StoreCommand::Backup { target },
-        } => print_json(&V2Store::open_existing(&config.daemon.store_root)?.backup_to(target)?),
-        Command::Store {
-            command:
-                StoreCommand::ExportRun {
-                    run_id,
-                    target,
-                    include_raw_model,
-                },
-        } => print_json(
-            &V2Store::open_existing(&config.daemon.store_root)?.export_run(
-                &RunId(run_id),
-                target,
-                include_raw_model,
-            )?,
-        ),
-        Command::Store {
-            command: StoreCommand::Restore { source, target },
-        } => {
-            let store = V2Store::restore_from(source, target)?;
-            print_json(&store.metrics(Utc::now())?)
-        }
+        StoreCommand::Backup { target } => admin_backup_store(config, target),
+        StoreCommand::Restore { source, target } => admin_restore_store(source, target),
+        StoreCommand::ExportRun {
+            run_id,
+            target,
+            include_raw_model,
+        } => admin_export_run(config, run_id, target, include_raw_model),
+        StoreCommand::Lesson { command } => lesson::run(&config.daemon.store_root, command),
     }
+}
+
+fn open_admin_store(config: &Config) -> Result<V2Store> {
+    Ok(V2Store::open_existing(&config.daemon.store_root)?)
+}
+
+fn admin_verify_store(config: &Config) -> Result<()> {
+    open_admin_store(config)?.verify_integrity()?;
+    println!("{{\"ok\":true}}");
+    Ok(())
+}
+
+fn admin_print_inventory(config: &Config) -> Result<()> {
+    print_json(&open_admin_store(config)?.storage_inventory()?)
+}
+
+fn admin_print_metrics(config: &Config) -> Result<()> {
+    print_json(&open_admin_store(config)?.metrics(Utc::now())?)
+}
+
+fn admin_print_alerts(config: &Config) -> Result<()> {
+    let metrics = open_admin_store(config)?.metrics(Utc::now())?;
+    print_json(&metrics.alerts())
+}
+
+fn admin_print_session(config: &Config, session_key: &str) -> Result<()> {
+    let slot = open_admin_store(config)?
+        .session_slot(session_key)?
+        .map(PaperSessionView::from);
+    print_json(&slot)
+}
+
+fn admin_backup_store(config: &Config, target: PathBuf) -> Result<()> {
+    print_json(&open_admin_store(config)?.backup_to(target)?)
+}
+
+fn admin_restore_store(source: PathBuf, target: PathBuf) -> Result<()> {
+    let store = V2Store::restore_from(source, target)?;
+    print_json(&store.metrics(Utc::now())?)
+}
+
+fn admin_export_run(
+    config: &Config,
+    run_id: String,
+    target: PathBuf,
+    include_raw_model: bool,
+) -> Result<()> {
+    print_json(&open_admin_store(config)?.export_run(&RunId(run_id), target, include_raw_model)?)
 }
 
 fn handle_observatory_config(config_path: &Path, command: &ObservatoryConfigCommand) -> Result<()> {
@@ -468,19 +515,9 @@ fn handle_observatory_config(config_path: &Path, command: &ObservatoryConfigComm
         ObservatoryConfigCommand::Init {
             template,
             store_root,
-            legacy_store,
         } => {
             if config_path.exists() {
                 return print_json(&serde_json::json!({ "created": false }));
-            }
-            if !store_root.exists()
-                && legacy_store
-                    .as_ref()
-                    .is_some_and(|legacy| legacy.join("akzio.sqlite3").is_file())
-            {
-                let legacy = legacy_store.as_ref().expect("checked above");
-                V2Store::open_existing(legacy)?.backup_to(store_root)?;
-                V2Store::open(store_root)?.clear_observatory_configuration()?;
             }
             let template_config = read_config_file(template)?;
             let mut document = read_config_document(template)?;
@@ -623,7 +660,7 @@ async fn approve_paper(
     max_notional_usd_cents: i64,
     valid_hours: i64,
 ) -> Result<()> {
-    let session = chrono::NaiveDate::parse_from_str(session_key, "%Y-%m-%d")
+    let _session = chrono::NaiveDate::parse_from_str(session_key, "%Y-%m-%d")
         .context("session_key must be YYYY-MM-DD")?;
     if operator.trim().is_empty()
         || reason.trim().is_empty()
@@ -633,106 +670,19 @@ async fn approve_paper(
     {
         bail!("invalid Paper approval scope");
     }
-    let execution_policy = ExecutionPolicy::default();
-    let maximum_notional = MoneyMicros::from_usd_cents(max_notional_usd_cents);
-    if maximum_notional.0 > execution_policy.max_new_notional.0 {
-        bail!("approval max notional exceeds execution policy");
-    }
-    let paper = AlpacaPaper::from_env().context("construct Paper broker for approval")?;
-    let account = paper
-        .account()
-        .await
-        .context("read Paper account for approval")?;
-    let broker_account_id = account
-        .get("id")
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .context("Paper account id missing")?
-        .to_owned();
-    let now = Utc::now();
     let identity = runtime_identity_from_config(config, config_path)?;
-    let manifest_payload = RuntimeManifest {
-        schema_version: V2_DOMAIN_SCHEMA_VERSION,
-        code_revision: identity.code_revision,
-        cargo_lock_hash: identity.cargo_lock_hash,
-        config_hash: identity.config_hash,
-        provider_id: identity.provider_id,
-        model_id: identity.model_id,
-        prompt_hash: identity.prompt_hash,
-        contract_hash: identity.contract_hash,
-        topology_hash: identity.topology_hash,
-        decision_policy_hash: identity.decision_policy_hash,
-        execution_policy_hash: identity.execution_policy_hash,
-        evaluation_policy_hash: identity.evaluation_policy_hash,
-        market_data_feed: identity.market_data_feed,
-        broker_account_id,
-        maximum_notional,
-        allowed_session_start: session,
-        allowed_session_end: session,
-        expires_at: now + ChronoDuration::hours(valid_hours),
-        created_at: now,
-    };
-    let manifest_hash = manifest_payload.manifest_hash()?;
-    let store = V2Store::open(&config.daemon.store_root)?;
-    let manifest = Artifact::new(
-        ArtifactKind::RuntimeManifest,
-        store.put_json(&manifest_payload)?,
-        "runtime.manifest",
-        ArtifactLifecycle::Canonical,
-        ArtifactProvenance {
-            source_family: "akzio.operator".to_owned(),
-            observed_at: None,
-            retrieved_at: now,
-            source_uri: None,
-            confidence_ppm: 1_000_000,
-            producer_contract_hash: None,
-        },
-        None,
-        vec![],
-        now,
-    )?;
-    store.write_bootstrap_artifact(&manifest)?;
-    let mut approval_payload = PaperLaunchApproval {
-        schema_version: V2_DOMAIN_SCHEMA_VERSION,
-        operator_identity: operator.to_owned(),
-        runtime_manifest: ArtifactRef {
-            artifact_id: manifest.artifact_id.clone(),
-            kind: ArtifactKind::RuntimeManifest,
-        },
-        runtime_manifest_hash: manifest_hash.clone(),
-        scope: PaperApprovalScope::Canary,
-        reason: reason.to_owned(),
-        approved_at: now,
-        expires_at: manifest_payload.expires_at,
-        approval_hash: ContentHash::of_bytes(b"pending"),
-    };
-    approval_payload.approval_hash = approval_payload.unsigned_hash()?;
-    let approval = Artifact::new(
-        ArtifactKind::PaperLaunchApproval,
-        store.put_json(&approval_payload)?,
-        "operator.paper_approval",
-        ArtifactLifecycle::Canonical,
-        ArtifactProvenance {
-            source_family: "akzio.operator".to_owned(),
-            observed_at: None,
-            retrieved_at: now,
-            source_uri: None,
-            confidence_ppm: 1_000_000,
-            producer_contract_hash: None,
-        },
-        None,
-        vec![approval_payload.runtime_manifest.clone()],
-        now,
-    )?;
-    store.write_bootstrap_artifact(&approval)?;
-    print_json(&serde_json::json!({
-        "session_key": session_key,
-        "runtime_manifest_artifact_id": manifest.artifact_id,
-        "runtime_manifest_hash": manifest_hash,
-        "approval_artifact_id": approval.artifact_id,
-        "approval_hash": approval_payload.approval_hash,
-        "expires_at": approval_payload.expires_at,
-    }))
+    print_json(
+        &ControlApiClient::from_config(config)?
+            .approve_paper(&PaperApprovalRequest {
+                session_key: session_key.to_owned(),
+                operator: operator.to_owned(),
+                reason: reason.to_owned(),
+                max_notional_usd_cents,
+                valid_hours,
+                identity,
+            })
+            .await?,
+    )
 }
 
 type EmbeddedComponent = (&'static str, &'static [u8]);
@@ -762,8 +712,8 @@ const PROMPT_COMPONENTS: &[EmbeddedComponent] = &[
         include_bytes!("../../akzio-research/src/agent_v2/schemas.rs"),
     ),
     (
-        "crates/akzio-research/src/v2.rs",
-        include_bytes!("../../akzio-research/src/v2.rs"),
+        "crates/akzio-research/src/lib.rs",
+        include_bytes!("../../akzio-research/src/lib.rs"),
     ),
 ];
 
@@ -1116,10 +1066,13 @@ fn resolve_env_placeholder(value: &str, field: &str) -> Result<String> {
     let Some(name) = value.strip_prefix('$') else {
         return Ok(value.to_owned());
     };
+    let (name, suffix) = name.split_once('/').unwrap_or((name, ""));
     if name.is_empty() {
         bail!("{field} environment placeholder is empty");
     }
-    std::env::var(name).with_context(|| format!("missing environment variable {name} for {field}"))
+    let value = std::env::var(name)
+        .with_context(|| format!("missing environment variable {name} for {field}"))?;
+    Ok(format!("{value}{suffix}"))
 }
 
 fn daemon_token(settings: &DaemonSettings) -> Result<String> {
@@ -1131,7 +1084,7 @@ fn daemon_token(settings: &DaemonSettings) -> Result<String> {
     })
 }
 
-async fn serve(config: Config, config_path: &Path) -> Result<()> {
+async fn serve(config: &Config, config_path: &Path) -> Result<()> {
     let auto_paper = config.daemon.auto_paper.unwrap_or(false);
     let token = daemon_token(&config.daemon)?;
     let observer_token = config
@@ -1151,13 +1104,13 @@ async fn serve(config: Config, config_path: &Path) -> Result<()> {
         .clone()
         .context("missing [model] configuration for daemon serve")?;
     let runtime_identity_hash = if auto_paper {
-        Some(runtime_identity_from_config(&config, config_path)?.identity_hash()?)
+        Some(runtime_identity_from_config(config, config_path)?.identity_hash()?)
     } else {
         None
     };
     let daemon = Daemon::open(
         DaemonConfig {
-            store_root: config.daemon.store_root,
+            store_root: config.daemon.store_root.clone(),
             http_token: token,
             observer_token,
             worker_count: config.daemon.worker_count.unwrap_or(4),
@@ -1258,21 +1211,18 @@ async fn wait_for_parent_stdin_eof() -> Result<()> {
 }
 
 async fn fixture_debug(config: Config) -> Result<()> {
-    let daemon = fixture_daemon(&config)?;
-    let run_id = daemon.submit_default(RunPurpose::Debug)?;
-    while daemon.run_one("fixture").await? {}
-    let snapshot = daemon.store().workflow_snapshot(&run_id)?;
-    if snapshot.status != WorkflowStatus::Completed {
+    let report = run_fixture_purpose(config, RunPurpose::Debug).await?;
+    if report.status != WorkflowStatus::Completed {
         bail!(
             "fixture Debug workflow did not complete: {:?}",
-            snapshot.status
+            report.status
         );
     }
     println!(
         "{}",
         serde_json::json!({
-            "run_id": run_id,
-            "status": snapshot.status,
+            "run_id": report.run_id,
+            "status": report.status,
             "fixture": true,
             "evidence": "fixture/offline"
         })
@@ -1281,17 +1231,16 @@ async fn fixture_debug(config: Config) -> Result<()> {
 }
 
 async fn paper_dry_run(config: Config) -> Result<()> {
-    let daemon = fixture_daemon(&config)?;
-    let run_id = daemon.submit_default(RunPurpose::PaperDryRun)?;
-    while daemon.run_one("paper-dry-run-fixture").await? {}
-    let snapshot = daemon.store().workflow_snapshot(&run_id)?;
-    if snapshot.status != WorkflowStatus::Completed {
+    let store_root = config.daemon.store_root.clone();
+    let report = run_fixture_purpose(config, RunPurpose::PaperDryRun).await?;
+    if report.status != WorkflowStatus::Completed {
         bail!(
             "Paper Dry Run workflow did not complete: {:?}",
-            snapshot.status
+            report.status
         );
     }
-    let events = daemon.store().events_after(&run_id, 0, 10_000)?;
+    let store = V2Store::open_existing(&store_root)?;
+    let events = store.events_after(&report.run_id, 0, 10_000)?;
     let canonical_learning_events = events
         .iter()
         .filter(|event| event.event_type == "policy.transitioned")
@@ -1299,19 +1248,100 @@ async fn paper_dry_run(config: Config) -> Result<()> {
     if canonical_learning_events != 0 {
         bail!("Paper Dry Run produced canonical learning transition");
     }
-    daemon.store().verify_integrity()?;
+    store.verify_integrity()?;
     println!(
         "{}",
         serde_json::json!({
-            "run_id": run_id,
+            "run_id": report.run_id,
             "purpose": "paper_dry_run",
-            "status": format!("{:?}", snapshot.status),
+            "status": format!("{:?}", report.status),
             "canonical_learning_events": canonical_learning_events,
             "fixture": true,
             "evidence": "fixture/offline"
         })
     );
     Ok(())
+}
+
+async fn run_fixture_purpose(config: Config, purpose: RunPurpose) -> Result<ReplayReport> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("bind ephemeral fixture control API")?;
+    let addr = listener.local_addr()?;
+    let token = "fixture-only".to_owned();
+    let daemon = fixture_daemon(&config)?;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let serve_daemon = daemon.clone();
+    let server = tokio::spawn(async move {
+        tokio::try_join!(
+            serve_daemon.serve_http_listener(listener, shutdown_rx.clone()),
+            serve_daemon.serve_workers(shutdown_rx),
+        )
+    });
+    let client = ControlApiClient::new(addr, token)?;
+    let mut ready = false;
+    for _ in 0..100 {
+        if client.health().await.is_ok() {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    if !ready {
+        let _ = shutdown_tx.send(true);
+        let _ = server.await;
+        bail!("fixture daemon HTTP control API did not become ready");
+    }
+    let submitted = match client.submit(purpose).await {
+        Ok(submitted) => submitted,
+        Err(error) => {
+            let _ = shutdown_tx.send(true);
+            let _ = server.await;
+            return Err(error);
+        }
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let report = loop {
+        match client.replay(&submitted.run_id.0).await {
+            Ok(report)
+                if matches!(
+                    report.status,
+                    WorkflowStatus::Completed
+                        | WorkflowStatus::CompletedWithExecutionRejection
+                        | WorkflowStatus::Failed
+                        | WorkflowStatus::Cancelled
+                ) =>
+            {
+                break report;
+            }
+            Ok(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Ok(report) => {
+                let _ = shutdown_tx.send(true);
+                let _ = server.await;
+                bail!(
+                    "fixture workflow did not reach a terminal status: {:?}",
+                    report.status
+                );
+            }
+            Err(error) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let _ = error;
+            }
+            Err(error) => {
+                let _ = shutdown_tx.send(true);
+                let _ = server.await;
+                return Err(error);
+            }
+        }
+    };
+    let _ = shutdown_tx.send(true);
+    match server.await {
+        Ok(Ok(_)) => Ok(report),
+        Ok(Err(error)) => Err(anyhow::anyhow!(error)),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn fixture_daemon(config: &Config) -> Result<Daemon> {

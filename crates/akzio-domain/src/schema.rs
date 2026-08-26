@@ -6,14 +6,14 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ArtifactRef, DomainError};
+use crate::DomainError;
 
 #[cfg(test)]
 use crate::{
     AgentContract, Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle, ArtifactProvenance,
-    BlobRef, CandidateCapabilityCeiling, ContentHash, ContextPolicy, ContractId, ContractPurpose,
-    EvidenceNeed, FailureDisposition, LeaseId, OutputContract, PromptBundle, ReadGrant,
-    RetryPolicy, RunId, RuntimeTaskClass, TaskBudget, TaskId, TaskRecipe, TaskRecipeId,
+    ArtifactRef, BlobRef, CandidateCapabilityCeiling, ContentHash, ContextPolicy, ContractId,
+    ContractPurpose, EvidenceNeed, FailureDisposition, LeaseId, OutputContract, PromptBundle,
+    ReadGrant, RetryPolicy, RunId, RuntimeTaskClass, TaskBudget, TaskId, TaskRecipe, TaskRecipeId,
     TaskWritePermit, TerminationPolicy, ToolGrant, ToolSpec, WorkflowProposal,
     WorkflowProposalDraft, WorkflowProposalDraftTask, WorkflowProposalTask,
 };
@@ -23,41 +23,6 @@ use std::collections::{BTreeMap, BTreeSet};
 /// A Store Root with this schema is intentionally incompatible with the previous
 /// v2 database. It is a fresh schema, not a migration layer.
 pub const V2_SCHEMA_VERSION: u32 = 10;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BlockerSeverity {
-    Hard,
-    Soft,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DecisionBlocker {
-    pub code: String,
-    pub severity: BlockerSeverity,
-    pub scope: String,
-    pub explanation: String,
-    pub source_refs: Vec<ArtifactRef>,
-}
-
-impl DecisionBlocker {
-    pub fn validate(&self) -> Result<(), DomainError> {
-        if self.code.trim().is_empty()
-            || self.scope.trim().is_empty()
-            || self.explanation.trim().is_empty()
-        {
-            return Err(DomainError::EmptyField {
-                field: "decision_blocker",
-            });
-        }
-        if self.severity == BlockerSeverity::Hard && self.source_refs.is_empty() {
-            return Err(DomainError::EmptyField {
-                field: "decision_blocker.source_refs",
-            });
-        }
-        Ok(())
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FactorLimits {
@@ -347,18 +312,6 @@ mod tests {
         let mut invalid = policy;
         invalid.min_artifacts = invalid.max_artifacts + 1;
         assert!(invalid.validate().is_err());
-    }
-
-    #[test]
-    fn hard_blocker_requires_evidence() {
-        let blocker = DecisionBlocker {
-            code: "stale_quote".to_owned(),
-            severity: BlockerSeverity::Hard,
-            scope: "TQQQ".to_owned(),
-            explanation: "quote expired".to_owned(),
-            source_refs: vec![],
-        };
-        assert!(blocker.validate().is_err());
     }
 
     #[test]

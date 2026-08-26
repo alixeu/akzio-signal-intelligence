@@ -87,7 +87,7 @@ impl WorkflowRuntime {
         };
         nodes[decision_index] = decision.clone();
         let graph = WorkflowGraph {
-            schema_version: V2_SCHEMA_VERSION,
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
             topology_id: previous_graph.topology_id.clone(),
             nodes,
         };
@@ -166,6 +166,9 @@ impl WorkflowRuntime {
                     .map(|intent| intent.evidence_need())
                     .collect::<Result<Vec<_>, _>>()?,
             );
+            if purpose == RunPurpose::Paper {
+                Self::normalize_paper_evidence_needs(&mut declared_needs);
+            }
             let mut evidence_needs = Vec::with_capacity(declared_needs.len());
             for need in declared_needs {
                 let artifact = if let Some(artifact) = need_artifacts.get(&need) {
@@ -228,6 +231,25 @@ impl WorkflowRuntime {
             now,
         )?;
         Ok((proposal, evidence_needs, proposal_artifact))
+    }
+
+    fn normalize_paper_evidence_needs(needs: &mut [EvidenceNeed]) {
+        for need in needs {
+            if need.source_family != "alpaca" {
+                continue;
+            }
+            let mut parts = need.resource.split(':').collect::<Vec<_>>();
+            if parts.len() != 5 || parts[0] != "bars" || parts[2] != "1d" {
+                continue;
+            }
+            let Ok(limit) = parts[4].parse::<u8>() else {
+                continue;
+            };
+            if limit < 32 {
+                parts[4] = "32";
+                need.resource = parts.join(":");
+            }
+        }
     }
 
     pub(super) fn insert_structured_critic(
@@ -688,7 +710,7 @@ impl WorkflowRuntime {
             return Err(RuntimeError::WorkflowNodeLimit);
         }
         let graph = WorkflowGraph {
-            schema_version: V2_SCHEMA_VERSION,
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
             topology_id,
             nodes,
         };
@@ -844,7 +866,7 @@ pub(super) fn prepare_debug_draft(
     }
 
     let debug_need = EvidenceNeed {
-        schema_version: V2_SCHEMA_VERSION,
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
         source_family: DEBUG_FIXTURE_SOURCE.to_owned(),
         resource: DEBUG_FIXTURE_RESOURCE.to_owned(),
         max_age_secs: DEBUG_FIXTURE_MAX_AGE_SECS,
@@ -915,4 +937,23 @@ pub fn should_run_structured_critique(claims: &[ResearchClaim]) -> bool {
                 )
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paper_bar_evidence_requests_use_the_full_window() {
+        let mut needs = vec![EvidenceNeed {
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
+            source_family: "alpaca".to_owned(),
+            resource: "bars:QQQ:1d:2026-07-24:12".to_owned(),
+            max_age_secs: 86_400,
+        }];
+
+        WorkflowRuntime::normalize_paper_evidence_needs(&mut needs);
+
+        assert_eq!(needs[0].resource, "bars:QQQ:1d:2026-07-24:32");
+    }
 }

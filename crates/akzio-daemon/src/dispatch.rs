@@ -29,14 +29,14 @@ impl Daemon {
         task: &ClaimedAttempt,
         now: DateTime<Utc>,
     ) -> Result<TaskCompletion> {
-        if task.node.recipe_id.as_str() == OUTCOME_WORKER_RECIPE_ID {
+        if task.node.recipe_id.as_str() == akzio_domain::LEARNING_OUTCOME_WORKER_RECIPE_ID {
             return self.execute_outcome_worker(task, now).await;
         }
         let recipe = self.workflow.catalogue().recipe(&task.node.recipe_id)?;
         match recipe.task_class {
             RuntimeTaskClass::Agent => {
                 let candidates = self.context_candidates(task)?;
-                if task.node.recipe_id.as_str() == "research.critic" {
+                if task.node.recipe_id.as_str() == akzio_domain::RESEARCH_CRITIC_RECIPE_ID {
                     let claims = candidates
                         .iter()
                         .filter(|reference| reference.kind == ArtifactKind::Claim)
@@ -56,7 +56,7 @@ impl Daemon {
                         now,
                     )
                     .await?;
-                if task.node.recipe_id.as_str() == "research.planner" {
+                if task.node.recipe_id.as_str() == akzio_domain::RESEARCH_PLANNER_RECIPE_ID {
                     let revision = self.workflow.recover(&task.run_id)?.revision;
                     self.workflow.apply_planner_output(
                         task,
@@ -157,33 +157,7 @@ impl Daemon {
         let session_key = context.broker_session.ok_or_else(|| {
             DaemonError::InvalidInput("accepted execution verdict has no broker session".to_owned())
         })?;
-        if let Some((manifest, approval)) = self.store.paper_approval_for_run(&task.run_id)? {
-            if approval.expires_at < now {
-                return Err(DaemonError::InvalidInput(
-                    "Paper approval expired before commitment".to_owned(),
-                ));
-            }
-            let execution_plan = context
-                .execution_plan
-                .as_ref()
-                .ok_or_else(|| DaemonError::InvalidInput("execution plan is missing".to_owned()))?;
-            let plan: ExecutionPlan = self.read_artifact_payload(execution_plan)?;
-            let total_notional = plan.orders.iter().try_fold(0_i64, |total, order| {
-                total.checked_add(order.notional.0).ok_or_else(|| {
-                    DaemonError::InvalidInput("execution plan notional overflow".to_owned())
-                })
-            })?;
-            if total_notional > manifest.maximum_notional.0 {
-                return Err(DaemonError::InvalidInput(
-                    "execution plan exceeds approved maximum notional".to_owned(),
-                ));
-            }
-        } else if self.auto_paper {
-            return Err(DaemonError::InvalidInput(
-                "Paper approval is missing".to_owned(),
-            ));
-        }
-        let lease = self.scheduler.active_lease(now)?;
+        let lease = self.paper.scheduler.active_lease(now)?;
         self.paper_commitment_runtime
             .commit(&PaperCommitmentInput {
                 lease,
@@ -212,12 +186,12 @@ impl Daemon {
             return Ok(TaskCompletion::NoOutput);
         }
         let commitment = self.terminal_input(task, ArtifactKind::ExecutionCommitment)?;
-        let broker = self.paper_broker.as_ref().ok_or_else(|| {
+        let broker = self.paper.paper_broker.as_ref().ok_or_else(|| {
             DaemonError::Unavailable(
                 "Paper reconciliation requires an injected Alpaca Paper broker adapter".to_owned(),
             )
         })?;
-        let lease = self.scheduler.active_lease(now)?;
+        let lease = self.paper.scheduler.active_lease(now)?;
         self.paper_dispatch_runtime
             .dispatch(
                 broker.as_ref(),
@@ -500,7 +474,7 @@ impl Daemon {
         }
 
         if candidates.is_empty()
-            && task.node.recipe_id.as_str() != "research.planner"
+            && task.node.recipe_id.as_str() != akzio_domain::RESEARCH_PLANNER_RECIPE_ID
             && task.node.parent_task_id.is_none()
         {
             return Err(DaemonError::MissingTaskContext(task.node.task_id.clone()));

@@ -157,12 +157,12 @@ impl AgentRuntime {
             return Err(ResearchError::ToolNotGranted(call.name.clone()));
         }
         let raw = tool.kind == akzio_domain::ToolKind::ReadRawEvidence;
-        let artifact = if raw {
+        let (artifact, value) = if raw {
             self.context
-                .read_raw(permit, contract, grant, &artifact_id, now)?
+                .read_raw_document(permit, contract, grant, &artifact_id, now)?
         } else {
             self.context
-                .read(permit, contract, grant, &artifact_id, now)?
+                .read_document(permit, contract, grant, &artifact_id, now)?
         };
         if !contract
             .tool_grants
@@ -181,9 +181,6 @@ impl AgentRuntime {
                 source_family: artifact.provenance.source_family.clone(),
             });
         }
-        let bytes = self.store.read_blob(&artifact.blob)?;
-        let value = serde_json::from_slice(&bytes)
-            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
         Ok((artifact, value))
     }
 }

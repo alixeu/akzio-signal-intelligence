@@ -1,4 +1,5 @@
 use super::*;
+use akzio_domain::LEARNING_OUTCOME_WORKER_RECIPE_ID;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledContract {
@@ -50,20 +51,14 @@ pub const ACTIVE_RESEARCH_MAX_NODES: usize = 32;
 pub(super) const ACTIVE_CONTRACT_VERSION: u32 = 4;
 pub(super) const ACTIVE_PROMPT_BUNDLE_VERSION: u32 = 4;
 pub(super) const SHARED_GOVERNANCE_PROMPT: &str = "Follow the installed Akzio Contract exactly. Rust owns state, evidence access, budgets, workflow gates, and Paper-only execution. Use only ContextManifest-granted artifacts and the declared tools. Never access arbitrary files, network resources, credentials, databases, or execution controls. Work in two phases: produce an auditable natural-language research memo, then call submit_result exactly once when Rust requests submission. submit_result is a zero-side-effect proposal channel; Rust alone validates and persists the result.";
-pub(super) const PLANNER_RECIPE_ID: &str = "research.planner";
-pub(super) const PLANNER_CHILD_RECIPE_IDS: [&str; 2] = ["research.analyst", "research.synthesizer"];
-pub(super) const GOVERNED_EVIDENCE_SOURCE_FAMILIES: [&str; 4] =
-    ["alpaca", "sec_edgar", "fred", "news_web"];
+pub(super) const PLANNER_RECIPE_ID: &str = akzio_domain::RESEARCH_PLANNER_RECIPE_ID;
+pub(super) const PLANNER_CHILD_RECIPE_IDS: [&str; 2] = [
+    akzio_domain::RESEARCH_ANALYST_RECIPE_ID,
+    akzio_domain::RESEARCH_SYNTHESIZER_RECIPE_ID,
+];
 pub(super) const PLANNER_MAX_DRAFT_TASKS: u16 = 7;
 pub(super) const RFC3339_TIMESTAMP_PATTERN: &str =
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$";
-pub(super) const EVIDENCE_GATE_RECIPE_ID: &str = "gate.evidence";
-pub(super) const DECISION_GATE_RECIPE_ID: &str = "gate.decision";
-pub(super) const EXECUTION_GATE_RECIPE_ID: &str = "gate.execution";
-pub(super) const PAPER_COMMIT_RECIPE_ID: &str = "gate.paper";
-pub(super) const RECONCILE_RECIPE_ID: &str = "gate.reconcile";
-pub(super) const EVALUATE_RECIPE_ID: &str = "gate.evaluate";
-pub(super) const OUTCOME_WORKER_RECIPE_ID: &str = "learning.outcome_worker";
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ActiveRecipePolicy {
@@ -199,7 +194,7 @@ impl ContractCatalogue {
         for installed in self.contracts() {
             let purpose = installed.contract.purpose.as_str();
             let Some(policy) = active_recipe_policy(purpose) else {
-                if purpose != OUTCOME_WORKER_RECIPE_ID {
+                if purpose != LEARNING_OUTCOME_WORKER_RECIPE_ID {
                     return Err(ResearchError::UnexpectedActiveContractPurpose(
                         purpose.to_owned(),
                     ));
@@ -272,11 +267,11 @@ impl ContractCatalogue {
         }
         if !outcome_worker_installed {
             return Err(ResearchError::MissingActiveContract(
-                OUTCOME_WORKER_RECIPE_ID,
+                LEARNING_OUTCOME_WORKER_RECIPE_ID,
             ));
         }
 
-        let (terminal_recipes, terminals) = rust_terminal_recipes()?;
+        let (terminal_recipes, terminals) = akzio_runtime::v2::rust_terminal_recipes()?;
         recipes.extend(terminal_recipes);
         Ok(RecipeCatalogue::new(
             recipes,

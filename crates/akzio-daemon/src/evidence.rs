@@ -111,8 +111,7 @@ impl Daemon {
                     need.resource.clone(),
                     (need_artifact.clone(), bundle.normalized.clone()),
                 );
-            } else if let Some(snapshot) = execution_snapshot_artifact(
-                &self.store,
+            } else if let Some(snapshot) = self.materialize_paper_single_snapshot(
                 task,
                 &need_artifact,
                 &need,
@@ -125,9 +124,11 @@ impl Daemon {
             artifacts.insert(bundle.normalized.artifact_id.clone(), bundle.normalized);
         }
         if !paper_account_components.is_empty() {
-            let snapshot =
-                paper_account_snapshot_artifact(&self.store, task, &paper_account_components, now)?;
-            artifacts.insert(snapshot.artifact_id.clone(), snapshot);
+            if let Some(snapshot) =
+                self.materialize_paper_account_components(task, &paper_account_components, now)?
+            {
+                artifacts.insert(snapshot.artifact_id.clone(), snapshot);
+            }
         }
         if artifacts.is_empty() {
             return Err(DaemonError::InvalidInput(format!(
@@ -208,8 +209,7 @@ impl Daemon {
                     need.resource.clone(),
                     (need_artifact.clone(), bundle.normalized.clone()),
                 );
-            } else if let Some(snapshot) = execution_snapshot_artifact(
-                &self.store,
+            } else if let Some(snapshot) = self.materialize_paper_single_snapshot(
                 task,
                 &need_artifact,
                 &need,
@@ -222,9 +222,11 @@ impl Daemon {
             artifacts.insert(bundle.normalized.artifact_id.clone(), bundle.normalized);
         }
         if !account_components.is_empty() {
-            let account =
-                paper_account_snapshot_artifact(&self.store, task, &account_components, now)?;
-            artifacts.insert(account.artifact_id.clone(), account);
+            if let Some(account) =
+                self.materialize_paper_account_components(task, &account_components, now)?
+            {
+                artifacts.insert(account.artifact_id.clone(), account);
+            }
         }
         Ok(artifacts.into_values().collect())
     }
@@ -264,7 +266,9 @@ impl Daemon {
         let evidence_task = snapshot
             .tasks
             .iter()
-            .find(|stored| stored.node.recipe_id.as_str() == "gate.evidence")
+            .find(|stored| {
+                stored.node.recipe_id.as_str() == akzio_runtime::v2::EVIDENCE_GATE_RECIPE_ID
+            })
             .ok_or_else(|| DaemonError::InvalidInput("Paper evidence gate missing".to_owned()))?;
         let mut needs = Vec::new();
         for reference in &evidence_task.node.input_artifacts {
@@ -333,8 +337,7 @@ impl Daemon {
                     resource.clone(),
                     (need_artifact.clone(), bundle.normalized.clone()),
                 );
-            } else if let Some(snapshot) = execution_snapshot_artifact(
-                &self.store,
+            } else if let Some(snapshot) = self.materialize_paper_single_snapshot(
                 task,
                 &need_artifact,
                 &need,
@@ -346,7 +349,13 @@ impl Daemon {
             artifacts.insert(bundle.raw.artifact_id.clone(), bundle.raw);
             artifacts.insert(bundle.normalized.artifact_id.clone(), bundle.normalized);
         }
-        let account = paper_account_snapshot_artifact(&self.store, task, &account_components, now)?;
+        let account = self
+            .materialize_paper_account_components(task, &account_components, now)?
+            .ok_or_else(|| {
+                DaemonError::InvalidInput(
+                    "Paper execution refresh did not materialize account snapshot".to_owned(),
+                )
+            })?;
         artifacts.insert(account.artifact_id.clone(), account);
 
         let mut artifacts = artifacts.into_values().collect::<Vec<_>>();
@@ -384,5 +393,167 @@ impl Daemon {
             ));
         }
         Ok((account, quotes, clock))
+    }
+    fn materialize_paper_single_snapshot(
+        &self,
+        task: &ClaimedAttempt,
+        need_artifact: &Artifact,
+        need: &EvidenceNeed,
+        normalized: &Artifact,
+        now: DateTime<Utc>,
+    ) -> Result<Option<Artifact>> {
+        if self.store.run_purpose(&task.run_id)? != RunPurpose::Paper
+            || evidence_source(&need.source_family)? != EvidenceSource::Alpaca
+            || need_artifact.producer != "scheduler.paper_snapshot"
+            || !matches!(
+                need.resource.as_str(),
+                PAPER_ACCOUNT_RESOURCE | PAPER_QUOTES_RESOURCE | PAPER_CLOCK_RESOURCE
+            )
+        {
+            return Ok(None);
+        }
+        let session_key = self
+            .store
+            .session_slot_for_run(&task.run_id)?
+            .map(|slot| slot.session_key)
+            .ok_or_else(|| DaemonError::InvalidInput("Paper run has no session slot".to_owned()))?;
+        let payload: NormalizedEvidencePayload =
+            serde_json::from_slice(&self.store.read_blob(&normalized.blob)?)?;
+        self.validate_paper_normalized(task, need_artifact, need, normalized, &payload)?;
+        let materialized = match need.resource.as_str() {
+            PAPER_ACCOUNT_RESOURCE => SnapshotArtifactMaterializer::materialize(
+                &self.store,
+                &task.permit,
+                &[normalized],
+                "execution.snapshot.account",
+                &decode_paper_account(&payload.value, session_key.clone(), payload.observed_at)?,
+                payload.observed_at,
+                Some(payload.provenance.source_uri.clone()),
+                now,
+            ),
+            PAPER_QUOTES_RESOURCE => SnapshotArtifactMaterializer::materialize(
+                &self.store,
+                &task.permit,
+                &[normalized],
+                "execution.snapshot.quotes",
+                &decode_paper_quotes(&payload.value, session_key.clone(), payload.observed_at)?,
+                payload.observed_at,
+                Some(payload.provenance.source_uri.clone()),
+                now,
+            ),
+            PAPER_CLOCK_RESOURCE => SnapshotArtifactMaterializer::materialize(
+                &self.store,
+                &task.permit,
+                &[normalized],
+                "execution.snapshot.clock",
+                &decode_paper_clock(&payload.value, session_key, payload.observed_at)?,
+                payload.observed_at,
+                Some(payload.provenance.source_uri.clone()),
+                now,
+            ),
+            _ => return Ok(None),
+        }
+        .map_err(|error| DaemonError::InvalidInput(error.to_string()))?;
+        Ok(Some(materialized))
+    }
+
+    fn materialize_paper_account_components(
+        &self,
+        task: &ClaimedAttempt,
+        components: &BTreeMap<String, (Artifact, Artifact)>,
+        now: DateTime<Utc>,
+    ) -> Result<Option<Artifact>> {
+        if self.store.run_purpose(&task.run_id)? != RunPurpose::Paper || components.is_empty() {
+            return Ok(None);
+        }
+        let session_key = self
+            .store
+            .session_slot_for_run(&task.run_id)?
+            .map(|slot| slot.session_key)
+            .ok_or_else(|| DaemonError::InvalidInput("Paper run has no session slot".to_owned()))?;
+        let expected_resources = BTreeSet::from([
+            PAPER_ACCOUNT_RESOURCE.to_owned(),
+            PAPER_POSITIONS_RESOURCE.to_owned(),
+            PAPER_OPEN_ORDERS_RESOURCE.to_owned(),
+            format!("paper.fills:{session_key}"),
+        ]);
+        if components.keys().cloned().collect::<BTreeSet<_>>() != expected_resources {
+            return Err(DaemonError::InvalidInput(
+                "Paper account snapshot inputs are incomplete".to_owned(),
+            ));
+        }
+        let mut payloads = BTreeMap::new();
+        for (resource, (need_artifact, normalized)) in components {
+            let need: EvidenceNeed =
+                serde_json::from_slice(&self.store.read_blob(&need_artifact.blob)?)?;
+            let payload: NormalizedEvidencePayload =
+                serde_json::from_slice(&self.store.read_blob(&normalized.blob)?)?;
+            self.validate_paper_normalized(task, need_artifact, &need, normalized, &payload)?;
+            payloads.insert(resource.clone(), (normalized, payload));
+        }
+        let observed_at = payloads
+            .values()
+            .map(|(_, payload)| payload.observed_at)
+            .max()
+            .ok_or_else(|| {
+                DaemonError::InvalidInput("Paper account payloads are empty".to_owned())
+            })?;
+        let account = akzio_ingest::decode_paper_account_components(
+            &payloads[PAPER_ACCOUNT_RESOURCE].1.value,
+            &payloads[PAPER_POSITIONS_RESOURCE].1.value,
+            &payloads[PAPER_OPEN_ORDERS_RESOURCE].1.value,
+            &payloads[&format!("paper.fills:{session_key}")].1.value,
+            session_key,
+            observed_at,
+        )?;
+        let normalized_sources = payloads
+            .values()
+            .map(|(normalized, _)| *normalized)
+            .collect::<Vec<_>>();
+        Ok(Some(
+            SnapshotArtifactMaterializer::materialize(
+                &self.store,
+                &task.permit,
+                &normalized_sources,
+                "execution.snapshot.account",
+                &account,
+                observed_at,
+                None,
+                now,
+            )
+            .map_err(|error| DaemonError::InvalidInput(error.to_string()))?,
+        ))
+    }
+
+    fn validate_paper_normalized(
+        &self,
+        task: &ClaimedAttempt,
+        need_artifact: &Artifact,
+        need: &EvidenceNeed,
+        normalized: &Artifact,
+        payload: &NormalizedEvidencePayload,
+    ) -> Result<()> {
+        if payload.source != EvidenceSource::Alpaca
+            || normalized.provenance.source_family != EvidenceSource::Alpaca.as_str()
+            || payload.resource != need.resource
+            || payload.need.artifact_id != need_artifact.artifact_id
+            || payload.need.kind != ArtifactKind::EvidenceNeed
+            || need_artifact.producer != "scheduler.paper_snapshot"
+            || need_artifact
+                .origin
+                .as_ref()
+                .and_then(|origin| origin.run_id.as_ref())
+                != Some(&task.run_id)
+            || normalized
+                .origin
+                .as_ref()
+                .and_then(|origin| origin.run_id.as_ref())
+                != Some(&task.run_id)
+        {
+            return Err(DaemonError::InvalidInput(
+                "Paper normalized evidence provenance is invalid".to_owned(),
+            ));
+        }
+        Ok(())
     }
 }

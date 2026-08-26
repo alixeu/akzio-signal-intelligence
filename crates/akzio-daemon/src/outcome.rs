@@ -13,7 +13,7 @@ impl Daemon {
         }
         let Some(outcome_lease) = self.store.acquire_daemon_lease(
             OUTCOME_WORKER_LEASE_NAME,
-            self.scheduler.owner_id(),
+            self.paper.scheduler.owner_id(),
             now,
             now + Duration::minutes(5),
         )?
@@ -135,11 +135,9 @@ impl Daemon {
         } else {
             None
         };
-        let contract_hash = task
-            .permit
-            .contract_hash
-            .clone()
-            .unwrap_or_else(|| ContentHash::of_bytes(OUTCOME_WORKER_RECIPE_ID.as_bytes()));
+        let contract_hash = task.permit.contract_hash.clone().unwrap_or_else(|| {
+            ContentHash::of_bytes(akzio_domain::LEARNING_OUTCOME_WORKER_RECIPE_ID.as_bytes())
+        });
         let evaluation = EvaluationRuntime::new(self.store.clone(), EvaluationPolicy::default())?;
         for horizon in due_horizons
             .iter()
@@ -371,7 +369,7 @@ impl Daemon {
                 schedule.baseline_trading_day
             );
             let need = EvidenceNeed {
-                schema_version: akzio_domain::V2_SCHEMA_VERSION,
+                schema_version: akzio_domain::V2_DOMAIN_SCHEMA_VERSION,
                 source_family: EvidenceSource::Alpaca.as_str().to_owned(),
                 resource: resource.clone(),
                 max_age_secs: 604_800,
@@ -435,43 +433,12 @@ impl Daemon {
         if common_dates.is_empty() {
             return Ok(None);
         }
-        let completed_sessions = u8::try_from(common_dates.len()).unwrap_or(u8::MAX);
-        let observations = OutcomeHorizon::ALL
-            .into_iter()
-            .filter(|horizon| horizon.is_due_after(completed_sessions))
-            .map(|horizon| {
-                let index = usize::from(horizon.trading_days()) - 1;
-                let observed_trading_day = common_dates[index];
-                let future_prices = Asset::EXECUTABLE.into_iter().try_fold(
-                    BTreeMap::new(),
-                    |mut prices, asset| {
-                        let price = bars_by_asset
-                            .get(&asset)
-                            .and_then(|bars| bars.get(&observed_trading_day))
-                            .copied()
-                            .ok_or_else(|| {
-                                DaemonError::Unavailable(
-                                    "Paper outcome bars are not aligned".to_owned(),
-                                )
-                            })?;
-                        prices.insert(asset, price);
-                        Ok::<_, DaemonError>(prices)
-                    },
-                )?;
-                Ok(GovernedHorizonObservation {
-                    horizon,
-                    completed_trading_sessions: completed_sessions,
-                    observed_trading_day,
-                    future_prices,
-                    expected_evidence_count: Asset::EXECUTABLE.len() as u64,
-                    observed_evidence_count: Asset::EXECUTABLE.len() as u64,
-                    expected_risk_count: (decision_context.hard_blockers.len()
-                        + decision_context.material_conflicts.len())
-                        as u64,
-                    detected_risk_count: None,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let observations = horizon_observations(
+            &bars_by_asset,
+            &common_dates,
+            (decision_context.hard_blockers.len() + decision_context.material_conflicts.len())
+                as u64,
+        )?;
         Ok(Some(CollectedOutcome {
             materialization: OutcomeMaterializationInput {
                 schedule: schedule.clone(),
@@ -488,7 +455,7 @@ impl Daemon {
                         kind: artifact.kind,
                     })
                     .collect(),
-                cost_model: self.outcome_cost_model,
+                cost_model: self.paper.outcome_cost_model,
                 sealed_at: now,
             },
             evidence_artifacts,

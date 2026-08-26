@@ -42,7 +42,6 @@ macro_rules! id_type {
     };
 }
 
-id_type!(EventId);
 id_type!(ExperienceId);
 id_type!(OutcomeId);
 id_type!(EvaluationId);
@@ -58,11 +57,7 @@ mod tests {
 
     #[test]
     fn generated_domain_ids_are_sixteen_lowercase_hex_characters() {
-        for value in [
-            EventId::new().0,
-            OutcomeId::new().0,
-            PolicyTransitionId::new().0,
-        ] {
+        for value in [OutcomeId::new().0, PolicyTransitionId::new().0] {
             assert_eq!(value.len(), 16);
             assert!(value.bytes().all(|byte| byte.is_ascii_hexdigit()));
             assert_eq!(value, value.to_ascii_lowercase());

@@ -12,6 +12,7 @@ use akzio_domain::{
 use akzio_store::v2::{StoreError, SucceededAttemptProof, V2Store};
 use chrono::{DateTime, Duration, Utc};
 use serde::{de::DeserializeOwned, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -66,10 +67,6 @@ struct ParentContextProof<'a> {
 impl ContextBroker {
     pub fn new(store: V2Store) -> Self {
         Self { store }
-    }
-
-    pub fn store(&self) -> &V2Store {
-        &self.store
     }
 
     /// Reconstructs durable learning influences only from the exact persisted
@@ -967,6 +964,38 @@ impl ContextBroker {
             return Err(ContextError::ExpectedRawEvidence);
         }
         Ok(artifact)
+    }
+
+    pub fn read_document(
+        &self,
+        permit: &TaskWritePermit,
+        contract: &AgentContract,
+        grant: &ReadGrant,
+        artifact_id: &ArtifactId,
+        now: DateTime<Utc>,
+    ) -> ContextResult<(Artifact, Value)> {
+        let artifact = self.read(permit, contract, grant, artifact_id, now)?;
+        let value = self.document_value(&artifact)?;
+        Ok((artifact, value))
+    }
+
+    pub fn read_raw_document(
+        &self,
+        permit: &TaskWritePermit,
+        contract: &AgentContract,
+        grant: &ReadGrant,
+        artifact_id: &ArtifactId,
+        now: DateTime<Utc>,
+    ) -> ContextResult<(Artifact, Value)> {
+        let artifact = self.read_raw(permit, contract, grant, artifact_id, now)?;
+        let value = self.document_value(&artifact)?;
+        Ok((artifact, value))
+    }
+
+    fn document_value(&self, artifact: &Artifact) -> ContextResult<Value> {
+        let bytes = self.store.read_blob(&artifact.blob)?;
+        Ok(serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned())))
     }
 
     fn validate_persisted_grant(

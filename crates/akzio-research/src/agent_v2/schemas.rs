@@ -96,7 +96,7 @@ pub(super) fn planner_draft_output_schema() -> Value {
         "properties": {
             "schema_version": {
                 "type": "integer",
-                "enum": [V2_SCHEMA_VERSION]
+                "enum": [V2_DOMAIN_SCHEMA_VERSION]
             },
             "topology_id": {"type": "string", "enum": ["active"]},
             "tasks": {
@@ -170,7 +170,7 @@ pub(super) fn research_intent_output_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "schema_version": {"type": "integer", "enum": [V2_SCHEMA_VERSION]},
+            "schema_version": {"type": "integer", "enum": [V2_DOMAIN_SCHEMA_VERSION]},
             "source_family": {"type": "string", "enum": GOVERNED_EVIDENCE_SOURCE_FAMILIES},
             "resource": {"type": "string", "minLength": 1, "maxLength": 2048},
             "query": {"type": "string", "minLength": 1, "maxLength": 2000},
@@ -204,7 +204,7 @@ pub(super) fn evidence_need_output_schema() -> Value {
         "properties": {
             "schema_version": {
                 "type": "integer",
-                "enum": [V2_SCHEMA_VERSION]
+                "enum": [V2_DOMAIN_SCHEMA_VERSION]
             },
             "source_family": {
                 "type": "string",
@@ -226,7 +226,7 @@ pub(super) fn claim_output_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "schema_version": { "type": "integer", "enum": [V2_SCHEMA_VERSION] },
+            "schema_version": { "type": "integer", "enum": [V2_DOMAIN_SCHEMA_VERSION] },
             "topic": { "type": "string", "minLength": 1, "maxLength": 128 },
             "statement": { "type": "string", "minLength": 1, "maxLength": 2048 },
             "horizon": { "type": "string", "enum": ["t1", "t3", "t5"] },
@@ -257,7 +257,7 @@ pub(super) fn critique_output_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "schema_version": { "type": "integer", "enum": [V2_SCHEMA_VERSION] },
+            "schema_version": { "type": "integer", "enum": [V2_DOMAIN_SCHEMA_VERSION] },
             "target": artifact_ref_schema(&["claim"]),
             "topic": { "type": "string", "minLength": 1, "maxLength": 128 },
             "severity": { "type": "string", "enum": ["low", "medium", "high"] },
@@ -286,7 +286,7 @@ pub(super) fn resolution_output_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "schema_version": { "type": "integer", "enum": [V2_SCHEMA_VERSION] },
+            "schema_version": { "type": "integer", "enum": [V2_DOMAIN_SCHEMA_VERSION] },
             "claim": artifact_ref_schema(&["claim"]),
             "critique": artifact_ref_schema(&["critique"]),
             "disposition": { "type": "string", "enum": ["accepted", "rebutted", "unresolved"] },

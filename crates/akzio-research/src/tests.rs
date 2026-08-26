@@ -10,12 +10,16 @@ use akzio_domain::{
     ArtifactLifecycle, ContextPolicy, ContractId, ContractPurpose, FailureDisposition,
     OutputContract, PromptBundle, RetryPolicy, TaskBudget, TaskRecipeId, TaskStatus,
     TerminationPolicy, ToolGrant, ToolKind, ToolSpec, WorkflowGraph, WorkflowNode,
-    V2_SCHEMA_VERSION,
+    V2_DOMAIN_SCHEMA_VERSION,
 };
 use akzio_store::v2::{StoredRun, WorkflowCommit};
 use tempfile::tempdir;
 
 use super::*;
+use akzio_runtime::v2::{
+    DECISION_GATE_RECIPE_ID, EVALUATE_RECIPE_ID, EVIDENCE_GATE_RECIPE_ID, EXECUTION_GATE_RECIPE_ID,
+    PAPER_COMMIT_RECIPE_ID, RECONCILE_RECIPE_ID,
+};
 
 #[test]
 fn deliberation_scores_are_additive_for_old_records_and_validated_for_new_runs() {
@@ -528,7 +532,7 @@ impl AgentModel for ToolThenOutputModel {
                 3 => {
                     assert_eq!(request.phase, AgentTurnPhase::Submit);
                     Ok(submission_turn(json!({
-                        "schema_version": V2_SCHEMA_VERSION,
+                        "schema_version": V2_DOMAIN_SCHEMA_VERSION,
                                         "topic": "market_regime",
                                         "statement": "The selected price evidence supports the stated regime claim.",
                                         "horizon": "t5",
@@ -609,7 +613,7 @@ impl AgentModel for RepairSubmissionModel {
                         "invalid_submission"
                     );
                     Ok(submission_turn(json!({
-                        "schema_version": V2_SCHEMA_VERSION,
+                        "schema_version": V2_DOMAIN_SCHEMA_VERSION,
                         "topic": "repaired",
                         "statement": "The repaired submission uses governed evidence.",
                         "horizon": "t1",
@@ -691,7 +695,7 @@ impl AgentModel for ToolCountModel {
                 return Ok(draft_turn("debug fixture research memo"));
             }
             Ok(submission_turn(json!({
-                "schema_version": V2_SCHEMA_VERSION,
+                "schema_version": V2_DOMAIN_SCHEMA_VERSION,
                 "topic": "debug",
                 "statement": "Debug context is sufficient without a model tool call.",
                 "horizon": "t1",
@@ -879,7 +883,7 @@ fn fixture_with(configure: impl FnOnce(&mut AgentContract)) -> Fixture {
         parent_task_id: None,
     };
     let graph = WorkflowGraph {
-        schema_version: V2_SCHEMA_VERSION,
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
         topology_id: "test".to_owned(),
         nodes: vec![node.clone()],
     };
@@ -946,7 +950,7 @@ fn fixture_with(configure: impl FnOnce(&mut AgentContract)) -> Fixture {
 fn planner_draft_schema_is_closed_and_governed() {
     let schema = planner_draft_output_schema();
     let valid = serde_json::json!({
-        "schema_version": V2_SCHEMA_VERSION,
+        "schema_version": V2_DOMAIN_SCHEMA_VERSION,
         "topology_id": "active",
         "tasks": {
             "analyst": {
@@ -955,7 +959,7 @@ fn planner_draft_schema_is_closed_and_governed() {
                 "depends_on": [],
                 "priority": 50,
                 "evidence_needs": [{
-                    "schema_version": V2_SCHEMA_VERSION,
+                    "schema_version": V2_DOMAIN_SCHEMA_VERSION,
                     "source_family": "alpaca",
                     "resource": "bars:TQQQ:1d",
                     "max_age_secs": 86400
@@ -966,7 +970,7 @@ fn planner_draft_schema_is_closed_and_governed() {
     validate_schema_value(&valid, &schema, "$").unwrap();
 
     let mut invalid_version = valid.clone();
-    invalid_version["schema_version"] = serde_json::json!(V2_SCHEMA_VERSION + 1);
+    invalid_version["schema_version"] = serde_json::json!(V2_DOMAIN_SCHEMA_VERSION + 1);
     assert!(validate_schema_value(&invalid_version, &schema, "$").is_err());
 
     let mut invalid_recipe = valid.clone();
@@ -1001,7 +1005,10 @@ fn active_catalogue_installs_canonical_contracts_and_bounded_recipes() {
         ("research.analyst", ArtifactKind::Claim),
         ("research.critic", ArtifactKind::Critique),
         ("research.synthesizer", ArtifactKind::DecisionProposal),
-        (OUTCOME_WORKER_RECIPE_ID, ArtifactKind::RetrospectiveDraft),
+        (
+            LEARNING_OUTCOME_WORKER_RECIPE_ID,
+            ArtifactKind::RetrospectiveDraft,
+        ),
     ];
 
     assert_eq!(active.contracts.contracts().count(), expected.len());
@@ -1077,7 +1084,7 @@ fn active_catalogue_installs_canonical_contracts_and_bounded_recipes() {
     }
     let worker_recipe = active
         .recipes
-        .recipe(&TaskRecipeId::new(OUTCOME_WORKER_RECIPE_ID).unwrap())
+        .recipe(&TaskRecipeId::new(LEARNING_OUTCOME_WORKER_RECIPE_ID).unwrap())
         .unwrap();
     assert_eq!(worker_recipe.task_class, RuntimeTaskClass::Evaluate);
     assert!(worker_recipe.contract_hash.is_some());
@@ -1750,7 +1757,7 @@ async fn agent_runtime_records_complete_tool_trace_and_contract_validated_claim(
         parent_task_id: None,
     };
     let graph = WorkflowGraph {
-        schema_version: V2_SCHEMA_VERSION,
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
         topology_id: "test".to_owned(),
         nodes: vec![node.clone()],
     };
@@ -1942,7 +1949,7 @@ async fn agent_runtime_records_complete_tool_trace_and_contract_validated_claim(
 
     let too_many_basis_ids = FixedModel(submission_turn(json!({
         "result": {
-            "schema_version": V2_SCHEMA_VERSION,
+            "schema_version": V2_DOMAIN_SCHEMA_VERSION,
             "topic": "bounded deliberation",
             "statement": "The governed evidence supports a bounded neutral claim.",
             "horizon": "t1",

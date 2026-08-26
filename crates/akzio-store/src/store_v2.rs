@@ -23,7 +23,7 @@ use akzio_domain::{
     PolicyState, PolicySubject, PolicyTransition, PolicyTransitionId, Reconciliation,
     Retrospective, RetrospectiveDraft, RetrospectiveStatus, RetryPolicy, RunId, RunPurpose,
     RuntimeManifest, TaskBudget, TaskId, TaskRecipeId, TaskStatus, TaskWritePermit, WorkflowGraph,
-    WorkflowNode, WorkflowProposal, WorkflowStatus, V2_DOMAIN_SCHEMA_VERSION, V2_SCHEMA_VERSION,
+    WorkflowNode, WorkflowProposal, WorkflowStatus, V2_DOMAIN_SCHEMA_VERSION,
 };
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{
@@ -33,6 +33,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
 
 mod blob;
+mod canary;
 mod doctor;
 mod execution;
 mod learning;
@@ -42,12 +43,13 @@ mod schema;
 mod trajectory;
 mod workflow;
 
+pub use canary::{CanaryCampaignHead, StoredCanarySession};
 pub use lesson::{LessonUsage, LessonWriteResult, StoredLesson};
 
 const DATABASE_FILE: &str = "akzio.sqlite3";
 const EXPORT_DATABASE_FILE: &str = "akzio-export.sqlite3";
-const POST_TERMINAL_WORKER_RECIPE_ID: &str = "learning.outcome_worker";
-const STORE_SCHEMA_VERSION: u32 = 11;
+const POST_TERMINAL_WORKER_RECIPE_ID: &str = akzio_domain::LEARNING_OUTCOME_WORKER_RECIPE_ID;
+const STORE_SCHEMA_VERSION: u32 = 12;
 const BLOB_ENCODING_IDENTITY: &str = "identity";
 const BLOB_ENCODING_ZSTD: &str = "zstd";
 const BLOB_COMPRESSION_THRESHOLD: usize = 1_024;
@@ -169,6 +171,10 @@ pub enum StoreError {
     PolicyEvaluationConflict(String),
     #[error("shadow pair {0} conflicts with a prior immutable completion")]
     ShadowPairConflict(String),
+    #[error("canary campaign {0} conflicts with the current campaign")]
+    CanaryCampaignConflict(String),
+    #[error("canary campaign {0} does not exist")]
+    MissingCanaryCampaign(String),
     #[error("Store Doctor: {0}")]
     Integrity(String),
     #[error("backup target already exists: {0}")]
@@ -824,6 +830,62 @@ impl V2Store {
         Ok(events)
     }
 
+    fn validate_paper_approval_binding(
+        &self,
+        runtime_manifest: &Artifact,
+        approval: &Artifact,
+    ) -> StoreResult<(RuntimeManifest, PaperLaunchApproval)> {
+        if runtime_manifest.kind != ArtifactKind::RuntimeManifest
+            || approval.kind != ArtifactKind::PaperLaunchApproval
+            || runtime_manifest.lifecycle != ArtifactLifecycle::Canonical
+            || approval.lifecycle != ArtifactLifecycle::Canonical
+            || runtime_manifest.origin.is_some()
+            || approval.origin.is_some()
+            || approval.source_refs
+                != vec![ArtifactRef {
+                    artifact_id: runtime_manifest.artifact_id.clone(),
+                    kind: ArtifactKind::RuntimeManifest,
+                }]
+        {
+            return Err(StoreError::InvalidSessionSlot(
+                "paper-approval-binding".to_owned(),
+            ));
+        }
+        runtime_manifest.validate()?;
+        approval.validate()?;
+        let manifest_payload: RuntimeManifest =
+            serde_json::from_slice(&self.read_blob(&runtime_manifest.blob)?)?;
+        let approval_payload: PaperLaunchApproval =
+            serde_json::from_slice(&self.read_blob(&approval.blob)?)?;
+        manifest_payload.validate()?;
+        approval_payload.validate()?;
+        if approval_payload.runtime_manifest.artifact_id != runtime_manifest.artifact_id
+            || approval_payload.runtime_manifest_hash != manifest_payload.manifest_hash()?
+            || approval_payload.expires_at > manifest_payload.expires_at
+        {
+            return Err(StoreError::InvalidSessionSlot(
+                "paper-approval-binding".to_owned(),
+            ));
+        }
+        Ok((manifest_payload, approval_payload))
+    }
+
+    /// Atomically publishes one runtime manifest and its operator approval.
+    /// A scheduler can never observe a half-written approval binding.
+    pub fn write_paper_approval_binding(
+        &self,
+        runtime_manifest: &Artifact,
+        approval: &Artifact,
+    ) -> StoreResult<()> {
+        self.validate_paper_approval_binding(runtime_manifest, approval)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        insert_artifact(&transaction, runtime_manifest)?;
+        insert_artifact(&transaction, approval)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Writes a root artifact such as an installed Contract. Bootstrap is deliberately
     /// narrow: a task-origin artifact must use `write_task_artifact` instead.
     pub fn write_bootstrap_artifact(&self, artifact: &Artifact) -> StoreResult<()> {
@@ -831,10 +893,7 @@ impl V2Store {
         if artifact.origin.is_some()
             || !matches!(
                 artifact.kind,
-                ArtifactKind::Contract
-                    | ArtifactKind::FreezeState
-                    | ArtifactKind::RuntimeManifest
-                    | ArtifactKind::PaperLaunchApproval
+                ArtifactKind::Contract | ArtifactKind::FreezeState
             )
         {
             return Err(StoreError::PermitOriginMismatch);
@@ -1271,7 +1330,7 @@ impl V2Store {
         commitment: &PaperCommitment,
         run_id: &RunId,
         session_key: &str,
-    ) -> StoreResult<()> {
+    ) -> StoreResult<ExecutionPlan> {
         let invalid = || StoreError::InvalidSessionSlot(session_key.to_owned());
         if commitment_artifact.kind != ArtifactKind::ExecutionCommitment
             || commitment_artifact.lifecycle != ArtifactLifecycle::Canonical
@@ -1401,6 +1460,44 @@ impl V2Store {
             || plan.broker_session != session_key
             || context.plan_hash.as_ref() != Some(&plan.plan_hash)
             || plan.plan_hash != commitment.plan_hash
+        {
+            return Err(invalid());
+        }
+        Ok(plan)
+    }
+
+    fn validate_consumed_paper_approval(
+        &self,
+        connection: &Connection,
+        session_key: &str,
+        plan: &ExecutionPlan,
+        committed_at: DateTime<Utc>,
+    ) -> StoreResult<()> {
+        let invalid = || StoreError::InvalidSessionSlot(session_key.to_owned());
+        let binding = connection
+            .query_row(
+                "SELECT runtime_manifest_artifact_id, approval_artifact_id FROM rebuild_paper_approval_consumptions WHERE session_key = ?1",
+                params![session_key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((manifest_id, approval_id)) = binding else {
+            return Err(invalid());
+        };
+        let manifest_artifact =
+            read_artifact(connection, &ArtifactId(ContentHash::new(manifest_id)?))?;
+        let approval_artifact =
+            read_artifact(connection, &ArtifactId(ContentHash::new(approval_id)?))?;
+        let (manifest, approval) =
+            self.validate_paper_approval_binding(&manifest_artifact, &approval_artifact)?;
+        let session =
+            chrono::NaiveDate::parse_from_str(session_key, "%Y-%m-%d").map_err(|_| invalid())?;
+        let total_notional = plan.orders.iter().try_fold(0_i64, |total, order| {
+            total.checked_add(order.notional.0).ok_or_else(invalid)
+        })?;
+        if !manifest.permits(session, committed_at)
+            || approval.expires_at < committed_at
+            || total_notional > manifest.maximum_notional.0
         {
             return Err(invalid());
         }
@@ -3396,6 +3493,30 @@ CREATE TABLE IF NOT EXISTS rebuild_shadow_pairs (
     completed_at TEXT NOT NULL,
     pair_event_cursor INTEGER NOT NULL UNIQUE REFERENCES rebuild_events(event_id)
 );
+CREATE TABLE IF NOT EXISTS rebuild_canary_campaigns (
+    campaign_id TEXT PRIMARY KEY,
+    spec_json TEXT NOT NULL,
+    status_json TEXT NOT NULL,
+    last_verdict_json TEXT,
+    revision INTEGER NOT NULL,
+    active INTEGER NOT NULL CHECK(active IN (0, 1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS rebuild_canary_one_active
+    ON rebuild_canary_campaigns(active) WHERE active = 1;
+CREATE TABLE IF NOT EXISTS rebuild_canary_sessions (
+    campaign_id TEXT NOT NULL REFERENCES rebuild_canary_campaigns(campaign_id),
+    level_json TEXT NOT NULL,
+    session_key TEXT NOT NULL UNIQUE,
+    parent_run_id TEXT NOT NULL REFERENCES rebuild_runs(run_id),
+    contract_shadow_run_id TEXT NOT NULL REFERENCES rebuild_runs(run_id),
+    topology_shadow_run_id TEXT NOT NULL REFERENCES rebuild_runs(run_id),
+    bundle_shadow_run_id TEXT NOT NULL REFERENCES rebuild_runs(run_id),
+    scheduler_epoch INTEGER NOT NULL,
+    reserved_at TEXT NOT NULL,
+    PRIMARY KEY (campaign_id, level_json)
+);
 CREATE TABLE IF NOT EXISTS rebuild_observatory_configuration (
     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
     configuration_json BLOB NOT NULL
@@ -5329,7 +5450,7 @@ fn read_artifact(connection: &Connection, artifact_id: &ArtifactId) -> StoreResu
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Artifact {
-        schema_version: V2_SCHEMA_VERSION,
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
         artifact_id: artifact_id.clone(),
         kind: parse_enum(&kind)?,
         blob: BlobRef {
@@ -5870,7 +5991,7 @@ fn read_policy_transition(
     let subject = parse_persisted_subject(&subject_id, &subject_json)?;
     Ok(Some(PolicyTransitionRecord {
         transition: PolicyTransition {
-            schema_version: V2_SCHEMA_VERSION,
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
             transition_id: transition_id.clone(),
             subject,
             from: serde_json::from_str(&from)?,
@@ -5922,7 +6043,7 @@ fn read_policy_transitions(
             }
             Ok(PolicyTransitionRecord {
                 transition: PolicyTransition {
-                    schema_version: V2_SCHEMA_VERSION,
+                    schema_version: V2_DOMAIN_SCHEMA_VERSION,
                     transition_id: PolicyTransitionId(transition_id),
                     subject,
                     from: serde_json::from_str(&from)?,

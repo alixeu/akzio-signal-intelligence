@@ -8,10 +8,11 @@ use std::{
 
 use akzio_domain::{
     Artifact, ArtifactKind, ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef,
-    AttemptId, ClaimStance, DomainError, EvidenceNeed, LifecycleEventType, ResearchClaim, RunId,
-    RunPurpose, RuntimeTaskClass, TaskId, TaskRecipe, TaskRecipeId, TaskStatus, WorkflowGraph,
-    WorkflowNode, WorkflowProposal, WorkflowProposalDraft, WorkflowProposalTask, WorkflowStatus,
-    STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID, V2_SCHEMA_VERSION,
+    AttemptId, ClaimStance, ContractPurpose, DomainError, EvidenceNeed, FailureDisposition,
+    LifecycleEventType, ResearchClaim, RetryPolicy, RunId, RunPurpose, RuntimeTaskClass,
+    TaskBudget, TaskId, TaskRecipe, TaskRecipeId, TaskStatus, WorkflowGraph, WorkflowNode,
+    WorkflowProposal, WorkflowProposalDraft, WorkflowProposalTask, WorkflowStatus,
+    STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID, V2_DOMAIN_SCHEMA_VERSION,
 };
 use akzio_store::v2::{
     ClaimedAttempt, DaemonLease, RetryTaskResult, SessionReservation, SessionSlotReservation,
@@ -27,9 +28,13 @@ mod replay;
 mod task;
 mod workflow;
 
-const POST_TERMINAL_WORKER_RECIPE_ID: &str = "learning.outcome_worker";
+const POST_TERMINAL_WORKER_RECIPE_ID: &str = akzio_domain::LEARNING_OUTCOME_WORKER_RECIPE_ID;
 
-pub use catalogue::{RecipeCatalogue, TerminalRecipeSet};
+pub use catalogue::{
+    rust_terminal_recipes, RecipeCatalogue, TerminalRecipeSet, DECISION_GATE_RECIPE_ID,
+    EVALUATE_RECIPE_ID, EVIDENCE_GATE_RECIPE_ID, EXECUTION_GATE_RECIPE_ID, PAPER_COMMIT_RECIPE_ID,
+    RECONCILE_RECIPE_ID,
+};
 pub use planner::should_run_structured_critique;
 pub use task::TaskRuntime;
 
@@ -57,8 +62,6 @@ pub enum RuntimeError {
         actual: RuntimeTaskClass,
         expected: RuntimeTaskClass,
     },
-    #[error("workflow already contains a terminal execution gate")]
-    TerminalGateAlreadyPresent,
     #[error("proposal would exceed the configured workflow node limit")]
     WorkflowNodeLimit,
     #[error("Paper workflow {0} is frozen once submitted")]
@@ -107,9 +110,9 @@ pub enum RuntimeError {
 
 pub type RuntimeResult<T> = Result<T, RuntimeError>;
 
-const ANALYST_RECIPE_ID: &str = "research.analyst";
-const CRITIC_RECIPE_ID: &str = "research.critic";
-const SYNTHESIZER_RECIPE_ID: &str = "research.synthesizer";
+const ANALYST_RECIPE_ID: &str = akzio_domain::RESEARCH_ANALYST_RECIPE_ID;
+const CRITIC_RECIPE_ID: &str = akzio_domain::RESEARCH_CRITIC_RECIPE_ID;
+const SYNTHESIZER_RECIPE_ID: &str = akzio_domain::RESEARCH_SYNTHESIZER_RECIPE_ID;
 const STRUCTURED_CRITIC_ALIAS_PREFIX: &str = "structured_critic";
 const DEBUG_FIXTURE_SOURCE: &str = "alpaca";
 const DEBUG_FIXTURE_RESOURCE: &str = "bars:TQQQ:1d";

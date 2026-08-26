@@ -17,13 +17,12 @@ use akzio_domain::{
     PromptBundle, ReadGrant, ResearchClaim, ResearchCritique, ResearchResolution, RetryPolicy,
     RunPurpose, RuntimeTaskClass, TaskBudget, TaskRecipe, TaskRecipeId, TaskWritePermit,
     TerminationPolicy, ToolGrant, ToolKind, ToolSpec, WorkflowNode, V2_DOMAIN_SCHEMA_VERSION,
-    V2_SCHEMA_VERSION,
 };
 use akzio_model::{
     ModelCallTrace, ModelCapabilitySnapshot, ModelClient, ModelContinuation, ModelError,
     ModelInput, ModelRequest, ModelToolChoice, ModelToolDefinition, ModelToolOutput,
 };
-use akzio_runtime::v2::{RecipeCatalogue, RetryCause, RuntimeError, TerminalRecipeSet};
+use akzio_runtime::v2::{RecipeCatalogue, RetryCause, RuntimeError};
 use akzio_store::v2::{StoreError, StoredContract, V2Store};
 use chrono::{DateTime, Duration, Utc};
 use futures::future::BoxFuture;
@@ -37,12 +36,14 @@ mod schemas;
 mod tools;
 mod validation;
 
+use akzio_domain::{
+    GOVERNED_EVIDENCE_SOURCE_FAMILIES, LEARNING_OUTCOME_WORKER_RECIPE_ID,
+    RESEARCH_ANALYST_RECIPE_ID, RESEARCH_CRITIC_RECIPE_ID, RESEARCH_SYNTHESIZER_RECIPE_ID,
+};
 use catalogue::{
     ActiveRecipePolicy, ACTIVE_CONTRACT_VERSION, ACTIVE_PROMPT_BUNDLE_VERSION,
-    ACTIVE_RECIPE_POLICIES, DECISION_GATE_RECIPE_ID, EVALUATE_RECIPE_ID, EVIDENCE_GATE_RECIPE_ID,
-    EXECUTION_GATE_RECIPE_ID, GOVERNED_EVIDENCE_SOURCE_FAMILIES, OUTCOME_WORKER_RECIPE_ID,
-    PAPER_COMMIT_RECIPE_ID, PLANNER_CHILD_RECIPE_IDS, PLANNER_MAX_DRAFT_TASKS, PLANNER_RECIPE_ID,
-    RECONCILE_RECIPE_ID, RFC3339_TIMESTAMP_PATTERN, SHARED_GOVERNANCE_PROMPT,
+    ACTIVE_RECIPE_POLICIES, PLANNER_CHILD_RECIPE_IDS, PLANNER_MAX_DRAFT_TASKS, PLANNER_RECIPE_ID,
+    RFC3339_TIMESTAMP_PATTERN, SHARED_GOVERNANCE_PROMPT,
 };
 pub use catalogue::{
     ActiveResearchCatalogue, ContractCatalogue, InstalledContract, ACTIVE_RESEARCH_MAX_NODES,
@@ -206,7 +207,7 @@ fn canonical_active_contracts(store: &V2Store) -> ResearchResult<Vec<AgentContra
             on_failure: FailureDisposition::FailRun,
         },
         CanonicalContractDefinition {
-            purpose: "research.analyst",
+            purpose: RESEARCH_ANALYST_RECIPE_ID,
             responsibility: "Produce evidence-linked, bounded research claims for one shard of the approved workflow.",
             output_kind: ArtifactKind::Claim,
             output_schema: claim_output_schema(),
@@ -230,7 +231,7 @@ fn canonical_active_contracts(store: &V2Store) -> ResearchResult<Vec<AgentContra
             on_failure: FailureDisposition::FailTask,
         },
         CanonicalContractDefinition {
-            purpose: "research.critic",
+            purpose: RESEARCH_CRITIC_RECIPE_ID,
             responsibility: "Challenge material claims and surface evidence or risk gaps without changing facts or execution authority.",
             output_kind: ArtifactKind::Critique,
             output_schema: critique_output_schema(),
@@ -255,7 +256,7 @@ fn canonical_active_contracts(store: &V2Store) -> ResearchResult<Vec<AgentContra
             on_failure: FailureDisposition::SkipTask,
         },
         CanonicalContractDefinition {
-            purpose: "research.synthesizer",
+            purpose: RESEARCH_SYNTHESIZER_RECIPE_ID,
             responsibility: "Synthesize approved claims and critiques into a DecisionProposal with typed blockers for Rust-owned gates.",
             output_kind: ArtifactKind::DecisionProposal,
             output_schema: decision_proposal_output_schema(),
@@ -280,7 +281,7 @@ fn canonical_active_contracts(store: &V2Store) -> ResearchResult<Vec<AgentContra
             on_failure: FailureDisposition::FailRun,
         },
         CanonicalContractDefinition {
-            purpose: OUTCOME_WORKER_RECIPE_ID,
+            purpose: LEARNING_OUTCOME_WORKER_RECIPE_ID,
             responsibility: "Produce a bounded retrospective draft from the governed Paper decision and outcome evidence chain.",
             output_kind: ArtifactKind::RetrospectiveDraft,
             output_schema: retrospective_draft_output_schema(),
@@ -321,11 +322,11 @@ fn canonical_active_contract(
 ) -> ResearchResult<AgentContract> {
     let base_prompt = two_phase_role_prompt(definition.purpose)?;
     let role_prompt = match definition.purpose {
-        "research.synthesizer" => format!(
+        RESEARCH_SYNTHESIZER_RECIPE_ID => format!(
             "{}\n\nAlways return exactly 12 forecasts: one for each executable asset (TQQQ, QQQ, SOXX, SOXL) at each horizon (t1, t3, t5), even when the proposal is blocked; for blocked proposals use neutral zero forecasts and explain the blocker in hard_blockers and summary. In deliberation.basis_artifact_ids and result references, use only artifact IDs that appear as top-level selections in the current ContextManifest; do not copy nested evidence IDs unless they are also selected. Preserve each selected artifact's exact kind: use claim only for claim refs, critique only for critique refs, and normalized_evidence or semantic_detail only when that exact kind is selected. ContextManifest deliberation_note selections may appear in basis_artifact_ids but must not be relabeled as result claims, critiques, or evidence.",
             base_prompt
         ),
-        "research.analyst" => format!(
+        RESEARCH_ANALYST_RECIPE_ID => format!(
             "{}\n\nKeep evidence_gaps to at most 2 items; combine overlapping limitations into concise, evidence-grounded gaps. Preserve the exact artifact kind shown in ContextManifest selections; do not relabel normalized_evidence as semantic_detail or vice versa.",
             base_prompt
         ),
@@ -375,10 +376,10 @@ fn canonical_active_contract(
 fn two_phase_role_prompt(purpose: &str) -> ResearchResult<String> {
     let prompt = match purpose {
         PLANNER_RECIPE_ID => "You are Akzio's bounded research planner. In Draft, explain the bounded workflow, required evidence, dependencies, and uncertainty. In Submit, produce WorkflowProposalDraft through submit_result. You may name only research.analyst and research.synthesizer recipes and express evidence needs inline. Numeric bounds are strict: priority 0-100, max_age_secs 1-604800, max_results 1-32, at most 4 assets and 7 tasks. window_start and window_end must be null or RFC3339 timestamps. Do not construct ArtifactRef values, widen capabilities, submit a decision, or submit an order.",
-        "research.analyst" => "You are Akzio's research analyst. In Draft, write an evidence-grounded memo covering the claim, support, counter-evidence, gaps, and uncertainty. In Submit, produce Claim through submit_result. Use only granted context artifacts. Do not call external systems, widen sources, change topology, submit decisions, or submit orders.",
-        "research.critic" => "You are Akzio's research critic. In Draft, write a concise critique memo covering counter-evidence, unsupported assumptions, gaps, and uncertainty. In Submit, produce Critique through submit_result. Challenge supplied claims using granted context. Do not invent evidence, widen sources or tools, alter workflow, produce a decision, or submit an order.",
-        "research.synthesizer" => "You are Akzio's research synthesizer. In Draft, write a decision memo reconciling claims, critiques, blockers, alternatives, and uncertainty. In Submit, produce DecisionProposal through submit_result. Use only artifacts selected by ContextManifest. Do not change evidence, bypass DecisionGate, submit an order, or expand any capability.",
-        OUTCOME_WORKER_RECIPE_ID => "You are Akzio's governed outcome reviewer. In Draft, write a bounded retrospective memo from granted decision, execution, outcomes, market evidence, deliberation notes, and prior retrospectives. In Submit, produce RetrospectiveDraft through submit_result. Never emit authoritative returns, calibration, slippage, risk recall, or policy decisions.",
+        RESEARCH_ANALYST_RECIPE_ID => "You are Akzio's research analyst. In Draft, write an evidence-grounded memo covering the claim, support, counter-evidence, gaps, and uncertainty. In Submit, produce Claim through submit_result. Use only granted context artifacts. Do not call external systems, widen sources, change topology, submit decisions, or submit orders.",
+        RESEARCH_CRITIC_RECIPE_ID => "You are Akzio's research critic. In Draft, write a concise critique memo covering counter-evidence, unsupported assumptions, gaps, and uncertainty. In Submit, produce Critique through submit_result. Challenge supplied claims using granted context. Do not invent evidence, widen sources or tools, alter workflow, produce a decision, or submit an order.",
+        RESEARCH_SYNTHESIZER_RECIPE_ID => "You are Akzio's research synthesizer. In Draft, write a decision memo reconciling claims, critiques, blockers, alternatives, and uncertainty. In Submit, produce DecisionProposal through submit_result. Use only artifacts selected by ContextManifest. Do not change evidence, bypass DecisionGate, submit an order, or expand any capability.",
+        LEARNING_OUTCOME_WORKER_RECIPE_ID => "You are Akzio's governed outcome reviewer. In Draft, write a bounded retrospective memo from granted decision, execution, outcomes, market evidence, deliberation notes, and prior retrospectives. In Submit, produce RetrospectiveDraft through submit_result. Never emit authoritative returns, calibration, slippage, risk recall, or policy decisions.",
         _ => return Err(ResearchError::UnexpectedActiveContractPurpose(purpose.to_owned())),
     };
     Ok(prompt.to_owned())
@@ -586,70 +587,6 @@ fn research_output_source_refs(
         ));
     }
     Ok(refs)
-}
-
-fn rust_terminal_recipes() -> ResearchResult<(Vec<TaskRecipe>, TerminalRecipeSet)> {
-    let evidence = rust_gate_recipe(EVIDENCE_GATE_RECIPE_ID, RuntimeTaskClass::Evidence)?;
-    let decision = rust_gate_recipe(DECISION_GATE_RECIPE_ID, RuntimeTaskClass::DecisionGate)?;
-    let execution = rust_gate_recipe(EXECUTION_GATE_RECIPE_ID, RuntimeTaskClass::ExecutionGate)?;
-    let paper = rust_gate_recipe(PAPER_COMMIT_RECIPE_ID, RuntimeTaskClass::PaperCommit)?;
-    let reconcile = rust_gate_recipe(RECONCILE_RECIPE_ID, RuntimeTaskClass::Reconcile)?;
-    let evaluate = rust_gate_recipe(EVALUATE_RECIPE_ID, RuntimeTaskClass::Evaluate)?;
-    let terminals = TerminalRecipeSet {
-        evidence_gate: evidence.recipe_id.clone(),
-        decision_gate: decision.recipe_id.clone(),
-        execution_gate: execution.recipe_id.clone(),
-        paper_commit: paper.recipe_id.clone(),
-        reconcile: reconcile.recipe_id.clone(),
-        evaluate: evaluate.recipe_id.clone(),
-    };
-    Ok((
-        vec![evidence, decision, execution, paper, reconcile, evaluate],
-        terminals,
-    ))
-}
-
-fn rust_gate_recipe(recipe_id: &str, task_class: RuntimeTaskClass) -> ResearchResult<TaskRecipe> {
-    let retry = match task_class {
-        RuntimeTaskClass::Evidence => RetryPolicy {
-            max_attempts: 5,
-            initial_backoff_ms: 1_000,
-            retry_transport: true,
-            retry_rate_limited: true,
-            retry_invalid_output: false,
-        },
-        RuntimeTaskClass::ExecutionGate => RetryPolicy {
-            max_attempts: 2,
-            initial_backoff_ms: 1_000,
-            retry_transport: true,
-            retry_rate_limited: true,
-            retry_invalid_output: false,
-        },
-        _ => RetryPolicy::none(),
-    };
-    let max_wall_time_secs = if task_class == RuntimeTaskClass::ExecutionGate {
-        90
-    } else {
-        30
-    };
-    Ok(TaskRecipe {
-        recipe_id: TaskRecipeId::new(recipe_id)?,
-        purpose: ContractPurpose::new(recipe_id)?,
-        contract_hash: None,
-        task_class,
-        allowed_evidence_sources: BTreeSet::new(),
-        max_children: 0,
-        max_depth: 0,
-        priority_ceiling: 100,
-        budget: TaskBudget {
-            max_input_tokens: 1,
-            max_output_tokens: 1,
-            max_wall_time_secs,
-            max_tool_calls: 0,
-        },
-        retry,
-        on_failure: FailureDisposition::FailRun,
-    })
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1004,6 +941,31 @@ impl AgentRuntime {
         &self.catalogue
     }
 
+    fn validate_authority_permit(&self, permit: &TaskWritePermit) -> ResearchResult<()> {
+        Ok(self.store.validate_task_permit(permit)?)
+    }
+
+    fn load_parent_succeeded_attempt(
+        &self,
+        run_id: &RunId,
+        parent_task_id: &TaskId,
+    ) -> ResearchResult<akzio_store::v2::SucceededAttemptProof> {
+        Ok(self
+            .store
+            .current_succeeded_attempt(run_id, parent_task_id)?)
+    }
+
+    pub(super) fn read_authority_blob(
+        &self,
+        blob_ref: &akzio_domain::BlobRef,
+    ) -> ResearchResult<Vec<u8>> {
+        Ok(self.store.read_blob(blob_ref)?)
+    }
+
+    fn run_purpose_for(&self, run_id: &RunId) -> ResearchResult<RunPurpose> {
+        Ok(self.store.run_purpose(run_id)?)
+    }
+
     pub async fn run(
         &self,
         permit: &TaskWritePermit,
@@ -1012,7 +974,7 @@ impl AgentRuntime {
         model: &dyn AgentModel,
         now: DateTime<Utc>,
     ) -> ResearchResult<Artifact> {
-        self.store.validate_task_permit(permit)?;
+        self.validate_authority_permit(permit)?;
         if permit.task_id != node.task_id {
             return Err(ResearchError::TaskMismatch);
         }
@@ -1036,9 +998,7 @@ impl AgentRuntime {
                     "parent task is not a declared dependency".to_owned(),
                 ));
             }
-            let proof = self
-                .store
-                .current_succeeded_attempt(&permit.run_id, parent_task_id)?;
+            let proof = self.load_parent_succeeded_attempt(&permit.run_id, parent_task_id)?;
             let parent_contract_hash = proof.contract_hash.as_ref().ok_or_else(|| {
                 ResearchError::InvalidOutput("parent attempt has no contract hash".to_owned())
             })?;
@@ -1059,20 +1019,20 @@ impl AgentRuntime {
             return Err(ResearchError::GrantPermitMismatch);
         }
         let context = self.context_values(permit, &installed.contract, &manifest, now)?;
-        let governance = String::from_utf8(
-            self.store
-                .read_blob(&installed.contract.prompt.governance)?,
-        )
-        .map_err(|_| ResearchError::InvalidOutput("governance prompt is not UTF-8".to_owned()))?;
-        let role = String::from_utf8(self.store.read_blob(&installed.contract.prompt.role)?)
+        let governance =
+            String::from_utf8(self.read_authority_blob(&installed.contract.prompt.governance)?)
+                .map_err(|_| {
+                    ResearchError::InvalidOutput("governance prompt is not UTF-8".to_owned())
+                })?;
+        let role = String::from_utf8(self.read_authority_blob(&installed.contract.prompt.role)?)
             .map_err(|_| ResearchError::InvalidOutput("role prompt is not UTF-8".to_owned()))?;
         let response_language = model.response_language().unwrap_or("简体中文").trim();
         let prompt = format!(
             "{governance}\n\n{role}\n\nDuring Draft, use granted read tools as needed, then return a concise, auditable research memo in {response_language}. State conclusions, evidence, counter-evidence, and uncertainty without exposing hidden chain-of-thought. During Submit, call submit_result exactly once; keep JSON property names, enum literals, identifiers, symbols, and cited source text unchanged."
         );
         let output_schema: Value =
-            serde_json::from_slice(&self.store.read_blob(&installed.contract.output.schema)?)?;
-        let run_purpose = self.store.run_purpose(&permit.run_id)?;
+            serde_json::from_slice(&self.read_authority_blob(&installed.contract.output.schema)?)?;
+        let run_purpose = self.run_purpose_for(&permit.run_id)?;
         let tools = if !should_advertise_read_tools(
             run_purpose,
             context.len(),
@@ -1162,6 +1122,7 @@ impl AgentRuntime {
                         &request,
                         "capability_mismatch",
                         None,
+                        None,
                         false,
                         &capability_snapshot,
                         &capability_snapshot_hash,
@@ -1174,7 +1135,7 @@ impl AgentRuntime {
                     return Err(capability);
                 }
                 let request_hash = model_request_hash(&request)?;
-                self.store.validate_task_permit(permit)?;
+                self.validate_authority_permit(permit)?;
                 self.store.append_task_event(
                     permit,
                     LifecycleEventType::AgentTurnStarted,
@@ -1246,6 +1207,7 @@ impl AgentRuntime {
                             },
                             &request,
                             model_error_class(&error),
+                            Some(research_error_detail(&error)),
                             model_debug_trace(&error),
                             will_retry,
                             &capability_snapshot,
@@ -1291,6 +1253,7 @@ impl AgentRuntime {
                     },
                     &request,
                     "wall_time",
+                    None,
                     None,
                     false,
                     &capability_snapshot,
@@ -1561,17 +1524,13 @@ impl AgentRuntime {
             .selections
             .iter()
             .map(|selection| {
-                let artifact = self.context.read(
+                let (artifact, value) = self.context.read_document(
                     permit,
                     contract,
                     &manifest.grant,
                     &selection.artifact.artifact_id,
                     now,
                 )?;
-                let bytes = self.store.read_blob(&artifact.blob)?;
-                let value = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
-                    Value::String(String::from_utf8_lossy(&bytes).into_owned())
-                });
                 Ok(json!({
                     "artifact_id": artifact.artifact_id,
                     "kind": artifact.kind,
@@ -1638,6 +1597,7 @@ impl AgentRuntime {
         record: &TurnRecord<'_>,
         request: &AgentModelRequest,
         error_class: &str,
+        error_detail: Option<Value>,
         model_debug: Option<&ModelCallTrace>,
         will_retry: bool,
         capability_snapshot: &ModelCapabilitySnapshot,
@@ -1658,6 +1618,9 @@ impl AgentRuntime {
             "error_class": error_class,
             "will_retry": will_retry,
         });
+        if let Some(error_detail) = error_detail {
+            trace["error_detail"] = error_detail;
+        }
         if let Some(model_debug) = model_debug {
             trace["model_debug"] = serde_json::to_value(model_debug)?;
         }
@@ -1706,8 +1669,7 @@ fn should_advertise_read_tools(
 }
 
 fn estimate_tokens<T: Serialize>(value: &T) -> ResearchResult<u32> {
-    let bytes = serde_json::to_vec(value)?.len() as u64;
-    Ok(u32::try_from(bytes.div_ceil(4).max(1)).unwrap_or(u32::MAX))
+    Ok(akzio_domain::estimate_json_tokens(value)?)
 }
 
 fn model_request_hash(request: &AgentModelRequest) -> ResearchResult<akzio_domain::ContentHash> {
@@ -1724,6 +1686,39 @@ fn capability_snapshot_hash(
     )?)?)
 }
 
+fn research_error_detail(error: &ResearchError) -> Value {
+    match error {
+        ResearchError::Model(message)
+        | ResearchError::RateLimited(message)
+        | ResearchError::InvalidOutput(message) => json!({
+            "kind": model_error_class(error),
+            "message": sanitize_provider_text(message),
+        }),
+        ResearchError::ModelDebug {
+            error_class,
+            message,
+            ..
+        } => json!({
+            "kind": error_class,
+            "message": sanitize_provider_text(message),
+        }),
+        _ => json!({ "kind": model_error_class(error) }),
+    }
+}
+
+fn sanitize_provider_text(value: &str) -> String {
+    let mut sanitized = value
+        .replace("Authorization", "[redacted-header]")
+        .replace("authorization", "[redacted-header]")
+        .replace("api_key", "[redacted-key]")
+        .replace("api-key", "[redacted-key]");
+    if sanitized.chars().count() > 512 {
+        sanitized = sanitized.chars().take(512).collect();
+        sanitized.push_str("...");
+    }
+    sanitized
+}
+
 fn model_error_result(error: &ModelError) -> Value {
     match error {
         ModelError::Http { status, body } => json!({
@@ -1731,7 +1726,10 @@ fn model_error_result(error: &ModelError) -> Value {
             "body": serde_json::from_str::<Value>(body)
                 .unwrap_or_else(|_| Value::String(body.clone())),
         }),
-        ModelError::Transport(_) => json!({"error": "transport"}),
+        ModelError::Transport(error) => json!({
+            "error": "transport",
+            "message": sanitize_provider_text(&error.to_string()),
+        }),
         ModelError::InvalidStream(_) => json!({"error": "invalid_stream"}),
         ModelError::Refused(message) => json!({"error": "refused", "message": message}),
         ModelError::Incomplete(reason) => json!({"error": "incomplete", "reason": reason}),
@@ -1752,11 +1750,19 @@ fn model_error_result(error: &ModelError) -> Value {
 
 fn model_client_error(error: ModelError, trace: Option<ModelCallTrace>) -> ResearchError {
     let (error_class, message) = match error {
-        ModelError::Transport(_) => ("transport", "transport".to_owned()),
-        ModelError::Http { status, .. } if status.as_u16() == 429 => {
-            ("rate_limited", "HTTP 429".to_owned())
-        }
-        ModelError::Http { status, .. } => ("transport", format!("HTTP {}", status.as_u16())),
+        ModelError::Transport(error) => ("transport", sanitize_provider_text(&error.to_string())),
+        ModelError::Http { status, body } if status.as_u16() == 429 => (
+            "rate_limited",
+            format!("HTTP 429: {}", sanitize_provider_text(&body)),
+        ),
+        ModelError::Http { status, body } => (
+            "transport",
+            format!(
+                "HTTP {}: {}",
+                status.as_u16(),
+                sanitize_provider_text(&body)
+            ),
+        ),
         ModelError::EmptyBaseUrl => ("configuration", "invalid base URL".to_owned()),
         ModelError::EmptyApiKey => ("configuration", "missing API key".to_owned()),
         ModelError::EmptyModel => ("configuration", "missing model name".to_owned()),
@@ -1935,7 +1941,7 @@ mod decision_proposal_tests {
         };
         let contract_hash = akzio_domain::ContentHash::of_bytes(b"contract");
         let manifest_payload = akzio_domain::ContextManifestPayload {
-            schema_version: V2_SCHEMA_VERSION,
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
             contract_hash: contract_hash.clone(),
             selections: vec![
                 akzio_domain::ContextSelection {

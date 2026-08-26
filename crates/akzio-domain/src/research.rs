@@ -111,7 +111,7 @@ impl ResearchIntent {
     pub fn evidence_need(&self) -> Result<EvidenceNeed, DomainError> {
         self.validate()?;
         Ok(EvidenceNeed {
-            schema_version: crate::V2_SCHEMA_VERSION,
+            schema_version: crate::V2_DOMAIN_SCHEMA_VERSION,
             source_family: self.source_family.clone(),
             resource: self.resource.clone(),
             max_age_secs: self.max_age_secs,

@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use akzio_domain::{
     Asset, CandidatePolicyState, MoneyMicros, Outcome, OutcomeHorizon, PolicyState, TargetPortfolio,
 };
+use akzio_ingest::parse_money_micros;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::Serialize;
 use serde_json::Value;
@@ -551,48 +552,16 @@ fn rounded_ppm(value: f64) -> i64 {
 }
 
 fn json_micros(value: &Value) -> Result<i64, String> {
-    let raw = value
-        .as_str()
-        .map(str::to_owned)
-        .or_else(|| value.as_f64().map(|value| value.to_string()))
-        .ok_or_else(|| "decimal value is neither string nor number".to_owned())?;
-    let raw = raw.trim();
-    let (negative, raw) = match raw.strip_prefix('-') {
-        Some(value) => (true, value),
-        None => (false, raw.strip_prefix('+').unwrap_or(raw)),
-    };
-    let (whole, fraction) = raw.split_once('.').unwrap_or((raw, ""));
-    if whole.is_empty()
-        || !whole.bytes().all(|byte| byte.is_ascii_digit())
-        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
-        || fraction.len() > 6
-    {
-        return Err("decimal value is invalid".to_owned());
-    }
-    let whole = whole
-        .parse::<i64>()
-        .map_err(|_| "decimal whole value overflow".to_owned())?;
-    let fraction = if fraction.is_empty() {
-        0
-    } else {
-        fraction
-            .parse::<i64>()
-            .map_err(|_| "decimal fraction overflow".to_owned())?
-            .checked_mul(10_i64.pow((6 - fraction.len()) as u32))
-            .ok_or_else(|| "decimal fraction overflow".to_owned())?
-    };
-    let value = whole
-        .checked_mul(1_000_000)
-        .and_then(|value| value.checked_add(fraction))
-        .ok_or_else(|| "decimal value overflow".to_owned())?;
-    Ok(if negative { -value } else { value })
+    parse_money_micros(value)
+        .map(|money| money.0)
+        .ok_or_else(|| "decimal value is invalid".to_owned())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use akzio_domain::{
-        ArtifactId, ArtifactKind, ArtifactRef, ContentHash, OutcomeId, V2_SCHEMA_VERSION,
+        ArtifactId, ArtifactKind, ArtifactRef, ContentHash, OutcomeId, V2_DOMAIN_SCHEMA_VERSION,
     };
     use chrono::{Duration, TimeZone};
 
@@ -667,7 +636,7 @@ mod tests {
             kind: ArtifactKind::OutcomeSchedule,
         };
         let outcome = Outcome {
-            schema_version: V2_SCHEMA_VERSION,
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
             outcome_id: OutcomeId("outcome".to_owned()),
             schedule: reference,
             market_evidence: vec![ArtifactRef {

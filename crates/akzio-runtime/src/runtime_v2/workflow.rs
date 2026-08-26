@@ -253,7 +253,7 @@ impl WorkflowRuntime {
             .catalogue
             .recipe(&TaskRecipeId::new(SYNTHESIZER_RECIPE_ID)?)?;
         let proposal = WorkflowProposal {
-            schema_version: V2_SCHEMA_VERSION,
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
             topology_id: topology_id.into(),
             tasks: BTreeMap::from([
                 (

@@ -127,7 +127,7 @@ impl V2Store {
         secure_directory(&target)?;
 
         let manifest = RunExportManifest {
-            schema_version: V2_SCHEMA_VERSION,
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
             exported_at: Utc::now(),
             include_raw_model,
             workflow,

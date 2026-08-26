@@ -35,7 +35,7 @@ fn claim(
     has_gap: bool,
 ) -> ResearchClaim {
     ResearchClaim {
-        schema_version: V2_SCHEMA_VERSION,
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
         topic: "TQQQ regime".to_owned(),
         statement: "fixture claim".to_owned(),
         horizon: DecisionHorizon::T5,
@@ -106,7 +106,7 @@ fn catalogue() -> RecipeCatalogue {
 
 fn proposal() -> WorkflowProposal {
     WorkflowProposal {
-        schema_version: V2_SCHEMA_VERSION,
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
         topology_id: "active".to_owned(),
         tasks: BTreeMap::from([
             (
@@ -140,7 +140,7 @@ fn planner_output_artifact(
     now: DateTime<Utc>,
 ) -> Artifact {
     let draft = WorkflowProposalDraft {
-        schema_version: V2_SCHEMA_VERSION,
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
         topology_id: "active".to_owned(),
         tasks: BTreeMap::from([(
             "analyst".to_owned(),
@@ -150,7 +150,7 @@ fn planner_output_artifact(
                 depends_on: vec![],
                 priority: 80,
                 evidence_needs: vec![EvidenceNeed {
-                    schema_version: V2_SCHEMA_VERSION,
+                    schema_version: V2_DOMAIN_SCHEMA_VERSION,
                     source_family: "alpaca".to_owned(),
                     resource: "bars:TQQQ:1d".to_owned(),
                     max_age_secs: 86_400,
@@ -256,7 +256,7 @@ fn planner_cannot_schedule_critic_directly() {
     let root = tempdir().unwrap();
     let runtime = WorkflowRuntime::new(V2Store::open(root.path()).unwrap(), catalogue());
     let mut draft = WorkflowProposalDraft {
-        schema_version: V2_SCHEMA_VERSION,
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
         topology_id: STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID.to_owned(),
         tasks: BTreeMap::from([
             (
@@ -303,7 +303,7 @@ fn structured_critique_is_reserved_for_the_candidate_topology() {
         research_intents: vec![],
     };
     let mut active = WorkflowProposalDraft {
-        schema_version: V2_SCHEMA_VERSION,
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
         topology_id: "active".to_owned(),
         tasks: BTreeMap::from([("analyst".to_owned(), analyst.clone())]),
         stop_reason: None,
@@ -312,7 +312,7 @@ fn structured_critique_is_reserved_for_the_candidate_topology() {
     assert_eq!(active.tasks.len(), 1);
 
     let mut candidate = WorkflowProposalDraft {
-        schema_version: V2_SCHEMA_VERSION,
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
         topology_id: STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID.to_owned(),
         tasks: BTreeMap::from([("analyst".to_owned(), analyst)]),
         stop_reason: None,

@@ -12,17 +12,19 @@ use super::*;
 use crate::scheduler::paper_snapshot_resources;
 use akzio_domain::{
     ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef, Asset,
-    ContextManifestPayload, EvidenceNeed, MoneyMicros, Outcome, OutcomeExecutionLineage,
-    OutcomeSchedule, PaperApprovalScope, PaperLaunchApproval, Quote, RetrospectiveStatus,
-    RuntimeManifest, TaskRecipeId, WorkflowProposal, WorkflowProposalDraft,
+    ContextManifestPayload, EvidenceNeed, MarketClockSnapshot, MoneyMicros, Outcome,
+    OutcomeExecutionLineage, OutcomeSchedule, PaperApprovalScope, PaperLaunchApproval, Quote,
+    RetrospectiveStatus, RuntimeManifest, TaskRecipeId, WorkflowProposal, WorkflowProposalDraft,
     WorkflowProposalDraftTask, WorkflowProposalTask, V2_DOMAIN_SCHEMA_VERSION,
 };
 use akzio_execution::paper::{CommittedPaperBroker, PaperError, PaperExecution, PaperOrderReceipt};
 use akzio_ingest::{
     runtime::EvidenceAdapterError, AcquiredEvidence, AsyncEvidenceAdapter, EvidenceProvenance,
-    EvidenceQuality, EvidenceRequest, NormalizedEvidencePayload,
+    EvidenceQuality, EvidenceRequest, NormalizedEvidencePayload, PaperDecodeError,
 };
-use akzio_research::AgentModel;
+use akzio_research::{
+    fixture_claim_output, fixture_critique_output, fixture_model_client, AgentModel,
+};
 use akzio_store::v2::AlertSeverity;
 use axum::{
     body::{to_bytes, Body},
@@ -44,6 +46,54 @@ fn config(root: PathBuf) -> DaemonConfig {
         outcome_cost_model: OutcomeCostModel::default(),
         runtime_identity_hash: None,
     }
+}
+
+fn runtime_identity(seed: &str) -> RuntimeIdentity {
+    RuntimeIdentity {
+        code_revision: format!("revision-{seed}"),
+        cargo_lock_hash: ContentHash::of_bytes(format!("cargo-{seed}").as_bytes()),
+        config_hash: ContentHash::of_bytes(format!("config-{seed}").as_bytes()),
+        provider_id: format!("provider-{seed}"),
+        model_id: format!("model-{seed}"),
+        prompt_hash: ContentHash::of_bytes(format!("prompt-{seed}").as_bytes()),
+        contract_hash: ContentHash::of_bytes(format!("contract-{seed}").as_bytes()),
+        topology_hash: ContentHash::of_bytes(format!("topology-{seed}").as_bytes()),
+        decision_policy_hash: ContentHash::of_bytes(format!("decision-{seed}").as_bytes()),
+        execution_policy_hash: ContentHash::of_bytes(format!("execution-{seed}").as_bytes()),
+        evaluation_policy_hash: ContentHash::of_bytes(format!("evaluation-{seed}").as_bytes()),
+        market_data_feed: "iex".to_owned(),
+    }
+}
+
+#[tokio::test]
+async fn paper_approval_rejects_a_mismatched_runtime_identity_before_broker_io() {
+    let directory = tempdir().unwrap();
+    let expected = runtime_identity("expected");
+    let mut daemon_config = config(directory.path().to_path_buf());
+    daemon_config.auto_paper = true;
+    daemon_config.runtime_identity_hash = Some(expected.identity_hash().unwrap());
+    let daemon = Daemon::with_model(daemon_config, fixture_model_client()).unwrap();
+
+    let error = daemon
+        .approve_paper(PaperApprovalRequest {
+            session_key: "2026-08-25".to_owned(),
+            operator: "fixture-operator".to_owned(),
+            reason: "identity mismatch test".to_owned(),
+            max_notional_usd_cents: 10_000,
+            valid_hours: 1,
+            identity: runtime_identity("other"),
+        })
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(error, DaemonError::InvalidInput(message) if message.contains("runtime identity"))
+    );
+    assert!(daemon
+        .store()
+        .latest_artifact_by_kind(ArtifactKind::PaperLaunchApproval)
+        .unwrap()
+        .is_none());
 }
 
 #[test]
@@ -86,7 +136,11 @@ fn daemon_selects_the_configured_model_for_each_stage() {
     );
 }
 
-fn install_test_paper_approval(store: &V2Store, session: NaiveDate, now: DateTime<Utc>) {
+fn install_test_paper_approval(
+    store: &V2Store,
+    session: NaiveDate,
+    now: DateTime<Utc>,
+) -> (Artifact, Artifact) {
     let manifest_payload = RuntimeManifest {
         schema_version: V2_DOMAIN_SCHEMA_VERSION,
         code_revision: "fixture-revision".to_owned(),
@@ -102,7 +156,7 @@ fn install_test_paper_approval(store: &V2Store, session: NaiveDate, now: DateTim
         evaluation_policy_hash: ContentHash::of_bytes(b"fixture-evaluation-policy"),
         market_data_feed: "iex".to_owned(),
         broker_account_id: "fixture-paper-account".to_owned(),
-        maximum_notional: MoneyMicros::from_usd_cents(10_000),
+        maximum_notional: MoneyMicros::from_usd_cents(2_000_000),
         allowed_session_start: session,
         allowed_session_end: session,
         expires_at: now + ChronoDuration::hours(8),
@@ -127,7 +181,6 @@ fn install_test_paper_approval(store: &V2Store, session: NaiveDate, now: DateTim
         now,
     )
     .unwrap();
-    store.write_bootstrap_artifact(&manifest).unwrap();
     let mut approval_payload = PaperLaunchApproval {
         schema_version: V2_DOMAIN_SCHEMA_VERSION,
         operator_identity: "fixture-operator".to_owned(),
@@ -161,7 +214,10 @@ fn install_test_paper_approval(store: &V2Store, session: NaiveDate, now: DateTim
         now,
     )
     .unwrap();
-    store.write_bootstrap_artifact(&approval).unwrap();
+    store
+        .write_paper_approval_binding(&manifest, &approval)
+        .unwrap();
+    (manifest, approval)
 }
 
 #[test]
@@ -1059,12 +1115,22 @@ async fn paper_fixture_snapshots_reach_accepted_commit_reconcile_and_outcome_sch
         },
     );
     proposal.tasks.get_mut("synthesizer").unwrap().depends_on = vec!["analyst".to_owned()];
+    let (manifest, approval) = install_test_paper_approval(
+        daemon.store(),
+        NaiveDate::parse_from_str(&session_key, "%Y-%m-%d").unwrap(),
+        now,
+    );
+    let lease = daemon.paper.scheduler.active_lease(now).unwrap();
     let slot = daemon
-        .reserve_paper_session_with_inputs_for_run(
+        .workflow
+        .reserve_paper_session_with_inputs_for_run_approved(
+            &lease,
             paper_run_id,
             &session_key,
             &proposal,
             &setup_artifacts,
+            &manifest,
+            &approval,
             now,
         )
         .unwrap();
@@ -1178,7 +1244,9 @@ async fn paper_fixture_snapshots_reach_accepted_commit_reconcile_and_outcome_sch
     let outcome_task = snapshot
         .tasks
         .iter()
-        .find(|task| task.node.recipe_id.as_str() == OUTCOME_WORKER_RECIPE_ID)
+        .find(|task| {
+            task.node.recipe_id.as_str() == akzio_domain::LEARNING_OUTCOME_WORKER_RECIPE_ID
+        })
         .expect("Paper run must retain an outcome worker task");
     let outcome_contract_hash = outcome_task
         .node
@@ -1377,6 +1445,7 @@ async fn paper_scheduler_does_not_reserve_when_clock_is_closed() {
     let source = StaticPaperWorkflowSource::new(paper_proposal());
 
     let reservation = daemon
+        .paper
         .scheduler
         .tick(&clock, &source, Utc::now())
         .await
@@ -1471,6 +1540,7 @@ async fn auto_paper_requires_a_durable_workflow_proposal() {
         Err(SchedulerError::WorkflowUnavailable)
     ));
     assert!(daemon
+        .paper
         .scheduler
         .tick(&clock, &source, Utc::now())
         .await
@@ -1599,7 +1669,7 @@ async fn paper_scheduler_rejects_cross_run_run_scoped_evidence_needs() {
     let clock = StaticSessionClock(Some(session_key.clone()));
     let source = StaticPaperWorkflowSource::new(proposal);
     assert!(matches!(
-        daemon.scheduler.tick(&clock, &source, now).await,
+        daemon.paper.scheduler.tick(&clock, &source, now).await,
         Err(SchedulerError::WorkflowUnavailable)
     ));
     assert!(daemon.store().session_slot(&session_key).unwrap().is_none());
@@ -1659,6 +1729,7 @@ async fn paper_scheduler_does_not_carry_scheduler_snapshots_into_new_run() {
     let clock = StaticSessionClock(Some(new_session));
     let source = StaticPaperWorkflowSource::new(new_proposal);
     let reservation = daemon
+        .paper
         .scheduler
         .tick(&clock, &source, now + Duration::seconds(1))
         .await
@@ -2345,6 +2416,6 @@ fn daily_bar_parser_is_decimal_safe_and_rejects_duplicate_dates() {
     );
     assert!(matches!(
         duplicate,
-        Err(DaemonError::Unavailable(message)) if message == "daily bar date is duplicated"
+        Err(PaperDecodeError::Unavailable(message)) if message == "daily bar date is duplicated"
     ));
 }

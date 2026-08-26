@@ -18,7 +18,7 @@ use akzio_domain::{
     Outcome, OutcomeCostModel, OutcomeExecutionLineage, OutcomeHorizon, OutcomeSchedule,
     OutcomeWindow, PolicyState, PolicySubject, PolicyTransition, PolicyTransitionId, Retrospective,
     RetrospectiveDraft, RetrospectiveStatus, RunPurpose, TargetPortfolio, TaskWritePermit,
-    TopologyId, V2_DOMAIN_SCHEMA_VERSION, V2_SCHEMA_VERSION,
+    TopologyId, V2_DOMAIN_SCHEMA_VERSION,
 };
 use akzio_store::v2::{
     DaemonLease, PolicyEvaluationCommit, PolicyHead, ShadowPairCompletion, ShadowPairWriteResult,
@@ -45,6 +45,15 @@ impl Default for EvaluationPolicy {
 }
 
 impl EvaluationPolicy {
+    pub fn outcome_is_degraded(&self, outcome: &Outcome) -> bool {
+        outcome.windows.iter().any(|window| {
+            window.evidence_completeness_ppm < self.minimum_evidence_completeness_ppm
+                || window
+                    .risk_recall_ppm
+                    .is_none_or(|value| value < self.minimum_risk_recall_ppm)
+        })
+    }
+
     fn validate(&self) -> Result<(), EvaluationError> {
         if self.minimum_evidence_completeness_ppm > PPM_ONE
             || self.minimum_risk_recall_ppm > PPM_ONE
@@ -67,6 +76,46 @@ pub struct GovernedHorizonObservation {
     pub observed_evidence_count: u64,
     pub expected_risk_count: u64,
     pub detected_risk_count: Option<u64>,
+}
+
+pub fn horizon_observations(
+    bars_by_asset: &BTreeMap<Asset, BTreeMap<NaiveDate, MoneyMicros>>,
+    common_dates: &[NaiveDate],
+    expected_risk_count: u64,
+) -> EvaluationRuntimeResult<Vec<GovernedHorizonObservation>> {
+    let completed_sessions = u8::try_from(common_dates.len()).unwrap_or(u8::MAX);
+    OutcomeHorizon::ALL
+        .into_iter()
+        .filter(|horizon| horizon.is_due_after(completed_sessions))
+        .map(|horizon| {
+            let index = usize::from(horizon.trading_days()) - 1;
+            let observed_trading_day = *common_dates
+                .get(index)
+                .ok_or(EvaluationError::UnalignedBars)?;
+            let future_prices =
+                Asset::EXECUTABLE
+                    .into_iter()
+                    .try_fold(BTreeMap::new(), |mut prices, asset| {
+                        let price = bars_by_asset
+                            .get(&asset)
+                            .and_then(|bars| bars.get(&observed_trading_day))
+                            .copied()
+                            .ok_or(EvaluationError::UnalignedBars)?;
+                        prices.insert(asset, price);
+                        Ok::<_, EvaluationError>(prices)
+                    })?;
+            Ok(GovernedHorizonObservation {
+                horizon,
+                completed_trading_sessions: completed_sessions,
+                observed_trading_day,
+                future_prices,
+                expected_evidence_count: Asset::EXECUTABLE.len() as u64,
+                observed_evidence_count: Asset::EXECUTABLE.len() as u64,
+                expected_risk_count,
+                detected_risk_count: None,
+            })
+        })
+        .collect()
 }
 
 /// Raw inputs from which Rust deterministically materializes a sealed Outcome.
@@ -147,6 +196,8 @@ pub enum EvaluationError {
     InvalidMaterialization(&'static str),
     #[error("outcome materialization arithmetic overflow")]
     ArithmeticOverflow,
+    #[error("Paper outcome bars are not aligned")]
+    UnalignedBars,
 }
 
 pub type EvaluationRuntimeResult<T> = Result<T, EvaluationError>;
@@ -262,12 +313,7 @@ impl EvaluationRuntime {
             .expect("materialized outcome always has sealed_at");
         let pair_snapshot = self.store.policy_shadow_pair_snapshot(&input.subject)?;
         let fresh_pairs_by_horizon = pair_snapshot.counts_by_horizon;
-        let degraded = outcome.windows.iter().any(|window| {
-            window.evidence_completeness_ppm < self.policy.minimum_evidence_completeness_ppm
-                || window
-                    .risk_recall_ppm
-                    .is_none_or(|value| value < self.policy.minimum_risk_recall_ppm)
-        });
+        let degraded = self.policy.outcome_is_degraded(&outcome);
 
         let origin = input.permit.artifact_origin();
         let provenance = crate::trusted_learning_provenance(&input.permit, created_at);
@@ -358,7 +404,7 @@ impl EvaluationRuntime {
         let schedule = &input.materialization.schedule;
         let policy_verdict = execution_verdict(&schedule.execution).clone();
         let experience = Experience {
-            schema_version: V2_SCHEMA_VERSION,
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
             experience_id: ExperienceId(stable_id(&serde_json::json!({
                 "subject": &input.subject,
                 "hypothesis_id": &input.hypothesis_id,
@@ -397,7 +443,7 @@ impl EvaluationRuntime {
         )?;
         let experience_ref = reference(&experience_artifact);
         let evaluation = Evaluation {
-            schema_version: V2_SCHEMA_VERSION,
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
             evaluation_id: EvaluationId(stable_id(&serde_json::json!({
                 "subject": &input.subject,
                 "outcome": &outcome_ref,
@@ -431,7 +477,7 @@ impl EvaluationRuntime {
             .as_ref()
             .map(|candidate| {
                 let policy = CandidatePolicy {
-                    schema_version: V2_SCHEMA_VERSION,
+                    schema_version: V2_DOMAIN_SCHEMA_VERSION,
                     subject: input.subject.clone(),
                     baseline: candidate.baseline.clone(),
                     candidate: candidate.candidate.clone(),
@@ -460,7 +506,7 @@ impl EvaluationRuntime {
             None
         } else {
             Some(PolicyTransition {
-                schema_version: V2_SCHEMA_VERSION,
+                schema_version: V2_DOMAIN_SCHEMA_VERSION,
                 transition_id: PolicyTransitionId(stable_id(&serde_json::json!({
                     "subject": &input.subject,
                     "from": current,
@@ -525,7 +571,7 @@ impl EvaluationRuntime {
                 continue;
             }
             let lesson = Lesson {
-                schema_version: V2_SCHEMA_VERSION,
+                schema_version: V2_DOMAIN_SCHEMA_VERSION,
                 lesson_id: LessonId(stable_id(&serde_json::json!({
                     "retrospective": retrospective_artifact.artifact_id,
                     "index": index,
@@ -854,7 +900,7 @@ pub fn materialize_outcome(
     }
 
     let outcome = Outcome {
-        schema_version: V2_SCHEMA_VERSION,
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
         outcome_id: input.schedule.outcome_id.clone(),
         schedule: input.schedule_artifact.clone(),
         market_evidence,

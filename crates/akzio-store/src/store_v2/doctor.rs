@@ -206,6 +206,7 @@ impl V2Store {
             if approval_payload.runtime_manifest != manifest_ref
                 || approval_payload.runtime_manifest_hash != manifest_payload.manifest_hash()?
                 || approval_payload.expires_at < consumed_at
+                || approval_payload.expires_at > manifest_payload.expires_at
                 || !manifest_payload.permits(session, consumed_at)
             {
                 return Err(StoreError::Integrity(format!(
@@ -285,19 +286,31 @@ impl V2Store {
                     let payload: PaperCommitment =
                         serde_json::from_slice(&self.read_blob(&commitment_artifact.blob)?)?;
                     payload.validate()?;
-                    self.validate_execution_commitment_lineage(
+                    let plan = self
+                        .validate_execution_commitment_lineage(
+                            &connection,
+                            &commitment_artifact,
+                            &payload,
+                            &RunId(run_id.clone()),
+                            &session_key,
+                        )
+                        .map_err(|error| {
+                            StoreError::Integrity(format!(
+                                "session slot {session_key} commitment lineage is invalid: {error}"
+                            ))
+                        })?;
+                    let committed_at = parse_time(&committed_at)?;
+                    self.validate_consumed_paper_approval(
                         &connection,
-                        &commitment_artifact,
-                        &payload,
-                        &RunId(run_id.clone()),
                         &session_key,
+                        &plan,
+                        committed_at,
                     )
                     .map_err(|error| {
                         StoreError::Integrity(format!(
-                            "session slot {session_key} commitment lineage is invalid: {error}"
+                            "session slot {session_key} approval is invalid: {error}"
                         ))
                     })?;
-                    parse_time(&committed_at)?;
                 }
             }
         }
@@ -518,6 +531,7 @@ impl V2Store {
         self.verify_policy_evaluation_history(&connection)?;
         self.verify_candidate_policy_history(&connection)?;
         self.verify_lesson_history(&connection)?;
+        self.verify_canary_campaign_history(&connection)?;
         Ok(())
     }
 

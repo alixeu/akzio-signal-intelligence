@@ -117,6 +117,47 @@ impl ControlApiClient {
             .await
     }
 
+    pub(crate) async fn approve_paper(
+        &self,
+        request: &PaperApprovalRequest,
+    ) -> Result<PaperApprovalResponse> {
+        self.json(
+            self.request(Method::POST, self.endpoint(&["control", "paper-approval"]))
+                .json(request),
+        )
+        .await
+    }
+
+    pub(crate) async fn canary_stage(
+        &self,
+        spec: &CanaryCampaignSpec,
+    ) -> Result<CanaryCampaignHead> {
+        self.json(
+            self.request(Method::POST, self.endpoint(&["control", "canary", "stage"]))
+                .json(spec),
+        )
+        .await
+    }
+
+    pub(crate) async fn canary_status(&self) -> Result<Option<CanaryCampaignHead>> {
+        self.json(self.request(Method::GET, self.endpoint(&["control", "canary", "status"])))
+            .await
+    }
+
+    pub(crate) async fn canary_resume(
+        &self,
+        campaign_id: &ContentHash,
+    ) -> Result<CanaryCampaignHead> {
+        self.json(
+            self.request(
+                Method::POST,
+                self.endpoint(&["control", "canary", "resume"]),
+            )
+            .json(&serde_json::json!({ "campaign_id": campaign_id })),
+        )
+        .await
+    }
+
     pub(crate) async fn set_freeze(&self, frozen: bool, reason: &str) -> Result<DaemonHealth> {
         let action = if frozen { "freeze" } else { "unfreeze" };
         self.json(

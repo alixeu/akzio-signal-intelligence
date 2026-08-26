@@ -22,28 +22,9 @@ impl V2Store {
         runtime_manifest: &Artifact,
         approval: &Artifact,
     ) -> StoreResult<SessionSlotReservation> {
-        if runtime_manifest.kind != ArtifactKind::RuntimeManifest
-            || approval.kind != ArtifactKind::PaperLaunchApproval
-            || runtime_manifest.lifecycle != ArtifactLifecycle::Canonical
-            || approval.lifecycle != ArtifactLifecycle::Canonical
-            || approval.source_refs
-                != vec![ArtifactRef {
-                    artifact_id: runtime_manifest.artifact_id.clone(),
-                    kind: ArtifactKind::RuntimeManifest,
-                }]
-        {
-            return Err(StoreError::InvalidSessionSlot(
-                reservation.session_key.clone(),
-            ));
-        }
-        runtime_manifest.validate()?;
-        approval.validate()?;
-        let manifest_payload: RuntimeManifest =
-            serde_json::from_slice(&self.read_blob(&runtime_manifest.blob)?)?;
-        let approval_payload: PaperLaunchApproval =
-            serde_json::from_slice(&self.read_blob(&approval.blob)?)?;
-        manifest_payload.validate()?;
-        approval_payload.validate()?;
+        let (manifest_payload, approval_payload) = self
+            .validate_paper_approval_binding(runtime_manifest, approval)
+            .map_err(|_| StoreError::InvalidSessionSlot(reservation.session_key.clone()))?;
         let session = chrono::NaiveDate::parse_from_str(&reservation.session_key, "%Y-%m-%d")
             .map_err(|_| StoreError::InvalidSessionSlot(reservation.session_key.clone()))?;
         if approval_payload.runtime_manifest.artifact_id != runtime_manifest.artifact_id
@@ -132,15 +113,6 @@ impl V2Store {
         let changed = connection.execute(
             "UPDATE rebuild_daemon_leases SET expires_at = ?1, heartbeat_at = ?2 WHERE lease_name = ?3 AND owner_id = ?4 AND epoch = ?5 AND expires_at > ?2",
             params![expires_at.to_rfc3339(), now.to_rfc3339(), lease.lease_name, lease.owner_id, lease.epoch],
-        )?;
-        Ok(changed == 1)
-    }
-
-    pub fn release_daemon_lease(&self, lease: &DaemonLease) -> StoreResult<bool> {
-        let connection = self.connection()?;
-        let changed = connection.execute(
-            "DELETE FROM rebuild_daemon_leases WHERE lease_name = ?1 AND owner_id = ?2 AND epoch = ?3",
-            params![lease.lease_name, lease.owner_id, lease.epoch],
         )?;
         Ok(changed == 1)
     }

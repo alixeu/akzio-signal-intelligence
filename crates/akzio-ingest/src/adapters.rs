@@ -26,25 +26,6 @@ pub trait AsyncEvidenceAdapter: Send + Sync {
     ) -> BoxFuture<'a, Result<AcquiredEvidence, EvidenceAdapterError>>;
 }
 
-/// Rust-injected transport for governed evidence adapters. It accepts a
-/// source enum and resource instead of an arbitrary URL, so model code never
-/// gets a route to network access.
-pub trait GovernedEvidenceTransport: Send + Sync {
-    fn acquire(
-        &self,
-        source: EvidenceSource,
-        resource: &str,
-    ) -> Result<AcquiredEvidence, EvidenceAdapterError>;
-}
-
-pub trait AsyncGovernedEvidenceTransport: Send + Sync {
-    fn acquire<'a>(
-        &'a self,
-        source: EvidenceSource,
-        resource: &'a str,
-    ) -> BoxFuture<'a, Result<AcquiredEvidence, EvidenceAdapterError>>;
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AlpacaMarketDataFeed {
@@ -107,17 +88,10 @@ impl AlpacaPaperEvidenceTransport {
         market_data_feed: Option<AlpacaMarketDataFeed>,
     ) -> Result<Self, EvidenceAdapterError> {
         let supplied = base_url.into();
-        let parsed = Url::parse(supplied.trim())
-            .map_err(|_| EvidenceAdapterError::Transport("non-Paper Alpaca endpoint".to_owned()))?;
-        if parsed.scheme() != "https"
-            || parsed.host_str() != Some("paper-api.alpaca.markets")
-            || parsed.port().is_some()
-            || parsed.username() != ""
-            || parsed.password().is_some()
-            || parsed.path() != "/"
-            || parsed.query().is_some()
-            || parsed.fragment().is_some()
-        {
+        if !matches!(
+            supplied.trim(),
+            "https://paper-api.alpaca.markets" | "https://paper-api.alpaca.markets/"
+        ) {
             return Err(EvidenceAdapterError::Transport(
                 "non-Paper Alpaca endpoint".to_owned(),
             ));
@@ -355,16 +329,6 @@ impl AlpacaPaperEvidenceTransport {
     }
 }
 
-impl AsyncGovernedEvidenceTransport for AlpacaPaperEvidenceTransport {
-    fn acquire<'a>(
-        &'a self,
-        source: EvidenceSource,
-        resource: &'a str,
-    ) -> BoxFuture<'a, Result<AcquiredEvidence, EvidenceAdapterError>> {
-        Box::pin(self.acquire_inner(source, resource))
-    }
-}
-
 impl AsyncEvidenceAdapter for AlpacaPaperEvidenceTransport {
     fn source(&self) -> EvidenceSource {
         EvidenceSource::Alpaca
@@ -536,48 +500,6 @@ impl AsyncEvidenceAdapter for ModelNativeWebEvidenceTransport {
         })
     }
 }
-
-macro_rules! governed_adapter {
-    ($name:ident, $source:expr) => {
-        #[derive(Debug, Clone)]
-        pub struct $name<T> {
-            transport: T,
-        }
-
-        impl<T> $name<T> {
-            pub fn new(transport: T) -> Self {
-                Self { transport }
-            }
-        }
-
-        impl<T: GovernedEvidenceTransport> EvidenceAdapter for $name<T> {
-            fn source(&self) -> EvidenceSource {
-                $source
-            }
-
-            fn acquire(
-                &self,
-                request: &EvidenceRequest,
-            ) -> Result<AcquiredEvidence, EvidenceAdapterError> {
-                if request.source != $source {
-                    return Err(EvidenceAdapterError::SourceMismatch);
-                }
-                let mut acquired = self.transport.acquire($source, &request.resource)?;
-                acquired.normalized = serde_json::json!({
-                    "adapter": $source.as_str(),
-                    "resource": request.resource,
-                    "payload": acquired.normalized,
-                });
-                Ok(acquired)
-            }
-        }
-    };
-}
-
-governed_adapter!(AlpacaEvidenceAdapter, EvidenceSource::Alpaca);
-governed_adapter!(SecEdgarEvidenceAdapter, EvidenceSource::SecEdgar);
-governed_adapter!(FredEvidenceAdapter, EvidenceSource::Fred);
-governed_adapter!(NewsWebEvidenceAdapter, EvidenceSource::NewsWeb);
 
 /// Local-only adapter for deterministic test and replay input. It has no
 /// filesystem, network, or model capability.

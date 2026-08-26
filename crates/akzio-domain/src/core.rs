@@ -118,15 +118,6 @@ pub struct WeightPpm(pub u32);
 impl WeightPpm {
     pub const ZERO: Self = Self(0);
     pub const SCALE: u32 = 1_000_000;
-
-    pub fn from_ratio(value: f64) -> Option<Self> {
-        (value.is_finite() && (0.0..=1.0).contains(&value))
-            .then(|| Self((value * f64::from(Self::SCALE)).round() as u32))
-    }
-
-    pub const fn as_ratio(self) -> f64 {
-        self.0 as f64 / Self::SCALE as f64
-    }
 }
 
 /// Signed money in millionths of a USD.  Execution accepts integer money only
@@ -140,10 +131,6 @@ impl MoneyMicros {
 
     pub const fn from_usd_cents(cents: i64) -> Self {
         Self(cents.saturating_mul(10_000))
-    }
-
-    pub const fn as_usd(self) -> f64 {
-        self.0 as f64 / 1_000_000.0
     }
 }
 
@@ -170,10 +157,6 @@ impl ContentHash {
 
     pub fn as_str(&self) -> &str {
         &self.0
-    }
-
-    pub fn short_id(&self) -> &str {
-        &self.0[..16]
     }
 }
 
@@ -214,14 +197,6 @@ macro_rules! id_type {
             pub fn new() -> Self {
                 let value = Uuid::new_v4().simple().to_string();
                 Self(value[..16].to_owned())
-            }
-
-            pub fn short_id(&self) -> String {
-                self.0
-                    .chars()
-                    .filter(|character| *character != '-')
-                    .take(16)
-                    .collect()
             }
         }
 
@@ -274,13 +249,6 @@ impl TargetPortfolio {
             return Err(DomainError::InvalidTargetUniverse);
         }
         Ok(())
-    }
-
-    pub fn gross_weight_ppm(&self) -> u64 {
-        self.weights
-            .values()
-            .map(|weight| u64::from(weight.0))
-            .sum()
     }
 }
 

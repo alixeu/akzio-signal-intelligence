@@ -313,10 +313,10 @@ impl Daemon {
                 readiness_ppm: readiness_ppm(
                     ready,
                     health.frozen,
-                    self.auto_paper,
+                    self.paper.auto_paper,
                     health.scheduler_owner.is_some(),
                 ),
-                auto_paper: self.auto_paper,
+                auto_paper: self.paper.auto_paper,
                 health,
                 approval: self.observer_approval(generated_at)?,
             },
@@ -396,7 +396,7 @@ impl Daemon {
         &self,
         range: ObserverPortfolioRange,
     ) -> ObserverSection<ObserverPortfolioHistory> {
-        let Some(paper) = self.paper_observer.as_ref() else {
+        let Some(paper) = self.paper.paper_observer.as_ref() else {
             return ObserverSection::unavailable("Alpaca Paper observer is not configured");
         };
         let now = Utc::now();
@@ -852,12 +852,7 @@ impl Daemon {
             let Some(outcome) = outcome_by_id.get(&evaluation.outcome.artifact_id) else {
                 continue;
             };
-            let degraded = outcome.windows.iter().any(|window| {
-                window.evidence_completeness_ppm < policy.minimum_evidence_completeness_ppm
-                    || window
-                        .risk_recall_ppm
-                        .is_some_and(|value| value < policy.minimum_risk_recall_ppm)
-            });
+            let degraded = policy.outcome_is_degraded(outcome);
             if let Some((_, state, values)) = grouped
                 .iter_mut()
                 .find(|(subject, _, _)| *subject == experience.subject)
@@ -1078,6 +1073,7 @@ impl Daemon {
         let status = if approval.expires_at < now {
             "expired"
         } else if self
+            .paper
             .runtime_identity_hash
             .as_ref()
             .is_some_and(|expected| expected != &manifest_identity_hash)
@@ -1099,7 +1095,7 @@ impl Daemon {
         observed_at: DateTime<Utc>,
         current_run: Option<&ObserverRunDetail>,
     ) -> ObserverSection<ObserverPortfolio> {
-        let Some(paper) = self.paper_observer.as_ref() else {
+        let Some(paper) = self.paper.paper_observer.as_ref() else {
             return ObserverSection::unavailable("Alpaca Paper observer is not configured");
         };
         let current = tokio::time::timeout(OBSERVER_BROKER_TIMEOUT, async {

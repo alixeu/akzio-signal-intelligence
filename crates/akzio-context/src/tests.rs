@@ -4,7 +4,7 @@ use akzio_domain::{
     ArtifactKind, CandidatePolicyState, ContractId, ContractPurpose, FailureDisposition,
     MemoryLifecycle, OutputContract, PromptBundle, RetryPolicy, RunPurpose, TaskBudget,
     TerminationPolicy, ToolGrant, ToolKind, ToolSpec, WorkflowGraph, WorkflowNode,
-    V2_SCHEMA_VERSION,
+    V2_DOMAIN_SCHEMA_VERSION,
 };
 use akzio_store::v2::{StoredRun, WorkflowCommit};
 use tempfile::tempdir;
@@ -281,7 +281,7 @@ fn permit_for_contract(
         parent_task_id: None,
     };
     let graph = WorkflowGraph {
-        schema_version: V2_SCHEMA_VERSION,
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
         topology_id: "test".to_owned(),
         nodes: vec![node.clone()],
     };

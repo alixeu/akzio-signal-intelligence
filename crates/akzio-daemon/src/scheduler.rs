@@ -13,13 +13,16 @@ use std::{
 
 use akzio_domain::{
     Artifact, ArtifactKind, ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef,
-    Asset, DomainError, EvidenceNeed, RunId, RunPurpose, RuntimeManifest, WorkflowProposal,
+    Asset, DomainError, EvidenceNeed, PolicySubject, RunId, RunPurpose, RuntimeManifest,
+    TopologyId, WorkflowProposal, STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID,
     V2_DOMAIN_SCHEMA_VERSION,
 };
 use akzio_execution::paper::AlpacaPaper;
 use akzio_ingest::AlpacaMarketDataFeed;
 use akzio_runtime::{RuntimeError, WorkflowRuntime};
-use akzio_store::v2::{DaemonLease, SessionSlotReservation, StoreError, V2Store};
+use akzio_store::v2::{
+    DaemonLease, SessionSlotReservation, StoreError, StoredCanarySession, V2Store,
+};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use thiserror::Error;
 use tokio::sync::watch;
@@ -184,6 +187,20 @@ impl StorePaperWorkflowSource {
 
 impl PaperWorkflowSource for StorePaperWorkflowSource {
     fn proposal(&self, _session_key: &str) -> SchedulerResult<WorkflowProposal> {
+        let candidate_subject = PolicySubject::Topology(TopologyId(
+            STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID.to_owned(),
+        ));
+        let preferred_topology = self
+            .store
+            .policy_head(&candidate_subject)?
+            .filter(|head| {
+                head.state
+                    == akzio_domain::PolicyState::Topology(
+                        akzio_domain::CandidatePolicyState::Active,
+                    )
+            })
+            .map(|_| STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID)
+            .unwrap_or("active");
         let mut latest_paper = None;
         for artifact in self
             .store
@@ -197,12 +214,16 @@ impl PaperWorkflowSource for StorePaperWorkflowSource {
                 continue;
             };
             if self.store.run_purpose(run_id)? == RunPurpose::Paper {
-                latest_paper = Some(artifact);
-                break;
+                let proposal: WorkflowProposal =
+                    serde_json::from_slice(&self.store.read_blob(&artifact.blob)?)?;
+                if proposal.topology_id == preferred_topology {
+                    latest_paper = Some(proposal);
+                    break;
+                }
             }
         }
 
-        let Some(artifact) = latest_paper else {
+        let Some(proposal) = latest_paper else {
             return self
                 .bootstrap
                 .as_ref()
@@ -212,9 +233,7 @@ impl PaperWorkflowSource for StorePaperWorkflowSource {
                 .transpose()?
                 .ok_or(SchedulerError::WorkflowUnavailable);
         };
-        Ok(serde_json::from_slice(
-            &self.store.read_blob(&artifact.blob)?,
-        )?)
+        Ok(proposal)
     }
 }
 
@@ -298,6 +317,17 @@ impl PaperScheduler {
 
     pub fn active_lease(&self, now: DateTime<Utc>) -> SchedulerResult<DaemonLease> {
         self.acquire_or_renew(now)
+    }
+
+    pub fn reserve_canary_session(
+        &self,
+        reservation: &akzio_domain::CanarySessionReservation,
+    ) -> SchedulerResult<StoredCanarySession> {
+        let lease = self.acquire_or_renew(reservation.reserved_at)?;
+        if lease.epoch != reservation.scheduler_epoch {
+            return Err(SchedulerError::NotLeader);
+        }
+        Ok(self.store.reserve_canary_session(&lease, reservation)?)
     }
 
     pub fn reserve_session(

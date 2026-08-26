@@ -2,7 +2,7 @@ use std::{
     collections::BTreeSet,
     fs,
     io::{self, Read},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use akzio_domain::{
@@ -13,20 +13,11 @@ use akzio_domain::{
 use akzio_store::{v2::StoredLesson, V2Store};
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
-use clap::{Parser, Subcommand};
+use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Parser)]
-#[command(name = "akzio-lesson", about = "Governed Akzio Lesson editor")]
-struct Cli {
-    #[arg(long, default_value = "outputs/akzio-v2-rebuild")]
-    store_root: PathBuf,
-    #[command(subcommand)]
-    command: Command,
-}
-
 #[derive(Debug, Subcommand)]
-enum Command {
+pub(crate) enum LessonCommand {
     Add {
         #[arg(long, default_value = "-")]
         file: PathBuf,
@@ -104,41 +95,40 @@ fn default_confidence() -> u32 {
     500_000
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-    match cli.command {
-        Command::Add { file } => add(&cli.store_root, &file),
-        Command::List { lifecycle, limit } => list(&cli.store_root, lifecycle.as_deref(), limit),
-        Command::Show { lesson_id } => show(&cli.store_root, &lesson_id),
-        Command::Usage { lesson_id } => usage(&cli.store_root, &lesson_id),
-        Command::Approve {
+pub(crate) fn run(store_root: &Path, command: LessonCommand) -> Result<()> {
+    match command {
+        LessonCommand::Add { file } => add(store_root, &file),
+        LessonCommand::List { lifecycle, limit } => list(store_root, lifecycle.as_deref(), limit),
+        LessonCommand::Show { lesson_id } => show(store_root, &lesson_id),
+        LessonCommand::Usage { lesson_id } => usage(store_root, &lesson_id),
+        LessonCommand::Approve {
             lesson_id,
             actor,
             reason,
         } => transition(
-            &cli.store_root,
+            store_root,
             &lesson_id,
             LessonLifecycle::Active,
             &actor,
             &reason,
         ),
-        Command::Contest {
+        LessonCommand::Contest {
             lesson_id,
             actor,
             reason,
         } => transition(
-            &cli.store_root,
+            store_root,
             &lesson_id,
             LessonLifecycle::Contested,
             &actor,
             &reason,
         ),
-        Command::Retire {
+        LessonCommand::Retire {
             lesson_id,
             actor,
             reason,
         } => transition(
-            &cli.store_root,
+            store_root,
             &lesson_id,
             LessonLifecycle::Retired,
             &actor,
@@ -147,7 +137,7 @@ fn main() -> Result<()> {
     }
 }
 
-fn add(store_root: &PathBuf, file: &PathBuf) -> Result<()> {
+fn add(store_root: &Path, file: &Path) -> Result<()> {
     let input: LessonInput = serde_json::from_str(&read_input(file)?)
         .with_context(|| format!("parse Lesson input {}", file.display()))?;
     if input.authored_by.trim().is_empty() {
@@ -196,7 +186,7 @@ fn add(store_root: &PathBuf, file: &PathBuf) -> Result<()> {
             regimes: input.regimes.into_iter().collect(),
             decision_stages: input.decision_stages.into_iter().collect(),
         },
-        source_refs: vec![akzio_domain::ArtifactRef {
+        source_refs: vec![ArtifactRef {
             artifact_id: source.artifact_id.clone(),
             kind: source.kind,
         }],
@@ -209,31 +199,31 @@ fn add(store_root: &PathBuf, file: &PathBuf) -> Result<()> {
         updated_at: now,
     };
     let result = store.write_lesson(&lesson, &source, now)?;
-    print_json(&view(&result.lesson))
+    crate::print_json(&view(&result.lesson))
 }
 
-fn list(store_root: &PathBuf, lifecycle: Option<&str>, limit: usize) -> Result<()> {
+fn list(store_root: &Path, lifecycle: Option<&str>, limit: usize) -> Result<()> {
     let lifecycle = lifecycle.map(parse_lifecycle).transpose()?;
     let store = V2Store::open_existing(store_root)?;
     let lessons = store.lessons(lifecycle, limit)?;
-    print_json(&lessons.iter().map(view).collect::<Vec<_>>())
+    crate::print_json(&lessons.iter().map(view).collect::<Vec<_>>())
 }
 
-fn show(store_root: &PathBuf, lesson_id: &str) -> Result<()> {
+fn show(store_root: &Path, lesson_id: &str) -> Result<()> {
     let store = V2Store::open_existing(store_root)?;
     let lesson = store
         .lesson(&LessonId(lesson_id.to_owned()))?
         .with_context(|| format!("lesson {lesson_id} not found"))?;
-    print_json(&view(&lesson))
+    crate::print_json(&view(&lesson))
 }
 
-fn usage(store_root: &PathBuf, lesson_id: &str) -> Result<()> {
+fn usage(store_root: &Path, lesson_id: &str) -> Result<()> {
     let store = V2Store::open_existing(store_root)?;
-    print_json(&store.lesson_usage(&LessonId(lesson_id.to_owned()))?)
+    crate::print_json(&store.lesson_usage(&LessonId(lesson_id.to_owned()))?)
 }
 
 fn transition(
-    store_root: &PathBuf,
+    store_root: &Path,
     lesson_id: &str,
     lifecycle: LessonLifecycle,
     actor: &str,
@@ -247,7 +237,7 @@ fn transition(
         reason,
         Utc::now(),
     )?;
-    print_json(&view(&lesson))
+    crate::print_json(&view(&lesson))
 }
 
 fn parse_horizon(value: &str) -> Result<DecisionHorizon> {
@@ -276,7 +266,7 @@ fn parse_lifecycle(value: &str) -> Result<LessonLifecycle> {
         .with_context(|| format!("unsupported Lesson lifecycle {value}"))
 }
 
-fn read_input(path: &PathBuf) -> Result<String> {
+fn read_input(path: &Path) -> Result<String> {
     if path.as_os_str() == "-" {
         let mut input = String::new();
         io::stdin().read_to_string(&mut input)?;
@@ -284,11 +274,6 @@ fn read_input(path: &PathBuf) -> Result<String> {
     } else {
         Ok(fs::read_to_string(path)?)
     }
-}
-
-fn print_json<T: Serialize>(value: &T) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(value)?);
-    Ok(())
 }
 
 fn view(value: &StoredLesson) -> LessonView<'_> {

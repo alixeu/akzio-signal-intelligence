@@ -11,6 +11,11 @@ struct ObserverPortfolioHistoryQuery {
     range: ObserverPortfolioRange,
 }
 
+#[derive(Debug, Deserialize)]
+struct CanaryResumeRequest {
+    campaign_id: ContentHash,
+}
+
 impl Daemon {
     pub fn router(&self) -> Router {
         Router::new()
@@ -32,6 +37,10 @@ impl Daemon {
             .route("/runs/{run_id}/retry", post(http_retry))
             .route("/control/freeze", post(http_freeze))
             .route("/control/unfreeze", post(http_unfreeze))
+            .route("/control/paper-approval", post(http_paper_approval))
+            .route("/control/canary/stage", post(http_canary_stage))
+            .route("/control/canary/status", get(http_canary_status))
+            .route("/control/canary/resume", post(http_canary_resume))
             .with_state(Arc::new(self.clone()))
     }
 
@@ -46,6 +55,20 @@ impl Daemon {
             ));
         }
         let listener = TcpListener::bind(address).await?;
+        self.serve_http_listener(listener, shutdown).await
+    }
+
+    pub async fn serve_http_listener(
+        &self,
+        listener: TcpListener,
+        shutdown: watch::Receiver<bool>,
+    ) -> Result<()> {
+        let address = listener.local_addr()?;
+        if !address.ip().is_loopback() {
+            return Err(DaemonError::InvalidInput(
+                "daemon HTTP control API must bind a loopback address".to_owned(),
+            ));
+        }
         axum::serve(listener, self.router())
             .with_graceful_shutdown(wait_for_shutdown(shutdown))
             .await
@@ -365,11 +388,59 @@ async fn http_unfreeze(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+async fn http_paper_approval(
+    State(daemon): State<Arc<Daemon>>,
+    headers: HeaderMap,
+    Json(request): Json<PaperApprovalRequest>,
+) -> std::result::Result<Json<PaperApprovalResponse>, StatusCode> {
+    authorize(&daemon, &headers)?;
+    daemon
+        .approve_paper(request)
+        .await
+        .map(Json)
+        .map_err(invalid_input_or_internal)
+}
+
+async fn http_canary_stage(
+    State(daemon): State<Arc<Daemon>>,
+    headers: HeaderMap,
+    Json(spec): Json<akzio_domain::CanaryCampaignSpec>,
+) -> std::result::Result<Json<akzio_store::v2::CanaryCampaignHead>, StatusCode> {
+    authorize(&daemon, &headers)?;
+    daemon
+        .stage_canary_campaign(spec)
+        .map(Json)
+        .map_err(invalid_input_or_internal)
+}
+
+async fn http_canary_status(
+    State(daemon): State<Arc<Daemon>>,
+    headers: HeaderMap,
+) -> std::result::Result<Json<Option<akzio_store::v2::CanaryCampaignHead>>, StatusCode> {
+    authorize(&daemon, &headers)?;
+    daemon
+        .canary_status()
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn http_canary_resume(
+    State(daemon): State<Arc<Daemon>>,
+    headers: HeaderMap,
+    Json(request): Json<CanaryResumeRequest>,
+) -> std::result::Result<Json<akzio_store::v2::CanaryCampaignHead>, StatusCode> {
+    authorize(&daemon, &headers)?;
+    daemon
+        .resume_canary_campaign(&request.campaign_id)
+        .map(Json)
+        .map_err(invalid_input_or_internal)
+}
+
 fn authorize(daemon: &Daemon, headers: &HeaderMap) -> std::result::Result<(), StatusCode> {
     headers
         .get("x-akzio-token")
         .and_then(|value| value.to_str().ok())
-        .filter(|value| *value == daemon.http_token)
+        .filter(|value| *value == daemon.transport.http_token)
         .map(|_| ())
         .ok_or(StatusCode::UNAUTHORIZED)
 }
@@ -378,7 +449,7 @@ fn authorize_observer(daemon: &Daemon, headers: &HeaderMap) -> std::result::Resu
     headers
         .get("x-akzio-observer-token")
         .and_then(|value| value.to_str().ok())
-        .zip(daemon.observer_token.as_deref())
+        .zip(daemon.transport.observer_token.as_deref())
         .filter(|(provided, expected)| provided == expected)
         .map(|_| ())
         .ok_or(StatusCode::UNAUTHORIZED)

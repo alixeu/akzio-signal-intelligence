@@ -1,10 +1,11 @@
 use akzio_domain::{
     ArtifactLifecycle, ArtifactProvenance, Asset, ContextPolicy, ExecutionPlan, FactorExposure,
     FailureDisposition, HardBlocker, MoneyMicros, NoOrder, OrderIntent, OrderSide, OutputContract,
-    PaperCommitment, PaperCommitmentId, PromptBundle, RetryPolicy, TargetPortfolio, TaskBudget,
-    TaskRecipeId, TerminationPolicy, ToolGrant, ToolKind, ToolSpec, WeightPpm,
-    WorkflowProposalTask,
+    PaperApprovalScope, PaperCommitment, PaperCommitmentId, PromptBundle, RetryPolicy,
+    RuntimeManifest, TargetPortfolio, TaskBudget, TaskRecipeId, TerminationPolicy, ToolGrant,
+    ToolKind, ToolSpec, WeightPpm, WorkflowProposalTask,
 };
+use chrono::NaiveDate;
 use tempfile::tempdir;
 
 use super::*;
@@ -442,7 +443,7 @@ fn contract_policy_transitions_activate_and_rollback_catalogue_history() {
         fixture.now,
     );
     let candidate_policy = CandidatePolicy {
-        schema_version: V2_SCHEMA_VERSION,
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
         subject: subject.clone(),
         baseline: artifact_ref(&active_installation.artifact),
         candidate: artifact_ref(&candidate_installation.artifact),
@@ -514,7 +515,7 @@ fn contract_policy_transitions_activate_and_rollback_catalogue_history() {
             completed_at,
         );
         let candidate_policy = CandidatePolicy {
-            schema_version: V2_SCHEMA_VERSION,
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
             subject: subject.clone(),
             baseline: artifact_ref(&active_installation.artifact),
             candidate: artifact_ref(&candidate_installation.artifact),
@@ -536,7 +537,7 @@ fn contract_policy_transitions_activate_and_rollback_catalogue_history() {
             completed_at,
         );
         let transition = PolicyTransition {
-            schema_version: V2_SCHEMA_VERSION,
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
             transition_id: PolicyTransitionId::new(),
             subject: subject.clone(),
             from: PolicyState::Contract(from),
@@ -581,7 +582,7 @@ fn contract_policy_transitions_activate_and_rollback_catalogue_history() {
     )
     .unwrap();
     let promote_transition = PolicyTransition {
-        schema_version: V2_SCHEMA_VERSION,
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
         transition_id: PolicyTransitionId::new(),
         subject: subject.clone(),
         from: PolicyState::Contract(akzio_domain::CandidatePolicyState::Canary50),
@@ -710,7 +711,7 @@ fn contract_policy_transitions_activate_and_rollback_catalogue_history() {
         rollback_at,
     );
     let rollback_candidate_policy = CandidatePolicy {
-        schema_version: V2_SCHEMA_VERSION,
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
         subject: subject.clone(),
         baseline: artifact_ref(&active_installation.artifact),
         candidate: artifact_ref(&candidate_installation.artifact),
@@ -732,7 +733,7 @@ fn contract_policy_transitions_activate_and_rollback_catalogue_history() {
         rollback_at,
     );
     let rollback_transition = PolicyTransition {
-        schema_version: V2_SCHEMA_VERSION,
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
         transition_id: PolicyTransitionId::new(),
         subject: subject.clone(),
         from: PolicyState::Contract(akzio_domain::CandidatePolicyState::Active),
@@ -814,7 +815,7 @@ fn artifact_with_refs(
 
 fn graph() -> WorkflowGraph {
     WorkflowGraph {
-        schema_version: V2_SCHEMA_VERSION,
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
         topology_id: "active".to_owned(),
         nodes: vec![WorkflowNode {
             task_id: TaskId::new(),
@@ -1135,6 +1136,121 @@ fn artifact_ref(artifact: &Artifact) -> ArtifactRef {
     }
 }
 
+fn reserve_approved_test_session(
+    store: &V2Store,
+    lease: &DaemonLease,
+    reservation: &SessionReservation,
+) -> SessionSlotReservation {
+    reserve_approved_test_session_with_limits(
+        store,
+        lease,
+        reservation,
+        MoneyMicros::from_usd_cents(100_000),
+        reservation.reserved_at + Duration::hours(8),
+    )
+}
+
+fn reserve_approved_test_session_with_limits(
+    store: &V2Store,
+    lease: &DaemonLease,
+    reservation: &SessionReservation,
+    maximum_notional: MoneyMicros,
+    expires_at: DateTime<Utc>,
+) -> SessionSlotReservation {
+    let now = reservation.reserved_at;
+    let run = &reservation.workflow.run;
+    let provenance = ArtifactProvenance {
+        source_family: "fixture.paper_approval".to_owned(),
+        observed_at: None,
+        retrieved_at: now,
+        source_uri: None,
+        confidence_ppm: 1_000_000,
+        producer_contract_hash: None,
+    };
+    let proposal_payload = WorkflowProposal {
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
+        topology_id: run.topology_id.clone(),
+        tasks: BTreeMap::new(),
+        stop_reason: Some("fixture approved Paper session".to_owned()),
+    };
+    let proposal = Artifact::new(
+        ArtifactKind::WorkflowProposal,
+        store.put_json(&proposal_payload).unwrap(),
+        "runtime.paper_provisioning",
+        ArtifactLifecycle::RunScoped,
+        provenance.clone(),
+        Some(ArtifactOrigin {
+            run_id: Some(run.run_id.clone()),
+            task_id: None,
+            attempt_id: None,
+            contract_hash: None,
+        }),
+        vec![],
+        now,
+    )
+    .unwrap();
+    let session = NaiveDate::parse_from_str(&reservation.session_key, "%Y-%m-%d").unwrap();
+    let manifest_payload = RuntimeManifest {
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
+        code_revision: "fixture-revision".to_owned(),
+        cargo_lock_hash: ContentHash::of_bytes(b"fixture-cargo"),
+        config_hash: ContentHash::of_bytes(b"fixture-config"),
+        provider_id: "fixture-provider".to_owned(),
+        model_id: "fixture-model".to_owned(),
+        prompt_hash: ContentHash::of_bytes(b"fixture-prompt"),
+        contract_hash: ContentHash::of_bytes(b"fixture-contract"),
+        topology_hash: ContentHash::of_bytes(b"fixture-topology"),
+        decision_policy_hash: ContentHash::of_bytes(b"fixture-decision"),
+        execution_policy_hash: ContentHash::of_bytes(b"fixture-execution"),
+        evaluation_policy_hash: ContentHash::of_bytes(b"fixture-evaluation"),
+        market_data_feed: "iex".to_owned(),
+        broker_account_id: "fixture-account".to_owned(),
+        maximum_notional,
+        allowed_session_start: session,
+        allowed_session_end: session,
+        expires_at,
+        created_at: now,
+    };
+    let manifest_hash = manifest_payload.manifest_hash().unwrap();
+    let manifest = Artifact::new(
+        ArtifactKind::RuntimeManifest,
+        store.put_json(&manifest_payload).unwrap(),
+        "runtime.manifest",
+        ArtifactLifecycle::Canonical,
+        provenance.clone(),
+        None,
+        vec![],
+        now,
+    )
+    .unwrap();
+    let mut approval_payload = PaperLaunchApproval {
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
+        operator_identity: "fixture-operator".to_owned(),
+        runtime_manifest: artifact_ref(&manifest),
+        runtime_manifest_hash: manifest_hash,
+        scope: PaperApprovalScope::Canary,
+        reason: "fixture approval".to_owned(),
+        approved_at: now,
+        expires_at: manifest_payload.expires_at,
+        approval_hash: ContentHash::of_bytes(b"pending"),
+    };
+    approval_payload.approval_hash = approval_payload.unsigned_hash().unwrap();
+    let approval = Artifact::new(
+        ArtifactKind::PaperLaunchApproval,
+        store.put_json(&approval_payload).unwrap(),
+        "operator.paper_approval",
+        ArtifactLifecycle::Canonical,
+        provenance,
+        None,
+        vec![approval_payload.runtime_manifest.clone()],
+        now,
+    )
+    .unwrap();
+    store
+        .reserve_paper_session_with_approval(lease, reservation, &proposal, &manifest, &approval)
+        .unwrap()
+}
+
 fn valid_execution_commitment(
     store: &V2Store,
     permit: &TaskWritePermit,
@@ -1169,12 +1285,13 @@ fn valid_execution_commitment(
     let mut target = TargetPortfolio::zeroed();
     target.weights.insert(Asset::Qqq, WeightPpm(100_000));
     let mut plan_payload = ExecutionPlan {
-        schema_version: V2_SCHEMA_VERSION,
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
         decision_context: decision_context.clone(),
         account_snapshot: account_snapshot.clone(),
         quote_snapshot: quote_snapshot.clone(),
         market_clock_snapshot: market_clock_snapshot.clone(),
         policy_hash: ContentHash::of_bytes(b"fixture-policy"),
+        maximum_total_notional: MoneyMicros::from_usd_cents(100_000),
         target: target.clone(),
         orders: vec![OrderIntent {
             asset: Asset::Qqq,
@@ -1215,7 +1332,7 @@ fn valid_execution_commitment(
         permit,
         ArtifactKind::ExecutionContext,
         &ExecutionContext {
-            schema_version: V2_SCHEMA_VERSION,
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
             run_id: permit.run_id.clone(),
             decision_context: decision_context.clone(),
             account_snapshot: Some(account_snapshot.clone()),
@@ -1298,6 +1415,19 @@ struct ExecutionCommitFixture {
 }
 
 fn execution_commit_fixture() -> ExecutionCommitFixture {
+    execution_commit_fixture_with_approval(None)
+}
+
+fn approved_execution_commit_fixture(
+    maximum_notional: MoneyMicros,
+    valid_for: Duration,
+) -> ExecutionCommitFixture {
+    execution_commit_fixture_with_approval(Some((maximum_notional, valid_for)))
+}
+
+fn execution_commit_fixture_with_approval(
+    approval: Option<(MoneyMicros, Duration)>,
+) -> ExecutionCommitFixture {
     let root = tempdir().unwrap();
     let store = V2Store::open(root.path()).unwrap();
     let now = Utc::now();
@@ -1317,33 +1447,44 @@ fn execution_commit_fixture() -> ExecutionCommitFixture {
         &serde_json::to_string(&graph).unwrap(),
         None,
     );
-    let _reservation = store
-        .reserve_session_slot(
-            &lease,
-            &SessionReservation {
-                session_key: "paper:fixture".to_owned(),
-                workflow: WorkflowCommit {
-                    run: StoredRun {
-                        run_id: RunId::new(),
-                        purpose: RunPurpose::Paper,
-                        topology_id: graph.topology_id.clone(),
-                        graph_artifact_id: graph_artifact.artifact_id.clone(),
-                        created_at: now,
-                    },
-                    graph: graph_artifact,
-                    nodes: graph.nodes,
-                },
-                setup_artifacts: vec![],
-                reserved_at: now,
+    let session_key = if approval.is_some() {
+        "2026-08-25"
+    } else {
+        "paper:fixture"
+    };
+    let reservation = SessionReservation {
+        session_key: session_key.to_owned(),
+        workflow: WorkflowCommit {
+            run: StoredRun {
+                run_id: RunId::new(),
+                purpose: RunPurpose::Paper,
+                topology_id: graph.topology_id.clone(),
+                graph_artifact_id: graph_artifact.artifact_id.clone(),
+                created_at: now,
             },
-        )
-        .unwrap();
+            graph: graph_artifact,
+            nodes: graph.nodes,
+        },
+        setup_artifacts: vec![],
+        reserved_at: now,
+    };
+    if let Some((maximum_notional, valid_for)) = approval {
+        reserve_approved_test_session_with_limits(
+            &store,
+            &lease,
+            &reservation,
+            maximum_notional,
+            now + valid_for,
+        );
+    } else {
+        store.reserve_session_slot(&lease, &reservation).unwrap();
+    }
     let permit = store
         .claim_next_task("fixture-worker", now, Duration::seconds(30))
         .unwrap()
         .unwrap()
         .permit;
-    let commitment = valid_execution_commitment(&store, &permit, "paper:fixture", now);
+    let commitment = valid_execution_commitment(&store, &permit, session_key, now);
     ExecutionCommitFixture {
         _root: root,
         store,
@@ -1474,7 +1615,7 @@ impl PolicyCommitFixture {
         );
         let outcome_id = akzio_domain::OutcomeId::new();
         let schedule_payload = OutcomeSchedule {
-            schema_version: V2_SCHEMA_VERSION,
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
             outcome_id: outcome_id.clone(),
             decision: artifact_ref(&decision),
             decision_context: artifact_ref(&decision_context),
@@ -1564,7 +1705,7 @@ impl PolicyCommitFixture {
             PolicySubject::Contract(_) => unreachable!(),
         };
         let outcome_payload = Outcome {
-            schema_version: V2_SCHEMA_VERSION,
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
             outcome_id,
             schedule: artifact_ref(&schedule),
             market_evidence: vec![artifact_ref(&normalized)],
@@ -1598,7 +1739,7 @@ impl PolicyCommitFixture {
         let final_retrospective = retrospective_artifact(&store, &permit, &outcome, now);
         let retrospective_ref = artifact_ref(&final_retrospective);
         let experience_payload = Experience {
-            schema_version: V2_SCHEMA_VERSION,
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
             experience_id: akzio_domain::ExperienceId::new(),
             subject: subject.clone(),
             hypothesis_id: "fixture".to_owned(),
@@ -1632,7 +1773,7 @@ impl PolicyCommitFixture {
             now,
         );
         let evaluation_payload = Evaluation {
-            schema_version: V2_SCHEMA_VERSION,
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
             evaluation_id: akzio_domain::EvaluationId::new(),
             outcome: artifact_ref(&outcome),
             experience: artifact_ref(&experience),
@@ -1656,7 +1797,7 @@ impl PolicyCommitFixture {
         );
         let candidate_policy = candidate_graph.map(|(candidate, _)| {
             let payload = CandidatePolicy {
-                schema_version: V2_SCHEMA_VERSION,
+                schema_version: V2_DOMAIN_SCHEMA_VERSION,
                 subject: subject.clone(),
                 baseline: paper_graph_ref,
                 candidate,
@@ -1678,7 +1819,7 @@ impl PolicyCommitFixture {
             )
         });
         let transition = PolicyTransition {
-            schema_version: V2_SCHEMA_VERSION,
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
             transition_id: PolicyTransitionId::new(),
             subject: subject.clone(),
             from,
@@ -2302,7 +2443,7 @@ fn workflow_patch_rolls_back_proposal_graph_tasks_events_and_planner_completion(
         parent_task_id: None,
     };
     let graph = WorkflowGraph {
-        schema_version: V2_SCHEMA_VERSION,
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
         topology_id: "active".to_owned(),
         nodes: vec![planner.clone(), evidence.clone(), decision.clone()],
     };
@@ -2371,7 +2512,7 @@ fn workflow_patch_rolls_back_proposal_graph_tasks_events_and_planner_completion(
     );
 
     let proposal = WorkflowProposal {
-        schema_version: V2_SCHEMA_VERSION,
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
         topology_id: "active".to_owned(),
         tasks: std::collections::BTreeMap::from([(
             "analyst".to_owned(),
@@ -2432,7 +2573,7 @@ fn workflow_patch_rolls_back_proposal_graph_tasks_events_and_planner_completion(
     let mut updated_decision = decision;
     updated_decision.dependencies = vec![added.task_id.clone()];
     let next_graph = WorkflowGraph {
-        schema_version: V2_SCHEMA_VERSION,
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
         topology_id: "active".to_owned(),
         nodes: vec![
             planner,
@@ -2710,6 +2851,64 @@ fn bootstrapped_contract_must_not_carry_task_origin() {
         .unwrap();
     store.write_bootstrap_artifact(&artifact).unwrap();
     store.verify_integrity().unwrap();
+}
+
+#[test]
+fn execution_commitment_requires_a_consumed_paper_approval() {
+    let fixture = execution_commit_fixture();
+
+    assert!(matches!(
+        fixture.store.commit_execution(
+            &fixture.lease,
+            &ExecutionCommit {
+                session_key: "paper:fixture".to_owned(),
+                permit: fixture.permit,
+                commitment: fixture.commitment,
+                committed_at: fixture.now,
+            },
+        ),
+        Err(StoreError::InvalidSessionSlot(_))
+    ));
+}
+
+#[test]
+fn execution_commitment_rejects_approval_notional_overrun() {
+    let fixture =
+        approved_execution_commit_fixture(MoneyMicros::from_usd_cents(1), Duration::hours(8));
+
+    assert!(matches!(
+        fixture.store.commit_execution(
+            &fixture.lease,
+            &ExecutionCommit {
+                session_key: "2026-08-25".to_owned(),
+                permit: fixture.permit,
+                commitment: fixture.commitment,
+                committed_at: fixture.now,
+            },
+        ),
+        Err(StoreError::InvalidSessionSlot(_))
+    ));
+}
+
+#[test]
+fn execution_commitment_rejects_expired_approval() {
+    let fixture = approved_execution_commit_fixture(
+        MoneyMicros::from_usd_cents(100_000),
+        Duration::seconds(1),
+    );
+
+    assert!(matches!(
+        fixture.store.commit_execution(
+            &fixture.lease,
+            &ExecutionCommit {
+                session_key: "2026-08-25".to_owned(),
+                permit: fixture.permit,
+                commitment: fixture.commitment,
+                committed_at: fixture.now + Duration::seconds(2),
+            },
+        ),
+        Err(StoreError::InvalidSessionSlot(_))
+    ));
 }
 
 #[test]
@@ -3342,7 +3541,7 @@ fn approved_paper_reservation_rejects_mismatched_proposal_and_keeps_store_atomic
         nodes: graph.nodes,
     };
     let proposal_payload = WorkflowProposal {
-        schema_version: V2_SCHEMA_VERSION,
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
         topology_id: run.topology_id.clone(),
         tasks: BTreeMap::from([(
             "analyst".to_owned(),
@@ -3434,7 +3633,7 @@ fn approved_paper_reservation_rejects_source_closure_mismatch_atomically() {
         }),
     );
     let proposal_payload = WorkflowProposal {
-        schema_version: V2_SCHEMA_VERSION,
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
         topology_id: run.topology_id.clone(),
         tasks: BTreeMap::from([(
             "analyst".to_owned(),
@@ -3512,7 +3711,7 @@ fn approved_paper_reservation_is_idempotent_for_duplicate_session() {
         nodes: graph.nodes,
     };
     let proposal_payload = WorkflowProposal {
-        schema_version: V2_SCHEMA_VERSION,
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
         topology_id: run.topology_id.clone(),
         tasks: BTreeMap::from([(
             "analyst".to_owned(),
@@ -3579,6 +3778,7 @@ fn session_slot_is_fenced_and_reuses_the_frozen_workflow() {
     let root = tempdir().unwrap();
     let store = V2Store::open(root.path()).unwrap();
     let now = Utc::now();
+    let session_key = "2026-08-25";
     let first_lease = store
         .acquire_daemon_lease("scheduler", "daemon-a", now, now + Duration::seconds(30))
         .unwrap()
@@ -3602,17 +3802,16 @@ fn session_slot_is_fenced_and_reuses_the_frozen_workflow() {
         graph: first_graph_artifact,
         nodes: first_graph.nodes,
     };
-    let first = store
-        .reserve_session_slot(
-            &first_lease,
-            &SessionReservation {
-                session_key: "paper:fixture-a".to_owned(),
-                workflow: first_workflow.clone(),
-                setup_artifacts: vec![],
-                reserved_at: now,
-            },
-        )
-        .unwrap();
+    let first = reserve_approved_test_session(
+        &store,
+        &first_lease,
+        &SessionReservation {
+            session_key: session_key.to_owned(),
+            workflow: first_workflow.clone(),
+            setup_artifacts: vec![],
+            reserved_at: now,
+        },
+    );
     assert!(first.newly_reserved);
 
     let mut replacement_graph = graph();
@@ -3638,7 +3837,7 @@ fn session_slot_is_fenced_and_reuses_the_frozen_workflow() {
         .reserve_session_slot(
             &first_lease,
             &SessionReservation {
-                session_key: "paper:fixture-a".to_owned(),
+                session_key: session_key.to_owned(),
                 workflow: replacement_workflow.clone(),
                 setup_artifacts: vec![],
                 reserved_at: now,
@@ -3659,7 +3858,7 @@ fn session_slot_is_fenced_and_reuses_the_frozen_workflow() {
         .claim_next_task("execution-worker", now, Duration::seconds(30))
         .unwrap()
         .unwrap();
-    let commitment = valid_execution_commitment(&store, &claimed.permit, "paper:fixture-a", now);
+    let commitment = valid_execution_commitment(&store, &claimed.permit, session_key, now);
     {
         let connection = store.connection.lock().unwrap();
         connection
@@ -3674,7 +3873,7 @@ fn session_slot_is_fenced_and_reuses_the_frozen_workflow() {
         store.commit_execution(
             &first_lease,
             &ExecutionCommit {
-                session_key: "paper:fixture-a".to_owned(),
+                session_key: session_key.to_owned(),
                 permit: claimed.permit.clone(),
                 commitment: commitment.clone(),
                 committed_at: now,
@@ -3684,7 +3883,7 @@ fn session_slot_is_fenced_and_reuses_the_frozen_workflow() {
     ));
     assert_eq!(
         store
-            .session_slot("paper:fixture-a")
+            .session_slot(session_key)
             .unwrap()
             .unwrap()
             .commitment_artifact_id,
@@ -3709,7 +3908,7 @@ fn session_slot_is_fenced_and_reuses_the_frozen_workflow() {
         .commit_execution(
             &first_lease,
             &ExecutionCommit {
-                session_key: "paper:fixture-a".to_owned(),
+                session_key: session_key.to_owned(),
                 permit: claimed.permit.clone(),
                 commitment: commitment.clone(),
                 committed_at: now,
@@ -3726,7 +3925,7 @@ fn session_slot_is_fenced_and_reuses_the_frozen_workflow() {
         store.commit_execution(
             &first_lease,
             &ExecutionCommit {
-                session_key: "paper:fixture-a".to_owned(),
+                session_key: session_key.to_owned(),
                 permit: claimed.permit.clone(),
                 commitment: commitment.clone(),
                 committed_at: now,
@@ -3747,7 +3946,7 @@ fn session_slot_is_fenced_and_reuses_the_frozen_workflow() {
     }));
     assert_eq!(
         store
-            .session_slot("paper:fixture-a")
+            .session_slot(session_key)
             .unwrap()
             .unwrap()
             .commitment_artifact_id,
@@ -3770,7 +3969,7 @@ fn session_slot_is_fenced_and_reuses_the_frozen_workflow() {
         store.commit_execution(
             &first_lease,
             &ExecutionCommit {
-                session_key: "paper:fixture-a".to_owned(),
+                session_key: session_key.to_owned(),
                 permit: claimed.permit.clone(),
                 commitment,
                 committed_at: successor_now,
@@ -3966,7 +4165,7 @@ fn policy_transition_is_atomic_with_learning_artifacts_and_terminal_event() {
     );
     let outcome_id = akzio_domain::OutcomeId::new();
     let schedule_payload = OutcomeSchedule {
-        schema_version: V2_SCHEMA_VERSION,
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
         outcome_id: outcome_id.clone(),
         decision: reference(&decision),
         decision_context: reference(&decision_context),
@@ -4014,7 +4213,7 @@ fn policy_transition_is_atomic_with_learning_artifacts_and_terminal_event() {
     let execution_ref = reference(&execution_context);
     let evidence_ref = reference(&normalized);
     let outcome_payload = Outcome {
-        schema_version: V2_SCHEMA_VERSION,
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
         outcome_id,
         schedule: reference(&schedule),
         market_evidence: vec![evidence_ref.clone()],
@@ -4052,7 +4251,7 @@ fn policy_transition_is_atomic_with_learning_artifacts_and_terminal_event() {
     let retrospective_ref = reference(&final_retrospective);
     let subject = PolicySubject::Memory(akzio_domain::MemoryId::new());
     let experience_payload = Experience {
-        schema_version: V2_SCHEMA_VERSION,
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
         experience_id: akzio_domain::ExperienceId::new(),
         subject: subject.clone(),
         hypothesis_id: "fixture".to_owned(),
@@ -4082,7 +4281,7 @@ fn policy_transition_is_atomic_with_learning_artifacts_and_terminal_event() {
     );
     let experience_ref = reference(&experience);
     let evaluation_payload = Evaluation {
-        schema_version: V2_SCHEMA_VERSION,
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
         evaluation_id: akzio_domain::EvaluationId::new(),
         outcome: outcome_ref.clone(),
         experience: experience_ref.clone(),
@@ -4111,7 +4310,7 @@ fn policy_transition_is_atomic_with_learning_artifacts_and_terminal_event() {
         to: PolicyState::Memory(akzio_domain::MemoryLifecycle::Active),
         pair_snapshot,
         transition: Some(PolicyTransition {
-            schema_version: V2_SCHEMA_VERSION,
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
             transition_id: PolicyTransitionId::new(),
             subject: subject.clone(),
             from: PolicyState::Memory(akzio_domain::MemoryLifecycle::Candidate),

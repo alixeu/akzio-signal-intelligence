@@ -4,6 +4,10 @@
 
 mod broker_v2;
 
-pub mod v2;
+pub mod v2 {
+    pub use crate::broker_v2::{
+        ContextBroker, ContextError, ContextManifest, ContextResult as Result,
+    };
+}
 
 pub use v2::*;

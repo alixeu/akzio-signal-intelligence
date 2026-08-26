@@ -7,6 +7,7 @@ mod core;
 mod schema;
 
 pub mod artifact;
+pub mod canary;
 pub mod context;
 pub mod contract;
 pub mod decision;
@@ -15,12 +16,12 @@ pub mod event;
 pub mod execution;
 pub mod ids;
 pub mod lesson;
-pub mod policy;
 pub mod research;
 pub mod runtime_manifest;
 pub mod workflow;
 
 pub use artifact::*;
+pub use canary::*;
 pub use context::*;
 pub use contract::*;
 pub use core::*;
@@ -29,15 +30,31 @@ pub use evaluation::*;
 pub use event::*;
 pub use execution::*;
 pub use ids::{
-    EvaluationId, EventId, ExperienceId, LessonId, OutcomeId, PaperCommitmentId, PaperRepriceId,
+    EvaluationId, ExperienceId, LessonId, OutcomeId, PaperCommitmentId, PaperRepriceId,
     PolicyTransitionId, ReconciliationId,
 };
 pub use lesson::*;
-pub use policy::*;
 pub use research::*;
 pub use runtime_manifest::*;
+pub use schema::FactorLimits;
 pub use workflow::*;
 
 /// Formal schema identity for the source-incompatible v2 domain graph.
 pub const V2_DOMAIN_SCHEMA_VERSION: u32 = schema::V2_SCHEMA_VERSION;
-pub use schema::V2_SCHEMA_VERSION;
+
+pub const RESEARCH_PLANNER_RECIPE_ID: &str = "research.planner";
+pub const RESEARCH_ANALYST_RECIPE_ID: &str = "research.analyst";
+pub const RESEARCH_CRITIC_RECIPE_ID: &str = "research.critic";
+pub const RESEARCH_SYNTHESIZER_RECIPE_ID: &str = "research.synthesizer";
+pub const LEARNING_OUTCOME_WORKER_RECIPE_ID: &str = "learning.outcome_worker";
+pub const GOVERNED_EVIDENCE_SOURCE_FAMILIES: [&str; 4] =
+    ["alpaca", "sec_edgar", "fred", "news_web"];
+
+pub fn estimate_tokens_from_bytes(bytes: u64) -> u32 {
+    u32::try_from(bytes.div_ceil(4).max(1)).unwrap_or(u32::MAX)
+}
+
+pub fn estimate_json_tokens<T: serde::Serialize>(value: &T) -> Result<u32, serde_json::Error> {
+    let bytes = serde_json::to_vec(value)?.len() as u64;
+    Ok(estimate_tokens_from_bytes(bytes))
+}

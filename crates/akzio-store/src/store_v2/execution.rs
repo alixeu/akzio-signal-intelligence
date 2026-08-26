@@ -31,12 +31,18 @@ impl V2Store {
         assert_permit(&transaction, &commit.permit)?;
         assert_paper_run(&transaction, &commit.permit.run_id)?;
         assert_origin_matches(commit.commitment.origin.as_ref(), &commit.permit)?;
-        self.validate_execution_commitment_lineage(
+        let plan = self.validate_execution_commitment_lineage(
             &transaction,
             &commit.commitment,
             &payload,
             &commit.permit.run_id,
             &commit.session_key,
+        )?;
+        self.validate_consumed_paper_approval(
+            &transaction,
+            &commit.session_key,
+            &plan,
+            commit.committed_at,
         )?;
         let (_, on_failure) = task_retry_policy(&transaction, &commit.permit.task_id)?;
         let slot = transaction

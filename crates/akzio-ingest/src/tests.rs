@@ -27,21 +27,6 @@ fn retry() -> RetryPolicy {
 }
 
 #[derive(Clone)]
-struct FixtureTransport {
-    evidence: AcquiredEvidence,
-}
-
-impl GovernedEvidenceTransport for FixtureTransport {
-    fn acquire(
-        &self,
-        _source: EvidenceSource,
-        _resource: &str,
-    ) -> Result<AcquiredEvidence, EvidenceAdapterError> {
-        Ok(self.evidence.clone())
-    }
-}
-
-#[derive(Clone)]
 struct ParityAdapter {
     evidence: AcquiredEvidence,
 }
@@ -73,80 +58,59 @@ impl AsyncEvidenceAdapter for ParityAdapter {
     }
 }
 
-fn transport() -> FixtureTransport {
+fn fixture_acquired() -> AcquiredEvidence {
     let observed_at = Utc::now();
-    FixtureTransport {
-        evidence: AcquiredEvidence {
-            raw: br#"{\"fixture\":true}"#.to_vec(),
-            media_type: "application/json".to_owned(),
-            source_uri: "fixture://governed/resource".to_owned(),
+    AcquiredEvidence {
+        raw: br#"{\"fixture\":true}"#.to_vec(),
+        media_type: "application/json".to_owned(),
+        source_uri: "fixture://governed/resource".to_owned(),
+        observed_at,
+        normalized: serde_json::json!({"fixture": true}),
+        provenance: EvidenceProvenance {
+            document_id: Some("fixture-governed".to_owned()),
+            published_at: None,
             observed_at,
-            normalized: serde_json::json!({"fixture": true}),
-            provenance: EvidenceProvenance {
-                document_id: Some("fixture-governed".to_owned()),
-                published_at: None,
-                observed_at,
-                revision: Some("1".to_owned()),
-                source_uri: "fixture://governed/resource".to_owned(),
-                dedupe_key: "fixture:governed:resource".to_owned(),
-                citations: vec![EvidenceCitation {
-                    start_byte: 0,
-                    end_byte: 18,
-                    quote: "{\"fixture\":true}".to_owned(),
-                }],
-            },
-            quality: EvidenceQuality::default(),
+            revision: Some("1".to_owned()),
+            source_uri: "fixture://governed/resource".to_owned(),
+            dedupe_key: "fixture:governed:resource".to_owned(),
+            citations: vec![EvidenceCitation {
+                start_byte: 0,
+                end_byte: 18,
+                quote: "{\"fixture\":true}".to_owned(),
+            }],
         },
+        quality: EvidenceQuality::default(),
     }
 }
 
-fn assert_governed_adapter<A: EvidenceAdapter>(
-    adapter: A,
-    source: EvidenceSource,
-    other: EvidenceSource,
-) {
-    let response = adapter
-        .acquire(&EvidenceRequest {
-            source,
-            resource: "resource".to_owned(),
-            max_age: Duration::seconds(30),
-        })
-        .unwrap();
-    assert_eq!(response.normalized["adapter"], source.as_str());
-    assert_eq!(response.normalized["resource"], "resource");
-    assert_eq!(response.normalized["payload"]["fixture"], true);
-    assert!(matches!(
-        adapter.acquire(&EvidenceRequest {
-            source: other,
-            resource: "resource".to_owned(),
-            max_age: Duration::seconds(30),
-        }),
-        Err(EvidenceAdapterError::SourceMismatch)
-    ));
-}
-
 #[test]
-fn governed_adapters_are_source_typed_and_local_transport_only() {
-    assert_governed_adapter(
-        AlpacaEvidenceAdapter::new(transport()),
-        EvidenceSource::Alpaca,
-        EvidenceSource::SecEdgar,
-    );
-    assert_governed_adapter(
-        SecEdgarEvidenceAdapter::new(transport()),
-        EvidenceSource::SecEdgar,
-        EvidenceSource::Fred,
-    );
-    assert_governed_adapter(
-        FredEvidenceAdapter::new(transport()),
-        EvidenceSource::Fred,
-        EvidenceSource::NewsWeb,
-    );
-    assert_governed_adapter(
-        NewsWebEvidenceAdapter::new(transport()),
-        EvidenceSource::NewsWeb,
-        EvidenceSource::Alpaca,
-    );
+fn fixture_adapters_are_source_typed() {
+    let pairs = [
+        (EvidenceSource::Alpaca, EvidenceSource::SecEdgar),
+        (EvidenceSource::SecEdgar, EvidenceSource::Fred),
+        (EvidenceSource::Fred, EvidenceSource::NewsWeb),
+        (EvidenceSource::NewsWeb, EvidenceSource::Alpaca),
+    ];
+    for (source, other) in pairs {
+        let adapter =
+            FixtureEvidenceAdapter::new(source, [("resource".to_owned(), fixture_acquired())]);
+        let response = adapter
+            .acquire(&EvidenceRequest {
+                source,
+                resource: "resource".to_owned(),
+                max_age: Duration::seconds(30),
+            })
+            .unwrap();
+        assert_eq!(response.normalized["fixture"], true);
+        assert!(matches!(
+            adapter.acquire(&EvidenceRequest {
+                source: other,
+                resource: "resource".to_owned(),
+                max_age: Duration::seconds(30),
+            }),
+            Err(EvidenceAdapterError::SourceMismatch)
+        ));
+    }
 }
 
 #[test]
@@ -585,11 +549,26 @@ fn semantic_detail_is_constructed_then_committed_by_task_runtime() {
 }
 
 #[test]
-fn alpaca_paper_transport_is_endpoint_and_resource_fenced() {
-    assert!(
-        AlpacaPaperEvidenceTransport::new("https://api.alpaca.markets", "key", "secret", None,)
-            .is_err()
+fn paper_money_parser_rejects_precision_loss_and_missing_whole_digits() {
+    assert!(crate::parse_money_micros(&serde_json::json!("1.0000001")).is_none());
+    assert!(crate::parse_money_micros(&serde_json::json!(".5")).is_none());
+    assert_eq!(
+        crate::parse_money_micros(&serde_json::json!("0.500000")),
+        Some(akzio_domain::MoneyMicros(500_000))
     );
+}
+
+#[test]
+fn alpaca_paper_transport_is_endpoint_and_resource_fenced() {
+    for endpoint in [
+        "https://api.alpaca.markets",
+        "http://paper-api.alpaca.markets",
+        "https://paper-api.alpaca.markets.evil.test",
+        "https://paper-api.alpaca.markets/v2",
+        "https://paper-api.alpaca.markets?live=true",
+    ] {
+        assert!(AlpacaPaperEvidenceTransport::new(endpoint, "key", "secret", None).is_err());
+    }
     assert_eq!(
         AlpacaPaperEvidenceTransport::path_for("bars:QQQ:1d").unwrap(),
         "/v2/stocks/QQQ/bars?timeframe=1Day&limit=1&adjustment=all"
