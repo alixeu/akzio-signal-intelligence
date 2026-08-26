@@ -33,10 +33,11 @@ use akzio_domain::{
     ArtifactProvenance, ArtifactRef, Asset, ContentHash, ContextPolicy, Decision, DecisionContext,
     DomainError, EvidenceNeed, ExecutionContext, ExecutionVerdict, FreezeState, LifecycleEventType,
     MemoryId, MoneyMicros, OrderReceipt, OrderReceiptState, OutcomeExecutionLineage,
-    OutcomeHorizon, OutcomeSchedule, PaperApprovalScope, PaperLaunchApproval, PolicySubject,
-    QuoteSnapshot, Reconciliation, ReconciliationState, ResearchClaim, Retrospective,
-    RetrospectiveDraft, RunId, RunPurpose, RuntimeIdentity, RuntimeManifest, RuntimeTaskClass,
-    TargetPortfolio, TaskId, TaskStatus, TopologyId, WeightPpm, WorkflowProposal, WorkflowStatus,
+    OutcomeHorizon, OutcomeId, OutcomeSchedule, PaperApprovalScope, PaperLaunchApproval,
+    PolicySubject, QuoteSnapshot, Reconciliation, ReconciliationState, ResearchClaim,
+    Retrospective, RetrospectiveDraft, RunId, RunPurpose, RuntimeIdentity, RuntimeManifest,
+    RuntimeTaskClass, TargetPortfolio, TaskId, TaskStatus, TopologyId, WeightPpm, WorkflowProposal,
+    WorkflowStatus,
 };
 use akzio_execution::{
     paper::{AlpacaPaper, CommittedPaperBroker, PortfolioHistoryRange},

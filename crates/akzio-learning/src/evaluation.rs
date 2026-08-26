@@ -614,6 +614,25 @@ impl EvaluationRuntime {
         diagnostic_gap: &str,
         now: DateTime<Utc>,
     ) -> EvaluationRuntimeResult<(Artifact, Artifact)> {
+        self.seal_outcome_with_retrospective_fenced(
+            lease,
+            permit,
+            materialization,
+            None,
+            diagnostic_gap,
+            now,
+        )
+    }
+
+    pub fn seal_outcome_with_retrospective_fenced(
+        &self,
+        lease: &DaemonLease,
+        permit: &TaskWritePermit,
+        materialization: OutcomeMaterializationInput,
+        retrospective_draft: Option<&RetrospectiveDraft>,
+        diagnostic_gap: &str,
+        now: DateTime<Utc>,
+    ) -> EvaluationRuntimeResult<(Artifact, Artifact)> {
         self.require_paper(&permit.run_id)?;
         let outcome = materialize_outcome(&materialization)?;
         outcome.validate_sealed()?;
@@ -647,7 +666,7 @@ impl EvaluationRuntime {
         );
         retrospective_source_refs.sort();
         retrospective_source_refs.dedup();
-        let retrospective = Retrospective {
+        let mut retrospective = Retrospective {
             schema_version: V2_DOMAIN_SCHEMA_VERSION,
             outcome_id: outcome.outcome_id.clone(),
             horizon: OutcomeHorizon::T5,
@@ -662,6 +681,28 @@ impl EvaluationRuntime {
             created_at: now,
             sealed_at: Some(now),
         };
+        if let Some(draft) = retrospective_draft {
+            if draft.outcome_id != outcome.outcome_id || draft.horizon != OutcomeHorizon::T5 {
+                return Err(EvaluationError::InvalidMaterialization(
+                    "retrospective draft identity",
+                ));
+            }
+            retrospective.status = RetrospectiveStatus::Complete;
+            retrospective.summary = draft.summary.clone();
+            retrospective.findings = draft.findings.clone();
+            retrospective.counterfactuals = draft.counterfactuals.clone();
+            retrospective.lesson_candidates = draft.lesson_candidates.clone();
+            retrospective.diagnostic_gaps = draft.diagnostic_gaps.clone();
+            retrospective.source_refs.extend(draft.source_refs.clone());
+            retrospective.source_refs.extend(
+                draft
+                    .findings
+                    .iter()
+                    .flat_map(|finding| finding.artifact_refs.iter().cloned()),
+            );
+            retrospective.source_refs.sort();
+            retrospective.source_refs.dedup();
+        }
         retrospective.validate()?;
         let retrospective_artifact = if let Some(existing) =
             self.store

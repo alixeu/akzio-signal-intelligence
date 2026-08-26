@@ -82,7 +82,7 @@ impl Daemon {
             RuntimeTaskClass::ExecutionGate => self.execute_execution_gate(task, now).await,
             RuntimeTaskClass::PaperCommit => self.execute_paper_commit(task, now),
             RuntimeTaskClass::Reconcile => self.execute_reconcile(task, now).await,
-            RuntimeTaskClass::Evaluate => self.execute_evaluate(task, now),
+            RuntimeTaskClass::Evaluate => self.execute_evaluate(task, now).await,
         }
     }
 
@@ -206,13 +206,18 @@ impl Daemon {
         Ok(TaskCompletion::Committed)
     }
 
-    pub(super) fn execute_evaluate(
+    pub(super) async fn execute_evaluate(
         &self,
         task: &ClaimedAttempt,
         now: DateTime<Utc>,
     ) -> Result<TaskCompletion> {
-        if self.store.run_purpose(&task.run_id)? != RunPurpose::Paper {
-            return Ok(TaskCompletion::NoOutput);
+        let purpose = self.store.run_purpose(&task.run_id)?;
+        if purpose != RunPurpose::Paper {
+            return if purpose == RunPurpose::Shadow {
+                self.execute_shadow_evaluate(task, now).await
+            } else {
+                Ok(TaskCompletion::NoOutput)
+            };
         }
         let decision = self.terminal_input(task, ArtifactKind::Decision)?;
         let decision_context = self.terminal_input(task, ArtifactKind::DecisionContext)?;

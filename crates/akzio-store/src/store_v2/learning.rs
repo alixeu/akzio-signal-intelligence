@@ -1262,6 +1262,65 @@ impl V2Store {
 
     /// Reads the current policy head without exposing mutable storage to
     /// callers. Previous policy versions remain in `rebuild_policy_transitions`.
+    pub fn outcome_schedule_for_run(&self, run_id: &RunId) -> StoreResult<Option<Artifact>> {
+        let connection = self.connection()?;
+        let mut matching = read_kind_artifacts(&connection, ArtifactKind::OutcomeSchedule)?
+            .into_iter()
+            .filter(|artifact| {
+                artifact
+                    .origin
+                    .as_ref()
+                    .and_then(|origin| origin.run_id.as_ref())
+                    == Some(run_id)
+                    && artifact.lifecycle == ArtifactLifecycle::Canonical
+            })
+            .collect::<Vec<_>>();
+        for artifact in &matching {
+            let schedule: OutcomeSchedule = self.read_artifact_payload(artifact)?;
+            schedule.validate()?;
+        }
+        matching.sort_by_key(|artifact| artifact.created_at);
+        match matching.len() {
+            0 => Ok(None),
+            1 => Ok(matching.pop()),
+            _ => Err(StoreError::Integrity(format!(
+                "run {run_id} has multiple OutcomeSchedule artifacts"
+            ))),
+        }
+    }
+
+    pub fn outcome_for_run(&self, run_id: &RunId) -> StoreResult<Option<Artifact>> {
+        let connection = self.connection()?;
+        let mut matching = Vec::new();
+        for artifact in read_kind_artifacts(&connection, ArtifactKind::Outcome)? {
+            if artifact
+                .origin
+                .as_ref()
+                .and_then(|origin| origin.run_id.as_ref())
+                != Some(run_id)
+            {
+                continue;
+            }
+            let outcome: Outcome = self.read_artifact_payload(&artifact)?;
+            if outcome.is_sealed()
+                && matches!(
+                    artifact.lifecycle,
+                    ArtifactLifecycle::Canonical | ArtifactLifecycle::RunScoped
+                )
+            {
+                matching.push(artifact);
+            }
+        }
+        matching.sort_by_key(|artifact| artifact.created_at);
+        match matching.len() {
+            0 => Ok(None),
+            1 => Ok(matching.pop()),
+            _ => Err(StoreError::Integrity(format!(
+                "run {run_id} has multiple sealed Outcome artifacts"
+            ))),
+        }
+    }
+
     pub fn policy_head(&self, subject: &PolicySubject) -> StoreResult<Option<PolicyHead>> {
         subject.validate()?;
         let connection = self.connection()?;

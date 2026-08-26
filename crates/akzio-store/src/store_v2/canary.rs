@@ -7,7 +7,7 @@
 use akzio_domain::{
     Artifact, ArtifactKind, ArtifactLifecycle, CanaryCampaignSpec, CanaryCampaignStatus,
     CanarySessionReservation, CanaryVerdict, ContentHash, PaperApprovalScope, PaperLaunchApproval,
-    RunPurpose, RuntimeManifest,
+    RunId, RunPurpose, RuntimeManifest,
 };
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -519,6 +519,26 @@ impl V2Store {
     ) -> StoreResult<Option<StoredCanarySession>> {
         let connection = self.connection()?;
         read_session(&connection, campaign_id, level)
+    }
+
+    pub fn canary_session_for_run(
+        &self,
+        run_id: &RunId,
+    ) -> StoreResult<Option<StoredCanarySession>> {
+        let connection = self.connection()?;
+        let row: Option<(String, String)> = connection
+            .query_row(
+                "SELECT campaign_id, level_json FROM rebuild_canary_sessions WHERE parent_run_id = ?1 OR contract_shadow_run_id = ?1 OR topology_shadow_run_id = ?1 OR bundle_shadow_run_id = ?1 LIMIT 1",
+                params![run_id.0],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((campaign_id, level_json)) = row else {
+            return Ok(None);
+        };
+        let campaign_id = ContentHash::new(campaign_id)?;
+        let level: CanaryCampaignStatus = serde_json::from_str(&level_json)?;
+        read_session(&connection, &campaign_id, level)
     }
 
     fn validate_campaign_artifacts(&self, spec: &CanaryCampaignSpec) -> StoreResult<()> {
