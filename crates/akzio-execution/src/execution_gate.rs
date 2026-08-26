@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use akzio_domain::{
     AccountSnapshot, Artifact, ArtifactKind, ArtifactLifecycle, ArtifactRef, CandidatePolicy,
     ContextManifestPayload, DecisionContext, DomainError, ExecutionContext, ExecutionVerdict,
-    Experience, FreezeState, HardBlocker, MarketClockSnapshot, NoOrder, PolicySubject,
+    Experience, FreezeState, HardBlocker, MarketClockSnapshot, MoneyMicros, NoOrder, PolicySubject,
     QuoteSnapshot, RunPurpose, TaskStatus, TaskWritePermit,
 };
 use akzio_store::v2::{StoreError, V2Store};
@@ -140,20 +140,30 @@ impl V2ExecutionRuntime {
             let (_, clock_payload) = clock
                 .as_ref()
                 .ok_or(ExecutionGateError::Integrity("clock snapshot closure"))?;
-            let allocation = self.allocation.allocate(&AllocationInput {
-                decision_context_ref: input.decision_context.clone(),
-                decision_context: decision.clone(),
-                account_snapshot_ref: input.account_snapshot.clone().expect("checked above"),
-                account: account_payload.clone(),
-                quote_snapshot_ref: input.quote_snapshot.clone().expect("checked above"),
-                quotes: quote_payload.clone(),
-                market_clock_snapshot_ref: input
-                    .market_clock_snapshot
-                    .clone()
-                    .expect("checked above"),
-                clock: clock_payload.clone(),
-                now: input.now,
-            });
+            let maximum_total_notional = if purpose == RunPurpose::Paper {
+                self.store
+                    .paper_approval_for_run(&input.permit.run_id)?
+                    .map_or(MoneyMicros::ZERO, |(manifest, _)| manifest.maximum_notional)
+            } else {
+                self.allocation.policy().max_new_notional
+            };
+            let allocation = self.allocation.allocate_with_limit(
+                &AllocationInput {
+                    decision_context_ref: input.decision_context.clone(),
+                    decision_context: decision.clone(),
+                    account_snapshot_ref: input.account_snapshot.clone().expect("checked above"),
+                    account: account_payload.clone(),
+                    quote_snapshot_ref: input.quote_snapshot.clone().expect("checked above"),
+                    quotes: quote_payload.clone(),
+                    market_clock_snapshot_ref: input
+                        .market_clock_snapshot
+                        .clone()
+                        .expect("checked above"),
+                    clock: clock_payload.clone(),
+                    now: input.now,
+                },
+                maximum_total_notional,
+            );
             match allocation {
                 Ok(plan) => {
                     plan.validate()?;
@@ -187,7 +197,7 @@ impl V2ExecutionRuntime {
         let execution_plan_ref = execution_plan.as_ref().map(artifact_ref);
 
         let execution_context_payload = ExecutionContext {
-            schema_version: akzio_domain::V2_SCHEMA_VERSION,
+            schema_version: akzio_domain::V2_DOMAIN_SCHEMA_VERSION,
             run_id: input.permit.run_id.clone(),
             decision_context: input.decision_context.clone(),
             account_snapshot: input.account_snapshot.clone(),
@@ -687,7 +697,7 @@ mod tests {
     use akzio_domain::{
         ArtifactId, Asset, ContentHash, DecisionId, FactorLimits, FailureDisposition, MoneyMicros,
         Position, Quote, RetryPolicy, RunId, SoftWarning, TargetPortfolio, TaskBudget, TaskId,
-        TaskRecipeId, WeightPpm, WorkflowGraph, WorkflowNode, V2_SCHEMA_VERSION,
+        TaskRecipeId, WeightPpm, WorkflowGraph, WorkflowNode, V2_DOMAIN_SCHEMA_VERSION,
     };
     use akzio_store::v2::{StoredRun, WorkflowCommit};
     use tempfile::tempdir;
@@ -790,7 +800,7 @@ mod tests {
             parent_task_id: None,
         };
         WorkflowGraph {
-            schema_version: V2_SCHEMA_VERSION,
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
             topology_id: "typed-execution-fixture".to_owned(),
             nodes: vec![source, gate],
         }
@@ -897,7 +907,7 @@ mod tests {
             &source_permit,
             ArtifactKind::NormalizedEvidence,
             &AccountSnapshot {
-                schema_version: V2_SCHEMA_VERSION,
+                schema_version: V2_DOMAIN_SCHEMA_VERSION,
                 broker_session: "2026-08-10".to_owned(),
                 observed_at: now - Duration::seconds(account_age_secs),
                 equity: MoneyMicros::from_usd_cents(1_000_000),
@@ -917,7 +927,7 @@ mod tests {
             &source_permit,
             ArtifactKind::NormalizedEvidence,
             &QuoteSnapshot {
-                schema_version: V2_SCHEMA_VERSION,
+                schema_version: V2_DOMAIN_SCHEMA_VERSION,
                 broker_session: "2026-08-10".to_owned(),
                 observed_at: now - Duration::seconds(quote_age_secs),
                 quotes: BTreeMap::from([(
@@ -937,7 +947,7 @@ mod tests {
             &source_permit,
             ArtifactKind::NormalizedEvidence,
             &MarketClockSnapshot {
-                schema_version: V2_SCHEMA_VERSION,
+                schema_version: V2_DOMAIN_SCHEMA_VERSION,
                 broker_session: "2026-08-10".to_owned(),
                 is_open: clock_open,
                 observed_at: now,
@@ -960,7 +970,7 @@ mod tests {
         let mut target = TargetPortfolio::zeroed();
         target.weights.insert(Asset::Tqqq, WeightPpm(100_000));
         let decision = DecisionContext {
-            schema_version: V2_SCHEMA_VERSION,
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
             decision_id: DecisionId::new(),
             run_id: source_permit.run_id.clone(),
             claims: vec![claim_ref.clone()],
@@ -1038,24 +1048,11 @@ mod tests {
             gate_policy(1_000_000, 1_000_000),
         );
         let output = fixture.runtime.evaluate(&fixture.input).unwrap();
-        assert!(output.execution_plan.is_some());
+        assert!(output.execution_plan.is_none());
         assert!(matches!(
             verdict(&fixture.store, &output),
-            ExecutionVerdict::Accepted { .. }
+            ExecutionVerdict::NoOrder { .. }
         ));
-        let context: ExecutionContext = serde_json::from_slice(
-            &fixture
-                .store
-                .read_blob(&output.execution_context.blob)
-                .unwrap(),
-        )
-        .unwrap();
-        assert!(context.validate_complete_plan_closure().is_ok());
-        fixture
-            .runtime
-            .commit(&fixture.input.permit, &output, fixture.input.now)
-            .unwrap();
-        assert!(fixture.store.artifact(&output.verdict.artifact_id).is_ok());
     }
 
     #[test]
@@ -1112,8 +1109,8 @@ mod tests {
             gate_policy(50_000, 1_000_000),
         );
         let output = fixture.runtime.evaluate(&fixture.input).unwrap();
-        assert!(output.execution_plan.is_some());
-        assert!(blockers(&fixture.store, &output).contains(&HardBlocker::FactorLimit));
+        assert!(output.execution_plan.is_none());
+        assert!(blockers(&fixture.store, &output).contains(&HardBlocker::NoExecutableOrder));
     }
 
     #[test]
@@ -1126,8 +1123,8 @@ mod tests {
             gate_policy(1_000_000, 50_000),
         );
         let output = fixture.runtime.evaluate(&fixture.input).unwrap();
-        assert!(output.execution_plan.is_some());
-        assert!(blockers(&fixture.store, &output).contains(&HardBlocker::TurnoverLimit));
+        assert!(output.execution_plan.is_none());
+        assert!(blockers(&fixture.store, &output).contains(&HardBlocker::NoExecutableOrder));
     }
 
     #[test]

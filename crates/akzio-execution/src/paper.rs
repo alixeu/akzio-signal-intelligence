@@ -196,20 +196,24 @@ pub struct AlpacaPaper {
     credentials: PaperCredentials,
 }
 
+pub fn is_alpaca_paper_base_url(supplied: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(supplied.trim()) else {
+        return false;
+    };
+    parsed.scheme() == "https"
+        && parsed.host_str() == Some("paper-api.alpaca.markets")
+        && parsed.port().is_none()
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.path() == "/"
+        && parsed.query().is_none()
+        && parsed.fragment().is_none()
+}
+
 impl AlpacaPaper {
     pub fn new(base_url: impl Into<String>, credentials: PaperCredentials) -> Result<Self> {
         let supplied = base_url.into();
-        let parsed = reqwest::Url::parse(supplied.trim())
-            .map_err(|_| PaperError::NonPaperEndpoint(supplied.clone()))?;
-        if parsed.scheme() != "https"
-            || parsed.host_str() != Some("paper-api.alpaca.markets")
-            || parsed.port().is_some()
-            || parsed.username() != ""
-            || parsed.password().is_some()
-            || parsed.path() != "/"
-            || parsed.query().is_some()
-            || parsed.fragment().is_some()
-        {
+        if !is_alpaca_paper_base_url(&supplied) {
             return Err(PaperError::NonPaperEndpoint(supplied));
         }
         let client = Client::builder()

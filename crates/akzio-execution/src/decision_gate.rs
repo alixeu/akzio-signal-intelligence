@@ -658,7 +658,7 @@ fn manifest_input_hash(
 }
 
 fn estimate_tokens(bytes: u64) -> u32 {
-    u32::try_from(bytes.div_ceil(4).max(1)).unwrap_or(u32::MAX)
+    akzio_domain::estimate_tokens_from_bytes(bytes)
 }
 
 #[cfg(test)]

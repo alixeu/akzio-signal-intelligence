@@ -208,6 +208,8 @@ pub struct ExecutionPlan {
     pub quote_snapshot: ArtifactRef,
     pub market_clock_snapshot: ArtifactRef,
     pub policy_hash: ContentHash,
+    /// Absolute order notional ceiling frozen into the plan hash.
+    pub maximum_total_notional: MoneyMicros,
     pub target: TargetPortfolio,
     pub orders: Vec<OrderIntent>,
     pub gross_exposure_ppm: u32,
@@ -227,6 +229,7 @@ struct ExecutionPlanHashPayload<'a> {
     quote_snapshot: &'a ArtifactRef,
     market_clock_snapshot: &'a ArtifactRef,
     policy_hash: &'a ContentHash,
+    maximum_total_notional: MoneyMicros,
     target: &'a TargetPortfolio,
     orders: &'a [OrderIntent],
     gross_exposure_ppm: u32,
@@ -246,6 +249,7 @@ impl ExecutionPlan {
             quote_snapshot: &self.quote_snapshot,
             market_clock_snapshot: &self.market_clock_snapshot,
             policy_hash: &self.policy_hash,
+            maximum_total_notional: self.maximum_total_notional,
             target: &self.target,
             orders: &self.orders,
             gross_exposure_ppm: self.gross_exposure_ppm,
@@ -271,6 +275,11 @@ impl ExecutionPlan {
                 field: "execution_plan.identity",
             });
         }
+        if self.maximum_total_notional.0 <= 0 {
+            return Err(DomainError::InvalidBudget {
+                field: "execution_plan.maximum_total_notional",
+            });
+        }
         if self.decision_context.kind != ArtifactKind::DecisionContext
             || self.account_snapshot.kind != ArtifactKind::NormalizedEvidence
             || self.quote_snapshot.kind != ArtifactKind::NormalizedEvidence
@@ -292,6 +301,18 @@ impl ExecutionPlan {
             });
         }
         self.orders.iter().try_for_each(OrderIntent::validate)?;
+        let total_notional = self
+            .orders
+            .iter()
+            .try_fold(0_i64, |total, order| total.checked_add(order.notional.0))
+            .ok_or(DomainError::InvalidBudget {
+                field: "execution_plan.total_notional",
+            })?;
+        if total_notional > self.maximum_total_notional.0 {
+            return Err(DomainError::InvalidBudget {
+                field: "execution_plan.maximum_total_notional",
+            });
+        }
         if self
             .orders
             .iter()
@@ -691,6 +712,7 @@ mod tests {
             quote_snapshot: reference(ArtifactKind::NormalizedEvidence, b"quotes"),
             market_clock_snapshot: reference(ArtifactKind::NormalizedEvidence, b"clock"),
             policy_hash: ContentHash::of_bytes(b"policy"),
+            maximum_total_notional: MoneyMicros::from_usd_cents(100_000),
             target: target.clone(),
             orders: vec![OrderIntent {
                 asset: Asset::Tqqq,

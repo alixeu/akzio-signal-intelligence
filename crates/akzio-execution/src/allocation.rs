@@ -58,6 +58,14 @@ impl V2AllocationRuntime {
     }
 
     pub fn allocate(&self, input: &AllocationInput) -> AllocationResult<ExecutionPlan> {
+        self.allocate_with_limit(input, self.policy.max_new_notional)
+    }
+
+    pub fn allocate_with_limit(
+        &self,
+        input: &AllocationInput,
+        maximum_total_notional: MoneyMicros,
+    ) -> AllocationResult<ExecutionPlan> {
         input.decision_context.validate()?;
         input.account.validate()?;
         input.quotes.validate()?;
@@ -73,13 +81,18 @@ impl V2AllocationRuntime {
         if !input.clock.is_open {
             return Err(AllocationError::MarketClosed);
         }
-        Ok(build_execution_plan(&self.policy, input)?)
+        Ok(build_execution_plan(
+            &self.policy,
+            input,
+            maximum_total_notional,
+        )?)
     }
 }
 
 fn build_execution_plan(
     policy: &ExecutionPolicy,
     input: &AllocationInput,
+    maximum_total_notional: MoneyMicros,
 ) -> std::result::Result<ExecutionPlan, ExecutionError> {
     let target = &input.decision_context.target;
     let account = &input.account;
@@ -162,10 +175,16 @@ fn build_execution_plan(
         });
     }
 
+    scale_orders_to_limit(&mut orders, maximum_total_notional)?;
+    new_notional = orders
+        .iter()
+        .map(|order| i128::from(order.notional.0))
+        .sum();
+    order_turnover = new_notional;
     if orders.is_empty() {
         return Err(ExecutionError::NoExecutableOrder);
     }
-    if new_notional > i128::from(policy.max_new_notional.0) {
+    if new_notional > i128::from(maximum_total_notional.0) {
         return Err(ExecutionError::NewNotionalExceeded);
     }
     if new_notional > i128::from(account.buying_power.0) {
@@ -192,6 +211,7 @@ fn build_execution_plan(
         quote_snapshot: input.quote_snapshot_ref.clone(),
         market_clock_snapshot: input.market_clock_snapshot_ref.clone(),
         policy_hash: policy.policy_hash()?,
+        maximum_total_notional,
         target: target.clone(),
         orders,
         gross_exposure_ppm: gross,
@@ -207,13 +227,61 @@ fn build_execution_plan(
     Ok(plan)
 }
 
+fn scale_orders_to_limit(
+    orders: &mut [OrderIntent],
+    maximum_total_notional: MoneyMicros,
+) -> std::result::Result<(), ExecutionError> {
+    if maximum_total_notional.0 <= 0 {
+        return Err(ExecutionError::NewNotionalExceeded);
+    }
+    let total = orders.iter().try_fold(0_i128, |total, order| {
+        total
+            .checked_add(i128::from(order.notional.0))
+            .ok_or(ExecutionError::NewNotionalExceeded)
+    })?;
+    let limit = i128::from(maximum_total_notional.0);
+    if total <= limit {
+        return Ok(());
+    }
+
+    let mut remainder = limit;
+    for order in orders.iter_mut() {
+        let scaled = i128::from(order.notional.0)
+            .checked_mul(limit)
+            .and_then(|value| value.checked_div(total))
+            .ok_or(ExecutionError::NewNotionalExceeded)?;
+        order.notional =
+            MoneyMicros(i64::try_from(scaled).map_err(|_| ExecutionError::NewNotionalExceeded)?);
+        remainder = remainder
+            .checked_sub(scaled)
+            .ok_or(ExecutionError::NewNotionalExceeded)?;
+    }
+
+    // Orders are created in Asset::EXECUTABLE order. Keep remainder allocation
+    // stable so equivalent inputs produce the same plan hash.
+    for order in orders.iter_mut() {
+        if remainder == 0 {
+            break;
+        }
+        order.notional = MoneyMicros(
+            order
+                .notional
+                .0
+                .checked_add(1)
+                .ok_or(ExecutionError::NewNotionalExceeded)?,
+        );
+        remainder -= 1;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use akzio_domain::{
         ArtifactId, ArtifactKind, Asset, ContentHash, DecisionId, HardBlocker, MoneyMicros,
-        Position, Quote, RunId, TargetPortfolio, WeightPpm, V2_SCHEMA_VERSION,
+        Position, Quote, RunId, TargetPortfolio, WeightPpm, V2_DOMAIN_SCHEMA_VERSION,
     };
     use chrono::Utc;
 
@@ -249,7 +317,7 @@ mod tests {
         AllocationInput {
             decision_context_ref: reference(ArtifactKind::DecisionContext, b"decision"),
             decision_context: DecisionContext {
-                schema_version: V2_SCHEMA_VERSION,
+                schema_version: V2_DOMAIN_SCHEMA_VERSION,
                 decision_id: DecisionId::new(),
                 run_id: RunId::new(),
                 claims: vec![reference(ArtifactKind::Claim, b"claim")],
@@ -267,7 +335,7 @@ mod tests {
             },
             account_snapshot_ref: reference(ArtifactKind::NormalizedEvidence, b"account"),
             account: AccountSnapshot {
-                schema_version: V2_SCHEMA_VERSION,
+                schema_version: V2_DOMAIN_SCHEMA_VERSION,
                 broker_session: "2026-08-10".to_owned(),
                 observed_at: now,
                 equity: MoneyMicros::from_usd_cents(1_000_000),
@@ -281,7 +349,7 @@ mod tests {
             },
             quote_snapshot_ref: reference(ArtifactKind::NormalizedEvidence, b"quotes"),
             quotes: QuoteSnapshot {
-                schema_version: V2_SCHEMA_VERSION,
+                schema_version: V2_DOMAIN_SCHEMA_VERSION,
                 broker_session: "2026-08-10".to_owned(),
                 observed_at: now,
                 quotes: BTreeMap::from([(
@@ -295,7 +363,7 @@ mod tests {
             },
             market_clock_snapshot_ref: reference(ArtifactKind::NormalizedEvidence, b"clock"),
             clock: MarketClockSnapshot {
-                schema_version: V2_SCHEMA_VERSION,
+                schema_version: V2_DOMAIN_SCHEMA_VERSION,
                 broker_session: "2026-08-10".to_owned(),
                 is_open: true,
                 observed_at: now,
@@ -312,6 +380,27 @@ mod tests {
             .unwrap();
         assert_eq!(plan.orders.len(), 1);
         assert!(plan.validate().is_ok());
+    }
+
+    #[test]
+    fn paper_limit_scales_orders_deterministically() {
+        let runtime = V2AllocationRuntime::new(policy()).unwrap();
+        let limit = MoneyMicros::from_usd_cents(100);
+        let source = input(vec![]);
+        let first = runtime.allocate_with_limit(&source, limit).unwrap();
+        let second = runtime.allocate_with_limit(&source, limit).unwrap();
+
+        assert_eq!(first.plan_hash, second.plan_hash);
+        assert_eq!(first.maximum_total_notional, limit);
+        assert_eq!(
+            first
+                .orders
+                .iter()
+                .map(|order| order.notional.0)
+                .sum::<i64>(),
+            limit.0
+        );
+        assert!(first.validate().is_ok());
     }
 
     #[test]

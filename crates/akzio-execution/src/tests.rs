@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use crate::{ExecutionPlan, MoneyMicros, OrderIntent};
 use akzio_domain::{
     ArtifactId, ArtifactKind, ArtifactRef, Asset, ContentHash, FactorExposure, PaperCommitmentId,
-    TargetPortfolio, WeightPpm, V2_SCHEMA_VERSION,
+    TargetPortfolio, WeightPpm, V2_DOMAIN_SCHEMA_VERSION,
 };
 use chrono::Utc;
 
@@ -12,7 +12,7 @@ fn fixture_plan() -> ExecutionPlan {
     let mut target = TargetPortfolio::zeroed();
     target.weights.insert(Asset::Tqqq, WeightPpm(100_000));
     let mut plan = ExecutionPlan {
-        schema_version: V2_SCHEMA_VERSION,
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
         decision_context: ArtifactRef {
             artifact_id: ArtifactId(ContentHash::of_bytes(b"decision")),
             kind: ArtifactKind::DecisionContext,
@@ -30,6 +30,7 @@ fn fixture_plan() -> ExecutionPlan {
             kind: ArtifactKind::NormalizedEvidence,
         },
         policy_hash: ContentHash::of_bytes(b"policy"),
+        maximum_total_notional: MoneyMicros::from_usd_cents(100_000),
         target: target.clone(),
         orders: vec![OrderIntent {
             asset: Asset::Tqqq,

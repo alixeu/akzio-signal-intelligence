@@ -8,7 +8,7 @@
 use akzio_domain::{
     Artifact, ArtifactKind, ArtifactLifecycle, ArtifactRef, DomainError, ExecutionContext,
     FreezeState, OrderReceipt, OrderReceiptState, PaperCommitment, PaperReprice, PaperRepriceId,
-    RunPurpose, TaskWritePermit, V2_SCHEMA_VERSION,
+    RunPurpose, TaskWritePermit, V2_DOMAIN_SCHEMA_VERSION,
 };
 use akzio_store::v2::{DaemonLease, RepriceCommit, StoreError, V2Store};
 use chrono::{DateTime, Utc};
@@ -196,7 +196,7 @@ impl V2RepriceRuntime {
             limit_price: replacement_limit_price,
         };
         let reprice_payload = PaperReprice {
-            schema_version: V2_SCHEMA_VERSION,
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
             reprice_id: PaperRepriceId::new(),
             commitment: input.commitment.clone(),
             prior_receipt: input.prior_receipt.clone(),

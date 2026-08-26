@@ -47,6 +47,14 @@ pub enum PaperCommitmentError {
     DuplicateAssetOrder(Asset),
     #[error("session already contains a different Paper commitment")]
     ExistingCommitmentMismatch,
+    #[error("Paper approval expired before commitment")]
+    ApprovalExpired,
+    #[error("execution plan exceeds approved maximum notional")]
+    ApprovalNotionalExceeded,
+    #[error("Paper approval is missing")]
+    ApprovalMissing,
+    #[error("execution plan notional overflow")]
+    ApprovalNotionalOverflow,
 }
 
 pub type PaperCommitmentResult<T> = std::result::Result<T, PaperCommitmentError>;
@@ -147,6 +155,23 @@ impl V2PaperCommitmentRuntime {
             || allocation.broker_session != input.session_key
         {
             return Err(PaperCommitmentError::PlanHashMismatch);
+        }
+        if let Some((manifest, approval)) =
+            self.store.paper_approval_for_run(&input.permit.run_id)?
+        {
+            if approval.expires_at < input.now {
+                return Err(PaperCommitmentError::ApprovalExpired);
+            }
+            let total_notional = allocation
+                .orders
+                .iter()
+                .try_fold(0_i64, |total, order| total.checked_add(order.notional.0))
+                .ok_or(PaperCommitmentError::ApprovalNotionalOverflow)?;
+            if total_notional > manifest.maximum_notional.0 {
+                return Err(PaperCommitmentError::ApprovalNotionalExceeded);
+            }
+        } else {
+            return Err(PaperCommitmentError::ApprovalMissing);
         }
         let mut client_order_ids = std::collections::BTreeMap::new();
         for (index, order) in allocation.orders.iter().enumerate() {
@@ -257,12 +282,15 @@ mod tests {
 
     use akzio_domain::{
         ArtifactId, ContentHash, FactorExposure, FailureDisposition, LifecycleEventType,
-        RetryPolicy, RunId, TargetPortfolio, TaskBudget, TaskId, TaskRecipeId, WeightPpm,
-        WorkflowGraph, WorkflowNode, V2_SCHEMA_VERSION,
+        MoneyMicros, PaperApprovalScope, PaperLaunchApproval, RetryPolicy, RunId, RuntimeManifest,
+        TargetPortfolio, TaskBudget, TaskId, TaskRecipeId, WeightPpm, WorkflowGraph, WorkflowNode,
+        WorkflowProposal, V2_DOMAIN_SCHEMA_VERSION,
     };
     use akzio_store::v2::{SessionReservation, StoredRun, WorkflowCommit};
 
     use super::*;
+
+    const SESSION_KEY: &str = "2026-08-25";
 
     fn budget() -> TaskBudget {
         TaskBudget {
@@ -285,7 +313,7 @@ mod tests {
 
     fn workflow() -> WorkflowGraph {
         WorkflowGraph {
-            schema_version: V2_SCHEMA_VERSION,
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
             topology_id: "paper-commitment-fixture".to_owned(),
             nodes: vec![WorkflowNode {
                 task_id: TaskId::new(),
@@ -357,6 +385,111 @@ mod tests {
         }
     }
 
+    fn reserve_approved_slot(
+        store: &V2Store,
+        lease: &DaemonLease,
+        workflow: WorkflowCommit,
+        now: DateTime<Utc>,
+    ) {
+        let run_id = workflow.run.run_id.clone();
+        let proposal_payload = WorkflowProposal {
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
+            topology_id: workflow.run.topology_id.clone(),
+            tasks: std::collections::BTreeMap::new(),
+            stop_reason: Some("fixture approved Paper session".to_owned()),
+        };
+        let proposal = Artifact::new(
+            ArtifactKind::WorkflowProposal,
+            store.put_json(&proposal_payload).unwrap(),
+            "runtime.paper_provisioning",
+            ArtifactLifecycle::RunScoped,
+            provenance(now),
+            Some(ArtifactOrigin {
+                run_id: Some(run_id),
+                task_id: None,
+                attempt_id: None,
+                contract_hash: None,
+            }),
+            vec![],
+            now,
+        )
+        .unwrap();
+        let session = chrono::NaiveDate::parse_from_str(SESSION_KEY, "%Y-%m-%d").unwrap();
+        let manifest_payload = RuntimeManifest {
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
+            code_revision: "fixture-revision".to_owned(),
+            cargo_lock_hash: ContentHash::of_bytes(b"fixture-cargo"),
+            config_hash: ContentHash::of_bytes(b"fixture-config"),
+            provider_id: "fixture-provider".to_owned(),
+            model_id: "fixture-model".to_owned(),
+            prompt_hash: ContentHash::of_bytes(b"fixture-prompt"),
+            contract_hash: ContentHash::of_bytes(b"fixture-contract"),
+            topology_hash: ContentHash::of_bytes(b"fixture-topology"),
+            decision_policy_hash: ContentHash::of_bytes(b"fixture-decision"),
+            execution_policy_hash: ContentHash::of_bytes(b"fixture-execution"),
+            evaluation_policy_hash: ContentHash::of_bytes(b"fixture-evaluation"),
+            market_data_feed: "iex".to_owned(),
+            broker_account_id: "fixture-account".to_owned(),
+            maximum_notional: MoneyMicros::from_usd_cents(100_000),
+            allowed_session_start: session,
+            allowed_session_end: session,
+            expires_at: now + Duration::hours(8),
+            created_at: now,
+        };
+        let manifest_hash = manifest_payload.manifest_hash().unwrap();
+        let manifest = Artifact::new(
+            ArtifactKind::RuntimeManifest,
+            store.put_json(&manifest_payload).unwrap(),
+            "runtime.manifest",
+            ArtifactLifecycle::Canonical,
+            provenance(now),
+            None,
+            vec![],
+            now,
+        )
+        .unwrap();
+        let mut approval_payload = PaperLaunchApproval {
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
+            operator_identity: "fixture-operator".to_owned(),
+            runtime_manifest: ArtifactRef {
+                artifact_id: manifest.artifact_id.clone(),
+                kind: ArtifactKind::RuntimeManifest,
+            },
+            runtime_manifest_hash: manifest_hash,
+            scope: PaperApprovalScope::Canary,
+            reason: "fixture approval".to_owned(),
+            approved_at: now,
+            expires_at: manifest_payload.expires_at,
+            approval_hash: ContentHash::of_bytes(b"pending"),
+        };
+        approval_payload.approval_hash = approval_payload.unsigned_hash().unwrap();
+        let approval = Artifact::new(
+            ArtifactKind::PaperLaunchApproval,
+            store.put_json(&approval_payload).unwrap(),
+            "operator.paper_approval",
+            ArtifactLifecycle::Canonical,
+            provenance(now),
+            None,
+            vec![approval_payload.runtime_manifest.clone()],
+            now,
+        )
+        .unwrap();
+        store
+            .reserve_paper_session_with_approval(
+                lease,
+                &SessionReservation {
+                    session_key: SESSION_KEY.to_owned(),
+                    workflow,
+                    setup_artifacts: vec![],
+                    reserved_at: now,
+                },
+                &proposal,
+                &manifest,
+                &approval,
+            )
+            .unwrap();
+    }
+
     fn fixture_plan(
         now: DateTime<Utc>,
         decision_context: ArtifactRef,
@@ -367,12 +500,13 @@ mod tests {
         let mut target = TargetPortfolio::zeroed();
         target.weights.insert(Asset::Qqq, WeightPpm(100_000));
         let mut plan = crate::ExecutionPlan {
-            schema_version: V2_SCHEMA_VERSION,
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
             decision_context,
             account_snapshot,
             quote_snapshot,
             market_clock_snapshot,
             policy_hash: ContentHash::of_bytes(b"fixture-policy"),
+            maximum_total_notional: crate::MoneyMicros::from_usd_cents(100_000),
             target: target.clone(),
             orders: vec![crate::OrderIntent {
                 asset: Asset::Qqq,
@@ -384,7 +518,7 @@ mod tests {
             net_exposure_ppm: 100_000,
             factor_exposure: FactorExposure::from_target(&target).unwrap(),
             turnover_ppm: 100_000,
-            broker_session: "paper:fixture".to_owned(),
+            broker_session: SESSION_KEY.to_owned(),
             created_at: now,
             plan_hash: ContentHash::of_bytes(b"pending"),
         };
@@ -429,17 +563,7 @@ mod tests {
             graph: graph_artifact,
             nodes: graph.nodes,
         };
-        store
-            .reserve_session_slot(
-                &lease,
-                &SessionReservation {
-                    session_key: "paper:fixture".to_owned(),
-                    workflow,
-                    setup_artifacts: vec![],
-                    reserved_at: now,
-                },
-            )
-            .unwrap();
+        reserve_approved_slot(&store, &lease, workflow, now);
         let permit = store
             .claim_next_task("fixture", now, Duration::seconds(30))
             .unwrap()
@@ -510,7 +634,7 @@ mod tests {
             kind: ArtifactKind::ExecutionPlan,
         };
         let execution_context_payload = ExecutionContext {
-            schema_version: V2_SCHEMA_VERSION,
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
             run_id: permit.run_id.clone(),
             decision_context: allocation.decision_context.clone(),
             account_snapshot: Some(allocation.account_snapshot.clone()),
@@ -587,7 +711,7 @@ mod tests {
             lease,
             permit,
             verdict: verdict_ref,
-            session_key: "paper:fixture".to_owned(),
+            session_key: SESSION_KEY.to_owned(),
             now,
         };
         let runtime = V2PaperCommitmentRuntime::new(store.clone());
@@ -600,7 +724,7 @@ mod tests {
         assert_eq!(retry.commitment.artifact_id, first.commitment.artifact_id);
         assert_eq!(
             store
-                .session_slot("paper:fixture")
+                .session_slot(SESSION_KEY)
                 .unwrap()
                 .unwrap()
                 .commitment_artifact_id,
@@ -719,7 +843,7 @@ mod tests {
             ArtifactKind::FreezeState,
             store
                 .put_json(&FreezeState {
-                    schema_version: V2_SCHEMA_VERSION,
+                    schema_version: V2_DOMAIN_SCHEMA_VERSION,
                     frozen: true,
                     reason: "fixture safety freeze".to_owned(),
                     changed_at: now,

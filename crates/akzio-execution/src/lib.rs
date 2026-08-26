@@ -8,6 +8,7 @@ pub mod paper_commitment;
 pub mod policy;
 pub mod reconciliation;
 pub mod reprice;
+pub mod snapshot;
 
 pub use allocation::{AllocationError, AllocationInput, V2AllocationRuntime};
 pub use decision_gate::{
@@ -28,6 +29,7 @@ pub use reconciliation::{
     ReconciliationError, ReconciliationInput, ReconciliationOutput, V2ReconciliationRuntime,
 };
 pub use reprice::{RepriceError, RepriceInput, RepriceOutput, V2RepriceRuntime};
+pub use snapshot::{ExecutionSnapshotPayload, SnapshotArtifactError, SnapshotArtifactMaterializer};
 
 use std::collections::BTreeSet;
 
