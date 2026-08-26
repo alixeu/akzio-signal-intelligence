@@ -8,7 +8,7 @@ use std::{
 
 use akzio_domain::{
     Artifact, ArtifactKind, ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef,
-    AttemptId, ClaimStance, ContractPurpose, DomainError, EvidenceNeed, FailureDisposition,
+    Asset, AttemptId, ClaimStance, ContractPurpose, DomainError, EvidenceNeed, FailureDisposition,
     LifecycleEventType, ResearchClaim, RetryPolicy, RunId, RunPurpose, RuntimeTaskClass,
     TaskBudget, TaskId, TaskRecipe, TaskRecipeId, TaskStatus, WorkflowGraph, WorkflowNode,
     WorkflowProposal, WorkflowProposalDraft, WorkflowProposalTask, WorkflowStatus,
@@ -150,11 +150,21 @@ struct ReplayedWorkflow {
 pub struct WorkflowRuntime {
     store: V2Store,
     catalogue: RecipeCatalogue,
+    fixture_mode: bool,
 }
 
 impl WorkflowRuntime {
     pub fn new(store: V2Store, catalogue: RecipeCatalogue) -> Self {
-        Self { store, catalogue }
+        Self {
+            store,
+            catalogue,
+            fixture_mode: false,
+        }
+    }
+
+    pub fn with_fixture_mode(mut self, enabled: bool) -> Self {
+        self.fixture_mode = enabled;
+        self
     }
 
     pub fn catalogue(&self) -> &RecipeCatalogue {

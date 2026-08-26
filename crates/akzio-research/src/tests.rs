@@ -115,7 +115,7 @@ fn only_invalid_output_errors_request_task_retry() {
 fn read_tool_is_hidden_when_selected_context_exceeds_tool_budget() {
     assert!(should_advertise_read_tools(RunPurpose::Paper, 4, 4));
     assert!(!should_advertise_read_tools(RunPurpose::Paper, 10, 4));
-    assert!(!should_advertise_read_tools(RunPurpose::Debug, 1, 4));
+    assert!(should_advertise_read_tools(RunPurpose::Debug, 1, 4));
 }
 
 #[test]
@@ -716,7 +716,7 @@ impl AgentModel for ToolCountModel {
 }
 
 #[tokio::test]
-async fn debug_run_does_not_advertise_read_artifact_tool() {
+async fn debug_run_advertises_read_artifact_tool() {
     let fixture = fixture_with(|_| {});
     let tool_count = Arc::new(AtomicU8::new(u8::MAX));
     let model = ToolCountModel {
@@ -744,7 +744,7 @@ async fn debug_run_does_not_advertise_read_artifact_tool() {
         .unwrap();
 
     assert_eq!(output.kind, ArtifactKind::Claim);
-    assert_eq!(tool_count.load(Ordering::SeqCst), 0);
+    assert_eq!(tool_count.load(Ordering::SeqCst), 1);
 }
 
 #[derive(Debug)]

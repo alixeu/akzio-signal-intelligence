@@ -1189,7 +1189,7 @@ async fn wait_for_parent_stdin_eof() -> Result<()> {
 }
 
 async fn fixture_debug(config: Config) -> Result<()> {
-    let report = run_fixture_purpose(config, RunPurpose::Debug).await?;
+    let report = run_fixture_purpose(config, RunPurpose::PaperDryRun).await?;
     if report.status != WorkflowStatus::Completed {
         bail!(
             "fixture Debug workflow did not complete: {:?}",

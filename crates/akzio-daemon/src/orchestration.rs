@@ -33,6 +33,7 @@ impl Daemon {
             model.clone(),
             FixtureEvidence::new(),
             debug,
+            false,
         )?;
         daemon.model = ModelClientAdapter::with_response_language(
             model.clone(),
@@ -80,7 +81,7 @@ impl Daemon {
         model: ModelClient,
         fixture_evidence: FixtureEvidence,
     ) -> Result<Self> {
-        Self::with_fixture_evidence_debug(config, model, fixture_evidence, false)
+        Self::with_fixture_evidence_debug(config, model, fixture_evidence, false, true)
     }
 
     fn with_fixture_evidence_debug(
@@ -88,10 +89,12 @@ impl Daemon {
         model: ModelClient,
         fixture_evidence: FixtureEvidence,
         model_debug: bool,
+        fixture_mode: bool,
     ) -> Result<Self> {
         let store = V2Store::open(&config.store_root)?;
         let active = ActiveResearchCatalogue::install(&store, Utc::now())?;
-        let workflow = WorkflowRuntime::new(store.clone(), active.recipes);
+        let workflow =
+            WorkflowRuntime::new(store.clone(), active.recipes).with_fixture_mode(fixture_mode);
         let (reasoning_events, _) = broadcast::channel(1_024);
         let agents = AgentRuntime::new(store.clone(), active.contracts, Duration::minutes(5))
             .with_reasoning_events(reasoning_events.clone());
@@ -114,6 +117,7 @@ impl Daemon {
             stage_models: Arc::new(BTreeMap::new()),
             reasoning_events,
             fixture_evidence: Arc::new(fixture_evidence),
+            fixture_mode,
             production_evidence: Arc::new(BTreeMap::new()),
             decision_runtime,
             execution_runtime,

@@ -42,6 +42,7 @@ impl WorkflowRuntime {
             prepare_debug_draft(
                 &mut draft,
                 self.catalogue.recipe(&synthesizer_recipe).is_ok(),
+                self.fixture_mode || purpose == RunPurpose::PaperDryRun,
             )?;
         }
         draft.validate(&self.catalogue.recipes)?;
@@ -134,6 +135,7 @@ impl WorkflowRuntime {
             prepare_debug_draft(
                 &mut draft,
                 self.catalogue.recipe(&synthesizer_recipe).is_ok(),
+                self.fixture_mode || purpose == RunPurpose::PaperDryRun,
             )?;
         }
         self.insert_structured_critic(&mut draft)?;
@@ -815,6 +817,7 @@ impl WorkflowRuntime {
 pub(super) fn prepare_debug_draft(
     draft: &mut WorkflowProposalDraft,
     has_synthesizer_recipe: bool,
+    fixture_mode: bool,
 ) -> RuntimeResult<()> {
     if draft.tasks.is_empty() {
         draft.tasks.insert(
@@ -843,7 +846,7 @@ pub(super) fn prepare_debug_draft(
     for task in draft.tasks.values_mut() {
         task.depends_on
             .retain(|dependency| aliases.contains(dependency));
-        if task.recipe_id.as_str() == ANALYST_RECIPE_ID {
+        if task.recipe_id.as_str() == ANALYST_RECIPE_ID && fixture_mode {
             task.evidence_needs.retain(|need| {
                 need.source_family == DEBUG_FIXTURE_SOURCE
                     && need.resource == DEBUG_FIXTURE_RESOURCE
@@ -865,11 +868,36 @@ pub(super) fn prepare_debug_draft(
         return Ok(());
     }
 
-    let debug_need = EvidenceNeed {
-        schema_version: V2_DOMAIN_SCHEMA_VERSION,
-        source_family: DEBUG_FIXTURE_SOURCE.to_owned(),
-        resource: DEBUG_FIXTURE_RESOURCE.to_owned(),
-        max_age_secs: DEBUG_FIXTURE_MAX_AGE_SECS,
+    let default_needs = if fixture_mode {
+        vec![EvidenceNeed {
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
+            source_family: DEBUG_FIXTURE_SOURCE.to_owned(),
+            resource: DEBUG_FIXTURE_RESOURCE.to_owned(),
+            max_age_secs: DEBUG_FIXTURE_MAX_AGE_SECS,
+        }]
+    } else {
+        let start = (Utc::now().date_naive() - Duration::days(28)).format("%Y-%m-%d");
+        [
+            "paper.account",
+            "paper.positions",
+            "paper.open_orders",
+            "paper.clock",
+            "paper.quotes",
+        ]
+        .into_iter()
+        .map(|resource| EvidenceNeed {
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
+            source_family: DEBUG_FIXTURE_SOURCE.to_owned(),
+            resource: resource.to_owned(),
+            max_age_secs: DEBUG_FIXTURE_MAX_AGE_SECS,
+        })
+        .chain(Asset::EXECUTABLE.into_iter().map(|asset| EvidenceNeed {
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
+            source_family: DEBUG_FIXTURE_SOURCE.to_owned(),
+            resource: format!("bars:{}:1d:{start}:32", asset.symbol()),
+            max_age_secs: DEBUG_FIXTURE_MAX_AGE_SECS,
+        }))
+        .collect()
     };
     let mut injected_need = false;
     for task in draft
@@ -878,7 +906,7 @@ pub(super) fn prepare_debug_draft(
         .filter(|task| task.recipe_id.as_str() == ANALYST_RECIPE_ID)
     {
         if task.evidence_needs.is_empty() && task.research_intents.is_empty() {
-            task.evidence_needs.push(debug_need.clone());
+            task.evidence_needs.extend(default_needs.iter().cloned());
             injected_need = true;
         }
     }
@@ -955,5 +983,38 @@ mod tests {
         WorkflowRuntime::normalize_paper_evidence_needs(&mut needs);
 
         assert_eq!(needs[0].resource, "bars:QQQ:1d:2026-07-24:32");
+    }
+
+    #[test]
+    fn production_debug_draft_injects_governed_alpaca_evidence() {
+        let mut draft = WorkflowProposalDraft {
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
+            topology_id: "active".to_owned(),
+            tasks: BTreeMap::from([(
+                "analyst".to_owned(),
+                akzio_domain::WorkflowProposalDraftTask {
+                    recipe_id: TaskRecipeId::new(ANALYST_RECIPE_ID).unwrap(),
+                    objective: "Inspect production evidence".to_owned(),
+                    depends_on: Vec::new(),
+                    priority: 80,
+                    evidence_needs: Vec::new(),
+                    research_intents: Vec::new(),
+                },
+            )]),
+            stop_reason: None,
+        };
+
+        prepare_debug_draft(&mut draft, false, false).unwrap();
+
+        let needs = &draft.tasks["analyst"].evidence_needs;
+        assert_eq!(needs.len(), 9);
+        assert!(needs.iter().all(|need| need.source_family == "alpaca"));
+        assert!(needs.iter().any(|need| need.resource == "paper.account"));
+        assert!(needs.iter().any(|need| {
+            need.resource.starts_with("bars:TQQQ:1d:") && need.resource.ends_with(":32")
+        }));
+        assert!(needs
+            .iter()
+            .all(|need| !need.resource.starts_with("fixture:")));
     }
 }

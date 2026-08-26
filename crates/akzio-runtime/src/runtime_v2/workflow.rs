@@ -20,7 +20,13 @@ impl WorkflowRuntime {
         }
         let recipe = self.catalogue.recipe(&self.catalogue.planner)?;
         let objective = match purpose {
-            RunPurpose::Debug | RunPurpose::PaperDryRun => {
+            RunPurpose::Debug if self.fixture_mode => {
+                "Run a bounded real-LLM debug workflow against governed TQQQ fixture evidence."
+            }
+            RunPurpose::Debug => {
+                "Run a bounded real-LLM debug workflow against production governed evidence."
+            }
+            RunPurpose::PaperDryRun => {
                 "Run a bounded real-LLM debug workflow against governed TQQQ fixture evidence."
             }
             _ => "Produce bounded workflow proposal",

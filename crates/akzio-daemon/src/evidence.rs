@@ -50,10 +50,9 @@ impl Daemon {
                 resource: need.resource.clone(),
                 max_age: Duration::seconds(max_age_secs),
             };
-            let use_debug_fixture = matches!(
-                self.store.run_purpose(&task.run_id)?,
-                RunPurpose::Debug | RunPurpose::PaperDryRun
-            ) && source == EvidenceSource::Alpaca;
+            let purpose = self.store.run_purpose(&task.run_id)?;
+            let use_debug_fixture =
+                purpose == RunPurpose::PaperDryRun && source == EvidenceSource::Alpaca;
             let production_adapter = (!use_debug_fixture)
                 .then(|| self.production_evidence.get(&source))
                 .flatten();
@@ -68,16 +67,20 @@ impl Daemon {
                     )
                     .await?
             } else {
+                if purpose == RunPurpose::Debug && !self.fixture_mode {
+                    return Err(DaemonError::Unavailable(format!(
+                        "real Debug evidence adapter is not configured for source {}",
+                        source.as_str()
+                    )));
+                }
                 let mut responses = self
                     .fixture_evidence
                     .get(&source)
                     .cloned()
                     .unwrap_or_default();
-                if matches!(
-                    self.store.run_purpose(&task.run_id)?,
-                    RunPurpose::Debug | RunPurpose::PaperDryRun
-                ) && source == EvidenceSource::Alpaca
-                {
+                let allow_fixture_evidence = purpose == RunPurpose::PaperDryRun
+                    || (purpose == RunPurpose::Debug && self.fixture_mode);
+                if allow_fixture_evidence && source == EvidenceSource::Alpaca {
                     responses
                         .entry(need.resource.clone())
                         .or_insert_with(|| debug_fixture_evidence(&need.resource, now));

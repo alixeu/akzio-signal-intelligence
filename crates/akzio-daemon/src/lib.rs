@@ -200,6 +200,7 @@ pub struct Daemon {
     stage_models: Arc<BTreeMap<String, ModelClientAdapter>>,
     reasoning_events: broadcast::Sender<AgentReasoningEvent>,
     fixture_evidence: Arc<FixtureEvidence>,
+    fixture_mode: bool,
     production_evidence: Arc<BTreeMap<EvidenceSource, Arc<dyn AsyncEvidenceAdapter>>>,
     decision_runtime: V2DecisionRuntime,
     execution_runtime: V2ExecutionRuntime,
