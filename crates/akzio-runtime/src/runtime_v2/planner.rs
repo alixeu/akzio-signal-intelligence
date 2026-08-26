@@ -171,6 +171,7 @@ impl WorkflowRuntime {
             if purpose == RunPurpose::Paper {
                 Self::normalize_paper_evidence_needs(&mut declared_needs);
             }
+            let declared_needs = declared_needs.into_iter().collect::<BTreeSet<_>>();
             let mut evidence_needs = Vec::with_capacity(declared_needs.len());
             for need in declared_needs {
                 let artifact = if let Some(artifact) = need_artifacts.get(&need) {
@@ -905,7 +906,15 @@ pub(super) fn prepare_debug_draft(
         .values_mut()
         .filter(|task| task.recipe_id.as_str() == ANALYST_RECIPE_ID)
     {
-        if task.evidence_needs.is_empty() && task.research_intents.is_empty() {
+        let has_alpaca_need = task
+            .evidence_needs
+            .iter()
+            .any(|need| need.source_family == DEBUG_FIXTURE_SOURCE)
+            || task
+                .research_intents
+                .iter()
+                .any(|intent| intent.source_family == DEBUG_FIXTURE_SOURCE);
+        if !has_alpaca_need {
             task.evidence_needs.extend(default_needs.iter().cloned());
             injected_need = true;
         }
@@ -1016,5 +1025,37 @@ mod tests {
         assert!(needs
             .iter()
             .all(|need| !need.resource.starts_with("fixture:")));
+    }
+
+    #[test]
+    fn production_debug_draft_keeps_model_need_and_adds_alpaca_defaults() {
+        let mut draft = WorkflowProposalDraft {
+            schema_version: V2_DOMAIN_SCHEMA_VERSION,
+            topology_id: "active".to_owned(),
+            tasks: BTreeMap::from([(
+                "analyst".to_owned(),
+                akzio_domain::WorkflowProposalDraftTask {
+                    recipe_id: TaskRecipeId::new(ANALYST_RECIPE_ID).unwrap(),
+                    objective: "Inspect production evidence".to_owned(),
+                    depends_on: Vec::new(),
+                    priority: 80,
+                    evidence_needs: vec![EvidenceNeed {
+                        schema_version: V2_DOMAIN_SCHEMA_VERSION,
+                        source_family: "news_web".to_owned(),
+                        resource: "authorized production debugging artifacts".to_owned(),
+                        max_age_secs: DEBUG_FIXTURE_MAX_AGE_SECS,
+                    }],
+                    research_intents: Vec::new(),
+                },
+            )]),
+            stop_reason: None,
+        };
+
+        prepare_debug_draft(&mut draft, false, false).unwrap();
+
+        let needs = &draft.tasks["analyst"].evidence_needs;
+        assert_eq!(needs.len(), 10);
+        assert!(needs.iter().any(|need| need.source_family == "news_web"));
+        assert!(needs.iter().any(|need| need.resource == "paper.account"));
     }
 }
