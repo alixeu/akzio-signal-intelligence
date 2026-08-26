@@ -219,6 +219,7 @@ impl AlpacaPaper {
         let client = Client::builder()
             .http1_only()
             .local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+            .connect_timeout(std::time::Duration::from_secs(15))
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|source| PaperError::Transport {
