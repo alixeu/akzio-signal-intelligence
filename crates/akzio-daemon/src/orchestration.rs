@@ -614,9 +614,20 @@ impl Daemon {
         campaign_id: &ContentHash,
     ) -> Result<akzio_store::v2::CanaryCampaignHead> {
         let now = Utc::now();
-        let _lease = self.paper.scheduler.active_lease(now)?;
-        self.store
+        let lease = self.paper.scheduler.active_lease(now)?;
+        let current = self
+            .store
             .canary_campaign(campaign_id)?
-            .ok_or_else(|| DaemonError::InvalidInput("canary campaign not found".to_owned()))
+            .ok_or_else(|| DaemonError::InvalidInput("canary campaign not found".to_owned()))?;
+        if current.status == akzio_domain::CanaryCampaignStatus::Staged {
+            return Ok(self.store.transition_canary_campaign(
+                &lease,
+                campaign_id,
+                akzio_domain::CanaryCampaignStatus::Staged,
+                akzio_domain::CanaryVerdict::Advance,
+                now,
+            )?);
+        }
+        Ok(current)
     }
 }
