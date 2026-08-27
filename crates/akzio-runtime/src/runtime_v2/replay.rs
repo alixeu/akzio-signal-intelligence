@@ -45,33 +45,6 @@ impl WorkflowRuntime {
 
     /// Replay an immutable graph revision through the event reducer and the
     /// current v2 invariants. This never trusts a revision row by itself.
-    pub fn replay_revision(
-        &self,
-        run_id: &RunId,
-        revision: u64,
-    ) -> RuntimeResult<WorkflowRevision> {
-        let replay = self.reduce_history(run_id)?;
-        self.validate_replay_revisions(run_id, &replay)?;
-        let reduced = replay.revisions.get(revision as usize).ok_or_else(|| {
-            Self::replay_error(
-                run_id,
-                format!("missing graph revision {revision} in event stream"),
-            )
-        })?;
-        let durable = self.store.workflow_revision(run_id, revision)?;
-        if durable.graph_artifact != reduced.graph_artifact
-            || durable.graph != reduced.graph
-            || durable.created_at != reduced.created_at
-        {
-            return Err(Self::replay_error(
-                run_id,
-                format!("revision {revision} differs from its workflow event"),
-            ));
-        }
-        self.validate_compiled_graph(self.store.run_purpose(run_id)?, &durable.graph)?;
-        Ok(durable)
-    }
-
     pub(super) fn reduce_history(&self, run_id: &RunId) -> RuntimeResult<ReplayedWorkflow> {
         let events = self.replay_events(run_id)?;
         let mut replay = ReplayedWorkflow::default();

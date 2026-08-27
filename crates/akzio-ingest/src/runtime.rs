@@ -461,18 +461,21 @@ pub struct EvidenceBundle {
     pub normalized: Artifact,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct DetailInput {
-    pub normalized: ArtifactRef,
-    pub value: Value,
-}
-
 #[path = "adapters.rs"]
 mod adapters;
 pub use adapters::{
     AlpacaMarketDataFeed, AlpacaPaperEvidenceTransport, AsyncEvidenceAdapter, EvidenceAdapter,
-    EvidenceAdapterError, FixtureEvidenceAdapter, ModelNativeWebEvidenceTransport,
+    EvidenceAdapterError, FixtureEvidenceAdapter,
 };
+
+pub fn model_native_web_evidence_transport(
+    client: ModelClient,
+    source: EvidenceSource,
+) -> std::sync::Arc<dyn AsyncEvidenceAdapter> {
+    std::sync::Arc::new(adapters::ModelNativeWebEvidenceTransport::for_source(
+        client, source,
+    ))
+}
 #[derive(Debug, Error)]
 pub enum EvidenceRuntimeError {
     #[error(transparent)]
@@ -512,243 +515,8 @@ pub struct EvidenceRuntime {
     store: V2Store,
     allowed_sources: BTreeSet<EvidenceSource>,
 }
-
-impl EvidenceRuntime {
-    pub fn new(store: V2Store, allowed_sources: impl IntoIterator<Item = EvidenceSource>) -> Self {
-        Self {
-            store,
-            allowed_sources: allowed_sources.into_iter().collect(),
-        }
-    }
-
-    pub fn store(&self) -> &V2Store {
-        &self.store
-    }
-
-    /// Construct raw and normalized evidence artifacts. The caller returns
-    /// them to `TaskRuntime`, which atomically commits the attempt.
-    pub fn acquire_and_normalize<A: EvidenceAdapter + ?Sized>(
-        &self,
-        permit: &TaskWritePermit,
-        need: &ArtifactRef,
-        request: &EvidenceRequest,
-        adapter: &A,
-        now: DateTime<Utc>,
-    ) -> EvidenceRuntimeResult<EvidenceBundle> {
-        self.authorize_request(permit, need, request, adapter.source())?;
-        let acquired = adapter.acquire(request)?;
-        self.materialize_acquired(permit, need, request, acquired, 1_000_000, now)
-    }
-
-    pub async fn acquire_and_normalize_async<A: AsyncEvidenceAdapter + ?Sized>(
-        &self,
-        permit: &TaskWritePermit,
-        need: &ArtifactRef,
-        request: &EvidenceRequest,
-        adapter: &A,
-        now: DateTime<Utc>,
-    ) -> EvidenceRuntimeResult<EvidenceBundle> {
-        self.authorize_request(permit, need, request, adapter.source())?;
-        let acquired = adapter.acquire(request).await?;
-        let confidence_ppm = acquired.quality.completeness_ppm;
-        self.materialize_acquired(permit, need, request, acquired, confidence_ppm, now)
-    }
-
-    fn authorize_request(
-        &self,
-        permit: &TaskWritePermit,
-        need: &ArtifactRef,
-        request: &EvidenceRequest,
-        adapter_source: EvidenceSource,
-    ) -> EvidenceRuntimeResult<()> {
-        request.validate()?;
-        if need.kind != ArtifactKind::EvidenceNeed {
-            return Err(EvidenceRuntimeError::InvalidEvidenceNeed);
-        }
-        let need_artifact = self.store.artifact(&need.artifact_id)?;
-        if need_artifact.kind != ArtifactKind::EvidenceNeed
-            || need_artifact
-                .origin
-                .as_ref()
-                .and_then(|origin| origin.run_id.as_ref())
-                != Some(&permit.run_id)
-        {
-            return Err(EvidenceRuntimeError::InvalidEvidenceNeed);
-        }
-        let declared: EvidenceNeed =
-            serde_json::from_slice(&self.store.read_blob(&need_artifact.blob)?)?;
-        declared.validate()?;
-        let declared_max_age = i64::try_from(declared.max_age_secs)
-            .map(Duration::seconds)
-            .map_err(|_| EvidenceRuntimeError::InvalidEvidenceNeed)?;
-        if declared.source_family != request.source.as_str()
-            || declared.resource != request.resource
-            || declared_max_age != request.max_age
-        {
-            return Err(EvidenceRuntimeError::InvalidEvidenceNeed);
-        }
-        if !self.allowed_sources.contains(&request.source) {
-            return Err(EvidenceRuntimeError::SourceNotAllowed(request.source));
-        }
-        if adapter_source != request.source {
-            return Err(EvidenceAdapterError::SourceMismatch.into());
-        }
-        Ok(())
-    }
-
-    fn materialize_acquired(
-        &self,
-        permit: &TaskWritePermit,
-        need: &ArtifactRef,
-        request: &EvidenceRequest,
-        acquired: AcquiredEvidence,
-        confidence_ppm: u32,
-        now: DateTime<Utc>,
-    ) -> EvidenceRuntimeResult<EvidenceBundle> {
-        Self::validate_acquisition(&acquired, request, now)?;
-
-        let raw = self.materialize_raw(permit, request, &acquired, now)?;
-        let raw_ref = ArtifactRef {
-            artifact_id: raw.artifact_id.clone(),
-            kind: ArtifactKind::RawEvidence,
-        };
-        let normalized_payload = NormalizedEvidencePayload {
-            schema_version: V2_DOMAIN_SCHEMA_VERSION,
-            source: request.source,
-            resource: request.resource.clone(),
-            need: need.clone(),
-            raw: raw_ref.clone(),
-            observed_at: acquired.observed_at,
-            value: acquired.normalized.clone(),
-            provenance: acquired.provenance.clone(),
-            quality: acquired.quality.clone(),
-        };
-        let normalized = Artifact::new(
-            ArtifactKind::NormalizedEvidence,
-            self.store.put_json(&normalized_payload)?,
-            format!("akzio.ingest.{}.normalized", request.source.as_str()),
-            ArtifactLifecycle::RunScoped,
-            ArtifactProvenance {
-                source_family: request.source.as_str().to_owned(),
-                observed_at: Some(acquired.observed_at),
-                retrieved_at: now,
-                source_uri: Some(acquired.source_uri.clone()),
-                confidence_ppm,
-                producer_contract_hash: permit.contract_hash.clone(),
-            },
-            Some(permit.artifact_origin()),
-            vec![raw_ref, need.clone()],
-            now,
-        )?;
-        Ok(EvidenceBundle { raw, normalized })
-    }
-
-    fn validate_acquisition(
-        acquired: &AcquiredEvidence,
-        request: &EvidenceRequest,
-        now: DateTime<Utc>,
-    ) -> EvidenceRuntimeResult<()> {
-        if acquired.raw.is_empty()
-            || acquired.media_type.trim().is_empty()
-            || acquired.source_uri.trim().is_empty()
-        {
-            return Err(EvidenceRuntimeError::InvalidAcquisition);
-        }
-        acquired.provenance.validate(
-            acquired.raw.len(),
-            &acquired.source_uri,
-            acquired.observed_at,
-        )?;
-        acquired.quality.validate()?;
-        Self::validate_source_uri(&acquired.source_uri)?;
-        if now.signed_duration_since(acquired.observed_at) > request.max_age {
-            return Err(EvidenceRuntimeError::StaleEvidence);
-        }
-        Ok(())
-    }
-
-    fn materialize_raw(
-        &self,
-        permit: &TaskWritePermit,
-        request: &EvidenceRequest,
-        acquired: &AcquiredEvidence,
-        now: DateTime<Utc>,
-    ) -> EvidenceRuntimeResult<Artifact> {
-        Ok(Artifact::new(
-            ArtifactKind::RawEvidence,
-            self.store.put_bytes(&acquired.raw, &acquired.media_type)?,
-            format!("akzio.ingest.{}.raw", request.source.as_str()),
-            ArtifactLifecycle::RunScoped,
-            ArtifactProvenance {
-                source_family: request.source.as_str().to_owned(),
-                observed_at: Some(acquired.observed_at),
-                retrieved_at: now,
-                source_uri: Some(acquired.source_uri.clone()),
-                confidence_ppm: 1_000_000,
-                producer_contract_hash: permit.contract_hash.clone(),
-            },
-            Some(permit.artifact_origin()),
-            vec![],
-            now,
-        )?)
-    }
-
-    /// Materialize a loss-bounded semantic detail in a separate task. The
-    /// caller must cite an already sealed normalized artifact.
-    pub fn materialize_detail(
-        &self,
-        permit: &TaskWritePermit,
-        input: DetailInput,
-        now: DateTime<Utc>,
-    ) -> EvidenceRuntimeResult<Artifact> {
-        if input.normalized.kind != ArtifactKind::NormalizedEvidence {
-            return Err(EvidenceRuntimeError::DetailRequiresNormalizedEvidence);
-        }
-        let normalized = self.store.artifact(&input.normalized.artifact_id)?;
-        if normalized.kind != ArtifactKind::NormalizedEvidence {
-            return Err(EvidenceRuntimeError::DetailRequiresNormalizedEvidence);
-        }
-        let detail = Artifact::new(
-            ArtifactKind::SemanticDetail,
-            self.store.put_json(&input.value)?,
-            "akzio.ingest.semantic_detail",
-            ArtifactLifecycle::RunScoped,
-            ArtifactProvenance {
-                source_family: normalized.provenance.source_family.clone(),
-                observed_at: normalized.provenance.observed_at,
-                retrieved_at: now,
-                source_uri: normalized.provenance.source_uri.clone(),
-                confidence_ppm: normalized.provenance.confidence_ppm,
-                producer_contract_hash: permit.contract_hash.clone(),
-            },
-            Some(permit.artifact_origin()),
-            vec![input.normalized],
-            now,
-        )?;
-        Ok(detail)
-    }
-
-    fn validate_source_uri(source_uri: &str) -> EvidenceRuntimeResult<()> {
-        let parsed = Url::parse(source_uri).map_err(|_| EvidenceRuntimeError::UnsafeSourceUri)?;
-        if parsed.username() != ""
-            || parsed.password().is_some()
-            || parsed.fragment().is_some()
-            || parsed.query_pairs().any(|(key, _)| {
-                let key = key.to_ascii_lowercase();
-                key.contains("token")
-                    || key.contains("secret")
-                    || key.contains("password")
-                    || key.contains("api_key")
-                    || key == "key"
-                    || key.contains("authorization")
-            })
-        {
-            return Err(EvidenceRuntimeError::UnsafeSourceUri);
-        }
-        Ok(())
-    }
-}
-
+include!("runtime_parts/materialize_raw.rs");
+include!("runtime_parts/materialize_normalized.rs");
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;

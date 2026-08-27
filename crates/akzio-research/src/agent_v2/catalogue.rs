@@ -1,6 +1,4 @@
 use super::*;
-use akzio_domain::LEARNING_OUTCOME_WORKER_RECIPE_ID;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledContract {
     pub contract: AgentContract,
@@ -86,36 +84,6 @@ pub(super) const PLANNER_MAX_DRAFT_TASKS: u16 = 7;
 pub(super) const RFC3339_TIMESTAMP_PATTERN: &str =
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$";
 
-#[derive(Debug, Clone, Copy)]
-pub(super) struct ActiveRecipePolicy {
-    pub(super) purpose: &'static str,
-    pub(super) output_kind: ArtifactKind,
-    pub(super) priority_ceiling: u8,
-}
-
-pub(super) const ACTIVE_RECIPE_POLICIES: [ActiveRecipePolicy; 4] = [
-    ActiveRecipePolicy {
-        purpose: PLANNER_RECIPE_ID,
-        output_kind: ArtifactKind::WorkflowProposalDraft,
-        priority_ceiling: 100,
-    },
-    ActiveRecipePolicy {
-        purpose: "research.analyst",
-        output_kind: ArtifactKind::Claim,
-        priority_ceiling: 90,
-    },
-    ActiveRecipePolicy {
-        purpose: "research.critic",
-        output_kind: ArtifactKind::Critique,
-        priority_ceiling: 80,
-    },
-    ActiveRecipePolicy {
-        purpose: "research.synthesizer",
-        output_kind: ArtifactKind::DecisionProposal,
-        priority_ceiling: 100,
-    },
-];
-
 #[derive(Debug, Clone, Default)]
 pub struct ContractCatalogue {
     by_hash: BTreeMap<akzio_domain::ContentHash, InstalledContract>,
@@ -150,7 +118,7 @@ impl ContractCatalogue {
             };
             let contract = stored.contract;
             contract.validate()?;
-            model_tool_definitions(store, &contract)?;
+            model_tool_definitions(&ContextBroker::new(store.clone()), &contract)?;
             if by_hash.contains_key(&contract.contract_hash) {
                 return Err(ResearchError::DuplicateContract(
                     contract.contract_hash.clone(),
@@ -240,98 +208,20 @@ impl ContractCatalogue {
     /// This method rejects unknown purposes and candidates that are not the
     /// current durable head rather than silently granting a new recipe.
     pub fn active_recipe_catalogue(&self, store: &V2Store) -> ResearchResult<RecipeCatalogue> {
-        let mut installed_purposes = BTreeSet::new();
-        let mut recipes = Vec::with_capacity(ACTIVE_RECIPE_POLICIES.len() + 6);
-
-        let mut outcome_worker_installed = false;
-        for installed in self.contracts() {
-            let purpose = installed.contract.purpose.as_str();
-            let Some(policy) = active_recipe_policy(purpose) else {
-                if purpose != LEARNING_OUTCOME_WORKER_RECIPE_ID {
-                    return Err(ResearchError::UnexpectedActiveContractPurpose(
-                        purpose.to_owned(),
-                    ));
-                }
-                if installed.contract.output.artifact_kind != ArtifactKind::RetrospectiveDraft {
-                    return Err(ResearchError::ActiveContractOutputMismatch {
-                        purpose: purpose.to_owned(),
-                        expected: ArtifactKind::RetrospectiveDraft,
-                        actual: installed.contract.output.artifact_kind,
-                    });
-                }
-                outcome_worker_installed = true;
-                recipes.push(TaskRecipe {
-                    recipe_id: TaskRecipeId::new(purpose)?,
-                    purpose: installed.contract.purpose.clone(),
-                    contract_hash: Some(installed.contract.contract_hash.clone()),
-                    task_class: RuntimeTaskClass::Evaluate,
-                    allowed_evidence_sources: recipe_evidence_sources(&installed.contract),
-                    max_children: 0,
-                    max_depth: 0,
-                    priority_ceiling: 100,
-                    budget: installed.contract.budget.clone(),
-                    retry: installed.contract.retry.clone(),
-                    on_failure: installed.contract.on_failure,
+        let contracts =
+            self.contracts()
+                .cloned()
+                .map(|installed| akzio_runtime::v2::ActiveContractRecipe {
+                    contract: installed.contract,
+                    artifact: installed.artifact,
                 });
-                continue;
-            };
-            if !installed_purposes.insert(purpose.to_owned()) {
-                return Err(ResearchError::DuplicateActiveContractPurpose(
-                    purpose.to_owned(),
-                ));
-            }
-            if installed.contract.output.artifact_kind != policy.output_kind {
-                return Err(ResearchError::ActiveContractOutputMismatch {
-                    purpose: purpose.to_owned(),
-                    expected: policy.output_kind,
-                    actual: installed.contract.output.artifact_kind,
-                });
-            }
-            let active = store
-                .active_contract(&installed.contract.purpose)?
-                .ok_or_else(|| ResearchError::NonCanonicalActiveContract(purpose.to_owned()))?;
-            if active.contract.contract_hash != installed.contract.contract_hash
-                || active.artifact != installed.artifact
-            {
-                return Err(ResearchError::NonCanonicalActiveContract(
-                    purpose.to_owned(),
-                ));
-            }
-
-            recipes.push(TaskRecipe {
-                recipe_id: TaskRecipeId::new(purpose)?,
-                purpose: installed.contract.purpose.clone(),
-                contract_hash: Some(installed.contract.contract_hash.clone()),
-                task_class: RuntimeTaskClass::Agent,
-                allowed_evidence_sources: recipe_evidence_sources(&installed.contract),
-                max_children: installed.contract.termination.max_child_tasks,
-                max_depth: installed.contract.termination.max_depth,
-                priority_ceiling: policy.priority_ceiling,
-                budget: installed.contract.budget.clone(),
-                retry: installed.contract.retry.clone(),
-                on_failure: installed.contract.on_failure,
-            });
-        }
-
-        for policy in ACTIVE_RECIPE_POLICIES {
-            if !installed_purposes.contains(policy.purpose) {
-                return Err(ResearchError::MissingActiveContract(policy.purpose));
-            }
-        }
-        if !outcome_worker_installed {
-            return Err(ResearchError::MissingActiveContract(
-                LEARNING_OUTCOME_WORKER_RECIPE_ID,
-            ));
-        }
-
-        let (terminal_recipes, terminals) = akzio_runtime::v2::rust_terminal_recipes()?;
-        recipes.extend(terminal_recipes);
-        Ok(RecipeCatalogue::new(
-            recipes,
+        akzio_runtime::v2::active_recipe_catalogue(
+            store,
+            contracts,
             TaskRecipeId::new(PLANNER_RECIPE_ID)?,
-            terminals,
             ACTIVE_RESEARCH_MAX_NODES,
-        )?)
+        )
+        .map_err(map_active_recipe_error)
     }
 
     /// Candidate contracts are data for later shadow evaluation. This gate
@@ -362,10 +252,47 @@ impl ContractCatalogue {
         now: DateTime<Utc>,
     ) -> ResearchResult<InstalledContract> {
         self.validate_candidate(active_contract_hash, candidate)?;
-        model_tool_definitions(store, candidate)?;
+        model_tool_definitions(&ContextBroker::new(store.clone()), candidate)?;
         let stored = store.install_candidate_contract(active_contract_hash, candidate, now)?;
         Ok(installed_contract(stored))
     }
+}
+
+fn map_active_recipe_error(error: RuntimeError) -> ResearchError {
+    match error {
+        RuntimeError::UnexpectedActiveContractPurpose(purpose) => {
+            ResearchError::UnexpectedActiveContractPurpose(purpose)
+        }
+        RuntimeError::DuplicateActiveContractPurpose(purpose) => {
+            ResearchError::DuplicateActiveContractPurpose(purpose)
+        }
+        RuntimeError::MissingActiveContract(purpose) => {
+            ResearchError::MissingActiveContract(purpose)
+        }
+        RuntimeError::ActiveContractOutputMismatch {
+            purpose,
+            expected,
+            actual,
+        } => ResearchError::ActiveContractOutputMismatch {
+            purpose,
+            expected,
+            actual,
+        },
+        RuntimeError::NonCanonicalActiveContract(purpose) => {
+            ResearchError::NonCanonicalActiveContract(purpose)
+        }
+        other => ResearchError::Runtime(other),
+    }
+}
+
+#[cfg(test)]
+pub(super) fn recipe_evidence_sources(contract: &AgentContract) -> BTreeSet<String> {
+    contract
+        .tool_grants
+        .iter()
+        .filter(|grant| grant.kind == ToolKind::ReadEvidence)
+        .flat_map(|grant| grant.allowed_sources.iter().cloned())
+        .collect()
 }
 
 fn installed_contract(stored: StoredContract) -> InstalledContract {

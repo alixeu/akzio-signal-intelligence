@@ -16,6 +16,112 @@ struct CanaryResumeRequest {
     campaign_id: ContentHash,
 }
 
+#[derive(Debug, Deserialize)]
+struct StoreBackupRequest {
+    target: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct StoreRestoreRequest {
+    source: PathBuf,
+    target: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct StoreExportRunRequest {
+    run_id: String,
+    target: PathBuf,
+    include_raw_model: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct StoreClaimNextRequest {
+    worker_id: String,
+    at: DateTime<Utc>,
+    lease_seconds: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct StoreRecoverExpiredRequest {
+    at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StoreEventsQuery {
+    after: Option<i64>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StoreFreezeRequest {
+    frozen: bool,
+    reason: String,
+    at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StoreLatestArtifactRequest {
+    kind: ArtifactKind,
+}
+
+#[derive(Debug, Deserialize)]
+struct StoreAcquireLeaseRequest {
+    lease_name: String,
+    owner_id: String,
+    at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StoreValidateLeaseRequest {
+    lease: DaemonLease,
+    at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StoreLessonInput {
+    lesson_id: Option<String>,
+    title: String,
+    statement: String,
+    rationale: String,
+    recommended_behavior: String,
+    #[serde(default)]
+    exclusions: Vec<String>,
+    #[serde(default)]
+    assets: Vec<String>,
+    #[serde(default)]
+    horizons: Vec<String>,
+    #[serde(default)]
+    regimes: Vec<String>,
+    #[serde(default)]
+    decision_stages: Vec<String>,
+    #[serde(default)]
+    supersedes: Vec<String>,
+    #[serde(default)]
+    conflicts_with: Vec<String>,
+    #[serde(default = "default_lesson_confidence")]
+    confidence_ppm: u32,
+    authored_by: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct StoreLessonListQuery {
+    lifecycle: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StoreLessonTransitionRequest {
+    lifecycle: LessonLifecycle,
+    actor: String,
+    reason: String,
+}
+
+fn default_lesson_confidence() -> u32 {
+    500_000
+}
+
 impl Daemon {
     pub fn router(&self) -> Router {
         Router::new()
@@ -41,6 +147,60 @@ impl Daemon {
             .route("/control/canary/stage", post(http_canary_stage))
             .route("/control/canary/status", get(http_canary_status))
             .route("/control/canary/resume", post(http_canary_resume))
+            .route("/control/store/doctor", get(http_store_doctor))
+            .route("/control/store/inventory", get(http_store_inventory))
+            .route("/control/store/metrics", get(http_store_metrics))
+            .route("/control/store/alerts", get(http_store_alerts))
+            .route(
+                "/control/store/session/{session_key}",
+                get(http_store_session),
+            )
+            .route("/control/store/backup", post(http_store_backup))
+            .route("/control/store/restore", post(http_store_restore))
+            .route("/control/store/export-run", post(http_store_export_run))
+            .route("/control/store/claim-next", post(http_store_claim_next))
+            .route(
+                "/control/store/recover-expired",
+                post(http_store_recover_expired),
+            )
+            .route("/control/store/workflow/{run_id}", get(http_store_workflow))
+            .route("/control/store/events/{run_id}", get(http_store_events))
+            .route(
+                "/control/store/artifacts/{artifact_id}",
+                get(http_store_artifact),
+            )
+            .route(
+                "/control/store/artifacts/{artifact_id}/diagnose",
+                post(http_store_diagnose),
+            )
+            .route("/control/store/freeze", post(http_store_freeze))
+            .route(
+                "/control/store/latest-artifact",
+                post(http_store_latest_artifact),
+            )
+            .route(
+                "/control/store/lease/acquire",
+                post(http_store_acquire_lease),
+            )
+            .route(
+                "/control/store/lease/validate",
+                post(http_store_validate_lease),
+            )
+            .route(
+                "/control/store/latest-retrospective",
+                get(http_store_latest_retrospective),
+            )
+            .route("/control/store/lessons", get(http_store_lessons))
+            .route("/control/store/lessons/add", post(http_store_lesson_add))
+            .route("/control/store/lessons/{lesson_id}", get(http_store_lesson))
+            .route(
+                "/control/store/lessons/{lesson_id}/usage",
+                get(http_store_lesson_usage),
+            )
+            .route(
+                "/control/store/lessons/{lesson_id}/transition",
+                post(http_store_lesson_transition),
+            )
             .with_state(Arc::new(self.clone()))
     }
 
@@ -436,6 +596,284 @@ async fn http_canary_resume(
         .map_err(invalid_input_or_internal)
 }
 
+async fn http_store_doctor(
+    State(daemon): State<Arc<Daemon>>,
+    headers: HeaderMap,
+) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
+    authorize(&daemon, &headers)?;
+    daemon
+        .store
+        .verify_integrity()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn http_store_inventory(
+    State(daemon): State<Arc<Daemon>>,
+    headers: HeaderMap,
+) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
+    authorize(&daemon, &headers)?;
+    store_json(daemon.store.storage_inventory())
+}
+
+async fn http_store_metrics(
+    State(daemon): State<Arc<Daemon>>,
+    headers: HeaderMap,
+) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
+    authorize(&daemon, &headers)?;
+    store_json(daemon.store.metrics(Utc::now()))
+}
+
+async fn http_store_alerts(
+    State(daemon): State<Arc<Daemon>>,
+    headers: HeaderMap,
+) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
+    authorize(&daemon, &headers)?;
+    let metrics = daemon
+        .store
+        .metrics(Utc::now())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    store_json(Ok(metrics.alerts()))
+}
+
+async fn http_store_session(
+    State(daemon): State<Arc<Daemon>>,
+    Path(session_key): Path<String>,
+    headers: HeaderMap,
+) -> std::result::Result<Json<Option<akzio_store::v2::SessionSlot>>, StatusCode> {
+    authorize(&daemon, &headers)?;
+    daemon
+        .store
+        .session_slot(&session_key)
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn http_store_backup(
+    State(daemon): State<Arc<Daemon>>,
+    headers: HeaderMap,
+    Json(request): Json<StoreBackupRequest>,
+) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
+    authorize(&daemon, &headers)?;
+    store_json(daemon.store.backup_to(request.target))
+}
+
+async fn http_store_restore(
+    State(daemon): State<Arc<Daemon>>,
+    headers: HeaderMap,
+    Json(request): Json<StoreRestoreRequest>,
+) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
+    authorize(&daemon, &headers)?;
+    let store = akzio_store::v2::V2Store::restore_from(request.source, request.target)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    store_json(store.metrics(Utc::now()))
+}
+
+async fn http_store_export_run(
+    State(daemon): State<Arc<Daemon>>,
+    headers: HeaderMap,
+    Json(request): Json<StoreExportRunRequest>,
+) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
+    authorize(&daemon, &headers)?;
+    store_json(daemon.store.export_run(
+        &RunId(request.run_id),
+        request.target,
+        request.include_raw_model,
+    ))
+}
+
+async fn http_store_lessons(
+    State(daemon): State<Arc<Daemon>>,
+    Query(query): Query<StoreLessonListQuery>,
+    headers: HeaderMap,
+) -> std::result::Result<Json<Vec<serde_json::Value>>, StatusCode> {
+    authorize(&daemon, &headers)?;
+    let lifecycle = query
+        .lifecycle
+        .map(|value| {
+            serde_json::from_value(serde_json::Value::String(value.to_ascii_lowercase()))
+                .map_err(|_| StatusCode::BAD_REQUEST)
+        })
+        .transpose()?;
+    let lessons = daemon
+        .store
+        .lessons(lifecycle, query.limit.unwrap_or(50))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    lessons
+        .iter()
+        .map(lesson_view_json)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map(Json)
+}
+
+async fn http_store_lesson_add(
+    State(daemon): State<Arc<Daemon>>,
+    headers: HeaderMap,
+    Json(input): Json<StoreLessonInput>,
+) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
+    authorize(&daemon, &headers)?;
+    if input.authored_by.trim().is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let now = Utc::now();
+    let source_blob = daemon
+        .store
+        .put_json(&input)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let source = Artifact::new(
+        ArtifactKind::SemanticDetail,
+        source_blob,
+        "operator.lesson.source",
+        ArtifactLifecycle::Canonical,
+        ArtifactProvenance {
+            source_family: "akzio.operator".to_owned(),
+            observed_at: None,
+            retrieved_at: now,
+            source_uri: None,
+            confidence_ppm: input.confidence_ppm,
+            producer_contract_hash: None,
+        },
+        None,
+        Vec::new(),
+        now,
+    )
+    .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let lesson = Lesson {
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
+        lesson_id: input.lesson_id.map(LessonId).unwrap_or_default(),
+        origin: LessonOrigin::Operator,
+        lifecycle: LessonLifecycle::Draft,
+        title: input.title,
+        statement: input.statement,
+        rationale: input.rationale,
+        recommended_behavior: input.recommended_behavior,
+        exclusions: input.exclusions,
+        scope: LessonScope {
+            assets: input
+                .assets
+                .iter()
+                .map(|value| Asset::try_from(value.as_str()))
+                .collect::<std::result::Result<_, _>>()
+                .map_err(|_| StatusCode::BAD_REQUEST)?,
+            horizons: input
+                .horizons
+                .iter()
+                .map(|value| parse_lesson_horizon(value))
+                .collect::<std::result::Result<_, _>>()
+                .map_err(|_| StatusCode::BAD_REQUEST)?,
+            regimes: input.regimes.into_iter().collect(),
+            decision_stages: input.decision_stages.into_iter().collect(),
+        },
+        source_refs: vec![ArtifactRef {
+            artifact_id: source.artifact_id.clone(),
+            kind: source.kind,
+        }],
+        supersedes: parse_lesson_refs_http(&input.supersedes)?,
+        conflicts_with: parse_lesson_refs_http(&input.conflicts_with)?,
+        confidence_ppm: input.confidence_ppm,
+        authored_by: Some(input.authored_by),
+        approved_by: None,
+        created_at: now,
+        updated_at: now,
+    };
+    let result = daemon
+        .store
+        .write_lesson(&lesson, &source, now)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    lesson_view_json(&result.lesson).map(Json)
+}
+
+async fn http_store_lesson(
+    State(daemon): State<Arc<Daemon>>,
+    Path(lesson_id): Path<String>,
+    headers: HeaderMap,
+) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
+    authorize(&daemon, &headers)?;
+    let lesson = daemon
+        .store
+        .lesson(&LessonId(lesson_id))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    lesson_view_json(&lesson).map(Json)
+}
+
+async fn http_store_lesson_usage(
+    State(daemon): State<Arc<Daemon>>,
+    Path(lesson_id): Path<String>,
+    headers: HeaderMap,
+) -> std::result::Result<Json<LessonUsage>, StatusCode> {
+    authorize(&daemon, &headers)?;
+    daemon
+        .store
+        .lesson_usage(&LessonId(lesson_id))
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn http_store_lesson_transition(
+    State(daemon): State<Arc<Daemon>>,
+    Path(lesson_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<StoreLessonTransitionRequest>,
+) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
+    authorize(&daemon, &headers)?;
+    let lesson = daemon
+        .store
+        .transition_lesson(
+            &LessonId(lesson_id),
+            request.lifecycle,
+            &request.actor,
+            &request.reason,
+            Utc::now(),
+        )
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    lesson_view_json(&lesson).map(Json)
+}
+
+fn parse_lesson_horizon(value: &str) -> std::result::Result<DecisionHorizon, ()> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "t1" => Ok(DecisionHorizon::T1),
+        "t3" => Ok(DecisionHorizon::T3),
+        "t5" => Ok(DecisionHorizon::T5),
+        _ => Err(()),
+    }
+}
+
+fn parse_lesson_refs_http(values: &[String]) -> std::result::Result<Vec<ArtifactRef>, StatusCode> {
+    values
+        .iter()
+        .map(|value| {
+            Ok(ArtifactRef {
+                artifact_id: ArtifactId(
+                    ContentHash::new(value.trim()).map_err(|_| StatusCode::BAD_REQUEST)?,
+                ),
+                kind: ArtifactKind::Lesson,
+            })
+        })
+        .collect()
+}
+
+fn lesson_view_json(value: &StoredLesson) -> std::result::Result<serde_json::Value, StatusCode> {
+    serde_json::to_value(serde_json::json!({
+        "artifact": &value.artifact,
+        "lesson": &value.lesson,
+        "revision": value.revision,
+    }))
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn store_json<T: Serialize>(
+    result: std::result::Result<T, StoreError>,
+) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
+    result
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .and_then(|value| {
+            serde_json::to_value(value)
+                .map(Json)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        })
+}
+
 fn authorize(daemon: &Daemon, headers: &HeaderMap) -> std::result::Result<(), StatusCode> {
     headers
         .get("x-akzio-token")
@@ -453,4 +891,183 @@ fn authorize_observer(daemon: &Daemon, headers: &HeaderMap) -> std::result::Resu
         .filter(|(provided, expected)| provided == expected)
         .map(|_| ())
         .ok_or(StatusCode::UNAUTHORIZED)
+}
+async fn http_store_claim_next(
+    State(daemon): State<Arc<Daemon>>,
+    headers: HeaderMap,
+    Json(request): Json<StoreClaimNextRequest>,
+) -> std::result::Result<Json<bool>, StatusCode> {
+    authorize(&daemon, &headers)?;
+    daemon
+        .store
+        .claim_next_task(
+            &request.worker_id,
+            request.at,
+            chrono::Duration::seconds(request.lease_seconds),
+        )
+        .map(|attempt| Json(attempt.is_some()))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn http_store_recover_expired(
+    State(daemon): State<Arc<Daemon>>,
+    headers: HeaderMap,
+    Json(request): Json<StoreRecoverExpiredRequest>,
+) -> std::result::Result<Json<u64>, StatusCode> {
+    authorize(&daemon, &headers)?;
+    daemon
+        .store
+        .recover_expired_tasks(request.at)
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn http_store_workflow(
+    State(daemon): State<Arc<Daemon>>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+) -> std::result::Result<Json<StoreWorkflowView>, StatusCode> {
+    authorize(&daemon, &headers)?;
+    daemon
+        .store
+        .workflow_snapshot(&RunId(run_id))
+        .map(|snapshot| {
+            Json(StoreWorkflowView {
+                status: snapshot.status,
+            })
+        })
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn http_store_events(
+    State(daemon): State<Arc<Daemon>>,
+    Path(run_id): Path<String>,
+    Query(query): Query<StoreEventsQuery>,
+    headers: HeaderMap,
+) -> std::result::Result<Json<Vec<StoreEventView>>, StatusCode> {
+    authorize(&daemon, &headers)?;
+    daemon
+        .store
+        .events_after(
+            &RunId(run_id),
+            query.after.unwrap_or(0),
+            query.limit.unwrap_or(EVENT_PAGE_SIZE),
+        )
+        .map(|events| {
+            Json(
+                events
+                    .into_iter()
+                    .map(|event| StoreEventView {
+                        event_type: event.event_type,
+                        artifact_id: event.artifact_id,
+                    })
+                    .collect(),
+            )
+        })
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn http_store_artifact(
+    State(daemon): State<Arc<Daemon>>,
+    Path(artifact_id): Path<String>,
+    headers: HeaderMap,
+) -> std::result::Result<Json<Artifact>, StatusCode> {
+    authorize(&daemon, &headers)?;
+    let artifact_id = ContentHash::new(artifact_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    daemon
+        .store
+        .artifact(&ArtifactId(artifact_id))
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn http_store_diagnose(
+    State(daemon): State<Arc<Daemon>>,
+    Path(artifact_id): Path<String>,
+    headers: HeaderMap,
+) -> std::result::Result<Json<bool>, StatusCode> {
+    authorize(&daemon, &headers)?;
+    let artifact_id = ContentHash::new(artifact_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    daemon
+        .store
+        .diagnose_corruption_rejection(&ArtifactId(artifact_id))
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn http_store_freeze(
+    State(daemon): State<Arc<Daemon>>,
+    headers: HeaderMap,
+    Json(request): Json<StoreFreezeRequest>,
+) -> std::result::Result<Json<Artifact>, StatusCode> {
+    authorize(&daemon, &headers)?;
+    daemon
+        .store
+        .write_freeze_state(request.frozen, request.reason, request.at)
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn http_store_latest_artifact(
+    State(daemon): State<Arc<Daemon>>,
+    headers: HeaderMap,
+    Json(request): Json<StoreLatestArtifactRequest>,
+) -> std::result::Result<Json<Option<Artifact>>, StatusCode> {
+    authorize(&daemon, &headers)?;
+    daemon
+        .store
+        .latest_artifact_by_kind(request.kind)
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn http_store_acquire_lease(
+    State(daemon): State<Arc<Daemon>>,
+    headers: HeaderMap,
+    Json(request): Json<StoreAcquireLeaseRequest>,
+) -> std::result::Result<Json<Option<DaemonLease>>, StatusCode> {
+    authorize(&daemon, &headers)?;
+    daemon
+        .store
+        .acquire_daemon_lease(
+            &request.lease_name,
+            &request.owner_id,
+            request.at,
+            request.expires_at,
+        )
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn http_store_validate_lease(
+    State(daemon): State<Arc<Daemon>>,
+    headers: HeaderMap,
+    Json(request): Json<StoreValidateLeaseRequest>,
+) -> std::result::Result<Json<bool>, StatusCode> {
+    authorize(&daemon, &headers)?;
+    daemon
+        .store
+        .validate_daemon_lease(&request.lease, request.at)
+        .map(|_| Json(true))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn http_store_latest_retrospective(
+    State(daemon): State<Arc<Daemon>>,
+    headers: HeaderMap,
+) -> std::result::Result<Json<Option<Retrospective>>, StatusCode> {
+    authorize(&daemon, &headers)?;
+    let Some(artifact) = daemon
+        .store
+        .latest_artifact_by_kind(ArtifactKind::Retrospective)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    else {
+        return Ok(Json(None));
+    };
+    let bytes = daemon
+        .store
+        .read_blob(&artifact.blob)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let payload = serde_json::from_slice(&bytes).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(Some(payload)))
 }

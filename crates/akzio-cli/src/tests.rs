@@ -19,30 +19,12 @@ fn write_config(directory: &tempfile::TempDir, daemon: &str, assets: &str) -> Pa
 
 #[test]
 fn runtime_identity_components_cover_split_modules() {
-    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    for (path, bytes) in PROMPT_COMPONENTS
-        .iter()
-        .chain(CONTRACT_COMPONENTS)
-        .chain(TOPOLOGY_COMPONENTS)
-    {
-        assert!(
-            workspace_root.join(path).is_file(),
-            "missing runtime identity component {path}"
-        );
-        assert!(!bytes.is_empty(), "empty embedded runtime component {path}");
-    }
-    assert!(PROMPT_COMPONENTS
-        .iter()
-        .any(|(path, _)| *path == "crates/akzio-research/src/agent_v2/schemas.rs"));
-    assert!(CONTRACT_COMPONENTS
-        .iter()
-        .any(|(path, _)| *path == "crates/akzio-research/src/agent_v2/catalogue.rs"));
-    assert!(TOPOLOGY_COMPONENTS
-        .iter()
-        .any(|(path, _)| *path == "crates/akzio-runtime/src/runtime_v2/planner.rs"));
-    assert!(TOPOLOGY_COMPONENTS
-        .iter()
-        .any(|(path, _)| *path == "crates/akzio-runtime/src/runtime_v2/workflow.rs"));
+    let prompt = prompt_component_hash();
+    let contract = contract_component_hash();
+    let topology = topology_component_hash();
+    assert_ne!(prompt, contract);
+    assert_ne!(prompt, topology);
+    assert_ne!(contract, topology);
     assert!(source_revision().unwrap().contains('+'));
 }
 

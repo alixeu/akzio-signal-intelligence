@@ -118,29 +118,3 @@ public struct MetricCard: View {
         .accessibilityLabel("\(L10n.text(label, language: language)): \(value)\(delta.map { ", change \($0)" } ?? "")")
     }
 }
-
-// MARK: - Count-up text
-
-/// Digit-rolling readout with a fixed sign / currency slot.
-public struct CountUpText: View {
-    private let text: String
-    private let value: Double
-    private let size: CGFloat
-    private let color: Color
-
-    @Environment(\.motionPolicy) private var policy
-
-    public init(_ text: String, value: Double, size: CGFloat = 20, color: Color = AkzioColor.primaryText) {
-        self.text = text
-        self.value = value
-        self.size = size
-        self.color = color
-    }
-
-    public var body: some View {
-        Text(text)
-            .akzioMetric(size, color: color)
-            .akzioCountUp(value, policy: policy)
-            .lineLimit(1)
-    }
-}

@@ -14,6 +14,11 @@ impl TaskRuntime {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn store(&self) -> &V2Store {
+        &self.store
+    }
+
     pub fn with_lease_duration(mut self, lease_duration: Duration) -> RuntimeResult<Self> {
         if lease_duration <= Duration::zero() {
             return Err(RuntimeError::InvalidTaskLeaseDuration);
@@ -22,8 +27,8 @@ impl TaskRuntime {
         Ok(self)
     }
 
-    pub fn store(&self) -> &V2Store {
-        &self.store
+    pub fn recover_expired_tasks(&self, now: DateTime<Utc>) -> RuntimeResult<u64> {
+        Ok(self.store.recover_expired_tasks(now)?)
     }
 
     /// Request cooperative cancellation through the Store-owned task state

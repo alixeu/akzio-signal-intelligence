@@ -229,7 +229,7 @@ pub(super) fn tool_set_hash(
 }
 
 pub(super) fn model_tool_definitions(
-    store: &V2Store,
+    context: &ContextBroker,
     contract: &AgentContract,
 ) -> ResearchResult<Vec<AgentToolDefinition>> {
     contract
@@ -242,8 +242,9 @@ pub(super) fn model_tool_definitions(
                     spec.name
                 )));
             }
-            let input_schema: Value =
-                serde_json::from_slice(&store.read_blob(&spec.input_schema)?)?;
+            let input_schema: Value = serde_json::from_slice(
+                &context.read_authority_document(contract, &spec.input_schema)?,
+            )?;
             if input_schema != artifact_id_tool_input_schema() {
                 return Err(ResearchError::InvalidToolSpec(format!(
                     "{} must use the strict artifact_id input schema",

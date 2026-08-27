@@ -32,10 +32,10 @@ impl Daemon {
         if task.node.recipe_id.as_str() == akzio_domain::LEARNING_OUTCOME_WORKER_RECIPE_ID {
             return self.execute_outcome_worker(task, now).await;
         }
-        let recipe = self.workflow.catalogue().recipe(&task.node.recipe_id)?;
+        let recipe = self.workflow.recipe(&task.node.recipe_id)?;
         match recipe.task_class {
             RuntimeTaskClass::Agent => {
-                let candidates = self.context_candidates(task)?;
+                let candidates = self.agent_input_candidates(task)?;
                 if task.node.recipe_id.as_str() == akzio_domain::RESEARCH_CRITIC_RECIPE_ID {
                     let claims = candidates
                         .iter()
@@ -393,24 +393,17 @@ impl Daemon {
         )?)
     }
 
-    pub(super) fn context_candidates(&self, task: &ClaimedAttempt) -> Result<Vec<ArtifactRef>> {
-        let contract_hash = task.node.contract_hash.as_ref().ok_or_else(|| {
-            DaemonError::InvalidInput(format!(
-                "agent task {} has no contract hash",
-                task.node.task_id
-            ))
-        })?;
-        let policy = &self.agents.catalogue().get(contract_hash)?.contract.context;
+    pub(super) fn agent_input_candidates(&self, task: &ClaimedAttempt) -> Result<Vec<ArtifactRef>> {
         let mut candidates = BTreeMap::<ArtifactId, ArtifactRef>::new();
 
         for reference in &task.node.input_artifacts {
-            self.admit_context_candidate(&mut candidates, policy, reference)?;
+            self.append_agent_input(&mut candidates, reference)?;
         }
 
         if let Some(parent_task_id) = &task.node.parent_task_id {
             if !task.node.dependencies.contains(parent_task_id) {
                 return Err(DaemonError::InvalidInput(format!(
-                    "agent task {} parent {parent_task_id} is not a dependency",
+                    "agent task {} parent {parent_task_id} is not dependency",
                     task.node.task_id
                 )));
             }
@@ -431,8 +424,7 @@ impl Daemon {
                     dependency: parent_task_id.clone(),
                 });
             }
-            // AgentRuntime performs the durable parent proof and child projection.
-            // Keep daemon dispatch limited to dependency status/fencing checks.
+            // AgentRuntime/ContextBroker owns parent projection and context policy.
         } else {
             let dependencies = task
                 .node
@@ -465,9 +457,8 @@ impl Daemon {
                         .store
                         .committed_task_outputs(&task.run_id, &dependency)?
                     {
-                        self.admit_context_candidate(
+                        self.append_agent_input(
                             &mut candidates,
-                            policy,
                             &ArtifactRef {
                                 artifact_id: artifact.artifact_id,
                                 kind: artifact.kind,
@@ -484,24 +475,25 @@ impl Daemon {
         {
             return Err(DaemonError::MissingTaskContext(task.node.task_id.clone()));
         }
+
         Ok(candidates.into_values().collect())
     }
 
-    pub(super) fn admit_context_candidate(
+    fn append_agent_input(
         &self,
         candidates: &mut BTreeMap<ArtifactId, ArtifactRef>,
-        policy: &ContextPolicy,
         reference: &ArtifactRef,
     ) -> Result<()> {
         let artifact = self.store.artifact(&reference.artifact_id)?;
-        if artifact.kind == ArtifactKind::RawEvidence {
-            return Ok(());
+        if artifact.kind != reference.kind {
+            return Err(DaemonError::InvalidInput(format!(
+                "artifact {} kind changed from {:?} to {:?}",
+                reference.artifact_id, reference.kind, artifact.kind
+            )));
         }
-        if policy.permitted_kinds.contains(&artifact.kind)
-            && policy
-                .permitted_source_families
-                .contains(&artifact.provenance.source_family)
-        {
+        // Raw evidence is only a source closure; ContextBroker must not put it in
+        // the model manifest directly.
+        if artifact.kind != ArtifactKind::RawEvidence {
             candidates.insert(
                 artifact.artifact_id.clone(),
                 ArtifactRef {

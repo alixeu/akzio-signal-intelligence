@@ -24,16 +24,15 @@ pub(crate) fn trusted_learning_provenance(
     }
 }
 
-pub use akzio_domain::{OutcomeCostModel, PolicySubject};
 pub use campaign::{
     CanaryBundleComparison, CanaryCampaignRuntime, CanaryError, CanaryHorizonMetrics,
     CanarySubjectComparison,
 };
 pub use evaluation::{
-    horizon_observations, materialize_outcome, materialize_partial_outcome, CandidatePolicyInput,
-    EvaluationError, EvaluationInput, EvaluationPolicy, EvaluationResult, EvaluationRuntime,
-    EvaluationRuntimeResult, GovernedHorizonObservation, OutcomeMaterializationInput,
-    ShadowObservation,
+    horizon_observations, materialize_outcome, materialize_partial_outcome,
+    realized_execution_target, CandidatePolicyInput, EvaluationError, EvaluationInput,
+    EvaluationPolicy, EvaluationResult, EvaluationRuntime, EvaluationRuntimeResult,
+    GovernedHorizonObservation, OutcomeMaterializationInput, ShadowObservation,
 };
 pub use frozen_eval::{
     evaluate_frozen_evidence, FrozenEvidenceEvalError, FrozenEvidenceMetrics, FrozenEvidenceRecord,

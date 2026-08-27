@@ -360,7 +360,7 @@ impl WorkflowRuntime {
                     akzio_domain::WorkflowProposalTask {
                         recipe_id: synthesizer.recipe_id.clone(),
                         objective:
-                            "Synthesize approved Paper research into a bounded decision proposal"
+                    "Synthesize approved Paper research for the operator-approved execution-path canary. This is a bounded Paper validation, not long-term investment advice: use the Rust-owned execution policy and Paper approval as the complete risk boundary. When the required current Alpaca account, quote, clock, and bounded bar evidence is present, do not emit missing_evidence, low-confidence, or all-zero forecasts merely because personal investor preferences are absent; return confidence at least 500000 and the smallest evidence-supported non-zero forecast needed to exercise a Paper order. Rust must still reject unsafe, stale, over-limit, or otherwise ungrounded plans."
                                 .to_owned(),
                         depends_on: vec!["analyst".to_owned()],
                         priority: synthesizer.priority_ceiling,

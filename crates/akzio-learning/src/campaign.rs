@@ -2,7 +2,10 @@
 
 use thiserror::Error;
 
-use akzio_domain::{CanaryCampaignStatus, CanaryVerdict, Outcome, OutcomeHorizon};
+use akzio_domain::{
+    CanaryCampaignStatus, CanaryVerdict, CandidatePolicyState, Outcome, OutcomeHorizon,
+    PolicyState, PolicySubject,
+};
 use akzio_store::v2::{CanaryCampaignHead, DaemonLease, StoreError, V2Store};
 use chrono::{DateTime, Utc};
 
@@ -139,6 +142,35 @@ impl CanaryCampaignRuntime {
         comparison.verdict(self.minimum_ppm)
     }
 
+    pub fn target_policy_state(
+        &self,
+        subject: &PolicySubject,
+        current: PolicyState,
+        status: CanaryCampaignStatus,
+        verdict: CanaryVerdict,
+    ) -> PolicyState {
+        match verdict {
+            CanaryVerdict::Advance => status
+                .policy_state()
+                .map(|state| match subject {
+                    PolicySubject::Contract(_) => PolicyState::Contract(state),
+                    PolicySubject::Topology(_) => PolicyState::Topology(state),
+                    PolicySubject::Memory(_) => current,
+                })
+                .unwrap_or(current),
+            CanaryVerdict::Rollback => match subject {
+                PolicySubject::Contract(_) => {
+                    PolicyState::Contract(CandidatePolicyState::Candidate)
+                }
+                PolicySubject::Topology(_) => {
+                    PolicyState::Topology(CandidatePolicyState::Candidate)
+                }
+                PolicySubject::Memory(_) => current,
+            },
+            CanaryVerdict::Hold | CanaryVerdict::Defer => current,
+        }
+    }
+
     pub fn apply_verdict(
         &self,
         lease: &DaemonLease,
@@ -151,10 +183,6 @@ impl CanaryCampaignRuntime {
         Ok(self
             .store
             .transition_canary_campaign(lease, campaign_id, status, verdict, now)?)
-    }
-
-    pub fn store(&self) -> &V2Store {
-        &self.store
     }
 }
 

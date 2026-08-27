@@ -11,16 +11,15 @@ public final class ObservatoryStore {
     // Data
     public private(set) var scenario: MockScenario
     public private(set) var snapshot: ObservatorySnapshot
-    public private(set) var dataMode: ObservatoryDataMode = .mock
+    private var dataMode: ObservatoryDataMode = .mock
     public private(set) var observerState: ObserverConnectionState = .mock
-    public var observerEndpoint = "http://127.0.0.1:7342"
+    private var observerEndpoint = "http://127.0.0.1:7342"
     private var observerToken = ""
     public let coreSupervisor = RustCoreSupervisor.shared
     public var coreConfigurationDraft = CoreCredentialStore.savedDraft()
     public private(set) var coreCredentialStatus = CoreCredentialStore.status()
     public private(set) var debugRunInFlight = false
     public private(set) var debugRunMessage = ""
-    public private(set) var lastSubmittedRunID: String?
     private var liveProjection: LiveProjection?
     private var livePayload: ObserverSnapshotPayload?
     private var observerTask: Task<Void, Never>?
@@ -40,7 +39,6 @@ public final class ObservatoryStore {
 
     // Per-page selection, kept in the shell so transitions can read it
     public var selectedStageID: String?
-    public var selectedRole: AgentRole = .synthesizer
     public var selectedHorizon: OutcomeHorizonKind = .t1
     public var equityRange: EquityRange = .oneDay {
         didSet {
@@ -92,7 +90,6 @@ public final class ObservatoryStore {
         self.dataMode = autoStartsCore ? .live : .mock
         self.observerState = autoStartsCore ? .connecting : .mock
         self.selectedStageID = snapshot.workflow.activeStageID
-        self.selectedRole = snapshot.council.selectedRole
         self.selectedHorizon = snapshot.outcome.selected
         self.selectedArchiveRowID = snapshot.archive.selectedRowID
     }
@@ -195,9 +192,6 @@ public final class ObservatoryStore {
     public var displayLearning: LearningPresentation {
         isLive ? (liveProjection?.learning ?? LiveProjection.unavailableLearning) : snapshot.learning
     }
-    public var archiveSuccessRateAvailable: Bool {
-        isLive ? (liveProjection?.hasArchiveSuccessRate ?? false) : true
-    }
 
     // MARK: Navigation
 
@@ -226,7 +220,7 @@ public final class ObservatoryStore {
         settingsPresented.toggle()
     }
 
-    public func openSettings(_ category: SettingsPresentation.Category) {
+    private func openSettings(_ category: SettingsPresentation.Category) {
         settingsCategory = category
         settingsPresented = true
     }
@@ -287,8 +281,7 @@ public final class ObservatoryStore {
             connect(connection)
         }
         do {
-            let runID = try await coreSupervisor.submitDebugRun()
-            lastSubmittedRunID = runID
+            try await coreSupervisor.submitDebugRun()
             debugRunMessage = "Run submitted"
             navigate(to: .workflow)
         } catch {
@@ -365,7 +358,7 @@ public final class ObservatoryStore {
         }
     }
 
-    public func useMockData() {
+    private func useMockData() {
         observerTask?.cancel()
         observerTask = nil
         observerClient = nil
@@ -463,7 +456,6 @@ public final class ObservatoryStore {
         snapshot = ScenarioLibrary.snapshot(next)
         settings.reduceMotionOverride = next.reduceMotionPreferred
         selectedStageID = snapshot.workflow.activeStageID
-        selectedRole = snapshot.council.selectedRole
         selectedHorizon = snapshot.outcome.selected
         selectedArchiveRowID = snapshot.archive.selectedRowID
         selectedPosition = nil
@@ -479,10 +471,6 @@ public final class ObservatoryStore {
 
     public var selectedStageInspector: StageInspectorPresentation {
         displayWorkflow.inspector(for: selectedStageID ?? displayWorkflow.activeStageID)
-    }
-
-    public var selectedHorizonWindow: OutcomeWindowPresentation? {
-        displayOutcome.window(selectedHorizon)
     }
 
     public var selectedArchiveRow: ArchiveRowPresentation? {

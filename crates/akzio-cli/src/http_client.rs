@@ -217,3 +217,292 @@ fn print_sse_data(event_data: &mut Vec<String>) {
         event_data.clear();
     }
 }
+
+impl ControlApiClient {
+    pub(crate) async fn store_doctor(&self) -> Result<serde_json::Value> {
+        self.json(self.request(Method::GET, self.endpoint(&["control", "store", "doctor"])))
+            .await
+    }
+
+    pub(crate) async fn store_inventory(&self) -> Result<serde_json::Value> {
+        self.json(self.request(
+            Method::GET,
+            self.endpoint(&["control", "store", "inventory"]),
+        ))
+        .await
+    }
+
+    pub(crate) async fn store_metrics(&self) -> Result<serde_json::Value> {
+        self.json(self.request(Method::GET, self.endpoint(&["control", "store", "metrics"])))
+            .await
+    }
+
+    pub(crate) async fn store_alerts(&self) -> Result<serde_json::Value> {
+        self.json(self.request(Method::GET, self.endpoint(&["control", "store", "alerts"])))
+            .await
+    }
+
+    pub(crate) async fn store_session(&self, session_key: &str) -> Result<Option<SessionSlot>> {
+        self.json(self.request(
+            Method::GET,
+            self.endpoint(&["control", "store", "session", session_key]),
+        ))
+        .await
+    }
+
+    pub(crate) async fn store_backup(&self, target: &Path) -> Result<serde_json::Value> {
+        self.json(
+            self.request(Method::POST, self.endpoint(&["control", "store", "backup"]))
+                .json(&serde_json::json!({ "target": target })),
+        )
+        .await
+    }
+
+    pub(crate) async fn store_restore(
+        &self,
+        source: &Path,
+        target: &Path,
+    ) -> Result<serde_json::Value> {
+        self.json(
+            self.request(
+                Method::POST,
+                self.endpoint(&["control", "store", "restore"]),
+            )
+            .json(&serde_json::json!({ "source": source, "target": target })),
+        )
+        .await
+    }
+
+    pub(crate) async fn store_export_run(
+        &self,
+        run_id: &str,
+        target: &Path,
+        include_raw_model: bool,
+    ) -> Result<serde_json::Value> {
+        self.json(
+            self.request(
+                Method::POST,
+                self.endpoint(&["control", "store", "export-run"]),
+            )
+            .json(&serde_json::json!({
+                "run_id": run_id,
+                "target": target,
+                "include_raw_model": include_raw_model,
+            })),
+        )
+        .await
+    }
+    pub(crate) async fn store_claim_next(
+        &self,
+        worker_id: &str,
+        at: DateTime<Utc>,
+        lease_seconds: i64,
+    ) -> Result<bool> {
+        self.json(
+            self.request(
+                Method::POST,
+                self.endpoint(&["control", "store", "claim-next"]),
+            )
+            .json(&serde_json::json!({
+                "worker_id": worker_id,
+                "at": at,
+                "lease_seconds": lease_seconds,
+            })),
+        )
+        .await
+    }
+
+    pub(crate) async fn store_recover_expired(&self, at: DateTime<Utc>) -> Result<u64> {
+        self.json(
+            self.request(
+                Method::POST,
+                self.endpoint(&["control", "store", "recover-expired"]),
+            )
+            .json(&serde_json::json!({ "at": at })),
+        )
+        .await
+    }
+
+    pub(crate) async fn store_workflow(&self, run_id: &RunId) -> Result<StoreWorkflowView> {
+        self.json(self.request(
+            Method::GET,
+            self.endpoint(&["control", "store", "workflow", run_id.0.as_str()]),
+        ))
+        .await
+    }
+
+    pub(crate) async fn store_events(
+        &self,
+        run_id: &RunId,
+        after: i64,
+        limit: usize,
+    ) -> Result<Vec<StoreEventView>> {
+        let mut url = self.endpoint(&["control", "store", "events", run_id.0.as_str()]);
+        url.query_pairs_mut()
+            .append_pair("after", &after.to_string())
+            .append_pair("limit", &limit.to_string());
+        self.json(self.request(Method::GET, url)).await
+    }
+
+    pub(crate) async fn store_artifact(&self, artifact_id: &ArtifactId) -> Result<Artifact> {
+        self.json(self.request(
+            Method::GET,
+            self.endpoint(&["control", "store", "artifacts", artifact_id.0.as_str()]),
+        ))
+        .await
+    }
+
+    pub(crate) async fn store_diagnose_corruption(&self, artifact_id: &ArtifactId) -> Result<bool> {
+        self.json(self.request(
+            Method::POST,
+            self.endpoint(&[
+                "control",
+                "store",
+                "artifacts",
+                artifact_id.0.as_str(),
+                "diagnose",
+            ]),
+        ))
+        .await
+    }
+
+    pub(crate) async fn store_freeze(
+        &self,
+        frozen: bool,
+        reason: &str,
+        at: DateTime<Utc>,
+    ) -> Result<Artifact> {
+        self.json(
+            self.request(Method::POST, self.endpoint(&["control", "store", "freeze"]))
+                .json(&serde_json::json!({
+                    "frozen": frozen,
+                    "reason": reason,
+                    "at": at,
+                })),
+        )
+        .await
+    }
+
+    pub(crate) async fn store_latest_artifact(
+        &self,
+        kind: ArtifactKind,
+    ) -> Result<Option<Artifact>> {
+        self.json(
+            self.request(
+                Method::POST,
+                self.endpoint(&["control", "store", "latest-artifact"]),
+            )
+            .json(&serde_json::json!({ "kind": kind })),
+        )
+        .await
+    }
+
+    pub(crate) async fn store_acquire_lease(
+        &self,
+        lease_name: &str,
+        owner_id: &str,
+        at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+    ) -> Result<Option<DaemonLease>> {
+        self.json(
+            self.request(
+                Method::POST,
+                self.endpoint(&["control", "store", "lease", "acquire"]),
+            )
+            .json(&serde_json::json!({
+                "lease_name": lease_name,
+                "owner_id": owner_id,
+                "at": at,
+                "expires_at": expires_at,
+            })),
+        )
+        .await
+    }
+
+    pub(crate) async fn store_validate_lease(
+        &self,
+        lease: &DaemonLease,
+        at: DateTime<Utc>,
+    ) -> Result<bool> {
+        self.json(
+            self.request(
+                Method::POST,
+                self.endpoint(&["control", "store", "lease", "validate"]),
+            )
+            .json(&serde_json::json!({ "lease": lease, "at": at })),
+        )
+        .await
+    }
+
+    pub(crate) async fn store_latest_retrospective(&self) -> Result<Option<Retrospective>> {
+        self.json(self.request(
+            Method::GET,
+            self.endpoint(&["control", "store", "latest-retrospective"]),
+        ))
+        .await
+    }
+
+    pub(crate) async fn lesson_add(&self, input: &serde_json::Value) -> Result<serde_json::Value> {
+        self.json(
+            self.request(
+                Method::POST,
+                self.endpoint(&["control", "store", "lessons", "add"]),
+            )
+            .json(input),
+        )
+        .await
+    }
+
+    pub(crate) async fn lesson_list(
+        &self,
+        lifecycle: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>> {
+        let mut url = self.endpoint(&["control", "store", "lessons"]);
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("limit", &limit.to_string());
+            if let Some(lifecycle) = lifecycle {
+                query.append_pair("lifecycle", lifecycle);
+            }
+        }
+        self.json(self.request(Method::GET, url)).await
+    }
+
+    pub(crate) async fn lesson_show(&self, lesson_id: &str) -> Result<serde_json::Value> {
+        self.json(self.request(
+            Method::GET,
+            self.endpoint(&["control", "store", "lessons", lesson_id]),
+        ))
+        .await
+    }
+
+    pub(crate) async fn lesson_usage(&self, lesson_id: &str) -> Result<serde_json::Value> {
+        self.json(self.request(
+            Method::GET,
+            self.endpoint(&["control", "store", "lessons", lesson_id, "usage"]),
+        ))
+        .await
+    }
+
+    pub(crate) async fn lesson_transition(
+        &self,
+        lesson_id: &str,
+        lifecycle: LessonLifecycle,
+        actor: &str,
+        reason: &str,
+    ) -> Result<serde_json::Value> {
+        self.json(
+            self.request(
+                Method::POST,
+                self.endpoint(&["control", "store", "lessons", lesson_id, "transition"]),
+            )
+            .json(&serde_json::json!({
+                "lifecycle": lifecycle,
+                "actor": actor,
+                "reason": reason,
+            })),
+        )
+        .await
+    }
+}

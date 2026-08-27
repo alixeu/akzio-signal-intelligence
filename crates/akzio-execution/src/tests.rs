@@ -76,14 +76,6 @@ fn limit_notional_becomes_fractional_quantity() {
 }
 
 #[test]
-fn broker_native_reprice_never_resubmits_quantity() {
-    let request = reprice_request(MoneyMicros::from_usd_cents(2_500), "replacement-id");
-    assert_eq!(request["client_order_id"], "replacement-id");
-    assert!(request.get("qty").is_none());
-    assert!(request.get("notional").is_none());
-}
-
-#[test]
 fn receipt_states_cover_lifecycle_and_terminal_outcomes() {
     assert_eq!(
         receipt_state("accepted").unwrap(),

@@ -7,7 +7,7 @@
 
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
-use akzio_runtime::{RuntimeError, TaskCompletion, TaskRuntime};
+use akzio_runtime::v2::{RuntimeError, TaskCompletion, TaskRuntime};
 use akzio_store::v2::{ClaimedAttempt, StoreError};
 use chrono::Utc;
 use tokio::sync::watch;
@@ -53,10 +53,7 @@ impl WorkerPool {
     /// Recover work owned by a process that stopped without finishing its
     /// leases.  It is safe to call before every pool start and is idempotent.
     pub fn recover_abandoned(&self) -> Result<u64, RuntimeError> {
-        self.runtime
-            .store()
-            .recover_expired_tasks(Utc::now())
-            .map_err(RuntimeError::from)
+        self.runtime.recover_expired_tasks(Utc::now())
     }
 
     /// Run the configured worker count until `shutdown` becomes true.

@@ -40,7 +40,7 @@ export_checked=false
 export_raw_model=false
 secret_scan_clean=false
 
-mkdir -p "${bundle}/commands" "${export_root}"
+mkdir -p "${bundle}/commands"
 
 write_summary() {
   jq -n \
@@ -222,7 +222,7 @@ clock_file="$(alpaca_get clock https://paper-api.alpaca.markets/v2/clock)" || {
   write_summary
   exit 10
 }
-quotes_file="$(alpaca_get quotes 'https://data.alpaca.markets/v2/stocks/quotes/latest?symbols=TQQQ%2CQQQ%2CSOXX%2CSOXL')" || {
+quotes_file="$(alpaca_get quotes "https://data.alpaca.markets/v2/stocks/quotes/latest?symbols=TQQQ%2CQQQ%2CSOXX%2CSOXL&feed=${market_data_feed}")" || {
   summary_status=preflight_error
   write_summary
   exit 10
@@ -315,16 +315,6 @@ binary="${target_dir}/debug/akzio"
 
 paper_approver="${AKZIO_PAPER_APPROVER:-${USER:-local-operator}}"
 paper_max_notional_usd_cents="${AKZIO_PAPER_MAX_NOTIONAL_USD_CENTS:-100000}"
-if ! "${binary}" --config "${runtime_config}" store approve-paper "${session_key}" \
-  --operator "${paper_approver}" \
-  --reason "one-session scheduler-owned Paper canary" \
-  --max-notional-usd-cents "${paper_max_notional_usd_cents}" \
-  --valid-hours 8 \
-  > "${bundle}/commands/paper-approval.json" 2> "${bundle}/commands/paper-approval.stderr"; then
-  summary_status=paper_approval_failed
-  write_summary
-  exit 12
-fi
 
 "${binary}" --config "${runtime_config}" daemon serve \
   > "${bundle}/commands/daemon.log" 2>&1 &
@@ -351,6 +341,17 @@ if [[ "${ready}" != true ]]; then
 fi
 "${binary}" --config "${runtime_config}" daemon health \
   > "${bundle}/commands/health-ready.json" 2>&1 || true
+
+if ! "${binary}" --config "${runtime_config}" store approve-paper "${session_key}" \
+  --operator "${paper_approver}" \
+  --reason "one-session scheduler-owned Paper canary" \
+  --max-notional-usd-cents "${paper_max_notional_usd_cents}" \
+  --valid-hours 8 \
+  > "${bundle}/commands/paper-approval.json" 2> "${bundle}/commands/paper-approval.stderr"; then
+  summary_status=paper_approval_failed
+  write_summary
+  exit 12
+fi
 
 session_found=false
 for attempt in {1..180}; do

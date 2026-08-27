@@ -14,10 +14,9 @@ pub use paper_decode::{
     PaperDecodeResult,
 };
 pub use runtime::{
-    validate_daily_bar_payload, AcquiredEvidence, AlpacaMarketDataFeed,
-    AlpacaPaperEvidenceTransport, AsyncEvidenceAdapter, DetailInput, EvidenceAdapter,
+    model_native_web_evidence_transport, validate_daily_bar_payload, AcquiredEvidence,
+    AlpacaMarketDataFeed, AlpacaPaperEvidenceTransport, AsyncEvidenceAdapter, EvidenceAdapter,
     EvidenceBundle, EvidenceCitation, EvidenceProvenance, EvidenceQuality, EvidenceRequest,
     EvidenceRuntime, EvidenceRuntimeError, EvidenceRuntimeResult, EvidenceSource,
-    FixtureEvidenceAdapter, GovernedResource, ModelNativeWebEvidenceTransport,
-    NormalizedEvidencePayload,
+    FixtureEvidenceAdapter, GovernedResource, NormalizedEvidencePayload,
 };

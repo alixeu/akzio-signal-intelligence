@@ -106,7 +106,3 @@ pub(super) fn manifest_input_hash(
             .collect::<Vec<_>>(),
     )?)
 }
-
-pub(super) fn estimate_tokens(bytes: u64) -> u32 {
-    akzio_domain::estimate_tokens_from_bytes(bytes)
-}

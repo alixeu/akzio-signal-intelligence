@@ -9,5 +9,3 @@ pub mod v2 {
         ContextBroker, ContextError, ContextManifest, ContextResult as Result,
     };
 }
-
-pub use v2::*;

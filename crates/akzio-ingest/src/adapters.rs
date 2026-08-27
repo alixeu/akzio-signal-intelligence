@@ -349,7 +349,7 @@ impl AsyncEvidenceAdapter for AlpacaPaperEvidenceTransport {
 }
 
 #[derive(Clone)]
-pub struct ModelNativeWebEvidenceTransport {
+pub(crate) struct ModelNativeWebEvidenceTransport {
     client: ModelClient,
     policy: NativeWebPolicy,
     source: EvidenceSource,
@@ -365,15 +365,7 @@ impl std::fmt::Debug for ModelNativeWebEvidenceTransport {
 }
 
 impl ModelNativeWebEvidenceTransport {
-    pub fn new(client: ModelClient, policy: NativeWebPolicy) -> Self {
-        Self {
-            client,
-            policy,
-            source: EvidenceSource::NewsWeb,
-        }
-    }
-
-    pub fn for_source(client: ModelClient, source: EvidenceSource) -> Self {
+    pub(crate) fn for_source(client: ModelClient, source: EvidenceSource) -> Self {
         let policy = NativeWebPolicy {
             allowed_hosts: match source {
                 EvidenceSource::SecEdgar => vec!["sec.gov".to_owned(), "www.sec.gov".to_owned()],

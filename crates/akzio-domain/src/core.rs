@@ -12,7 +12,6 @@ use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use uuid::Uuid;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum DomainError {
@@ -185,33 +184,6 @@ pub fn canonical_json_bytes(value: &Value) -> Result<Vec<u8>, serde_json::Error>
 
 pub fn content_hash_json(value: &Value) -> Result<ContentHash, serde_json::Error> {
     canonical_json_bytes(value).map(|bytes| ContentHash::of_bytes(&bytes))
-}
-
-macro_rules! id_type {
-    ($name:ident) => {
-        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-        #[serde(transparent)]
-        pub struct $name(pub String);
-
-        impl $name {
-            pub fn new() -> Self {
-                let value = Uuid::new_v4().simple().to_string();
-                Self(value[..16].to_owned())
-            }
-        }
-
-        impl Default for $name {
-            fn default() -> Self {
-                Self::new()
-            }
-        }
-
-        impl fmt::Display for $name {
-            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str(&self.0)
-            }
-        }
-    };
 }
 
 id_type!(RunId);

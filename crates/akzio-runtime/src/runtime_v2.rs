@@ -17,7 +17,7 @@ use akzio_domain::{
 use akzio_store::v2::{
     ClaimedAttempt, DaemonLease, RetryTaskResult, SessionReservation, SessionSlotReservation,
     StoreError, StoredEvent, StoredRun, V2Store, WorkflowCommit, WorkflowPatchCommit,
-    WorkflowRevision, WorkflowSnapshot,
+    WorkflowSnapshot,
 };
 use chrono::{DateTime, Duration, Utc};
 use thiserror::Error;
@@ -31,9 +31,9 @@ mod workflow;
 const POST_TERMINAL_WORKER_RECIPE_ID: &str = akzio_domain::LEARNING_OUTCOME_WORKER_RECIPE_ID;
 
 pub use catalogue::{
-    rust_terminal_recipes, RecipeCatalogue, TerminalRecipeSet, DECISION_GATE_RECIPE_ID,
-    EVALUATE_RECIPE_ID, EVIDENCE_GATE_RECIPE_ID, EXECUTION_GATE_RECIPE_ID, PAPER_COMMIT_RECIPE_ID,
-    RECONCILE_RECIPE_ID,
+    active_recipe_catalogue, rust_terminal_recipes, ActiveContractRecipe, RecipeCatalogue,
+    TerminalRecipeSet, DECISION_GATE_RECIPE_ID, EVALUATE_RECIPE_ID, EVIDENCE_GATE_RECIPE_ID,
+    EXECUTION_GATE_RECIPE_ID, PAPER_COMMIT_RECIPE_ID, RECONCILE_RECIPE_ID,
 };
 pub use planner::should_run_structured_critique;
 pub use task::TaskRuntime;
@@ -48,6 +48,20 @@ pub enum RuntimeError {
     Json(#[from] serde_json::Error),
     #[error("recipe {0} is missing")]
     MissingRecipe(TaskRecipeId),
+    #[error("active contract purpose is not allowed: {0}")]
+    UnexpectedActiveContractPurpose(String),
+    #[error("active contract purpose appears more than once: {0}")]
+    DuplicateActiveContractPurpose(String),
+    #[error("active contract is missing: {0}")]
+    MissingActiveContract(&'static str),
+    #[error("active contract {purpose} outputs {actual:?}, expected {expected:?}")]
+    ActiveContractOutputMismatch {
+        purpose: String,
+        expected: ArtifactKind,
+        actual: ArtifactKind,
+    },
+    #[error("active contract {0} is not the canonical Store head")]
+    NonCanonicalActiveContract(String),
     #[error("Planner may not schedule Rust terminal recipe {0}")]
     TerminalRecipeInProposal(TaskRecipeId),
     #[error(
@@ -167,8 +181,8 @@ impl WorkflowRuntime {
         self
     }
 
-    pub fn catalogue(&self) -> &RecipeCatalogue {
-        &self.catalogue
+    pub fn recipe(&self, recipe_id: &TaskRecipeId) -> RuntimeResult<&TaskRecipe> {
+        self.catalogue.recipe(recipe_id)
     }
 }
 

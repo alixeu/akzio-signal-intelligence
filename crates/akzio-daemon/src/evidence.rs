@@ -142,76 +142,63 @@ impl Daemon {
         Ok(artifacts.into_values().collect())
     }
 
-    async fn acquire_paper_evidence_concurrently(
+    async fn acquire_paper_need(
+        &self,
+        permit: &TaskWritePermit,
+        reference: &ArtifactRef,
+        need_artifact: Artifact,
+        need: EvidenceNeed,
+        adapter: &dyn AsyncEvidenceAdapter,
+        now: DateTime<Utc>,
+    ) -> Result<(EvidenceNeed, Artifact, EvidenceBundle)> {
+        if reference.kind != ArtifactKind::EvidenceNeed {
+            return Err(DaemonError::InvalidInput(
+                "Paper evidence task has non-EvidenceNeed input".to_owned(),
+            ));
+        }
+        if evidence_source(&need.source_family)? != EvidenceSource::Alpaca {
+            return Err(DaemonError::InvalidInput(
+                "Paper evidence input is not Alpaca".to_owned(),
+            ));
+        }
+        let max_age_secs = i64::try_from(need.max_age_secs).map_err(|_| {
+            DaemonError::InvalidInput("EvidenceNeed max_age_secs exceeds i64".to_owned())
+        })?;
+        let runtime = EvidenceRuntime::new(self.store.clone(), [EvidenceSource::Alpaca]);
+        let bundle = runtime
+            .acquire_and_normalize_async(
+                permit,
+                reference,
+                &EvidenceRequest {
+                    source: EvidenceSource::Alpaca,
+                    resource: need.resource.clone(),
+                    max_age: Duration::seconds(max_age_secs),
+                },
+                adapter,
+                now,
+            )
+            .await?;
+        Ok((need, need_artifact, bundle))
+    }
+
+    fn materialize_paper_acquisitions(
         &self,
         task: &ClaimedAttempt,
+        acquisitions: Vec<(EvidenceNeed, Artifact, EvidenceBundle)>,
         now: DateTime<Utc>,
-    ) -> Result<Vec<Artifact>> {
-        let adapter = self
-            .production_evidence
-            .get(&EvidenceSource::Alpaca)
-            .cloned()
-            .ok_or_else(|| {
-                DaemonError::Unavailable("Paper evidence requires Alpaca adapter".to_owned())
-            })?;
-        let acquisitions =
-            futures::future::try_join_all(task.node.input_artifacts.iter().map(|reference| {
-                let reference = reference.clone();
-                let store = self.store.clone();
-                let adapter = adapter.clone();
-                let permit = task.permit.clone();
-                async move {
-                    if reference.kind != ArtifactKind::EvidenceNeed {
-                        return Err(DaemonError::InvalidInput(
-                            "Paper evidence task has non-EvidenceNeed input".to_owned(),
-                        ));
-                    }
-                    let need_artifact = store.artifact(&reference.artifact_id)?;
-                    let need: EvidenceNeed =
-                        serde_json::from_slice(&store.read_blob(&need_artifact.blob)?)?;
-                    need.validate()
-                        .map_err(|error| DaemonError::InvalidInput(error.to_string()))?;
-                    if evidence_source(&need.source_family)? != EvidenceSource::Alpaca {
-                        return Err(DaemonError::InvalidInput(
-                            "Paper evidence input is not Alpaca".to_owned(),
-                        ));
-                    }
-                    let max_age_secs = i64::try_from(need.max_age_secs).map_err(|_| {
-                        DaemonError::InvalidInput(
-                            "EvidenceNeed max_age_secs exceeds i64".to_owned(),
-                        )
-                    })?;
-                    let runtime = EvidenceRuntime::new(store, [EvidenceSource::Alpaca]);
-                    let bundle = runtime
-                        .acquire_and_normalize_async(
-                            &permit,
-                            &reference,
-                            &EvidenceRequest {
-                                source: EvidenceSource::Alpaca,
-                                resource: need.resource.clone(),
-                                max_age: Duration::seconds(max_age_secs),
-                            },
-                            adapter.as_ref(),
-                            now,
-                        )
-                        .await?;
-                    Ok::<_, DaemonError>((need, need_artifact, bundle))
-                }
-            }))
-            .await?;
-
+    ) -> Result<(BTreeMap<ArtifactId, Artifact>, Option<Artifact>)> {
         let mut artifacts = BTreeMap::new();
         let mut account_components = BTreeMap::new();
+
         for (need, need_artifact, bundle) in acquisitions {
+            let resource = need.resource.clone();
             if matches!(
-                need.resource.as_str(),
+                resource.as_str(),
                 PAPER_ACCOUNT_RESOURCE | PAPER_POSITIONS_RESOURCE | PAPER_OPEN_ORDERS_RESOURCE
-            ) || need.resource.starts_with("paper.fills:")
+            ) || resource.starts_with("paper.fills:")
             {
-                account_components.insert(
-                    need.resource.clone(),
-                    (need_artifact.clone(), bundle.normalized.clone()),
-                );
+                account_components
+                    .insert(resource, (need_artifact.clone(), bundle.normalized.clone()));
             } else if let Some(snapshot) = self.materialize_paper_single_snapshot(
                 task,
                 &need_artifact,
@@ -224,12 +211,56 @@ impl Daemon {
             artifacts.insert(bundle.raw.artifact_id.clone(), bundle.raw);
             artifacts.insert(bundle.normalized.artifact_id.clone(), bundle.normalized);
         }
-        if !account_components.is_empty() {
-            if let Some(account) =
-                self.materialize_paper_account_components(task, &account_components, now)?
-            {
-                artifacts.insert(account.artifact_id.clone(), account);
-            }
+
+        let account = self.materialize_paper_account_components(task, &account_components, now)?;
+        if let Some(account) = &account {
+            artifacts.insert(account.artifact_id.clone(), account.clone());
+        }
+        Ok((artifacts, account))
+    }
+
+    async fn acquire_paper_evidence_concurrently(
+        &self,
+        task: &ClaimedAttempt,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<Artifact>> {
+        let adapter = self
+            .production_evidence
+            .get(&EvidenceSource::Alpaca)
+            .cloned()
+            .ok_or_else(|| {
+                DaemonError::Unavailable("Paper evidence requires Alpaca adapter".to_owned())
+            })?;
+        let acquisitions = futures::future::try_join_all(task.node.input_artifacts.iter().map(
+            |reference| async {
+                let reference = reference.clone();
+                if reference.kind != ArtifactKind::EvidenceNeed {
+                    return Err(DaemonError::InvalidInput(
+                        "Paper evidence task has non-EvidenceNeed input".to_owned(),
+                    ));
+                }
+                let need_artifact = self.store.artifact(&reference.artifact_id)?;
+                let need: EvidenceNeed =
+                    serde_json::from_slice(&self.store.read_blob(&need_artifact.blob)?)?;
+                self.acquire_paper_need(
+                    &task.permit,
+                    &reference,
+                    need_artifact,
+                    need,
+                    adapter.as_ref(),
+                    now,
+                )
+                .await
+            },
+        ))
+        .await?;
+
+        let (artifacts, _) = self.materialize_paper_acquisitions(task, acquisitions, now)?;
+        if artifacts.is_empty() {
+            return Err(DaemonError::InvalidInput(format!(
+                "evidence task {} produced no snapshots",
+                task.node.task_id
+            )));
         }
         Ok(artifacts.into_values().collect())
     }
@@ -296,71 +327,58 @@ impl Daemon {
                 "Paper execution refresh inputs are incomplete".to_owned(),
             ));
         }
-
-        let acquisitions = futures::future::try_join_all(needs.into_iter().map(
+        let (market_needs, account_needs): (Vec<_>, Vec<_>) =
+            needs.into_iter().partition(|(_, _, need)| {
+                matches!(
+                    need.resource.as_str(),
+                    PAPER_QUOTES_RESOURCE | PAPER_CLOCK_RESOURCE
+                )
+            });
+        let account_now = Utc::now();
+        let mut acquisitions = futures::future::try_join_all(account_needs.into_iter().map(
             |(reference, need_artifact, need)| {
-                let runtime = EvidenceRuntime::new(self.store.clone(), [EvidenceSource::Alpaca]);
                 let adapter = adapter.clone();
-                let permit = task.permit.clone();
                 async move {
-                    let max_age_secs = i64::try_from(need.max_age_secs).map_err(|_| {
-                        DaemonError::InvalidInput(
-                            "EvidenceNeed max_age_secs exceeds i64".to_owned(),
-                        )
-                    })?;
-                    let bundle = runtime
-                        .acquire_and_normalize_async(
-                            &permit,
-                            &reference,
-                            &EvidenceRequest {
-                                source: EvidenceSource::Alpaca,
-                                resource: need.resource.clone(),
-                                max_age: Duration::seconds(max_age_secs),
-                            },
-                            adapter.as_ref(),
-                            now,
-                        )
-                        .await?;
-                    Ok::<_, DaemonError>((need, need_artifact, bundle))
+                    self.acquire_paper_need(
+                        &task.permit,
+                        &reference,
+                        need_artifact,
+                        need,
+                        adapter.as_ref(),
+                        account_now,
+                    )
+                    .await
                 }
             },
         ))
         .await?;
+        let market_now = Utc::now();
+        acquisitions.extend(
+            futures::future::try_join_all(market_needs.into_iter().map(
+                |(reference, need_artifact, need)| {
+                    let adapter = adapter.clone();
+                    async move {
+                        self.acquire_paper_need(
+                            &task.permit,
+                            &reference,
+                            need_artifact,
+                            need,
+                            adapter.as_ref(),
+                            market_now,
+                        )
+                        .await
+                    }
+                },
+            ))
+            .await?,
+        );
 
-        let mut artifacts = BTreeMap::new();
-        let mut account_components = BTreeMap::new();
-        for (need, need_artifact, bundle) in acquisitions {
-            let resource = need.resource.clone();
-            if matches!(
-                resource.as_str(),
-                PAPER_ACCOUNT_RESOURCE | PAPER_POSITIONS_RESOURCE | PAPER_OPEN_ORDERS_RESOURCE
-            ) || resource.starts_with("paper.fills:")
-            {
-                account_components.insert(
-                    resource.clone(),
-                    (need_artifact.clone(), bundle.normalized.clone()),
-                );
-            } else if let Some(snapshot) = self.materialize_paper_single_snapshot(
-                task,
-                &need_artifact,
-                &need,
-                &bundle.normalized,
-                now,
-            )? {
-                artifacts.insert(snapshot.artifact_id.clone(), snapshot);
-            }
-            artifacts.insert(bundle.raw.artifact_id.clone(), bundle.raw);
-            artifacts.insert(bundle.normalized.artifact_id.clone(), bundle.normalized);
-        }
-        let account = self
-            .materialize_paper_account_components(task, &account_components, now)?
-            .ok_or_else(|| {
-                DaemonError::InvalidInput(
-                    "Paper execution refresh did not materialize account snapshot".to_owned(),
-                )
-            })?;
-        artifacts.insert(account.artifact_id.clone(), account);
-
+        let (artifacts, account) = self.materialize_paper_acquisitions(task, acquisitions, now)?;
+        account.ok_or_else(|| {
+            DaemonError::InvalidInput(
+                "Paper execution refresh did not materialize account snapshot".to_owned(),
+            )
+        })?;
         let mut artifacts = artifacts.into_values().collect::<Vec<_>>();
         artifacts.sort_by_key(|artifact| match artifact.kind {
             ArtifactKind::RawEvidence => 0,
@@ -424,7 +442,7 @@ impl Daemon {
             serde_json::from_slice(&self.store.read_blob(&normalized.blob)?)?;
         self.validate_paper_normalized(task, need_artifact, need, normalized, &payload)?;
         let materialized = match need.resource.as_str() {
-            PAPER_ACCOUNT_RESOURCE => SnapshotArtifactMaterializer::materialize(
+            PAPER_ACCOUNT_RESOURCE => materialize_snapshot_artifact(
                 &self.store,
                 &task.permit,
                 &[normalized],
@@ -434,7 +452,7 @@ impl Daemon {
                 Some(payload.provenance.source_uri.clone()),
                 now,
             ),
-            PAPER_QUOTES_RESOURCE => SnapshotArtifactMaterializer::materialize(
+            PAPER_QUOTES_RESOURCE => materialize_snapshot_artifact(
                 &self.store,
                 &task.permit,
                 &[normalized],
@@ -444,7 +462,7 @@ impl Daemon {
                 Some(payload.provenance.source_uri.clone()),
                 now,
             ),
-            PAPER_CLOCK_RESOURCE => SnapshotArtifactMaterializer::materialize(
+            PAPER_CLOCK_RESOURCE => materialize_snapshot_artifact(
                 &self.store,
                 &task.permit,
                 &[normalized],
@@ -514,7 +532,7 @@ impl Daemon {
             .map(|(normalized, _)| *normalized)
             .collect::<Vec<_>>();
         Ok(Some(
-            SnapshotArtifactMaterializer::materialize(
+            materialize_snapshot_artifact(
                 &self.store,
                 &task.permit,
                 &normalized_sources,

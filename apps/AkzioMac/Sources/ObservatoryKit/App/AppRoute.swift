@@ -50,18 +50,6 @@ public enum AppRoute: String, CaseIterable, Identifiable, Sendable {
         }
     }
 
-    public var subtitle: String {
-        switch self {
-        case .overview: "Real-time Intelligence. Disciplined Execution."
-        case .workflow: "End-to-end orchestration and decision intelligence."
-        case .intelligence: "Collaborative intelligence. Better outcomes."
-        case .portfolio: "Positions, P&L and exposure in one screen."
-        case .outcome: "Multi-horizon outcomes with verifiable evidence."
-        case .learning: "Turn outcomes into reusable learning assets."
-        case .runArchive: "Complete ledger of runs, decisions and outcomes."
-        case .scenarioGallery: "Deterministic mock scenarios and component library."
-        }
-    }
 
     public var symbol: String {
         switch self {

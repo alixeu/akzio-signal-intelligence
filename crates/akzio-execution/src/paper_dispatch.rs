@@ -8,15 +8,6 @@ pub struct PaperDispatchInput {
     pub now: DateTime<Utc>,
 }
 
-/// Submission input for a durable, one-time r0 -> r1 replacement intent.
-#[derive(Debug, Clone)]
-pub struct PaperRepriceDispatchInput {
-    pub lease: DaemonLease,
-    pub permit: TaskWritePermit,
-    pub reprice: ArtifactRef,
-    pub now: DateTime<Utc>,
-}
-
 #[derive(Debug, Clone)]
 pub struct PaperDispatchOutput {
     pub commitment: Artifact,
@@ -47,8 +38,6 @@ pub enum PaperDispatchError {
     Frozen,
     #[error("commitment is not the durable session commitment")]
     CommitmentNotDurable,
-    #[error("reprice is not the durable r0 -> r1 lineage for this commitment")]
-    RepriceNotDurable,
     #[error("commitment does not retain its execution context")]
     CommitmentContextMissing,
     #[error("commitment execution context does not match dispatch run or plan")]
@@ -57,14 +46,10 @@ pub enum PaperDispatchError {
     MissingAllocationPlan,
     #[error("allocation plan hash does not match commitment")]
     PlanHashMismatch,
-    #[error("reprice does not match the committed allocation")]
-    RepricePlanMismatch,
     #[error("broker response plan hash does not match commitment")]
     BrokerPlanHashMismatch,
     #[error("broker returned unsupported order status {0}")]
     UnsupportedReceiptStatus(String),
-    #[error("broker returned a reprice lineage that is not in the commitment")]
-    UnexpectedReprice,
 }
 
 pub type PaperDispatchResult<T> = std::result::Result<T, PaperDispatchError>;
@@ -201,7 +186,7 @@ impl V2PaperDispatchRuntime {
         let broker_receipts = execution
             .orders
             .iter()
-            .map(|receipt| broker_receipt(receipt, &commitment, None, input.now))
+            .map(|receipt| broker_receipt(receipt, &commitment, input.now))
             .collect::<PaperDispatchResult<Vec<_>>>()?;
         let reconciliation_runtime = V2ReconciliationRuntime::new(self.store.clone());
         let reconciliation = reconciliation_runtime.reconcile(&ReconciliationInput {
@@ -216,116 +201,6 @@ impl V2PaperDispatchRuntime {
             &input.permit,
             &reconciliation,
             &input.commitment,
-            recovered,
-            Utc::now(),
-        )?;
-
-        Ok(PaperDispatchOutput {
-            commitment: commitment_artifact,
-            execution,
-            reconciliation,
-        })
-    }
-
-    pub async fn dispatch_reprice<B: CommittedPaperBroker + ?Sized>(
-        &self,
-        broker: &B,
-        input: &PaperRepriceDispatchInput,
-    ) -> PaperDispatchResult<PaperDispatchOutput> {
-        self.require_paper_run(&input.permit)?;
-        let reprice_artifact =
-            self.load_expected(&input.reprice, ArtifactKind::ExecutionReprice)?;
-        let reprice: PaperReprice =
-            serde_json::from_slice(&self.store.read_blob(&reprice_artifact.blob)?)?;
-        reprice.validate()?;
-        let durable_reprice = self
-            .store
-            .reprice_for(&reprice.commitment, reprice.asset)?
-            .ok_or(PaperDispatchError::RepriceNotDurable)?;
-        if durable_reprice.artifact_id != input.reprice.artifact_id
-            || !reprice_artifact
-                .source_refs
-                .iter()
-                .any(|source| source == &reprice.commitment)
-            || !reprice_artifact
-                .source_refs
-                .iter()
-                .any(|source| source == &reprice.prior_receipt)
-        {
-            return Err(PaperDispatchError::RepriceNotDurable);
-        }
-
-        let CommittedPlanContext {
-            commitment_artifact,
-            commitment,
-            plan,
-        } = self.load_committed_plan(&input.permit, &reprice.commitment)?;
-        let (order_index, original) = plan
-            .orders
-            .iter()
-            .enumerate()
-            .find(|(_, order)| order.asset == reprice.asset)
-            .ok_or(PaperDispatchError::RepricePlanMismatch)?;
-        if commitment.client_order_ids.get(&reprice.asset) != Some(&reprice.prior_client_order_id)
-            || reprice.replacement_client_order_id
-                != client_order_id(&commitment.broker_session, &plan.plan_hash, order_index, 1)
-        {
-            return Err(PaperDispatchError::RepricePlanMismatch);
-        }
-        let replacement = OrderIntent {
-            asset: original.asset,
-            side: original.side,
-            notional: original.notional,
-            limit_price: reprice.replacement_limit_price,
-        };
-
-        self.ensure_unfrozen()?;
-        self.store.validate_daemon_lease(&input.lease, Utc::now())?;
-        self.store.validate_task_permit(&input.permit)?;
-        let recovered = self.store.record_paper_effect_intent(
-            &input.lease,
-            &input.permit,
-            &input.reprice,
-            input.now,
-        )?;
-        let receipt = broker
-            .replace_commitment_once(&commitment, &reprice, &replacement)
-            .await?;
-        let submitted = PaperExecution {
-            plan_hash: plan.plan_hash.clone(),
-            orders: vec![receipt],
-        };
-        self.store.validate_daemon_lease(&input.lease, Utc::now())?;
-        let execution = reconcile_until_settled(
-            &self.store,
-            &input.lease,
-            broker,
-            &commitment,
-            &submitted,
-            self.settlement_timeout,
-        )
-        .await?;
-        if execution.plan_hash != commitment.plan_hash {
-            return Err(PaperDispatchError::BrokerPlanHashMismatch);
-        }
-        let broker_receipts = execution
-            .orders
-            .iter()
-            .map(|receipt| broker_receipt(receipt, &commitment, Some(&reprice), input.now))
-            .collect::<PaperDispatchResult<Vec<_>>>()?;
-        let reconciliation_runtime = V2ReconciliationRuntime::new(self.store.clone());
-        let reconciliation = reconciliation_runtime.reconcile(&ReconciliationInput {
-            permit: input.permit.clone(),
-            commitment: reprice.commitment.clone(),
-            reprice: Some(input.reprice.clone()),
-            broker_receipts,
-            now: input.now,
-        })?;
-        reconciliation_runtime.commit_with_effect(
-            &input.lease,
-            &input.permit,
-            &reconciliation,
-            &input.reprice,
             recovered,
             Utc::now(),
         )?;
@@ -477,20 +352,9 @@ fn execution_is_settled(execution: &PaperExecution) -> PaperDispatchResult<bool>
 fn broker_receipt(
     receipt: &PaperOrderReceipt,
     commitment: &PaperCommitment,
-    reprice: Option<&PaperReprice>,
     observed_at: DateTime<Utc>,
 ) -> PaperDispatchResult<OrderReceipt> {
-    let expected_reprice_count = u8::from(reprice.is_some());
-    if receipt.reprice_count != expected_reprice_count {
-        return Err(PaperDispatchError::UnexpectedReprice);
-    }
     let asset = Asset::try_from(receipt.symbol.as_str())?;
-    if let Some(reprice) = reprice {
-        if asset != reprice.asset || receipt.client_order_id != reprice.replacement_client_order_id
-        {
-            return Err(PaperDispatchError::UnexpectedReprice);
-        }
-    }
     Ok(OrderReceipt {
         plan_hash: commitment.plan_hash.clone(),
         asset,
@@ -506,7 +370,6 @@ fn broker_receipt(
         observed_at,
     })
 }
-
 #[cfg(test)]
 mod settle_tests {
     use super::*;

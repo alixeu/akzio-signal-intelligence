@@ -3,6 +3,43 @@
 //! This crate contains schemas and validation only: no database, model,
 //! network, filesystem, or broker I/O.
 
+macro_rules! id_type {
+    ($name:ident) => {
+        #[derive(
+            Debug,
+            Clone,
+            PartialEq,
+            Eq,
+            PartialOrd,
+            Ord,
+            Hash,
+            serde::Serialize,
+            serde::Deserialize,
+        )]
+        #[serde(transparent)]
+        pub struct $name(pub String);
+
+        impl $name {
+            pub fn new() -> Self {
+                let value = uuid::Uuid::new_v4().simple().to_string();
+                Self(value[..16].to_owned())
+            }
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(&self.0)
+            }
+        }
+    };
+}
+
 mod core;
 mod schema;
 

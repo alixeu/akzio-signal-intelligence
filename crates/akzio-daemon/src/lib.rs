@@ -29,51 +29,55 @@ use std::{
 };
 
 use akzio_domain::{
-    AccountSnapshot, AgentContract, Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle,
-    ArtifactOrigin, ArtifactProvenance, ArtifactRef, Asset, CandidatePolicyState, ContentHash,
-    ContextPolicy, ContractPurpose, Decision, DecisionContext, DomainError, EvidenceNeed,
-    ExecutionContext, ExecutionVerdict, FreezeState, LifecycleEventType, MemoryId, MoneyMicros,
-    OrderReceipt, OrderReceiptState, Outcome, OutcomeExecutionLineage, OutcomeHorizon, OutcomeId,
-    OutcomeSchedule, PaperApprovalScope, PaperLaunchApproval, PolicyState, PolicySubject,
-    QuoteSnapshot, Reconciliation, ReconciliationState, ResearchClaim, Retrospective,
-    RetrospectiveDraft, RunId, RunPurpose, RuntimeIdentity, RuntimeManifest, RuntimeTaskClass,
-    TargetPortfolio, TaskId, TaskStatus, TopologyId, WeightPpm, WorkflowGraph, WorkflowProposal,
-    WorkflowStatus,
+    content_hash_json, AccountSnapshot, AgentContract, Artifact, ArtifactId, ArtifactKind,
+    ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef, Asset, ContentHash,
+    ContractPurpose, Decision, DecisionContext, DecisionHorizon, DomainError, EvidenceNeed,
+    ExecutionContext, ExecutionVerdict, FreezeState, Lesson, LessonId, LessonLifecycle,
+    LessonOrigin, LessonScope, LifecycleEventType, MemoryId, MoneyMicros, OrderReceipt, Outcome,
+    OutcomeCostModel, OutcomeExecutionLineage, OutcomeHorizon, OutcomeId, OutcomeSchedule,
+    PaperApprovalScope, PaperLaunchApproval, PolicySubject, QuoteSnapshot, Reconciliation,
+    ReconciliationState, ResearchClaim, Retrospective, RetrospectiveDraft, RunId, RunPurpose,
+    RuntimeIdentity, RuntimeManifest, RuntimeTaskClass, TargetPortfolio, TaskId, TaskStatus,
+    TaskWritePermit, TopologyId, WorkflowGraph, WorkflowProposal, WorkflowStatus,
+    V2_DOMAIN_SCHEMA_VERSION,
 };
 use akzio_execution::{
+    materialize_snapshot_artifact,
     paper::{AlpacaPaper, CommittedPaperBroker, PortfolioHistoryRange},
-    DecisionGateError, DecisionGateInput, ExecutionGateError, ExecutionGateInput, ExecutionPlan,
-    ExecutionPolicy, OrderSide, PaperCommitmentError, PaperCommitmentInput, PaperDispatchError,
-    PaperDispatchFailpoint, PaperDispatchInput, SnapshotArtifactMaterializer, V2DecisionRuntime,
-    V2ExecutionRuntime, V2PaperCommitmentRuntime, V2PaperDispatchRuntime,
+    DecisionGateError, DecisionGateInput, DecisionPolicy, ExecutionGateError, ExecutionGateInput,
+    ExecutionPlan, ExecutionPolicy, PaperCommitmentError, PaperCommitmentInput, PaperDispatchError,
+    PaperDispatchFailpoint, PaperDispatchInput, V2DecisionRuntime, V2ExecutionRuntime,
+    V2PaperCommitmentRuntime, V2PaperDispatchRuntime,
 };
 pub use akzio_ingest::AlpacaMarketDataFeed;
 use akzio_ingest::{
     common_bar_dates, decode_paper_account, decode_paper_clock, decode_paper_quotes,
-    parse_daily_bars, parse_money_micros, provider_money, AcquiredEvidence,
-    AlpacaPaperEvidenceTransport, AsyncEvidenceAdapter, EvidenceProvenance, EvidenceQuality,
-    EvidenceRequest, EvidenceRuntime, EvidenceRuntimeError, EvidenceSource, FixtureEvidenceAdapter,
-    FredDirectTransport, ModelNativeWebEvidenceTransport, NormalizedEvidencePayload,
+    model_native_web_evidence_transport, parse_daily_bars, parse_money_micros, provider_money,
+    AcquiredEvidence, AlpacaPaperEvidenceTransport, AsyncEvidenceAdapter, EvidenceBundle,
+    EvidenceProvenance, EvidenceQuality, EvidenceRequest, EvidenceRuntime, EvidenceRuntimeError,
+    EvidenceSource, FixtureEvidenceAdapter, FredDirectTransport, NormalizedEvidencePayload,
     PaperDecodeError, SecEdgarDirectTransport,
 };
 use akzio_learning::{
     horizon_observations, CanaryBundleComparison, CanaryCampaignRuntime, CanaryError,
     CanarySubjectComparison, CandidatePolicyInput, EvaluationError, EvaluationInput,
-    EvaluationPolicy, EvaluationRuntime, OutcomeCostModel, OutcomeMaterializationInput,
-    OutcomeScheduleError, OutcomeScheduleInput, OutcomeSchedulingRuntime, ShadowObservation,
+    EvaluationPolicy, EvaluationRuntime, OutcomeMaterializationInput, OutcomeScheduleError,
+    OutcomeScheduleInput, OutcomeSchedulingRuntime, ShadowObservation,
 };
 use akzio_model::{ModelClient, ModelConfig, ModelError};
-pub use akzio_research::fixture_model_client;
+pub use akzio_research::v2::fixture_model_client;
 use akzio_research::v2::{
     ActiveResearchCatalogue, AgentReasoningEvent, AgentRuntime, ModelClientAdapter, ResearchError,
 };
-use akzio_runtime::{
+pub use akzio_research::{contract_component_hash, prompt_component_hash};
+pub use akzio_runtime::topology_component_hash;
+use akzio_runtime::v2::{
     should_run_structured_critique, RetryCause, RuntimeError, TaskCompletion, TaskRuntime,
     WorkflowRuntime,
 };
 use akzio_store::v2::{
-    ClaimedAttempt, DaemonLease, StoreAlert, StoreError, StoreMetrics, StoredEvent,
-    TrajectoryEntry, V2Store, WorkflowSnapshot,
+    ClaimedAttempt, DaemonLease, LessonUsage, StoreAlert, StoreError, StoreMetrics, StoredEvent,
+    StoredLesson, TrajectoryEntry, V2Store, WorkflowSnapshot,
 };
 use async_stream::stream;
 use axum::{
@@ -167,6 +171,36 @@ impl From<PaperDecodeError> for DaemonError {
 pub type Result<T> = std::result::Result<T, DaemonError>;
 
 #[derive(Debug, Clone)]
+pub struct RuntimePolicyIdentity {
+    pub decision_policy_hash: ContentHash,
+    pub execution_policy_hash: ContentHash,
+    pub evaluation_policy_hash: ContentHash,
+    pub minimum_evidence_completeness_ppm: u32,
+    pub minimum_risk_recall_ppm: u32,
+    pub minimum_fresh_pairs_per_horizon: u64,
+}
+
+pub fn default_runtime_policy_identity() -> Result<RuntimePolicyIdentity> {
+    let evaluation_policy = EvaluationPolicy::default();
+    Ok(RuntimePolicyIdentity {
+        decision_policy_hash: DecisionPolicy::default()
+            .policy_hash()
+            .map_err(|error| DaemonError::InvalidInput(error.to_string()))?,
+        execution_policy_hash: ExecutionPolicy::default()
+            .policy_hash()
+            .map_err(|error| DaemonError::InvalidInput(error.to_string()))?,
+        evaluation_policy_hash: content_hash_json(&serde_json::json!({
+            "minimum_evidence_completeness_ppm": evaluation_policy.minimum_evidence_completeness_ppm,
+            "minimum_risk_recall_ppm": evaluation_policy.minimum_risk_recall_ppm,
+            "minimum_fresh_pairs_per_horizon": evaluation_policy.minimum_fresh_pairs_per_horizon,
+        }))?,
+        minimum_evidence_completeness_ppm: evaluation_policy.minimum_evidence_completeness_ppm,
+        minimum_risk_recall_ppm: evaluation_policy.minimum_risk_recall_ppm,
+        minimum_fresh_pairs_per_horizon: evaluation_policy.minimum_fresh_pairs_per_horizon,
+    })
+}
+
+#[derive(Debug, Clone)]
 pub struct DaemonConfig {
     pub store_root: PathBuf,
     pub http_token: String,
@@ -252,6 +286,17 @@ pub struct RunCancellationResponse {
 pub struct RunRetryResponse {
     pub source_run_id: RunId,
     pub run_id: RunId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoreWorkflowView {
+    pub status: WorkflowStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoreEventView {
+    pub event_type: String,
+    pub artifact_id: Option<ArtifactId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

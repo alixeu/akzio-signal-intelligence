@@ -7,7 +7,6 @@ pub mod paper;
 pub mod paper_commitment;
 pub mod policy;
 pub mod reconciliation;
-pub mod reprice;
 pub mod snapshot;
 
 pub use allocation::{AllocationError, AllocationInput, V2AllocationRuntime};
@@ -19,7 +18,7 @@ pub use execution_gate::{
 };
 pub use paper::{
     PaperDispatchError, PaperDispatchFailpoint, PaperDispatchInput, PaperDispatchOutput,
-    PaperRepriceDispatchInput, V2PaperDispatchRuntime,
+    V2PaperDispatchRuntime,
 };
 pub use paper_commitment::{
     PaperCommitmentError, PaperCommitmentInput, PaperCommitmentOutput, V2PaperCommitmentRuntime,
@@ -28,8 +27,9 @@ pub use policy::ExecutionGatePolicy;
 pub use reconciliation::{
     ReconciliationError, ReconciliationInput, ReconciliationOutput, V2ReconciliationRuntime,
 };
-pub use reprice::{RepriceError, RepriceInput, RepriceOutput, V2RepriceRuntime};
-pub use snapshot::{ExecutionSnapshotPayload, SnapshotArtifactError, SnapshotArtifactMaterializer};
+pub use snapshot::{
+    materialize_snapshot_artifact, ExecutionSnapshotPayload, SnapshotArtifactError,
+};
 
 use std::collections::BTreeSet;
 
