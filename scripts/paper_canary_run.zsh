@@ -138,6 +138,10 @@ done
   print -u2 -- "Paper canary requires ALPACA_API_KEY and ALPACA_API_SECRET"
   exit 2
 }
+[[ -n "${FRED_API_KEY:-}" ]] || {
+  print -u2 -- "Paper canary requires FRED_API_KEY"
+  exit 2
+}
 [[ "${ALPACA_PAPER_BASE_URL:-https://paper-api.alpaca.markets}" == "https://paper-api.alpaca.markets" ]] || {
   print -u2 -- "Paper canary rejects non-Paper ALPACA_PAPER_BASE_URL"
   exit 2

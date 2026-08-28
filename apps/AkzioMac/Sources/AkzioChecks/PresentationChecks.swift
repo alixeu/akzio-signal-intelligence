@@ -280,15 +280,24 @@ func runPresentationChecks() {
             "observer decode failed",
             "Core failure detail remains visible in Settings"
         )
-        Check.expect(
-            CoreCredentialStatus(
-                llmAPIKey: true,
-                alpacaAPIKey: true,
-                alpacaAPISecret: true,
-                fredAPIKey: false
-            ).requiredComplete,
-            "required credentials persist independently of optional FRED"
-        )
+    Check.expect(
+        !CoreCredentialStatus(
+            llmAPIKey: true,
+            alpacaAPIKey: true,
+            alpacaAPISecret: true,
+            fredAPIKey: false
+        ).requiredComplete,
+        "missing FRED key keeps auto-Paper Core fail-closed"
+    )
+    Check.expect(
+        CoreCredentialStatus(
+            llmAPIKey: true,
+            alpacaAPIKey: true,
+            alpacaAPISecret: true,
+            fredAPIKey: true
+        ).requiredComplete,
+        "all auto-Paper credentials satisfy Core startup"
+    )
         Check.expect(
             !CoreCredentialStatus(
                 llmAPIKey: true,

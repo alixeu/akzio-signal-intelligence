@@ -370,6 +370,9 @@ impl WorkflowRuntime {
             ]),
             stop_reason: Some("rust-approved Paper provisioning".to_owned()),
         };
+        if let Some(task) = proposal.tasks.get_mut("synthesizer") {
+            task.objective = "Synthesize governed research with fail-closed directional evidence requirements: always return exactly 12 forecasts; any direction-blocking evidence gap or incomplete asset/horizon coverage requires missing_evidence and neutral zero forecasts.".to_owned();
+        }
         if topology_id == STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID {
             let critic = self
                 .catalogue

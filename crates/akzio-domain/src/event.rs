@@ -46,6 +46,17 @@ pub enum LifecycleEventType {
     OutcomeWorkerEnqueued,
     PaperSeedArtifactCreated,
     PlannerEvidenceNeedCreated,
+    /// Session-scoped `EvidenceNeed` minted by the Paper scheduler while it
+    /// reserves a session slot. It belongs to the new run but predates any of
+    /// its tasks, so it is recorded at run level.
+    SchedulerSnapshotNeedCreated,
+    /// Frozen `WorkflowProposal` written atomically with a Paper session slot.
+    SchedulerWorkflowProposalCreated,
+    SupplementalEvidenceNeedCreated,
+    /// A Paper analyst asked for supplemental evidence and the round did not
+    /// produce a refined Claim. The task still succeeds on its first Claim, so
+    /// this fact is the only durable trace that coverage stayed incomplete.
+    SupplementalRoundAbandoned,
     PolicyEvaluated,
     PolicyTransitioned,
     RunCancelRequested,
@@ -112,6 +123,10 @@ impl LifecycleEventType {
             "outcome.worker.enqueued" => Self::OutcomeWorkerEnqueued,
             "paper.seed_artifact.created" => Self::PaperSeedArtifactCreated,
             "planner.evidence_need_created" => Self::PlannerEvidenceNeedCreated,
+            "scheduler.snapshot_need_created" => Self::SchedulerSnapshotNeedCreated,
+            "scheduler.workflow_proposal_created" => Self::SchedulerWorkflowProposalCreated,
+            "supplemental.evidence_need_created" => Self::SupplementalEvidenceNeedCreated,
+            "supplemental.round_abandoned" => Self::SupplementalRoundAbandoned,
             "policy.evaluated" => Self::PolicyEvaluated,
             "policy.transitioned" => Self::PolicyTransitioned,
             "run.cancel_requested" => Self::RunCancelRequested,
@@ -180,6 +195,10 @@ impl LifecycleEventType {
             Self::OutcomeWorkerEnqueued => "outcome.worker.enqueued",
             Self::PaperSeedArtifactCreated => "paper.seed_artifact.created",
             Self::PlannerEvidenceNeedCreated => "planner.evidence_need_created",
+            Self::SchedulerSnapshotNeedCreated => "scheduler.snapshot_need_created",
+            Self::SchedulerWorkflowProposalCreated => "scheduler.workflow_proposal_created",
+            Self::SupplementalEvidenceNeedCreated => "supplemental.evidence_need_created",
+            Self::SupplementalRoundAbandoned => "supplemental.round_abandoned",
             Self::PolicyEvaluated => "policy.evaluated",
             Self::PolicyTransitioned => "policy.transitioned",
             Self::RunCancelRequested => "run.cancel_requested",
@@ -248,6 +267,10 @@ mod tests {
             "outcome.worker.enqueued",
             "paper.seed_artifact.created",
             "planner.evidence_need_created",
+            "scheduler.snapshot_need_created",
+            "scheduler.workflow_proposal_created",
+            "supplemental.evidence_need_created",
+            "supplemental.round_abandoned",
             "policy.evaluated",
             "policy.transitioned",
             "run.cancel_requested",

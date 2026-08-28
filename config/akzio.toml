@@ -1,5 +1,5 @@
 [daemon]
-store_root = "outputs/akzio-v2-rebuild"
+store_root = "/Users/alixeu/.akzio/store"
 http_addr = "127.0.0.1:7342"
 token_env = "AKZIO_DAEMON_TOKEN"
 # Optional read-only credential for Akzio Observatory. Uncomment after setting

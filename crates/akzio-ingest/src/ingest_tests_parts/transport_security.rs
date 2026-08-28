@@ -36,7 +36,7 @@ fn alpaca_paper_transport_is_endpoint_and_resource_fenced() {
         "/v2/stocks/QQQ/bars?timeframe=1Day&limit=1000&adjustment=all&start=2026-05-12"
     );
     assert!(AlpacaPaperEvidenceTransport::path_for("observer.qqq_history:all:2026-05-12").is_err());
-    assert!(AlpacaPaperEvidenceTransport::path_for("bars:QQQ:1d:2026-08-01:33").is_err());
+    assert!(AlpacaPaperEvidenceTransport::path_for("bars:QQQ:1d:2026-08-01:253").is_err());
     assert!(AlpacaPaperEvidenceTransport::path_for("bars:SPY:1d").is_err());
     assert!(AlpacaPaperEvidenceTransport::path_for("bars:QQQ:5m").is_err());
     assert!(AlpacaPaperEvidenceTransport::path_for("https://example.com").is_err());

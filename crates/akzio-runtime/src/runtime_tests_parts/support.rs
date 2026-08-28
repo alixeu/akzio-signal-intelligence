@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use akzio_domain::{
     ArtifactId, ArtifactOrigin, ArtifactRef, ClaimStance, ContentHash, ContractPurpose,
-    DecisionHorizon, EvidenceGap, EvidenceNeed, FailureDisposition, LifecycleEventType,
+    DecisionHorizon, EvidenceGap, EvidenceGapImpact, EvidenceNeed, FailureDisposition,
+    LifecycleEventType,
     ResearchClaim, RetryPolicy, TaskBudget, WorkflowProposalDraft, WorkflowProposalDraftTask,
     WorkflowProposalTask,
 };
@@ -45,10 +46,12 @@ fn claim(
         confidence_ppm,
         grounds: vec![],
         evidence_gaps: has_gap
-            .then(|| EvidenceGap {
-                topic: "fixture gap".to_owned(),
-                rationale: "fixture uncertainty".to_owned(),
-            })
+        .then(|| EvidenceGap {
+            topic: "fixture gap".to_owned(),
+            rationale: "fixture uncertainty".to_owned(),
+            impact: EvidenceGapImpact::Warning,
+            supplemental_needs: vec![],
+        })
             .into_iter()
             .collect(),
     }

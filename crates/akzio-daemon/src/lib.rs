@@ -36,9 +36,9 @@ use akzio_domain::{
     LessonOrigin, LessonScope, LifecycleEventType, MemoryId, MoneyMicros, OrderReceipt, Outcome,
     OutcomeCostModel, OutcomeExecutionLineage, OutcomeHorizon, OutcomeId, OutcomeSchedule,
     PaperApprovalScope, PaperLaunchApproval, PolicySubject, QuoteSnapshot, Reconciliation,
-    ReconciliationState, ResearchClaim, Retrospective, RetrospectiveDraft, RunId, RunPurpose,
-    RuntimeIdentity, RuntimeManifest, RuntimeTaskClass, TargetPortfolio, TaskId, TaskStatus,
-    TaskWritePermit, TopologyId, WorkflowGraph, WorkflowProposal, WorkflowStatus,
+    ReconciliationState, ResearchClaim, ResearchIntent, Retrospective, RetrospectiveDraft, RunId,
+    RunPurpose, RuntimeIdentity, RuntimeManifest, RuntimeTaskClass, TargetPortfolio, TaskId,
+    TaskStatus, TaskWritePermit, TopologyId, WorkflowGraph, WorkflowProposal, WorkflowStatus,
     V2_DOMAIN_SCHEMA_VERSION,
 };
 use akzio_execution::{
@@ -67,7 +67,8 @@ use akzio_learning::{
 use akzio_model::{ModelClient, ModelConfig, ModelError};
 pub use akzio_research::v2::fixture_model_client;
 use akzio_research::v2::{
-    ActiveResearchCatalogue, AgentReasoningEvent, AgentRuntime, ModelClientAdapter, ResearchError,
+    ActiveResearchCatalogue, AgentReasoningEvent, AgentRunBudget, AgentRuntime, ModelClientAdapter,
+    ResearchError,
 };
 pub use akzio_research::{contract_component_hash, prompt_component_hash};
 pub use akzio_runtime::topology_component_hash;
@@ -371,21 +372,58 @@ fn retry_cause_for_daemon_error(error: &DaemonError) -> Option<RetryCause> {
     }
 }
 
-fn debug_fixture_evidence(resource: &str, now: DateTime<Utc>) -> AcquiredEvidence {
-    let source_uri = format!("fixture://alpaca/{resource}");
+fn debug_fixture_evidence(
+    source: EvidenceSource,
+    resource: &str,
+    now: DateTime<Utc>,
+) -> AcquiredEvidence {
+    let source_uri = format!("fixture://{}/{resource}", source.as_str());
+    let normalized = match resource {
+        PAPER_ACCOUNT_RESOURCE => serde_json::json!({
+            "equity": "100000",
+            "buying_power": "400000",
+            "status": "ACTIVE",
+            "trading_blocked": false,
+        }),
+        PAPER_POSITIONS_RESOURCE | PAPER_OPEN_ORDERS_RESOURCE => serde_json::json!([]),
+        value if value.starts_with("paper.fills:") => serde_json::json!([]),
+        PAPER_QUOTES_RESOURCE => serde_json::json!({
+            "quotes": {
+                "TQQQ": { "bp": 100.0, "ap": 100.1, "t": now.to_rfc3339() },
+                "QQQ": { "bp": 100.0, "ap": 100.1, "t": now.to_rfc3339() },
+                "SOXX": { "bp": 100.0, "ap": 100.1, "t": now.to_rfc3339() },
+                "SOXL": { "bp": 100.0, "ap": 100.1, "t": now.to_rfc3339() },
+            }
+        }),
+        PAPER_CLOCK_RESOURCE => serde_json::json!({
+            "is_open": true,
+            "timestamp": now.to_rfc3339(),
+        }),
+        value if value.starts_with("bars:") => serde_json::json!({
+            "bars": [{
+                "t": now.to_rfc3339(),
+                "o": 100.0,
+                "h": 101.0,
+                "l": 99.0,
+                "c": 100.5,
+                "v": 1.0,
+            }]
+        }),
+        value if value.starts_with("news:") => serde_json::json!({
+            "answer": "fixture market news",
+            "citations": [{ "uri": "https://www.reuters.com/", "published_at": now.to_rfc3339() }],
+        }),
+        value if value.starts_with("series:") => serde_json::json!({
+            "observations": [{ "date": now.date_naive().to_string(), "value": "1.0" }]
+        }),
+        _ => serde_json::json!({ "resource": resource, "fixture": true }),
+    };
     AcquiredEvidence {
-        raw: serde_json::to_vec(&serde_json::json!({
-            "resource": resource,
-            "bars": [{"asset": "TQQQ", "close": 100}],
-        }))
-        .expect("static debug fixture JSON must serialize"),
+        raw: serde_json::to_vec(&normalized).expect("static debug fixture JSON must serialize"),
         media_type: "application/json".to_owned(),
         source_uri: source_uri.clone(),
         observed_at: now,
-        normalized: serde_json::json!({
-            "resource": resource,
-            "bars": [{"asset": "TQQQ", "close": 100}],
-        }),
+        normalized,
         provenance: EvidenceProvenance {
             document_id: Some("akzio-debug-fixture".to_owned()),
             published_at: None,

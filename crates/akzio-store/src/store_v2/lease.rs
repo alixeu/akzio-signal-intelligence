@@ -215,6 +215,7 @@ impl V2Store {
                     insert_artifact(&transaction, artifact)?;
                 }
                 Self::commit_workflow_transaction(&transaction, &reservation.workflow)?;
+                Self::append_session_setup_events(&transaction, reservation, None)?;
                 transaction.execute(
                     "INSERT INTO rebuild_session_slots (session_key, run_id, topology_id, graph_artifact_id, run_created_at, scheduler_epoch, reserved_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![

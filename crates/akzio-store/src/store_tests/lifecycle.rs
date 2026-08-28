@@ -107,6 +107,18 @@ fn context_child_and_repair_lifecycle_validator_enforces_lineage_and_sources() {
         fixture.store.artifact(&foreign_child.artifact_id),
         Err(StoreError::MissingArtifact(_))
     ));
+    {
+        // The bait belongs to a run that was never created, so it is itself a
+        // Store inconsistency. Drop it now that the rejection is proven, so the
+        // integrity assertion below judges the real parent/child/repair chain.
+        let connection = fixture.store.connection.lock().unwrap();
+        connection
+            .execute(
+                "DELETE FROM rebuild_artifacts WHERE artifact_id = ?1",
+                params![foreign_parent.artifact_id.0.as_str()],
+            )
+            .unwrap();
+    }
 
     let child = permit_artifact(
         &fixture.store,

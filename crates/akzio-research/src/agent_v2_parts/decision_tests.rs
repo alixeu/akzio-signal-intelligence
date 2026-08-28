@@ -81,6 +81,9 @@ mod decision_proposal_tests {
             grounds: vec![akzio_domain::EvidenceGround {
                 evidence: evidence_ref.clone(),
                 support: "Observed fixture evidence.".to_owned(),
+                role: akzio_domain::EvidenceGroundRole::Descriptive,
+                assets: std::collections::BTreeSet::new(),
+                domain: None,
             }],
             evidence_gaps: Vec::new(),
         };

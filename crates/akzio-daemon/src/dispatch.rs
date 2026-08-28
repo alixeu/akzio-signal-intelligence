@@ -46,16 +46,108 @@ impl Daemon {
                         return Ok(TaskCompletion::NoOutput);
                     }
                 }
+                let model = self.model_for(task.node.recipe_id.as_str());
+                let mut agent_budget = AgentRunBudget::new(&task.node.budget, &task.node.retry);
                 let output = self
                     .agents
-                    .run(
+                    .run_with_budget(
                         &task.permit,
                         &task.node,
-                        candidates,
-                        self.model_for(task.node.recipe_id.as_str()),
+                        candidates.clone(),
+                        model,
                         now,
+                        &mut agent_budget,
                     )
                     .await?;
+                if task.node.recipe_id.as_str() == akzio_domain::RESEARCH_ANALYST_RECIPE_ID
+                    && self.store.run_purpose(&task.run_id)? == RunPurpose::Paper
+                {
+                    let claim: ResearchClaim =
+                        serde_json::from_slice(&self.store.read_blob(&output.blob)?)?;
+                    let has_supplemental_request = claim.evidence_gaps.iter().any(|gap| {
+                        gap.impact == akzio_domain::EvidenceGapImpact::BlocksDirectionalForecast
+                            && !gap.supplemental_needs.is_empty()
+                    });
+                    if has_supplemental_request {
+                        if !self.paper_session_is_current(task).await? {
+                            return Err(DaemonError::InvalidInput(
+                            "Paper broker session changed before supplemental evidence collection"
+                                .to_owned(),
+                        ));
+                        }
+                        let request_source = output
+                            .source_refs
+                            .iter()
+                            .find(|reference| reference.kind == ArtifactKind::AgentTurn)
+                            .cloned()
+                            .ok_or_else(|| {
+                                DaemonError::InvalidInput(
+                                    "analyst refinement has no durable AgentTurn source".to_owned(),
+                                )
+                            })?;
+                        let prepared = match self.prepare_supplemental_needs(
+                            task,
+                            &claim,
+                            &request_source,
+                            &candidates,
+                            now,
+                        ) {
+                            Ok(prepared) => prepared,
+                            Err(error) => {
+                                self.note_supplemental_round_abandoned(
+                                    task,
+                                    "supplemental evidence request rejected",
+                                    &error,
+                                )?;
+                                Vec::new()
+                            }
+                        };
+                        if !prepared.is_empty() {
+                            match self
+                                .acquire_supplemental_evidence(task, &prepared, now)
+                                .await
+                            {
+                                Ok(supplemental_refs) => {
+                                    if !self.paper_session_is_current(task).await? {
+                                        return Err(DaemonError::InvalidInput(
+                                            "Paper broker session changed before supplemental analyst round"
+                                                .to_owned(),
+                                        ));
+                                    }
+                                    let mut refined_candidates = candidates;
+                                    refined_candidates.extend(supplemental_refs);
+                                    let refinement_now = Utc::now();
+                                    match self
+                                        .agents
+                                        .run_with_budget(
+                                            &task.permit,
+                                            &task.node,
+                                            refined_candidates,
+                                            model,
+                                            refinement_now,
+                                            &mut agent_budget,
+                                        )
+                                        .await
+                                    {
+                                        Ok(refined) => {
+                                            return Ok(TaskCompletion::Succeeded(vec![refined]))
+                                        }
+                                        Err(error) => self.note_supplemental_round_abandoned(
+                                            task,
+                                            "supplemental analyst round failed",
+                                            &error,
+                                        )?,
+                                    }
+                                }
+                                Err(error) => self.note_supplemental_round_abandoned(
+                                    task,
+                                    "supplemental evidence collection failed",
+                                    &error,
+                                )?,
+                            }
+                        }
+                    }
+                }
                 if task.node.recipe_id.as_str() == akzio_domain::RESEARCH_PLANNER_RECIPE_ID {
                     let revision = self.workflow.recover(&task.run_id)?.revision;
                     self.workflow.apply_planner_output(
@@ -91,6 +183,22 @@ impl Daemon {
     /// This never scans a run's artifact set or exposes raw evidence;
     /// `AgentRuntime` then creates the task-bound ContextManifest and
     /// ReadGrant.
+    async fn paper_session_is_current(&self, task: &ClaimedAttempt) -> Result<bool> {
+        let Some(paper) = self.paper.paper_observer.as_ref() else {
+            return Ok(true);
+        };
+        let expected = self
+            .store
+            .session_slot_for_run(&task.run_id)?
+            .map(|slot| slot.session_key)
+            .ok_or_else(|| DaemonError::InvalidInput("Paper run has no session slot".to_owned()))?;
+        let clock = paper
+            .market_clock()
+            .await
+            .map_err(|error| DaemonError::InvalidInput(error.to_string()))?;
+        Ok(clock.is_open && clock.session_date.to_string() == expected)
+    }
+
     pub(super) fn execute_decision_gate(
         &self,
         task: &ClaimedAttempt,

@@ -73,7 +73,7 @@ impl PaperScheduler {
                         .origin
                         .as_ref()
                         .and_then(|origin| origin.run_id.as_ref());
-                    if artifact.producer == "scheduler.paper_snapshot" {
+                    if artifact.producer == PAPER_SNAPSHOT_PRODUCER {
                         // Snapshot inputs are session-specific. A new slot must
                         // acquire fresh account/quotes/clock evidence below,
                         // never carry a prior Run's scheduler snapshot forward.
@@ -105,19 +105,13 @@ impl PaperScheduler {
         let first_task = proposal
             .tasks
             .get_mut(&snapshot_alias)
-            .ok_or(SchedulerError::WorkflowUnavailable)?;
-        for resource in paper_snapshot_resources(&session_key) {
-            let need = EvidenceNeed {
-                schema_version: V2_DOMAIN_SCHEMA_VERSION,
-                source_family: "alpaca".to_owned(),
-                resource,
-                max_age_secs: 5,
-            };
+    .ok_or(SchedulerError::WorkflowUnavailable)?;
+    for need in paper_session_evidence_needs(&session_key) {
             need.validate()?;
             let artifact = Artifact::new(
                 ArtifactKind::EvidenceNeed,
                 self.store.put_json(&need)?,
-                "scheduler.paper_snapshot",
+                PAPER_SNAPSHOT_PRODUCER,
                 ArtifactLifecycle::RunScoped,
                 ArtifactProvenance {
                     source_family: "akzio.scheduler".to_owned(),

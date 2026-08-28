@@ -1,4 +1,5 @@
 use super::*;
+use akzio_model::ModelError;
 use std::net::{IpAddr, Ipv4Addr};
 
 #[derive(Debug, Error)]
@@ -9,6 +10,29 @@ pub enum EvidenceAdapterError {
     SourceMismatch,
     #[error("governed evidence transport failed: {0}")]
     Transport(String),
+    #[error("governed evidence policy rejected {evidence_source:?} {resource}: {reason}")]
+    Policy {
+        evidence_source: EvidenceSource,
+        resource: String,
+        reason: String,
+    },
+}
+
+fn model_error(error: ModelError, source: EvidenceSource, resource: &str) -> EvidenceAdapterError {
+    let reason = error.to_string();
+    match error {
+        ModelError::NativeWebUnavailable
+        | ModelError::NativeWebToolNotAllowed
+        | ModelError::NativeWebArgumentsInvalid
+        | ModelError::NativeWebCitationsMissing
+        | ModelError::NativeWebUnsafeCitation { .. }
+        | ModelError::NativeWebLimitExceeded => EvidenceAdapterError::Policy {
+            evidence_source: source,
+            resource: resource.to_owned(),
+            reason,
+        },
+        _ => EvidenceAdapterError::Transport(reason),
+    }
 }
 
 pub trait EvidenceAdapter: Send + Sync {
@@ -160,12 +184,12 @@ impl AlpacaPaperEvidenceTransport {
                         "invalid Alpaca bars resource".to_owned(),
                     ));
                 }
-                let limit = limit.parse::<u8>().map_err(|_| {
+                let limit = limit.parse::<u16>().map_err(|_| {
                     EvidenceAdapterError::Transport("invalid Alpaca bars limit".to_owned())
                 })?;
-                if !(1..=32).contains(&limit) {
+                if !(1..=252).contains(&limit) {
                     return Err(EvidenceAdapterError::Transport(
-                        "Alpaca bars limit outside 1..=32".to_owned(),
+                        "Alpaca bars limit outside 1..=252".to_owned(),
                     ));
                 }
                 if let Some(start) = start {
@@ -375,6 +399,11 @@ impl ModelNativeWebEvidenceTransport {
                     "www.reuters.com".to_owned(),
                     "apnews.com".to_owned(),
                     "www.apnews.com".to_owned(),
+                    "etfchannel.com".to_owned(),
+                    "m.etfchannel.com".to_owned(),
+                    "www.etfchannel.com".to_owned(),
+                    "etf.com".to_owned(),
+                    "www.etf.com".to_owned(),
                 ],
                 EvidenceSource::Alpaca => Vec::new(),
             },
@@ -413,16 +442,19 @@ impl ModelNativeWebEvidenceTransport {
             .client
             .respond(request)
             .await
-            .map_err(|error| EvidenceAdapterError::Transport(error.to_string()))?;
+            .map_err(|error| model_error(error, source, resource))?;
+        self.policy
+            .validate_provider_response(&response.raw)
+            .map_err(|error| model_error(error, source, resource))?;
         if !response.tool_calls.is_empty() {
             self.policy
                 .validate_tool_calls(&response.tool_calls)
-                .map_err(|error| EvidenceAdapterError::Transport(error.to_string()))?;
+                .map_err(|error| model_error(error, source, resource))?;
         }
         let citations = self
             .policy
             .extract_citations(&response.raw)
-            .map_err(|error| EvidenceAdapterError::Transport(error.to_string()))?;
+            .map_err(|error| model_error(error, source, resource))?;
         let raw_value = serde_json::json!({
                 "source_family": source,
                 "resource": resource,
@@ -433,6 +465,25 @@ impl ModelNativeWebEvidenceTransport {
         });
         let raw = serde_json::to_vec(&raw_value)
             .map_err(|error| EvidenceAdapterError::Transport(error.to_string()))?;
+        let provenance_citations = citations
+            .iter()
+            .map(|citation| {
+                let needle = citation.uri.as_bytes();
+                let start_byte = raw
+                    .windows(needle.len())
+                    .position(|window| window == needle)
+                    .ok_or_else(|| {
+                        EvidenceAdapterError::Transport(
+                            "native web citation missing from retained raw payload".to_owned(),
+                        )
+                    })?;
+                Ok(EvidenceCitation {
+                    start_byte,
+                    end_byte: start_byte + needle.len(),
+                    quote: citation.uri.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, EvidenceAdapterError>>()?;
         let observed_at = Utc::now();
         let source_uri = citations
             .first()
@@ -465,11 +516,11 @@ impl ModelNativeWebEvidenceTransport {
                     primary.document_id.as_deref().unwrap_or(resource),
                     primary.revision.as_deref().unwrap_or("latest")
                 ),
-                citations: Vec::new(),
+                citations: provenance_citations,
             },
             quality: EvidenceQuality {
-                completeness_ppm: 0,
-                citations_complete: false,
+                completeness_ppm: 1_000_000,
+                citations_complete: true,
                 normalized: true,
             },
         })
@@ -527,5 +578,26 @@ impl EvidenceAdapter for FixtureEvidenceAdapter {
             .get(&request.resource)
             .cloned()
             .ok_or_else(|| EvidenceAdapterError::MissingFixture(request.resource.clone()))
+    }
+}
+
+impl AsyncEvidenceAdapter for FixtureEvidenceAdapter {
+    fn source(&self) -> EvidenceSource {
+        self.source
+    }
+
+    fn acquire<'a>(
+        &'a self,
+        request: &'a EvidenceRequest,
+    ) -> BoxFuture<'a, Result<AcquiredEvidence, EvidenceAdapterError>> {
+        Box::pin(async move {
+            if request.source != self.source {
+                return Err(EvidenceAdapterError::SourceMismatch);
+            }
+            self.responses
+                .get(&request.resource)
+                .cloned()
+                .ok_or_else(|| EvidenceAdapterError::MissingFixture(request.resource.clone()))
+        })
     }
 }

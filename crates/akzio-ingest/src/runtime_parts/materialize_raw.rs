@@ -33,8 +33,40 @@ impl EvidenceRuntime {
         adapter: &A,
         now: DateTime<Utc>,
     ) -> EvidenceRuntimeResult<EvidenceBundle> {
+        let acquired = self
+            .acquire_validated_async(permit, need, request, adapter, now)
+            .await?;
+        self.materialize_validated(permit, need, request, acquired, now)
+    }
+
+    /// Acquire and validate provider bytes without writing CAS blobs. Callers
+    /// that must inspect a complete multi-resource surface can defer
+    /// materialization until the entire surface is usable.
+    pub async fn acquire_validated_async<A: AsyncEvidenceAdapter + ?Sized>(
+        &self,
+        permit: &TaskWritePermit,
+        need: &ArtifactRef,
+        request: &EvidenceRequest,
+        adapter: &A,
+        now: DateTime<Utc>,
+    ) -> EvidenceRuntimeResult<AcquiredEvidence> {
         self.authorize_request(permit, need, request, adapter.source())?;
         let acquired = adapter.acquire(request).await?;
+        Self::validate_acquisition(&acquired, request, now)?;
+        Ok(acquired)
+    }
+
+    /// Materialize a previously validated acquisition after rechecking the
+    /// current permit and declared EvidenceNeed.
+    pub fn materialize_validated(
+        &self,
+        permit: &TaskWritePermit,
+        need: &ArtifactRef,
+        request: &EvidenceRequest,
+        acquired: AcquiredEvidence,
+        now: DateTime<Utc>,
+    ) -> EvidenceRuntimeResult<EvidenceBundle> {
+        self.authorize_request(permit, need, request, request.source)?;
         let confidence_ppm = acquired.quality.completeness_ppm;
         self.materialize_acquired(permit, need, request, acquired, confidence_ppm, now)
     }

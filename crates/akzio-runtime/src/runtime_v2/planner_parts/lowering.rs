@@ -259,7 +259,7 @@ impl WorkflowRuntime {
                     .collect::<Result<Vec<_>, _>>()?,
             );
             if purpose == RunPurpose::Paper {
-                Self::normalize_paper_evidence_needs(&mut declared_needs);
+                akzio_domain::normalize_paper_bars_limit(&mut declared_needs);
             }
             let declared_needs = declared_needs.into_iter().collect::<BTreeSet<_>>();
             let mut evidence_needs = Vec::with_capacity(declared_needs.len());
@@ -324,24 +324,5 @@ impl WorkflowRuntime {
             now,
         )?;
         Ok((proposal, evidence_needs, proposal_artifact))
-    }
-
-    fn normalize_paper_evidence_needs(needs: &mut [EvidenceNeed]) {
-        for need in needs {
-            if need.source_family != "alpaca" {
-                continue;
-            }
-            let mut parts = need.resource.split(':').collect::<Vec<_>>();
-            if parts.len() != 5 || parts[0] != "bars" || parts[2] != "1d" {
-                continue;
-            }
-            let Ok(limit) = parts[4].parse::<u8>() else {
-                continue;
-            };
-            if limit < 32 {
-                parts[4] = "32";
-                need.resource = parts.join(":");
-            }
-        }
     }
 }

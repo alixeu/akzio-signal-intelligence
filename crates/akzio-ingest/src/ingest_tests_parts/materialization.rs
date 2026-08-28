@@ -39,6 +39,23 @@ async fn sync_and_async_materialization_preserve_confidence_semantics() {
     };
     let runtime = EvidenceRuntime::new(store.clone(), [EvidenceSource::Alpaca]);
 
+    let inventory_before = store.storage_inventory().unwrap();
+    let acquired = runtime
+        .acquire_validated_async(&claimed.permit, &need, &request, &adapter, now)
+        .await
+        .unwrap();
+    let inventory_after_acquire = store.storage_inventory().unwrap();
+    assert_eq!(inventory_after_acquire.blob_count, inventory_before.blob_count);
+    assert_eq!(
+        inventory_after_acquire.unreferenced_blob_count,
+        inventory_before.unreferenced_blob_count
+    );
+    let inspected = runtime
+        .materialize_validated(&claimed.permit, &need, &request, acquired, now)
+        .unwrap();
+    assert_eq!(inspected.raw.kind, ArtifactKind::RawEvidence);
+    assert_eq!(inspected.normalized.kind, ArtifactKind::NormalizedEvidence);
+
     let synchronous = runtime
         .acquire_and_normalize(&claimed.permit, &need, &request, &adapter, now)
         .unwrap();

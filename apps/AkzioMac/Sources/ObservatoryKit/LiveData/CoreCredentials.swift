@@ -56,12 +56,13 @@ public struct CoreConfiguration: Codable, Sendable, Equatable {
             && !globalModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !globalReasoningEffort.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !globalResponseLanguage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && stageModels.values.allSatisfy {
-                !$0.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    && !$0.reasoningEffort.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            }
-            && !alpacaAPIKey.isEmpty
-            && !alpacaAPISecret.isEmpty
+        && stageModels.values.allSatisfy {
+            !$0.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !$0.reasoningEffort.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        && !alpacaAPIKey.isEmpty
+        && !alpacaAPISecret.isEmpty
+        && fredAPIKey?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
     }
 }
 
@@ -84,7 +85,7 @@ public struct CoreCredentialStatus: Sendable, Equatable {
     }
 
     public var requiredComplete: Bool {
-        llmAPIKey && alpacaAPIKey && alpacaAPISecret
+        llmAPIKey && alpacaAPIKey && alpacaAPISecret && fredAPIKey
     }
 }
 
@@ -123,7 +124,7 @@ enum CoreCredentialError: LocalizedError {
         case .configuration(let message):
             "Core configuration operation failed: \(message)"
         case .incompleteRequiredConfiguration:
-            "LLM URL, LLM API key, Alpaca API key, and Alpaca API secret are required"
+            "LLM URL, LLM API key, Alpaca API key, Alpaca API secret, and FRED API key are required"
         }
     }
 }

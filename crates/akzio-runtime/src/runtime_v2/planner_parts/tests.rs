@@ -11,9 +11,11 @@ mod tests {
             max_age_secs: 86_400,
         }];
 
-        WorkflowRuntime::normalize_paper_evidence_needs(&mut needs);
+        // Lowering delegates the floor to `akzio-domain` for Paper runs; this
+        // pins the entitlement the planner path relies on.
+        akzio_domain::normalize_paper_bars_limit(&mut needs);
 
-        assert_eq!(needs[0].resource, "bars:QQQ:1d:2026-07-24:32");
+        assert_eq!(needs[0].resource, "bars:QQQ:1d:2026-07-24:252");
     }
 
     #[test]
@@ -42,7 +44,7 @@ mod tests {
         assert!(needs.iter().all(|need| need.source_family == "alpaca"));
         assert!(needs.iter().any(|need| need.resource == "paper.account"));
         assert!(needs.iter().any(|need| {
-            need.resource.starts_with("bars:TQQQ:1d:") && need.resource.ends_with(":32")
+            need.resource.starts_with("bars:TQQQ:1d:") && need.resource.ends_with(":252")
         }));
         assert!(needs
             .iter()

@@ -321,3 +321,162 @@ impl ContextBroker {
         )
     }
 }
+
+impl ContextBroker {
+    fn select_analyst_bundle(
+        &self,
+        artifacts: &[Artifact],
+        policy: &ContextPolicy,
+    ) -> ContextResult<Option<Vec<Artifact>>> {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+        enum EvidenceDomain {
+            Bars,
+            Macro,
+            News,
+        }
+
+        #[derive(Clone)]
+        struct Bundle {
+            asset: Asset,
+            artifacts: [Artifact; 3],
+            minimum_confidence_ppm: u32,
+            total_confidence_ppm: u64,
+            total_bytes: u64,
+            estimated_tokens: u32,
+        }
+
+        let mut by_asset =
+            std::collections::BTreeMap::<Asset, std::collections::BTreeMap<_, Vec<Artifact>>>::new();
+
+        for artifact in artifacts {
+            if artifact.kind != ArtifactKind::NormalizedEvidence {
+                continue;
+            }
+            let Some(bytes) = self.store.read_blob(&artifact.blob).ok() else {
+                continue;
+            };
+            let Ok(payload) = serde_json::from_slice::<Value>(&bytes) else {
+                continue;
+            };
+            let Some(resource) = payload.get("resource").and_then(Value::as_str) else {
+                continue;
+            };
+            let mut parts = resource.split(':');
+            let Some(kind) = parts.next() else {
+                continue;
+            };
+
+            match kind {
+                "bars" | "news" => {
+                    let Some(asset) = parts.next().and_then(|symbol| Asset::try_from(symbol).ok())
+                    else {
+                        continue;
+                    };
+                    let domain = if kind == "bars" {
+                        EvidenceDomain::Bars
+                    } else {
+                        EvidenceDomain::News
+                    };
+                    by_asset
+                        .entry(asset)
+                        .or_default()
+                        .entry(domain)
+                        .or_default()
+                        .push(artifact.clone());
+                }
+                "series"
+                    if matches!(
+                        parts.next(),
+                        Some("DFF" | "DFII10" | "VIXCLS" | "DGS2" | "DGS10")
+                    ) =>
+                {
+                    for asset in Asset::EXECUTABLE {
+                        by_asset
+                            .entry(asset)
+                            .or_default()
+                            .entry(EvidenceDomain::Macro)
+                            .or_default()
+                            .push(artifact.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut complete_bundles = Vec::new();
+        for (asset, domains) in by_asset {
+            let Some(bars_candidates) = domains.get(&EvidenceDomain::Bars) else {
+                continue;
+            };
+            let Some(macro_candidates) = domains.get(&EvidenceDomain::Macro) else {
+                continue;
+            };
+            let Some(news_candidates) = domains.get(&EvidenceDomain::News) else {
+                continue;
+            };
+
+            for bars in bars_candidates {
+                for macro_series in macro_candidates {
+                    for news in news_candidates {
+                        let artifacts = [bars.clone(), macro_series.clone(), news.clone()];
+                        let minimum_confidence_ppm = artifacts
+                            .iter()
+                            .map(|artifact| artifact.provenance.confidence_ppm)
+                            .min()
+                            .unwrap_or_default();
+                        let total_confidence_ppm = artifacts
+                            .iter()
+                            .map(|artifact| u64::from(artifact.provenance.confidence_ppm))
+                            .sum();
+                        let total_bytes = artifacts
+                            .iter()
+                            .map(|artifact| artifact.blob.bytes)
+                            .fold(0_u64, u64::saturating_add);
+                        let estimated_tokens = artifacts
+                            .iter()
+                            .map(|artifact| estimate_tokens_from_bytes(artifact.blob.bytes))
+                            .fold(0_u32, u32::saturating_add);
+                        complete_bundles.push(Bundle {
+                            asset,
+                            artifacts,
+                            minimum_confidence_ppm,
+                            total_confidence_ppm,
+                            total_bytes,
+                            estimated_tokens,
+                        });
+                    }
+                }
+            }
+        }
+
+        if complete_bundles.is_empty() {
+            return Ok(None);
+        }
+
+        complete_bundles.retain(|bundle| {
+            bundle.artifacts.len() <= usize::from(policy.max_artifacts)
+                && bundle.total_bytes <= policy.max_bytes
+                && bundle.estimated_tokens <= policy.max_tokens
+        });
+
+        let Some(bundle) = complete_bundles.into_iter().max_by(|left, right| {
+            left.minimum_confidence_ppm
+                .cmp(&right.minimum_confidence_ppm)
+                .then_with(|| left.total_confidence_ppm.cmp(&right.total_confidence_ppm))
+                .then_with(|| right.total_bytes.cmp(&left.total_bytes))
+                .then_with(|| right.estimated_tokens.cmp(&left.estimated_tokens))
+                .then_with(|| right.asset.cmp(&left.asset))
+                .then_with(|| {
+                    right
+                        .artifacts
+                        .iter()
+                        .map(|artifact| &artifact.artifact_id)
+                        .cmp(left.artifacts.iter().map(|artifact| &artifact.artifact_id))
+                })
+        }) else {
+            return Err(ContextError::BudgetExceeded);
+        };
+
+        Ok(Some(bundle.artifacts.into_iter().collect()))
+    }
+}

@@ -80,15 +80,9 @@ impl PaperScheduler {
         session_key: &str,
         now: DateTime<Utc>,
     ) -> SchedulerResult<Vec<Artifact>> {
-        paper_snapshot_resources(session_key)
+        paper_session_evidence_needs(session_key)
             .into_iter()
-            .map(|resource| {
-                let need = EvidenceNeed {
-                    schema_version: V2_DOMAIN_SCHEMA_VERSION,
-                    source_family: "alpaca".to_owned(),
-                    resource,
-                    max_age_secs: 5,
-                };
+            .map(|need| {
                 need.validate()?;
                 Ok(Artifact::new(
                     ArtifactKind::EvidenceNeed,

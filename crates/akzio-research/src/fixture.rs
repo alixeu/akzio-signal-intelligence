@@ -19,7 +19,10 @@ pub fn fixture_claim_output() -> Value {
                 "artifact_id": akzio_model::FIXTURE_CONTEXT_EVIDENCE_ID,
                 "kind": "normalized_evidence"
             },
-            "support": "The selected governed fixture evidence is the stated support."
+            "support": "The selected governed fixture evidence is the stated support.",
+            "role": "descriptive",
+            "assets": [],
+            "domain": null
         }],
         "evidence_gaps": []
     })
@@ -39,7 +42,9 @@ pub fn fixture_critique_output() -> Value {
         "grounds": [],
         "evidence_gaps": [{
             "topic": "fixture_depth",
-            "rationale": "No additional governed detail was selected for the fixture critique."
+            "rationale": "No additional governed detail was selected for the fixture critique.",
+            "impact": "warning",
+            "supplemental_needs": []
         }]
     })
 }

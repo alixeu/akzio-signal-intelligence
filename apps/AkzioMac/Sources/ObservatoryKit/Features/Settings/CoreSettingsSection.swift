@@ -48,15 +48,13 @@ struct CoreSettingsSection: View {
 
             HairlineDivider()
 
-            SettingsSection(
-                "Optional Evidence",
-                footnote: "Missing optional sources do not prevent Core startup."
-            ) {
-                VStack(alignment: .leading, spacing: AkzioLayout.s2) {
-                    SecureField(L10n.text("FRED API key", language: language), text: $store.coreConfigurationDraft.fredAPIKey)
-                        .textFieldStyle(.roundedBorder)
-                    TextField(L10n.text("SEC user agent", language: language), text: $store.coreConfigurationDraft.secUserAgent)
-                        .textFieldStyle(.roundedBorder)
+        SettingsSection(
+            "Optional Source Metadata",
+            footnote: "SEC metadata is not required by the current Paper evidence policy."
+        ) {
+            VStack(alignment: .leading, spacing: AkzioLayout.s2) {
+                TextField(L10n.text("SEC user agent", language: language), text: $store.coreConfigurationDraft.secUserAgent)
+                    .textFieldStyle(.roundedBorder)
                 }
             }
 
@@ -110,6 +108,11 @@ struct CoreSettingsSection: View {
                 "Alpaca API secret",
                 text: $store.coreConfigurationDraft.alpacaAPISecret,
                 configured: store.coreCredentialStatus.alpacaAPISecret
+            )
+            configuredField(
+                "FRED API key",
+                text: $store.coreConfigurationDraft.fredAPIKey,
+                configured: store.coreCredentialStatus.fredAPIKey
             )
         }
     }

@@ -8,7 +8,7 @@ use akzio_domain::{
     BlobRef, CandidatePolicy, ContextManifestPayload, ContextPolicy, ContextProjection,
     ContextSelection, DecisionHorizon, DomainError, Experience, Lesson, LessonLifecycle,
     LessonScope, LifecycleEventType, PolicyState, ReadGrant, TaskWritePermit,
-    V2_DOMAIN_SCHEMA_VERSION,
+    RESEARCH_ANALYST_RECIPE_ID, V2_DOMAIN_SCHEMA_VERSION,
 };
 use akzio_store::v2::{StoreError, SucceededAttemptProof, V2Store};
 use chrono::{DateTime, Duration, Utc};

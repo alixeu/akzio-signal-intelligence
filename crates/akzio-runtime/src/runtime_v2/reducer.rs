@@ -171,6 +171,10 @@ impl WorkflowRuntime {
                 }
                 replay.cancel_requested = true;
             }
+            LifecycleEventType::SchedulerSnapshotNeedCreated
+            | LifecycleEventType::SchedulerWorkflowProposalCreated => {
+                self.reduce_session_setup_event(run_id, event)?;
+            }
             _ if event.artifact_id.is_some() => {
                 self.reduce_artifact_trace_event(run_id, replay, event)?;
             }
@@ -182,6 +186,43 @@ impl WorkflowRuntime {
             }
         }
         replay.event_cursor = event.cursor;
+        Ok(())
+    }
+
+    /// The scheduler freezes a session's `EvidenceNeed`s and `WorkflowProposal`
+    /// while it reserves the slot, before any task row exists, so these facts
+    /// are run-level and touch no replayed task state. Replay still checks the
+    /// lineage so the event cannot smuggle in a foreign artifact.
+    fn reduce_session_setup_event(&self, run_id: &RunId, event: &StoredEvent) -> RuntimeResult<()> {
+        if event.task_id.is_some() || event.attempt_id.is_some() {
+            return Err(Self::replay_error(
+                run_id,
+                format!("{} unexpectedly names a task attempt", event.event_type),
+            ));
+        }
+        let artifact_id = event.artifact_id.as_ref().ok_or_else(|| {
+            Self::replay_error(
+                run_id,
+                format!("{} is missing its artifact id", event.event_type),
+            )
+        })?;
+        let artifact = self.store.artifact(artifact_id)?;
+        artifact.validate()?;
+        if !matches!(
+            artifact.kind,
+            ArtifactKind::EvidenceNeed | ArtifactKind::WorkflowProposal
+        ) || artifact.lifecycle != ArtifactLifecycle::RunScoped
+            || artifact
+                .origin
+                .as_ref()
+                .and_then(|origin| origin.run_id.as_ref())
+                != Some(run_id)
+        {
+            return Err(Self::replay_error(
+                run_id,
+                format!("{} references a foreign artifact", event.event_type),
+            ));
+        }
         Ok(())
     }
 

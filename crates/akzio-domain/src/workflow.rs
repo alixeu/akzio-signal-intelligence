@@ -33,15 +33,28 @@ pub struct EvidenceNeed {
 }
 
 impl EvidenceNeed {
+    /// Bounds mirror `ResearchIntent::validate`. An `EvidenceNeed` is the
+    /// lowered form of an intent, so a need built directly by Rust or proposed
+    /// by a model may not widen the source vocabulary, the resource length, or
+    /// the freshness window the evidence runtime will accept.
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != V2_SCHEMA_VERSION
             || self.source_family.trim().is_empty()
             || self.resource.trim().is_empty()
-            || self.max_age_secs == 0
+            || self.resource.chars().count() > 2_048
+            || !(1..=86_400 * 7).contains(&self.max_age_secs)
         {
             return Err(DomainError::EmptyField {
                 field: "evidence_need",
             });
+        }
+        if !matches!(
+            self.source_family.as_str(),
+            "alpaca" | "sec_edgar" | "fred" | "news_web"
+        ) {
+            return Err(DomainError::EvidenceSourceNotAllowed(
+                self.source_family.clone(),
+            ));
         }
         Ok(())
     }
@@ -370,5 +383,220 @@ impl WorkflowGraph {
             visit(node_id, &nodes, &mut states)?;
         }
         Ok(())
+    }
+}
+
+/// Calendar lookback for the daily-bar snapshot. It must stay wide enough that
+/// `PAPER_BARS_LIMIT` sessions actually exist inside the window; roughly 252
+/// trading days fall in 366 calendar days, so 400 leaves headroom for holidays.
+pub const PAPER_BARS_LOOKBACK_DAYS: i64 = 400;
+/// Daily bars every Paper analyst shard is entitled to. The planner may not
+/// lower it, so a shard can always compute a one-year structure.
+pub const PAPER_BARS_LIMIT: u16 = 252;
+const PAPER_NEWS_LOOKBACK_DAYS: i64 = 14;
+const PAPER_MACRO_LOOKBACK_DAYS: i64 = 366;
+const PAPER_FRED_SERIES: [&str; 3] = ["DFF", "DFII10", "VIXCLS"];
+const PAPER_NEED_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+const PAPER_BROKER_NEED_MAX_AGE_SECS: u64 = 300;
+
+/// The complete evidence vocabulary of one Paper session, keyed by its broker
+/// session date.
+///
+/// This is domain policy, not scheduling mechanics: the scheduler mints these
+/// needs, the planner normalizes model-declared needs against the same bounds,
+/// and dispatch re-derives the set to validate a task's granted inputs. All
+/// three must agree, so the vocabulary lives here rather than in any one of
+/// them.
+pub fn paper_session_evidence_needs(session_key: &str) -> Vec<EvidenceNeed> {
+    let lookback = |days: i64| {
+        chrono::NaiveDate::parse_from_str(session_key, "%Y-%m-%d")
+            .ok()
+            .and_then(|date| date.checked_sub_signed(chrono::Duration::days(days)))
+            .map(|date| date.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| session_key.to_owned())
+    };
+    let bars_start = lookback(PAPER_BARS_LOOKBACK_DAYS);
+    let news_start = lookback(PAPER_NEWS_LOOKBACK_DAYS);
+    let macro_start = lookback(PAPER_MACRO_LOOKBACK_DAYS);
+    let mut resources = vec![
+        "paper.account".to_owned(),
+        "paper.positions".to_owned(),
+        "paper.open_orders".to_owned(),
+        format!("paper.fills:{session_key}"),
+        "paper.quotes".to_owned(),
+        "paper.clock".to_owned(),
+    ];
+    resources.extend(
+        crate::Asset::EXECUTABLE
+            .into_iter()
+            .map(|asset| format!("bars:{}:1d:{bars_start}:{PAPER_BARS_LIMIT}", asset.symbol())),
+    );
+    resources.extend(
+        crate::Asset::EXECUTABLE
+            .into_iter()
+            .map(|asset| format!("news:{}:{news_start}:{session_key}:market", asset.symbol())),
+    );
+    resources.extend(
+        PAPER_FRED_SERIES
+            .into_iter()
+            .map(|series| format!("series:{series}:{macro_start}:{session_key}")),
+    );
+    resources
+        .into_iter()
+        .map(|resource| EvidenceNeed {
+            schema_version: V2_SCHEMA_VERSION,
+            source_family: paper_need_source_family(&resource).to_owned(),
+            max_age_secs: if resource.starts_with("paper.") {
+                PAPER_BROKER_NEED_MAX_AGE_SECS
+            } else {
+                PAPER_NEED_MAX_AGE_SECS
+            },
+            resource,
+        })
+        .collect()
+}
+
+fn paper_need_source_family(resource: &str) -> &'static str {
+    if resource.starts_with("bars:") || resource.starts_with("paper.") {
+        "alpaca"
+    } else if resource.starts_with("news:") {
+        "news_web"
+    } else {
+        "fred"
+    }
+}
+
+/// Raise any model-declared daily-bar need up to `PAPER_BARS_LIMIT`. A planner
+/// may widen a window but never shrink the entitlement below what a Paper shard
+/// needs, so this is a floor rather than a rejection.
+pub fn normalize_paper_bars_limit(needs: &mut [EvidenceNeed]) {
+    for need in needs {
+        if need.source_family != "alpaca" {
+            continue;
+        }
+        let mut parts = need.resource.split(':').collect::<Vec<_>>();
+        if parts.len() != 5 || parts[0] != "bars" || parts[2] != "1d" {
+            continue;
+        }
+        let Ok(limit) = parts[4].parse::<u16>() else {
+            continue;
+        };
+        if limit < PAPER_BARS_LIMIT {
+            let floor = PAPER_BARS_LIMIT.to_string();
+            parts[4] = &floor;
+            need.resource = parts.join(":");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EvidenceNeed, V2_SCHEMA_VERSION};
+    use crate::DomainError;
+
+    fn need(source_family: &str, max_age_secs: u64) -> EvidenceNeed {
+        EvidenceNeed {
+            schema_version: V2_SCHEMA_VERSION,
+            source_family: source_family.to_owned(),
+            resource: "bars:TQQQ:1d".to_owned(),
+            max_age_secs,
+        }
+    }
+
+    #[test]
+    fn evidence_need_bounds_match_the_lowered_research_intent() {
+        need("alpaca", 86_400 * 7).validate().unwrap();
+        assert!(matches!(
+            need("alpaca", 86_400 * 7 + 1).validate(),
+            Err(DomainError::EmptyField {
+                field: "evidence_need"
+            })
+        ));
+        assert!(matches!(
+            need("alpaca", 0).validate(),
+            Err(DomainError::EmptyField {
+                field: "evidence_need"
+            })
+        ));
+        assert!(matches!(
+            need("observatory", 300).validate(),
+            Err(DomainError::EvidenceSourceNotAllowed(family)) if family == "observatory"
+        ));
+        let mut oversized = need("news_web", 300);
+        oversized.resource = "n".repeat(2_049);
+        assert!(matches!(
+            oversized.validate(),
+            Err(DomainError::EmptyField {
+                field: "evidence_need"
+            })
+        ));
+    }
+
+    #[test]
+    fn paper_session_needs_are_valid_and_cover_every_shard_domain() {
+        let needs = super::paper_session_evidence_needs("2026-08-28");
+        for need in &needs {
+            need.validate().unwrap();
+        }
+        assert_eq!(needs.len(), 6 + 4 + 4 + 3);
+        // One daily-bar entitlement per executable asset, at the shared floor.
+        for asset in crate::Asset::EXECUTABLE {
+            let resource = format!("bars:{}:1d:2025-07-24:252", asset.symbol());
+            assert!(
+                needs.iter().any(|need| need.resource == resource),
+                "missing {resource}"
+            );
+        }
+        assert!(needs
+            .iter()
+            .any(|need| need.resource == "paper.fills:2026-08-28"));
+        assert!(needs.iter().any(
+            |need| need.resource == "series:VIXCLS:2025-08-27:2026-08-28"
+                && need.source_family == "fred"
+        ));
+        assert!(needs
+            .iter()
+            .filter(|need| need.resource.starts_with("paper."))
+            .all(|need| need.max_age_secs == 300));
+    }
+
+    #[test]
+    fn paper_bars_lookback_window_can_hold_the_bar_limit() {
+        // Roughly 252 of 366 calendar days are trading sessions. The lookback
+        // must exceed that ratio or the minted need is unsatisfiable.
+        let sessions_in_window = super::PAPER_BARS_LOOKBACK_DAYS * 252 / 366;
+        assert!(
+            sessions_in_window >= i64::from(super::PAPER_BARS_LIMIT),
+            "{sessions_in_window} sessions cannot supply {} bars",
+            super::PAPER_BARS_LIMIT
+        );
+    }
+
+    #[test]
+    fn normalize_raises_a_short_bars_limit_and_leaves_others_alone() {
+        let mut needs = vec![
+            EvidenceNeed {
+                schema_version: V2_SCHEMA_VERSION,
+                source_family: "alpaca".to_owned(),
+                resource: "bars:TQQQ:1d:2026-01-01:30".to_owned(),
+                max_age_secs: 300,
+            },
+            EvidenceNeed {
+                schema_version: V2_SCHEMA_VERSION,
+                source_family: "alpaca".to_owned(),
+                resource: "bars:QQQ:1d:2026-01-01:400".to_owned(),
+                max_age_secs: 300,
+            },
+            EvidenceNeed {
+                schema_version: V2_SCHEMA_VERSION,
+                source_family: "news_web".to_owned(),
+                resource: "news:QQQ:2026-01-01:2026-01-02:market".to_owned(),
+                max_age_secs: 300,
+            },
+        ];
+        super::normalize_paper_bars_limit(&mut needs);
+        assert_eq!(needs[0].resource, "bars:TQQQ:1d:2026-01-01:252");
+        assert_eq!(needs[1].resource, "bars:QQQ:1d:2026-01-01:400");
+        assert_eq!(needs[2].resource, "news:QQQ:2026-01-01:2026-01-02:market");
     }
 }

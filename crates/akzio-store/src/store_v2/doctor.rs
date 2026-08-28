@@ -81,6 +81,32 @@ impl V2Store {
                 "attempt output has invalid terminal-event lineage".to_owned(),
             ));
         }
+        // A RunScoped artifact may only cite RunScoped inputs from its own run.
+        // The write path enforces this per gate; the Doctor proves no historical
+        // row escaped it.
+        let cross_run_reference = connection
+            .query_row(
+                r#"SELECT child.artifact_id
+                     FROM rebuild_artifact_refs AS reference
+                     JOIN rebuild_artifacts AS child ON child.artifact_id = reference.artifact_id
+                     JOIN rebuild_artifacts AS parent
+                       ON parent.artifact_id = reference.source_artifact_id
+                    WHERE child.lifecycle = 'run_scoped'
+                      AND parent.lifecycle = 'run_scoped'
+                      AND json_extract(child.origin_json, '$.run_id') IS NOT NULL
+                      AND json_extract(parent.origin_json, '$.run_id') IS NOT NULL
+                      AND json_extract(child.origin_json, '$.run_id')
+                          != json_extract(parent.origin_json, '$.run_id')
+                    LIMIT 1"#,
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(artifact_id) = cross_run_reference {
+            return Err(StoreError::Integrity(format!(
+                "artifact {artifact_id} cites RunScoped evidence from another run"
+            )));
+        }
         let mut statement = connection.prepare(
             "SELECT artifact_id, blob_hash, media_type, bytes FROM rebuild_artifacts ORDER BY artifact_id",
         )?;
@@ -532,6 +558,38 @@ impl V2Store {
         self.verify_candidate_policy_history(&connection)?;
         self.verify_lesson_history(&connection)?;
         self.verify_canary_campaign_history(&connection)?;
+        // Every artifact bound to a run must be observable in that run's event
+        // log. Artifacts without an origin run are the Rust- and
+        // operator-owned catalogue entries (contract, runtime manifest,
+        // approval) that exist independently of any run. This runs last: it is
+        // a broad backstop, and the lineage checks above give a far more
+        // specific diagnosis for the same row.
+        let unlogged_artifact = connection
+            .query_row(
+                r#"SELECT a.artifact_id, a.kind, a.producer
+                     FROM rebuild_artifacts AS a
+                    WHERE json_extract(a.origin_json, '$.run_id') IS NOT NULL
+                      AND NOT EXISTS (
+                            SELECT 1 FROM rebuild_events AS e
+                             WHERE e.artifact_id = a.artifact_id
+                               AND e.run_id = json_extract(a.origin_json, '$.run_id')
+                          )
+                    LIMIT 1"#,
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((artifact_id, kind, producer)) = unlogged_artifact {
+            return Err(StoreError::Integrity(format!(
+                "artifact {artifact_id} of kind {kind} from {producer} has no lifecycle event"
+            )));
+        }
         Ok(())
     }
 

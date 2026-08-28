@@ -8,7 +8,7 @@
 - Rust 负责状态、权限、Contract、预算、Workflow Gate、学习迁移和执行策略。
 - `V2Store` 是唯一耐久状态权威；Agent 只能通过 `ContextManifest` 与 task/attempt-bound `ReadGrant` 读取资料。
 - `daemon.auto_paper=true` 只允许通过 Alpaca Paper market clock、`StorePaperWorkflowSource`、scheduler-owned snapshots 和 `CommittedPaperBroker`。
-- Alpaca 凭据只从 `ALPACA_API_KEY`、`ALPACA_API_SECRET` 环境注入；`ALPACA_PAPER_BASE_URL` 为空或必须为 `https://paper-api.alpaca.markets`。
+- Alpaca 凭据只从 `ALPACA_API_KEY`、`ALPACA_API_SECRET` 环境注入；强制 Paper evidence policy 还要求 `FRED_API_KEY`；`ALPACA_PAPER_BASE_URL` 为空或必须为 `https://paper-api.alpaca.markets`。
 - `auto_paper=true` 时必须配置经过审批的非零 `transaction_cost_ppm` 或 `slippage_ppm`；零成本只可用于 fixture/离线验证。
 
 当前 Store Root 只有 `akzio.sqlite3`。Artifact payload 以 SHA-256 为键存入
@@ -34,7 +34,7 @@ cargo run --offline -p akzio-cli -- run fixture-debug
 此节只适用于已获批准的独立 Paper sandbox；不得在本地 fixture 或生产 Store Root 上替代执行。凭据只通过环境变量注入，不写入配置、Store 或日志。
 
 1. 使用全新的、已备份的 Store Root，配置 `daemon.auto_paper=true`，并为 `transaction_cost_ppm` 或 `slippage_ppm` 设置已审批的非零值。
-2. 仅允许 `ALPACA_PAPER_BASE_URL=https://paper-api.alpaca.markets`，并在环境中设置 `ALPACA_API_KEY`、`ALPACA_API_SECRET`；启动前保存 Store manifest/hash 和 `store doctor` 结果。
+2. 仅允许 `ALPACA_PAPER_BASE_URL=https://paper-api.alpaca.markets`，并在环境中设置 `ALPACA_API_KEY`、`ALPACA_API_SECRET`、`FRED_API_KEY`；启动前保存 Store manifest/hash 和 `store doctor` 结果。
 3. 启动 daemon 后记录 `daemon health`：必须看到 Paper scheduler、lease owner/epoch、未冻结状态和无未处理 critical alert；任何配置或凭据错误都应停止，不得降级到 fixture。
 4. 记录首个 broker session date、`run replay <run-id>`、`run events <run-id>` 和 Store session slot。重启 daemon 后，必须复用同一 plan hash、task IDs、session slot 和 client-order IDs。
 5. 在独立记录中逐项确认：market clock、account、四资产 quote、一次性 durable commitment、每个 client-order ID、broker receipt、reconciliation、freeze/unfreeze，以及进程强杀后的恢复。任一项缺证据，结果为未通过。

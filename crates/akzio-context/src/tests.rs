@@ -8,3 +8,4 @@ include!("context_tests/child_projection.rs");
 include!("context_tests/deliberation.rs");
 include!("context_tests/child_policy.rs");
 include!("context_tests/child_stability.rs");
+include!("context_tests/bundles.rs");

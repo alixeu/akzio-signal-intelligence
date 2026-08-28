@@ -94,20 +94,25 @@ fn fixture_adapters_are_source_typed() {
     for (source, other) in pairs {
         let adapter =
             FixtureEvidenceAdapter::new(source, [("resource".to_owned(), fixture_acquired())]);
-        let response = adapter
-            .acquire(&EvidenceRequest {
+        let response = EvidenceAdapter::acquire(
+            &adapter,
+            &EvidenceRequest {
                 source,
                 resource: "resource".to_owned(),
                 max_age: Duration::seconds(30),
-            })
+            },
+        )
             .unwrap();
         assert_eq!(response.normalized["fixture"], true);
         assert!(matches!(
-            adapter.acquire(&EvidenceRequest {
+            EvidenceAdapter::acquire(
+                &adapter,
+                &EvidenceRequest {
                 source: other,
                 resource: "resource".to_owned(),
                 max_age: Duration::seconds(30),
-            }),
+                },
+            ),
             Err(EvidenceAdapterError::SourceMismatch)
         ));
     }

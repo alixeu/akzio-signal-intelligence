@@ -82,7 +82,7 @@ pub enum GovernedResource {
     AlpacaBars {
         asset: Asset,
         start: Option<NaiveDate>,
-        limit: u8,
+        limit: u16,
     },
     SecSubmissions {
         cik: String,
@@ -187,9 +187,9 @@ impl GovernedResource {
             }),
             ["bars", symbol, timeframe, start, limit] if *timeframe == "1d" => {
                 let limit = limit
-                    .parse::<u8>()
+                    .parse::<u16>()
                     .map_err(|_| EvidenceRuntimeError::InvalidRequest)?;
-                if !(1..=32).contains(&limit) {
+                if !(1..=252).contains(&limit) {
                     return Err(EvidenceRuntimeError::InvalidRequest);
                 }
                 Ok(Self::AlpacaBars {

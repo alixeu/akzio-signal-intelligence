@@ -157,7 +157,7 @@ fn canonical_active_contracts(store: &V2Store) -> ResearchResult<Vec<AgentContra
             ]),
             min_context_artifacts: 1,
             budget: TaskBudget {
-                max_input_tokens: 8_000,
+            max_input_tokens: 48_000,
                 max_output_tokens: 1_500,
                 max_wall_time_secs: 120,
                 max_tool_calls: 4,
@@ -212,7 +212,7 @@ fn canonical_active_contracts(store: &V2Store) -> ResearchResult<Vec<AgentContra
  ]),
             min_context_artifacts: 1,
             budget: TaskBudget {
-                max_input_tokens: 12_000,
+            max_input_tokens: 48_000,
                 max_output_tokens: 2_000,
                 max_wall_time_secs: 120,
                 max_tool_calls: 2,
@@ -267,7 +267,7 @@ fn canonical_active_contract(
             base_prompt
         ),
         RESEARCH_ANALYST_RECIPE_ID => format!(
-            "{}\n\nKeep evidence_gaps to at most 2 items; combine overlapping limitations into concise, evidence-grounded gaps. Preserve the exact artifact kind shown in ContextManifest selections; do not relabel normalized_evidence as semantic_detail or vice versa. For every grounds.evidence reference, copy the exact 64-character artifact_id and exact kind from a top-level context item. Never use the ContextManifest ID, a resource name, or an alias as an evidence artifact_id. Include at least one ground when readable evidence is present.",
+            "{}\n\nKeep evidence_gaps to at most 2 items; combine overlapping limitations into concise, evidence-grounded gaps. Preserve the exact artifact kind shown in ContextManifest selections; do not relabel normalized_evidence as semantic_detail or vice versa. For every grounds.evidence reference, copy the exact 64-character artifact_id and exact kind from a top-level context item. Never use the ContextManifest ID, a resource name, or an alias as an evidence artifact_id. Include at least one ground when readable evidence is present. Supplemental needs max_results must be 1-32. For Alpaca bars shorthand, resource must be \"bars\", assets must be explicit, and window_start must be a concrete RFC3339 timestamp; Rust expands it into one canonical per-asset bars need.",
             base_prompt
         ),
         _ => base_prompt,
@@ -275,7 +275,41 @@ fn canonical_active_contract(
     let role_prompt = format!(
         "{role_prompt}\n\nUse at most 3 alternatives and at most 3 uncertainties. Use at most 8 evidence-relevant IDs in deliberation.basis_artifact_ids. Provide one alternative_match_ppm value for each alternative. Provide one uncertainty_weight_ppm value for each uncertainty; those weights must sum exactly to 1000000 - confidence_ppm. Use empty score arrays when the corresponding text array is empty. These scores are model-assessed metadata, not observed market facts."
     );
-    let prompt = PromptBundle {
+    let role_prompt = match definition.purpose {
+        RESEARCH_ANALYST_RECIPE_ID => format!(
+            "{role_prompt}\n\nMark direction-blocking gaps with impact=blocks_directional_forecast. Every ground must declare role and assets. Use one directional ground per asset and never claim assets absent from the evidence payload."
+        ),
+        RESEARCH_SYNTHESIZER_RECIPE_ID => role_prompt.replace(
+            "blocked proposals use neutral zero forecasts explain blocker in hard_blockers summary.",
+            "blocking evidence gaps or incomplete asset/horizon coverage require MissingEvidence and neutral zero forecasts.",
+        ),
+        _ => role_prompt,
+    };
+    let role_prompt = format!(
+        "{role_prompt}\n\nEvery evidence ground must declare role, assets, and domain. Blocking gaps may request at most 8 supplemental_needs; request only governed, asset-bound resources whose window ends no later than the current Paper session. Sentiment is not supported by this contract, and the current ETF Paper universe does not require SEC filings.",
+    );
+    let role_prompt = if definition.purpose == RESEARCH_ANALYST_RECIPE_ID {
+        format!(
+            "{role_prompt}\n\nFor directional grounds, use normalized evidence with one payload-scoped asset and set domain to bars=price_market_structure, series=macro, or news=news_event. For descriptive paper account, positions, open orders, fills, quotes, or clock evidence, set role=descriptive and domain=null; do not invent a shard."
+        )
+        } else {
+            role_prompt
+        };
+        let role_prompt = if definition.purpose == RESEARCH_ANALYST_RECIPE_ID {
+            format!(
+                "{role_prompt}\n\nFor descriptive grounds over paper.* evidence, always set assets to an empty array."
+            )
+        } else {
+            role_prompt
+        };
+        let role_prompt = if definition.purpose == RESEARCH_SYNTHESIZER_RECIPE_ID {
+            format!(
+                "{role_prompt}\n\nCopy every selected Claim reference unchanged into result.claims; if no Claim is selected, leave claims empty. Never put a normalized_evidence ID in claims or critiques."
+            )
+        } else {
+            role_prompt
+        };
+        let prompt = PromptBundle {
         version: ACTIVE_PROMPT_BUNDLE_VERSION,
         governance: store.put_bytes(SHARED_GOVERNANCE_PROMPT.as_bytes(), "text/plain")?,
         role: store.put_bytes(role_prompt.as_bytes(), "text/plain")?,
@@ -292,7 +326,11 @@ fn canonical_active_contract(
             permitted_source_families: governed_context_sources(),
             min_artifacts: definition.min_context_artifacts,
             max_artifacts: 24,
-            max_bytes: 128 * 1024,
+            max_bytes: if definition.purpose == RESEARCH_SYNTHESIZER_RECIPE_ID {
+                192 * 1024
+            } else {
+                128 * 1024
+            },
             max_tokens: definition.budget.max_input_tokens,
             allow_raw_reread: false,
         },
@@ -322,7 +360,15 @@ fn two_phase_role_prompt(purpose: &str) -> ResearchResult<String> {
         LEARNING_OUTCOME_WORKER_RECIPE_ID => "You are Akzio's governed outcome reviewer. In Draft, write a bounded retrospective memo from granted decision, execution, outcomes, market evidence, deliberation notes, and prior retrospectives. In Submit, produce RetrospectiveDraft through submit_result. Never emit authoritative returns, calibration, slippage, risk recall, or policy decisions.",
         _ => return Err(ResearchError::UnexpectedActiveContractPurpose(purpose.to_owned())),
     };
-    Ok(prompt.to_owned())
+    let prompt = if purpose == PLANNER_RECIPE_ID {
+        prompt.replace(
+            "priority 0-100",
+            "research.analyst priority 1-90, research.synthesizer priority 1-100",
+        )
+    } else {
+        prompt.to_owned()
+    };
+    Ok(prompt)
 }
 
 fn governed_context_sources() -> BTreeSet<String> {
@@ -362,13 +408,14 @@ fn research_output_source_refs(
 ) -> ResearchResult<Vec<ArtifactRef>> {
     let refs = match kind {
         ArtifactKind::Claim => {
-            let claim: ResearchClaim = serde_json::from_value(output.clone()).map_err(|error| {
-                ResearchError::InvalidOutput(format!("invalid Claim payload: {error}"))
-            })?;
-            claim
-                .validate()
-                .map_err(|error| ResearchError::InvalidOutput(error.to_string()))?;
-            claim.source_refs()
+        let claim: ResearchClaim = serde_json::from_value(output.clone()).map_err(|error| {
+            ResearchError::InvalidOutput(format!("invalid Claim payload: {error}"))
+        })?;
+        claim
+            .validate()
+            .map_err(|error| ResearchError::InvalidOutput(error.to_string()))?;
+        validate_claim_ground_scopes(store, &claim, manifest)?;
+        claim.source_refs()
         }
         ArtifactKind::Critique => {
             let critique: ResearchCritique =
@@ -420,11 +467,21 @@ fn research_output_source_refs(
                         "invalid DecisionProposal payload: {error}"
                     ))
                 })?;
-            proposal
-                .validate()
-                .map_err(|error| ResearchError::InvalidOutput(error.to_string()))?;
+        proposal
+            .validate()
+            .map_err(|error| ResearchError::InvalidOutput(error.to_string()))?;
 
-            let selected = manifest
+        for reference in proposal.claims.iter().chain(proposal.critiques.iter()) {
+            let artifact = store.artifact(&reference.artifact_id)?;
+            if artifact.kind != reference.kind {
+                return Err(ResearchError::InvalidOutput(format!(
+                    "DecisionProposal reference kind {:?} does not match stored artifact kind {:?}",
+                    reference.kind, artifact.kind
+                )));
+            }
+        }
+
+        let selected = manifest
                 .payload
                 .selections
                 .iter()
@@ -466,20 +523,23 @@ fn research_output_source_refs(
                 .claims
                 .iter()
                 .chain(proposal.critiques.iter())
-                .chain(proposal.evidence.iter())
-                .cloned()
-                .collect::<Vec<_>>();
+        .chain(proposal.evidence.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+        let mut claims = Vec::new();
 
-            for reference in proposal.claims.iter().chain(proposal.critiques.iter()) {
-                let artifact = store.artifact(&reference.artifact_id)?;
-                let payload = store.read_blob(&artifact.blob)?;
+        for reference in proposal.claims.iter().chain(proposal.critiques.iter()) {
+            let artifact = store.artifact(&reference.artifact_id)?;
+            let payload = store.read_blob(&artifact.blob)?;
                 let source_refs = match reference.kind {
                     ArtifactKind::Claim => {
                         let claim: ResearchClaim = serde_json::from_slice(&payload)?;
-                        claim
-                            .validate()
-                            .map_err(|error| ResearchError::InvalidOutput(error.to_string()))?;
-                        claim.source_refs()
+                    claim
+                        .validate()
+                        .map_err(|error| ResearchError::InvalidOutput(error.to_string()))?;
+                    validate_claim_ground_scopes(store, &claim, manifest)?;
+                    claims.push(claim.clone());
+                    claim.source_refs()
                     }
                     ArtifactKind::Critique => {
                         let critique: ResearchCritique = serde_json::from_slice(&payload)?;
@@ -499,9 +559,11 @@ fn research_output_source_refs(
                             .to_owned(),
                     ));
                 }
-                refs.extend(source_refs);
-            }
-            refs.sort();
+            refs.extend(source_refs);
+        }
+        validate_decision_evidence_sufficiency(&proposal, &claims)
+            .map_err(|error| ResearchError::InvalidOutput(error.to_string()))?;
+        refs.sort();
             refs.dedup();
             refs
         }
@@ -519,4 +581,183 @@ fn research_output_source_refs(
         ));
     }
     Ok(refs)
+}
+
+fn validate_claim_ground_scopes(
+    store: &V2Store,
+    claim: &ResearchClaim,
+    manifest: &ContextManifest,
+) -> ResearchResult<()> {
+    let selected = manifest
+        .payload
+        .selections
+        .iter()
+        .map(|selection| (selection.artifact.artifact_id.clone(), selection.artifact.clone()))
+        .collect::<BTreeMap<_, _>>();
+
+    for ground in &claim.grounds {
+        let Some(selected_ref) = selected.get(&ground.evidence.artifact_id) else {
+            return Err(ResearchError::InvalidOutput(
+                "claim ground is outside ContextManifest".to_owned(),
+            ));
+        };
+        if selected_ref != &ground.evidence {
+            return Err(ResearchError::InvalidOutput(
+                "claim ground kind does not match ContextManifest".to_owned(),
+            ));
+        }
+
+        let artifact = store.artifact(&ground.evidence.artifact_id)?;
+        let payload: Value = serde_json::from_slice(&store.read_blob(&artifact.blob)?)?;
+        let scope = evidence_asset_scope(&payload)?;
+        let domain = evidence_domain(&payload)?;
+        if ground.domain != domain
+            && (ground.role == EvidenceGroundRole::Directional
+                || (ground.domain.is_some() && domain.is_some()))
+        {
+            return Err(ResearchError::InvalidOutput(
+                format!(
+                    "ground domain {:?} does not match evidence resource {} (expected {:?}); choose the selected artifact whose resource matches the declared domain",
+                    ground.domain,
+                    payload
+                        .get("resource")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown"),
+                    domain
+                ),
+            ));
+        }
+
+        if ground.role == EvidenceGroundRole::Directional {
+            if ground.evidence.kind != ArtifactKind::NormalizedEvidence
+                || domain.is_none()
+                || scope.is_none()
+                || ground.assets.is_empty()
+                || scope
+                    .as_ref()
+                    .is_some_and(|assets| !ground.assets.is_subset(assets))
+            {
+                return Err(ResearchError::InvalidOutput(
+                    "directional ground must bind exactly one asset to a scoped normalized evidence artifact"
+                        .to_owned(),
+                ));
+            }
+        } else if let Some(scope) = scope {
+            if !ground.assets.is_subset(&scope) {
+                return Err(ResearchError::InvalidOutput(
+                    "descriptive ground assets exceed evidence payload scope".to_owned(),
+                ));
+            }
+        } else if !ground.assets.is_empty() {
+            return Err(ResearchError::InvalidOutput(
+                "unknown evidence scope cannot declare assets".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn evidence_asset_scope(payload: &Value) -> ResearchResult<Option<BTreeSet<Asset>>> {
+    let resource = payload.get("resource").and_then(Value::as_str);
+    if let Some(resource) = resource {
+        if let Some(symbol) = resource.strip_prefix("bars:").and_then(|value| value.split(':').next()) {
+            let asset = Asset::try_from(symbol).map_err(|error| {
+                ResearchError::InvalidOutput(format!("invalid bar asset scope: {error}"))
+            })?;
+            return Ok(Some(BTreeSet::from([asset])));
+        }
+
+        if let Some(symbol) = resource.strip_prefix("news:").and_then(|value| value.split(':').next()) {
+            let asset = Asset::try_from(symbol).map_err(|error| {
+                ResearchError::InvalidOutput(format!("invalid news asset scope: {error}"))
+            })?;
+            return Ok(Some(BTreeSet::from([asset])));
+        }
+
+        if resource.starts_with("series:") {
+            let series = resource.split(':').nth(1).unwrap_or_default();
+            if matches!(series, "DFF" | "DFII10" | "VIXCLS" | "DGS2" | "DGS10") {
+                return Ok(Some(Asset::EXECUTABLE.into_iter().collect()));
+            }
+        }
+
+        if resource == "paper.positions" {
+            return scoped_symbols(payload.pointer("/value"));
+        }
+        if resource == "paper.quotes" {
+            return scoped_object_keys(payload.pointer("/value/quotes"));
+        }
+        if resource == "paper.account"
+            || resource == "paper.clock"
+            || resource == "paper.open_orders"
+            || resource.starts_with("paper.fills:")
+        {
+            return Ok(Some(BTreeSet::new()));
+        }
+        return Ok(None);
+    }
+
+    if payload.get("quotes").is_some() {
+        return scoped_object_keys(payload.get("quotes"));
+    }
+    if payload.get("positions").is_some() {
+        return scoped_object_keys(payload.get("positions"));
+    }
+    Ok(None)
+}
+
+fn evidence_domain(payload: &Value) -> ResearchResult<Option<ResearchShard>> {
+    let Some(resource) = payload.get("resource").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    if resource.starts_with("bars:") {
+        return Ok(Some(ResearchShard::PriceMarketStructure));
+    }
+    if resource.starts_with("news:") {
+        return Ok(Some(ResearchShard::NewsEvent));
+    }
+    if resource.starts_with("series:") {
+        let series = resource.split(':').nth(1).unwrap_or_default();
+        return Ok(matches!(
+            series,
+            "DFF" | "DFII10" | "VIXCLS" | "DGS2" | "DGS10"
+        )
+        .then_some(ResearchShard::Macro));
+    }
+    Ok(None)
+}
+
+fn scoped_symbols(value: Option<&Value>) -> ResearchResult<Option<BTreeSet<Asset>>> {
+    let Some(Value::Array(items)) = value else {
+        return Err(ResearchError::InvalidOutput(
+            "asset-scoped evidence payload is not an array".to_owned(),
+        ));
+    };
+    let mut assets = BTreeSet::new();
+    for item in items {
+        let Some(symbol) = item.get("symbol").and_then(Value::as_str) else {
+            return Err(ResearchError::InvalidOutput(
+                "asset-scoped evidence item has no symbol".to_owned(),
+            ));
+        };
+        assets.insert(Asset::try_from(symbol).map_err(|error| {
+            ResearchError::InvalidOutput(format!("invalid asset scope: {error}"))
+        })?);
+    }
+    Ok(Some(assets))
+}
+
+fn scoped_object_keys(value: Option<&Value>) -> ResearchResult<Option<BTreeSet<Asset>>> {
+    let Some(Value::Object(items)) = value else {
+        return Err(ResearchError::InvalidOutput(
+            "asset-scoped evidence payload is not an object".to_owned(),
+        ));
+    };
+    let mut assets = BTreeSet::new();
+    for symbol in items.keys() {
+        assets.insert(Asset::try_from(symbol.as_str()).map_err(|error| {
+            ResearchError::InvalidOutput(format!("invalid asset scope: {error}"))
+        })?);
+    }
+    Ok(Some(assets))
 }

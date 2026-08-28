@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     artifact::{ArtifactKind, ArtifactRef},
-    Asset, ContentHash, DecisionId, DomainError, RunId, TargetPortfolio, V2_DOMAIN_SCHEMA_VERSION,
+    Asset, ContentHash, DecisionId, DomainError, EvidenceGapImpact, EvidenceGroundRole,
+    ResearchClaim, ResearchShard, RunId, TargetPortfolio, V2_DOMAIN_SCHEMA_VERSION,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -190,6 +191,10 @@ impl Forecast {
         }
         Ok(())
     }
+
+    pub fn is_neutral(&self) -> bool {
+        self.expected_return_ppm == 0 && self.positive_return_probability_ppm == 500_000
+    }
 }
 
 /// Schema-bounded model output. It can request a decision, but cannot embed a
@@ -287,6 +292,72 @@ impl DecisionDraft {
     }
 }
 
+pub fn validate_decision_evidence_sufficiency(
+    draft: &DecisionDraft,
+    claims: &[ResearchClaim],
+) -> Result<(), DomainError> {
+    let has_gaps = claims.iter().any(|claim| !claim.evidence_gaps.is_empty());
+    let has_blocking_gap = claims.iter().any(|claim| {
+        claim
+            .evidence_gaps
+            .iter()
+            .any(|gap| gap.impact == EvidenceGapImpact::BlocksDirectionalForecast)
+    });
+    let has_missing_evidence = draft.hard_blockers.contains(&HardBlocker::MissingEvidence);
+    let has_incomplete_evidence = draft
+        .soft_warnings
+        .contains(&SoftWarning::IncompleteEvidence);
+
+    if has_gaps && !has_incomplete_evidence {
+        return Err(DomainError::InsufficientDecisionEvidence);
+    }
+
+    let has_non_neutral_forecast = draft
+        .forecasts
+        .iter()
+        .any(|forecast| !forecast.is_neutral());
+    if has_blocking_gap || has_missing_evidence {
+        if !has_missing_evidence || has_non_neutral_forecast {
+            return Err(DomainError::InsufficientDecisionEvidence);
+        }
+        return Ok(());
+    }
+
+    if !has_non_neutral_forecast {
+        return Ok(());
+    }
+
+    let covered = |asset: Asset, horizon: DecisionHorizon| {
+        let domains = claims
+            .iter()
+            .filter(|claim| claim.horizon == horizon)
+            .flat_map(|claim| claim.grounds.iter())
+            .filter(|ground| {
+                ground.role == EvidenceGroundRole::Directional && ground.assets.contains(&asset)
+            })
+            .filter_map(|ground| ground.domain)
+            .collect::<std::collections::BTreeSet<_>>();
+        [
+            ResearchShard::PriceMarketStructure,
+            ResearchShard::Macro,
+            ResearchShard::NewsEvent,
+        ]
+        .into_iter()
+        .all(|domain| domains.contains(&domain))
+    };
+
+    if draft
+        .forecasts
+        .iter()
+        .filter(|forecast| !forecast.is_neutral())
+        .any(|forecast| !covered(forecast.asset, forecast.horizon))
+    {
+        return Err(DomainError::InsufficientDecisionEvidence);
+    }
+
+    Ok(())
+}
+
 /// Rust-bound decision. It carries no execution authority; the referenced
 /// `DecisionContext` is the complete provenance and blocker surface.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -358,12 +429,13 @@ mod tests {
     use chrono::Utc;
 
     use super::{
-        Decision, DecisionContext, DecisionDraft, DecisionHorizon, Forecast, HardBlocker,
-        MaterialConflict,
+        validate_decision_evidence_sufficiency, Decision, DecisionContext, DecisionDraft,
+        DecisionHorizon, Forecast, HardBlocker, MaterialConflict, ResearchShard, SoftWarning,
     };
     use crate::{
         artifact::{ArtifactId, ArtifactKind, ArtifactRef},
-        Asset, ContentHash, DecisionId, RunId, TargetPortfolio,
+        Asset, ClaimStance, ContentHash, DecisionId, DomainError, EvidenceGap, EvidenceGapImpact,
+        EvidenceGround, EvidenceGroundRole, ResearchClaim, RunId, TargetPortfolio,
     };
 
     fn reference(kind: ArtifactKind, value: &[u8]) -> ArtifactRef {
@@ -508,5 +580,159 @@ mod tests {
         };
 
         decision.validate().unwrap();
+    }
+
+    fn forecast_set(expected_return_ppm: i64) -> Vec<Forecast> {
+        Asset::EXECUTABLE
+            .into_iter()
+            .flat_map(|asset| {
+                [
+                    DecisionHorizon::T1,
+                    DecisionHorizon::T3,
+                    DecisionHorizon::T5,
+                ]
+                .into_iter()
+                .map(move |horizon| Forecast {
+                    asset,
+                    horizon,
+                    positive_return_probability_ppm: 500_000,
+                    expected_return_ppm,
+                })
+            })
+            .collect()
+    }
+
+    fn claim_for(asset: Asset, horizon: DecisionHorizon) -> ResearchClaim {
+        ResearchClaim {
+            schema_version: crate::V2_DOMAIN_SCHEMA_VERSION,
+            topic: "direction".to_owned(),
+            statement: "bounded directional evidence".to_owned(),
+            horizon,
+            stance: ClaimStance::Neutral,
+            materiality_ppm: 500_000,
+            confidence_ppm: 500_000,
+            grounds: [
+                (
+                    b"directional-price".as_slice(),
+                    ResearchShard::PriceMarketStructure,
+                ),
+                (b"directional-macro".as_slice(), ResearchShard::Macro),
+                (b"directional-news".as_slice(), ResearchShard::NewsEvent),
+            ]
+            .into_iter()
+            .map(|(value, domain)| EvidenceGround {
+                evidence: reference(ArtifactKind::NormalizedEvidence, value),
+                support: "scoped directional evidence".to_owned(),
+                role: EvidenceGroundRole::Directional,
+                assets: std::collections::BTreeSet::from([asset]),
+                domain: Some(domain),
+            })
+            .collect(),
+            evidence_gaps: vec![],
+        }
+    }
+
+    fn draft_with(
+        forecasts: Vec<Forecast>,
+        hard_blockers: Vec<HardBlocker>,
+        soft_warnings: Vec<SoftWarning>,
+    ) -> DecisionDraft {
+        DecisionDraft {
+            summary: "bounded decision".to_owned(),
+            confidence_ppm: 500_000,
+            forecasts,
+            claims: vec![reference(ArtifactKind::Claim, b"claim")],
+            critiques: vec![],
+            evidence: vec![reference(ArtifactKind::NormalizedEvidence, b"directional")],
+            material_conflicts: vec![],
+            hard_blockers,
+            soft_warnings,
+            applied_learning_refs: vec![],
+            rejected_learning_refs: vec![],
+        }
+    }
+
+    #[test]
+    fn blocking_gap_requires_missing_evidence_and_neutral_forecasts() {
+        let mut claim = claim_for(Asset::Tqqq, DecisionHorizon::T1);
+        claim.evidence_gaps = vec![EvidenceGap {
+            topic: "direction".to_owned(),
+            rationale: "missing directional inputs".to_owned(),
+            impact: EvidenceGapImpact::BlocksDirectionalForecast,
+            supplemental_needs: vec![],
+        }];
+
+        let non_neutral = draft_with(
+            forecast_set(1),
+            vec![],
+            vec![SoftWarning::IncompleteEvidence],
+        );
+        assert_eq!(
+            validate_decision_evidence_sufficiency(&non_neutral, &[claim.clone()]),
+            Err(DomainError::InsufficientDecisionEvidence)
+        );
+
+        let blocked = draft_with(
+            forecast_set(0),
+            vec![HardBlocker::MissingEvidence],
+            vec![SoftWarning::IncompleteEvidence],
+        );
+        assert!(validate_decision_evidence_sufficiency(&blocked, &[claim]).is_ok());
+    }
+
+    #[test]
+    fn non_neutral_forecasts_require_same_horizon_asset_coverage() {
+        let claims = Asset::EXECUTABLE
+            .into_iter()
+            .flat_map(|asset| {
+                [
+                    DecisionHorizon::T1,
+                    DecisionHorizon::T3,
+                    DecisionHorizon::T5,
+                ]
+                .into_iter()
+                .map(move |horizon| claim_for(asset, horizon))
+            })
+            .collect::<Vec<_>>();
+        let draft = draft_with(forecast_set(1), vec![], vec![]);
+        assert!(validate_decision_evidence_sufficiency(&draft, &claims).is_ok());
+
+        let incomplete = &claims[..claims.len() - 1];
+        assert_eq!(
+            validate_decision_evidence_sufficiency(&draft, incomplete),
+            Err(DomainError::InsufficientDecisionEvidence)
+        );
+    }
+
+    #[test]
+    fn neutral_forecasts_without_coverage_do_not_block_non_neutral_evidence() {
+        let mut forecasts = forecast_set(0);
+        forecasts
+            .iter_mut()
+            .find(|forecast| {
+                forecast.asset == Asset::Tqqq && forecast.horizon == DecisionHorizon::T1
+            })
+            .expect("forecast set includes TQQQ/t1")
+            .expected_return_ppm = 1;
+        let draft = draft_with(forecasts, vec![], vec![]);
+        let claim = claim_for(Asset::Tqqq, DecisionHorizon::T1);
+
+        assert!(validate_decision_evidence_sufficiency(&draft, &[claim]).is_ok());
+    }
+
+    #[test]
+    fn any_claim_gap_requires_incomplete_evidence_warning() {
+        let mut claim = claim_for(Asset::Tqqq, DecisionHorizon::T1);
+        claim.evidence_gaps = vec![EvidenceGap {
+            topic: "governance".to_owned(),
+            rationale: "risk rules are not in context".to_owned(),
+            impact: EvidenceGapImpact::Warning,
+            supplemental_needs: vec![],
+        }];
+        let draft = draft_with(forecast_set(0), vec![], vec![]);
+        assert_eq!(
+            validate_decision_evidence_sufficiency(&draft, &[claim]),
+            Err(DomainError::InsufficientDecisionEvidence)
+        );
     }
 }

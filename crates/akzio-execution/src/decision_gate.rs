@@ -7,10 +7,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use akzio_domain::{
-    content_hash_json, Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle, ArtifactRef, Asset,
-    CandidatePolicy, ContextManifestPayload, Decision, DecisionContext, DecisionDraft,
-    DecisionHorizon, DomainError, Experience, Forecast, HardBlocker, PolicySubject, RunPurpose,
-    TargetPortfolio, TaskStatus, TaskWritePermit, WeightPpm, V2_DOMAIN_SCHEMA_VERSION,
+    content_hash_json, validate_decision_evidence_sufficiency, Artifact, ArtifactId, ArtifactKind,
+    ArtifactLifecycle, ArtifactRef, Asset, CandidatePolicy, ContextManifestPayload, Decision,
+    DecisionContext, DecisionDraft, DecisionHorizon, DomainError, Experience, Forecast,
+    HardBlocker, PolicySubject, ResearchClaim, RunPurpose, TargetPortfolio, TaskStatus,
+    TaskWritePermit, WeightPpm, V2_DOMAIN_SCHEMA_VERSION,
 };
 use akzio_store::v2::{StoreError, V2Store};
 use chrono::{DateTime, Utc};
@@ -35,6 +36,12 @@ pub enum DecisionGateError {
     },
     #[error("decision proposal provenance is invalid")]
     InvalidProposalProvenance,
+    #[error("decision proposal claim evidence is semantically insufficient")]
+    InsufficientClaimEvidence,
+    #[error(
+        "decision proposal producer contract is not installed or predates evidence sufficiency"
+    )]
+    UnsupportedProposalContract,
     #[error("decision proposal must retain exactly one ContextManifest")]
     InvalidManifestReference,
     #[error("decision ContextManifest closure is invalid")]

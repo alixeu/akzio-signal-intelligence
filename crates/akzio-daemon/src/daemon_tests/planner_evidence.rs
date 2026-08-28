@@ -122,6 +122,279 @@ async fn invalid_agent_output_requests_task_retry() {
 }
 
 #[tokio::test]
+async fn paper_blocking_gap_collects_one_supplemental_round() {
+    let directory = tempdir().unwrap();
+    let now = Utc::now();
+    let session_key = now.date_naive().to_string();
+    let supplemental_start = (now.date_naive() - ChronoDuration::days(2)).to_string();
+    let first_claim = serde_json::json!({
+        "schema_version": akzio_domain::V2_DOMAIN_SCHEMA_VERSION,
+        "topic": "fixture_gap",
+        "statement": "The initial evidence lacks a focused news view.",
+        "horizon": "t1",
+        "stance": "neutral",
+        "materiality_ppm": 500000,
+        "confidence_ppm": 500000,
+        "grounds": [{
+            "evidence": {
+                "artifact_id": akzio_model::FIXTURE_CONTEXT_EVIDENCE_ID,
+                "kind": "normalized_evidence"
+            },
+            "support": "The initial governed evidence is descriptive.",
+            "role": "descriptive",
+            "assets": [],
+            "domain": null
+        }],
+        "evidence_gaps": [{
+            "topic": "news",
+            "rationale": "A focused asset news query is needed.",
+            "impact": "blocks_directional_forecast",
+            "supplemental_needs": [{
+                "schema_version": akzio_domain::V2_DOMAIN_SCHEMA_VERSION,
+                "source_family": "news_web",
+                "resource": format!("news:QQQ:{supplemental_start}:{session_key}:market"),
+                "query": "QQQ market news",
+                "assets": ["QQQ"],
+                "window_start": null,
+                "window_end": null,
+                "max_age_secs": 300,
+                "max_results": 1
+            }]
+        }]
+    });
+    let second_claim = serde_json::json!({
+        "schema_version": akzio_domain::V2_DOMAIN_SCHEMA_VERSION,
+        "topic": "refined",
+        "statement": "The supplemental evidence was reviewed.",
+        "horizon": "t1",
+        "stance": "neutral",
+        "materiality_ppm": 500000,
+        "confidence_ppm": 500000,
+        "grounds": [{
+            "evidence": {
+                "artifact_id": akzio_model::FIXTURE_CONTEXT_EVIDENCE_ID,
+                "kind": "normalized_evidence"
+            },
+            "support": "The refined review remains neutral.",
+            "role": "descriptive",
+            "assets": [],
+            "domain": null
+        }],
+        "evidence_gaps": []
+    });
+    let mut responses = two_phase_responses(first_claim);
+    responses.extend(two_phase_responses(second_claim));
+    let daemon = Daemon::with_fixture_evidence(
+        config(directory.path().to_path_buf()),
+        ModelClient::FixtureSequence(Arc::new(Mutex::new(VecDeque::from(responses)))),
+        BTreeMap::new(),
+    )
+    .unwrap();
+    let paper_run_id = RunId::new();
+    let setup_artifacts = paper_session_evidence_needs(&session_key)
+        .iter()
+        .map(|need| scheduler_snapshot_need(daemon.store(), &paper_run_id, &need.resource, now))
+        .collect::<Vec<_>>();
+    let snapshot_refs = setup_artifacts
+        .iter()
+        .map(|artifact| ArtifactRef {
+            artifact_id: artifact.artifact_id.clone(),
+            kind: ArtifactKind::EvidenceNeed,
+        })
+        .collect::<Vec<_>>();
+    let mut proposal = paper_proposal();
+    proposal.tasks.insert(
+        "analyst".to_owned(),
+        WorkflowProposalTask {
+            recipe_id: TaskRecipeId::new("research.analyst").unwrap(),
+            objective: "Assess fixture Paper evidence".to_owned(),
+            depends_on: vec![],
+            priority: 90,
+            evidence_needs: snapshot_refs,
+        },
+    );
+    proposal.tasks.get_mut("synthesizer").unwrap().depends_on = vec!["analyst".to_owned()];
+    let slot = daemon
+        .reserve_paper_session_with_inputs_for_run(
+            paper_run_id,
+            &session_key,
+            &proposal,
+            &setup_artifacts,
+            now,
+        )
+        .unwrap();
+    let run_id = slot.slot.workflow.run.run_id.clone();
+    let evidence_task = daemon
+        .store()
+        .claim_next_task("refinement-evidence", now, ChronoDuration::seconds(30))
+        .unwrap()
+        .unwrap();
+    let evidence_outputs = daemon.acquire_evidence(&evidence_task, now).await.unwrap();
+    daemon
+        .store()
+        .commit_attempt(&evidence_task.permit, &evidence_outputs, TaskStatus::Succeeded, now)
+        .unwrap();
+    assert!(daemon.run_one("refinement-analyst").await.unwrap());
+
+    let snapshot = daemon.store().workflow_snapshot(&run_id).unwrap();
+    let analyst = snapshot
+        .tasks
+        .iter()
+        .find(|task| task.node.recipe_id.as_str() == "research.analyst")
+        .unwrap();
+    let turns = daemon
+        .store()
+        .events_after(&run_id, 0, 256)
+        .unwrap()
+        .iter()
+        .filter(|event| {
+            event.task_id.as_ref() == Some(&analyst.node.task_id)
+                && event.event_type == LifecycleEventType::ContextManifestCreated.as_str()
+        })
+        .count();
+    assert_eq!(turns, 2);
+    assert!(daemon
+        .store()
+        .recent_artifacts_by_kind(ArtifactKind::NormalizedEvidence, 256)
+        .unwrap()
+        .iter()
+        .any(|artifact| artifact
+            .provenance
+            .source_family
+            == EvidenceSource::NewsWeb.as_str()));
+}
+
+#[tokio::test]
+async fn rejected_supplemental_request_leaves_a_durable_abandoned_event() {
+    let directory = tempdir().unwrap();
+    let now = Utc::now();
+    let session_key = now.date_naive().to_string();
+    let supplemental_start = (now.date_naive() - ChronoDuration::days(2)).to_string();
+    // The window ends after the broker session, so the Rust supplemental policy
+    // rejects the request and no second analyst round can run.
+    let future_end = (now.date_naive() + ChronoDuration::days(1)).to_string();
+    let first_claim = serde_json::json!({
+        "schema_version": akzio_domain::V2_DOMAIN_SCHEMA_VERSION,
+        "topic": "fixture_gap",
+        "statement": "The initial evidence lacks a focused news view.",
+        "horizon": "t1",
+        "stance": "neutral",
+        "materiality_ppm": 500000,
+        "confidence_ppm": 500000,
+        "grounds": [{
+            "evidence": {
+                "artifact_id": akzio_model::FIXTURE_CONTEXT_EVIDENCE_ID,
+                "kind": "normalized_evidence"
+            },
+            "support": "The initial governed evidence is descriptive.",
+            "role": "descriptive",
+            "assets": [],
+            "domain": null
+        }],
+        "evidence_gaps": [{
+            "topic": "news",
+            "rationale": "A focused asset news query is needed.",
+            "impact": "blocks_directional_forecast",
+            "supplemental_needs": [{
+                "schema_version": akzio_domain::V2_DOMAIN_SCHEMA_VERSION,
+                "source_family": "news_web",
+                "resource": format!("news:QQQ:{supplemental_start}:{future_end}:market"),
+                "query": "QQQ market news",
+                "assets": ["QQQ"],
+                "window_start": null,
+                "window_end": null,
+                "max_age_secs": 300,
+                "max_results": 1
+            }]
+        }]
+    });
+    let daemon = Daemon::with_fixture_evidence(
+        config(directory.path().to_path_buf()),
+        ModelClient::FixtureSequence(Arc::new(Mutex::new(VecDeque::from(two_phase_responses(
+            first_claim,
+        ))))),
+        BTreeMap::new(),
+    )
+    .unwrap();
+    let paper_run_id = RunId::new();
+    let setup_artifacts = paper_session_evidence_needs(&session_key)
+        .iter()
+        .map(|need| scheduler_snapshot_need(daemon.store(), &paper_run_id, &need.resource, now))
+        .collect::<Vec<_>>();
+    let snapshot_refs = setup_artifacts
+        .iter()
+        .map(|artifact| ArtifactRef {
+            artifact_id: artifact.artifact_id.clone(),
+            kind: ArtifactKind::EvidenceNeed,
+        })
+        .collect::<Vec<_>>();
+    let mut proposal = paper_proposal();
+    proposal.tasks.insert(
+        "analyst".to_owned(),
+        WorkflowProposalTask {
+            recipe_id: TaskRecipeId::new("research.analyst").unwrap(),
+            objective: "Assess fixture Paper evidence".to_owned(),
+            depends_on: vec![],
+            priority: 90,
+            evidence_needs: snapshot_refs,
+        },
+    );
+    proposal.tasks.get_mut("synthesizer").unwrap().depends_on = vec!["analyst".to_owned()];
+    let slot = daemon
+        .reserve_paper_session_with_inputs_for_run(
+            paper_run_id,
+            &session_key,
+            &proposal,
+            &setup_artifacts,
+            now,
+        )
+        .unwrap();
+    let run_id = slot.slot.workflow.run.run_id.clone();
+    let evidence_task = daemon
+        .store()
+        .claim_next_task("abandoned-evidence", now, ChronoDuration::seconds(30))
+        .unwrap()
+        .unwrap();
+    let evidence_outputs = daemon.acquire_evidence(&evidence_task, now).await.unwrap();
+    daemon
+        .store()
+        .commit_attempt(
+            &evidence_task.permit,
+            &evidence_outputs,
+            TaskStatus::Succeeded,
+            now,
+        )
+        .unwrap();
+    assert!(daemon.run_one("abandoned-analyst").await.unwrap());
+
+    let snapshot = daemon.store().workflow_snapshot(&run_id).unwrap();
+    let analyst = snapshot
+        .tasks
+        .iter()
+        .find(|task| task.node.recipe_id.as_str() == "research.analyst")
+        .unwrap();
+    let events = daemon.store().events_after(&run_id, 0, 256).unwrap();
+    let analyst_events = |event_type: LifecycleEventType| {
+        events
+            .iter()
+            .filter(|event| {
+                event.task_id.as_ref() == Some(&analyst.node.task_id)
+                    && event.event_type == event_type.as_str()
+            })
+            .count()
+    };
+    // One turn only: the refined round never ran, and the abandonment is the
+    // sole durable trace that the coverage gap stayed open.
+    assert_eq!(analyst_events(LifecycleEventType::ContextManifestCreated), 1);
+    assert_eq!(
+        analyst_events(LifecycleEventType::SupplementalRoundAbandoned),
+        1
+    );
+    assert_eq!(analyst.status, TaskStatus::Succeeded);
+    daemon.store().verify_integrity().unwrap();
+}
+
+#[tokio::test]
 async fn evidence_gate_resolves_need_with_fixture_adapter_and_keeps_provenance() {
     let directory = tempdir().unwrap();
     let observed_at = Utc::now();

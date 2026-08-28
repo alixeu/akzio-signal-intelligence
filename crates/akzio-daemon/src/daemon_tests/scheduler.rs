@@ -98,9 +98,30 @@ async fn auto_paper_supervisor_reserves_an_open_broker_session() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         snapshot_resources,
-        paper_snapshot_resources(&session_key)
+        paper_session_evidence_needs(&session_key)
             .into_iter()
+            .map(|need| need.resource)
             .collect::<BTreeSet<_>>()
+    );
+    let events = daemon.store().events_after(&run_id, 0, 256).unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                event.event_type == LifecycleEventType::SchedulerSnapshotNeedCreated.as_str()
+            })
+            .count(),
+        paper_session_evidence_needs(&session_key).len()
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                event.event_type
+                    == LifecycleEventType::SchedulerWorkflowProposalCreated.as_str()
+            })
+            .count(),
+        1
     );
     daemon.store().verify_integrity().unwrap();
 }
@@ -236,6 +257,107 @@ async fn auto_paper_source_ignores_a_newer_debug_proposal() {
 
     assert_eq!(proposal.topology_id, "active");
     assert_eq!(proposal.tasks.len(), 2);
+    daemon.store().verify_integrity().unwrap();
+}
+
+#[tokio::test]
+async fn auto_paper_source_skips_a_proposal_carrying_a_foreign_planner_need() {
+    let directory = tempdir().unwrap();
+    let mut daemon_config = config(directory.path().to_path_buf());
+    daemon_config.auto_paper = true;
+    let daemon = Daemon::with_model(daemon_config, fixture_model_client()).unwrap();
+    let old_run_id = daemon.submit_default(RunPurpose::Debug).unwrap();
+    let now = Utc::now();
+    let claimed = daemon
+        .store()
+        .claim_next_task("foreign-need-fixture", now, Duration::seconds(30))
+        .unwrap()
+        .unwrap();
+    let need = EvidenceNeed {
+        schema_version: akzio_domain::V2_DOMAIN_SCHEMA_VERSION,
+        source_family: "alpaca".to_owned(),
+        resource: "bars:TQQQ:1d".to_owned(),
+        max_age_secs: 86_400,
+    };
+    let need_artifact = Artifact::new(
+        ArtifactKind::EvidenceNeed,
+        daemon.store().put_json(&need).unwrap(),
+        "runtime.planner.evidence_need",
+        ArtifactLifecycle::RunScoped,
+        ArtifactProvenance {
+            source_family: "akzio.workflow.planner".to_owned(),
+            observed_at: None,
+            retrieved_at: now,
+            source_uri: None,
+            confidence_ppm: 1_000_000,
+            producer_contract_hash: claimed.permit.contract_hash.clone(),
+        },
+        Some(ArtifactOrigin {
+            run_id: Some(old_run_id.clone()),
+            task_id: Some(claimed.permit.task_id.clone()),
+            attempt_id: Some(claimed.permit.attempt_id.clone()),
+            contract_hash: claimed.permit.contract_hash.clone(),
+        }),
+        Vec::new(),
+        now,
+    )
+    .unwrap();
+    daemon
+        .store()
+        .write_task_artifact(
+            &claimed.permit,
+            &need_artifact,
+            LifecycleEventType::PlannerEvidenceNeedCreated,
+            now,
+        )
+        .unwrap();
+
+    let source = daemon.paper_workflow_source();
+    let clean = paper_proposal();
+    assert!(!source.references_foreign_run_scoped_need(&clean).unwrap());
+
+    let mut poisoned = paper_proposal();
+    poisoned.tasks.insert(
+        "analyst".to_owned(),
+        WorkflowProposalTask {
+            recipe_id: TaskRecipeId::new("research.analyst").unwrap(),
+            objective: "Assess stale fixture evidence".to_owned(),
+            depends_on: vec![],
+            priority: 90,
+            evidence_needs: vec![ArtifactRef {
+                artifact_id: need_artifact.artifact_id.clone(),
+                kind: ArtifactKind::EvidenceNeed,
+            }],
+        },
+    );
+    assert!(source.references_foreign_run_scoped_need(&poisoned).unwrap());
+
+    // Scheduler snapshots are re-minted per session, so carrying one forward
+    // never blocks selection.
+    let snapshot_run_id = RunId::new();
+    let snapshot =
+        scheduler_snapshot_need(daemon.store(), &snapshot_run_id, PAPER_ACCOUNT_RESOURCE, now);
+    daemon
+        .reserve_paper_session_with_inputs_for_run(
+            snapshot_run_id,
+            &now.date_naive().to_string(),
+            &paper_proposal(),
+            std::slice::from_ref(&snapshot),
+            now,
+        )
+        .unwrap();
+    let mut with_snapshot = paper_proposal();
+    with_snapshot
+        .tasks
+        .get_mut("synthesizer")
+        .unwrap()
+        .evidence_needs = vec![ArtifactRef {
+        artifact_id: snapshot.artifact_id.clone(),
+        kind: ArtifactKind::EvidenceNeed,
+    }];
+    assert!(!source
+        .references_foreign_run_scoped_need(&with_snapshot)
+        .unwrap());
     daemon.store().verify_integrity().unwrap();
 }
 

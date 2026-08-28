@@ -1,7 +1,9 @@
 use akzio_domain::{
-    ArtifactLifecycle, Asset, ContentHash, ContextSelection, DecisionHorizon, FailureDisposition,
-    Forecast, LifecycleEventType, RetryPolicy, RunId, TaskBudget, TaskId, TaskRecipeId, WeightPpm,
-    WorkflowGraph, WorkflowNode,
+    AgentContract, ArtifactLifecycle, Asset, ClaimStance, ContentHash, ContextPolicy,
+    ContextSelection, ContractId, ContractPurpose, DecisionHorizon, EvidenceGround,
+    EvidenceGroundRole, FailureDisposition, Forecast, LifecycleEventType, OutputContract,
+    PromptBundle, ResearchShard, RetryPolicy, RunId, TaskBudget, TaskId, TaskRecipeId,
+    TerminationPolicy, ToolGrant, ToolKind, ToolSpec, WeightPpm, WorkflowGraph, WorkflowNode,
 };
 use akzio_store::v2::{StoredRun, WorkflowCommit};
 use chrono::Duration;
@@ -14,6 +16,13 @@ enum DraftMode {
     Accepted,
     Blocked,
     ForgedReference,
+    /// Directional forecasts for every horizon, but claims for only one of
+    /// them, so the three-domain coverage rule cannot be satisfied.
+    UncoveredHorizons,
+    /// Only TQQQ/t1 is directional; all other forecasts remain neutral.
+    FocusedDirectional,
+    /// Focused directional forecast whose claim omits one mandatory domain.
+    FocusedDirectionalMissingDomain,
 }
 
 struct GateCase {
@@ -132,6 +141,138 @@ fn forecasts() -> Vec<Forecast> {
         .collect()
 }
 
+/// A draft that declares `MissingEvidence` may only carry neutral forecasts;
+/// the DecisionGate rejects a blocked draft that still takes a direction.
+fn neutral_forecasts() -> Vec<Forecast> {
+    Asset::EXECUTABLE
+        .into_iter()
+        .flat_map(|asset| {
+            [
+                DecisionHorizon::T1,
+                DecisionHorizon::T3,
+                DecisionHorizon::T5,
+            ]
+            .into_iter()
+            .map(move |horizon| Forecast {
+                asset,
+                horizon,
+                positive_return_probability_ppm: 500_000,
+                expected_return_ppm: 0,
+            })
+        })
+        .collect()
+}
+
+fn focused_forecasts() -> Vec<Forecast> {
+    let mut forecasts = neutral_forecasts();
+    let target = forecasts
+        .iter_mut()
+        .find(|forecast| forecast.asset == Asset::Tqqq && forecast.horizon == DecisionHorizon::T1)
+        .expect("neutral forecast set includes TQQQ/t1");
+    target.positive_return_probability_ppm = 800_000;
+    target.expected_return_ppm = 100_000;
+    forecasts
+}
+
+/// The synthesizer contract must be installed for the gate to accept its
+/// proposal, so the fixture uses a deterministic identity and content: every
+/// `seed_case` in one Store reinstalls the same contract idempotently.
+fn install_synthesizer_contract(store: &V2Store, now: DateTime<Utc>) -> ContentHash {
+    let contract = AgentContract::new(
+        ContractId("decision-gate-fixture".to_owned()),
+        5,
+        ContractPurpose::new("research.synthesizer").unwrap(),
+        "fixture synthesizer contract",
+        PromptBundle {
+            version: 1,
+            governance: store
+                .put_bytes(b"fixture governance", "text/plain")
+                .unwrap(),
+            role: store.put_bytes(b"fixture prompt", "text/plain").unwrap(),
+        },
+        ContextPolicy {
+            permitted_kinds: BTreeSet::from([ArtifactKind::Claim]),
+            permitted_source_families: BTreeSet::from(["akzio.agent".to_owned()]),
+            min_artifacts: 1,
+            max_artifacts: 8,
+            max_bytes: 8192,
+            max_tokens: 2048,
+            allow_raw_reread: false,
+        },
+        vec![ToolGrant {
+            kind: ToolKind::ReadEvidence,
+            allowed_sources: vec!["akzio.agent".to_owned()],
+        }],
+        vec![ToolSpec {
+            name: "read_artifact".to_owned(),
+            description: "read fixture artifact".to_owned(),
+            kind: ToolKind::ReadEvidence,
+            input_schema: store
+                .put_bytes(b"fixture tool schema", "application/json")
+                .unwrap(),
+            strict: true,
+        }],
+        OutputContract {
+            artifact_kind: ArtifactKind::DecisionProposal,
+            schema: store
+                .put_bytes(
+                    br#"{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"],"additionalProperties":false}"#,
+                    "application/json",
+                )
+                .unwrap(),
+        },
+        budget(),
+        retry(),
+        TerminationPolicy::leaf(),
+        FailureDisposition::FailRun,
+    )
+    .unwrap();
+    store
+        .install_active_contract(&contract, now)
+        .unwrap()
+        .contract
+        .contract_hash
+}
+
+/// One claim per horizon, each grounding every executable asset in all three
+/// mandatory Directional domains. Grounds must cite distinct evidence, so the
+/// caller supplies one artifact per domain. This is the minimum a non-neutral
+/// Paper decision must present.
+fn horizon_claims(evidence: &[ArtifactRef]) -> Vec<ResearchClaim> {
+    [
+        DecisionHorizon::T1,
+        DecisionHorizon::T3,
+        DecisionHorizon::T5,
+    ]
+    .into_iter()
+    .map(|horizon| ResearchClaim {
+        schema_version: V2_DOMAIN_SCHEMA_VERSION,
+        topic: format!("fixture coverage {horizon:?}"),
+        statement: format!("Fixture evidence supports a {horizon:?} view"),
+        horizon,
+        stance: ClaimStance::Bullish,
+        materiality_ppm: 500_000,
+        confidence_ppm: 500_000,
+        grounds: [
+            ResearchShard::PriceMarketStructure,
+            ResearchShard::Macro,
+            ResearchShard::NewsEvent,
+        ]
+        .into_iter()
+        .zip(evidence.iter())
+        .map(|(domain, evidence)| EvidenceGround {
+            evidence: evidence.clone(),
+            support: format!("{domain:?} support"),
+            role: EvidenceGroundRole::Directional,
+            assets: Asset::EXECUTABLE.into_iter().collect(),
+            domain: Some(domain),
+        })
+        .collect(),
+        evidence_gaps: vec![],
+    })
+    .collect()
+}
+
 #[test]
 fn rust_owned_policy_derives_target_from_forecasts_without_model_weights() {
     let policy = decision_policy();
@@ -147,18 +288,27 @@ fn rust_owned_policy_derives_target_from_forecasts_without_model_weights() {
     );
 }
 
-fn draft(claim: &ArtifactRef, mode: DraftMode) -> DecisionDraft {
+fn draft(claims: &[ArtifactRef], mode: DraftMode) -> DecisionDraft {
     let claims = match mode {
         DraftMode::ForgedReference => vec![ArtifactRef {
             artifact_id: ArtifactId(ContentHash::of_bytes(b"forged-claim")),
             kind: ArtifactKind::Claim,
         }],
-        _ => vec![claim.clone()],
+        DraftMode::UncoveredHorizons
+        | DraftMode::FocusedDirectional
+        | DraftMode::FocusedDirectionalMissingDomain => claims[..1].to_vec(),
+        _ => claims.to_vec(),
     };
     DecisionDraft {
         summary: "fixture decision".to_owned(),
         confidence_ppm: 500_000,
-        forecasts: forecasts(),
+        forecasts: match mode {
+            DraftMode::Blocked => neutral_forecasts(),
+            DraftMode::FocusedDirectional | DraftMode::FocusedDirectionalMissingDomain => {
+                focused_forecasts()
+            }
+            _ => forecasts(),
+        },
         claims,
         critiques: vec![],
         evidence: vec![],
@@ -181,7 +331,7 @@ fn seed_case(
     include_manifest_ref: bool,
     now: DateTime<Utc>,
 ) -> GateCase {
-    let contract_hash = ContentHash::of_bytes(b"synthesizer-contract");
+    let contract_hash = install_synthesizer_contract(store, now);
     let source = node("fixture.source", vec![], None, 100);
     let synthesizer = node(
         "research.synthesizer",
@@ -226,39 +376,66 @@ fn seed_case(
         .unwrap()
         .unwrap()
         .permit;
-    let evidence = Artifact::new(
-        ArtifactKind::NormalizedEvidence,
-        store
-            .put_json(&serde_json::json!({"evidence": "fixture"}))
-            .unwrap(),
-        "fixture.evidence",
-        ArtifactLifecycle::RunScoped,
-        provenance("fixture.evidence", None, now),
-        Some(origin(&source_permit)),
-        vec![],
-        now,
-    )
-    .unwrap();
-    let claim = Artifact::new(
-        ArtifactKind::Claim,
-        store
-            .put_json(&serde_json::json!({"claim": "fixture"}))
-            .unwrap(),
-        "fixture.claim",
-        ArtifactLifecycle::RunScoped,
-        provenance("akzio.agent", None, now),
-        Some(origin(&source_permit)),
-        vec![reference(&evidence)],
-        now,
-    )
-    .unwrap();
+    let domains = [
+        ResearchShard::PriceMarketStructure,
+        ResearchShard::Macro,
+        ResearchShard::NewsEvent,
+    ];
+    let evidence = domains
+        .iter()
+        .map(|domain| {
+            Artifact::new(
+                ArtifactKind::NormalizedEvidence,
+                store
+                    .put_json(&serde_json::json!({"evidence": format!("{domain:?}")}))
+                    .unwrap(),
+                "fixture.evidence",
+                ArtifactLifecycle::RunScoped,
+                provenance("fixture.evidence", None, now),
+                Some(origin(&source_permit)),
+                vec![],
+                now,
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let evidence_refs = evidence.iter().map(reference).collect::<Vec<_>>();
+    let claims = horizon_claims(&evidence_refs)
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut claim)| {
+            if matches!(
+                mode,
+                DraftMode::FocusedDirectional | DraftMode::FocusedDirectionalMissingDomain
+            ) && index == 0
+            {
+                for ground in &mut claim.grounds {
+                    ground.assets = BTreeSet::from([Asset::Tqqq]);
+                }
+                if matches!(mode, DraftMode::FocusedDirectionalMissingDomain) {
+                    claim
+                        .grounds
+                        .retain(|ground| ground.domain != Some(ResearchShard::NewsEvent));
+                }
+            }
+            claim.validate().unwrap();
+            Artifact::new(
+                ArtifactKind::Claim,
+                store.put_json(&claim).unwrap(),
+                "fixture.claim",
+                ArtifactLifecycle::RunScoped,
+                provenance("akzio.agent", None, now),
+                Some(origin(&source_permit)),
+                evidence_refs.clone(),
+                now,
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut committed = evidence;
+    committed.extend(claims.iter().cloned());
     store
-        .commit_attempt(
-            &source_permit,
-            &[evidence, claim.clone()],
-            TaskStatus::Succeeded,
-            now,
-        )
+        .commit_attempt(&source_permit, &committed, TaskStatus::Succeeded, now)
         .unwrap();
 
     let synth_permit = store
@@ -266,12 +443,16 @@ fn seed_case(
         .unwrap()
         .unwrap()
         .permit;
-    let claim_ref = reference(&claim);
-    let selection = ContextSelection {
-        artifact: claim_ref.clone(),
-        reason: "claim".to_owned(),
-        estimated_tokens: estimate_tokens(claim.blob.bytes),
-    };
+    let claim_refs = claims.iter().map(reference).collect::<Vec<_>>();
+    let selections = claims
+        .iter()
+        .map(|claim| ContextSelection {
+            artifact: reference(claim),
+            reason: "claim".to_owned(),
+            estimated_tokens: estimate_tokens(claim.blob.bytes),
+        })
+        .collect::<Vec<_>>();
+    let total_bytes = claims.iter().map(|claim| claim.blob.bytes).sum::<u64>();
     let manifest_contract = if manifest_contract_matches {
         contract_hash.clone()
     } else {
@@ -280,15 +461,13 @@ fn seed_case(
     let manifest_payload = ContextManifestPayload {
         schema_version: V2_DOMAIN_SCHEMA_VERSION,
         contract_hash: manifest_contract,
-        selections: vec![selection],
-        total_bytes: claim.blob.bytes,
-        estimated_tokens: estimate_tokens(claim.blob.bytes),
-        input_hash: manifest_input_hash(&[ContextSelection {
-            artifact: claim_ref.clone(),
-            reason: "claim".to_owned(),
-            estimated_tokens: estimate_tokens(claim.blob.bytes),
-        }])
-        .unwrap(),
+        selections: selections.clone(),
+        total_bytes,
+        estimated_tokens: selections
+            .iter()
+            .map(|selection| selection.estimated_tokens)
+            .sum(),
+        input_hash: manifest_input_hash(&selections).unwrap(),
     };
     let manifest = Artifact::new(
         ArtifactKind::ContextManifest,
@@ -297,7 +476,7 @@ fn seed_case(
         ArtifactLifecycle::RunScoped,
         provenance("akzio.context", Some(contract_hash.clone()), now),
         Some(origin(&synth_permit)),
-        vec![claim_ref.clone()],
+        claim_refs.clone(),
         now,
     )
     .unwrap();
@@ -312,7 +491,7 @@ fn seed_case(
 
     let proposal = Artifact::new(
         ArtifactKind::DecisionProposal,
-        store.put_json(&draft(&claim_ref, mode)).unwrap(),
+        store.put_json(&draft(&claim_refs, mode)).unwrap(),
         "agent.research.synthesizer",
         ArtifactLifecycle::RunScoped,
         provenance("akzio.agent", Some(contract_hash), now),
@@ -390,6 +569,38 @@ fn accepted_paper_proposal_commits_canonical_context_and_decision() {
 }
 
 #[test]
+fn focused_non_neutral_forecast_accepts_with_local_three_domain_coverage() {
+    let root = tempdir().unwrap();
+    let store = V2Store::open(root.path()).unwrap();
+    let now = Utc::now();
+    let case = seed_case(
+        &store,
+        RunPurpose::Paper,
+        DraftMode::FocusedDirectional,
+        true,
+        true,
+        now,
+    );
+
+    let output = V2DecisionRuntime::new(store.clone(), decision_policy())
+        .unwrap()
+        .decide(&DecisionGateInput {
+            permit: case.permit,
+            proposal: case.proposal,
+            now,
+        })
+        .unwrap();
+
+    let context: DecisionContext =
+        serde_json::from_slice(&store.read_blob(&output.decision_context.blob).unwrap()).unwrap();
+    assert!(context.accepted());
+    assert!(context.target.weights[&Asset::Tqqq].0 > 0);
+    assert_eq!(context.target.weights[&Asset::Qqq], WeightPpm::ZERO);
+    assert_eq!(context.target.weights[&Asset::Soxx], WeightPpm::ZERO);
+    assert_eq!(context.target.weights[&Asset::Soxl], WeightPpm::ZERO);
+}
+
+#[test]
 fn model_blocker_is_preserved_and_cannot_create_acceptance() {
     let root = tempdir().unwrap();
     let store = V2Store::open(root.path()).unwrap();
@@ -415,6 +626,59 @@ fn model_blocker_is_preserved_and_cannot_create_acceptance() {
 
     assert!(!context.accepted());
     assert_eq!(context.hard_blockers, vec![HardBlocker::MissingEvidence]);
+}
+
+#[test]
+fn directional_proposal_without_three_domain_coverage_is_rejected() {
+    let root = tempdir().unwrap();
+    let store = V2Store::open(root.path()).unwrap();
+    let now = Utc::now();
+    let case = seed_case(
+        &store,
+        RunPurpose::Paper,
+        DraftMode::UncoveredHorizons,
+        true,
+        true,
+        now,
+    );
+    assert!(matches!(
+        V2DecisionRuntime::new(store.clone(), decision_policy())
+            .unwrap()
+            .decide(&DecisionGateInput {
+                permit: case.permit.clone(),
+                proposal: case.proposal,
+                now,
+            }),
+        Err(DecisionGateError::InsufficientClaimEvidence)
+    ));
+    store.verify_integrity().unwrap();
+}
+
+#[test]
+fn focused_non_neutral_forecast_without_one_domain_is_rejected() {
+    let root = tempdir().unwrap();
+    let store = V2Store::open(root.path()).unwrap();
+    let now = Utc::now();
+    let case = seed_case(
+        &store,
+        RunPurpose::Paper,
+        DraftMode::FocusedDirectionalMissingDomain,
+        true,
+        true,
+        now,
+    );
+
+    assert!(matches!(
+        V2DecisionRuntime::new(store.clone(), decision_policy())
+            .unwrap()
+            .decide(&DecisionGateInput {
+                permit: case.permit,
+                proposal: case.proposal,
+                now,
+            }),
+        Err(DecisionGateError::InsufficientClaimEvidence)
+    ));
+    store.verify_integrity().unwrap();
 }
 
 #[test]
@@ -544,7 +808,7 @@ fn selected_learning_requires_explicit_attribution() {
         kind: ArtifactKind::Lesson,
     };
     let selected = BTreeSet::from([claim.clone(), lesson.clone()]);
-    let draft_without_attribution = draft(&claim, DraftMode::Accepted);
+    let draft_without_attribution = draft(std::slice::from_ref(&claim), DraftMode::Accepted);
 
     assert!(matches!(
         runtime.validate_draft_closure(&draft_without_attribution, &selected),

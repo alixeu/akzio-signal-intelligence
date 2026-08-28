@@ -9,7 +9,6 @@ use std::{
 };
 
 use super::*;
-use crate::scheduler::paper_snapshot_resources;
 use akzio_domain::{
     ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef, Asset,
     ContextManifestPayload, EvidenceNeed, MarketClockSnapshot, MoneyMicros, Outcome,

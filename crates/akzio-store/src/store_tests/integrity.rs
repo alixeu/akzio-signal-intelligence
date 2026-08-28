@@ -382,3 +382,101 @@ fn trajectory_redacts_provider_and_tool_payloads() {
         .iter()
         .any(|reference| reference.artifact_id == note.artifact_id));
 }
+
+#[test]
+fn doctor_rejects_a_run_bound_artifact_with_no_lifecycle_event() {
+    let fixture = task_artifact_fixture(RunPurpose::Debug);
+    fixture.store.verify_integrity().unwrap();
+    let unlogged = permit_artifact(
+        &fixture.store,
+        &fixture.permit,
+        ArtifactKind::NormalizedEvidence,
+        &serde_json::json!({"unlogged": true}),
+        vec![],
+        ArtifactLifecycle::RunScoped,
+        fixture.now,
+    );
+    {
+        let mut connection = fixture.store.connection.lock().unwrap();
+        let transaction = connection.transaction().unwrap();
+        insert_artifact(&transaction, &unlogged).unwrap();
+        transaction.commit().unwrap();
+    }
+
+    let error = fixture.store.verify_integrity().unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            StoreError::Integrity(message) if message.contains("has no lifecycle event")
+        ),
+        "{error}"
+    );
+}
+
+#[test]
+fn doctor_rejects_run_scoped_evidence_cited_across_runs() {
+    let fixture = task_artifact_fixture(RunPurpose::Debug);
+    let parent = permit_artifact(
+        &fixture.store,
+        &fixture.permit,
+        ArtifactKind::NormalizedEvidence,
+        &serde_json::json!({"parent": true}),
+        vec![],
+        ArtifactLifecycle::RunScoped,
+        fixture.now,
+    );
+    fixture
+        .store
+        .write_task_artifact(
+            &fixture.permit,
+            &parent,
+            LifecycleEventType::Evidence,
+            fixture.now,
+        )
+        .unwrap();
+    let foreign_child = Artifact::new(
+        ArtifactKind::ContextRepair,
+        fixture
+            .store
+            .put_json(&serde_json::json!({"foreign_child": true}))
+            .unwrap(),
+        "fixture.foreign",
+        ArtifactLifecycle::RunScoped,
+        ArtifactProvenance {
+            source_family: "fixture".to_owned(),
+            observed_at: None,
+            retrieved_at: fixture.now,
+            source_uri: None,
+            confidence_ppm: 1_000_000,
+            producer_contract_hash: fixture.permit.contract_hash.clone(),
+        },
+        Some(ArtifactOrigin {
+            run_id: Some(RunId::new()),
+            task_id: Some(fixture.permit.task_id.clone()),
+            attempt_id: Some(fixture.permit.attempt_id.clone()),
+            contract_hash: fixture.permit.contract_hash.clone(),
+        }),
+        vec![ArtifactRef {
+            artifact_id: parent.artifact_id.clone(),
+            kind: ArtifactKind::NormalizedEvidence,
+        }],
+        fixture.now,
+    )
+    .unwrap();
+    {
+        let mut connection = fixture.store.connection.lock().unwrap();
+        let transaction = connection.transaction().unwrap();
+        insert_artifact(&transaction, &foreign_child).unwrap();
+        transaction.commit().unwrap();
+    }
+
+    let error = fixture.store.verify_integrity().unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            StoreError::Integrity(message)
+                if message.contains("cites RunScoped evidence from another run")
+        ),
+        "{error}"
+    );
+}

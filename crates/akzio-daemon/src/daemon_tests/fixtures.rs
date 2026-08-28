@@ -46,11 +46,21 @@ fn paper_provider_payloads_are_mapped_to_domain_snapshots() {
 
 #[test]
 fn paper_session_inputs_include_bounded_directional_bars() {
-    let resources = paper_snapshot_resources("2026-08-17");
-    assert_eq!(resources.len(), 10);
+    let needs = paper_session_evidence_needs("2026-08-17");
+    assert_eq!(needs.len(), 17);
+    assert_ne!(
+        needs,
+        paper_session_evidence_needs("2026-08-16"),
+        "Paper evidence needs must be session-bound"
+    );
     for asset in Asset::EXECUTABLE {
-        assert!(resources.contains(&format!("bars:{}:1d:2026-07-20:32", asset.symbol())));
+        assert!(needs.iter().any(|need| {
+            need.resource.starts_with(&format!("bars:{}:1d:", asset.symbol()))
+                && need.resource.ends_with(":252")
+        }));
     }
+    assert!(needs.iter().any(|need| need.resource.starts_with("news:QQQ:")));
+    assert!(needs.iter().any(|need| need.resource.starts_with("series:DFF:")));
 }
 
 fn two_phase_responses(output: serde_json::Value) -> Vec<serde_json::Value> {
@@ -60,10 +70,10 @@ fn two_phase_responses(output: serde_json::Value) -> Vec<serde_json::Value> {
             "selected_path": "fixture path",
             "alternatives": [],
             "alternative_match_ppm": [],
-            "uncertainties": [],
-            "uncertainty_weight_ppm": [],
+            "uncertainties": ["fixture uncertainty"],
+            "uncertainty_weight_ppm": [250000],
             "basis_artifact_ids": [],
-            "confidence_ppm": 1000000
+            "confidence_ppm": 750000
         }
     });
     vec![
@@ -151,8 +161,8 @@ fn accepted_paper_decision(
                     serde_json::json!({
                         "asset": asset.symbol(),
                         "horizon": horizon,
-                        "positive_return_probability_ppm": if asset == Asset::Qqq { 900000 } else { 500000 },
-                        "expected_return_ppm": if asset == Asset::Qqq { 100000 } else { 0 },
+                "positive_return_probability_ppm": 500000,
+                "expected_return_ppm": 0,
                     })
                 })
             })
@@ -212,9 +222,19 @@ fn scheduler_snapshot_need(
 ) -> Artifact {
     let need = EvidenceNeed {
         schema_version: akzio_domain::V2_DOMAIN_SCHEMA_VERSION,
-        source_family: "alpaca".to_owned(),
+        source_family: if resource.starts_with("news:") {
+            "news_web".to_owned()
+        } else if resource.starts_with("series:") {
+            "fred".to_owned()
+        } else {
+            "alpaca".to_owned()
+        },
         resource: resource.to_owned(),
-        max_age_secs: 5,
+        max_age_secs: if resource.starts_with("paper.") {
+            300
+        } else {
+            7 * 24 * 60 * 60
+        },
     };
     Artifact::new(
         ArtifactKind::EvidenceNeed,

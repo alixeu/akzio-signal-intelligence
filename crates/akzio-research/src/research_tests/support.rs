@@ -167,7 +167,8 @@ fn planner_prompt_states_research_intent_bounds() {
         .unwrap();
     let prompt = String::from_utf8(store.read_blob(&planner.prompt.role).unwrap()).unwrap();
     assert!(prompt.contains("max_results 1-32"));
-    assert!(prompt.contains("priority 0-100"));
+    assert!(prompt.contains("research.analyst priority 1-90"));
+    assert!(prompt.contains("research.synthesizer priority 1-100"));
     assert!(prompt.contains("max_age_secs 1-604800"));
     assert!(prompt.contains("window_start and window_end must be null or RFC3339 timestamps"));
 }
@@ -186,6 +187,7 @@ fn analyst_prompt_requires_exact_context_artifact_refs() {
     assert!(prompt.contains("exact 64-character artifact_id"));
     assert!(prompt.contains("Never use the ContextManifest ID"));
     assert!(prompt.contains("Include at least one ground"));
+    assert!(prompt.contains("domain=null"));
 }
 
 #[test]
@@ -205,7 +207,10 @@ fn analyst_freshness_candidate_is_inactive_and_capability_bounded() {
         .install_analyst_freshness_candidate(&store, Utc::now())
         .unwrap();
 
-    assert_eq!(candidate.contract.version, 5);
+    assert_eq!(
+        candidate.contract.version,
+        super::catalogue::ANALYST_FRESHNESS_CANDIDATE_VERSION
+    );
     assert!(baseline.permits_candidate(&candidate.contract));
     assert!(store
         .active_contract(&candidate.contract.purpose)

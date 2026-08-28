@@ -128,7 +128,7 @@ contract_id + semver + purpose + context_policy + evidence_policy
 | --- | --- | --- | --- |
 | `research.planner` | market regime、gap summary、budget | `WorkflowProposal` + `EvidenceNeed` | 选择 preinstalled Recipe；不能提交 decision/order。 |
 | `research.analyst` | granted evidence/detail | evidence-linked `Claim` | 并行分片研究；不能扩展 source/tool scope。 |
-| `research.critic` | material claim set/conflicts | `Critique` / blocker candidate | 仅在价值/冲突阈值达标时插入。 |
+| `research.critic` | material claim set/conflicts | `Critique` / blocker candidate | 仅在 candidate topology 且价值/冲突阈值达标时由 Rust 插入；planner 不得自行排入。 |
 | `research.synthesizer` | approved claims/critiques | `DecisionDraft` + typed blockers | 不能修改事实、不能绕开 DecisionGate。 |
 
 Risk、Execution、Scheduler、Store Doctor 均为 Rust module，绝不是 Agent。后续 topology candidate 可以 merge/split/remove/add research Recipe，但只能从 capability grammar 中选择，且通过 paired Shadow、canary、风险召回和证据完整度门槛后才可 Active。

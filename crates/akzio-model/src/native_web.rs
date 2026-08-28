@@ -50,6 +50,20 @@ pub struct NativeWebCitation {
 
 impl NativeWebPolicy {
     pub fn tool_definition(&self) -> ModelToolDefinition {
+        let domains_schema = json!({
+            "type": "array",
+            "minItems": usize::from(!self.allowed_hosts.is_empty()),
+            "maxItems": self.allowed_hosts.len().max(1),
+            "items": {
+                "type": "string",
+                "enum": self.allowed_hosts,
+            }
+        });
+        let required = if self.allowed_hosts.is_empty() {
+            vec!["query"]
+        } else {
+            vec!["query", "domains"]
+        };
         ModelToolDefinition {
             name: self.tool_name.clone(),
             description: "Rust-governed native web search; citations are mandatory".to_owned(),
@@ -57,10 +71,10 @@ impl NativeWebPolicy {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "maxLength": self.max_query_chars},
-                    "domains": {"type": "array", "items": {"type": "string"}},
+                    "domains": domains_schema,
                     "max_results": {"type": "integer", "minimum": 1, "maximum": self.max_results}
                 },
-                "required": ["query"],
+                "required": required,
                 "additionalProperties": false
             }),
             strict: true,
@@ -88,7 +102,8 @@ impl NativeWebPolicy {
                 return Err(ModelError::NativeWebLimitExceeded);
             }
             let domains = match object.get("domains") {
-                None => Vec::new(),
+                None if self.allowed_hosts.is_empty() => Vec::new(),
+                None => return Err(ModelError::NativeWebArgumentsInvalid),
                 Some(value) => value
                     .as_array()
                     .ok_or(ModelError::NativeWebArgumentsInvalid)?
@@ -101,6 +116,9 @@ impl NativeWebPolicy {
                     })
                     .collect::<Result<Vec<_>>>()?,
             };
+            if !self.allowed_hosts.is_empty() && domains.is_empty() {
+                return Err(ModelError::NativeWebToolNotAllowed);
+            }
             if domains
                 .iter()
                 .any(|domain| !self.allowed_hosts.iter().any(|allowed| domain == allowed))
@@ -124,9 +142,78 @@ impl NativeWebPolicy {
         Ok(queries)
     }
 
+    /// Validate the hosted Responses `web_search_call` trace. Hosted web
+    /// search is not a function call, so its Rust-owned bounds must be checked
+    /// against `output[].action` rather than `ModelToolCall`.
+    pub fn validate_provider_response(&self, raw: &Value) -> Result<()> {
+        let calls = raw
+            .get("output")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("web_search_call"))
+            .collect::<Vec<_>>();
+        if calls.is_empty() {
+            return Err(ModelError::NativeWebUnavailable);
+        }
+
+        let mut saw_search = false;
+        let mut sources = std::collections::BTreeSet::new();
+        for call in calls {
+            if call.get("status").and_then(Value::as_str) != Some("completed") {
+                return Err(ModelError::NativeWebUnavailable);
+            }
+            let action = call
+                .get("action")
+                .and_then(Value::as_object)
+                .ok_or(ModelError::NativeWebArgumentsInvalid)?;
+            match action.get("type").and_then(Value::as_str) {
+                Some("search") => {
+                    saw_search = true;
+                    let mut queries = Vec::new();
+                    if let Some(query) = action.get("query").and_then(Value::as_str) {
+                        queries.push(query);
+                    }
+                    if let Some(values) = action.get("queries").and_then(Value::as_array) {
+                        queries.extend(values.iter().filter_map(Value::as_str));
+                    }
+                    if queries.is_empty()
+                        || queries.iter().any(|query| {
+                            query.trim().is_empty() || query.chars().count() > self.max_query_chars
+                        })
+                    {
+                        return Err(ModelError::NativeWebLimitExceeded);
+                    }
+                    let action_sources = action
+                        .get("sources")
+                        .and_then(Value::as_array)
+                        .ok_or(ModelError::NativeWebArgumentsInvalid)?;
+                    for source in action_sources {
+                        let uri = source
+                            .get("url")
+                            .or_else(|| source.get("uri"))
+                            .and_then(Value::as_str)
+                            .ok_or(ModelError::NativeWebArgumentsInvalid)?;
+                        self.validate_uri(uri)?;
+                        sources.insert(uri.to_owned());
+                    }
+                }
+                Some("open_page" | "find_in_page") => {}
+                _ => return Err(ModelError::NativeWebArgumentsInvalid),
+            }
+        }
+        if !saw_search || sources.is_empty() {
+            return Err(ModelError::NativeWebArgumentsInvalid);
+        }
+        if sources.len() > self.max_results {
+            return Err(ModelError::NativeWebLimitExceeded);
+        }
+        Ok(())
+    }
+
     pub fn extract_citations(&self, raw: &Value) -> Result<Vec<NativeWebCitation>> {
         let mut citations = Vec::new();
-        collect_citations(raw, &mut citations, self.max_citations);
+        collect_citations(raw, &mut citations);
         citations.sort_by(|left, right| left.uri.cmp(&right.uri));
         citations.dedup_by(|left, right| left.uri == right.uri);
         if citations.is_empty() {
@@ -136,31 +223,39 @@ impl NativeWebPolicy {
             return Err(ModelError::NativeWebLimitExceeded);
         }
         for citation in &citations {
-            let parsed = reqwest::Url::parse(&citation.uri)
-                .map_err(|_| ModelError::NativeWebUnsafeCitation)?;
-            if parsed.username() != ""
-                || parsed.password().is_some()
-                || parsed.query().is_some()
-                || !self
-                    .allowed_hosts
-                    .iter()
-                    .any(|host| parsed.host_str() == Some(host.as_str()))
-            {
-                return Err(ModelError::NativeWebUnsafeCitation);
-            }
+            self.validate_uri(&citation.uri)?;
         }
         Ok(citations)
     }
+
+    fn validate_uri(&self, uri: &str) -> Result<()> {
+        let parsed = reqwest::Url::parse(uri).map_err(|_| ModelError::NativeWebUnsafeCitation {
+            uri: uri.to_owned(),
+            reason: "invalid URL".to_owned(),
+        })?;
+        if parsed.scheme() != "https"
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.port().is_some()
+            || !self
+                .allowed_hosts
+                .iter()
+                .any(|host| parsed.host_str() == Some(host.as_str()))
+        {
+            return Err(ModelError::NativeWebUnsafeCitation {
+                uri: uri.to_owned(),
+                reason: "scheme, credentials, port, or host is not allowed".to_owned(),
+            });
+        }
+        Ok(())
+    }
 }
 
-fn collect_citations(value: &Value, output: &mut Vec<NativeWebCitation>, limit: usize) {
-    if output.len() >= limit {
-        return;
-    }
+fn collect_citations(value: &Value, output: &mut Vec<NativeWebCitation>) {
     match value {
         Value::Array(values) => values
             .iter()
-            .for_each(|value| collect_citations(value, output, limit)),
+            .for_each(|value| collect_citations(value, output)),
         Value::Object(object) => {
             let uri = object
                 .get("url")
@@ -198,7 +293,7 @@ fn collect_citations(value: &Value, output: &mut Vec<NativeWebCitation>, limit: 
             }
             object
                 .values()
-                .for_each(|value| collect_citations(value, output, limit));
+                .for_each(|value| collect_citations(value, output));
         }
         _ => {}
     }

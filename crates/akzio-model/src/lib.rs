@@ -56,8 +56,8 @@ pub enum ModelError {
     NativeWebArgumentsInvalid,
     #[error("native web result has no verifiable citations")]
     NativeWebCitationsMissing,
-    #[error("native web citation URI is not allowlisted")]
-    NativeWebUnsafeCitation,
+    #[error("native web citation URI is not allowlisted: {uri} ({reason})")]
+    NativeWebUnsafeCitation { uri: String, reason: String },
     #[error("native web result exceeds the configured limit")]
     NativeWebLimitExceeded,
 }
@@ -203,7 +203,7 @@ pub enum ModelInput {
     },
 }
 
-pub const NATIVE_WEB_SEARCH_TOOL: &str = "web_search_preview";
+pub const NATIVE_WEB_SEARCH_TOOL: &str = "web_search";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelRequest {

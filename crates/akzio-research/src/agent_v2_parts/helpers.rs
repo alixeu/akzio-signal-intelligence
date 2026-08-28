@@ -79,7 +79,7 @@ fn model_error_result(error: &ModelError) -> Value {
         | ModelError::NativeWebToolNotAllowed
         | ModelError::NativeWebArgumentsInvalid
         | ModelError::NativeWebCitationsMissing
-        | ModelError::NativeWebUnsafeCitation
+        | ModelError::NativeWebUnsafeCitation { .. }
         | ModelError::NativeWebLimitExceeded => json!({"error": "native_web_contract"}),
         ModelError::EmptyBaseUrl
         | ModelError::EmptyApiKey
@@ -116,7 +116,7 @@ fn model_client_error(error: ModelError, trace: Option<ModelCallTrace>) -> Resea
         | ModelError::NativeWebToolNotAllowed
         | ModelError::NativeWebArgumentsInvalid
         | ModelError::NativeWebCitationsMissing
-        | ModelError::NativeWebUnsafeCitation
+        | ModelError::NativeWebUnsafeCitation { .. }
         | ModelError::NativeWebLimitExceeded => (
             "native_web_contract",
             "native web contract rejected response".to_owned(),

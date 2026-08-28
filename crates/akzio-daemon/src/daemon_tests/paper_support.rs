@@ -181,3 +181,16 @@ fn evidence_transport_failure_requests_transport_retry() {
         Some(RetryCause::Transport)
     );
 }
+
+#[test]
+fn evidence_policy_failure_stays_terminal() {
+    let error = DaemonError::Evidence(EvidenceRuntimeError::Adapter(
+        akzio_ingest::runtime::EvidenceAdapterError::Policy {
+            evidence_source: EvidenceSource::NewsWeb,
+            resource: "news:QQQ:2026-08-20:2026-08-27:market".to_owned(),
+            reason: "native web citation URI is not allowlisted: https://example.com/story"
+                .to_owned(),
+        },
+    ));
+    assert_eq!(retry_cause_for_daemon_error(&error), None);
+}

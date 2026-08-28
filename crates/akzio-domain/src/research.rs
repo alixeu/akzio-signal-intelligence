@@ -29,6 +29,22 @@ pub enum CritiqueSeverity {
     High,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceGroundRole {
+    #[default]
+    Descriptive,
+    Directional,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceGapImpact {
+    #[default]
+    Warning,
+    BlocksDirectionalForecast,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResolutionDisposition {
@@ -124,6 +140,12 @@ impl ResearchIntent {
 pub struct EvidenceGround {
     pub evidence: ArtifactRef,
     pub support: String,
+    #[serde(default)]
+    pub role: EvidenceGroundRole,
+    #[serde(default)]
+    pub assets: BTreeSet<Asset>,
+    #[serde(default)]
+    pub domain: Option<ResearchShard>,
 }
 
 impl EvidenceGround {
@@ -137,6 +159,9 @@ impl EvidenceGround {
                 field: "research.ground",
             });
         }
+        if self.role == EvidenceGroundRole::Directional && self.assets.is_empty() {
+            return Err(DomainError::InvalidEvidenceGroundScope);
+        }
         Ok(())
     }
 }
@@ -145,6 +170,10 @@ impl EvidenceGround {
 pub struct EvidenceGap {
     pub topic: String,
     pub rationale: String,
+    #[serde(default)]
+    pub impact: EvidenceGapImpact,
+    #[serde(default)]
+    pub supplemental_needs: Vec<ResearchIntent>,
 }
 
 impl EvidenceGap {
@@ -153,6 +182,14 @@ impl EvidenceGap {
             return Err(DomainError::EmptyField {
                 field: "research.evidence_gap",
             });
+        }
+        if self.supplemental_needs.len() > 8 {
+            return Err(DomainError::InvalidBudget {
+                field: "research.evidence_gap.supplemental_needs",
+            });
+        }
+        for need in &self.supplemental_needs {
+            need.validate()?;
         }
         Ok(())
     }
@@ -336,6 +373,9 @@ mod tests {
     fn ground() -> EvidenceGround {
         EvidenceGround {
             evidence: reference(ArtifactKind::NormalizedEvidence, b"evidence"),
+            role: EvidenceGroundRole::Descriptive,
+            assets: BTreeSet::new(),
+            domain: None,
             support: "reported price and date support the claim".to_owned(),
         }
     }
@@ -385,6 +425,8 @@ mod tests {
             remaining_gaps: vec![EvidenceGap {
                 topic: "freshness".to_owned(),
                 rationale: "No current session observation is available.".to_owned(),
+                impact: EvidenceGapImpact::Warning,
+                supplemental_needs: vec![],
             }],
         };
         resolution.validate().unwrap();

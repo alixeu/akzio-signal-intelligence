@@ -1,7 +1,7 @@
 [daemon]
 # Overridden at launch with AKZIO_STORE_ROOT so Finder launches never depend
 # on the current working directory.
-store_root = "outputs/akzio-observatory-unused"
+store_root = "/Users/alixeu/.akzio/store"
 http_addr = "127.0.0.1:7342"
 token_env = "AKZIO_DAEMON_TOKEN"
 observer_token_env = "AKZIO_OBSERVER_TOKEN"
@@ -27,5 +27,6 @@ debug = false
 [credentials]
 alpaca_api_key = ""
 alpaca_api_secret = ""
+fred_api_key = ""
 
 [observatory]

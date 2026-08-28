@@ -7,6 +7,32 @@ impl AgentRuntime {
         model: &dyn AgentModel,
         now: DateTime<Utc>,
     ) -> ResearchResult<Artifact> {
+        self.run_inner(permit, node, candidates, model, now, None)
+            .await
+    }
+
+    pub async fn run_with_budget(
+        &self,
+        permit: &TaskWritePermit,
+        node: &WorkflowNode,
+        candidates: impl IntoIterator<Item = ArtifactRef>,
+        model: &dyn AgentModel,
+        now: DateTime<Utc>,
+        budget: &mut AgentRunBudget,
+    ) -> ResearchResult<Artifact> {
+        self.run_inner(permit, node, candidates, model, now, Some(budget))
+            .await
+    }
+
+    async fn run_inner(
+        &self,
+        permit: &TaskWritePermit,
+        node: &WorkflowNode,
+        candidates: impl IntoIterator<Item = ArtifactRef>,
+        model: &dyn AgentModel,
+        now: DateTime<Utc>,
+        mut shared_budget: Option<&mut AgentRunBudget>,
+    ) -> ResearchResult<Artifact> {
         self.validate_authority_permit(permit)?;
         if permit.task_id != node.task_id {
             return Err(ResearchError::TaskMismatch);
@@ -113,10 +139,16 @@ impl AgentRuntime {
             .saturating_mul(u32::from(installed.contract.budget.max_tool_calls) + 3);
         let mut phase = AgentTurnPhase::Draft;
         let mut submission_attempts = 0_u8;
-        let started = Instant::now();
+        let started = shared_budget
+            .as_ref()
+            .map(|budget| budget.started)
+            .unwrap_or_else(Instant::now);
         let wall_time =
             StdDuration::from_secs(u64::from(installed.contract.budget.max_wall_time_secs));
         loop {
+            if let Some(budget) = shared_budget.as_deref_mut() {
+                budget.check_wall()?;
+            }
             if started.elapsed() > wall_time {
                 return Err(ResearchError::WallTimeExceeded {
                     maximum_secs: installed.contract.budget.max_wall_time_secs,
@@ -155,12 +187,14 @@ impl AgentRuntime {
                     ),
                     input_schema: output_schema.clone(),
                 }),
-            };
-            let input_tokens = estimate_tokens(&request)?;
-            if input_tokens > installed.contract.budget.max_input_tokens {
-                return Err(ResearchError::InputBudgetExceeded {
-                    actual: input_tokens,
-                    maximum: installed.contract.budget.max_input_tokens,
+        };
+        let input_tokens = estimate_tokens(&request)?;
+        if let Some(budget) = shared_budget.as_deref_mut() {
+            budget.record_input(input_tokens)?;
+        } else if input_tokens > installed.contract.budget.max_input_tokens {
+            return Err(ResearchError::InputBudgetExceeded {
+                actual: input_tokens,
+                maximum: installed.contract.budget.max_input_tokens,
                 });
             }
             let tool_set_hash = tool_set_hash(&request)?;
@@ -239,9 +273,11 @@ impl AgentRuntime {
                     };
                     let _ = sender.send(event);
                 });
-                if provider_calls >= max_provider_calls {
-                    return Err(ResearchError::ModelCallBudgetExceeded);
-                }
+            if let Some(budget) = shared_budget.as_deref_mut() {
+                budget.record_model_call()?;
+            } else if provider_calls >= max_provider_calls {
+                return Err(ResearchError::ModelCallBudgetExceeded);
+            }
                 provider_calls = provider_calls.saturating_add(1);
                 match model.turn_with_events(request.clone(), on_event).await {
                     Ok(turn) => {
@@ -356,6 +392,9 @@ impl AgentRuntime {
             }
             if phase == AgentTurnPhase::Draft && !turn.tool_calls.is_empty() {
                 let next = tool_calls.saturating_add(turn.tool_calls.len() as u16);
+                if let Some(budget) = shared_budget.as_deref_mut() {
+                    budget.record_tool_calls(turn.tool_calls.len() as u16)?;
+                }
                 if next > installed.contract.budget.max_tool_calls {
                     return Err(ResearchError::ToolBudgetExceeded);
                 }
@@ -389,13 +428,16 @@ impl AgentRuntime {
                     .filter(|text| !text.trim().is_empty())
                     .ok_or(ResearchError::MissingFinalOutput)?;
                 let output_tokens = estimate_tokens(&memo)?;
-                if output_tokens > installed.contract.budget.max_output_tokens {
-                    return Err(ResearchError::OutputBudgetExceeded {
-                        actual: output_tokens,
-                        maximum: installed.contract.budget.max_output_tokens,
-                    });
-                }
-                phase = AgentTurnPhase::Submit;
+            if output_tokens > installed.contract.budget.max_output_tokens {
+                return Err(ResearchError::OutputBudgetExceeded {
+                    actual: output_tokens,
+                    maximum: installed.contract.budget.max_output_tokens,
+                });
+            }
+            if let Some(budget) = shared_budget.as_deref_mut() {
+                budget.record_output(output_tokens)?;
+            }
+            phase = AgentTurnPhase::Submit;
                 model_turn = model_turn.saturating_add(1);
                 continue;
             }
@@ -407,12 +449,15 @@ impl AgentRuntime {
                 .terminal_submission
                 .ok_or(ResearchError::MissingFinalOutput)?;
             let output_tokens = estimate_tokens(&submission.arguments)?;
-            if output_tokens > installed.contract.budget.max_output_tokens {
-                return Err(ResearchError::OutputBudgetExceeded {
-                    actual: output_tokens,
-                    maximum: installed.contract.budget.max_output_tokens,
-                });
-            }
+        if output_tokens > installed.contract.budget.max_output_tokens {
+            return Err(ResearchError::OutputBudgetExceeded {
+                actual: output_tokens,
+                maximum: installed.contract.budget.max_output_tokens,
+            });
+        }
+        if let Some(budget) = shared_budget.as_deref_mut() {
+            budget.record_output(output_tokens)?;
+        }
 
             let validated = (|| {
                 validate_submission_schema(

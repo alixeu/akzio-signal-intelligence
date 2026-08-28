@@ -281,7 +281,7 @@ public final class ObservatoryStore {
             connect(connection)
         }
         do {
-            try await coreSupervisor.submitDebugRun()
+            _ = try await coreSupervisor.submitDebugRun()
             debugRunMessage = "Run submitted"
             navigate(to: .workflow)
         } catch {

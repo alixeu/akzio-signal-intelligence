@@ -102,6 +102,7 @@ impl V2Store {
                     insert_artifact(&transaction, approval)?;
                 }
                 Self::commit_workflow_transaction(&transaction, &reservation.workflow)?;
+                Self::append_session_setup_events(&transaction, reservation, Some(proposal))?;
                 transaction.execute(
                     "INSERT INTO rebuild_session_slots (session_key, run_id, topology_id, graph_artifact_id, run_created_at, scheduler_epoch, reserved_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
@@ -155,6 +156,7 @@ impl V2Store {
             insert_artifact(transaction, approval)?;
         }
         Self::commit_workflow_transaction(transaction, &reservation.workflow)?;
+        Self::append_session_setup_events(transaction, reservation, Some(proposal))?;
         transaction.execute(
             "INSERT INTO rebuild_session_slots (session_key, run_id, topology_id, graph_artifact_id, run_created_at, scheduler_epoch, reserved_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
@@ -176,6 +178,41 @@ impl V2Store {
                     reservation.session_key,
                     reservation.reserved_at.to_rfc3339(),
                 ],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Record run-level facts for the artifacts a session reservation writes
+    /// before any task row exists: the scheduler's session-scoped
+    /// `EvidenceNeed`s and, where present, the frozen `WorkflowProposal`. They
+    /// are bound to the run, so without these events the Doctor cannot observe
+    /// them in the run's event log at all.
+    pub(super) fn append_session_setup_events(
+        transaction: &Transaction<'_>,
+        reservation: &SessionReservation,
+        proposal: Option<&Artifact>,
+    ) -> StoreResult<()> {
+        for artifact in &reservation.setup_artifacts {
+            append_event(
+                transaction,
+                &reservation.workflow.run.run_id,
+                None,
+                None,
+                LifecycleEventType::SchedulerSnapshotNeedCreated,
+                Some(&artifact.artifact_id),
+                reservation.reserved_at,
+            )?;
+        }
+        if let Some(proposal) = proposal {
+            append_event(
+                transaction,
+                &reservation.workflow.run.run_id,
+                None,
+                None,
+                LifecycleEventType::SchedulerWorkflowProposalCreated,
+                Some(&proposal.artifact_id),
+                reservation.reserved_at,
             )?;
         }
         Ok(())

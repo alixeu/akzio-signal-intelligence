@@ -56,7 +56,17 @@ impl Daemon {
         );
         let outcome_worker_enabled =
             auto_paper && production_evidence.contains_key(&EvidenceSource::Alpaca);
-        daemon.production_evidence = Arc::new(production_evidence);
+    if auto_paper && !production_evidence.contains_key(&EvidenceSource::Alpaca) {
+        return Err(DaemonError::InvalidInput(
+            "auto_paper requires Alpaca Paper evidence adapter".to_owned(),
+        ));
+    }
+    if auto_paper && !production_evidence.contains_key(&EvidenceSource::Fred) {
+        return Err(DaemonError::InvalidInput(
+            "auto_paper requires FRED_API_KEY".to_owned(),
+        ));
+    }
+    daemon.production_evidence = Arc::new(production_evidence);
         daemon.outcome_scheduling_runtime = OutcomeSchedulingRuntime::new(daemon.store.clone())
             .with_worker_enabled(outcome_worker_enabled);
         Ok(daemon)

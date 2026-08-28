@@ -22,6 +22,12 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo test --workspace --locked
 
+  observatory:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift run --package-path apps/AkzioMac -Xswiftc -warnings-as-errors AkzioChecks
+
   audit:
     runs-on: ubuntu-latest
     steps:

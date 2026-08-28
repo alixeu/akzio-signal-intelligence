@@ -56,7 +56,13 @@ impl AgentRuntime {
                 observed_at: None,
                 retrieved_at: now,
                 source_uri: None,
-                confidence_ppm: envelope.deliberation.confidence_ppm,
+                // Provenance confidence is Rust-owned. It must not carry the
+                // model's self-reported `deliberation.confidence_ppm`, because
+                // ContextManifest selection ranks candidates by this field
+                // (`akzio-context` broker_parts/manifest.rs), which would let an
+                // agent raise its own note's selection priority in later turns.
+                // The self-report stays inside the note payload.
+                confidence_ppm: 1_000_000,
                 producer_contract_hash: Some(contract.contract_hash.clone()),
             },
             Some(permit.artifact_origin()),

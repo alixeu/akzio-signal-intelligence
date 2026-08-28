@@ -69,7 +69,10 @@ impl AgentModel for ToolCountModel {
                         "artifact_id": evidence_id.0.as_str(),
                         "kind": "normalized_evidence"
                     },
-                    "support": "The debug fixture is already present in the authorized context."
+                    "support": "The debug fixture is already present in the authorized context.",
+                    "role": "descriptive",
+                    "assets": [],
+                    "domain": null
                 }],
                 "evidence_gaps": []
             })))

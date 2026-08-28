@@ -239,6 +239,16 @@ pub(super) fn responses_request_body(
         "store": false,
         "stream": true,
     });
+    if request
+        .tools
+        .iter()
+        .any(|tool| tool.name == NATIVE_WEB_SEARCH_TOOL)
+    {
+        body["include"]
+            .as_array_mut()
+            .expect("Responses include is an array")
+            .push(json!("web_search_call.action.sources"));
+    }
     if !request.tools.is_empty() {
         body["tools"] = Value::Array(
             request
@@ -246,7 +256,17 @@ pub(super) fn responses_request_body(
                 .iter()
                 .map(|tool| {
                     if tool.name == NATIVE_WEB_SEARCH_TOOL {
-                        json!({"type": NATIVE_WEB_SEARCH_TOOL})
+                        let mut native_web = json!({"type": NATIVE_WEB_SEARCH_TOOL});
+                        if let Some(domains) = tool
+                            .input_schema
+                            .pointer("/properties/domains/items/enum")
+                            .filter(|domains| domains.is_array())
+                        {
+                            native_web["filters"] = json!({
+                                "allowed_domains": domains,
+                            });
+                        }
+                        native_web
                     } else {
                         json!({
                             "type": "function",

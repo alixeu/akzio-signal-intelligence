@@ -13,10 +13,11 @@ use akzio_context::v2::{ContextBroker, ContextError, ContextManifest};
 #[cfg(test)]
 use akzio_domain::RuntimeTaskClass;
 use akzio_domain::{
-    AgentContract, AgentOutputEnvelope, Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle,
-    ArtifactProvenance, ArtifactRef, ContextPolicy, ContractId, ContractPurpose, DecisionDraft,
-    DeliberationPolicy, DomainError, FailureDisposition, LifecycleEventType, OutputContract,
-    PromptBundle, ReadGrant, ResearchClaim, ResearchCritique, ResearchResolution, RetryPolicy,
+    validate_decision_evidence_sufficiency, AgentContract, AgentOutputEnvelope, Artifact,
+    ArtifactId, ArtifactKind, ArtifactLifecycle, ArtifactProvenance, ArtifactRef, Asset,
+    ContextPolicy, ContractId, ContractPurpose, DecisionDraft, DeliberationPolicy, DomainError,
+    EvidenceGroundRole, FailureDisposition, LifecycleEventType, OutputContract, PromptBundle,
+    ReadGrant, ResearchClaim, ResearchCritique, ResearchResolution, ResearchShard, RetryPolicy,
     RunPurpose, TaskBudget, TaskRecipeId, TaskWritePermit, TerminationPolicy, ToolGrant, ToolKind,
     ToolSpec, WorkflowNode, V2_DOMAIN_SCHEMA_VERSION,
 };

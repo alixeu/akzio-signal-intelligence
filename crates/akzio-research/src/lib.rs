@@ -9,9 +9,10 @@ mod fixture;
 pub mod v2 {
     pub use crate::agent_v2::{
         ActiveResearchCatalogue, AgentModel, AgentModelRequest, AgentModelTurn,
-        AgentReasoningEvent, AgentRuntime, AgentTerminalDefinition, AgentTerminalSubmission,
-        AgentToolCall, AgentToolDefinition, AgentTurnPhase, ContractCatalogue, InstalledContract,
-        ModelClientAdapter, ResearchError, ResearchResult as Result, ACTIVE_RESEARCH_MAX_NODES,
+        AgentReasoningEvent, AgentRunBudget, AgentRuntime, AgentTerminalDefinition,
+        AgentTerminalSubmission, AgentToolCall, AgentToolDefinition, AgentTurnPhase,
+        ContractCatalogue, InstalledContract, ModelClientAdapter, ResearchError,
+        ResearchResult as Result, ACTIVE_RESEARCH_MAX_NODES,
     };
     pub use crate::fixture::{fixture_claim_output, fixture_critique_output, fixture_model_client};
 }

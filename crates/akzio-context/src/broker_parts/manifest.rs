@@ -173,6 +173,11 @@ impl ContextBroker {
         }
     }
         let mut artifacts = eligible;
+        let analyst_bundle = if contract.purpose.as_str() == RESEARCH_ANALYST_RECIPE_ID {
+            self.select_analyst_bundle(&artifacts, policy)?
+        } else {
+            None
+        };
         artifacts.sort_by(|left, right| {
             context_rank(left)
                 .cmp(&context_rank(right))
@@ -184,6 +189,20 @@ impl ContextBroker {
                 })
                 .then_with(|| left.artifact_id.cmp(&right.artifact_id))
         });
+
+        if let Some(bundle) = analyst_bundle {
+            let bundle_ids = bundle
+                .iter()
+                .map(|artifact| artifact.artifact_id.clone())
+                .collect::<BTreeSet<_>>();
+            let mut prioritized = bundle;
+            prioritized.extend(
+                artifacts
+                    .into_iter()
+                    .filter(|artifact| !bundle_ids.contains(&artifact.artifact_id)),
+            );
+            artifacts = prioritized;
+        }
 
         let mut total_bytes = 0_u64;
         let mut estimated_tokens = 0_u32;

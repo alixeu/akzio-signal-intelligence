@@ -71,9 +71,9 @@ impl ActiveResearchCatalogue {
 
 pub const ACTIVE_RESEARCH_MAX_NODES: usize = 32;
 
-pub(super) const ACTIVE_CONTRACT_VERSION: u32 = 4;
-pub(super) const ACTIVE_PROMPT_BUNDLE_VERSION: u32 = 4;
-pub const ANALYST_FRESHNESS_CANDIDATE_VERSION: u32 = 5;
+pub(super) const ACTIVE_CONTRACT_VERSION: u32 = 12;
+pub(super) const ACTIVE_PROMPT_BUNDLE_VERSION: u32 = 9;
+pub const ANALYST_FRESHNESS_CANDIDATE_VERSION: u32 = 13;
 pub(super) const SHARED_GOVERNANCE_PROMPT: &str = "Follow the installed Akzio Contract exactly. Rust owns state, evidence access, budgets, workflow gates, and Paper-only execution. Use only ContextManifest-granted artifacts and the declared tools. Never access arbitrary files, network resources, credentials, databases, or execution controls. Work in two phases: produce an auditable natural-language research memo, then call submit_result exactly once when Rust requests submission. submit_result is a zero-side-effect proposal channel; Rust alone validates and persists the result.";
 pub(super) const PLANNER_RECIPE_ID: &str = akzio_domain::RESEARCH_PLANNER_RECIPE_ID;
 pub(super) const PLANNER_CHILD_RECIPE_IDS: [&str; 2] = [

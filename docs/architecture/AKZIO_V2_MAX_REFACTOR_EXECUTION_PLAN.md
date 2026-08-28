@@ -144,6 +144,13 @@ Initial active topology uses four contract purposes:
 3. `research.critic` — conditionally attacks material claims or gaps;
 4. `research.synthesizer` — returns a decision proposal plus typed blockers.
 
+Only three of these run on the current `active` topology. `insert_structured_critic`
+is gated on `STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID`, so the critic is reachable
+only through a candidate topology under a canary or shadow campaign; an `active`
+Paper session never critiques its own claims, whatever the materiality or conflict
+thresholds say. The planner may not schedule the critic itself
+(`RuntimeError::PlannerSchedulesCritic`).
+
 These are contract purposes rather than a closed Rust role enum. Candidate topology
 may merge, remove, split, or add a contract recipe only within the approved
 capability grammar. Rust risk and execution gates are not agent contracts.

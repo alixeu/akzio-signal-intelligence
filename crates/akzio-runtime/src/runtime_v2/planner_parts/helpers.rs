@@ -60,7 +60,11 @@ pub(super) fn prepare_debug_draft(
             max_age_secs: DEBUG_FIXTURE_MAX_AGE_SECS,
         }]
     } else {
-        let start = (Utc::now().date_naive() - Duration::days(28)).format("%Y-%m-%d");
+        // Debug bar windows reuse the Paper lookback and limit so a Debug run
+        // exercises the same entitlement a Paper shard receives.
+        let start = (Utc::now().date_naive()
+            - Duration::days(akzio_domain::PAPER_BARS_LOOKBACK_DAYS))
+        .format("%Y-%m-%d");
         [
             "paper.account",
             "paper.positions",
@@ -78,7 +82,11 @@ pub(super) fn prepare_debug_draft(
         .chain(Asset::EXECUTABLE.into_iter().map(|asset| EvidenceNeed {
             schema_version: V2_DOMAIN_SCHEMA_VERSION,
             source_family: DEBUG_FIXTURE_SOURCE.to_owned(),
-            resource: format!("bars:{}:1d:{start}:32", asset.symbol()),
+            resource: format!(
+                "bars:{}:1d:{start}:{}",
+                asset.symbol(),
+                akzio_domain::PAPER_BARS_LIMIT
+            ),
             max_age_secs: DEBUG_FIXTURE_MAX_AGE_SECS,
         }))
         .collect()

@@ -312,8 +312,17 @@ fn native_web_contract_rejects_unallowlisted_query_and_uri() {
     ));
     assert!(matches!(
         policy.extract_citations(&json!({"citations": [{"url": "https://example.com/a"}]})),
-        Err(ModelError::NativeWebUnsafeCitation)
+        Err(ModelError::NativeWebUnsafeCitation { ref uri, .. }) if uri == "https://example.com/a"
     ));
+    let query_uri = policy
+        .extract_citations(&json!({
+            "citations": [{"url": "https://reuters.com/article?utm_source=fixture"}]
+        }))
+        .unwrap();
+    assert_eq!(
+        query_uri[0].uri,
+        "https://reuters.com/article?utm_source=fixture"
+    );
 }
 
 #[test]
@@ -322,7 +331,7 @@ fn native_web_contract_requires_citations_and_bounds_results() {
     let call = ModelToolCall {
         call_id: "call-1".to_owned(),
         name: policy.tool_name.clone(),
-        arguments: json!({"query": "QQQ filing", "max_results": 1}),
+        arguments: json!({"query": "QQQ filing", "domains": ["reuters.com"], "max_results": 1}),
     };
     assert_eq!(
         policy.validate_tool_calls(&[call]).unwrap()[0].max_results,
@@ -331,6 +340,15 @@ fn native_web_contract_requires_citations_and_bounds_results() {
     assert!(matches!(
         policy.extract_citations(&json!({"output": "no citations"})),
         Err(ModelError::NativeWebCitationsMissing)
+    ));
+    let missing_domains = ModelToolCall {
+        call_id: "call-2".to_owned(),
+        name: policy.tool_name.clone(),
+        arguments: json!({"query": "QQQ filing", "max_results": 1}),
+    };
+    assert!(matches!(
+        policy.validate_tool_calls(&[missing_domains]),
+        Err(ModelError::NativeWebArgumentsInvalid)
     ));
     let body = responses_request_body(
         "fixture",
@@ -341,4 +359,102 @@ fn native_web_contract_requires_citations_and_bounds_results() {
         },
     );
     assert_eq!(body["tools"][0]["type"], NATIVE_WEB_SEARCH_TOOL);
+    assert_eq!(body["tools"][0]["filters"]["allowed_domains"][0], "sec.gov");
+    assert!(body["include"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("web_search_call.action.sources")));
+}
+
+#[test]
+fn native_web_contract_validates_provider_search_actions() {
+    let policy = NativeWebPolicy {
+        max_query_chars: 8,
+        max_results: 1,
+        ..NativeWebPolicy::default()
+    };
+    let response = json!({
+        "output": [{
+            "type": "web_search_call",
+            "status": "completed",
+            "action": {
+                "type": "search",
+                "queries": ["QQQ news"],
+                "sources": [{"url": "https://reuters.com/story"}]
+            }
+        }]
+    });
+    policy.validate_provider_response(&response).unwrap();
+
+    let too_long = json!({
+        "output": [{
+            "type": "web_search_call",
+            "status": "completed",
+            "action": {
+                "type": "search",
+                "query": "QQQ news today",
+                "sources": [{"url": "https://reuters.com/story"}]
+            }
+        }]
+    });
+    assert!(matches!(
+        policy.validate_provider_response(&too_long),
+        Err(ModelError::NativeWebLimitExceeded)
+    ));
+
+    let too_many_sources = json!({
+        "output": [{
+            "type": "web_search_call",
+            "status": "completed",
+            "action": {
+                "type": "search",
+                "query": "QQQ",
+                "sources": [
+                    {"url": "https://reuters.com/one"},
+                    {"url": "https://reuters.com/two"}
+                ]
+            }
+        }]
+    });
+    assert!(matches!(
+        policy.validate_provider_response(&too_many_sources),
+        Err(ModelError::NativeWebLimitExceeded)
+    ));
+    assert!(matches!(
+        policy.validate_provider_response(&json!({"output": []})),
+        Err(ModelError::NativeWebUnavailable)
+    ));
+}
+
+#[test]
+fn native_web_contract_rejects_citations_beyond_the_limit() {
+    let policy = NativeWebPolicy {
+        max_citations: 2,
+        ..NativeWebPolicy::default()
+    };
+    let response = json!({
+        "citations": [
+            {"url": "https://reuters.com/one"},
+            {"url": "https://reuters.com/two"},
+            {"url": "https://reuters.com/three"}
+        ]
+    });
+    assert!(matches!(
+        policy.extract_citations(&response),
+        Err(ModelError::NativeWebLimitExceeded)
+    ));
+
+    let unsafe_after_duplicates = json!({
+        "citations": [
+            {"url": "https://reuters.com/one"},
+            {"url": "https://reuters.com/one"},
+            {"url": "https://reuters.com/one"},
+            {"url": "https://example.com/hidden"}
+        ]
+    });
+    assert!(matches!(
+        policy.extract_citations(&unsafe_after_duplicates),
+        Err(ModelError::NativeWebUnsafeCitation { ref uri, .. })
+            if uri == "https://example.com/hidden"
+    ));
 }

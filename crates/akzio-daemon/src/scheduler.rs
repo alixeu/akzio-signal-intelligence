@@ -12,10 +12,11 @@ use std::{
 };
 
 use akzio_domain::{
-    AgentContract, Artifact, ArtifactKind, ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance,
-    ArtifactRef, Asset, CanaryCampaignStatus, CanarySessionReservation, DomainError, EvidenceNeed,
-    PolicySubject, RunId, RunPurpose, RuntimeManifest, TopologyId, WorkflowProposal,
-    STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID, V2_DOMAIN_SCHEMA_VERSION,
+    paper_session_evidence_needs, AgentContract, Artifact, ArtifactKind, ArtifactLifecycle,
+    ArtifactOrigin, ArtifactProvenance, ArtifactRef, CanaryCampaignStatus,
+    CanarySessionReservation, DomainError, PolicySubject, RunId, RunPurpose, RuntimeManifest,
+    TopologyId, WorkflowProposal, STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID,
+    V2_DOMAIN_SCHEMA_VERSION,
 };
 use akzio_execution::paper::AlpacaPaper;
 use akzio_ingest::AlpacaMarketDataFeed;
@@ -57,33 +58,9 @@ pub enum SchedulerError {
 
 pub type SchedulerResult<T> = std::result::Result<T, SchedulerError>;
 
-const PAPER_ACCOUNT_RESOURCE: &str = "paper.account";
-const PAPER_POSITIONS_RESOURCE: &str = "paper.positions";
-const PAPER_OPEN_ORDERS_RESOURCE: &str = "paper.open_orders";
-const PAPER_QUOTES_RESOURCE: &str = "paper.quotes";
-const PAPER_CLOCK_RESOURCE: &str = "paper.clock";
-
-pub(super) fn paper_snapshot_resources(session_key: &str) -> Vec<String> {
-    let start = NaiveDate::parse_from_str(session_key, "%Y-%m-%d")
-        .ok()
-        .and_then(|date| date.checked_sub_signed(Duration::days(28)))
-        .map(|date| date.format("%Y-%m-%d").to_string())
-        .unwrap_or_else(|| session_key.to_owned());
-    let mut resources = vec![
-        PAPER_ACCOUNT_RESOURCE.to_owned(),
-        PAPER_POSITIONS_RESOURCE.to_owned(),
-        PAPER_OPEN_ORDERS_RESOURCE.to_owned(),
-        format!("paper.fills:{session_key}"),
-        PAPER_QUOTES_RESOURCE.to_owned(),
-        PAPER_CLOCK_RESOURCE.to_owned(),
-    ];
-    resources.extend(
-        Asset::EXECUTABLE
-            .into_iter()
-            .map(|asset| format!("bars:{}:1d:{start}:32", asset.symbol())),
-    );
-    resources
-}
+/// Producer of the scheduler-minted, session-specific snapshot needs. Only
+/// these may be carried in a stored proposal and re-minted per session.
+const PAPER_SNAPSHOT_PRODUCER: &str = "scheduler.paper_snapshot";
 
 /// A broker-authoritative clock returns an open session date; local wall-clock
 /// dates and hand-maintained market calendars never create Paper slots.
@@ -183,6 +160,40 @@ impl StorePaperWorkflowSource {
         self.bootstrap = Some((workflow, topology_id.into()));
         self
     }
+
+    /// A stored proposal that still references another Run's planner-lowered
+    /// `EvidenceNeed` can never be reserved, because reservation rejects
+    /// cross-run RunScoped evidence fail-closed. Such a proposal must be
+    /// skipped during selection; otherwise it stays the newest durable Paper
+    /// proposal and stalls every future session.
+    ///
+    /// Scheduler snapshots are excluded: reservation drops and re-mints those
+    /// for the new session, so carrying them is harmless.
+    pub(crate) fn references_foreign_run_scoped_need(
+        &self,
+        proposal: &WorkflowProposal,
+    ) -> SchedulerResult<bool> {
+        for task in proposal.tasks.values() {
+            for reference in &task.evidence_needs {
+                let artifact = self.store.artifact(&reference.artifact_id)?;
+                if artifact.kind != ArtifactKind::EvidenceNeed
+                    || artifact.lifecycle != ArtifactLifecycle::RunScoped
+                    || artifact.producer == PAPER_SNAPSHOT_PRODUCER
+                {
+                    continue;
+                }
+                if artifact
+                    .origin
+                    .as_ref()
+                    .and_then(|origin| origin.run_id.as_ref())
+                    .is_some()
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
 }
 
 impl PaperWorkflowSource for StorePaperWorkflowSource {
@@ -217,6 +228,9 @@ impl PaperWorkflowSource for StorePaperWorkflowSource {
                 let proposal: WorkflowProposal =
                     serde_json::from_slice(&self.store.read_blob(&artifact.blob)?)?;
                 if proposal.topology_id == preferred_topology {
+                    if self.references_foreign_run_scoped_need(&proposal)? {
+                        continue;
+                    }
                     latest_paper = Some(proposal);
                     break;
                 }

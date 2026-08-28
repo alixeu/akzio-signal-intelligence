@@ -33,51 +33,30 @@ async fn scheduler_owned_paper_run_forwards_no_order_and_schedules_outcome() {
     .unwrap();
     let now = Utc::now();
     let paper_run_id = RunId::new();
-    let need = EvidenceNeed {
-        schema_version: akzio_domain::V2_DOMAIN_SCHEMA_VERSION,
-        source_family: "alpaca".to_owned(),
-        resource: "bars:TQQQ:1d".to_owned(),
-        max_age_secs: 86_400,
-    };
-    let need_artifact = Artifact::new(
-        ArtifactKind::EvidenceNeed,
-        daemon.store().put_json(&need).unwrap(),
-        "scheduler.fixture",
-        ArtifactLifecycle::RunScoped,
-        ArtifactProvenance {
-            source_family: "akzio.scheduler".to_owned(),
-            observed_at: Some(now),
-            retrieved_at: now,
-            source_uri: None,
-            confidence_ppm: 1_000_000,
-            producer_contract_hash: None,
-        },
-        Some(ArtifactOrigin {
-            run_id: Some(paper_run_id.clone()),
-            task_id: None,
-            attempt_id: None,
-            contract_hash: None,
-        }),
-        vec![],
-        now,
-    )
-    .unwrap();
+    let session_key = now.date_naive().to_string();
+    let setup_artifacts = paper_session_evidence_needs(&session_key)
+        .iter()
+        .map(|need| scheduler_snapshot_need(daemon.store(), &paper_run_id, &need.resource, now))
+        .collect::<Vec<_>>();
+    let snapshot_refs = setup_artifacts
+        .iter()
+        .map(|artifact| ArtifactRef {
+            artifact_id: artifact.artifact_id.clone(),
+            kind: ArtifactKind::EvidenceNeed,
+        })
+        .collect::<Vec<_>>();
     let mut proposal = paper_proposal();
     proposal
         .tasks
         .get_mut("synthesizer")
         .unwrap()
-        .evidence_needs = vec![ArtifactRef {
-        artifact_id: need_artifact.artifact_id.clone(),
-        kind: ArtifactKind::EvidenceNeed,
-    }];
-    let session_key = now.date_naive().to_string();
+        .evidence_needs = snapshot_refs;
     let slot = daemon
         .reserve_paper_session_with_inputs_for_run(
             paper_run_id,
             &session_key,
             &proposal,
-            &[need_artifact],
+            &setup_artifacts,
             now,
         )
         .unwrap();
@@ -236,19 +215,10 @@ async fn paper_fixture_snapshots_reach_accepted_commit_reconcile_and_outcome_sch
             as Arc<dyn AsyncEvidenceAdapter>,
     )]));
     let paper_run_id = RunId::new();
-    let setup_artifacts = [
-        scheduler_snapshot_need(daemon.store(), &paper_run_id, PAPER_ACCOUNT_RESOURCE, now),
-        scheduler_snapshot_need(daemon.store(), &paper_run_id, PAPER_POSITIONS_RESOURCE, now),
-        scheduler_snapshot_need(
-            daemon.store(),
-            &paper_run_id,
-            PAPER_OPEN_ORDERS_RESOURCE,
-            now,
-        ),
-        scheduler_snapshot_need(daemon.store(), &paper_run_id, &fills_resource, now),
-        scheduler_snapshot_need(daemon.store(), &paper_run_id, PAPER_QUOTES_RESOURCE, now),
-        scheduler_snapshot_need(daemon.store(), &paper_run_id, PAPER_CLOCK_RESOURCE, now),
-    ];
+    let setup_artifacts = paper_session_evidence_needs(&session_key)
+        .iter()
+        .map(|need| scheduler_snapshot_need(daemon.store(), &paper_run_id, &need.resource, now))
+        .collect::<Vec<_>>();
     let snapshot_refs = setup_artifacts
         .iter()
         .map(|artifact| ArtifactRef {
@@ -367,10 +337,14 @@ async fn paper_fixture_snapshots_reach_accepted_commit_reconcile_and_outcome_sch
             .unwrap(),
     )
     .unwrap();
-    assert!(synthesizer_manifest
-        .selections
-        .iter()
-        .any(|selection| selection.artifact.kind == ArtifactKind::NormalizedEvidence));
+        assert!(synthesizer_manifest
+            .selections
+            .iter()
+            .any(|selection| selection.artifact.kind == ArtifactKind::NormalizedEvidence));
+        assert!(synthesizer_manifest
+            .selections
+            .iter()
+            .any(|selection| selection.artifact.kind == ArtifactKind::Claim));
 
     for _ in 0..5 {
         assert!(daemon.run_one("accepted-paper-gates").await.unwrap());
@@ -442,7 +416,20 @@ async fn paper_fixture_snapshots_reach_accepted_commit_reconcile_and_outcome_sch
         .selections
         .iter()
         .any(|selection| selection.artifact.kind == ArtifactKind::DeliberationNote));
-    assert_eq!(broker.submissions.load(Ordering::SeqCst), 1);
+    // Provenance confidence is Rust-owned: the ContextManifest broker ranks
+    // candidates by it, so a note must not inherit the model's self-reported
+    // deliberation confidence. The self-report stays in the payload.
+    let note = outcome_manifest_payload
+        .selections
+        .iter()
+        .find(|selection| selection.artifact.kind == ArtifactKind::DeliberationNote)
+        .and_then(|selection| daemon.store().artifact(&selection.artifact.artifact_id).ok())
+        .expect("deliberation note is durable");
+    assert_eq!(note.provenance.confidence_ppm, 1_000_000);
+    let note_payload: serde_json::Value =
+        serde_json::from_slice(&daemon.store().read_blob(&note.blob).unwrap()).unwrap();
+    assert_eq!(note_payload["confidence_ppm"], 750_000);
+    assert_eq!(broker.submissions.load(Ordering::SeqCst), 0);
     let schedule = daemon
         .store()
         .latest_artifact_by_kind(ArtifactKind::OutcomeSchedule)
@@ -452,7 +439,7 @@ async fn paper_fixture_snapshots_reach_accepted_commit_reconcile_and_outcome_sch
         serde_json::from_slice(&daemon.store().read_blob(&schedule.blob).unwrap()).unwrap();
     assert!(matches!(
         payload.execution,
-        OutcomeExecutionLineage::ReconciledPaper { .. }
+        OutcomeExecutionLineage::NoOrder { .. }
     ));
     assert!(daemon
         .store()
@@ -507,7 +494,7 @@ async fn paper_fixture_snapshots_reach_accepted_commit_reconcile_and_outcome_sch
         .events_after(&run_id, 0, 256)
         .unwrap()
         .iter()
-        .any(|event| event.event_type == "execution.committed"));
+    .all(|event| event.event_type != "execution.committed"));
     let observer = daemon.observer_snapshot().await.unwrap();
     let observer_outcome = observer.outcome.data.expect("sealed Outcome is observable");
     assert!(observer_outcome

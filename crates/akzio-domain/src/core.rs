@@ -43,6 +43,10 @@ pub enum DomainError {
     InvalidDecisionForecastHorizons,
     #[error("decision forecast probability must be at most one million ppm")]
     InvalidDecisionForecastProbability,
+    #[error("evidence ground scope is invalid")]
+    InvalidEvidenceGroundScope,
+    #[error("decision evidence is insufficient for the submitted forecasts")]
+    InsufficientDecisionEvidence,
     #[error("a document attempt origin requires a task origin")]
     AttemptOriginWithoutTask,
     #[error("raw evidence may only be read through a Rust-controlled tool")]

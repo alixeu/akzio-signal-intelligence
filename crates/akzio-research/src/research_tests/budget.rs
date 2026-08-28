@@ -224,7 +224,10 @@ async fn agent_runtime_records_complete_tool_trace_and_contract_validated_claim(
                     "artifact_id": evidence.artifact_id.0.as_str(),
                     "kind": "normalized_evidence"
                 },
-                "support": "The governed evidence is selected."
+                "support": "The governed evidence is selected.",
+                "role": "descriptive",
+                "assets": [],
+                "domain": null
             }],
             "evidence_gaps": []
         },

@@ -195,7 +195,12 @@ fn append_task_event(
     event_type: LifecycleEventType,
     created_at: DateTime<Utc>,
 ) -> StoreResult<i64> {
-    if event_type != LifecycleEventType::AgentTurnStarted {
+    // Only artifact-less attempt facts may enter through this door; anything
+    // that carries a payload must go through an artifact write.
+    if !matches!(
+        event_type,
+        LifecycleEventType::AgentTurnStarted | LifecycleEventType::SupplementalRoundAbandoned
+    ) {
         return Err(StoreError::InvalidLifecycleEventShape {
             event_type: event_type.as_str().to_owned(),
         });
@@ -234,6 +239,10 @@ fn validate_event_shape(
 
     let valid = match event_type {
         LifecycleEventType::WorkflowCreated => !has_task_id && !has_attempt_id && has_artifact_id,
+        LifecycleEventType::SchedulerSnapshotNeedCreated
+        | LifecycleEventType::SchedulerWorkflowProposalCreated => {
+            !has_task_id && !has_attempt_id && has_artifact_id
+        }
         LifecycleEventType::RunCancelRequested => {
             !has_task_id && !has_attempt_id && !has_artifact_id
         }
@@ -243,6 +252,7 @@ fn validate_event_shape(
         LifecycleEventType::TaskCancelled => has_task_id && (!has_artifact_id || has_attempt_id),
         LifecycleEventType::TaskStarted
         | LifecycleEventType::AgentTurnStarted
+        | LifecycleEventType::SupplementalRoundAbandoned
         | LifecycleEventType::TaskDeferred
         | LifecycleEventType::TaskRecovered
         | LifecycleEventType::TaskRecoveryExhausted

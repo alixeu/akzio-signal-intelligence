@@ -92,3 +92,14 @@ rtk cargo run -p akzio-cli -- store doctor
 ```
 
 Keep generated Store Roots, blobs, sockets, reports, credentials and local config overrides out of Git. Preserve unrelated dirty work; do not reset, clean or checkout the workspace.
+
+## Observatory App refresh and Debug submit
+
+Use `scripts/update_app_and_submit_debug.sh` when the distributable macOS App and one Debug run must be refreshed together. The script:
+
+1. runs `apps/AkzioMac/Scripts/build_app.sh`, so the App bundle receives a freshly built SwiftUI executable and bundled `akzio-core`;
+2. applies the existing ad-hoc self-use signature;
+3. removes repository build intermediates from `target/`, `apps/AkzioMac/.build/` and `apps/AkzioMac/dist/dmg-stage/`, while retaining `apps/AkzioMac/dist/Akzio Observatory.app`;
+4. runs `cargo run -p akzio-cli -- run submit debug` with a temporary `CARGO_TARGET_DIR`, then removes that temporary target on exit.
+
+The final CLI command still requires an already-running loopback daemon and the matching `AKZIO_DAEMON_TOKEN` from the default `config/akzio.toml`. The script does not attach the CLI to the randomly tokenized daemon started inside an already-open Observatory App, and it does not launch or restart the App. Quit and reopen the App after rebuilding if it was already open. Debug remains noncanonical and must not be treated as Paper or learning verification.

@@ -34,7 +34,7 @@ fn contract(store: &V2Store) -> AgentContract {
             schema: store.put_json(&claim_output_schema()).unwrap(),
         },
         TaskBudget {
-            max_input_tokens: 1024,
+            max_input_tokens: 2048,
             max_output_tokens: 128,
             max_wall_time_secs: 30,
             max_tool_calls: 2,

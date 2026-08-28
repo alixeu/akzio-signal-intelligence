@@ -158,6 +158,10 @@ async fn fixture_debug(config: Config) -> Result<()> {
         "{}",
         serde_json::json!({
             "run_id": report.run_id,
+            // `fixture-debug` drives the PaperDryRun fixture path. Report the
+            // Store-owned purpose so this is never read as Debug or as Paper
+            // acceptance evidence.
+            "purpose": report.purpose,
             "status": report.status,
             "fixture": true,
             "evidence": "fixture/offline"

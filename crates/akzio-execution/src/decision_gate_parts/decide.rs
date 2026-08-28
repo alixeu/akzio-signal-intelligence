@@ -22,6 +22,30 @@ impl V2DecisionRuntime {
         let draft: DecisionDraft = serde_json::from_slice(&self.store.read_blob(&proposal.blob)?)?;
         draft.validate()?;
         self.validate_draft_closure(&draft, &selected)?;
+        // Semantic evidence sufficiency is unconditional. A producer contract
+        // that is not installed, or that predates the rule, cannot vouch for
+        // claim semantics, so the gate rejects the proposal rather than
+        // silently skipping the check.
+        let installed = self
+            .store
+            .contract_installation(&proposal_contract)?
+            .ok_or(DecisionGateError::UnsupportedProposalContract)?;
+        if installed.contract.version < 5 {
+            return Err(DecisionGateError::UnsupportedProposalContract);
+        }
+        let claims = draft
+            .claims
+            .iter()
+            .map(|reference| {
+                let artifact = self.load_expected(reference, ArtifactKind::Claim)?;
+                let claim: ResearchClaim =
+                    serde_json::from_slice(&self.store.read_blob(&artifact.blob)?)?;
+                claim.validate()?;
+                Ok(claim)
+            })
+            .collect::<DecisionGateResult<Vec<_>>>()?;
+        validate_decision_evidence_sufficiency(&draft, &claims)
+            .map_err(|_| DecisionGateError::InsufficientClaimEvidence)?;
 
         let policy_influences = draft
             .applied_learning_refs

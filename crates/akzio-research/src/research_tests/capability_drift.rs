@@ -125,7 +125,10 @@ impl AgentModel for ToolThenOutputModel {
                                                 "artifact_id": self.evidence_id.0.as_str(),
                                                 "kind": "normalized_evidence"
                                             },
-                                            "support": "The governed evidence supplied the price used in this claim."
+                                    "support": "The governed evidence supplied the price used in this claim.",
+                                    "role": "descriptive",
+                                    "assets": [],
+                                    "domain": null
                         }],
                         "evidence_gaps": []
                     })))
@@ -206,7 +209,10 @@ impl AgentModel for RepairSubmissionModel {
                                 "artifact_id": self.evidence_id.0.as_str(),
                                 "kind": "normalized_evidence"
                             },
-                            "support": "Governed fixture evidence."
+                                "support": "Governed fixture evidence.",
+                                "role": "descriptive",
+                                "assets": [],
+                                "domain": null
                         }],
                         "evidence_gaps": []
                     })))

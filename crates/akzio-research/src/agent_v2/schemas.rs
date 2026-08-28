@@ -316,9 +316,25 @@ pub(super) fn evidence_ground_schema() -> Value {
         "type": "object",
         "properties": {
             "evidence": artifact_ref_schema(&["normalized_evidence", "semantic_detail"]),
-            "support": { "type": "string", "minLength": 1, "maxLength": 2048 }
+            "support": { "type": "string", "minLength": 1, "maxLength": 2048 },
+            "role": { "type": "string", "enum": ["descriptive", "directional"] },
+            "assets": {
+                "type": "array",
+                "maxItems": 4,
+                "items": { "type": "string", "enum": ["TQQQ", "QQQ", "SOXX", "SOXL"] }
+            },
+            "domain": {
+                "type": ["string", "null"],
+                "enum": [
+                    "price_market_structure",
+                    "macro",
+                    "fundamentals_semiconductor",
+                    "news_event",
+                    null
+                ]
+            }
         },
-        "required": ["evidence", "support"],
+        "required": ["evidence", "support", "role", "assets", "domain"],
         "additionalProperties": false
     })
 }
@@ -328,9 +344,15 @@ pub(super) fn evidence_gap_schema() -> Value {
         "type": "object",
         "properties": {
             "topic": { "type": "string", "minLength": 1, "maxLength": 128 },
-            "rationale": { "type": "string", "minLength": 1, "maxLength": 2048 }
+            "rationale": { "type": "string", "minLength": 1, "maxLength": 2048 },
+            "impact": { "type": "string", "enum": ["warning", "blocks_directional_forecast"] },
+            "supplemental_needs": {
+                "type": "array",
+                "maxItems": 8,
+                "items": research_intent_output_schema()
+            }
         },
-        "required": ["topic", "rationale"],
+        "required": ["topic", "rationale", "impact", "supplemental_needs"],
         "additionalProperties": false
     })
 }
