@@ -36,7 +36,7 @@ private struct HighContrastKey: EnvironmentKey { static let defaultValue = false
 private struct CompactLayoutKey: EnvironmentKey { static let defaultValue = false }
 private struct ColorIndependentStatusKey: EnvironmentKey { static let defaultValue = true }
 private struct GlassIntensityKey: EnvironmentKey { static let defaultValue = GlassIntensity.medium }
-private struct GlassTransparencyKey: EnvironmentKey { static let defaultValue = 0.5 }
+private struct GlassTransparencyKey: EnvironmentKey { static let defaultValue = 0.65 }
 private struct ReduceTransparencyOverrideKey: EnvironmentKey { static let defaultValue = false }
 
 extension EnvironmentValues {
@@ -50,7 +50,7 @@ extension EnvironmentValues {
         set { self[GlassIntensityKey.self] = newValue }
     }
 
-    /// 0.10–0.50 from Settings; higher means more see-through.
+    /// 0.00–1.00 in Settings; higher means more see-through.
     public var glassTransparency: Double {
         get { self[GlassTransparencyKey.self] }
         set { self[GlassTransparencyKey.self] = newValue }
@@ -102,8 +102,8 @@ struct GlassSurfaceModifier: ViewModifier {
             variant = .regular
         }
 
-        let tintOpacity = max(0.50, min(0.90, 1 - transparency))
-        return variant.tint(AkzioColor.deepBackground.opacity(tintOpacity))
+        let tintOpacity = max(0, min(1, 1 - transparency))
+        return variant.tint(AkzioColor.raisedSurface.opacity(tintOpacity))
     }
 
     private var specularOpacity: Double {
@@ -118,7 +118,11 @@ struct GlassSurfaceModifier: ViewModifier {
         let shape = RoundedRectangle(cornerRadius: radius, style: .continuous)
         // Reduce Transparency, High Contrast, or glass-in-glass: fall back to an
         // opaque raised surface. Blur is never a carrier of meaning.
-        let opaque = reduceTransparency || reduceTransparencyOverride || highContrast || insideGlass
+        let opaque = transparency <= 0.001
+            || reduceTransparency
+            || reduceTransparencyOverride
+            || highContrast
+            || insideGlass
         if opaque {
             #if DEBUG
             if insideGlass && !reduceTransparency {
@@ -129,7 +133,13 @@ struct GlassSurfaceModifier: ViewModifier {
             // stronger border under High Contrast so the chrome edge stays legible.
             return AnyView(
                 content
-                    .background(shape.fill(AkzioColor.raisedSurface))
+                .background(
+                    shape.fill(
+                        transparency <= 0.001
+                            ? AkzioColor.elevatedSurface
+                            : AkzioColor.raisedSurface
+                    )
+                )
                     .overlay(
                         shape.strokeBorder(
                             highContrast ? AkzioColor.primaryText.opacity(0.34) : AkzioColor.hairline,
@@ -179,19 +189,60 @@ private struct GlassBackdropModifier: ViewModifier {
     @Environment(\.akzioRendersOffscreen) private var rendersOffscreen
 
     private var surfaceOpacity: Double {
-        max(0.50, min(0.90, 1 - transparency))
+        max(0, min(1, 1 - transparency))
+    }
+
+    private var surfaceTint: Color {
+        transparency <= 0.001 ? AkzioColor.elevatedSurface : tint
     }
 
     func body(content: Content) -> some View {
         let shape = RoundedRectangle(cornerRadius: radius, style: .continuous)
 
         content.background {
-            if reduceTransparency || reduceTransparencyOverride || highContrast || rendersOffscreen || insideGlass {
-                shape.fill(tint)
+            if transparency <= 0.001
+                || reduceTransparency
+                || reduceTransparencyOverride
+                || highContrast
+                || rendersOffscreen
+                || insideGlass
+            {
+                shape.fill(surfaceTint)
             } else {
                 shape
-                    .fill(tint.opacity(surfaceOpacity))
+                    .fill(surfaceTint.opacity(surfaceOpacity))
                     .glassEffect(.regular, in: shape)
+            }
+        }
+    }
+}
+
+/// The window background stays physically transparent so foreground Liquid
+/// Glass can refract the desktop. Unlike a regular glass backdrop, this layer
+/// must not blur the entire window into one large frosted sheet.
+private struct WindowBackdropModifier: ViewModifier {
+    let tint: Color
+
+    @Environment(\.glassTransparency) private var transparency
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.akzioReduceTransparencyOverride) private var reduceTransparencyOverride
+    @Environment(\.akzioHighContrast) private var highContrast
+    @Environment(\.akzioRendersOffscreen) private var rendersOffscreen
+
+    private var surfaceOpacity: Double {
+        max(0, min(1, 1 - transparency))
+    }
+
+    private var surfaceTint: Color {
+        transparency <= 0.001 ? AkzioColor.elevatedSurface : tint
+    }
+
+    func body(content: Content) -> some View {
+        content.background {
+            if reduceTransparency || reduceTransparencyOverride || highContrast || rendersOffscreen {
+                surfaceTint
+            } else {
+                surfaceTint.opacity(surfaceOpacity)
             }
         }
     }
@@ -215,5 +266,9 @@ extension View {
 
     public func akzioGlassBackdrop(_ tint: Color, radius: CGFloat = 0) -> some View {
         modifier(GlassBackdropModifier(tint: tint, radius: radius))
+    }
+
+    public func akzioWindowBackdrop(_ tint: Color) -> some View {
+        modifier(WindowBackdropModifier(tint: tint))
     }
 }

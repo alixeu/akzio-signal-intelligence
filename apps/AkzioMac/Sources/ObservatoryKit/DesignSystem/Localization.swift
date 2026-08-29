@@ -228,7 +228,7 @@ public enum L10n {
         "Locked": "已锁定",
         "Layout": "布局",
         "Scales card padding and table row height.": "调整卡片内边距与表格行高。",
-        "Higher lets more of the page through.": "值越高，底层页面越清晰。",
+        "Higher reveals more of the desktop behind the window.": "值越高，窗口后方的桌面越清晰。",
         "Dark": "深色",
         "Dusk": "暮色",
         "Midnight": "午夜",

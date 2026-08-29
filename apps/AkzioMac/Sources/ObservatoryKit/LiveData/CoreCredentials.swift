@@ -257,6 +257,91 @@ private struct CoreFileConfiguration: Codable {
     let alpacaAPISecret: String
     let fredAPIKey: String?
     let secUserAgent: String?
+
+    enum CodingKeys: String, CodingKey {
+        case llmBaseURL
+        case llmAPIKey
+        case globalModel
+        case globalReasoningEffort
+        case globalResponseLanguage
+        case stageModels
+        case alpacaAPIKey
+        case alpacaAPISecret
+        case fredAPIKey
+        case secUserAgent
+    }
+
+    init(
+        llmBaseURL: String,
+        llmAPIKey: String,
+        globalModel: String,
+        globalReasoningEffort: String,
+        globalResponseLanguage: String,
+        stageModels: [CoreModelStage: CoreStageModelConfiguration],
+        alpacaAPIKey: String,
+        alpacaAPISecret: String,
+        fredAPIKey: String?,
+        secUserAgent: String?
+    ) {
+        self.llmBaseURL = llmBaseURL
+        self.llmAPIKey = llmAPIKey
+        self.globalModel = globalModel
+        self.globalReasoningEffort = globalReasoningEffort
+        self.globalResponseLanguage = globalResponseLanguage
+        self.stageModels = stageModels
+        self.alpacaAPIKey = alpacaAPIKey
+        self.alpacaAPISecret = alpacaAPISecret
+        self.fredAPIKey = fredAPIKey
+        self.secUserAgent = secUserAgent
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        llmBaseURL = try container.decode(String.self, forKey: .llmBaseURL)
+        llmAPIKey = try container.decode(String.self, forKey: .llmAPIKey)
+        globalModel = try container.decode(String.self, forKey: .globalModel)
+        globalReasoningEffort = try container.decode(String.self, forKey: .globalReasoningEffort)
+        globalResponseLanguage = try container.decode(String.self, forKey: .globalResponseLanguage)
+
+        let rawStageModels = try container.decode(
+            [String: CoreStageModelConfiguration].self,
+            forKey: .stageModels
+        )
+        var decodedStageModels: [CoreModelStage: CoreStageModelConfiguration] = [:]
+        for (rawStage, configuration) in rawStageModels {
+            guard let stage = CoreModelStage(rawValue: rawStage) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .stageModels,
+                    in: container,
+                    debugDescription: "Unsupported model route \(rawStage)"
+                )
+            }
+            decodedStageModels[stage] = configuration
+        }
+        stageModels = decodedStageModels
+
+        alpacaAPIKey = try container.decode(String.self, forKey: .alpacaAPIKey)
+        alpacaAPISecret = try container.decode(String.self, forKey: .alpacaAPISecret)
+        fredAPIKey = try container.decodeIfPresent(String.self, forKey: .fredAPIKey)
+        secUserAgent = try container.decodeIfPresent(String.self, forKey: .secUserAgent)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(llmBaseURL, forKey: .llmBaseURL)
+        try container.encode(llmAPIKey, forKey: .llmAPIKey)
+        try container.encode(globalModel, forKey: .globalModel)
+        try container.encode(globalReasoningEffort, forKey: .globalReasoningEffort)
+        try container.encode(globalResponseLanguage, forKey: .globalResponseLanguage)
+        let rawStageModels = Dictionary(uniqueKeysWithValues: stageModels.map {
+            ($0.key.rawValue, $0.value)
+        })
+        try container.encode(rawStageModels, forKey: .stageModels)
+        try container.encode(alpacaAPIKey, forKey: .alpacaAPIKey)
+        try container.encode(alpacaAPISecret, forKey: .alpacaAPISecret)
+        try container.encodeIfPresent(fredAPIKey, forKey: .fredAPIKey)
+        try container.encodeIfPresent(secUserAgent, forKey: .secUserAgent)
+    }
 }
 
 struct CoreCredentialStore {
@@ -356,17 +441,35 @@ struct CoreCredentialStore {
         let data = try runConfigurationCommand(.get)
         let configuration = try JSONDecoder().decode(CoreFileConfiguration.self, from: data)
         var draft = environmentDraft()
-        draft.llmBaseURL = configuration.llmBaseURL
-        draft.llmAPIKey = configuration.llmAPIKey
+        draft.llmBaseURL = resolvedSavedValue(configuration.llmBaseURL, fallback: draft.llmBaseURL)
+        draft.llmAPIKey = resolvedSavedValue(configuration.llmAPIKey, fallback: draft.llmAPIKey)
         draft.globalModel = configuration.globalModel
         draft.globalReasoningEffort = configuration.globalReasoningEffort
         draft.globalResponseLanguage = configuration.globalResponseLanguage
         draft.stageModels.merge(configuration.stageModels) { _, saved in saved }
-        draft.alpacaAPIKey = configuration.alpacaAPIKey
-        draft.alpacaAPISecret = configuration.alpacaAPISecret
-        draft.fredAPIKey = configuration.fredAPIKey ?? ""
+        draft.alpacaAPIKey = resolvedSavedValue(configuration.alpacaAPIKey, fallback: draft.alpacaAPIKey)
+        draft.alpacaAPISecret = resolvedSavedValue(configuration.alpacaAPISecret, fallback: draft.alpacaAPISecret)
+        draft.fredAPIKey = resolvedSavedValue(configuration.fredAPIKey, fallback: draft.fredAPIKey)
         draft.secUserAgent = configuration.secUserAgent ?? ""
         return draft
+    }
+
+    private static func resolvedSavedValue(_ value: String, fallback: String) -> String {
+        guard value.hasPrefix("$") else { return value }
+        let placeholder = String(value.dropFirst())
+        let parts = placeholder.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
+        guard let name = parts.first, !name.isEmpty,
+              let environmentValue = ProcessInfo.processInfo.environment[String(name)]
+        else {
+            return fallback
+        }
+        guard parts.count == 2 else { return environmentValue }
+        return environmentValue + "/" + parts[1]
+    }
+
+    private static func resolvedSavedValue(_ value: String?, fallback: String) -> String {
+        guard let value else { return fallback }
+        return resolvedSavedValue(value, fallback: fallback)
     }
 
     private static func runConfigurationCommand(

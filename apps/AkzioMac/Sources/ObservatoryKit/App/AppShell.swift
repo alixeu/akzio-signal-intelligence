@@ -87,7 +87,7 @@ public struct AppShell: View {
             .frame(width: proxy.size.width, height: proxy.size.height)
         }
         .frame(minWidth: 1280)
-        .akzioGlassBackdrop(AkzioColor.background(for: store.settings.theme))
+        .akzioWindowBackdrop(AkzioColor.surface(for: store.settings.theme))
         .animation(store.motionPolicy.resolve(Motion.themeCrossfade), value: store.settings.theme)
         .environment(\.sharedNamespace, shared)
         .environment(\.appLanguage, store.settings.language)

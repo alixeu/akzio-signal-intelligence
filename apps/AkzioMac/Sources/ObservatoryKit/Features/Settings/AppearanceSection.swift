@@ -57,9 +57,9 @@ struct AppearanceSection: View {
                 )
                 SettingsSlider(
                     "Transparency",
-                    detail: "Higher lets more of the page through.",
+                    detail: "Higher reveals more of the desktop behind the window.",
                     value: $settings.glassTransparency,
-                    range: 0.10...0.50
+                    range: 0.00...1.00
                 )
             }
         }

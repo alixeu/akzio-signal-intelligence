@@ -99,7 +99,7 @@ public struct SettingsPresentation: Sendable, Hashable {
         theme: Theme = .dark,
         density: Density = .comfortable,
         glassIntensity: GlassIntensity = .medium,
-        glassTransparency: Double = 0.5,
+        glassTransparency: Double = 0.65,
         globalMotionEnabled: Bool = true,
         motionIntensity: Double = 1.0,
         particleDensity: Double = 1.0,

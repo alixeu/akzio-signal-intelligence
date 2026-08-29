@@ -93,13 +93,15 @@ rtk cargo run -p akzio-cli -- store doctor
 
 Keep generated Store Roots, blobs, sockets, reports, credentials and local config overrides out of Git. Preserve unrelated dirty work; do not reset, clean or checkout the workspace.
 
-## Observatory App refresh and Debug submit
+## Observatory App build and package
 
-Use `scripts/update_app_and_submit_debug.sh` when the distributable macOS App and one Debug run must be refreshed together. The script:
+Use `scripts/update_app_and_submit_debug.sh` when the distributable macOS App must be rebuilt and packaged. The script:
 
 1. runs `apps/AkzioMac/Scripts/build_app.sh`, so the App bundle receives a freshly built SwiftUI executable and bundled `akzio-core`;
 2. applies the existing ad-hoc self-use signature;
 3. removes repository build intermediates from `target/`, `apps/AkzioMac/.build/` and `apps/AkzioMac/dist/dmg-stage/`, while retaining `apps/AkzioMac/dist/Akzio Observatory.app`;
-4. runs `cargo run -p akzio-cli -- run submit debug` with a temporary `CARGO_TARGET_DIR`, then removes that temporary target on exit.
+4. prints the final packaged App path.
 
-The final CLI command still requires an already-running loopback daemon and the matching `AKZIO_DAEMON_TOKEN` from the default `config/akzio.toml`. The script does not attach the CLI to the randomly tokenized daemon started inside an already-open Observatory App, and it does not launch or restart the App. Quit and reopen the App after rebuilding if it was already open. Debug remains noncanonical and must not be treated as Paper or learning verification.
+This script is packaging-only: it does not launch or restart the App, start a daemon, submit a run, or perform runtime verification. Quit and reopen the App after rebuilding if it was already open. Debug remains noncanonical and must not be treated as Paper or learning verification.
+
+The packaged App itself must contain `Contents/MacOS/akzio-core`. On App startup, `RustCoreSupervisor` launches that bundled core with `daemon serve`; the core owns the Paper scheduler/cron loop. The App must resolve its persistent configuration from `~/.akzio/config.toml` and force the core Store root to `~/.akzio/store` through `AKZIO_STORE_ROOT`. A scheduler message such as `Paper scheduler waiting: broker market is closed` means the scheduler is running and waiting for the next eligible Paper session; it is distinct from `Rust core unavailable`.

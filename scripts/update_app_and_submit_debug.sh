@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 
-# Rebuild the distributable Observatory app, remove repository build products,
-# then submit one Debug run using an isolated temporary Cargo target.
+# Rebuild the distributable Observatory app and remove repository build products.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -9,17 +8,6 @@ APP_ROOT="$ROOT/apps/AkzioMac"
 BUILD_SCRIPT="$APP_ROOT/Scripts/build_app.sh"
 SIGN_SCRIPT="$APP_ROOT/Scripts/sign_app.sh"
 APP_BUNDLE="$APP_ROOT/dist/Akzio Observatory.app"
-RUN_TARGET="$(mktemp -d "${TMPDIR:-/tmp}/akzio-cli-submit-target.XXXXXX")"
-
-cleanup() {
-  local exit_status=$?
-  trap - EXIT
-  if [[ -d "$RUN_TARGET" ]]; then
-    rm -rf -- "$RUN_TARGET"
-  fi
-  exit "$exit_status"
-}
-trap cleanup EXIT
 
 echo "==> rebuilding Observatory app"
 "$BUILD_SCRIPT"
@@ -48,7 +36,4 @@ do
   fi
 done
 
-echo "==> submitting Debug run"
-# cargo run compiles the CLI itself. Keep that unavoidable compilation in a
-# temporary target so the repository remains clean after this command exits.
-CARGO_TARGET_DIR="$RUN_TARGET" cargo run -p akzio-cli -- run submit debug
+echo "packaged: $APP_BUNDLE"

@@ -3,7 +3,9 @@ import SwiftUI
 
 public enum WindowChromeLayout {
     public static func buttonOriginY(containerHeight: CGFloat, buttonHeight: CGFloat) -> CGFloat {
-        max(0, containerHeight - AkzioLayout.statusBarHeight / 2 - buttonHeight / 2 - 3)
+ // AppKit's title-bar coordinates grow upward; this centers the native
+ // traffic lights in the same 44pt row as the AKZIO wordmark.
+ max(0, containerHeight - AkzioLayout.statusBarHeight / 2 - buttonHeight / 2)
     }
 }
 
