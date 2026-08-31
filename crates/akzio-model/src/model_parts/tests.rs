@@ -639,3 +639,22 @@ fn response_usage_preserves_missing_reasoning_and_missing_usage() {
     let missing = openai_response_from_raw(json!({"output_text": "ok"}), json!({})).unwrap();
     assert_eq!(missing.usage, ModelUsage::default());
 }
+
+#[test]
+fn fixture_materialization_reads_metadata_first_context_ledger() {
+    let evidence_id = "fixture-metadata-evidence".to_owned();
+    let input = json!({
+        "context": [{
+            "type": "context_metadata_ledger",
+            "documents": [{
+                "document_id": evidence_id,
+                "kind": "normalized_evidence"
+            }]
+        }]
+    })
+    .to_string();
+    assert_eq!(
+        fixture_context_artifact_id(&input, "normalized_evidence"),
+        Some(evidence_id)
+    );
+}
