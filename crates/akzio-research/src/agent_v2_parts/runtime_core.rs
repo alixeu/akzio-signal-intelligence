@@ -2,11 +2,44 @@ impl AgentRuntime {
     pub fn new(store: V2Store, catalogue: ContractCatalogue, grant_ttl: Duration) -> Self {
         Self {
             context: ContextBroker::new(store.clone()),
+            store_executor: StoreExecutor::new(store.clone()),
             store,
             catalogue,
             grant_ttl,
             reasoning_events: None,
+            #[cfg(test)]
+            failpoint: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_failpoint(mut self, point: AgentFailpoint) -> Self {
+        self.failpoint = Some(Arc::new(AgentFailpointState {
+            point,
+            fired: std::sync::atomic::AtomicBool::new(false),
+        }));
+        self
+    }
+
+    #[cfg(test)]
+    fn hit_failpoint(&self, point: AgentFailpoint) -> ResearchResult<()> {
+        let Some(failpoint) = &self.failpoint else {
+            return Ok(());
+        };
+        if failpoint.point == point
+            && failpoint
+                .fired
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_ok()
+        {
+            return Err(ResearchError::InjectedFailpoint(format!("{point:?}")));
+        }
+        Ok(())
     }
 
     pub fn with_reasoning_events(
@@ -14,6 +47,11 @@ impl AgentRuntime {
         reasoning_events: broadcast::Sender<AgentReasoningEvent>,
     ) -> Self {
         self.reasoning_events = Some(reasoning_events);
+        self
+    }
+
+    pub fn with_store_executor(mut self, store_executor: StoreExecutor) -> Self {
+        self.store_executor = store_executor;
         self
     }
 
@@ -31,22 +69,47 @@ impl AgentRuntime {
         Ok(&self.contract(hash)?.contract.context)
     }
 
-
-    fn validate_authority_permit(&self, permit: &TaskWritePermit) -> ResearchResult<()> {
-        Ok(self.store.validate_task_permit(permit)?)
+    async fn read_authority_document(
+        &self,
+        contract: &AgentContract,
+        document: &akzio_domain::BlobRef,
+    ) -> ResearchResult<Vec<u8>> {
+        let context = self.context.clone();
+        let contract = contract.clone();
+        let document = document.clone();
+        Ok(self
+            .store_executor
+            .execute(move |_| context.read_authority_document(&contract, &document))
+            .await??)
     }
 
-    fn load_parent_succeeded_attempt(
+
+    async fn validate_authority_permit(&self, permit: &TaskWritePermit) -> ResearchResult<()> {
+        let permit = permit.clone();
+        Ok(self
+            .store_executor
+            .execute(move |store| store.validate_task_permit(&permit))
+            .await??)
+    }
+
+    async fn load_parent_succeeded_attempt(
         &self,
         run_id: &RunId,
         parent_task_id: &TaskId,
     ) -> ResearchResult<akzio_store::v2::SucceededAttemptProof> {
+        let run_id = run_id.clone();
+        let parent_task_id = parent_task_id.clone();
         Ok(self
-            .store
-            .current_succeeded_attempt(run_id, parent_task_id)?)
+            .store_executor
+            .execute(move |store| store.current_succeeded_attempt(&run_id, &parent_task_id))
+            .await??)
     }
 
-    fn run_purpose_for(&self, run_id: &RunId) -> ResearchResult<RunPurpose> {
-        Ok(self.store.run_purpose(run_id)?)
+    async fn run_purpose_for(&self, run_id: &RunId) -> ResearchResult<RunPurpose> {
+        let run_id = run_id.clone();
+        Ok(self
+            .store_executor
+            .execute(move |store| store.run_purpose(&run_id))
+            .await??)
     }
 }

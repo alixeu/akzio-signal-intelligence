@@ -5,6 +5,28 @@ use akzio_domain::{
 use chrono::{Duration, TimeZone};
 
 #[test]
+fn policy_exposure_only_reports_true_active_allocation() {
+    for state in [
+        CandidatePolicyState::Candidate,
+        CandidatePolicyState::Canary10,
+        CandidatePolicyState::Canary25,
+        CandidatePolicyState::Canary50,
+    ] {
+        assert_eq!(policy_exposure_ppm(PolicyState::Contract(state)), None);
+        assert_eq!(policy_exposure_ppm(PolicyState::Topology(state)), None);
+    }
+
+    assert_eq!(
+        policy_exposure_ppm(PolicyState::Contract(CandidatePolicyState::Active)),
+        Some(1_000_000)
+    );
+    assert_eq!(
+        policy_exposure_ppm(PolicyState::Topology(CandidatePolicyState::Active)),
+        Some(1_000_000)
+    );
+}
+
+#[test]
 fn managed_realized_pnl_uses_opening_average_cost() {
     let positions = serde_json::json!([
         {"symbol":"QQQ","qty":"2","avg_entry_price":"100"}

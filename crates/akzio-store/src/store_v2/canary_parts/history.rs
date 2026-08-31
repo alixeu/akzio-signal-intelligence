@@ -75,6 +75,9 @@ impl V2Store {
                 campaign_id: campaign_id.clone(),
                 level,
                 session_key,
+                cohort_id: None,
+                market_day: None,
+                regime: None,
                 parent_run_id: akzio_domain::RunId(parent_run_id),
                 contract_shadow_run_id: akzio_domain::RunId(contract_shadow_run_id),
                 topology_shadow_run_id: akzio_domain::RunId(topology_shadow_run_id),
@@ -83,13 +86,12 @@ impl V2Store {
                 reserved_at: parse_time(&reserved_at)?,
             };
             reservation.validate()?;
-            let head = read_campaign(connection, &campaign_id)?.ok_or_else(|| {
+            read_campaign(connection, &campaign_id)?.ok_or_else(|| {
                 StoreError::Integrity(format!(
                     "canary session references missing campaign {campaign_id}"
                 ))
             })?;
-            if head.status != level
-                || run_purpose_from_connection(connection, &reservation.parent_run_id)?
+            if run_purpose_from_connection(connection, &reservation.parent_run_id)?
                     != RunPurpose::Paper
                 || run_purpose_from_connection(connection, &reservation.contract_shadow_run_id)?
                     != RunPurpose::Shadow
@@ -100,6 +102,103 @@ impl V2Store {
             {
                 return Err(StoreError::Integrity(
                     "canary session lineage is invalid".to_owned(),
+                ));
+            }
+        }
+
+        let cohort_sessions = connection
+            .prepare(
+                "SELECT reservation_json FROM rebuild_canary_cohort_sessions ORDER BY cohort_id, session_key",
+            )?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for reservation_json in cohort_sessions {
+            let reservation: CanarySessionReservation = serde_json::from_str(&reservation_json)?;
+            reservation.validate()?;
+            let campaign = read_campaign(connection, &reservation.campaign_id)?.ok_or_else(|| {
+                StoreError::Integrity("canary cohort session campaign is missing".to_owned())
+            })?;
+            validate_session_cohort(&campaign, &reservation)?;
+            if run_purpose_from_connection(connection, &reservation.parent_run_id)?
+                != RunPurpose::Paper
+                || run_purpose_from_connection(connection, &reservation.contract_shadow_run_id)?
+                    != RunPurpose::Shadow
+                || run_purpose_from_connection(connection, &reservation.topology_shadow_run_id)?
+                    != RunPurpose::Shadow
+                || run_purpose_from_connection(connection, &reservation.bundle_shadow_run_id)?
+                    != RunPurpose::Shadow
+            {
+                return Err(StoreError::Integrity(
+                    "canary cohort session lineage is invalid".to_owned(),
+                ));
+            }
+        }
+
+        let observations = connection
+            .prepare(
+                "SELECT campaign_id, stage_json, observation_json FROM rebuild_canary_observations ORDER BY observation_id",
+            )?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (campaign_id, stage_json, observation_json) in observations {
+            let campaign_id = ContentHash::new(campaign_id)?;
+            let stage: CanaryCampaignStatus = serde_json::from_str(&stage_json)?;
+            let observation: CanaryPairedObservation = serde_json::from_str(&observation_json)?;
+            observation.validate()?;
+            let campaign = read_campaign(connection, &campaign_id)?.ok_or_else(|| {
+                StoreError::Integrity("canary observation campaign is missing".to_owned())
+            })?;
+            let cohort = campaign.spec.cohort(stage).ok_or_else(|| {
+                StoreError::Integrity("canary observation cohort is missing".to_owned())
+            })?;
+            if observation.cohort_id != cohort.cohort_id
+                || read_cohort_session_by_key(
+                    connection,
+                    &cohort.cohort_id,
+                    &observation.session_key,
+                )?
+                .is_none()
+            {
+                return Err(StoreError::Integrity(
+                    "canary observation lineage is invalid".to_owned(),
+                ));
+            }
+        }
+
+        let evaluations = connection
+            .prepare(
+                "SELECT campaign_id, stage_json, evaluation_json FROM rebuild_canary_evaluations ORDER BY evaluation_id",
+            )?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (campaign_id, stage_json, evaluation_json) in evaluations {
+            let campaign_id = ContentHash::new(campaign_id)?;
+            let stage: CanaryCampaignStatus = serde_json::from_str(&stage_json)?;
+            let evaluation: CanaryCohortEvaluation = serde_json::from_str(&evaluation_json)?;
+            evaluation.validate()?;
+            let campaign = read_campaign(connection, &campaign_id)?.ok_or_else(|| {
+                StoreError::Integrity("canary evaluation campaign is missing".to_owned())
+            })?;
+            let cohort = campaign.spec.cohort(stage).ok_or_else(|| {
+                StoreError::Integrity("canary evaluation cohort is missing".to_owned())
+            })?;
+            if evaluation.cohort_id != cohort.cohort_id
+                || evaluation.promotion_policy_hash != cohort.promotion_policy_hash
+            {
+                return Err(StoreError::Integrity(
+                    "canary evaluation lineage is invalid".to_owned(),
                 ));
             }
         }

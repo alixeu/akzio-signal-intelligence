@@ -8,13 +8,14 @@ pub mod v2 {
     pub use crate::store_v2::{
         AlertSeverity, BackupManifest, CanaryCampaignHead, ClaimedAttempt, DaemonLease,
         ExecutionCommit, ExecutionCommitResult, LessonUsage, LessonWriteResult,
-        PolicyEvaluationCommit, PolicyEvaluationResult, PolicyHead, PolicyShadowPairSnapshot,
-        PolicyTransitionRecord, RetryTaskResult, RunExportArtifact, RunExportManifest,
-        SessionReservation, SessionSlot, SessionSlotReservation, ShadowPairCompletion,
-        ShadowPairWriteResult, StorageInventory, StoreAlert, StoreError, StoreMetrics,
-        StoreResult as Result, StoredActiveAttempt, StoredCanarySession, StoredContract,
-        StoredEvent, StoredLesson, StoredRun, StoredShadowPair, StoredTask, StoredTaskSnapshot,
-        SucceededAttemptProof, TrajectoryEntry, TrajectoryModelMetadata, TrajectoryToolLifecycle,
-        V2Store, WorkflowCommit, WorkflowPatchCommit, WorkflowRevision, WorkflowSnapshot,
+        MaintenanceLeaseDeferral, PolicyEvaluationCommit, PolicyEvaluationResult, PolicyHead,
+        PolicyShadowPairSnapshot, PolicyTransitionRecord, ReleaseEvidenceExpectations,
+        RetryTaskResult, RunExportArtifact, RunExportManifest, SessionReservation, SessionSlot,
+        SessionSlotReservation, ShadowPairCompletion, ShadowPairWriteResult, StorageInventory,
+        StoreAlert, StoreError, StoreMetrics, StoreResult as Result, StoredActiveAttempt,
+        StoredCanarySession, StoredContract, StoredEvent, StoredLesson, StoredRun,
+        StoredShadowPair, StoredTask, StoredTaskSnapshot, SucceededAttemptProof, TrajectoryEntry,
+        TrajectoryModelMetadata, TrajectoryToolLifecycle, V2Store, WorkflowCommit,
+        WorkflowPatchCommit, WorkflowRevision, WorkflowSnapshot,
     };
 }

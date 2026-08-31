@@ -88,6 +88,7 @@ async fn serve(config: &Config, config_path: &Path) -> Result<()> {
         let source = daemon.paper_workflow_source();
         source
             .proposal("preflight")
+            .await
             .map_err(|error| anyhow::anyhow!(error.to_string()))
             .context("load Paper workflow proposal")?;
         let clock = clock

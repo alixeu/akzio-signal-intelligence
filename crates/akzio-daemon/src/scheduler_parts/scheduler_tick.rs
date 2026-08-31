@@ -1,3 +1,5 @@
+use super::*;
+
 impl PaperScheduler {
     pub async fn tick<C, P>(
         &self,
@@ -13,14 +15,23 @@ impl PaperScheduler {
             eprintln!("Paper scheduler waiting: broker market is closed");
             return Ok(None);
         };
-    if let Some(slot) = self.store.session_slot(&session_key)? {
-        self.acquire_or_renew(now)?;
-        return Ok(Some(SessionSlotReservation {
-            slot,
-            newly_reserved: false,
+        let stored_session_key = session_key.clone();
+        if let Some(slot) = self
+            .store_executor
+            .execute(move |store| store.session_slot(&stored_session_key))
+            .await??
+        {
+            self.acquire_or_renew_async(now).await?;
+            return Ok(Some(SessionSlotReservation {
+                slot,
+                newly_reserved: false,
             }));
         }
-        if let Some(campaign) = self.store.active_canary_campaign()? {
+        if let Some(campaign) = self
+            .store_executor
+            .execute(|store| store.active_canary_campaign())
+            .await??
+        {
             if campaign.status == CanaryCampaignStatus::Staged {
                 return Ok(None);
             }
@@ -28,12 +39,22 @@ impl PaperScheduler {
                 return self.tick_canary(&campaign, &session_key, clock, now).await;
             }
         }
-        let Some((runtime_manifest, approval)) = self.current_approval_binding()? else {
+        let scheduler = self.clone();
+        let Some((runtime_manifest, approval)) = self
+            .store_executor
+            .execute(move |_| scheduler.current_approval_binding())
+            .await??
+        else {
             eprintln!("Paper scheduler waiting: no current Paper approval binding");
             return Ok(None);
         };
-        let manifest_payload: RuntimeManifest =
-            serde_json::from_slice(&self.store.read_blob(&runtime_manifest.blob)?)?;
+        let manifest_blob = runtime_manifest.blob.clone();
+        let manifest_payload: RuntimeManifest = serde_json::from_slice(
+            &self
+                .store_executor
+                .execute(move |store| store.read_blob(&manifest_blob))
+                .await??,
+        )?;
         if let Some(expected) = &self.runtime_identity_hash {
             if manifest_payload.runtime_identity_hash()? != *expected {
                 eprintln!("Paper scheduler waiting: runtime identity does not match approval");
@@ -49,7 +70,7 @@ impl PaperScheduler {
             eprintln!("Paper scheduler waiting: broker account or market-data feed mismatch");
             return Ok(None);
         }
-        let proposal = match source.proposal(&session_key) {
+        let proposal = match source.proposal(&session_key).await {
             Ok(proposal) => proposal,
             Err(SchedulerError::WorkflowUnavailable) => {
                 eprintln!("Paper scheduler waiting: workflow proposal unavailable");
@@ -57,7 +78,7 @@ impl PaperScheduler {
             }
             Err(error) => return Err(error),
         };
-        let lease = self.acquire_or_renew(now)?;
+        let lease = self.acquire_or_renew_async(now).await?;
         let run_id = RunId::new();
         let mut setup_artifacts = Vec::new();
         let mut proposal = proposal;
@@ -65,7 +86,11 @@ impl PaperScheduler {
         for task in proposal.tasks.values_mut() {
             let mut retained = Vec::with_capacity(task.evidence_needs.len());
             for reference in task.evidence_needs.drain(..) {
-                let artifact = self.store.artifact(&reference.artifact_id)?;
+                let artifact_id = reference.artifact_id.clone();
+                let artifact = self
+                    .store_executor
+                    .execute(move |store| store.artifact(&artifact_id))
+                    .await??;
                 if artifact.kind == ArtifactKind::EvidenceNeed
                     && artifact.lifecycle == ArtifactLifecycle::RunScoped
                 {
@@ -95,8 +120,8 @@ impl PaperScheduler {
             .tasks
             .iter()
             .find_map(|(alias, task)| {
-            self.workflow
-                .recipe(&task.recipe_id)
+                self.workflow
+                    .recipe(&task.recipe_id)
                     .ok()
                     .filter(|recipe| recipe.allowed_evidence_sources.contains("alpaca"))
                     .map(|_| alias.clone())
@@ -105,12 +130,17 @@ impl PaperScheduler {
         let first_task = proposal
             .tasks
             .get_mut(&snapshot_alias)
-    .ok_or(SchedulerError::WorkflowUnavailable)?;
-    for need in paper_session_evidence_needs(&session_key) {
+            .ok_or(SchedulerError::WorkflowUnavailable)?;
+        for need in paper_session_evidence_needs(&session_key) {
             need.validate()?;
             let artifact = Artifact::new(
                 ArtifactKind::EvidenceNeed,
-                self.store.put_json(&need)?,
+                self.store_executor
+                    .execute({
+                        let need = need.clone();
+                        move |store| store.put_json(&need)
+                    })
+                    .await??,
                 PAPER_SNAPSHOT_PRODUCER,
                 ArtifactLifecycle::RunScoped,
                 ArtifactProvenance {
@@ -137,18 +167,22 @@ impl PaperScheduler {
             setup_artifacts.push(artifact);
         }
 
+        let workflow = self.workflow.clone();
         Ok(Some(
-            self.workflow
-                .reserve_paper_session_with_inputs_for_run_approved(
-                    &lease,
-                    run_id,
-                    &session_key,
-                    &proposal,
-                    &setup_artifacts,
-                    &runtime_manifest,
-                    &approval,
-                    now,
-                )?,
+            self.store_executor
+                .execute(move |_| {
+                    workflow.reserve_paper_session_with_inputs_for_run_approved(
+                        &lease,
+                        run_id,
+                        &session_key,
+                        &proposal,
+                        &setup_artifacts,
+                        &runtime_manifest,
+                        &approval,
+                        now,
+                    )
+                })
+                .await??,
         ))
     }
 }

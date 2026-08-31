@@ -135,7 +135,7 @@ impl V2Store {
     }
 }
 
-fn stored_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredEvent> {
+pub(super) fn stored_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredEvent> {
     Ok(StoredEvent {
         cursor: row.get(0)?,
         run_id: RunId(row.get(1)?),

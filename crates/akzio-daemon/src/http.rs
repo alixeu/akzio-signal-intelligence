@@ -150,10 +150,15 @@ impl Daemon {
             .route("/control/store/doctor", get(http_store_doctor))
             .route("/control/store/inventory", get(http_store_inventory))
             .route("/control/store/metrics", get(http_store_metrics))
+            .route("/control/store/executor", get(http_store_executor))
             .route("/control/store/alerts", get(http_store_alerts))
             .route(
                 "/control/store/session/{session_key}",
                 get(http_store_session),
+            )
+            .route(
+                "/control/store/release-evidence/{run_id}",
+                get(http_store_release_evidence),
             )
             .route("/control/store/backup", post(http_store_backup))
             .route("/control/store/restore", post(http_store_restore))
@@ -252,8 +257,9 @@ async fn http_health(
     headers: HeaderMap,
 ) -> std::result::Result<Json<DaemonHealth>, StatusCode> {
     authorize(&daemon, &headers)?;
-    daemon
-        .health()
+    let operation = daemon.clone();
+    run_daemon_store_operation(daemon.store_executor.clone(), move || operation.health())
+        .await
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
@@ -263,10 +269,14 @@ async fn http_ready(
     headers: HeaderMap,
 ) -> std::result::Result<Json<DaemonHealth>, StatusCode> {
     authorize(&daemon, &headers)?;
-    daemon.ready().map(Json).map_err(|error| match error {
-        DaemonError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
-    })
+    let operation = daemon.clone();
+    run_daemon_store_operation(daemon.store_executor.clone(), move || operation.ready())
+        .await
+        .map(Json)
+        .map_err(|error| match error {
+            DaemonError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        })
 }
 
 async fn http_observer_snapshot(
@@ -287,16 +297,20 @@ async fn http_observer_run(
 ) -> std::result::Result<Json<ObserverRunDetail>, StatusCode> {
     authorize_observer(&daemon, &headers)?;
     let run_id = RunId(run_id);
-    daemon
-        .observer_run_detail(&run_id)
-        .map(Json)
-        .map_err(|error| {
-            eprintln!("observer run detail failed for {run_id}: {error}");
-            match error {
-                DaemonError::Store(StoreError::MissingRun(_)) => StatusCode::NOT_FOUND,
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
-            }
-        })
+    let operation = daemon.clone();
+    let operation_run_id = run_id.clone();
+    run_daemon_store_operation(daemon.store_executor.clone(), move || {
+        operation.observer_run_detail(&operation_run_id)
+    })
+    .await
+    .map(Json)
+    .map_err(|error| {
+        eprintln!("observer run detail failed for {run_id}: {error}");
+        match error {
+            DaemonError::Store(StoreError::MissingRun(_)) => StatusCode::NOT_FOUND,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    })
 }
 
 async fn http_observer_portfolio_history(
@@ -338,8 +352,12 @@ async fn http_observer_events(
                         .data(format!("reasoning stream lagged by {skipped} events"))),
                     Err(broadcast::error::RecvError::Closed) => {}
                 },
-                _ = poll.tick() => match daemon.store.event_cursor() {
-                    Ok(next) if next > cursor => {
+                _ = poll.tick() => match daemon
+                    .store_executor
+                    .execute(|store| store.event_cursor())
+                    .await
+                {
+                    Ok(Ok(next)) if next > cursor => {
                         cursor = next;
                         match serde_json::to_string(&ObserverInvalidation { cursor }) {
                             Ok(data) => yield Ok(Event::default()
@@ -351,7 +369,10 @@ async fn http_observer_events(
                                 .data(error.to_string())),
                         }
                     }
-                    Ok(_) => yield Ok(Event::default().comment("keepalive")),
+                    Ok(Ok(_)) => yield Ok(Event::default().comment("keepalive")),
+                    Ok(Err(error)) => yield Ok(Event::default()
+                        .event("error")
+                        .data(error.to_string())),
                     Err(error) => yield Ok(Event::default()
                         .event("error")
                         .data(error.to_string())),
@@ -397,11 +418,15 @@ async fn http_events(
                         .data(format!("reasoning stream lagged by {skipped} events"))),
                     Err(broadcast::error::RecvError::Closed) => {}
                 },
-                _ = poll.tick() => match daemon.store.events_after(&run_id, cursor, EVENT_PAGE_SIZE) {
-                    Ok(events) if events.is_empty() => {
+                _ = poll.tick() => {
+                    let event_run_id = run_id.clone();
+                    match daemon.store_executor.execute(move |store| {
+                        store.events_after(&event_run_id, cursor, EVENT_PAGE_SIZE)
+                    }).await {
+                    Ok(Ok(events)) if events.is_empty() => {
                         yield Ok(Event::default().comment("keepalive"));
                     }
-                    Ok(events) => {
+                    Ok(Ok(events)) => {
                         for event in events {
                             cursor = event.cursor;
                             match serde_json::to_string(&EventView::from(event)) {
@@ -414,8 +439,12 @@ async fn http_events(
                             }
                         }
                     }
+                    Ok(Err(error)) => {
+                        yield Ok(Event::default().event("error").data(error.to_string()));
+                    }
                     Err(error) => {
                         yield Ok(Event::default().event("error").data(error.to_string()));
+                    }
                     }
                 }
             }
@@ -430,10 +459,13 @@ async fn http_replay(
     headers: HeaderMap,
 ) -> std::result::Result<Json<ReplayReport>, StatusCode> {
     authorize(&daemon, &headers)?;
-    daemon
-        .replay_report(&RunId(run_id))
-        .map(Json)
-        .map_err(invalid_input_or_conflict)
+    let operation = daemon.clone();
+    run_daemon_store_operation(daemon.store_executor.clone(), move || {
+        operation.replay_report(&RunId(run_id))
+    })
+    .await
+    .map(Json)
+    .map_err(invalid_input_or_conflict)
 }
 
 async fn http_trajectory(
@@ -442,10 +474,13 @@ async fn http_trajectory(
     headers: HeaderMap,
 ) -> std::result::Result<Json<Vec<TrajectoryEntry>>, StatusCode> {
     authorize(&daemon, &headers)?;
-    daemon
-        .trajectory(&RunId(run_id))
-        .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    let operation = daemon.clone();
+    run_daemon_store_operation(daemon.store_executor.clone(), move || {
+        operation.trajectory(&RunId(run_id))
+    })
+    .await
+    .map(Json)
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 async fn http_retrospectives(
@@ -454,10 +489,13 @@ async fn http_retrospectives(
     headers: HeaderMap,
 ) -> std::result::Result<Json<Vec<RetrospectiveView>>, StatusCode> {
     authorize(&daemon, &headers)?;
-    daemon
-        .retrospectives(&RunId(run_id))
-        .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    let operation = daemon.clone();
+    run_daemon_store_operation(daemon.store_executor.clone(), move || {
+        operation.retrospectives(&RunId(run_id))
+    })
+    .await
+    .map(Json)
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 async fn http_submit(
@@ -466,10 +504,13 @@ async fn http_submit(
     Json(request): Json<SubmitRequest>,
 ) -> std::result::Result<Json<RunSubmissionResponse>, StatusCode> {
     authorize(&daemon, &headers)?;
-    daemon
-        .submit_default(request.purpose)
-        .map(|run_id| Json(RunSubmissionResponse { run_id }))
-        .map_err(invalid_input_or_internal)
+    let operation = daemon.clone();
+    run_daemon_store_operation(daemon.store_executor.clone(), move || {
+        operation.submit_default(request.purpose)
+    })
+    .await
+    .map(|run_id| Json(RunSubmissionResponse { run_id }))
+    .map_err(invalid_input_or_internal)
 }
 
 async fn http_cancel(
@@ -481,6 +522,7 @@ async fn http_cancel(
     let run_id = RunId(run_id);
     daemon
         .request_cancel(&run_id, "operator cancellation request")
+        .await
         .map(|cancelled_tasks| {
             Json(RunCancellationResponse {
                 run_id,
@@ -497,15 +539,19 @@ async fn http_retry(
 ) -> std::result::Result<Json<RunRetryResponse>, StatusCode> {
     authorize(&daemon, &headers)?;
     let source_run_id = RunId(run_id);
-    daemon
-        .retry_run(&source_run_id)
-        .map(|run_id| {
-            Json(RunRetryResponse {
-                source_run_id,
-                run_id,
-            })
+    let operation = daemon.clone();
+    let operation_run_id = source_run_id.clone();
+    run_daemon_store_operation(daemon.store_executor.clone(), move || {
+        operation.retry_run(&operation_run_id)
+    })
+    .await
+    .map(|run_id| {
+        Json(RunRetryResponse {
+            source_run_id,
+            run_id,
         })
-        .map_err(invalid_input_or_conflict)
+    })
+    .map_err(invalid_input_or_conflict)
 }
 
 fn invalid_input_or_internal(error: DaemonError) -> StatusCode {
@@ -530,10 +576,13 @@ async fn http_freeze(
     Json(request): Json<FreezeRequest>,
 ) -> std::result::Result<Json<DaemonHealth>, StatusCode> {
     authorize(&daemon, &headers)?;
-    daemon
-        .set_freeze(true, request.reason)
-        .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    let operation = daemon.clone();
+    run_daemon_store_operation(daemon.store_executor.clone(), move || {
+        operation.set_freeze(true, request.reason)
+    })
+    .await
+    .map(Json)
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 async fn http_unfreeze(
@@ -542,10 +591,13 @@ async fn http_unfreeze(
     Json(request): Json<FreezeRequest>,
 ) -> std::result::Result<Json<DaemonHealth>, StatusCode> {
     authorize(&daemon, &headers)?;
-    daemon
-        .set_freeze(false, request.reason)
-        .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    let operation = daemon.clone();
+    run_daemon_store_operation(daemon.store_executor.clone(), move || {
+        operation.set_freeze(false, request.reason)
+    })
+    .await
+    .map(Json)
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 async fn http_paper_approval(
@@ -567,10 +619,13 @@ async fn http_canary_stage(
     Json(spec): Json<akzio_domain::CanaryCampaignSpec>,
 ) -> std::result::Result<Json<akzio_store::v2::CanaryCampaignHead>, StatusCode> {
     authorize(&daemon, &headers)?;
-    daemon
-        .stage_canary_campaign(spec)
-        .map(Json)
-        .map_err(invalid_input_or_internal)
+    let operation = daemon.clone();
+    run_daemon_store_operation(daemon.store_executor.clone(), move || {
+        operation.stage_canary_campaign(spec)
+    })
+    .await
+    .map(Json)
+    .map_err(invalid_input_or_internal)
 }
 
 async fn http_canary_status(
@@ -578,10 +633,13 @@ async fn http_canary_status(
     headers: HeaderMap,
 ) -> std::result::Result<Json<Option<akzio_store::v2::CanaryCampaignHead>>, StatusCode> {
     authorize(&daemon, &headers)?;
-    daemon
-        .canary_status()
-        .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    let operation = daemon.clone();
+    run_daemon_store_operation(daemon.store_executor.clone(), move || {
+        operation.canary_status()
+    })
+    .await
+    .map(Json)
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 async fn http_canary_resume(
@@ -590,10 +648,13 @@ async fn http_canary_resume(
     Json(request): Json<CanaryResumeRequest>,
 ) -> std::result::Result<Json<akzio_store::v2::CanaryCampaignHead>, StatusCode> {
     authorize(&daemon, &headers)?;
-    daemon
-        .resume_canary_campaign(&request.campaign_id)
-        .map(Json)
-        .map_err(invalid_input_or_internal)
+    let operation = daemon.clone();
+    run_daemon_store_operation(daemon.store_executor.clone(), move || {
+        operation.resume_canary_campaign(&request.campaign_id)
+    })
+    .await
+    .map(Json)
+    .map_err(invalid_input_or_internal)
 }
 
 async fn http_store_doctor(
@@ -601,10 +662,12 @@ async fn http_store_doctor(
     headers: HeaderMap,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
     authorize(&daemon, &headers)?;
-    daemon
-        .store
-        .verify_integrity()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    run_store_maintenance(
+        daemon.maintenance(),
+        StoreMaintenanceKind::Doctor,
+        |store| store.verify_integrity(),
+    )
+    .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -613,7 +676,12 @@ async fn http_store_inventory(
     headers: HeaderMap,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
     authorize(&daemon, &headers)?;
-    store_json(daemon.store.storage_inventory())
+    store_json(Ok(run_store_operation(
+        daemon.store_executor.clone(),
+        "store.inventory",
+        |store| store.storage_inventory(),
+    )
+    .await?))
 }
 
 async fn http_store_metrics(
@@ -621,7 +689,20 @@ async fn http_store_metrics(
     headers: HeaderMap,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
     authorize(&daemon, &headers)?;
-    store_json(daemon.store.metrics(Utc::now()))
+    store_json(Ok(run_store_operation(
+        daemon.store_executor.clone(),
+        "store.metrics",
+        |store| store.metrics(Utc::now()),
+    )
+    .await?))
+}
+
+async fn http_store_executor(
+    State(daemon): State<Arc<Daemon>>,
+    headers: HeaderMap,
+) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
+    authorize(&daemon, &headers)?;
+    Ok(Json(store_executor_json(&daemon.store_executor)))
 }
 
 async fn http_store_alerts(
@@ -629,10 +710,10 @@ async fn http_store_alerts(
     headers: HeaderMap,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
     authorize(&daemon, &headers)?;
-    let metrics = daemon
-        .store
-        .metrics(Utc::now())
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let metrics = run_store_operation(daemon.store_executor.clone(), "store.alerts", |store| {
+        store.metrics(Utc::now())
+    })
+    .await?;
     store_json(Ok(metrics.alerts()))
 }
 
@@ -642,11 +723,33 @@ async fn http_store_session(
     headers: HeaderMap,
 ) -> std::result::Result<Json<Option<akzio_store::v2::SessionSlot>>, StatusCode> {
     authorize(&daemon, &headers)?;
-    daemon
-        .store
-        .session_slot(&session_key)
-        .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    run_store_operation(
+        daemon.store_executor.clone(),
+        "store.session",
+        move |store| store.session_slot(&session_key),
+    )
+    .await
+    .map(Json)
+}
+
+async fn http_store_release_evidence(
+    State(daemon): State<Arc<Daemon>>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+) -> std::result::Result<Json<akzio_domain::ReleaseEvidenceBundle>, StatusCode> {
+    authorize(&daemon, &headers)?;
+    run_store_operation(
+        daemon.store_executor.clone(),
+        "store.release_evidence",
+        move |store| {
+            store.release_evidence_bundle(
+                &RunId(run_id),
+                &akzio_store::v2::ReleaseEvidenceExpectations::default(),
+            )
+        },
+    )
+    .await
+    .map(Json)
 }
 
 async fn http_store_backup(
@@ -655,7 +758,12 @@ async fn http_store_backup(
     Json(request): Json<StoreBackupRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
     authorize(&daemon, &headers)?;
-    store_json(daemon.store.backup_to(request.target))
+    store_json(Ok(run_store_maintenance(
+        daemon.maintenance(),
+        StoreMaintenanceKind::Backup,
+        move |store| store.backup_to(request.target),
+    )
+    .await?))
 }
 
 async fn http_store_restore(
@@ -664,9 +772,15 @@ async fn http_store_restore(
     Json(request): Json<StoreRestoreRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
     authorize(&daemon, &headers)?;
-    let store = akzio_store::v2::V2Store::restore_from(request.source, request.target)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    store_json(store.metrics(Utc::now()))
+    store_json(Ok(run_store_maintenance(
+        daemon.maintenance(),
+        StoreMaintenanceKind::Restore,
+        move |_| {
+            akzio_store::v2::V2Store::restore_from(request.source, request.target)
+                .and_then(|store| store.metrics(Utc::now()))
+        },
+    )
+    .await?))
 }
 
 async fn http_store_export_run(
@@ -675,11 +789,18 @@ async fn http_store_export_run(
     Json(request): Json<StoreExportRunRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
     authorize(&daemon, &headers)?;
-    store_json(daemon.store.export_run(
-        &RunId(request.run_id),
-        request.target,
-        request.include_raw_model,
-    ))
+    store_json(Ok(run_store_maintenance(
+        daemon.maintenance(),
+        StoreMaintenanceKind::ExportRun,
+        move |store| {
+            store.export_run(
+                &RunId(request.run_id),
+                request.target,
+                request.include_raw_model,
+            )
+        },
+    )
+    .await?))
 }
 
 async fn http_store_lessons(
@@ -695,10 +816,13 @@ async fn http_store_lessons(
                 .map_err(|_| StatusCode::BAD_REQUEST)
         })
         .transpose()?;
-    let lessons = daemon
-        .store
-        .lessons(lifecycle, query.limit.unwrap_or(50))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let limit = query.limit.unwrap_or(50);
+    let lessons = run_store_operation(
+        daemon.store_executor.clone(),
+        "store.lessons",
+        move |store| store.lessons(lifecycle, limit),
+    )
+    .await?;
     lessons
         .iter()
         .map(lesson_view_json)
@@ -716,10 +840,13 @@ async fn http_store_lesson_add(
         return Err(StatusCode::BAD_REQUEST);
     }
     let now = Utc::now();
-    let source_blob = daemon
-        .store
-        .put_json(&input)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let stored_input = serde_json::to_vec(&input).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let source_blob = run_store_operation(
+        daemon.store_executor.clone(),
+        "store.lesson.source",
+        move |store| store.put_bytes(&stored_input, "application/json"),
+    )
+    .await?;
     let source = Artifact::new(
         ArtifactKind::SemanticDetail,
         source_blob,
@@ -776,10 +903,13 @@ async fn http_store_lesson_add(
         created_at: now,
         updated_at: now,
     };
-    let result = daemon
-        .store
-        .write_lesson(&lesson, &source, now)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let result = run_store_operation(
+        daemon.store_executor.clone(),
+        "store.lesson.add",
+        move |store| store.write_lesson(&lesson, &source, now),
+    )
+    .await
+    .map_err(|_| StatusCode::BAD_REQUEST)?;
     lesson_view_json(&result.lesson).map(Json)
 }
 
@@ -789,11 +919,13 @@ async fn http_store_lesson(
     headers: HeaderMap,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
     authorize(&daemon, &headers)?;
-    let lesson = daemon
-        .store
-        .lesson(&LessonId(lesson_id))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let lesson = run_store_operation(
+        daemon.store_executor.clone(),
+        "store.lesson",
+        move |store| store.lesson(&LessonId(lesson_id)),
+    )
+    .await?
+    .ok_or(StatusCode::NOT_FOUND)?;
     lesson_view_json(&lesson).map(Json)
 }
 
@@ -803,11 +935,13 @@ async fn http_store_lesson_usage(
     headers: HeaderMap,
 ) -> std::result::Result<Json<LessonUsage>, StatusCode> {
     authorize(&daemon, &headers)?;
-    daemon
-        .store
-        .lesson_usage(&LessonId(lesson_id))
-        .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    run_store_operation(
+        daemon.store_executor.clone(),
+        "store.lesson.usage",
+        move |store| store.lesson_usage(&LessonId(lesson_id)),
+    )
+    .await
+    .map(Json)
 }
 
 async fn http_store_lesson_transition(
@@ -817,16 +951,21 @@ async fn http_store_lesson_transition(
     Json(request): Json<StoreLessonTransitionRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
     authorize(&daemon, &headers)?;
-    let lesson = daemon
-        .store
-        .transition_lesson(
-            &LessonId(lesson_id),
-            request.lifecycle,
-            &request.actor,
-            &request.reason,
-            Utc::now(),
-        )
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let lesson = run_store_operation(
+        daemon.store_executor.clone(),
+        "store.lesson.transition",
+        move |store| {
+            store.transition_lesson(
+                &LessonId(lesson_id),
+                request.lifecycle,
+                &request.actor,
+                &request.reason,
+                Utc::now(),
+            )
+        },
+    )
+    .await
+    .map_err(|_| StatusCode::BAD_REQUEST)?;
     lesson_view_json(&lesson).map(Json)
 }
 
@@ -862,6 +1001,39 @@ fn lesson_view_json(value: &StoredLesson) -> std::result::Result<serde_json::Val
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+fn store_executor_json(executor: &StoreExecutor) -> serde_json::Value {
+    let telemetry = executor.telemetry();
+    let maintenance = match telemetry.maintenance {
+        StoreMaintenanceState::Idle => serde_json::json!({ "state": "idle" }),
+        StoreMaintenanceState::Running { kind, sequence } => serde_json::json!({
+            "state": "running",
+            "kind": kind.as_str(),
+            "sequence": sequence,
+        }),
+        StoreMaintenanceState::Completed {
+            kind,
+            sequence,
+            outcome,
+            lease_deferral,
+        } => serde_json::json!({
+            "state": "completed",
+            "kind": kind.as_str(),
+            "sequence": sequence,
+            "outcome": outcome.as_str(),
+            "deferred_task_leases": lease_deferral.task_leases,
+            "deferred_daemon_leases": lease_deferral.daemon_leases,
+        }),
+    };
+    serde_json::json!({
+        "accepting_operations": telemetry.accepting_operations,
+        "queued_operation_count": telemetry.queued_operation_count,
+        "completed_operation_count": telemetry.completed_operation_count,
+        "last_queue_wait_micros": telemetry.last_queue_wait.as_micros(),
+        "last_execution_duration_micros": telemetry.last_execution_duration.as_micros(),
+        "maintenance": maintenance,
+    })
+}
+
 fn store_json<T: Serialize>(
     result: std::result::Result<T, StoreError>,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
@@ -872,6 +1044,57 @@ fn store_json<T: Serialize>(
                 .map(Json)
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
         })
+}
+
+async fn run_store_operation<T, F>(
+    executor: StoreExecutor,
+    operation: &'static str,
+    work: F,
+) -> std::result::Result<T, StatusCode>
+where
+    T: Send + 'static,
+    F: FnOnce(V2Store) -> std::result::Result<T, StoreError> + Send + 'static,
+{
+    executor
+        .execute(work)
+        .await
+        .map_err(|error| {
+            tracing::error!(operation, error = %error, "Store executor task failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .map_err(|error| {
+            tracing::error!(operation, error = %error, "Store operation failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+async fn run_daemon_store_operation<T, F>(
+    executor: StoreExecutor,
+    work: F,
+) -> std::result::Result<T, DaemonError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> std::result::Result<T, DaemonError> + Send + 'static,
+{
+    executor.execute(move |_| work()).await?
+}
+
+pub(super) async fn run_store_maintenance<T>(
+    maintenance: crate::application::Maintenance,
+    kind: StoreMaintenanceKind,
+    work: impl FnOnce(V2Store) -> std::result::Result<T, StoreError> + Send + 'static,
+) -> std::result::Result<T, StatusCode>
+where
+    T: Send + 'static,
+{
+    maintenance.run(kind, work).await.map_err(|error| {
+        tracing::error!(
+            operation = kind.as_str(),
+            error = %error,
+            "Store maintenance task failed"
+        );
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 fn authorize(daemon: &Daemon, headers: &HeaderMap) -> std::result::Result<(), StatusCode> {
@@ -898,15 +1121,19 @@ async fn http_store_claim_next(
     Json(request): Json<StoreClaimNextRequest>,
 ) -> std::result::Result<Json<bool>, StatusCode> {
     authorize(&daemon, &headers)?;
-    daemon
-        .store
-        .claim_next_task(
-            &request.worker_id,
-            request.at,
-            chrono::Duration::seconds(request.lease_seconds),
-        )
-        .map(|attempt| Json(attempt.is_some()))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    run_store_operation(
+        daemon.store_executor.clone(),
+        "store.claim_next",
+        move |store| {
+            store.claim_next_task(
+                &request.worker_id,
+                request.at,
+                chrono::Duration::seconds(request.lease_seconds),
+            )
+        },
+    )
+    .await
+    .map(|attempt| Json(attempt.is_some()))
 }
 
 async fn http_store_recover_expired(
@@ -915,11 +1142,13 @@ async fn http_store_recover_expired(
     Json(request): Json<StoreRecoverExpiredRequest>,
 ) -> std::result::Result<Json<u64>, StatusCode> {
     authorize(&daemon, &headers)?;
-    daemon
-        .store
-        .recover_expired_tasks(request.at)
-        .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    run_store_operation(
+        daemon.store_executor.clone(),
+        "store.recover_expired",
+        move |store| store.recover_expired_tasks(request.at),
+    )
+    .await
+    .map(Json)
 }
 
 async fn http_store_workflow(
@@ -928,15 +1157,17 @@ async fn http_store_workflow(
     headers: HeaderMap,
 ) -> std::result::Result<Json<StoreWorkflowView>, StatusCode> {
     authorize(&daemon, &headers)?;
-    daemon
-        .store
-        .workflow_snapshot(&RunId(run_id))
-        .map(|snapshot| {
-            Json(StoreWorkflowView {
-                status: snapshot.status,
-            })
+    run_store_operation(
+        daemon.store_executor.clone(),
+        "store.workflow",
+        move |store| store.workflow_snapshot(&RunId(run_id)),
+    )
+    .await
+    .map(|snapshot| {
+        Json(StoreWorkflowView {
+            status: snapshot.status,
         })
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    })
 }
 
 async fn http_store_events(
@@ -946,25 +1177,29 @@ async fn http_store_events(
     headers: HeaderMap,
 ) -> std::result::Result<Json<Vec<StoreEventView>>, StatusCode> {
     authorize(&daemon, &headers)?;
-    daemon
-        .store
-        .events_after(
-            &RunId(run_id),
-            query.after.unwrap_or(0),
-            query.limit.unwrap_or(EVENT_PAGE_SIZE),
-        )
-        .map(|events| {
-            Json(
-                events
-                    .into_iter()
-                    .map(|event| StoreEventView {
-                        event_type: event.event_type,
-                        artifact_id: event.artifact_id,
-                    })
-                    .collect(),
+    run_store_operation(
+        daemon.store_executor.clone(),
+        "store.events",
+        move |store| {
+            store.events_after(
+                &RunId(run_id),
+                query.after.unwrap_or(0),
+                query.limit.unwrap_or(EVENT_PAGE_SIZE),
             )
-        })
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        },
+    )
+    .await
+    .map(|events| {
+        Json(
+            events
+                .into_iter()
+                .map(|event| StoreEventView {
+                    event_type: event.event_type,
+                    artifact_id: event.artifact_id,
+                })
+                .collect(),
+        )
+    })
 }
 
 async fn http_store_artifact(
@@ -974,11 +1209,13 @@ async fn http_store_artifact(
 ) -> std::result::Result<Json<Artifact>, StatusCode> {
     authorize(&daemon, &headers)?;
     let artifact_id = ContentHash::new(artifact_id).map_err(|_| StatusCode::BAD_REQUEST)?;
-    daemon
-        .store
-        .artifact(&ArtifactId(artifact_id))
-        .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    run_store_operation(
+        daemon.store_executor.clone(),
+        "store.artifact",
+        move |store| store.artifact(&ArtifactId(artifact_id)),
+    )
+    .await
+    .map(Json)
 }
 
 async fn http_store_diagnose(
@@ -988,11 +1225,13 @@ async fn http_store_diagnose(
 ) -> std::result::Result<Json<bool>, StatusCode> {
     authorize(&daemon, &headers)?;
     let artifact_id = ContentHash::new(artifact_id).map_err(|_| StatusCode::BAD_REQUEST)?;
-    daemon
-        .store
-        .diagnose_corruption_rejection(&ArtifactId(artifact_id))
-        .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    run_store_operation(
+        daemon.store_executor.clone(),
+        "store.diagnose",
+        move |store| store.diagnose_corruption_rejection(&ArtifactId(artifact_id)),
+    )
+    .await
+    .map(Json)
 }
 
 async fn http_store_freeze(
@@ -1001,11 +1240,13 @@ async fn http_store_freeze(
     Json(request): Json<StoreFreezeRequest>,
 ) -> std::result::Result<Json<Artifact>, StatusCode> {
     authorize(&daemon, &headers)?;
-    daemon
-        .store
-        .write_freeze_state(request.frozen, request.reason, request.at)
-        .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    run_store_operation(
+        daemon.store_executor.clone(),
+        "store.freeze",
+        move |store| store.write_freeze_state(request.frozen, request.reason, request.at),
+    )
+    .await
+    .map(Json)
 }
 
 async fn http_store_latest_artifact(
@@ -1014,11 +1255,13 @@ async fn http_store_latest_artifact(
     Json(request): Json<StoreLatestArtifactRequest>,
 ) -> std::result::Result<Json<Option<Artifact>>, StatusCode> {
     authorize(&daemon, &headers)?;
-    daemon
-        .store
-        .latest_artifact_by_kind(request.kind)
-        .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    run_store_operation(
+        daemon.store_executor.clone(),
+        "store.latest_artifact",
+        move |store| store.latest_artifact_by_kind(request.kind),
+    )
+    .await
+    .map(Json)
 }
 
 async fn http_store_acquire_lease(
@@ -1027,16 +1270,20 @@ async fn http_store_acquire_lease(
     Json(request): Json<StoreAcquireLeaseRequest>,
 ) -> std::result::Result<Json<Option<DaemonLease>>, StatusCode> {
     authorize(&daemon, &headers)?;
-    daemon
-        .store
-        .acquire_daemon_lease(
-            &request.lease_name,
-            &request.owner_id,
-            request.at,
-            request.expires_at,
-        )
-        .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    run_store_operation(
+        daemon.store_executor.clone(),
+        "store.lease.acquire",
+        move |store| {
+            store.acquire_daemon_lease(
+                &request.lease_name,
+                &request.owner_id,
+                request.at,
+                request.expires_at,
+            )
+        },
+    )
+    .await
+    .map(Json)
 }
 
 async fn http_store_validate_lease(
@@ -1045,11 +1292,13 @@ async fn http_store_validate_lease(
     Json(request): Json<StoreValidateLeaseRequest>,
 ) -> std::result::Result<Json<bool>, StatusCode> {
     authorize(&daemon, &headers)?;
-    daemon
-        .store
-        .validate_daemon_lease(&request.lease, request.at)
-        .map(|_| Json(true))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    run_store_operation(
+        daemon.store_executor.clone(),
+        "store.lease.validate",
+        move |store| store.validate_daemon_lease(&request.lease, request.at),
+    )
+    .await
+    .map(|_| Json(true))
 }
 
 async fn http_store_latest_retrospective(
@@ -1057,17 +1306,20 @@ async fn http_store_latest_retrospective(
     headers: HeaderMap,
 ) -> std::result::Result<Json<Option<Retrospective>>, StatusCode> {
     authorize(&daemon, &headers)?;
-    let Some(artifact) = daemon
-        .store
-        .latest_artifact_by_kind(ArtifactKind::Retrospective)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    else {
+    let payload = run_store_operation(
+        daemon.store_executor.clone(),
+        "store.latest_retrospective",
+        move |store| -> std::result::Result<Option<Vec<u8>>, StoreError> {
+            let Some(artifact) = store.latest_artifact_by_kind(ArtifactKind::Retrospective)? else {
+                return Ok(None);
+            };
+            Ok(Some(store.read_blob(&artifact.blob)?))
+        },
+    )
+    .await?;
+    let Some(bytes) = payload else {
         return Ok(Json(None));
     };
-    let bytes = daemon
-        .store
-        .read_blob(&artifact.blob)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let payload = serde_json::from_slice(&bytes).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(Some(payload)))
 }

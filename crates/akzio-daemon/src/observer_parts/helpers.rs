@@ -1,4 +1,6 @@
-fn observer_run_telemetry(trajectory: &[TrajectoryEntry]) -> ObserverRunTelemetry {
+use super::*;
+
+pub(super) fn observer_run_telemetry(trajectory: &[TrajectoryEntry]) -> ObserverRunTelemetry {
     ObserverRunTelemetry {
         model_id: trajectory
             .iter()
@@ -27,7 +29,7 @@ fn observer_run_telemetry(trajectory: &[TrajectoryEntry]) -> ObserverRunTelemetr
     }
 }
 
-fn observer_broker_order_ids(run: &ObserverRunDetail) -> BTreeSet<String> {
+pub(super) fn observer_broker_order_ids(run: &ObserverRunDetail) -> BTreeSet<String> {
     run.artifacts
         .iter()
         .filter(|artifact| artifact.kind == ArtifactKind::OrderReceipt)
@@ -41,7 +43,7 @@ fn observer_broker_order_ids(run: &ObserverRunDetail) -> BTreeSet<String> {
         .collect()
 }
 
-fn parse_portfolio(
+pub(super) fn parse_portfolio(
     account: &Value,
     positions: &Value,
     broker_session: &str,
@@ -105,7 +107,7 @@ fn parse_portfolio(
     })
 }
 
-fn parse_portfolio_history(
+pub(super) fn parse_portfolio_history(
     range: ObserverPortfolioRange,
     value: &Value,
 ) -> Result<ObserverPortfolioHistory> {
@@ -160,7 +162,7 @@ fn parse_portfolio_history(
     })
 }
 
-fn outcome_average_utility(outcome: &Outcome) -> i64 {
+pub(super) fn outcome_average_utility(outcome: &Outcome) -> i64 {
     if outcome.windows.is_empty() {
         return 0;
     }
@@ -176,7 +178,7 @@ fn outcome_average_utility(outcome: &Outcome) -> i64 {
     })
 }
 
-fn observer_number_micros(value: &Value, field: &str) -> Result<i64> {
+pub(super) fn observer_number_micros(value: &Value, field: &str) -> Result<i64> {
     value
         .get(field)
         .and_then(parse_money_micros)
@@ -184,7 +186,7 @@ fn observer_number_micros(value: &Value, field: &str) -> Result<i64> {
         .ok_or_else(|| DaemonError::InvalidInput(format!("Paper provider field {field} invalid")))
 }
 
-fn observer_optional_micros(value: &Value, field: &str) -> Option<i64> {
+pub(super) fn observer_optional_micros(value: &Value, field: &str) -> Option<i64> {
     value
         .get(field)
         .and_then(parse_money_micros)

@@ -43,13 +43,34 @@ pub(super) fn fixture_input(request: &ModelRequest) -> Option<String> {
 }
 
 pub(super) fn fixture_context_artifact_id(input: &str, kind: &str) -> Option<String> {
-    serde_json::from_str::<Value>(input)
-        .ok()?
-        .get("context")?
-        .as_array()?
-        .iter()
-        .find(|artifact| artifact.get("kind").and_then(Value::as_str) == Some(kind))?
-        .get("artifact_id")?
+    let input = serde_json::from_str::<Value>(input).ok()?;
+    let context = input.get("context")?.as_array()?;
+    context.iter().find_map(|entry| {
+        fixture_artifact_identity(entry, kind).or_else(|| {
+            entry
+                .get("documents")
+                .and_then(Value::as_array)
+                .and_then(|documents| {
+                    documents
+                        .iter()
+                        .find_map(|document| fixture_artifact_identity(document, kind))
+                })
+                .or_else(|| {
+                    entry
+                        .get("metadata")
+                        .and_then(|metadata| fixture_artifact_identity(metadata, kind))
+                })
+        })
+    })
+}
+
+fn fixture_artifact_identity(value: &Value, kind: &str) -> Option<String> {
+    if value.get("kind").and_then(Value::as_str) != Some(kind) {
+        return None;
+    }
+    value
+        .get("artifact_id")
+        .or_else(|| value.get("document_id"))?
         .as_str()
         .map(ToOwned::to_owned)
 }

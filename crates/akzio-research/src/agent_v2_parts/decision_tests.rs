@@ -2,6 +2,16 @@
 mod decision_proposal_tests {
     use super::*;
 
+    #[test]
+    fn directional_evidence_requires_complete_citations() {
+        assert!(evidence_has_complete_citations(&serde_json::json!({
+            "quality": { "citations_complete": true }
+        })));
+        assert!(!evidence_has_complete_citations(&serde_json::json!({
+            "quality": { "citations_complete": false }
+        })));
+    }
+
     fn provenance() -> ArtifactProvenance {
         ArtifactProvenance {
             source_family: "fixture".to_owned(),

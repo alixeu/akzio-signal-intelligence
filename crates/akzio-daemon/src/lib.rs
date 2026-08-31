@@ -4,6 +4,7 @@
 //! while the v2 Store and runtimes own durable state, contracts, context
 //! grants, task attempts, and workflow transitions.
 
+mod application;
 mod dispatch;
 mod evidence;
 mod http;
@@ -30,7 +31,8 @@ use std::{
 
 use akzio_domain::{
     content_hash_json, AccountSnapshot, AgentContract, Artifact, ArtifactId, ArtifactKind,
-    ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef, Asset, ContentHash,
+    ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef, Asset,
+    CanaryPairedObservation, CanaryPairedOutcomeMetrics, CanaryPairedSubjectMetrics, ContentHash,
     ContractPurpose, Decision, DecisionContext, DecisionHorizon, DomainError, EvidenceNeed,
     ExecutionContext, ExecutionVerdict, FreezeState, Lesson, LessonId, LessonLifecycle,
     LessonOrigin, LessonScope, LifecycleEventType, MemoryId, MoneyMicros, OrderReceipt, Outcome,
@@ -59,10 +61,10 @@ use akzio_ingest::{
     PaperDecodeError, SecEdgarDirectTransport,
 };
 use akzio_learning::{
-    horizon_observations, CanaryBundleComparison, CanaryCampaignRuntime, CanaryError,
-    CanarySubjectComparison, CandidatePolicyInput, EvaluationError, EvaluationInput,
-    EvaluationPolicy, EvaluationRuntime, OutcomeMaterializationInput, OutcomeScheduleError,
-    OutcomeScheduleInput, OutcomeSchedulingRuntime, ShadowObservation,
+    evaluate_canary_cohort, horizon_observations, CanaryCampaignRuntime, CanaryError,
+    CandidatePolicyInput, EvaluationError, EvaluationInput, EvaluationPolicy, EvaluationRuntime,
+    OutcomeMaterializationInput, OutcomeScheduleError, OutcomeScheduleInput,
+    OutcomeSchedulingRuntime, ShadowObservation,
 };
 use akzio_model::{ModelClient, ModelConfig, ModelError};
 pub use akzio_research::v2::fixture_model_client;
@@ -73,8 +75,8 @@ use akzio_research::v2::{
 pub use akzio_research::{contract_component_hash, prompt_component_hash};
 pub use akzio_runtime::topology_component_hash;
 use akzio_runtime::v2::{
-    should_run_structured_critique, RetryCause, RuntimeError, TaskCompletion, TaskRuntime,
-    WorkflowRuntime,
+    should_run_structured_critique, RetryCause, RuntimeError, StoreExecutor, StoreMaintenanceKind,
+    StoreMaintenanceState, TaskCompletion, TaskRuntime, WorkflowRuntime,
 };
 use akzio_store::v2::{
     ClaimedAttempt, DaemonLease, LessonUsage, StoreAlert, StoreError, StoreMetrics, StoredEvent,
@@ -233,6 +235,7 @@ struct DaemonPaperState {
 #[derive(Clone)]
 pub struct Daemon {
     store: V2Store,
+    store_executor: StoreExecutor,
     workflow: WorkflowRuntime,
     task_runtime: TaskRuntime,
     agents: AgentRuntime,

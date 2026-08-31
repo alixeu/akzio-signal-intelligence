@@ -1,5 +1,7 @@
+use super::*;
+
 impl Daemon {
-    pub(super) fn realized_execution_target(
+    pub(crate) fn realized_execution_target(
         &self,
         schedule: &OutcomeSchedule,
         execution_context: &ExecutionContext,
@@ -12,8 +14,7 @@ impl Daemon {
         let account: AccountSnapshot = self.read_artifact_payload(account_reference)?;
         let mut plan = None;
         let mut receipts = Vec::new();
-        if let OutcomeExecutionLineage::ReconciledPaper { reconciliation, .. } =
-            &schedule.execution
+        if let OutcomeExecutionLineage::ReconciledPaper { reconciliation, .. } = &schedule.execution
         {
             let reconciliation: Reconciliation = self.read_artifact_payload(reconciliation)?;
             if reconciliation.state != ReconciliationState::Complete {
@@ -37,5 +38,4 @@ impl Daemon {
         )
         .map_err(|error| DaemonError::InvalidInput(error.to_string()))
     }
-
 }

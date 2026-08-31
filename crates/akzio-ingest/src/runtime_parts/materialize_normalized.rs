@@ -45,6 +45,105 @@ impl EvidenceRuntime {
         Ok(())
     }
 
+    fn attach_news_source_blobs(
+        &self,
+        value: &mut Value,
+        raw: &[u8],
+        citations: &[EvidenceCitation],
+    ) -> EvidenceRuntimeResult<()> {
+        let Some(sources) = value
+            .get_mut("source_document")
+            .and_then(|document| document.get_mut("sources"))
+            .and_then(Value::as_array_mut)
+        else {
+            return Ok(());
+        };
+
+        for source in sources {
+            if source.get("status").and_then(Value::as_str) != Some("snapshot") {
+                continue;
+            }
+            let start = source
+                .get("bundle_start_byte")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or(EvidenceRuntimeError::InvalidAcquisition)?;
+            let end = source
+                .get("bundle_end_byte")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or(EvidenceRuntimeError::InvalidAcquisition)?;
+            let bytes = raw
+                .get(start..end)
+                .filter(|bytes| !bytes.is_empty())
+                .ok_or(EvidenceRuntimeError::InvalidAcquisition)?;
+            if source
+                .get("claim_binding")
+                .and_then(|binding| binding.get("status"))
+                .and_then(Value::as_str)
+                == Some("exact_quote")
+            {
+                let binding = source
+                    .get("claim_binding")
+                    .ok_or(EvidenceRuntimeError::InvalidCitation)?;
+                let quote = binding
+                    .get("quote")
+                    .and_then(Value::as_str)
+                    .filter(|quote| !quote.trim().is_empty())
+                    .ok_or(EvidenceRuntimeError::InvalidCitation)?;
+                let source_start = binding
+                    .get("source_start_byte")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or(EvidenceRuntimeError::InvalidCitation)?;
+                let source_end = binding
+                    .get("source_end_byte")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or(EvidenceRuntimeError::InvalidCitation)?;
+                let bundle_start = binding
+                    .get("bundle_start_byte")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or(EvidenceRuntimeError::InvalidCitation)?;
+                let bundle_end = binding
+                    .get("bundle_end_byte")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or(EvidenceRuntimeError::InvalidCitation)?;
+                if bytes.get(source_start..source_end) != Some(quote.as_bytes())
+                    || bundle_start != start.saturating_add(source_start)
+                    || bundle_end != start.saturating_add(source_end)
+                    || !citations.iter().any(|citation| {
+                        citation.start_byte == bundle_start
+                            && citation.end_byte == bundle_end
+                            && citation.quote == quote
+                    })
+                {
+                    return Err(EvidenceRuntimeError::InvalidCitation);
+                }
+            }
+            let expected_hash = source
+                .get("content_hash")
+                .and_then(Value::as_str)
+                .ok_or(EvidenceRuntimeError::InvalidAcquisition)?;
+            if ContentHash::of_bytes(bytes).as_str() != expected_hash {
+                return Err(EvidenceRuntimeError::InvalidAcquisition);
+            }
+            let media_type = source
+                .get("media_type")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or(EvidenceRuntimeError::InvalidAcquisition)?;
+            let blob = self.store.put_bytes(bytes, media_type)?;
+            source
+                .as_object_mut()
+                .ok_or(EvidenceRuntimeError::InvalidAcquisition)?
+                .insert("blob".to_owned(), serde_json::to_value(blob)?);
+        }
+        Ok(())
+    }
+
     fn materialize_acquired(
         &self,
         permit: &TaskWritePermit,
@@ -61,6 +160,14 @@ impl EvidenceRuntime {
             artifact_id: raw.artifact_id.clone(),
             kind: ArtifactKind::RawEvidence,
         };
+        let mut normalized_value = acquired.normalized.clone();
+        if request.source == EvidenceSource::NewsWeb {
+            self.attach_news_source_blobs(
+                &mut normalized_value,
+                &acquired.raw,
+                &acquired.provenance.citations,
+            )?;
+        }
         let normalized_payload = NormalizedEvidencePayload {
             schema_version: V2_DOMAIN_SCHEMA_VERSION,
             source: request.source,
@@ -68,7 +175,7 @@ impl EvidenceRuntime {
             need: need.clone(),
             raw: raw_ref.clone(),
             observed_at: acquired.observed_at,
-            value: acquired.normalized.clone(),
+            value: normalized_value,
             provenance: acquired.provenance.clone(),
             quality: acquired.quality.clone(),
         };
@@ -104,7 +211,7 @@ impl EvidenceRuntime {
             return Err(EvidenceRuntimeError::InvalidAcquisition);
         }
         acquired.provenance.validate(
-            acquired.raw.len(),
+            &acquired.raw,
             &acquired.source_uri,
             acquired.observed_at,
         )?;

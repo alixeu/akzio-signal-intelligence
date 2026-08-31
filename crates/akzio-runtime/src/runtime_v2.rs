@@ -10,9 +10,9 @@ use akzio_domain::{
     Artifact, ArtifactKind, ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef,
     Asset, AttemptId, ClaimStance, ContentHash, ContractPurpose, DomainError, EvidenceNeed,
     FailureDisposition, LifecycleEventType, ResearchClaim, RetryPolicy, RunId, RunPurpose,
-    RuntimeTaskClass, TaskBudget, TaskId, TaskRecipe, TaskRecipeId, TaskStatus, WorkflowGraph,
-    WorkflowNode, WorkflowProposal, WorkflowProposalDraft, WorkflowProposalTask, WorkflowStatus,
-    STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID, V2_DOMAIN_SCHEMA_VERSION,
+    RuntimeTaskClass, TaskBudget, TaskId, TaskRecipe, TaskRecipeId, TaskStatus, TaskWritePermit,
+    WorkflowGraph, WorkflowNode, WorkflowProposal, WorkflowProposalDraft, WorkflowProposalTask,
+    WorkflowStatus, STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID, V2_DOMAIN_SCHEMA_VERSION,
 };
 use akzio_store::v2::{
     ClaimedAttempt, DaemonLease, RetryTaskResult, SessionReservation, SessionSlotReservation,
@@ -25,6 +25,7 @@ use thiserror::Error;
 mod catalogue;
 mod planner;
 mod replay;
+mod store_executor;
 mod task;
 mod workflow;
 
@@ -36,6 +37,10 @@ pub use catalogue::{
     EXECUTION_GATE_RECIPE_ID, PAPER_COMMIT_RECIPE_ID, RECONCILE_RECIPE_ID,
 };
 pub use planner::should_run_structured_critique;
+pub use store_executor::{
+    StoreExecutor, StoreExecutorTelemetry, StoreMaintenanceKind, StoreMaintenanceOutcome,
+    StoreMaintenanceState,
+};
 pub use task::TaskRuntime;
 
 #[derive(Debug, Error)]
@@ -44,6 +49,8 @@ pub enum RuntimeError {
     Domain(#[from] DomainError),
     #[error(transparent)]
     Store(#[from] StoreError),
+    #[error("blocking store executor failed: {0}")]
+    StoreExecutor(String),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error("recipe {0} is missing")]
@@ -92,6 +99,9 @@ pub enum RuntimeError {
     MultipleAgentParents { task: String },
     #[error("task lease duration must be positive")]
     InvalidTaskLeaseDuration,
+    #[cfg(test)]
+    #[error("injected task failpoint: {0}")]
+    InjectedFailpoint(String),
     #[error("task retry backoff exceeds supported duration")]
     InvalidRetryBackoff,
     #[error("workflow node {0} diverges from its installed recipe")]

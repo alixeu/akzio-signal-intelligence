@@ -79,151 +79,154 @@ impl AgentRuntime {
         Ok((envelope.result, Some(note)))
     }
 
-    fn context_values(
+    async fn context_materialization(
         &self,
         permit: &TaskWritePermit,
         contract: &AgentContract,
         manifest: &ContextManifest,
         now: DateTime<Utc>,
-    ) -> ResearchResult<Vec<Value>> {
+    ) -> ResearchResult<ContextMaterialization> {
         if !manifest.grant.matches_permit(permit) {
             return Err(ResearchError::GrantPermitMismatch);
         }
-        manifest
-            .payload
-            .selections
-            .iter()
-            .map(|selection| {
-                let (artifact, value) = self.context.read_document(
-                    permit,
-                    contract,
-                    &manifest.grant,
-                    &selection.artifact.artifact_id,
-                    now,
-                )?;
-                Ok(json!({
-                    "artifact_id": artifact.artifact_id,
-                    "kind": artifact.kind,
-                    "provenance": artifact.provenance,
-                    "value": value,
-                }))
-            })
-            .collect()
+        let context = self.context.clone();
+        let permit = permit.clone();
+        let contract = contract.clone();
+        let manifest = manifest.clone();
+        Ok(self
+            .store_executor
+            .execute(move |_| context.materialize_for_agent(&permit, &contract, &manifest, now))
+            .await??)
     }
 
-    fn record_turn(
+    async fn record_turn(
         &self,
-        record: &TurnRecord<'_>,
+        record: TurnRecord,
         request: &AgentModelRequest,
         response: &AgentModelTurn,
-        capability_snapshot: &ModelCapabilitySnapshot,
-        capability_snapshot_hash: &akzio_domain::ContentHash,
-        tool_set_hash: &akzio_domain::ContentHash,
+        runtime_snapshot: &AgentTurnRuntimeSnapshot,
     ) -> ResearchResult<Artifact> {
         let request_hash = model_request_hash(request)?;
-        let artifact = Artifact::new(
-            ArtifactKind::AgentTurn,
-            self.store.put_json(&json!({
-                "turn": record.turn,
-                "attempt": record.attempt,
-                "contract_hash": record.contract.contract_hash,
-                "context_manifest": record.manifest.artifact.artifact_id,
-                "request_hash": request_hash,
-                "capability_snapshot": capability_snapshot,
-                "capability_snapshot_hash": capability_snapshot_hash,
-                "tool_set_hash": tool_set_hash,
-                "request": request,
-                "response": response,
-            }))?,
-            format!("agent.turn.{}", record.contract.purpose.as_str()),
-            ArtifactLifecycle::RunScoped,
-            ArtifactProvenance {
-                source_family: "akzio.agent".to_owned(),
-                observed_at: None,
-                retrieved_at: record.now,
-                source_uri: None,
-                confidence_ppm: 1_000_000,
-                producer_contract_hash: Some(record.contract.contract_hash.clone()),
-            },
-            Some(record.permit.artifact_origin()),
-            vec![ArtifactRef {
-                artifact_id: record.manifest.artifact.artifact_id.clone(),
-                kind: ArtifactKind::ContextManifest,
-            }],
-            record.now,
-        )?;
-        self.store.write_task_artifact(
-            record.permit,
-            &artifact,
-            LifecycleEventType::AgentTurnCompleted,
-            record.now,
-        )?;
-        Ok(artifact)
+        let request = request.clone();
+        let response = response.clone();
+        let runtime_snapshot = runtime_snapshot.clone();
+        self.store_executor
+            .execute(move |store| {
+                let artifact = Artifact::new(
+                    ArtifactKind::AgentTurn,
+                    store.put_json(&json!({
+                        "turn": record.turn,
+                        "attempt": record.attempt,
+                        "contract_hash": &record.contract.contract_hash,
+                        "context_manifest": &record.manifest.artifact.artifact_id,
+                        "request_hash": request_hash,
+                        "capability_snapshot": runtime_snapshot.capability,
+                        "capability_snapshot_hash": runtime_snapshot.capability_hash,
+                        "budget_policy": runtime_snapshot.budget_policy,
+                        "budget_policy_hash": runtime_snapshot.budget_policy_hash,
+                        "tool_set_hash": runtime_snapshot.tool_set_hash,
+                        "request": request,
+                        "response": response,
+                    }))?,
+                    format!("agent.turn.{}", record.contract.purpose.as_str()),
+                    ArtifactLifecycle::RunScoped,
+                    ArtifactProvenance {
+                        source_family: "akzio.agent".to_owned(),
+                        observed_at: None,
+                        retrieved_at: record.now,
+                        source_uri: None,
+                        confidence_ppm: 1_000_000,
+                        producer_contract_hash: Some(record.contract.contract_hash.clone()),
+                    },
+                    Some(record.permit.artifact_origin()),
+                    vec![ArtifactRef {
+                        artifact_id: record.manifest.artifact.artifact_id.clone(),
+                        kind: ArtifactKind::ContextManifest,
+                    }],
+                    record.now,
+                )?;
+                store.write_task_artifact(
+                    &record.permit,
+                    &artifact,
+                    LifecycleEventType::AgentTurnCompleted,
+                    record.now,
+                )?;
+                Ok::<_, ResearchError>(artifact)
+            })
+            .await?
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn record_failed_turn(
+    async fn record_failed_turn(
         &self,
-        record: &TurnRecord<'_>,
+        record: TurnRecord,
         request: &AgentModelRequest,
         error_class: &str,
         error_detail: Option<Value>,
         model_debug: Option<&ModelCallTrace>,
         will_retry: bool,
-        capability_snapshot: &ModelCapabilitySnapshot,
-        capability_snapshot_hash: &akzio_domain::ContentHash,
-        tool_set_hash: &akzio_domain::ContentHash,
+        runtime_snapshot: &AgentTurnRuntimeSnapshot,
     ) -> ResearchResult<Artifact> {
         let request_hash = model_request_hash(request)?;
-        let mut trace = json!({
-            "turn": record.turn,
-            "attempt": record.attempt,
-            "contract_hash": record.contract.contract_hash,
-            "context_manifest": record.manifest.artifact.artifact_id,
-            "request_hash": request_hash,
-            "capability_snapshot": capability_snapshot,
-            "capability_snapshot_hash": capability_snapshot_hash,
-            "tool_set_hash": tool_set_hash,
-            "request": request,
-            "error_class": error_class,
-            "will_retry": will_retry,
-        });
-        if let Some(error_detail) = error_detail {
-            trace["error_detail"] = error_detail;
-        }
-        if let Some(model_debug) = model_debug {
-            trace["model_debug"] = serde_json::to_value(model_debug)?;
-        }
-        let artifact = Artifact::new(
-            ArtifactKind::AgentTurn,
-            self.store.put_json(&trace)?,
-            format!("agent.turn.{}", record.contract.purpose.as_str()),
-            ArtifactLifecycle::RunScoped,
-            ArtifactProvenance {
-                source_family: "akzio.agent".to_owned(),
-                observed_at: None,
-                retrieved_at: record.now,
-                source_uri: None,
-                confidence_ppm: 1_000_000,
-                producer_contract_hash: Some(record.contract.contract_hash.clone()),
-            },
-            Some(record.permit.artifact_origin()),
-            vec![ArtifactRef {
-                artifact_id: record.manifest.artifact.artifact_id.clone(),
-                kind: ArtifactKind::ContextManifest,
-            }],
-            record.now,
-        )?;
-        self.store.write_task_artifact(
-            record.permit,
-            &artifact,
-            if will_retry {
-                LifecycleEventType::AgentTurnRetryableFailed
-            } else {
-                LifecycleEventType::AgentTurnFailed
-            },
-            record.now,
-        )?;
-        Ok(artifact)
+        let request = request.clone();
+        let error_class = error_class.to_owned();
+        let model_debug = model_debug.cloned();
+        let runtime_snapshot = runtime_snapshot.clone();
+        self.store_executor
+            .execute(move |store| {
+                let mut trace = json!({
+                    "turn": record.turn,
+                    "attempt": record.attempt,
+                    "contract_hash": &record.contract.contract_hash,
+                    "context_manifest": &record.manifest.artifact.artifact_id,
+                    "request_hash": request_hash,
+                    "capability_snapshot": runtime_snapshot.capability,
+                    "capability_snapshot_hash": runtime_snapshot.capability_hash,
+                    "budget_policy": runtime_snapshot.budget_policy,
+                    "budget_policy_hash": runtime_snapshot.budget_policy_hash,
+                    "tool_set_hash": runtime_snapshot.tool_set_hash,
+                    "request": request,
+                    "error_class": error_class,
+                    "will_retry": will_retry,
+                });
+                if let Some(error_detail) = error_detail {
+                    trace["error_detail"] = error_detail;
+                }
+                if let Some(model_debug) = model_debug {
+                    trace["model_debug"] = serde_json::to_value(model_debug)?;
+                }
+                let artifact = Artifact::new(
+                    ArtifactKind::AgentTurn,
+                    store.put_json(&trace)?,
+                    format!("agent.turn.{}", record.contract.purpose.as_str()),
+                    ArtifactLifecycle::RunScoped,
+                    ArtifactProvenance {
+                        source_family: "akzio.agent".to_owned(),
+                        observed_at: None,
+                        retrieved_at: record.now,
+                        source_uri: None,
+                        confidence_ppm: 1_000_000,
+                        producer_contract_hash: Some(record.contract.contract_hash.clone()),
+                    },
+                    Some(record.permit.artifact_origin()),
+                    vec![ArtifactRef {
+                        artifact_id: record.manifest.artifact.artifact_id.clone(),
+                        kind: ArtifactKind::ContextManifest,
+                    }],
+                    record.now,
+                )?;
+                store.write_task_artifact(
+                    &record.permit,
+                    &artifact,
+                    if will_retry {
+                        LifecycleEventType::AgentTurnRetryableFailed
+                    } else {
+                        LifecycleEventType::AgentTurnFailed
+                    },
+                    record.now,
+                )?;
+                Ok::<_, ResearchError>(artifact)
+            })
+            .await?
     }
 }

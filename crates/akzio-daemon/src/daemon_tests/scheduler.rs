@@ -202,7 +202,7 @@ async fn auto_paper_requires_a_durable_workflow_proposal() {
     let source = StorePaperWorkflowSource::new(daemon.store().clone());
 
     assert!(matches!(
-        source.proposal("preflight"),
+        source.proposal("preflight").await,
         Err(SchedulerError::WorkflowUnavailable)
     ));
     assert!(daemon
@@ -216,8 +216,8 @@ async fn auto_paper_requires_a_durable_workflow_proposal() {
     daemon.store().verify_integrity().unwrap();
 }
 
-#[test]
-fn auto_paper_source_bootstraps_the_first_approved_proposal() {
+#[tokio::test]
+async fn auto_paper_source_bootstraps_the_first_approved_proposal() {
     let directory = tempdir().unwrap();
     let mut daemon_config = config(directory.path().to_path_buf());
     daemon_config.auto_paper = true;
@@ -226,6 +226,7 @@ fn auto_paper_source_bootstraps_the_first_approved_proposal() {
     let proposal = daemon
         .paper_workflow_source()
         .proposal("preflight")
+        .await
         .unwrap();
 
     assert_eq!(proposal.topology_id, "active");
@@ -253,6 +254,7 @@ async fn auto_paper_source_ignores_a_newer_debug_proposal() {
     let proposal = daemon
         .paper_workflow_source()
         .proposal("preflight")
+        .await
         .unwrap();
 
     assert_eq!(proposal.topology_id, "active");

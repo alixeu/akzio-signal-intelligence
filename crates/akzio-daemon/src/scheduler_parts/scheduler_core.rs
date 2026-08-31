@@ -1,3 +1,5 @@
+use super::*;
+
 impl PaperScheduler {
     pub fn new(
         store: V2Store,
@@ -8,6 +10,7 @@ impl PaperScheduler {
             return Err(SchedulerError::InvalidOwner);
         }
         Ok(Self {
+            store_executor: StoreExecutor::new(store.clone()),
             store,
             workflow,
             owner_id,
@@ -16,6 +19,11 @@ impl PaperScheduler {
             market_data_feed: None,
             runtime_identity_hash: None,
         })
+    }
+
+    pub fn with_store_executor(mut self, store_executor: StoreExecutor) -> Self {
+        self.store_executor = store_executor;
+        self
     }
 
     pub fn with_market_data_feed(mut self, market_data_feed: Option<AlpacaMarketDataFeed>) -> Self {
@@ -39,7 +47,7 @@ impl PaperScheduler {
         Ok(self)
     }
 
-    fn current_approval_binding(&self) -> SchedulerResult<Option<(Artifact, Artifact)>> {
+    pub(super) fn current_approval_binding(&self) -> SchedulerResult<Option<(Artifact, Artifact)>> {
         let Some(approval) = self
             .store
             .latest_artifact_by_kind(ArtifactKind::PaperLaunchApproval)?
@@ -74,7 +82,7 @@ impl PaperScheduler {
         Ok(self.store.reserve_canary_session(&lease, reservation)?)
     }
 
-    fn paper_snapshot_artifacts(
+    pub(super) fn paper_snapshot_artifacts(
         &self,
         run_id: &RunId,
         session_key: &str,

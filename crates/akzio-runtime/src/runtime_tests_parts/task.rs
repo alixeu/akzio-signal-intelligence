@@ -151,7 +151,7 @@ async fn task_runtime_replays_exhausted_retry_as_terminal_failure() {
 }
 
 #[tokio::test]
-async fn task_runtime_recovers_expired_attempt_and_honors_cancel_requests() {
+async fn task_runtime_recovery_is_explicit_and_honors_cancel_requests() {
     let root = tempdir().unwrap();
     let store = V2Store::open(root.path()).unwrap();
     let workflow = WorkflowRuntime::new(store.clone(), catalogue());
@@ -184,6 +184,16 @@ async fn task_runtime_recovers_expired_attempt_and_honors_cancel_requests() {
     let old_permit = abandoned.permit.clone();
     let old_attempt_id = old_permit.attempt_id.clone();
     let old_epoch = old_permit.epoch;
+    assert!(!tasks
+        .run_one("pre-recovery-worker", |_| async {
+            panic!("run_one must not recover expired tasks")
+        })
+        .await
+        .unwrap());
+    assert_eq!(
+        tasks.recover_expired_tasks(Utc::now()).await.unwrap(),
+        1
+    );
     assert!(tasks
         .run_one("recovery-worker", move |task| {
             assert_ne!(task.permit.attempt_id, old_attempt_id);
@@ -247,4 +257,94 @@ async fn task_runtime_recovers_expired_attempt_and_honors_cancel_requests() {
         workflow.replay_run(&run_id).unwrap(),
         tasks.store().workflow_snapshot(&run_id).unwrap()
     );
+}
+
+#[tokio::test]
+async fn task_commit_and_finish_failpoints_are_idempotent_after_recovery() {
+    for (point, with_artifact, expected_handler_calls) in [
+        (TaskFailpoint::BeforeCommit, true, 2),
+        (TaskFailpoint::AfterCommit, true, 1),
+        (TaskFailpoint::BeforeFinish, false, 2),
+        (TaskFailpoint::AfterFinish, false, 1),
+    ] {
+        let root = tempdir().unwrap();
+        let store = V2Store::open(root.path()).unwrap();
+        let workflow = WorkflowRuntime::new(store.clone(), catalogue());
+        let graph = workflow.bootstrap(RunPurpose::Debug, "failpoint").unwrap();
+        let task_id = graph.nodes[0].task_id.clone();
+        let run_id = RunId::new();
+        workflow
+            .submit(run_id.clone(), RunPurpose::Debug, graph, Utc::now())
+            .unwrap();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let tasks = TaskRuntime::new(store.clone())
+            .with_lease_duration(Duration::milliseconds(1))
+            .unwrap()
+            .with_failpoint(point);
+        let first_calls = std::sync::Arc::clone(&calls);
+        let first_store = store.clone();
+        let first = tasks
+            .run_one("failpoint-worker", move |task| {
+                first_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let completion = if with_artifact {
+                    TaskCompletion::Succeeded(vec![task_artifact(&first_store, &task, Utc::now())])
+                } else {
+                    TaskCompletion::NoOutput
+                };
+                async move { completion }
+            })
+            .await;
+        assert!(matches!(first, Err(RuntimeError::InjectedFailpoint(_))), "{point:?}");
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let recovered = tasks.recover_expired_tasks(Utc::now()).await.unwrap();
+        if matches!(point, TaskFailpoint::BeforeCommit | TaskFailpoint::BeforeFinish) {
+            assert_eq!(recovered, 1, "{point:?}");
+            let second_calls = std::sync::Arc::clone(&calls);
+            let second_store = store.clone();
+            assert!(tasks
+                .run_one("recovery-worker", move |task| {
+                    second_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let completion = if with_artifact {
+                        TaskCompletion::Succeeded(vec![task_artifact(
+                            &second_store,
+                            &task,
+                            Utc::now(),
+                        )])
+                    } else {
+                        TaskCompletion::NoOutput
+                    };
+                    async move { completion }
+                })
+                .await
+                .unwrap(), "{point:?}");
+        } else {
+            assert_eq!(recovered, 0, "{point:?}");
+        }
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            expected_handler_calls,
+            "{point:?}"
+        );
+        if with_artifact {
+            let proof = store.current_succeeded_attempt(&run_id, &task_id).unwrap();
+            assert_eq!(proof.outputs.len(), 1, "{point:?}");
+        } else {
+            let snapshot = store.workflow_snapshot(&run_id).unwrap();
+            let task = snapshot
+                .tasks
+                .iter()
+                .find(|task| task.node.task_id == task_id)
+                .unwrap();
+            assert_eq!(task.status, TaskStatus::Succeeded, "{point:?}");
+        }
+        let succeeded = store
+            .events_after(&run_id, 0, 1_000)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event_type == LifecycleEventType::TaskSucceeded.as_str())
+            .count();
+        assert_eq!(succeeded, 1, "{point:?}");
+    }
 }

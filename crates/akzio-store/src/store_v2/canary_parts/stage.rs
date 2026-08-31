@@ -6,6 +6,11 @@ impl V2Store {
         now: DateTime<Utc>,
     ) -> StoreResult<CanaryCampaignHead> {
         spec.validate()?;
+        if !spec.has_paired_cohorts() {
+            return Err(StoreError::CanaryCampaignConflict(
+                "new canary campaigns require paired cohort manifests".to_owned(),
+            ));
+        }
         self.validate_campaign_artifacts(spec)?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -90,47 +95,33 @@ impl V2Store {
         assert_daemon_lease(&transaction, lease, now)?;
         let current = read_campaign(&transaction, campaign_id)?
             .ok_or_else(|| StoreError::MissingCanaryCampaign(campaign_id.to_string()))?;
+        if let Some(idempotent) = idempotent_transition(&current, expected_status, verdict) {
+            transaction.commit()?;
+            return Ok(idempotent);
+        }
         if current.status != expected_status {
             return Err(StoreError::CanaryCampaignConflict(format!(
                 "{} expected {:?}, found {:?}",
                 campaign_id, expected_status, current.status
             )));
         }
-
-        let next_status = match verdict {
-            CanaryVerdict::Advance => current.status.next().ok_or_else(|| {
-                StoreError::CanaryCampaignConflict(format!(
-                    "{} cannot advance from {:?}",
-                    campaign_id, current.status
-                ))
-            })?,
-            CanaryVerdict::Hold | CanaryVerdict::Defer => current.status,
-            CanaryVerdict::Rollback => CanaryCampaignStatus::Frozen,
-        };
-        let revision = current.revision.saturating_add(1);
-        let active = i64::from(!matches!(
-            next_status,
-            CanaryCampaignStatus::Completed | CanaryCampaignStatus::Frozen
-        ));
-        transaction.execute(
-            "UPDATE rebuild_canary_campaigns SET status_json = ?1, last_verdict_json = ?2, revision = ?3, active = ?4, updated_at = ?5 WHERE campaign_id = ?6",
-            params![
-                serde_json::to_string(&next_status)?,
-                serde_json::to_string(&verdict)?,
-                revision,
-                active,
-                now.to_rfc3339(),
-                campaign_id.as_str(),
-            ],
+        if verdict == CanaryVerdict::Advance
+            && current.status.is_level()
+            && current.spec.has_paired_cohorts()
+        {
+            return Err(StoreError::CanaryCampaignConflict(
+                "paired cohort evaluation is required to advance".to_owned(),
+            ));
+        }
+        let updated = transition_campaign_transaction(
+            &transaction,
+            current,
+            campaign_id,
+            verdict,
+            now,
         )?;
         transaction.commit()?;
-        Ok(CanaryCampaignHead {
-            spec: current.spec,
-            status: next_status,
-            last_verdict: Some(verdict),
-            revision,
-            updated_at: now,
-        })
+        Ok(updated)
     }
 
     pub fn reserve_canary_session(
@@ -145,72 +136,84 @@ impl V2Store {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_daemon_lease(&transaction, lease, reservation.reserved_at)?;
-        let current = read_campaign(&transaction, &reservation.campaign_id)?.ok_or_else(|| {
-            StoreError::MissingCanaryCampaign(reservation.campaign_id.to_string())
-        })?;
-        if current.status != reservation.level {
-            return Err(StoreError::CanaryCampaignConflict(format!(
-                "{} session level {:?} does not match campaign {:?}",
-                reservation.campaign_id, reservation.level, current.status
-            )));
-        }
-        if run_purpose_from_connection(&transaction, &reservation.parent_run_id)?
-            != RunPurpose::Paper
-            || run_purpose_from_connection(&transaction, &reservation.contract_shadow_run_id)?
-                != RunPurpose::Shadow
-            || run_purpose_from_connection(&transaction, &reservation.topology_shadow_run_id)?
-                != RunPurpose::Shadow
-            || run_purpose_from_connection(&transaction, &reservation.bundle_shadow_run_id)?
-                != RunPurpose::Shadow
-        {
-            return Err(StoreError::CanaryCampaignConflict(
-                "canary session run purposes".to_owned(),
-            ));
-        }
-
-        if let Some(existing) =
-            read_session(&transaction, &reservation.campaign_id, reservation.level)?
-        {
-            if existing.reservation != *reservation {
-                return Err(StoreError::CanaryCampaignConflict(format!(
-                    "{} already has a different {:?} session",
-                    reservation.campaign_id, reservation.level
-                )));
-            }
-            transaction.commit()?;
-            return Ok(existing);
-        }
-
-        let duplicate_session: Option<String> = transaction
-            .query_row(
-                "SELECT campaign_id FROM rebuild_canary_sessions WHERE session_key = ?1",
-                params![reservation.session_key],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if duplicate_session.is_some() {
-            return Err(StoreError::CanaryCampaignConflict(
-                reservation.session_key.clone(),
-            ));
-        }
-
-        transaction.execute(
-            "INSERT INTO rebuild_canary_sessions (campaign_id, level_json, session_key, parent_run_id, contract_shadow_run_id, topology_shadow_run_id, bundle_shadow_run_id, scheduler_epoch, reserved_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                reservation.campaign_id.as_str(),
-                serde_json::to_string(&reservation.level)?,
-                reservation.session_key,
-                reservation.parent_run_id.0,
-                reservation.contract_shadow_run_id.0,
-                reservation.topology_shadow_run_id.0,
-                reservation.bundle_shadow_run_id.0,
-                reservation.scheduler_epoch,
-                reservation.reserved_at.to_rfc3339(),
-            ],
-        )?;
+        Self::commit_canary_session_transaction(&transaction, reservation)?;
         transaction.commit()?;
-        Ok(StoredCanarySession {
-            reservation: reservation.clone(),
+        drop(connection);
+        if let Some(cohort_id) = &reservation.cohort_id {
+            return self
+                .canary_session_by_key(
+                    &reservation.campaign_id,
+                    reservation.level,
+                    &reservation.session_key,
+                )?
+                .ok_or_else(|| {
+                    StoreError::Integrity(format!(
+                        "canary cohort session {cohort_id}/{} missing after commit",
+                        reservation.session_key
+                    ))
+                });
+        }
+        let connection = self.connection()?;
+        read_session(&connection, &reservation.campaign_id, reservation.level)?.ok_or_else(|| {
+            StoreError::Integrity("legacy canary session missing after commit".to_owned())
         })
     }
+}
+
+fn idempotent_transition(
+    current: &CanaryCampaignHead,
+    expected_status: CanaryCampaignStatus,
+    verdict: CanaryVerdict,
+) -> Option<CanaryCampaignHead> {
+    if current.last_verdict != Some(verdict) {
+        return None;
+    }
+    let repeated = match verdict {
+        CanaryVerdict::Advance => expected_status.next() == Some(current.status),
+        CanaryVerdict::Rollback => current.status == CanaryCampaignStatus::Frozen,
+        CanaryVerdict::Hold | CanaryVerdict::Defer => current.status == expected_status,
+    };
+    repeated.then(|| current.clone())
+}
+
+fn transition_campaign_transaction(
+    transaction: &Transaction<'_>,
+    current: CanaryCampaignHead,
+    campaign_id: &ContentHash,
+    verdict: CanaryVerdict,
+    now: DateTime<Utc>,
+) -> StoreResult<CanaryCampaignHead> {
+    let next_status = match verdict {
+        CanaryVerdict::Advance => current.status.next().ok_or_else(|| {
+            StoreError::CanaryCampaignConflict(format!(
+                "{} cannot advance from {:?}",
+                campaign_id, current.status
+            ))
+        })?,
+        CanaryVerdict::Hold | CanaryVerdict::Defer => current.status,
+        CanaryVerdict::Rollback => CanaryCampaignStatus::Frozen,
+    };
+    let revision = current.revision.saturating_add(1);
+    let active = i64::from(!matches!(
+        next_status,
+        CanaryCampaignStatus::Completed | CanaryCampaignStatus::Frozen
+    ));
+    transaction.execute(
+        "UPDATE rebuild_canary_campaigns SET status_json = ?1, last_verdict_json = ?2, revision = ?3, active = ?4, updated_at = ?5 WHERE campaign_id = ?6",
+        params![
+            serde_json::to_string(&next_status)?,
+            serde_json::to_string(&verdict)?,
+            revision,
+            active,
+            now.to_rfc3339(),
+            campaign_id.as_str(),
+        ],
+    )?;
+    Ok(CanaryCampaignHead {
+        spec: current.spec,
+        status: next_status,
+        last_verdict: Some(verdict),
+        revision,
+        updated_at: now,
+    })
 }

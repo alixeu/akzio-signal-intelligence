@@ -1,5 +1,7 @@
+use super::*;
+
 impl Daemon {
-    fn observer_learning_analytics(
+    pub(super) fn observer_learning_analytics(
         &self,
         now: DateTime<Utc>,
         visible_transitions: &[ObserverPolicyTransition],

@@ -1,5 +1,5 @@
-#[test]
-fn cancellation_and_freeze_are_durable_store_owned_transitions() {
+#[tokio::test]
+async fn cancellation_and_freeze_are_durable_store_owned_transitions() {
     let directory = tempdir().unwrap();
     let daemon = Daemon::with_model(
         config(directory.path().to_path_buf()),
@@ -10,6 +10,7 @@ fn cancellation_and_freeze_are_durable_store_owned_transitions() {
     assert_eq!(
         daemon
             .request_cancel(&run_id, "fixture cancellation request")
+            .await
             .unwrap(),
         1
     );
@@ -51,6 +52,101 @@ async fn http_control_rejects_non_loopback_bind() {
             .await,
         Err(DaemonError::InvalidInput(_))
     ));
+}
+
+#[tokio::test]
+async fn release_evidence_endpoint_materializes_store_owned_bundle() {
+    let directory = tempdir().unwrap();
+    let daemon = Daemon::with_model(
+        config(directory.path().to_path_buf()),
+        fixture_model_client(),
+    )
+    .unwrap();
+    let run_id = daemon.submit_default(RunPurpose::Debug).unwrap();
+    let response = daemon
+        .router()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(format!("/control/store/release-evidence/{run_id}"))
+                .header("x-akzio-token", "fixture-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let bundle: akzio_domain::ReleaseEvidenceBundle = serde_json::from_slice(&body).unwrap();
+    assert_eq!(bundle.body.run_id, run_id);
+    assert_eq!(
+        bundle.status,
+        akzio_domain::ReleaseEvidenceStatus::NotApprovable
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn blocking_store_maintenance_keeps_http_responsive() {
+    let directory = tempdir().unwrap();
+    let daemon = Daemon::with_model(
+        config(directory.path().to_path_buf()),
+        fixture_model_client(),
+    )
+    .unwrap();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let started_at = std::time::Instant::now();
+    let maintenance = tokio::spawn(http::run_store_maintenance(
+        daemon.maintenance(),
+        StoreMaintenanceKind::Test,
+        move |_| {
+            started_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+            Ok(())
+        },
+    ));
+
+    started_rx.await.unwrap();
+    let started_promptly = started_at.elapsed() < std::time::Duration::from_secs(2);
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        daemon.router().oneshot(
+            Request::builder()
+                .uri("/control/store/executor")
+                .header("x-akzio-token", "fixture-token")
+                .body(Body::empty())
+                .unwrap(),
+        ),
+    )
+    .await;
+    let _ = release_tx.send(());
+    maintenance.await.unwrap().unwrap();
+
+    assert!(started_promptly, "maintenance ran on the Tokio event loop");
+    let response = response.unwrap().unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status["maintenance"]["state"], "running");
+}
+
+#[tokio::test]
+async fn store_maintenance_join_error_maps_to_internal_server_error() {
+    let directory = tempdir().unwrap();
+    let status = http::run_store_maintenance(
+        application::Maintenance::new(StoreExecutor::new(
+            V2Store::open(directory.path()).unwrap(),
+        )),
+        StoreMaintenanceKind::Test,
+        |_| -> std::result::Result<(), StoreError> { panic!("fixture maintenance panic") },
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 }
 
 #[tokio::test]
@@ -360,6 +456,7 @@ async fn http_sse_resumes_from_the_requested_cursor() {
     let run_id = daemon.submit_default(RunPurpose::Debug).unwrap();
     daemon
         .request_cancel(&run_id, "fixture cancellation request")
+        .await
         .unwrap();
     let events = daemon.store().events_after(&run_id, 0, 16).unwrap();
     assert!(events.len() >= 2);

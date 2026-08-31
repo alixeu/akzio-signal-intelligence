@@ -2,20 +2,23 @@
 
 use super::*;
 
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[derive(Clone)]
-pub struct ResponsesClient {
+pub struct OpenAIResponsesClient {
     http: Client,
-    base_url: String,
+    pub(super) base_url: String,
     api_key: String,
     pub(super) model: String,
     pub(super) reasoning_effort: String,
-    timeout: std::time::Duration,
+    stream_idle_timeout: Duration,
 }
 
-impl std::fmt::Debug for ResponsesClient {
+impl std::fmt::Debug for OpenAIResponsesClient {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("ResponsesClient")
+            .debug_struct("OpenAIResponsesClient")
             .field("base_url", &self.base_url)
             .field("api_key", &"<redacted>")
             .field("model", &self.model)
@@ -24,12 +27,30 @@ impl std::fmt::Debug for ResponsesClient {
     }
 }
 
-impl ResponsesClient {
+impl OpenAIResponsesClient {
     pub fn new(
         base_url: impl Into<String>,
         api_key: impl Into<String>,
         model: impl Into<String>,
         reasoning_effort: impl Into<String>,
+    ) -> Result<Self> {
+        Self::with_timeouts(
+            base_url,
+            api_key,
+            model,
+            reasoning_effort,
+            DEFAULT_CONNECT_TIMEOUT,
+            DEFAULT_STREAM_IDLE_TIMEOUT,
+        )
+    }
+
+    fn with_timeouts(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+        reasoning_effort: impl Into<String>,
+        connect_timeout: Duration,
+        stream_idle_timeout: Duration,
     ) -> Result<Self> {
         let base_url = base_url.into().trim().trim_end_matches('/').to_owned();
         if base_url.is_empty() {
@@ -48,17 +69,34 @@ impl ResponsesClient {
             return Err(ModelError::EmptyReasoningEffort);
         }
         Ok(Self {
-            http: Client::new(),
+            http: Client::builder()
+                .connect_timeout(connect_timeout)
+                .read_timeout(stream_idle_timeout)
+                .build()?,
             base_url,
             api_key,
             model,
             reasoning_effort,
-            timeout: std::time::Duration::from_secs(30),
+            stream_idle_timeout,
         })
     }
 
     pub fn request_body(&self, request: &ModelRequest) -> Value {
-        responses_request_body(&self.model, &self.reasoning_effort, request)
+        openai_responses_request_body(&self.model, &self.reasoning_effort, request)
+    }
+
+    pub fn declared_capabilities(&self) -> OpenAIResponsesCapabilities {
+        let official_endpoint = is_official_openai_base_url(&self.base_url);
+        OpenAIResponsesCapabilities {
+            supports_tool_calls: official_endpoint,
+            supports_stateless_continuation: official_endpoint,
+            reasoning_items: official_endpoint,
+            encrypted_continuation: official_endpoint,
+            native_web_tool: official_endpoint,
+            streaming: official_endpoint,
+            basis: ModelCapabilityBasis::StaticDeclared,
+            verified: false,
+        }
     }
 
     pub async fn respond(&self, request: ModelRequest) -> Result<ModelResponse> {
@@ -75,7 +113,6 @@ impl ResponsesClient {
             .http
             .post(format!("{}/responses", self.base_url))
             .bearer_auth(&self.api_key)
-            .timeout(self.timeout)
             .json(&body)
             .send()
             .await?;
@@ -96,7 +133,13 @@ impl ResponsesClient {
                 Ok(None) => break,
                 Err(error) => {
                     end_reasoning(&mut stream, &mut on_event);
-                    return Err(error.into());
+                    return Err(if error.is_timeout() {
+                        ModelError::StreamIdleTimeout {
+                            idle_timeout: self.stream_idle_timeout,
+                        }
+                    } else {
+                        error.into()
+                    });
                 }
             };
             pending.extend_from_slice(&chunk);
@@ -136,7 +179,7 @@ impl ResponsesClient {
         let raw = stream.response.ok_or_else(|| {
             ModelError::InvalidStream("missing response.completed event".to_owned())
         })?;
-        response_from_raw(raw, body)
+        openai_response_from_raw(raw, body)
     }
 }
 
@@ -199,7 +242,7 @@ fn end_reasoning(stream: &mut ReasoningStream, on_event: &mut impl FnMut(ModelSt
     }
 }
 
-pub(super) fn responses_request_body(
+pub(super) fn openai_responses_request_body(
     model: &str,
     reasoning_effort: &str,
     request: &ModelRequest,
@@ -290,7 +333,7 @@ pub(super) fn responses_request_body(
     body
 }
 
-pub(super) fn response_from_raw(raw: Value, request_body: Value) -> Result<ModelResponse> {
+pub(super) fn openai_response_from_raw(raw: Value, request_body: Value) -> Result<ModelResponse> {
     if raw.get("status").and_then(Value::as_str) == Some("incomplete") {
         let reason = raw
             .pointer("/incomplete_details/reason")
@@ -307,6 +350,7 @@ pub(super) fn response_from_raw(raw: Value, request_body: Value) -> Result<Model
     if output_text.is_empty() && tool_calls.is_empty() {
         return Err(ModelError::MissingOutput);
     }
+    let usage = normalize_usage(&raw);
     Ok(ModelResponse {
         output_text,
         tool_calls,
@@ -317,8 +361,41 @@ pub(super) fn response_from_raw(raw: Value, request_body: Value) -> Result<Model
                 .unwrap_or_default(),
         ),
         raw,
+        usage,
         request_body,
     })
+}
+
+fn usage_value(raw: &Value, pointers: &[&str]) -> Option<u64> {
+    pointers
+        .iter()
+        .find_map(|pointer| raw.pointer(pointer).and_then(Value::as_u64))
+}
+
+/// Normalize field names emitted by Responses-compatible providers without
+/// claiming their broader transport or continuation semantics are identical.
+fn normalize_usage(raw: &Value) -> ModelUsage {
+    ModelUsage {
+        input_tokens: usage_value(raw, &["/usage/input_tokens", "/usage/prompt_tokens"]),
+        cached_input_tokens: usage_value(
+            raw,
+            &[
+                "/usage/input_tokens_details/cached_tokens",
+                "/usage/prompt_tokens_details/cached_tokens",
+                "/usage/cache_read_input_tokens",
+                "/usage/cached_input_tokens",
+            ],
+        ),
+        output_tokens: usage_value(raw, &["/usage/output_tokens", "/usage/completion_tokens"]),
+        reasoning_tokens: usage_value(
+            raw,
+            &[
+                "/usage/output_tokens_details/reasoning_tokens",
+                "/usage/completion_tokens_details/reasoning_tokens",
+                "/usage/reasoning_tokens",
+            ],
+        ),
+    }
 }
 
 fn extract_refusal(response: &Value) -> Option<String> {
@@ -405,6 +482,116 @@ pub(super) fn parse_tool_call(value: &Value) -> Option<ModelToolCall> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        task::JoinHandle,
+        time::{sleep, Duration},
+    };
+
+    const COMPLETED_SSE: &str =
+        "data: {\"type\":\"response.completed\",\"response\":{\"output_text\":\"{}\"}}\n\n";
+
+    async fn serve_sse(chunks: Vec<(Duration, &'static str)>) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.set_nodelay(true).unwrap();
+            let mut request = [0; 4096];
+            assert_ne!(socket.read(&mut request).await.unwrap(), 0);
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+
+            for (delay, chunk) in chunks {
+                sleep(delay).await;
+                let frame = format!("{:x}\r\n{chunk}\r\n", chunk.len());
+                if socket.write_all(frame.as_bytes()).await.is_err() {
+                    return;
+                }
+                socket.flush().await.unwrap();
+            }
+            let _ = socket.write_all(b"0\r\n\r\n").await;
+        });
+        (format!("http://{address}"), server)
+    }
+
+    fn test_client(base_url: String, timeout: Duration) -> OpenAIResponsesClient {
+        OpenAIResponsesClient::with_timeouts(
+            base_url,
+            "fixture-key",
+            "fixture-model",
+            "medium",
+            Duration::from_secs(1),
+            timeout,
+        )
+        .unwrap()
+    }
+
+    fn request() -> ModelRequest {
+        ModelRequest {
+            instructions: "test".to_owned(),
+            input: ModelInput::Fresh {
+                text: "{}".to_owned(),
+            },
+            max_output_tokens: 1,
+            tools: vec![],
+            tool_choice: ModelToolChoice::None,
+            fixture_key: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn active_stream_can_outlive_idle_interval() {
+        let delay = Duration::from_millis(30);
+        let mut chunks = vec![(delay, ": keep-alive\n\n"); 4];
+        chunks.push((delay, COMPLETED_SSE));
+        let (base_url, server) = serve_sse(chunks).await;
+
+        let response = test_client(base_url, Duration::from_millis(100))
+            .respond(request())
+            .await;
+        server.await.unwrap();
+
+        assert_eq!(response.unwrap().output_text, "{}");
+    }
+
+    #[tokio::test]
+    async fn idle_stream_has_a_distinct_error() {
+        let idle_timeout = Duration::from_millis(40);
+        let (base_url, server) = serve_sse(vec![(Duration::from_millis(200), COMPLETED_SSE)]).await;
+
+        let error = test_client(base_url, idle_timeout)
+            .respond(request())
+            .await
+            .unwrap_err();
+        server.abort();
+
+        assert!(matches!(
+            error,
+            ModelError::StreamIdleTimeout {
+                idle_timeout: actual
+            } if actual == idle_timeout
+        ));
+    }
+
+    #[tokio::test]
+    async fn connection_failure_remains_a_transport_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+
+        let error = test_client(format!("http://{address}"), Duration::from_secs(1))
+            .respond(request())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ModelError::Transport(_)));
+    }
 
     #[test]
     fn reasoning_summary_stream_maps_to_start_delta_end() {

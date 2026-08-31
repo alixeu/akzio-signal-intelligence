@@ -7,10 +7,7 @@ fn runtime_identity_from_config(config: &Config, config_path: &Path) -> Result<R
         .execution
         .market_data_feed
         .context("Paper runtime requires execution.market_data_feed")?;
-    let provider_id = Url::parse(&model.base_url)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_owned))
-        .unwrap_or_else(|| model.base_url.clone());
+    let provider_id = model.provider_identity().as_str().to_owned();
     let policy_identity = default_runtime_policy_identity()?;
     Ok(RuntimeIdentity {
         code_revision: source_revision()?,
@@ -29,6 +26,7 @@ fn runtime_identity_from_config(config: &Config, config_path: &Path) -> Result<R
                 "slippage_ppm": config.execution.slippage_ppm,
             },
             "model": {
+                "provider": model.provider_identity().as_str(),
                 "base_url": model.base_url,
                 "model": model.model,
                 "reasoning_effort": model.reasoning_effort,
@@ -135,7 +133,7 @@ fn set_optional_toml_string(
     }
 }
 
-fn validate_model_settings(model: &ModelConfig) -> Result<()> {
+fn validate_model_settings(model: &OpenAIResponsesConfig) -> Result<()> {
     if model.base_url.trim().is_empty()
         || model.model.trim().is_empty()
         || model.reasoning_effort.trim().is_empty()

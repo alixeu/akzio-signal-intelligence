@@ -6,9 +6,10 @@ import Foundation
 // the Rust store speak the same language even though this build reads mock data.
 
 /// `RunPurpose` — crates/akzio-domain/src/core.rs:307
-public enum RunPurpose: String, CaseIterable, Sendable {
+public enum RunPurpose: String, CaseIterable, Codable, Hashable, Sendable {
     case paper
     case debug
+    case positionPlan = "position_plan"
     case paperDryRun = "paper_dry_run"
     case replay
     case shadow
@@ -17,6 +18,7 @@ public enum RunPurpose: String, CaseIterable, Sendable {
         switch self {
         case .paper: "Paper"
         case .debug: "Debug"
+        case .positionPlan: "Position Plan"
         case .paperDryRun: "Paper Dry Run"
         case .replay: "Replay"
         case .shadow: "Shadow"
@@ -34,7 +36,36 @@ public enum RunPurpose: String, CaseIterable, Sendable {
         switch self {
         case .paper: .gold
         case .shadow: .gold
-        case .debug, .paperDryRun, .replay: .neutral
+        case .debug, .positionPlan, .paperDryRun, .replay: .neutral
+        }
+    }
+
+    public static let userLaunchModes: [RunPurpose] = [.debug, .positionPlan]
+
+    public var launchModeName: String {
+        switch self {
+        case .debug: "Full research"
+        case .positionPlan: "Position plan only"
+        default: displayName
+        }
+    }
+
+    public var launchModeSummary: String {
+        switch self {
+        case .debug: "Full research · Debug safety mode"
+        case .positionPlan: "Position plan · No execution"
+        default: displayName
+        }
+    }
+
+    public var launchModeDescription: String {
+        switch self {
+        case .debug:
+            "Run a full real-model research workflow. Paper submission remains scheduler-owned."
+        case .positionPlan:
+            "Generate target positions and stop before execution."
+        default:
+            displayName
         }
     }
 }

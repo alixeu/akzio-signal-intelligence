@@ -1,4 +1,5 @@
 fn contract(store: &V2Store) -> AgentContract {
+    let tool_specs = evidence_read_tool_specs(store).unwrap();
     AgentContract::new(
         ContractId::new(),
         1,
@@ -22,19 +23,13 @@ fn contract(store: &V2Store) -> AgentContract {
             kind: ToolKind::ReadEvidence,
             allowed_sources: vec!["market".to_owned()],
         }],
-        vec![ToolSpec {
-            name: "read_artifact".to_owned(),
-            description: "read granted artifact".to_owned(),
-            kind: ToolKind::ReadEvidence,
-            input_schema: store.put_json(&artifact_id_tool_input_schema()).unwrap(),
-            strict: true,
-        }],
+        tool_specs,
         OutputContract {
             artifact_kind: ArtifactKind::Claim,
             schema: store.put_json(&claim_output_schema()).unwrap(),
         },
         TaskBudget {
-            max_input_tokens: 2048,
+            max_input_tokens: 4096,
             max_output_tokens: 128,
             max_wall_time_secs: 30,
             max_tool_calls: 2,

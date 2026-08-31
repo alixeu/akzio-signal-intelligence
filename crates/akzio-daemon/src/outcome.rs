@@ -2,9 +2,17 @@
 
 use super::*;
 
-include!("outcome_parts/worker.rs");
-include!("outcome_parts/canary.rs");
-include!("outcome_parts/shadow.rs");
-include!("outcome_parts/materialization.rs");
-include!("outcome_parts/collection.rs");
-include!("outcome_parts/helpers.rs");
+#[path = "outcome_parts/canary.rs"]
+mod canary;
+#[path = "outcome_parts/collection.rs"]
+mod collection;
+#[path = "outcome_parts/helpers.rs"]
+mod helpers;
+#[path = "outcome_parts/materialization.rs"]
+mod materialization;
+#[path = "outcome_parts/shadow.rs"]
+mod shadow;
+#[path = "outcome_parts/worker.rs"]
+mod worker;
+
+use helpers::*;

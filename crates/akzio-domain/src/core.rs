@@ -250,6 +250,7 @@ impl BlobRef {
 #[serde(rename_all = "snake_case")]
 pub enum RunPurpose {
     Debug,
+    PositionPlan,
     Paper,
     PaperDryRun,
     Replay,
@@ -418,6 +419,7 @@ mod tests {
         assert!(RunPurpose::Paper.is_canonical_learning());
         for purpose in [
             RunPurpose::Debug,
+            RunPurpose::PositionPlan,
             RunPurpose::Replay,
             RunPurpose::PaperDryRun,
             RunPurpose::Shadow,
@@ -427,6 +429,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&RunPurpose::Replay).unwrap(),
             "\"replay\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RunPurpose::PositionPlan).unwrap(),
+            "\"position_plan\""
         );
     }
 }

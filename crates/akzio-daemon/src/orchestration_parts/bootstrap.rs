@@ -1,3 +1,5 @@
+use super::*;
+
 impl Daemon {
     /// Construct the local daemon with its production model adapter. Model
     /// credentials stay in local configuration and are never persisted.
@@ -52,21 +54,21 @@ impl Daemon {
         }
         production_evidence.insert(
             EvidenceSource::NewsWeb,
-            model_native_web_evidence_transport(model.clone(), EvidenceSource::NewsWeb),
+            model_native_web_evidence_transport(model.clone(), EvidenceSource::NewsWeb)?,
         );
         let outcome_worker_enabled =
             auto_paper && production_evidence.contains_key(&EvidenceSource::Alpaca);
-    if auto_paper && !production_evidence.contains_key(&EvidenceSource::Alpaca) {
-        return Err(DaemonError::InvalidInput(
-            "auto_paper requires Alpaca Paper evidence adapter".to_owned(),
-        ));
-    }
-    if auto_paper && !production_evidence.contains_key(&EvidenceSource::Fred) {
-        return Err(DaemonError::InvalidInput(
-            "auto_paper requires FRED_API_KEY".to_owned(),
-        ));
-    }
-    daemon.production_evidence = Arc::new(production_evidence);
+        if auto_paper && !production_evidence.contains_key(&EvidenceSource::Alpaca) {
+            return Err(DaemonError::InvalidInput(
+                "auto_paper requires Alpaca Paper evidence adapter".to_owned(),
+            ));
+        }
+        if auto_paper && !production_evidence.contains_key(&EvidenceSource::Fred) {
+            return Err(DaemonError::InvalidInput(
+                "auto_paper requires FRED_API_KEY".to_owned(),
+            ));
+        }
+        daemon.production_evidence = Arc::new(production_evidence);
         daemon.outcome_scheduling_runtime = OutcomeSchedulingRuntime::new(daemon.store.clone())
             .with_worker_enabled(outcome_worker_enabled);
         Ok(daemon)
@@ -106,8 +108,10 @@ impl Daemon {
         };
         let workflow =
             WorkflowRuntime::new(store.clone(), active.recipes).with_fixture_mode(fixture_mode);
+        let store_executor = StoreExecutor::new(store.clone());
         let (reasoning_events, _) = broadcast::channel(1_024);
         let agents = AgentRuntime::new(store.clone(), agent_catalogue, Duration::minutes(5))
+            .with_store_executor(store_executor.clone())
             .with_reasoning_events(reasoning_events.clone());
         let decision_runtime = V2DecisionRuntime::new(store.clone(), Default::default())?;
         let execution_runtime =
@@ -117,11 +121,13 @@ impl Daemon {
             workflow.clone(),
             format!("akzio-daemon-{}", RunId::new()),
         )?
+        .with_store_executor(store_executor.clone())
         .with_market_data_feed(config.market_data_feed)
         .with_runtime_identity_hash(config.runtime_identity_hash.clone());
 
         Ok(Self {
-            task_runtime: TaskRuntime::new(store.clone()),
+            store_executor: store_executor.clone(),
+            task_runtime: TaskRuntime::new(store.clone()).with_store_executor(store_executor),
             workflow,
             agents,
             model: ModelClientAdapter::with_debug(model, model_debug),
@@ -163,6 +169,7 @@ impl Daemon {
 
     pub fn paper_workflow_source(&self) -> StorePaperWorkflowSource {
         StorePaperWorkflowSource::new(self.store.clone())
+            .with_store_executor(self.store_executor.clone())
             .with_bootstrap(self.workflow.clone(), "active")
     }
 

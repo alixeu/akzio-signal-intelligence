@@ -1,4 +1,6 @@
-fn next_outcome_check_at(now: DateTime<Utc>) -> Result<DateTime<Utc>> {
+use super::*;
+
+pub(super) fn next_outcome_check_at(now: DateTime<Utc>) -> Result<DateTime<Utc>> {
     let today = DateTime::from_naive_utc_and_offset(
         now.date_naive()
             .and_hms_opt(22, 0, 0)

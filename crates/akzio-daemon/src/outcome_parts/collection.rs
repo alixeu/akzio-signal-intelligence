@@ -1,5 +1,7 @@
+use super::*;
+
 impl Daemon {
-    pub(super) async fn collect_outcome_materialization(
+    pub(crate) async fn collect_outcome_materialization(
         &self,
         outcome_lease: &DaemonLease,
         task: &ClaimedAttempt,
@@ -65,13 +67,8 @@ impl Daemon {
                 resource: resource.clone(),
                 max_age_secs: 604_800,
             };
-            let need_artifact = self.outcome_evidence_need(
-                outcome_lease,
-                task,
-                schedule_reference,
-                &need,
-                now,
-            )?;
+            let need_artifact =
+                self.outcome_evidence_need(outcome_lease, task, schedule_reference, &need, now)?;
             let need_reference = ArtifactRef {
                 artifact_id: need_artifact.artifact_id,
                 kind: ArtifactKind::EvidenceNeed,
@@ -104,13 +101,8 @@ impl Daemon {
         }
         let mut evidence_artifacts = Vec::with_capacity(acquisitions.len() * 2);
         for (need, request, acquired) in acquisitions {
-            let bundle = runtime.materialize_validated(
-                &task.permit,
-                &need,
-                &request,
-                acquired,
-                now,
-            )?;
+            let bundle =
+                runtime.materialize_validated(&task.permit, &need, &request, acquired, now)?;
             evidence_artifacts.extend([bundle.raw, bundle.normalized]);
         }
         let observations = horizon_observations(
@@ -220,7 +212,7 @@ impl Daemon {
         Ok(artifact)
     }
 
-    pub(super) fn paper_baseline_day(&self, run_id: &RunId) -> Result<NaiveDate> {
+    pub(crate) fn paper_baseline_day(&self, run_id: &RunId) -> Result<NaiveDate> {
         let slot = self.store.session_slot_for_run(run_id)?.ok_or_else(|| {
             DaemonError::InvalidInput(format!("Paper run {run_id} has no session slot"))
         })?;

@@ -17,12 +17,12 @@ use akzio_daemon::{
 };
 use akzio_domain::{
     content_hash_json, Artifact, ArtifactId, ArtifactKind, Asset, CanaryCampaignSpec, ContentHash,
-    LessonLifecycle, OutcomeCostModel, Retrospective, RunId, RunPurpose, RuntimeIdentity,
-    WorkflowStatus,
+    LessonLifecycle, OutcomeCostModel, ReleaseEvidenceBundle, Retrospective, RunId, RunPurpose,
+    RuntimeIdentity, WorkflowStatus,
 };
 use akzio_execution::paper::AlpacaPaper;
 use akzio_learning::{evaluate_frozen_evidence, FrozenEvidenceRecord, FrozenEvidenceSet};
-use akzio_model::ModelConfig;
+use akzio_model::OpenAIResponsesConfig;
 use akzio_store::v2::{CanaryCampaignHead, DaemonLease, SessionSlot, StoredRun, TrajectoryEntry};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -180,6 +180,11 @@ enum StoreCommand {
         #[arg(long)]
         include_raw_model: bool,
     },
+    ReleaseEvidence {
+        run_id: String,
+        #[arg(long)]
+        target: Option<PathBuf>,
+    },
     Lesson {
         #[command(subcommand)]
         command: lesson::LessonCommand,
@@ -220,7 +225,7 @@ enum PurposeArg {
 struct Config {
     daemon: DaemonSettings,
     execution: ExecutionSettings,
-    model: Option<ModelConfig>,
+    model: Option<OpenAIResponsesConfig>,
     #[serde(default)]
     credentials: CredentialsSettings,
     #[serde(default)]
@@ -291,7 +296,7 @@ struct ObservatoryEditableConfiguration {
     global_model: String,
     global_reasoning_effort: String,
     global_response_language: String,
-    stage_models: BTreeMap<String, akzio_model::ModelRouteConfig>,
+    stage_models: BTreeMap<String, akzio_model::OpenAIResponsesRouteConfig>,
     #[serde(rename = "alpacaAPIKey")]
     alpaca_api_key: String,
     #[serde(rename = "alpacaAPISecret")]

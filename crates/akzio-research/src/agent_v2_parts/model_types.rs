@@ -34,6 +34,10 @@ pub struct AgentModelRequest {
     pub prompt: String,
     pub objective: String,
     pub manifest_artifact_id: ArtifactId,
+    #[serde(default)]
+    pub read_grant_identity: Option<akzio_domain::ContentHash>,
+    #[serde(default)]
+    pub context_materialization_identity: Option<akzio_domain::ContentHash>,
     pub context: Vec<Value>,
     pub continuation: Option<ModelContinuation>,
     pub tool_outputs: Vec<ModelToolOutput>,
@@ -55,7 +59,20 @@ pub struct AgentToolDefinition {
 pub struct AgentTurnTelemetry {
     pub latency_millis: u64,
     pub input_tokens: Option<u64>,
+    #[serde(default)]
+    pub cached_input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    #[serde(default)]
+    pub reasoning_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct AgentTurnRuntimeSnapshot {
+    capability: ModelCapabilitySnapshot,
+    capability_hash: akzio_domain::ContentHash,
+    budget_policy: ModelBudgetPolicy,
+    budget_policy_hash: akzio_domain::ContentHash,
+    tool_set_hash: akzio_domain::ContentHash,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -123,10 +140,10 @@ struct ToolResult {
     artifact: Artifact,
 }
 
-struct TurnRecord<'a> {
-    permit: &'a TaskWritePermit,
-    contract: &'a AgentContract,
-    manifest: &'a ContextManifest,
+struct TurnRecord {
+    permit: TaskWritePermit,
+    contract: AgentContract,
+    manifest: ContextManifest,
     turn: u16,
     attempt: u8,
     now: DateTime<Utc>,
@@ -141,6 +158,10 @@ pub trait AgentModel: Send + Sync {
 
     fn response_language(&self) -> Option<&str> {
         None
+    }
+
+    fn budget_policy(&self) -> ModelBudgetPolicy {
+        ModelBudgetPolicy::default()
     }
 
     fn turn<'a>(
@@ -162,6 +183,7 @@ pub struct ModelClientAdapter {
     client: ModelClient,
     debug: bool,
     response_language: String,
+    budget_policy: ModelBudgetPolicy,
 }
 
 impl ModelClientAdapter {
@@ -182,7 +204,13 @@ impl ModelClientAdapter {
             client,
             debug,
             response_language: response_language.into(),
+            budget_policy: ModelBudgetPolicy::default(),
         }
+    }
+
+    pub fn with_budget_policy(mut self, budget_policy: ModelBudgetPolicy) -> Self {
+        self.budget_policy = budget_policy;
+        self
     }
 }
 
@@ -193,6 +221,10 @@ impl AgentModel for ModelClientAdapter {
 
     fn response_language(&self) -> Option<&str> {
         Some(&self.response_language)
+    }
+
+    fn budget_policy(&self) -> ModelBudgetPolicy {
+        self.budget_policy.clone()
     }
 
     fn turn<'a>(
@@ -270,17 +302,13 @@ impl AgentModel for ModelClientAdapter {
                     });
                     model_client_error(error, trace)
                 })?;
-            let telemetry = AgentTurnTelemetry {
-                latency_millis: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                input_tokens: response
-                    .raw
-                    .pointer("/usage/input_tokens")
-                    .and_then(Value::as_u64),
-                output_tokens: response
-                    .raw
-                    .pointer("/usage/output_tokens")
-                    .and_then(Value::as_u64),
-            };
+        let telemetry = AgentTurnTelemetry {
+            latency_millis: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            input_tokens: response.usage.input_tokens,
+            cached_input_tokens: response.usage.cached_input_tokens,
+            output_tokens: response.usage.output_tokens,
+            reasoning_tokens: response.usage.reasoning_tokens,
+        };
             let model_debug = self.debug.then(|| ModelCallTrace {
                 request: response.request_body.clone(),
                 result: response.raw.clone(),

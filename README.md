@@ -25,6 +25,8 @@ flowchart LR
 
 Rust 是状态、权限、Contract、预算、workflow gate、持久化、学习迁移和执行策略的唯一权威。模型不能访问任意文件、HTTP、Raw Evidence、SQLite 或交易凭据；`ContextManifest` 与 task/attempt-bound `ReadGrant` 是唯一资料通道。Debug、Replay、Shadow 与 Paper Dry Run 永远 noncanonical；只有 sealed Paper Outcome 可推动 memory 或 topology。
 
+当前唯一实现的生产模型协议是 **OpenAI Responses**。配置必须声明 `provider = "openai_responses"`；自定义 `base_url` 不会自动获得 native web、reasoning 或 continuation capability。项目没有原生 Anthropic Messages adapter，也没有经过验证的 xAI adapter；endpoint 兼容不代表语义兼容。详见 [OpenAI Responses Provider 边界](docs/architecture/AKZIO_OPENAI_RESPONSES_PROVIDER.md)。
+
 ## 操作面
 
 唯一业务控制面是带 `x-akzio-token` 认证的 loopback HTTP/SSE。CLI 和未来本地 UI 都调用它；没有 socket 回退、直接 Store 写入或 direct Paper submit/retry。
@@ -54,7 +56,10 @@ Akzio Observatory 使用单一用户目录保存桌面运行数据：
 首次启动会从内置模板生成 `config.toml`，并通过 `V2Store` backup 将旧的
 `~/Library/Application Support/Akzio/Store/schema-11` 复制到新 Store；旧目录不会自动删除。
 
-`run submit` 只接受 `debug` 或 `paper-dry-run`。Paper 创建和 Paper retry 只能由带 lease/epoch fencing 的注入 scheduler loop 完成；普通 `daemon serve` 不会从配置构造真实 Paper loop，并对缺少适配器或不合规配置 fail closed。
+`run submit` 只接受 `debug` 或 `paper-dry-run`。Paper 创建和 Paper retry 只能由带 lease/epoch fencing 的 scheduler loop 完成。`daemon serve` 的启动模式由 `daemon.auto_paper` 决定：
+
+- `false`（默认）：只启动认证的 loopback HTTP API 和普通 workers，不构造 Alpaca Paper 适配器。
+- `true`：从 `ALPACA_API_KEY`、`ALPACA_API_SECRET` 和可选的 `ALPACA_PAPER_BASE_URL`（默认为 Alpaca Paper origin）构造适配器，同时注入 observer 与 committed broker，预检 workflow proposal 后启动 Paper scheduler。缺少凭据、非 Paper endpoint、缺少 market-data feed 或零成本配置均 fail closed。
 
 `run replay` 从耐久事件重建并校验 run snapshot；它是只读诊断，不创建 workflow、memory 或 execution state。`run fixture-debug` 是明确标记的本地 fixture diagnostic，不访问市场、模型或 broker。`store doctor` 是本地 V2Store 完整性诊断；旧 Store Root 会报不兼容错误，不会迁移或读取。
 

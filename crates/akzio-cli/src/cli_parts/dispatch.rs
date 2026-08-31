@@ -126,6 +126,36 @@ async fn dispatch_store(
                 .store_export_run(&run_id, &target, include_raw_model)
                 .await?,
         ),
+        StoreCommand::ReleaseEvidence { run_id, target } => {
+            let run_id = RunId(run_id);
+            let bundle = client.store_release_evidence(&run_id).await?;
+            if let Some(target) = target {
+                export_release_evidence_bundle(&bundle, &target)?;
+                print_json(&serde_json::json!({
+                    "run_id": run_id,
+                    "target": target,
+                    "bundle_hash": bundle.bundle_hash,
+                    "status": bundle.status,
+                }))
+            } else {
+                print_json(&bundle)
+            }
+        }
         StoreCommand::Lesson { command } => lesson::run(config, command).await,
     }
+}
+
+fn export_release_evidence_bundle(bundle: &ReleaseEvidenceBundle, target: &Path) -> Result<()> {
+    if target.exists() {
+        bail!("release evidence target already exists: {}", target.display());
+    }
+    let parent = target
+        .parent()
+        .context("release evidence target has no parent")?;
+    fs::create_dir_all(parent).with_context(|| {
+        format!("create release evidence directory {}", parent.display())
+    })?;
+    let bytes = serde_json::to_vec_pretty(bundle).context("serialize release evidence bundle")?;
+    fs::write(target, bytes)
+        .with_context(|| format!("write release evidence bundle {}", target.display()))
 }

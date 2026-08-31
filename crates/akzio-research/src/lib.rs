@@ -61,8 +61,16 @@ pub fn prompt_component_hash() -> ContentHash {
             include_bytes!("agent_v2_parts/model_types.rs"),
         ),
         (
+            "crates/akzio-research/src/agent_v2_parts/budget.rs",
+            include_bytes!("agent_v2_parts/budget.rs"),
+        ),
+        (
             "crates/akzio-research/src/agent_v2_parts/runtime_type.rs",
             include_bytes!("agent_v2_parts/runtime_type.rs"),
+        ),
+        (
+            "crates/akzio-research/src/agent_v2_parts/recovery.rs",
+            include_bytes!("agent_v2_parts/recovery.rs"),
         ),
         (
             "crates/akzio-research/src/agent_v2_parts/runtime_core.rs",

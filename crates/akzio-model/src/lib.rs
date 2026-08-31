@@ -7,10 +7,11 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use reqwest::{Client, StatusCode};
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 use thiserror::Error;
 
@@ -21,7 +22,8 @@ mod schema;
 
 use fixture::*;
 pub use native_web::{NativeWebCitation, NativeWebPolicy, NativeWebQuery};
-use responses::*;
+pub use responses::{extract_output_text, extract_tool_calls, OpenAIResponsesClient};
+use responses::{openai_response_from_raw, openai_responses_request_body};
 use schema::*;
 
 #[derive(Debug, Error)]
@@ -36,6 +38,8 @@ pub enum ModelError {
     EmptyReasoningEffort,
     #[error("model response transport failed: {0}")]
     Transport(#[from] reqwest::Error),
+    #[error("model response stream was idle for {idle_timeout:?}")]
+    StreamIdleTimeout { idle_timeout: Duration },
     #[error("model returned HTTP {status}: {body}")]
     Http { status: StatusCode, body: String },
     #[error("model response stream is invalid: {0}")]
@@ -77,39 +81,100 @@ fn default_response_language() -> String {
     "简体中文".to_owned()
 }
 
-/// Production model settings loaded from the local Akzio TOML configuration.
+pub const OPENAI_RESPONSES_PROVIDER_ID: &str = "openai_responses";
+pub const OPENAI_RESPONSES_OFFICIAL_BASE_URL: &str = "https://api.openai.com/v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ModelProviderIdentity {
+    #[serde(rename = "openai_responses", alias = "openai")]
+    OpenAIResponses,
+}
+
+impl ModelProviderIdentity {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAIResponses => OPENAI_RESPONSES_PROVIDER_ID,
+        }
+    }
+}
+
+/// Per-purpose OpenAI Responses route settings.
 ///
 /// The API key is intentionally redacted from `Debug` output and never copied
 /// into a durable AgentTurn trace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ModelRouteConfig {
+pub struct OpenAIResponsesRouteConfig {
     pub model: String,
     pub reasoning_effort: String,
     #[serde(default)]
     pub response_language: Option<String>,
 }
 
-#[derive(Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ModelConfig {
+/// Configuration for the only production provider implemented by this crate.
+#[derive(Clone, PartialEq)]
+pub struct OpenAIResponsesConfig {
     pub base_url: String,
     pub model: String,
     pub api_key: String,
-    #[serde(default = "default_reasoning_effort")]
     pub reasoning_effort: String,
-    #[serde(default = "default_response_language")]
     pub response_language: String,
-    #[serde(default)]
     pub debug: bool,
-    #[serde(default)]
-    pub routes: BTreeMap<String, ModelRouteConfig>,
+    pub routes: BTreeMap<String, OpenAIResponsesRouteConfig>,
 }
 
-impl std::fmt::Debug for ModelConfig {
+/// Compatibility aliases for callers while configuration and documentation
+/// migrate to provider-specific names.
+pub type ModelConfig = OpenAIResponsesConfig;
+pub type ModelRouteConfig = OpenAIResponsesRouteConfig;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpenAIResponsesConfigWire {
+    #[serde(default)]
+    provider: Option<ModelProviderIdentity>,
+    base_url: String,
+    model: String,
+    api_key: String,
+    #[serde(default = "default_reasoning_effort")]
+    reasoning_effort: String,
+    #[serde(default = "default_response_language")]
+    response_language: String,
+    #[serde(default)]
+    debug: bool,
+    #[serde(default)]
+    routes: BTreeMap<String, OpenAIResponsesRouteConfig>,
+}
+
+impl<'de> Deserialize<'de> for OpenAIResponsesConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = OpenAIResponsesConfigWire::deserialize(deserializer)?;
+        if wire.provider.is_none() && !is_official_openai_base_url(&wire.base_url) {
+            return Err(D::Error::custom(format!(
+                "legacy model config with custom base_url {} is ambiguous; add provider = \"{}\" to explicitly select OpenAI Responses semantics",
+                wire.base_url, OPENAI_RESPONSES_PROVIDER_ID
+            )));
+        }
+        Ok(Self {
+            base_url: wire.base_url,
+            model: wire.model,
+            api_key: wire.api_key,
+            reasoning_effort: wire.reasoning_effort,
+            response_language: wire.response_language,
+            debug: wire.debug,
+            routes: wire.routes,
+        })
+    }
+}
+
+impl std::fmt::Debug for OpenAIResponsesConfig {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("ModelConfig")
+            .debug_struct("OpenAIResponsesConfig")
+            .field("provider", &OPENAI_RESPONSES_PROVIDER_ID)
             .field("base_url", &self.base_url)
             .field("model", &self.model)
             .field("api_key", &"<redacted>")
@@ -121,8 +186,12 @@ impl std::fmt::Debug for ModelConfig {
     }
 }
 
-impl ModelConfig {
-    pub fn for_route(&self, route: &ModelRouteConfig) -> Self {
+impl OpenAIResponsesConfig {
+    pub const fn provider_identity(&self) -> ModelProviderIdentity {
+        ModelProviderIdentity::OpenAIResponses
+    }
+
+    pub fn for_route(&self, route: &OpenAIResponsesRouteConfig) -> Self {
         Self {
             base_url: self.base_url.clone(),
             model: route.model.clone(),
@@ -138,6 +207,10 @@ impl ModelConfig {
             routes: BTreeMap::new(),
         }
     }
+}
+
+fn is_official_openai_base_url(base_url: &str) -> bool {
+    base_url.trim().trim_end_matches('/') == OPENAI_RESPONSES_OFFICIAL_BASE_URL
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -159,6 +232,46 @@ pub struct ModelToolCall {
 pub struct ModelToolOutput {
     pub call_id: String,
     pub output: Value,
+}
+
+/// Provider usage normalized into Akzio-owned accounting categories.
+///
+/// Detail fields remain optional because Responses-compatible providers do not
+/// all report cache and reasoning breakdowns. Input/output totals are optional
+/// too, allowing the harness to distinguish reported usage from local estimates.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelUsage {
+    pub input_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+}
+
+/// Immutable, versioned price table selected for one model route.
+///
+/// Rates are micro-units of account currency per one million tokens. They are
+/// explicit configuration data, never changing vendor prices embedded in policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelPricingSnapshot {
+    pub identity: String,
+    pub version: String,
+    pub input_micros_per_million_tokens: u64,
+    pub cached_input_micros_per_million_tokens: u64,
+    pub output_micros_per_million_tokens: u64,
+    pub reasoning_micros_per_million_tokens: u64,
+}
+
+/// Optional whole-task cost authority supplied explicitly by the caller.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelBudgetPolicy {
+    #[serde(default)]
+    pub route_identity: Option<String>,
+    #[serde(default)]
+    pub max_cost_micros: Option<u64>,
+    #[serde(default)]
+    pub pricing: Option<ModelPricingSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -220,6 +333,27 @@ pub struct ModelRequest {
 ///
 /// This is descriptive metadata only: it is not a provider handshake and
 /// never grants tools, context, or execution authority.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCapabilityBasis {
+    #[default]
+    Unknown,
+    StaticDeclared,
+    RuntimeNegotiated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenAIResponsesCapabilities {
+    pub supports_tool_calls: bool,
+    pub supports_stateless_continuation: bool,
+    pub reasoning_items: bool,
+    pub encrypted_continuation: bool,
+    pub native_web_tool: bool,
+    pub streaming: bool,
+    pub basis: ModelCapabilityBasis,
+    pub verified: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelCapabilitySnapshot {
     pub provider_id: String,
@@ -268,6 +402,7 @@ pub struct ModelResponse {
     pub tool_calls: Vec<ModelToolCall>,
     pub continuation: ModelContinuation,
     pub raw: Value,
+    pub usage: ModelUsage,
     /// Provider payload without authorization headers or credentials.
     pub request_body: Value,
 }
@@ -281,7 +416,7 @@ pub enum ModelStreamEvent {
 
 #[derive(Debug, Clone)]
 pub enum ModelClient {
-    Responses(ResponsesClient),
+    OpenAIResponses(OpenAIResponsesClient),
     Fixture(Value),
     FixtureByPurpose(Arc<Mutex<BTreeMap<String, VecDeque<Value>>>>),
     FixtureSequence(Arc<Mutex<VecDeque<Value>>>),

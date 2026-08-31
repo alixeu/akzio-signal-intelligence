@@ -8,12 +8,28 @@ use tokio::{
 fn write_config(directory: &tempfile::TempDir, daemon: &str, assets: &str) -> PathBuf {
     let path = directory.path().join("akzio.toml");
     std::fs::write(
-            &path,
-            format!(
-                "[daemon]\nstore_root='store'\n{daemon}\ntoken_env='TOKEN'\n[execution]\nassets={assets}\n"
-            ),
-        )
-        .unwrap();
+        &path,
+        format!(
+            "[daemon]\nstore_root='store'\n{daemon}\ntoken_env='TOKEN'\n[execution]\nassets={assets}\n"
+        ),
+    )
+    .unwrap();
+    path
+}
+
+fn write_auto_paper_config(
+    directory: &tempfile::TempDir,
+    auto_paper: bool,
+    execution: &str,
+) -> PathBuf {
+    let path = directory.path().join("akzio.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "[daemon]\nstore_root='store'\nauto_paper={auto_paper}\nhttp_addr='127.0.0.1:1'\ntoken_env='TOKEN'\n[execution]\nassets=['TQQQ', 'QQQ', 'SOXX', 'SOXL']\n{execution}"
+        ),
+    )
+    .unwrap();
     path
 }
 
@@ -42,14 +58,17 @@ fn paper_session_command_accepts_broker_session_key() {
 }
 
 #[test]
+fn config_accepts_worker_only_without_paper_requirements() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = write_auto_paper_config(&directory, false, "");
+
+    assert!(load_config(&path).is_ok());
+}
+
+#[test]
 fn config_rejects_zero_cost_auto_paper() {
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("akzio.toml");
-    std::fs::write(
-            &path,
-            "[daemon]\nstore_root='store'\nauto_paper=true\nhttp_addr='127.0.0.1:1'\ntoken_env='TOKEN'\n[execution]\nassets=['TQQQ', 'QQQ', 'SOXX', 'SOXL']\n",
-        )
-        .unwrap();
+    let path = write_auto_paper_config(&directory, true, "");
 
     let error = load_config(&path).unwrap_err().to_string();
     assert!(error.contains("transaction_cost_ppm or slippage_ppm"));
@@ -58,15 +77,23 @@ fn config_rejects_zero_cost_auto_paper() {
 #[test]
 fn config_rejects_auto_paper_without_market_data_feed() {
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("akzio.toml");
-    std::fs::write(
-            &path,
-            "[daemon]\nstore_root='store'\nauto_paper=true\nhttp_addr='127.0.0.1:1'\ntoken_env='TOKEN'\n[execution]\nassets=['TQQQ', 'QQQ', 'SOXX', 'SOXL']\ntransaction_cost_ppm=1\nslippage_ppm=1\n",
-        )
-        .unwrap();
+    let path =
+        write_auto_paper_config(&directory, true, "transaction_cost_ppm=1\nslippage_ppm=1\n");
 
     let error = load_config(&path).unwrap_err().to_string();
     assert!(error.contains("execution.market_data_feed"));
+}
+
+#[test]
+fn config_accepts_complete_auto_paper_requirements() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = write_auto_paper_config(
+        &directory,
+        true,
+        "market_data_feed='iex'\ntransaction_cost_ppm=1\nslippage_ppm=1\n",
+    );
+
+    assert!(load_config(&path).is_ok());
 }
 
 #[test]
@@ -103,7 +130,7 @@ fn config_reads_local_model_settings() {
     );
     let mut text = std::fs::read_to_string(&path).unwrap();
     text.push_str(
-            "[model]\nbase_url='http://fixture/v1'\nmodel='fixture-model'\napi_key='fixture-key'\nreasoning_effort='high'\ndebug=true\n",
+            "[model]\nprovider='openai_responses'\nbase_url='http://fixture/v1'\nmodel='fixture-model'\napi_key='fixture-key'\nreasoning_effort='high'\ndebug=true\n",
         );
     std::fs::write(&path, text).unwrap();
 
@@ -112,6 +139,46 @@ fn config_reads_local_model_settings() {
     assert_eq!(model.model, "fixture-model");
     assert_eq!(model.reasoning_effort, "high");
     assert!(model.debug);
+}
+
+#[test]
+fn provider_config_rejects_unknown_and_ambiguous_legacy_endpoints() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = write_config(
+        &directory,
+        "http_addr='127.0.0.1:1'",
+        "['TQQQ', 'QQQ', 'SOXX', 'SOXL']",
+    );
+    let base = std::fs::read_to_string(&path).unwrap();
+
+    std::fs::write(
+        &path,
+        format!(
+            "{base}[model]\nprovider='anthropic_messages'\nbase_url='https://api.anthropic.com/v1'\nmodel='fixture-model'\napi_key='fixture-key'\n"
+        ),
+    )
+    .unwrap();
+    assert!(load_config(&path).is_err());
+
+    std::fs::write(
+        &path,
+        format!(
+            "{base}[model]\nbase_url='https://gateway.example.invalid/v1'\nmodel='fixture-model'\napi_key='fixture-key'\n"
+        ),
+    )
+    .unwrap();
+    let error = load_config(&path).unwrap_err();
+    assert!(format!("{error:#}").contains("legacy model config"));
+
+    std::fs::write(
+        &path,
+        format!(
+            "{base}[model]\nbase_url='https://api.openai.com/v1'\nmodel='fixture-model'\napi_key='fixture-key'\n"
+        ),
+    )
+    .unwrap();
+    let legacy = load_config(&path).unwrap().model.unwrap();
+    assert_eq!(legacy.provider_identity().as_str(), "openai_responses");
 }
 
 #[test]
@@ -124,7 +191,7 @@ fn observatory_configuration_and_credentials_live_in_private_toml() {
     );
     let mut text = std::fs::read_to_string(&template).unwrap();
     text.push_str(
-        "[model]\nbase_url='$LLM_GATEWAY_BASE_URL'\nmodel='fixture-model'\napi_key='$LLM_GATEWAY_API_KEY'\nreasoning_effort='low'\nresponse_language='简体中文'\n",
+        "[model]\nprovider='openai_responses'\nbase_url='$LLM_GATEWAY_BASE_URL'\nmodel='fixture-model'\napi_key='$LLM_GATEWAY_API_KEY'\nreasoning_effort='low'\nresponse_language='简体中文'\n",
     );
     std::fs::write(&template, text).unwrap();
 
@@ -160,7 +227,7 @@ fn observatory_configuration_and_credentials_live_in_private_toml() {
         global_response_language: "简体中文".to_owned(),
         stage_models: BTreeMap::from([(
             "research.critic".to_owned(),
-            akzio_model::ModelRouteConfig {
+            akzio_model::OpenAIResponsesRouteConfig {
                 model: "critic-fixture".to_owned(),
                 reasoning_effort: "medium".to_owned(),
                 response_language: None,
@@ -184,6 +251,7 @@ fn observatory_configuration_and_credentials_live_in_private_toml() {
         Some("Akzio test@example.com")
     );
     let rendered = std::fs::read_to_string(config_path).unwrap();
+    assert!(rendered.contains("provider = \"openai_responses\""));
     assert_eq!(saved.credentials.alpaca_api_key, "fixture-alpaca-key");
     assert_eq!(saved.credentials.alpaca_api_secret, "fixture-alpaca-secret");
     assert!(rendered.contains("fixture-llm-key"));
@@ -199,7 +267,7 @@ fn config_rejects_unknown_or_empty_model_routes() {
     );
     let mut text = std::fs::read_to_string(&path).unwrap();
     text.push_str(
-        "[model]\nbase_url='http://fixture/v1'\nmodel='fixture-model'\napi_key='fixture-key'\n\
+        "[model]\nprovider='openai_responses'\nbase_url='http://fixture/v1'\nmodel='fixture-model'\napi_key='fixture-key'\n\
          [model.routes.'research.unknown']\nmodel='route-model'\nreasoning_effort='low'\n",
     );
     std::fs::write(&path, text).unwrap();
@@ -225,7 +293,7 @@ fn runtime_identity_binds_effective_model_routes() {
     );
     let mut text = std::fs::read_to_string(&path).unwrap();
     text.push_str(
-        "[model]\nbase_url='http://fixture/v1'\nmodel='fixture-model'\napi_key='fixture-key'\n",
+        "[model]\nprovider='openai_responses'\nbase_url='http://fixture/v1'\nmodel='fixture-model'\napi_key='fixture-key'\n",
     );
     std::fs::write(&path, text).unwrap();
 
@@ -234,7 +302,7 @@ fn runtime_identity_binds_effective_model_routes() {
     let baseline = runtime_identity_from_config(&config, &path).unwrap();
     config.model.as_mut().unwrap().routes.insert(
         "research.critic".to_owned(),
-        akzio_model::ModelRouteConfig {
+        akzio_model::OpenAIResponsesRouteConfig {
             model: "critic-model".to_owned(),
             reasoning_effort: "high".to_owned(),
             response_language: Some("简体中文".to_owned()),
@@ -255,7 +323,7 @@ fn runtime_identity_redacts_rotated_credentials() {
     );
     let mut text = std::fs::read_to_string(&path).unwrap();
     text.push_str(
-        "[model]\nbase_url='http://fixture/v1'\nmodel='fixture-model'\napi_key='first-key'\n",
+        "[model]\nprovider='openai_responses'\nbase_url='http://fixture/v1'\nmodel='fixture-model'\napi_key='first-key'\n",
     );
     std::fs::write(&path, &text).unwrap();
 
@@ -281,7 +349,7 @@ fn config_resolves_model_environment_placeholders() {
     );
     let mut text = std::fs::read_to_string(&path).unwrap();
     text.push_str(
-            "[model]\nbase_url='$AKZIO_TEST_MODEL_URL'\nmodel='fixture-model'\napi_key='$AKZIO_TEST_MODEL_KEY'\n",
+            "[model]\nprovider='openai_responses'\nbase_url='$AKZIO_TEST_MODEL_URL'\nmodel='fixture-model'\napi_key='$AKZIO_TEST_MODEL_KEY'\n",
         );
     std::fs::write(&path, text).unwrap();
     std::env::set_var("AKZIO_TEST_MODEL_URL", "http://fixture/v1");
@@ -350,4 +418,77 @@ fn help_has_no_unix_control_surface() {
     let help = command.render_long_help().to_string();
     assert!(!help.to_ascii_lowercase().contains("unix"));
     assert!(Cli::try_parse_from(["akzio", "daemon", "unfreeze", "fixture reason"]).is_ok());
+}
+
+#[test]
+fn release_evidence_cli_supports_view_and_export() {
+    let view = Cli::try_parse_from(["akzio", "store", "release-evidence", "run-fixture"]).unwrap();
+    assert!(matches!(
+        view.command,
+        Command::Store {
+            command: StoreCommand::ReleaseEvidence {
+                ref run_id,
+                target: None,
+            }
+        } if run_id == "run-fixture"
+    ));
+
+    let directory = tempfile::tempdir().unwrap();
+    let target = directory.path().join("bundle.json");
+    let export = Cli::try_parse_from([
+        "akzio",
+        "store",
+        "release-evidence",
+        "run-fixture",
+        "--target",
+        target.to_str().unwrap(),
+    ])
+    .unwrap();
+    assert!(matches!(
+        export.command,
+        Command::Store {
+            command: StoreCommand::ReleaseEvidence {
+                target: Some(_),
+                ..
+            }
+        }
+    ));
+}
+
+#[test]
+fn release_evidence_export_is_deterministic_and_refuses_overwrite() {
+    let bundle =
+        akzio_domain::ReleaseEvidenceBundle::materialize(akzio_domain::ReleaseEvidenceBody {
+            run_id: RunId::new(),
+            purpose: RunPurpose::Debug,
+            environment: akzio_domain::ReleaseEvidenceEnvironment::OfflineFixture,
+            materialized_at: Utc::now(),
+            runtime: None,
+            workflow: None,
+            contracts: akzio_domain::ReleaseContractEvidence::default(),
+            provider_routes: Default::default(),
+            source_snapshots: Default::default(),
+            broker: None,
+            session: None,
+            daemon: None,
+            execution: None,
+            outcomes: Default::default(),
+            learning: None,
+            canary: None,
+            human_approval: None,
+            integrity: akzio_domain::ReleaseIntegrityEvidence {
+                config_hash_matches: false,
+                workflow_hash_matches: false,
+                broker_account_matches: false,
+                daemon_epoch_current: false,
+            },
+        })
+        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let target = directory.path().join("release").join("bundle.json");
+    export_release_evidence_bundle(&bundle, &target).unwrap();
+    let decoded: akzio_domain::ReleaseEvidenceBundle =
+        serde_json::from_slice(&std::fs::read(&target).unwrap()).unwrap();
+    assert_eq!(decoded.bundle_hash, bundle.bundle_hash);
+    assert!(export_release_evidence_bundle(&bundle, &target).is_err());
 }

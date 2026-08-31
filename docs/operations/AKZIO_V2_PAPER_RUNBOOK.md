@@ -11,6 +11,13 @@
 - Alpaca 凭据只从 `ALPACA_API_KEY`、`ALPACA_API_SECRET` 环境注入；强制 Paper evidence policy 还要求 `FRED_API_KEY`；`ALPACA_PAPER_BASE_URL` 为空或必须为 `https://paper-api.alpaca.markets`。
 - `auto_paper=true` 时必须配置经过审批的非零 `transaction_cost_ppm` 或 `slippage_ppm`；零成本只可用于 fixture/离线验证。
 
+### `daemon serve` 启动模式
+
+| `daemon.auto_paper` | 启动行为 | fail-closed 条件 |
+| --- | --- | --- |
+| `false` | 启动 loopback HTTP API 和普通 workers；不构造 Alpaca Paper client | 仍须通过通用配置校验 |
+| `true` | 从环境构造 Alpaca Paper client，注入 observer/broker，预检 durable workflow proposal，启动 HTTP API 和 Paper scheduler | 缺少 Alpaca 凭据、endpoint 不是精确 Paper origin、缺少 `market_data_feed`、交易成本与滑点同时为零，或 workflow proposal 预检失败 |
+
 当前 Store Root 只有 `akzio.sqlite3`。Artifact payload 以 SHA-256 为键存入
 `rebuild_blobs`，Artifact metadata、关系、事件和运行状态存入同一数据库；不再有
 filesystem CAS sidecar。`store backup`、`store restore` 和 `store export-run` 也只生成

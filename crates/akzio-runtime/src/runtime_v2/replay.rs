@@ -24,7 +24,7 @@ impl WorkflowRuntime {
         }
         if !matches!(
             source.run.purpose,
-            RunPurpose::Debug | RunPurpose::PaperDryRun
+            RunPurpose::Debug | RunPurpose::PositionPlan | RunPurpose::PaperDryRun
         ) {
             return Err(RuntimeError::RetryPurpose(source.run.purpose));
         }

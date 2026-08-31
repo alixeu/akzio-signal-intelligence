@@ -74,6 +74,21 @@ async fn sync_and_async_materialization_preserve_confidence_semantics() {
 }
 
 #[test]
+fn provenance_rejects_quote_mismatch() {
+    let mut acquired = fixture_acquired();
+    acquired.provenance.citations[0].quote = "different".to_owned();
+
+    assert!(matches!(
+        acquired.provenance.validate(
+            &acquired.raw,
+            &acquired.source_uri,
+            acquired.observed_at,
+        ),
+        Err(EvidenceRuntimeError::InvalidCitation)
+    ));
+}
+
+#[test]
 fn acquisition_returns_uncommitted_artifacts_until_task_runtime_commits() {
     let root = tempdir().unwrap();
     let store = V2Store::open(root.path()).unwrap();

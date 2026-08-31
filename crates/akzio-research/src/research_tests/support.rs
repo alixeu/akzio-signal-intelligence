@@ -9,7 +9,7 @@ use std::{
 use akzio_domain::{
     ArtifactLifecycle, ContextPolicy, ContractId, ContractPurpose, FailureDisposition,
     OutputContract, PromptBundle, RetryPolicy, TaskBudget, TaskRecipeId, TaskStatus,
-    TerminationPolicy, ToolGrant, ToolKind, ToolSpec, WorkflowGraph, WorkflowNode,
+    TerminationPolicy, ToolGrant, ToolKind, WorkflowGraph, WorkflowNode,
     V2_DOMAIN_SCHEMA_VERSION,
 };
 use akzio_store::v2::{StoredRun, WorkflowCommit};
@@ -84,6 +84,21 @@ fn missing_model_output_keeps_invalid_output_classification() {
 }
 
 #[test]
+fn stream_idle_timeout_keeps_transport_retry_semantics() {
+    let timeout = std::time::Duration::from_millis(40);
+    let error = ModelError::StreamIdleTimeout {
+        idle_timeout: timeout,
+    };
+
+    assert_eq!(model_error_result(&error)["error"], "stream_idle_timeout");
+    assert_eq!(model_error_result(&error)["idle_timeout_ms"], 40);
+    assert!(matches!(
+        model_client_error(error, None),
+        ResearchError::Model(message) if message.contains("response stream idle")
+    ));
+}
+
+#[test]
 fn only_invalid_output_errors_request_task_retry() {
     let invalid = [
         ResearchError::InvalidOutput("invalid JSON".to_owned()),
@@ -112,10 +127,10 @@ fn only_invalid_output_errors_request_task_retry() {
 }
 
 #[test]
-fn read_tool_is_hidden_when_selected_context_exceeds_tool_budget() {
-    assert!(should_advertise_read_tools(RunPurpose::Paper, 4, 4));
-    assert!(!should_advertise_read_tools(RunPurpose::Paper, 10, 4));
-    assert!(should_advertise_read_tools(RunPurpose::Debug, 1, 4));
+fn read_tools_remain_available_independent_of_manifest_size() {
+    assert!(should_advertise_read_tools(RunPurpose::Paper));
+    assert!(should_advertise_read_tools(RunPurpose::Debug));
+    assert!(!should_advertise_read_tools(RunPurpose::PaperDryRun));
 }
 
 #[test]
@@ -309,6 +324,8 @@ fn capability_request(output_schema: Value, tools: Vec<AgentToolDefinition>) -> 
         manifest_artifact_id: ArtifactId(akzio_domain::ContentHash::of_bytes(
             b"capability-manifest",
         )),
+        read_grant_identity: None,
+        context_materialization_identity: None,
         context: vec![],
         phase: AgentTurnPhase::Submit,
         continuation: Some(ModelContinuation::from_items(vec![])),

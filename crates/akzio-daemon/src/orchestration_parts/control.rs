@@ -1,3 +1,5 @@
+use super::*;
+
 impl Daemon {
     pub fn reserve_paper_session_with_inputs(
         &self,
@@ -79,17 +81,17 @@ impl Daemon {
         Ok(())
     }
 
-    pub(super) fn request_cancel(&self, run_id: &RunId, reason: &str) -> Result<u64> {
-        Ok(u64::from(self.task_runtime.request_cancel(
-            run_id,
-            reason,
-            Utc::now(),
-        )?))
+    pub(crate) async fn request_cancel(&self, run_id: &RunId, reason: &str) -> Result<u64> {
+        Ok(u64::from(
+            self.task_runtime
+                .request_cancel(run_id, reason, Utc::now())
+                .await?,
+        ))
     }
 
-    pub(super) fn retry_run(&self, source_run_id: &RunId) -> Result<RunId> {
+    pub(crate) fn retry_run(&self, source_run_id: &RunId) -> Result<RunId> {
         match self.store.run_purpose(source_run_id)? {
-            RunPurpose::Debug | RunPurpose::PaperDryRun => {}
+            RunPurpose::Debug | RunPurpose::PositionPlan | RunPurpose::PaperDryRun => {}
             RunPurpose::Paper => {
                 return Err(DaemonError::InvalidInput(
                     "Paper runs are scheduler-owned and cannot be retried by an operator"
@@ -105,7 +107,7 @@ impl Daemon {
         Ok(self.workflow.retry_run(source_run_id, Utc::now())?)
     }
 
-    pub(super) fn replay_report(&self, run_id: &RunId) -> Result<ReplayReport> {
+    pub(crate) fn replay_report(&self, run_id: &RunId) -> Result<ReplayReport> {
         let snapshot = self.workflow.replay_run(run_id)?;
         Ok(ReplayReport {
             run_id: snapshot.run.run_id,
@@ -131,7 +133,7 @@ impl Daemon {
         })
     }
 
-    pub(super) fn retrospectives(&self, run_id: &RunId) -> Result<Vec<RetrospectiveView>> {
+    pub(crate) fn retrospectives(&self, run_id: &RunId) -> Result<Vec<RetrospectiveView>> {
         let run_purpose = self.store.run_purpose(run_id)?;
         if !matches!(run_purpose, RunPurpose::Paper) {
             return Ok(Vec::new());
@@ -155,11 +157,11 @@ impl Daemon {
             .collect()
     }
 
-    pub(super) fn trajectory(&self, run_id: &RunId) -> Result<Vec<TrajectoryEntry>> {
+    pub(crate) fn trajectory(&self, run_id: &RunId) -> Result<Vec<TrajectoryEntry>> {
         Ok(self.store.trajectory(run_id)?)
     }
 
-    pub(super) fn set_freeze(&self, frozen: bool, reason: String) -> Result<DaemonHealth> {
+    pub(crate) fn set_freeze(&self, frozen: bool, reason: String) -> Result<DaemonHealth> {
         self.store.write_freeze_state(frozen, reason, Utc::now())?;
         self.health()
     }

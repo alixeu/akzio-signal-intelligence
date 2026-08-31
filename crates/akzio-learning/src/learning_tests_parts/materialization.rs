@@ -186,30 +186,36 @@ fn memory_lifecycle_requires_pairs_and_degrades_to_retirement() {
         PolicyState::Memory(MemoryLifecycle::Candidate)
     );
     assert_eq!(
-        next_state_with_fresh_pairs(subject.initial_state(), false, [0, 0, 0]),
+        next_state_with_fresh_pairs(subject.initial_state(), None, false, [0, 0, 0], 1),
         PolicyState::Memory(MemoryLifecycle::Candidate)
     );
     assert_eq!(
         next_state_with_fresh_pairs(
             PolicyState::Memory(MemoryLifecycle::Active),
+            None,
             false,
             [1, 1, 1],
+            1,
         ),
         PolicyState::Memory(MemoryLifecycle::Proven)
     );
     assert_eq!(
         next_state_with_fresh_pairs(
             PolicyState::Memory(MemoryLifecycle::Proven),
+            None,
             true,
             [1, 1, 1],
+            2,
         ),
         PolicyState::Memory(MemoryLifecycle::Contested)
     );
     assert_eq!(
         next_state_with_fresh_pairs(
             PolicyState::Memory(MemoryLifecycle::Contested),
+            None,
             true,
-            [1, 1, 1],
+            [0, 0, 0],
+            2,
         ),
         PolicyState::Memory(MemoryLifecycle::Retired)
     );

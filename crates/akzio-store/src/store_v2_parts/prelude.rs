@@ -19,6 +19,15 @@ use akzio_domain::{
     RuntimeManifest, TaskBudget, TaskId, TaskRecipeId, TaskStatus, TaskWritePermit, WorkflowGraph,
     WorkflowNode, WorkflowProposal, WorkflowStatus, V2_DOMAIN_SCHEMA_VERSION,
 };
+use akzio_domain::{
+    ReleaseBrokerEvidence, ReleaseBrokerEvidenceTrust, ReleaseCanaryEvidence,
+    ReleaseContractEvidence, ReleaseDaemonEvidence, ReleaseEvidenceBody, ReleaseEvidenceBundle,
+    ReleaseEvidenceEnvironment, ReleaseExecutionEvidence, ReleaseHumanApprovalEvidence,
+    ReleaseHumanApprovalStatus, ReleaseIntegrityEvidence, ReleaseLearningEvidence,
+    ReleaseOrderIdentity, ReleaseOutcomeEvidence, ReleaseProviderRouteEvidence,
+    ReleaseRuntimeEvidence, ReleaseSessionEvidence, ReleaseSourceSnapshotEvidence,
+    ReleaseWorkflowEvidence,
+};
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{
     params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
