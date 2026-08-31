@@ -6,19 +6,19 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
-pub struct ResponsesClient {
+pub struct OpenAIResponsesClient {
     http: Client,
-    base_url: String,
+    pub(super) base_url: String,
     api_key: String,
     pub(super) model: String,
     pub(super) reasoning_effort: String,
     stream_idle_timeout: Duration,
 }
 
-impl std::fmt::Debug for ResponsesClient {
+impl std::fmt::Debug for OpenAIResponsesClient {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("ResponsesClient")
+            .debug_struct("OpenAIResponsesClient")
             .field("base_url", &self.base_url)
             .field("api_key", &"<redacted>")
             .field("model", &self.model)
@@ -27,7 +27,7 @@ impl std::fmt::Debug for ResponsesClient {
     }
 }
 
-impl ResponsesClient {
+impl OpenAIResponsesClient {
     pub fn new(
         base_url: impl Into<String>,
         api_key: impl Into<String>,
@@ -82,7 +82,21 @@ impl ResponsesClient {
     }
 
     pub fn request_body(&self, request: &ModelRequest) -> Value {
-        responses_request_body(&self.model, &self.reasoning_effort, request)
+        openai_responses_request_body(&self.model, &self.reasoning_effort, request)
+    }
+
+    pub fn declared_capabilities(&self) -> OpenAIResponsesCapabilities {
+        let official_endpoint = is_official_openai_base_url(&self.base_url);
+        OpenAIResponsesCapabilities {
+            supports_tool_calls: official_endpoint,
+            supports_stateless_continuation: official_endpoint,
+            reasoning_items: official_endpoint,
+            encrypted_continuation: official_endpoint,
+            native_web_tool: official_endpoint,
+            streaming: official_endpoint,
+            basis: ModelCapabilityBasis::StaticDeclared,
+            verified: false,
+        }
     }
 
     pub async fn respond(&self, request: ModelRequest) -> Result<ModelResponse> {
@@ -165,7 +179,7 @@ impl ResponsesClient {
         let raw = stream.response.ok_or_else(|| {
             ModelError::InvalidStream("missing response.completed event".to_owned())
         })?;
-        response_from_raw(raw, body)
+        openai_response_from_raw(raw, body)
     }
 }
 
@@ -228,7 +242,7 @@ fn end_reasoning(stream: &mut ReasoningStream, on_event: &mut impl FnMut(ModelSt
     }
 }
 
-pub(super) fn responses_request_body(
+pub(super) fn openai_responses_request_body(
     model: &str,
     reasoning_effort: &str,
     request: &ModelRequest,
@@ -319,7 +333,7 @@ pub(super) fn responses_request_body(
     body
 }
 
-pub(super) fn response_from_raw(raw: Value, request_body: Value) -> Result<ModelResponse> {
+pub(super) fn openai_response_from_raw(raw: Value, request_body: Value) -> Result<ModelResponse> {
     if raw.get("status").and_then(Value::as_str) == Some("incomplete") {
         let reason = raw
             .pointer("/incomplete_details/reason")
@@ -506,8 +520,8 @@ mod tests {
         (format!("http://{address}"), server)
     }
 
-    fn test_client(base_url: String, timeout: Duration) -> ResponsesClient {
-        ResponsesClient::with_timeouts(
+    fn test_client(base_url: String, timeout: Duration) -> OpenAIResponsesClient {
+        OpenAIResponsesClient::with_timeouts(
             base_url,
             "fixture-key",
             "fixture-model",

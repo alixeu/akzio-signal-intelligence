@@ -29,7 +29,7 @@ fn response_request_body_marks_function_tools_strict() {
     }];
     request.tool_choice = ModelToolChoice::Auto;
 
-    let body = responses_request_body("fixture", "high", &request);
+    let body = openai_responses_request_body("fixture", "high", &request);
     assert_eq!(body["tools"][0]["strict"], true);
     assert_eq!(body["reasoning"]["effort"], "high");
     assert_eq!(body["reasoning"]["summary"], "auto");
@@ -67,7 +67,7 @@ fn response_request_body_drops_provider_unsupported_object_bounds() {
     }];
     request.tool_choice = ModelToolChoice::RequiredFunction("submit_result".to_owned());
 
-    let body = responses_request_body("fixture", "high", &request);
+    let body = openai_responses_request_body("fixture", "high", &request);
     let tasks = &body["tools"][0]["parameters"]["properties"]["tasks"];
     assert!(tasks.get("minProperties").is_none());
     assert!(tasks.get("maxProperties").is_none());
@@ -104,7 +104,7 @@ fn continuation_replays_items_then_tool_outputs_then_instruction() {
     }];
     request.tool_choice = ModelToolChoice::RequiredFunction("submit_result".to_owned());
 
-    let body = responses_request_body("fixture", "high", &request);
+    let body = openai_responses_request_body("fixture", "high", &request);
     let input = body["input"].as_array().unwrap();
     assert_eq!(input[0]["type"], "reasoning");
     assert_eq!(input[1]["call_id"], "call-1");
@@ -117,7 +117,7 @@ fn continuation_replays_items_then_tool_outputs_then_instruction() {
 #[test]
 fn response_rejects_refusal_and_incomplete_status() {
     assert!(matches!(
-        response_from_raw(
+        openai_response_from_raw(
             json!({
                 "output": [{
                     "type": "message",
@@ -129,7 +129,7 @@ fn response_rejects_refusal_and_incomplete_status() {
         Err(ModelError::Refused(message)) if message == "not allowed"
     ));
     assert!(matches!(
-        response_from_raw(
+        openai_response_from_raw(
             json!({
                 "status": "incomplete",
                 "incomplete_details": {"reason": "max_output_tokens"}
@@ -142,7 +142,8 @@ fn response_rejects_refusal_and_incomplete_status() {
 
 #[test]
 fn configured_client_redacts_its_api_key_from_debug_output() {
-    let client = ResponsesClient::new("http://fixture", "secret", "fixture", "medium").unwrap();
+    let client =
+        OpenAIResponsesClient::new("http://fixture", "secret", "fixture", "medium").unwrap();
 
     let rendered = format!("{client:?}");
     assert!(rendered.contains("<redacted>"));
@@ -151,7 +152,7 @@ fn configured_client_redacts_its_api_key_from_debug_output() {
 
 #[test]
 fn model_config_drives_reasoning_and_rejects_empty_credentials() {
-    let config = ModelConfig {
+    let config = OpenAIResponsesConfig {
         base_url: "http://fixture/v1".to_owned(),
         model: "fixture-model".to_owned(),
         api_key: "fixture-key".to_owned(),
@@ -175,8 +176,58 @@ fn model_config_drives_reasoning_and_rejects_empty_credentials() {
 }
 
 #[test]
+fn explicit_openai_responses_config_accepts_custom_endpoint() {
+    let config: OpenAIResponsesConfig = serde_json::from_value(json!({
+        "provider": "openai_responses",
+        "base_url": "https://gateway.example.invalid/v1",
+        "model": "fixture-model",
+        "api_key": "fixture-key"
+    }))
+    .unwrap();
+    assert_eq!(
+        config.provider_identity(),
+        ModelProviderIdentity::OpenAIResponses
+    );
+    assert_eq!(config.base_url, "https://gateway.example.invalid/v1");
+}
+
+#[test]
+fn unknown_provider_is_rejected_by_config_parser() {
+    let error = serde_json::from_value::<OpenAIResponsesConfig>(json!({
+        "provider": "anthropic_messages",
+        "base_url": "https://api.anthropic.com/v1",
+        "model": "fixture-model",
+        "api_key": "fixture-key"
+    }))
+    .unwrap_err();
+    assert!(error.to_string().contains("unknown variant"));
+}
+
+#[test]
+fn legacy_official_openai_config_is_compatible_but_custom_gateway_is_ambiguous() {
+    let legacy: OpenAIResponsesConfig = serde_json::from_value(json!({
+        "base_url": OPENAI_RESPONSES_OFFICIAL_BASE_URL,
+        "model": "fixture-model",
+        "api_key": "fixture-key"
+    }))
+    .unwrap();
+    assert_eq!(legacy.reasoning_effort, "medium");
+
+    let error = serde_json::from_value::<OpenAIResponsesConfig>(json!({
+        "base_url": "https://gateway.example.invalid/v1",
+        "model": "fixture-model",
+        "api_key": "fixture-key"
+    }))
+    .unwrap_err();
+    assert!(error.to_string().contains("legacy model config"));
+    assert!(error
+        .to_string()
+        .contains("provider = \"openai_responses\""));
+}
+
+#[test]
 fn route_config_overrides_model_and_reasoning_only() {
-    let config = ModelConfig {
+    let config = OpenAIResponsesConfig {
         base_url: "http://fixture/v1".to_owned(),
         model: "global-model".to_owned(),
         api_key: "fixture-key".to_owned(),
@@ -185,7 +236,7 @@ fn route_config_overrides_model_and_reasoning_only() {
         debug: true,
         routes: BTreeMap::from([(
             "research.critic".to_owned(),
-            ModelRouteConfig {
+            OpenAIResponsesRouteConfig {
                 model: "critic-model".to_owned(),
                 reasoning_effort: "high".to_owned(),
                 response_language: Some("简体中文".to_owned()),
@@ -204,8 +255,8 @@ fn route_config_overrides_model_and_reasoning_only() {
 
 #[test]
 fn capability_snapshot_is_stable_and_redacted() {
-    let config = ModelConfig {
-        base_url: "https://example.invalid/v1".to_owned(),
+    let config = OpenAIResponsesConfig {
+        base_url: OPENAI_RESPONSES_OFFICIAL_BASE_URL.to_owned(),
         model: "fixture-model".to_owned(),
         api_key: "secret-key".to_owned(),
         reasoning_effort: "high".to_owned(),
@@ -215,15 +266,50 @@ fn capability_snapshot_is_stable_and_redacted() {
     };
     let client = ModelClient::from_config(&config).unwrap();
     let snapshot = client.capability_snapshot();
-    assert_eq!(snapshot.provider_id, "responses");
+    assert_eq!(snapshot.provider_id, OPENAI_RESPONSES_PROVIDER_ID);
     assert_eq!(snapshot.model_id, "fixture-model");
     assert_eq!(snapshot.reasoning_effort, "high");
-    assert_eq!(snapshot.source, "adapter_declared");
+    assert_eq!(
+        snapshot.source,
+        "openai_responses_static_declared_unverified"
+    );
+    let capabilities = client.openai_responses_capabilities().unwrap();
+    assert_eq!(capabilities.basis, ModelCapabilityBasis::StaticDeclared);
+    assert!(!capabilities.verified);
+    assert!(capabilities.reasoning_items);
+    assert!(capabilities.encrypted_continuation);
 
     let encoded = serde_json::to_string(&snapshot).unwrap();
     assert!(!encoded.contains("secret-key"));
-    assert!(!encoded.contains("example.invalid"));
+    assert!(!encoded.contains("api.openai.com"));
     assert_eq!(snapshot, client.capability_snapshot());
+}
+
+#[test]
+fn custom_base_url_does_not_inherit_openai_declared_capabilities() {
+    let config = OpenAIResponsesConfig {
+        base_url: "https://gateway.example.invalid/v1".to_owned(),
+        model: "fixture-model".to_owned(),
+        api_key: "fixture-key".to_owned(),
+        reasoning_effort: "high".to_owned(),
+        response_language: "English".to_owned(),
+        debug: false,
+        routes: BTreeMap::new(),
+    };
+    let client = ModelClient::from_openai_responses_config(&config).unwrap();
+    let snapshot = client.capability_snapshot();
+    assert_eq!(snapshot.provider_id, OPENAI_RESPONSES_PROVIDER_ID);
+    assert!(!snapshot.supports_tool_calls);
+    assert!(!snapshot.supports_stateless_continuation);
+    assert!(!snapshot.native_web_tool);
+    assert_eq!(snapshot.streaming, Some(false));
+    assert_eq!(snapshot.source, "custom_endpoint_unverified");
+
+    let capabilities = client.openai_responses_capabilities().unwrap();
+    assert!(!capabilities.reasoning_items);
+    assert!(!capabilities.encrypted_continuation);
+    assert_eq!(capabilities.basis, ModelCapabilityBasis::StaticDeclared);
+    assert!(!capabilities.verified);
 }
 
 #[test]
@@ -385,7 +471,7 @@ fn native_web_contract_requires_citations_and_bounds_results() {
         policy.validate_tool_calls(&[missing_domains]),
         Err(ModelError::NativeWebArgumentsInvalid)
     ));
-    let body = responses_request_body(
+    let body = openai_responses_request_body(
         "fixture",
         "high",
         &ModelRequest {
@@ -496,7 +582,7 @@ fn native_web_contract_rejects_citations_beyond_the_limit() {
 
 #[test]
 fn response_usage_normalizes_responses_and_compatible_aliases() {
-    let response = response_from_raw(
+    let response = openai_response_from_raw(
         json!({
             "output_text": "ok",
             "usage": {
@@ -519,7 +605,7 @@ fn response_usage_normalizes_responses_and_compatible_aliases() {
         }
     );
 
-    let aliases = response_from_raw(
+    let aliases = openai_response_from_raw(
         json!({
             "output_text": "ok",
             "usage": {
@@ -540,7 +626,7 @@ fn response_usage_normalizes_responses_and_compatible_aliases() {
 
 #[test]
 fn response_usage_preserves_missing_reasoning_and_missing_usage() {
-    let without_reasoning = response_from_raw(
+    let without_reasoning = openai_response_from_raw(
         json!({
             "output_text": "ok",
             "usage": {"input_tokens": 7, "output_tokens": 5}
@@ -550,6 +636,6 @@ fn response_usage_preserves_missing_reasoning_and_missing_usage() {
     .unwrap();
     assert_eq!(without_reasoning.usage.reasoning_tokens, None);
 
-    let missing = response_from_raw(json!({"output_text": "ok"}), json!({})).unwrap();
+    let missing = openai_response_from_raw(json!({"output_text": "ok"}), json!({})).unwrap();
     assert_eq!(missing.usage, ModelUsage::default());
 }
