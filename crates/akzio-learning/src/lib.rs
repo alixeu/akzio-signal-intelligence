@@ -25,8 +25,8 @@ pub(crate) fn trusted_learning_provenance(
 }
 
 pub use campaign::{
-    CanaryBundleComparison, CanaryCampaignRuntime, CanaryError, CanaryHorizonMetrics,
-    CanarySubjectComparison,
+    evaluate_canary_cohort, CanaryBundleComparison, CanaryCampaignRuntime, CanaryError,
+    CanaryHorizonMetrics, CanarySubjectComparison,
 };
 pub use evaluation::{
     horizon_observations, materialize_outcome, materialize_partial_outcome,

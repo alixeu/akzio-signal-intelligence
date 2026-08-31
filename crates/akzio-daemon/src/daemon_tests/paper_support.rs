@@ -91,6 +91,16 @@ fn install_test_paper_approval(
     session: NaiveDate,
     now: DateTime<Utc>,
 ) -> (Artifact, Artifact) {
+    install_test_paper_approval_range(store, session, session, now, ChronoDuration::hours(8))
+}
+
+fn install_test_paper_approval_range(
+    store: &V2Store,
+    session_start: NaiveDate,
+    session_end: NaiveDate,
+    now: DateTime<Utc>,
+    validity: ChronoDuration,
+) -> (Artifact, Artifact) {
     let manifest_payload = RuntimeManifest {
         schema_version: V2_DOMAIN_SCHEMA_VERSION,
         code_revision: "fixture-revision".to_owned(),
@@ -107,9 +117,9 @@ fn install_test_paper_approval(
         market_data_feed: "iex".to_owned(),
         broker_account_id: "fixture-paper-account".to_owned(),
         maximum_notional: MoneyMicros::from_usd_cents(100_000),
-        allowed_session_start: session,
-        allowed_session_end: session,
-        expires_at: now + ChronoDuration::hours(8),
+        allowed_session_start: session_start,
+        allowed_session_end: session_end,
+        expires_at: now + validity,
         created_at: now,
     };
     let manifest_hash = manifest_payload.manifest_hash().unwrap();
@@ -142,7 +152,7 @@ fn install_test_paper_approval(
         scope: PaperApprovalScope::Canary,
         reason: "fixture canary".to_owned(),
         approved_at: now,
-        expires_at: now + ChronoDuration::hours(8),
+        expires_at: now + validity,
         approval_hash: ContentHash::of_bytes(b"pending"),
     };
     approval_payload.approval_hash = approval_payload.unsigned_hash().unwrap();

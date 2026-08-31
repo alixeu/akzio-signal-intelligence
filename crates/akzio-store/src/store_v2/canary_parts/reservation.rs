@@ -12,6 +12,7 @@ impl V2Store {
                 reservation.campaign_id, reservation.level, current.status
             )));
         }
+        validate_session_cohort(&current, reservation)?;
         if run_purpose_from_connection(transaction, &reservation.parent_run_id)?
             != RunPurpose::Paper
             || run_purpose_from_connection(transaction, &reservation.contract_shadow_run_id)?
@@ -24,6 +25,47 @@ impl V2Store {
             return Err(StoreError::CanaryCampaignConflict(
                 "canary session run purposes".to_owned(),
             ));
+        }
+        if let Some(cohort_id) = &reservation.cohort_id {
+            if let Some(existing) =
+                read_cohort_session_by_key(transaction, cohort_id, &reservation.session_key)?
+            {
+                if existing.reservation != *reservation {
+                    return Err(StoreError::CanaryCampaignConflict(
+                        "canary cohort session is immutable".to_owned(),
+                    ));
+                }
+                return Ok(());
+            }
+            let duplicate_session: Option<String> = transaction
+                .query_row(
+                    "SELECT campaign_id FROM rebuild_canary_sessions WHERE session_key = ?1 UNION ALL SELECT campaign_id FROM rebuild_canary_cohort_sessions WHERE session_key = ?1 LIMIT 1",
+                    params![reservation.session_key],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if duplicate_session.is_some() {
+                return Err(StoreError::CanaryCampaignConflict(
+                    reservation.session_key.clone(),
+                ));
+            }
+            transaction.execute(
+                "INSERT INTO rebuild_canary_cohort_sessions (cohort_id, campaign_id, stage_json, session_key, reservation_json, parent_run_id, contract_shadow_run_id, topology_shadow_run_id, bundle_shadow_run_id, scheduler_epoch, reserved_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    cohort_id.as_str(),
+                    reservation.campaign_id.as_str(),
+                    serde_json::to_string(&reservation.level)?,
+                    reservation.session_key,
+                    serde_json::to_string(reservation)?,
+                    reservation.parent_run_id.0,
+                    reservation.contract_shadow_run_id.0,
+                    reservation.topology_shadow_run_id.0,
+                    reservation.bundle_shadow_run_id.0,
+                    reservation.scheduler_epoch,
+                    reservation.reserved_at.to_rfc3339(),
+                ],
+            )?;
+            return Ok(());
         }
         if let Some(existing) =
             read_session(transaction, &reservation.campaign_id, reservation.level)?
@@ -143,8 +185,43 @@ impl V2Store {
         campaign_id: &ContentHash,
         level: CanaryCampaignStatus,
     ) -> StoreResult<Option<StoredCanarySession>> {
+        if let Some(session) = self.canary_sessions(campaign_id, level)?.into_iter().next() {
+            return Ok(Some(session));
+        }
         let connection = self.connection()?;
         read_session(&connection, campaign_id, level)
+    }
+
+    pub fn canary_sessions(
+        &self,
+        campaign_id: &ContentHash,
+        level: CanaryCampaignStatus,
+    ) -> StoreResult<Vec<StoredCanarySession>> {
+        let connection = self.connection()?;
+        let Some(campaign) = read_campaign(&connection, campaign_id)? else {
+            return Ok(Vec::new());
+        };
+        let Some(cohort) = campaign.spec.cohort(level) else {
+            return Ok(Vec::new());
+        };
+        read_cohort_sessions(&connection, &cohort.cohort_id)
+    }
+
+    pub fn canary_session_by_key(
+        &self,
+        campaign_id: &ContentHash,
+        level: CanaryCampaignStatus,
+        session_key: &str,
+    ) -> StoreResult<Option<StoredCanarySession>> {
+        let connection = self.connection()?;
+        let Some(campaign) = read_campaign(&connection, campaign_id)? else {
+            return Ok(None);
+        };
+        if let Some(cohort) = campaign.spec.cohort(level) {
+            return read_cohort_session_by_key(&connection, &cohort.cohort_id, session_key);
+        }
+        Ok(read_session(&connection, campaign_id, level)?
+            .filter(|session| session.reservation.session_key == session_key))
     }
 
     pub fn canary_session_for_run(
@@ -152,6 +229,18 @@ impl V2Store {
         run_id: &RunId,
     ) -> StoreResult<Option<StoredCanarySession>> {
         let connection = self.connection()?;
+        let cohort_reservation: Option<String> = connection
+            .query_row(
+                "SELECT reservation_json FROM rebuild_canary_cohort_sessions WHERE parent_run_id = ?1 OR contract_shadow_run_id = ?1 OR topology_shadow_run_id = ?1 OR bundle_shadow_run_id = ?1 LIMIT 1",
+                params![run_id.0],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(reservation) = cohort_reservation {
+            return Ok(Some(StoredCanarySession {
+                reservation: serde_json::from_str(&reservation)?,
+            }));
+        }
         let row: Option<(String, String)> = connection
             .query_row(
                 "SELECT campaign_id, level_json FROM rebuild_canary_sessions WHERE parent_run_id = ?1 OR contract_shadow_run_id = ?1 OR topology_shadow_run_id = ?1 OR bundle_shadow_run_id = ?1 LIMIT 1",
@@ -200,6 +289,23 @@ impl V2Store {
                     "campaign artifact closure".to_owned(),
                 ));
             }
+        }
+
+        let candidate_contract_artifact = self.artifact(&spec.candidate_contract.artifact_id)?;
+        let candidate_contract: AgentContract =
+            serde_json::from_slice(&self.read_blob(&candidate_contract_artifact.blob)?)?;
+        candidate_contract.validate()?;
+        let candidate_topology_artifact = self.artifact(&spec.candidate_topology.artifact_id)?;
+        let candidate_topology: WorkflowGraph =
+            serde_json::from_slice(&self.read_blob(&candidate_topology_artifact.blob)?)?;
+        candidate_topology.validate()?;
+        if spec.cohorts.iter().any(|cohort| {
+            cohort.candidate_contract_hash != candidate_contract.contract_hash
+                || cohort.candidate_topology_id.0 != candidate_topology.topology_id
+        }) {
+            return Err(StoreError::CanaryCampaignConflict(
+                "campaign candidate cohort identity".to_owned(),
+            ));
         }
 
         let manifest_artifact = self.artifact(&spec.runtime_manifest.artifact_id)?;

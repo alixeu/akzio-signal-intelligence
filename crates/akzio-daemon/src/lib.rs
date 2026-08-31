@@ -30,7 +30,8 @@ use std::{
 
 use akzio_domain::{
     content_hash_json, AccountSnapshot, AgentContract, Artifact, ArtifactId, ArtifactKind,
-    ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef, Asset, ContentHash,
+    ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef, Asset,
+    CanaryPairedObservation, CanaryPairedOutcomeMetrics, CanaryPairedSubjectMetrics, ContentHash,
     ContractPurpose, Decision, DecisionContext, DecisionHorizon, DomainError, EvidenceNeed,
     ExecutionContext, ExecutionVerdict, FreezeState, Lesson, LessonId, LessonLifecycle,
     LessonOrigin, LessonScope, LifecycleEventType, MemoryId, MoneyMicros, OrderReceipt, Outcome,
@@ -59,10 +60,10 @@ use akzio_ingest::{
     PaperDecodeError, SecEdgarDirectTransport,
 };
 use akzio_learning::{
-    horizon_observations, CanaryBundleComparison, CanaryCampaignRuntime, CanaryError,
-    CanarySubjectComparison, CandidatePolicyInput, EvaluationError, EvaluationInput,
-    EvaluationPolicy, EvaluationRuntime, OutcomeMaterializationInput, OutcomeScheduleError,
-    OutcomeScheduleInput, OutcomeSchedulingRuntime, ShadowObservation,
+    evaluate_canary_cohort, horizon_observations, CanaryCampaignRuntime, CanaryError,
+    CandidatePolicyInput, EvaluationError, EvaluationInput, EvaluationPolicy, EvaluationRuntime,
+    OutcomeMaterializationInput, OutcomeScheduleError, OutcomeScheduleInput,
+    OutcomeSchedulingRuntime, ShadowObservation,
 };
 use akzio_model::{ModelClient, ModelConfig, ModelError};
 pub use akzio_research::v2::fixture_model_client;
