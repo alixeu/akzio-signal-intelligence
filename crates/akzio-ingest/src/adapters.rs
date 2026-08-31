@@ -606,10 +606,90 @@ struct SourceMaterialization {
     metadata: Value,
 }
 
-struct SourceDocumentResult {
-    citation: NativeWebCitation,
+/// One provider search, reduced to the Rust-owned identity that a later audit
+/// can compare against. `payload_hash` covers the provider result alone, so it
+/// stays stable even though the persisted envelope also carries the request.
+struct ProviderSearchIdentity {
+    response_id: Option<String>,
+    request_hash: String,
+    payload_hash: String,
+    searched_at: DateTime<Utc>,
+}
+
+impl ProviderSearchIdentity {
+    fn new(raw: &Value, request_body: &Value) -> Result<Self, EvidenceAdapterError> {
+        let json_hash = |value: &Value| -> Result<String, EvidenceAdapterError> {
+            let bytes = serde_json::to_vec(value)
+                .map_err(|error| EvidenceAdapterError::Transport(error.to_string()))?;
+            Ok(ContentHash::of_bytes(&bytes).to_string())
+        };
+        Ok(Self {
+            response_id: raw.get("id").and_then(Value::as_str).map(str::to_owned),
+            request_hash: json_hash(request_body)?,
+            payload_hash: json_hash(raw)?,
+            searched_at: Utc::now(),
+        })
+    }
+
+    fn provenance(&self) -> Value {
+        serde_json::json!({
+            "provider_response_id": self.response_id,
+            "provider_request_hash": self.request_hash,
+            "provider_payload_hash": self.payload_hash,
+        })
+    }
+}
+
+/// Every provider citation that canonicalizes to one source URL. Aggregating
+/// before acquisition keeps `required_source_count`, the concatenated bundle and
+/// the completeness denominator counted per source document, not per citation.
+struct AggregatedSource {
     canonical_url: String,
+    provider_urls: Vec<String>,
+    excerpts: Vec<String>,
+}
+
+struct SourceDocumentResult {
+    source: AggregatedSource,
     fetched: Result<SourceDocumentSnapshot, SourceDocumentFetchError>,
+}
+
+fn aggregate_sources_by_canonical_url(
+    citations: &[NativeWebCitation],
+) -> Result<Vec<AggregatedSource>, EvidenceAdapterError> {
+    let mut order = Vec::<AggregatedSource>::new();
+    let mut index = BTreeMap::<String, usize>::new();
+    for citation in citations {
+        let canonical_url = canonical_source_url(&citation.uri)?;
+        let position = *index.entry(canonical_url.clone()).or_insert_with(|| {
+            order.push(AggregatedSource {
+                canonical_url,
+                provider_urls: Vec::new(),
+                excerpts: Vec::new(),
+            });
+            order.len() - 1
+        });
+        let source = &mut order[position];
+        if !source.provider_urls.contains(&citation.uri) {
+            source.provider_urls.push(citation.uri.clone());
+        }
+        if let Some(excerpt) = citation
+            .excerpt
+            .as_deref()
+            .map(str::trim)
+            .filter(|excerpt| !excerpt.is_empty())
+        {
+            let excerpt = excerpt.to_owned();
+            if !source.excerpts.contains(&excerpt) {
+                source.excerpts.push(excerpt);
+            }
+        }
+    }
+    for source in &mut order {
+        source.provider_urls.sort();
+        source.excerpts.sort();
+    }
+    Ok(order)
 }
 
 fn canonical_source_url(uri: &str) -> Result<String, EvidenceAdapterError> {
@@ -632,9 +712,10 @@ impl SourceMaterialization {
         raw: Vec<u8>,
         citations: &[NativeWebCitation],
         primary: &NativeWebCitation,
-        resource: &str,
         snapshot_error: Option<String>,
+        identity: &ProviderSearchIdentity,
     ) -> Result<Self, EvidenceAdapterError> {
+        let required_source_count = aggregate_sources_by_canonical_url(citations)?.len();
         let citations = citations
             .iter()
             .map(|citation| {
@@ -655,32 +736,47 @@ impl SourceMaterialization {
             })
             .collect::<Result<Vec<_>, EvidenceAdapterError>>()?;
 
+        let mut metadata = serde_json::json!({
+            "status": "provider_attributed_unverified",
+            "snapshot_error": snapshot_error,
+            "acquisition_mode": EvidenceAcquisitionMode::DiscoveryOnly.as_str(),
+            "acquisition_policy_version": akzio_domain::EVIDENCE_ACQUISITION_POLICY_VERSION,
+            "acquisition_policy_hash": akzio_domain::evidence_acquisition_policy_hash().to_string(),
+            "source_closure": "provider_attributed",
+            "required_source_count": required_source_count,
+            "verified_source_count": 0,
+            "fetch_count": 0,
+            "exact_quote_count": 0,
+            "search_completed_at": identity.searched_at,
+        });
+        merge_object(&mut metadata, identity.provenance());
+
         Ok(Self {
             raw,
             media_type: "application/json".to_owned(),
-            observed_at: Utc::now(),
+            observed_at: identity.searched_at,
             citations,
             quality: EvidenceQuality {
                 completeness_ppm: 250_000,
                 citations_complete: false,
                 normalized: true,
             },
-            revision: primary.revision.clone(),
+            revision: primary
+                .revision
+                .clone()
+                .or_else(|| Some(identity.payload_hash.clone())),
             dedupe_key: format!(
                 "native-web:{}:{}",
-                primary.document_id.as_deref().unwrap_or(resource),
-                primary.revision.as_deref().unwrap_or("latest")
+                identity.request_hash, identity.payload_hash
             ),
-            metadata: serde_json::json!({
-                "status": "provider_attributed_unverified",
-                "snapshot_error": snapshot_error,
-            }),
+            metadata,
         })
     }
 
     fn source_documents(
         provider_raw: Vec<u8>,
         documents: Vec<SourceDocumentResult>,
+        identity: &ProviderSearchIdentity,
     ) -> Result<Self, EvidenceAdapterError> {
         let source_count = documents.len();
         let mut raw = Vec::new();
@@ -690,11 +786,16 @@ impl SourceMaterialization {
         let mut observed_at = None;
         let mut successful_sources = 0_usize;
         let mut verified_sources = 0_usize;
+        let mut exact_quote_count = 0_usize;
         let mut sole_media_type = None;
 
         for SourceDocumentResult {
-            citation,
-            canonical_url,
+            source:
+                AggregatedSource {
+                    canonical_url,
+                    provider_urls,
+                    excerpts,
+                },
             fetched,
         } in documents
         {
@@ -713,39 +814,56 @@ impl SourceMaterialization {
                     let source_end_byte = raw.len();
                     let content_hash = ContentHash::of_bytes(&snapshot.body).to_string();
                     let snapshot_id = source_snapshot_identity(&canonical_url, &content_hash);
-                    let exact_quote = citation
-                        .excerpt
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|quote| {
-                            (MIN_SOURCE_QUOTE_BYTES..=MAX_SOURCE_QUOTE_BYTES).contains(&quote.len())
-                        })
-                        .and_then(|quote| {
-                            snapshot
-                                .body
-                                .windows(quote.len())
-                                .position(|window| window == quote.as_bytes())
-                                .map(|relative_start| (quote, relative_start))
-                        });
 
-                    let claim_binding = exact_quote.map(|(quote, relative_start)| {
-                        verified_sources += 1;
+                    // Every excerpt attributed to this source document must land
+                    // exactly, otherwise the source stays unverified.
+                    let mut claim_bindings = Vec::with_capacity(excerpts.len());
+                    for excerpt in &excerpts {
+                        let Some(relative_start) = Some(excerpt.as_str())
+                            .filter(|quote| {
+                                (MIN_SOURCE_QUOTE_BYTES..=MAX_SOURCE_QUOTE_BYTES)
+                                    .contains(&quote.len())
+                            })
+                            .and_then(|quote| {
+                                snapshot
+                                    .body
+                                    .windows(quote.len())
+                                    .position(|window| window == quote.as_bytes())
+                            })
+                        else {
+                            claim_bindings.clear();
+                            break;
+                        };
                         let start_byte = source_start_byte + relative_start;
-                        let end_byte = start_byte + quote.len();
-                        citations.push(EvidenceCitation {
-                            start_byte,
-                            end_byte,
-                            quote: quote.to_owned(),
-                        });
-                        serde_json::json!({
+                        let end_byte = start_byte + excerpt.len();
+                        claim_bindings.push(serde_json::json!({
                             "status": "exact_quote",
-                            "quote": quote,
+                            "quote": excerpt,
                             "source_start_byte": relative_start,
-                            "source_end_byte": relative_start + quote.len(),
+                            "source_end_byte": relative_start + excerpt.len(),
                             "bundle_start_byte": start_byte,
                             "bundle_end_byte": end_byte,
-                        })
-                    });
+                        }));
+                    }
+                    if claim_bindings.is_empty() {
+                        claim_bindings.push(serde_json::json!({
+                            "status": "missing_exact_quote",
+                        }));
+                    } else {
+                        verified_sources += 1;
+                        exact_quote_count += claim_bindings.len();
+                        for binding in &claim_bindings {
+                            citations.push(EvidenceCitation {
+                                start_byte: binding_byte(binding, "bundle_start_byte")?,
+                                end_byte: binding_byte(binding, "bundle_end_byte")?,
+                                quote: binding
+                                    .get("quote")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_owned(),
+                            });
+                        }
+                    }
 
                     identity_parts.push(serde_json::json!({
                         "canonical_url": canonical_url,
@@ -754,7 +872,8 @@ impl SourceMaterialization {
                     }));
                     source_artifacts.push(serde_json::json!({
                         "status": "snapshot",
-                        "provider_url": citation.uri,
+                        "provider_url": provider_urls.first(),
+                        "provider_urls": provider_urls,
                         "canonical_url": canonical_url,
                         "snapshot_id": snapshot_id,
                         "content_hash": content_hash,
@@ -766,9 +885,8 @@ impl SourceMaterialization {
                         "fetched_at": snapshot.fetched_at,
                         "etag": snapshot.etag,
                         "last_modified": snapshot.last_modified,
-                        "claim_binding": claim_binding.unwrap_or_else(|| serde_json::json!({
-                            "status": "missing_exact_quote",
-                        })),
+                        "claim_binding": claim_bindings[0],
+                        "claim_bindings": claim_bindings,
                     }));
                 }
                 Err(error) => {
@@ -781,7 +899,8 @@ impl SourceMaterialization {
                     }));
                     source_artifacts.push(serde_json::json!({
                         "status": "fetch_failed",
-                        "provider_url": citation.uri,
+                        "provider_url": provider_urls.first(),
+                        "provider_urls": provider_urls,
                         "canonical_url": canonical_url,
                         "failure_kind": error.kind.as_str(),
                         "failure_identity": failure_identity,
@@ -816,11 +935,32 @@ impl SourceMaterialization {
             1 => sole_media_type.unwrap_or_else(|| "application/octet-stream".to_owned()),
             _ => "application/vnd.akzio.news-web-source-bundle".to_owned(),
         };
+        let mut metadata = serde_json::json!({
+            "status": status,
+            "source_count": source_count,
+            "successful_source_count": successful_sources,
+            "verified_source_count": verified_sources,
+            "acquisition_mode": EvidenceAcquisitionMode::VerifiedSource.as_str(),
+            "acquisition_policy_version": akzio_domain::EVIDENCE_ACQUISITION_POLICY_VERSION,
+            "acquisition_policy_hash": akzio_domain::evidence_acquisition_policy_hash().to_string(),
+            "source_closure": if citations_complete {
+                "complete"
+            } else if successful_sources > 0 {
+                "partial"
+            } else {
+                "provider_attributed"
+            },
+            "required_source_count": source_count,
+            "fetch_count": source_count,
+            "exact_quote_count": exact_quote_count,
+            "sources": source_artifacts,
+        });
+        merge_object(&mut metadata, identity.provenance());
 
         Ok(Self {
             raw,
             media_type,
-            observed_at: observed_at.unwrap_or_else(Utc::now),
+            observed_at: observed_at.unwrap_or(identity.searched_at),
             citations,
             quality: EvidenceQuality {
                 completeness_ppm,
@@ -829,15 +969,39 @@ impl SourceMaterialization {
             },
             revision: Some(revision.clone()),
             dedupe_key: format!("source-document-set:{revision}"),
-            metadata: serde_json::json!({
-                "status": status,
-                "source_count": source_count,
-                "successful_source_count": successful_sources,
-                "verified_source_count": verified_sources,
-                "sources": source_artifacts,
-            }),
+            metadata,
         })
     }
+}
+
+fn binding_byte(binding: &Value, field: &str) -> Result<usize, EvidenceAdapterError> {
+    claim_binding_byte(binding, field)
+        .ok_or_else(|| EvidenceAdapterError::Transport(format!("claim binding is missing {field}")))
+}
+
+fn merge_object(target: &mut Value, extra: Value) {
+    let (Some(target), Some(extra)) = (target.as_object_mut(), extra.as_object()) else {
+        return;
+    };
+    for (key, value) in extra {
+        target.insert(key.clone(), value.clone());
+    }
+}
+
+/// Comma-joined failure kinds for telemetry only; the durable record keeps the
+/// per-source failure detail.
+fn fetch_failure_kinds(metadata: &Value) -> String {
+    metadata
+        .get("sources")
+        .and_then(Value::as_array)
+        .map(|sources| {
+            sources
+                .iter()
+                .filter_map(|source| source.get("failure_kind").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default()
 }
 
 #[derive(Clone)]
@@ -878,6 +1042,13 @@ impl ModelNativeWebEvidenceTransport {
         Self::new(client, source, Some(fetcher))
     }
 
+    /// Provider-mediated transport with no independent fetcher at all. A
+    /// `VerifiedSource` request against it must fail closed.
+    #[cfg(test)]
+    pub(super) fn for_source_without_fetcher(client: ModelClient, source: EvidenceSource) -> Self {
+        Self::new(client, source, None)
+    }
+
     fn new(
         client: ModelClient,
         source: EvidenceSource,
@@ -915,6 +1086,7 @@ impl ModelNativeWebEvidenceTransport {
         &self,
         source: EvidenceSource,
         resource: &str,
+        acquisition_mode: EvidenceAcquisitionMode,
     ) -> Result<AcquiredEvidence, EvidenceAdapterError> {
         if source == EvidenceSource::Alpaca {
             return Err(EvidenceAdapterError::SourceMismatch);
@@ -933,11 +1105,15 @@ impl ModelNativeWebEvidenceTransport {
             tool_choice: ModelToolChoice::Auto,
             fixture_key: None,
         };
+        // One acquisition performs exactly one provider request; the response may
+        // contain any provider search action the Rust policy already accepts.
+        let search_started = std::time::Instant::now();
         let response = self
             .client
             .respond(request)
             .await
             .map_err(|error| model_error(error, source, resource))?;
+        let provider_search_ms = search_started.elapsed().as_millis();
         self.policy
             .validate_provider_response(&response.raw)
             .map_err(|error| model_error(error, source, resource))?;
@@ -950,6 +1126,20 @@ impl ModelNativeWebEvidenceTransport {
             .policy
             .extract_citations(&response.raw)
             .map_err(|error| model_error(error, source, resource))?;
+        // Full URL safety closes before any network request, and covers every
+        // citation rather than only the one that becomes `source_uri`.
+        for citation in &citations {
+            if !governed_source_uri_is_safe(&citation.uri) {
+                return Err(EvidenceAdapterError::Policy {
+                    evidence_source: source,
+                    resource: resource.to_owned(),
+                    reason: format!(
+                        "citation URI carries credentials, a fragment, or a sensitive query: {}",
+                        citation.uri
+                    ),
+                });
+            }
+        }
         let primary = citations
             .iter()
             .find(|citation| {
@@ -961,6 +1151,7 @@ impl ModelNativeWebEvidenceTransport {
             .or_else(|| citations.first())
             .cloned()
             .ok_or_else(|| EvidenceAdapterError::Transport("missing citation URI".to_owned()))?;
+        let identity = ProviderSearchIdentity::new(&response.raw, &response.request_body)?;
         let provider_value = serde_json::json!({
             "source_family": source,
             "resource": resource,
@@ -971,25 +1162,31 @@ impl ModelNativeWebEvidenceTransport {
         });
         let provider_raw = serde_json::to_vec(&provider_value)
             .map_err(|error| EvidenceAdapterError::Transport(error.to_string()))?;
-        let materialization = if let Some(fetcher) = &self.source_document {
-            let mut documents = Vec::with_capacity(citations.len());
-            for citation in &citations {
-                let canonical_url = canonical_source_url(&citation.uri)?;
-                let fetched = fetcher.fetch(&canonical_url).await;
-                documents.push(SourceDocumentResult {
-                    citation: citation.clone(),
-                    canonical_url,
-                    fetched,
-                });
+        let fetch_started = std::time::Instant::now();
+        let materialization = if acquisition_mode.requires_independent_fetch() {
+            let fetcher =
+                self.source_document
+                    .as_ref()
+                    .ok_or_else(|| EvidenceAdapterError::Policy {
+                        evidence_source: source,
+                        resource: resource.to_owned(),
+                        reason: "VerifiedSource acquisition has no independent source fetcher"
+                            .to_owned(),
+                    })?;
+            let aggregated = aggregate_sources_by_canonical_url(&citations)?;
+            let mut documents = Vec::with_capacity(aggregated.len());
+            for source in aggregated {
+                let fetched = fetcher.fetch(&source.canonical_url).await;
+                documents.push(SourceDocumentResult { source, fetched });
             }
-            SourceMaterialization::source_documents(provider_raw, documents)?
+            SourceMaterialization::source_documents(provider_raw, documents, &identity)?
         } else {
             SourceMaterialization::provider_attributed(
                 provider_raw,
                 &citations,
                 &primary,
-                resource,
                 None,
+                &identity,
             )?
         };
         let SourceMaterialization {
@@ -1002,6 +1199,29 @@ impl ModelNativeWebEvidenceTransport {
             dedupe_key,
             metadata,
         } = materialization;
+        let metadata_count = |field: &str| -> u64 {
+            metadata
+                .get(field)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default()
+        };
+        tracing::debug!(
+            evidence_source = source.as_str(),
+            resource,
+            acquisition_mode = acquisition_mode.as_str(),
+            provider_search_ms = provider_search_ms as u64,
+            independent_fetch_ms = fetch_started.elapsed().as_millis() as u64,
+            fetch_count = metadata_count("fetch_count"),
+            verified_source_count = metadata_count("verified_source_count"),
+            required_source_count = metadata_count("required_source_count"),
+            exact_quote_count = metadata_count("exact_quote_count"),
+            fetch_failure_kinds = %fetch_failure_kinds(&metadata),
+            source_closure = metadata
+                .get("source_closure")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default(),
+            "native web evidence acquired"
+        );
         let source_uri = primary.uri.clone();
         let mut normalized = provider_value;
         normalized
@@ -1049,7 +1269,8 @@ impl AsyncEvidenceAdapter for ModelNativeWebEvidenceTransport {
             if request.source != self.source {
                 return Err(EvidenceAdapterError::SourceMismatch);
             }
-            self.acquire_inner(request.source, &request.resource).await
+            self.acquire_inner(request.source, &request.resource, request.acquisition_mode)
+                .await
         })
     }
 }
@@ -1196,5 +1417,103 @@ mod source_document_fetcher_tests {
         assert_eq!(snapshot.media_type, "text/html");
         assert_eq!(snapshot.status_code, 200);
         assert_eq!(snapshot.etag.as_deref(), Some("fixture-etag"));
+    }
+
+    #[tokio::test]
+    async fn source_document_fetcher_rejects_empty_bodies() {
+        let uri = serve_once(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let error = HttpSourceDocumentFetcher::new()
+            .unwrap()
+            .fetch(&uri)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind, SourceDocumentFailureKind::EmptyBody);
+    }
+
+    #[tokio::test]
+    async fn source_document_fetcher_retains_both_validator_headers() {
+        let uri = serve_once(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nETag: \"v7\"\r\nLast-Modified: Sat, 29 Aug 2026 12:00:00 GMT\r\nContent-Length: 6\r\nConnection: close\r\n\r\nsealed",
+        )
+        .await;
+        let snapshot = HttpSourceDocumentFetcher::new()
+            .unwrap()
+            .fetch(&uri)
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.etag.as_deref(), Some("\"v7\""));
+        assert_eq!(
+            snapshot.last_modified.as_deref(),
+            Some("Sat, 29 Aug 2026 12:00:00 GMT")
+        );
+    }
+
+    /// An undeclared body cannot be trusted to stop at the limit, so the stream
+    /// itself must be bounded rather than the `Content-Length` header alone.
+    #[tokio::test]
+    async fn source_document_fetcher_bounds_undeclared_streamed_bodies() {
+        static CHUNK: [u8; 65_536] = [b'a'; 65_536];
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1_024];
+            let _ = socket.read(&mut request).await;
+            if socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .is_err()
+            {
+                return;
+            }
+            // 33 x 64 KiB is just past the 2 MiB ceiling.
+            for _ in 0..33 {
+                if socket.write_all(&CHUNK).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let error = HttpSourceDocumentFetcher::new()
+            .unwrap()
+            .fetch(&format!("http://{address}/source"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind, SourceDocumentFailureKind::BodyTooLarge);
+    }
+
+    #[test]
+    fn canonical_aggregation_collapses_fragment_variants_and_duplicates() {
+        let citation = |uri: &str, excerpt: &str| NativeWebCitation {
+            uri: uri.to_owned(),
+            title: None,
+            excerpt: Some(excerpt.to_owned()),
+            published_at: None,
+            revision: None,
+            document_id: None,
+        };
+        let aggregated = aggregate_sources_by_canonical_url(&[
+            citation("https://www.reuters.com/story#first", "first quote"),
+            citation("https://www.reuters.com/story#second", "second quote"),
+            citation("https://www.reuters.com/story", "first quote"),
+            citation("https://apnews.com/story", "other quote"),
+        ])
+        .unwrap();
+
+        assert_eq!(aggregated.len(), 2);
+        assert_eq!(aggregated[0].canonical_url, "https://www.reuters.com/story");
+        assert_eq!(aggregated[0].provider_urls.len(), 3);
+        assert_eq!(aggregated[0].excerpts, ["first quote", "second quote"]);
+        assert_eq!(aggregated[1].canonical_url, "https://apnews.com/story");
+        assert_eq!(aggregated[1].excerpts, ["other quote"]);
     }
 }

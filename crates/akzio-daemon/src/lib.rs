@@ -30,18 +30,18 @@ use std::{
 };
 
 use akzio_domain::{
-    content_hash_json, AccountSnapshot, AgentContract, Artifact, ArtifactId, ArtifactKind,
-    ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef, Asset,
-    CanaryPairedObservation, CanaryPairedOutcomeMetrics, CanaryPairedSubjectMetrics, ContentHash,
-    ContractPurpose, Decision, DecisionContext, DecisionHorizon, DomainError, EvidenceNeed,
-    ExecutionContext, ExecutionVerdict, FreezeState, Lesson, LessonId, LessonLifecycle,
-    LessonOrigin, LessonScope, LifecycleEventType, MemoryId, MoneyMicros, OrderReceipt, Outcome,
-    OutcomeCostModel, OutcomeExecutionLineage, OutcomeHorizon, OutcomeId, OutcomeSchedule,
-    PaperApprovalScope, PaperLaunchApproval, PolicySubject, QuoteSnapshot, Reconciliation,
-    ReconciliationState, ResearchClaim, ResearchIntent, Retrospective, RetrospectiveDraft, RunId,
-    RunPurpose, RuntimeIdentity, RuntimeManifest, RuntimeTaskClass, TargetPortfolio, TaskId,
-    TaskStatus, TaskWritePermit, TopologyId, WorkflowGraph, WorkflowProposal, WorkflowStatus,
-    V2_DOMAIN_SCHEMA_VERSION,
+    content_hash_json, evidence_acquisition_mode, AccountSnapshot, AgentContract, Artifact,
+    ArtifactId, ArtifactKind, ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef,
+    Asset, CanaryPairedObservation, CanaryPairedOutcomeMetrics, CanaryPairedSubjectMetrics,
+    ContentHash, ContractPurpose, Decision, DecisionContext, DecisionHorizon, DomainError,
+    EvidenceAcquisitionMode, EvidenceNeed, ExecutionContext, ExecutionVerdict, FreezeState, Lesson,
+    LessonId, LessonLifecycle, LessonOrigin, LessonScope, LifecycleEventType, MemoryId,
+    MoneyMicros, OrderReceipt, Outcome, OutcomeCostModel, OutcomeExecutionLineage, OutcomeHorizon,
+    OutcomeId, OutcomeSchedule, PaperApprovalScope, PaperLaunchApproval, PolicySubject,
+    QuoteSnapshot, Reconciliation, ReconciliationState, ResearchClaim, ResearchIntent,
+    Retrospective, RetrospectiveDraft, RunId, RunPurpose, RuntimeIdentity, RuntimeManifest,
+    RuntimeTaskClass, TargetPortfolio, TaskId, TaskStatus, TaskWritePermit, TopologyId,
+    WorkflowGraph, WorkflowProposal, WorkflowStatus, V2_DOMAIN_SCHEMA_VERSION,
 };
 use akzio_execution::{
     materialize_snapshot_artifact,

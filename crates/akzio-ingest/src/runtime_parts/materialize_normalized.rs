@@ -26,23 +26,11 @@ impl EvidenceRuntime {
     }
 
     fn validate_source_uri(source_uri: &str) -> EvidenceRuntimeResult<()> {
-        let parsed = Url::parse(source_uri).map_err(|_| EvidenceRuntimeError::UnsafeSourceUri)?;
-        if parsed.username() != ""
-            || parsed.password().is_some()
-            || parsed.fragment().is_some()
-            || parsed.query_pairs().any(|(key, _)| {
-                let key = key.to_ascii_lowercase();
-                key.contains("token")
-                    || key.contains("secret")
-                    || key.contains("password")
-                    || key.contains("api_key")
-                    || key == "key"
-                    || key.contains("authorization")
-            })
-        {
-            return Err(EvidenceRuntimeError::UnsafeSourceUri);
+        if governed_source_uri_is_safe(source_uri) {
+            Ok(())
+        } else {
+            Err(EvidenceRuntimeError::UnsafeSourceUri)
         }
-        Ok(())
     }
 
     fn attach_news_source_blobs(
@@ -77,41 +65,27 @@ impl EvidenceRuntime {
                 .get(start..end)
                 .filter(|bytes| !bytes.is_empty())
                 .ok_or(EvidenceRuntimeError::InvalidAcquisition)?;
-            if source
-                .get("claim_binding")
-                .and_then(|binding| binding.get("status"))
-                .and_then(Value::as_str)
-                == Some("exact_quote")
-            {
-                let binding = source
-                    .get("claim_binding")
-                    .ok_or(EvidenceRuntimeError::InvalidCitation)?;
+            let bindings = source
+                .get("claim_bindings")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if source.get("claim_binding") != bindings.first() {
+                return Err(EvidenceRuntimeError::InvalidCitation);
+            }
+            for binding in &bindings {
+                if binding.get("status").and_then(Value::as_str) != Some("exact_quote") {
+                    continue;
+                }
                 let quote = binding
                     .get("quote")
                     .and_then(Value::as_str)
                     .filter(|quote| !quote.trim().is_empty())
                     .ok_or(EvidenceRuntimeError::InvalidCitation)?;
-                let source_start = binding
-                    .get("source_start_byte")
-                    .and_then(Value::as_u64)
-                    .and_then(|value| usize::try_from(value).ok())
-                    .ok_or(EvidenceRuntimeError::InvalidCitation)?;
-                let source_end = binding
-                    .get("source_end_byte")
-                    .and_then(Value::as_u64)
-                    .and_then(|value| usize::try_from(value).ok())
-                    .ok_or(EvidenceRuntimeError::InvalidCitation)?;
-                let bundle_start = binding
-                    .get("bundle_start_byte")
-                    .and_then(Value::as_u64)
-                    .and_then(|value| usize::try_from(value).ok())
-                    .ok_or(EvidenceRuntimeError::InvalidCitation)?;
-                let bundle_end = binding
-                    .get("bundle_end_byte")
-                    .and_then(Value::as_u64)
-                    .and_then(|value| usize::try_from(value).ok())
-                    .ok_or(EvidenceRuntimeError::InvalidCitation)?;
-                if bytes.get(source_start..source_end) != Some(quote.as_bytes())
+                let source_start = binding_byte(binding, "source_start_byte")?;
+                let source_end = binding_byte(binding, "source_end_byte")?;
+                let bundle_start = binding_byte(binding, "bundle_start_byte")?;
+                let bundle_end = binding_byte(binding, "bundle_end_byte")?;                if bytes.get(source_start..source_end) != Some(quote.as_bytes())
                     || bundle_start != start.saturating_add(source_start)
                     || bundle_end != start.saturating_add(source_end)
                     || !citations.iter().any(|citation| {
@@ -222,4 +196,8 @@ impl EvidenceRuntime {
         }
         Ok(())
     }
+}
+
+fn binding_byte(binding: &Value, field: &str) -> EvidenceRuntimeResult<usize> {
+    claim_binding_byte(binding, field).ok_or(EvidenceRuntimeError::InvalidCitation)
 }

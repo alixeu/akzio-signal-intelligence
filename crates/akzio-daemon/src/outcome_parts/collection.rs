@@ -77,6 +77,7 @@ impl Daemon {
                 source: EvidenceSource::Alpaca,
                 resource,
                 max_age: Duration::days(7),
+                acquisition_mode: EvidenceAcquisitionMode::VerifiedSource,
             };
             let acquired = runtime
                 .acquire_validated_async(

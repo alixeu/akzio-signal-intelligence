@@ -7,6 +7,7 @@ mod direct;
 mod paper_decode;
 pub mod runtime;
 
+pub use akzio_domain::EvidenceAcquisitionMode;
 pub use direct::{FredDirectTransport, SecEdgarDirectTransport};
 pub use paper_decode::{
     common_bar_dates, decode_paper_account, decode_paper_account_components, decode_paper_clock,

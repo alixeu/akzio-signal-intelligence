@@ -6,3 +6,4 @@ include!("daemon_tests/scheduler.rs");
 include!("daemon_tests/control.rs");
 include!("daemon_tests/replay.rs");
 include!("daemon_tests/parsing.rs");
+include!("daemon_tests/acquisition_modes.rs");

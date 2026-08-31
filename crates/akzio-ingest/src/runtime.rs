@@ -8,7 +8,7 @@ use std::env;
 
 use akzio_domain::{
     Artifact, ArtifactKind, ArtifactLifecycle, ArtifactProvenance, ArtifactRef, Asset, ContentHash,
-    DomainError, EvidenceNeed, TaskWritePermit, V2_DOMAIN_SCHEMA_VERSION,
+    DomainError, EvidenceAcquisitionMode, EvidenceNeed, TaskWritePermit, V2_DOMAIN_SCHEMA_VERSION,
 };
 use akzio_model::{ModelClient, ModelInput, ModelRequest, ModelToolChoice, NativeWebPolicy};
 use akzio_store::v2::{StoreError, V2Store};
@@ -47,6 +47,9 @@ pub struct EvidenceRequest {
     pub source: EvidenceSource,
     pub resource: String,
     pub max_age: Duration,
+    /// Rust-owned acquisition policy for this request. Adapters may read it but
+    /// never widen it, and no model output participates in choosing it.
+    pub acquisition_mode: EvidenceAcquisitionMode,
 }
 
 impl EvidenceRequest {
@@ -462,6 +465,37 @@ pub struct EvidenceBundle {
     pub normalized: Artifact,
 }
 
+/// Read one byte offset out of a persisted claim binding.
+pub(crate) fn claim_binding_byte(binding: &Value, field: &str) -> Option<usize> {
+    binding
+        .get(field)
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+}
+
+/// Governed URI rules shared by provider citations and materialized evidence.
+///
+/// Provider citations are checked against this before any independent HTTPS
+/// request, so a credential-bearing or fragment-carrying URL never reaches the
+/// network; the materialization path re-checks the sealed `source_uri`.
+pub(crate) fn governed_source_uri_is_safe(source_uri: &str) -> bool {
+    let Ok(parsed) = Url::parse(source_uri) else {
+        return false;
+    };
+    parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.fragment().is_none()
+        && !parsed.query_pairs().any(|(key, _)| {
+            let key = key.to_ascii_lowercase();
+            key.contains("token")
+                || key.contains("secret")
+                || key.contains("password")
+                || key.contains("api_key")
+                || key == "key"
+                || key.contains("authorization")
+        })
+}
+
 #[path = "adapters.rs"]
 mod adapters;
 pub use adapters::{
@@ -486,6 +520,16 @@ fn model_native_web_evidence_transport_with_fetcher(
 ) -> std::sync::Arc<dyn AsyncEvidenceAdapter> {
     std::sync::Arc::new(
         adapters::ModelNativeWebEvidenceTransport::for_source_with_fetcher(client, source, fetcher),
+    )
+}
+
+#[cfg(test)]
+fn model_native_web_evidence_transport_without_fetcher(
+    client: ModelClient,
+    source: EvidenceSource,
+) -> std::sync::Arc<dyn AsyncEvidenceAdapter> {
+    std::sync::Arc::new(
+        adapters::ModelNativeWebEvidenceTransport::for_source_without_fetcher(client, source),
     )
 }
 #[derive(Debug, Error)]

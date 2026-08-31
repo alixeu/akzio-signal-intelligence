@@ -281,6 +281,7 @@ impl Daemon {
                 source: EvidenceSource::Alpaca,
                 resource: format!("paper.fills:{broker_session}"),
                 max_age: Duration::days(1),
+                acquisition_mode: EvidenceAcquisitionMode::VerifiedSource,
             })
             .await
             .map_err(|error| DaemonError::Unavailable(error.to_string()))?;

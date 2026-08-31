@@ -122,6 +122,9 @@ async fn native_web_transport_requires_allowlisted_citations() {
             source: EvidenceSource::Fred,
             resource: "series:DFII10".to_owned(),
             max_age: Duration::minutes(5),
+            // A native-web Fred citation is discovery: no independent fetcher
+            // exists for that family, so it may only be provider-attributed.
+            acquisition_mode: EvidenceAcquisitionMode::DiscoveryOnly,
         })
         .await
         .unwrap();
@@ -154,6 +157,7 @@ async fn news_web_transport_cites_an_independent_source_snapshot() {
             source: EvidenceSource::NewsWeb,
             resource: "news:QQQ:2026-08-20:2026-08-27:market".to_owned(),
             max_age: Duration::minutes(5),
+            acquisition_mode: EvidenceAcquisitionMode::VerifiedSource,
         })
         .await
         .unwrap();
@@ -215,6 +219,7 @@ async fn news_web_source_snapshot_is_sealed_through_v2_store() {
         source: EvidenceSource::NewsWeb,
         resource: resource.to_owned(),
         max_age: Duration::seconds(300),
+        acquisition_mode: EvidenceAcquisitionMode::VerifiedSource,
     };
     let runtime = EvidenceRuntime::new(store.clone(), [EvidenceSource::NewsWeb]);
     let acquired = runtime
@@ -312,6 +317,7 @@ async fn news_web_multi_source_snapshots_get_independent_cas_refs() {
         source: EvidenceSource::NewsWeb,
         resource: resource.to_owned(),
         max_age: Duration::seconds(300),
+        acquisition_mode: EvidenceAcquisitionMode::VerifiedSource,
     };
     let runtime = EvidenceRuntime::new(store.clone(), [EvidenceSource::NewsWeb]);
     let acquired = runtime
@@ -402,6 +408,7 @@ async fn news_web_multi_source_snapshot_stays_partial() {
             source: EvidenceSource::NewsWeb,
             resource: "news:QQQ:2026-08-20:2026-08-27:market".to_owned(),
             max_age: Duration::minutes(5),
+            acquisition_mode: EvidenceAcquisitionMode::VerifiedSource,
         })
         .await
         .unwrap();
@@ -453,6 +460,7 @@ async fn news_web_two_citations_bind_to_independent_snapshots() {
             source: EvidenceSource::NewsWeb,
             resource: "news:QQQ:2026-08-20:2026-08-27:market".to_owned(),
             max_age: Duration::minutes(5),
+            acquisition_mode: EvidenceAcquisitionMode::VerifiedSource,
         })
         .await
         .unwrap();
@@ -519,6 +527,7 @@ async fn news_web_identical_bodies_keep_distinct_source_identity() {
             source: EvidenceSource::NewsWeb,
             resource: "news:QQQ:2026-08-20:2026-08-27:market".to_owned(),
             max_age: Duration::minutes(5),
+            acquisition_mode: EvidenceAcquisitionMode::VerifiedSource,
         })
         .await
         .unwrap();
@@ -560,6 +569,7 @@ async fn news_web_repeated_materialization_is_idempotent() {
         source: EvidenceSource::NewsWeb,
         resource: "news:QQQ:2026-08-20:2026-08-27:market".to_owned(),
         max_age: Duration::minutes(5),
+        acquisition_mode: EvidenceAcquisitionMode::VerifiedSource,
     };
 
     let first = transport.acquire(&request).await.unwrap();
@@ -608,6 +618,7 @@ async fn news_web_quote_found_only_in_wrong_source_is_not_verified() {
             source: EvidenceSource::NewsWeb,
             resource: "news:QQQ:2026-08-20:2026-08-27:market".to_owned(),
             max_age: Duration::minutes(5),
+            acquisition_mode: EvidenceAcquisitionMode::VerifiedSource,
         })
         .await
         .unwrap();
@@ -644,6 +655,7 @@ async fn news_web_snapshot_without_exact_quote_stays_incomplete() {
             source: EvidenceSource::NewsWeb,
             resource: "news:QQQ:2026-08-20:2026-08-27:market".to_owned(),
             max_age: Duration::minutes(5),
+            acquisition_mode: EvidenceAcquisitionMode::VerifiedSource,
         })
         .await
         .unwrap();
@@ -667,6 +679,7 @@ async fn native_web_transport_reports_policy_failures_without_transport_class() 
             source: EvidenceSource::NewsWeb,
             resource: "news:QQQ:2026-08-20:2026-08-27:market".to_owned(),
             max_age: Duration::minutes(5),
+            acquisition_mode: EvidenceAcquisitionMode::VerifiedSource,
         })
         .await
         .unwrap_err();
@@ -690,6 +703,7 @@ async fn native_web_transport_accepts_allowlisted_query_uri() {
             source: EvidenceSource::NewsWeb,
             resource: "news:QQQ:2026-08-20:2026-08-27:market".to_owned(),
             max_age: Duration::minutes(5),
+            acquisition_mode: EvidenceAcquisitionMode::VerifiedSource,
         })
         .await
         .unwrap();
@@ -719,6 +733,7 @@ async fn native_web_transport_accepts_allowlisted_query_uri() {
             source: EvidenceSource::NewsWeb,
             resource: "news:SOXX:2026-08-20:2026-08-27:market".to_owned(),
             max_age: Duration::minutes(5),
+            acquisition_mode: EvidenceAcquisitionMode::VerifiedSource,
         })
         .await
         .is_ok());
@@ -733,6 +748,7 @@ async fn native_web_transport_accepts_allowlisted_query_uri() {
             source: EvidenceSource::NewsWeb,
             resource: "news:QQQ:2026-08-20:2026-08-27:market".to_owned(),
             max_age: Duration::minutes(5),
+            acquisition_mode: EvidenceAcquisitionMode::VerifiedSource,
         })
         .await
         .is_ok());
@@ -747,6 +763,7 @@ async fn native_web_transport_accepts_allowlisted_query_uri() {
             source: EvidenceSource::NewsWeb,
             resource: "news:TQQQ:2026-08-20:2026-08-27:market".to_owned(),
             max_age: Duration::minutes(5),
+            acquisition_mode: EvidenceAcquisitionMode::VerifiedSource,
         })
         .await
         .is_ok());
@@ -764,6 +781,7 @@ async fn news_web_rejects_non_https_citation_before_fetch() {
             source: EvidenceSource::NewsWeb,
             resource: "news:QQQ:2026-08-20:2026-08-27:market".to_owned(),
             max_age: Duration::minutes(5),
+            acquisition_mode: EvidenceAcquisitionMode::VerifiedSource,
         })
         .await
         .unwrap_err();

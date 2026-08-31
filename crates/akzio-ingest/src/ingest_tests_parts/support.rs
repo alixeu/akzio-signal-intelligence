@@ -100,6 +100,7 @@ fn fixture_adapters_are_source_typed() {
                 source,
                 resource: "resource".to_owned(),
                 max_age: Duration::seconds(30),
+                acquisition_mode: EvidenceAcquisitionMode::VerifiedSource,
             },
         )
         .unwrap();
@@ -111,6 +112,7 @@ fn fixture_adapters_are_source_typed() {
                     source: other,
                     resource: "resource".to_owned(),
                     max_age: Duration::seconds(30),
+                    acquisition_mode: EvidenceAcquisitionMode::VerifiedSource,
                 },
             ),
             Err(EvidenceAdapterError::SourceMismatch)

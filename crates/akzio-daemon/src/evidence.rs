@@ -59,12 +59,13 @@ impl Daemon {
                 DaemonError::InvalidInput("EvidenceNeed max_age_secs exceeds i64".to_owned())
             })?;
             let runtime = EvidenceRuntime::new(self.store.clone(), [source]);
+            let purpose = self.store.run_purpose(&task.run_id)?;
             let request = EvidenceRequest {
                 source,
                 resource: need.resource.clone(),
                 max_age: Duration::seconds(max_age_secs),
+                acquisition_mode: evidence_acquisition_mode(purpose, &need),
             };
-            let purpose = self.store.run_purpose(&task.run_id)?;
             let use_fixture_adapter = self.fixture_mode || purpose == RunPurpose::PaperDryRun;
             let production_adapter = (!use_fixture_adapter)
                 .then(|| self.production_evidence.get(&source))
@@ -354,6 +355,7 @@ impl Daemon {
         needs: &[(ArtifactRef, Artifact, EvidenceNeed)],
         now: DateTime<Utc>,
     ) -> Result<Vec<ArtifactRef>> {
+        let purpose = self.store.run_purpose(&task.run_id)?;
         let bundles =
             futures::future::try_join_all(needs.iter().map(|(reference, need_artifact, need)| {
                 let reference = reference.clone();
@@ -371,6 +373,7 @@ impl Daemon {
                         source,
                         resource: need.resource.clone(),
                         max_age: Duration::seconds(max_age_secs),
+                        acquisition_mode: evidence_acquisition_mode(purpose, &need),
                     };
                     let bundle = if self.fixture_mode {
                         let mut responses = self
@@ -567,6 +570,10 @@ impl Daemon {
             source,
             resource: need.resource.clone(),
             max_age: Duration::seconds(max_age_secs),
+            acquisition_mode: evidence_acquisition_mode(
+                self.store.run_purpose(&task.run_id)?,
+                &need,
+            ),
         };
         let bundle = if self.fixture_mode {
             let mut responses = self
@@ -641,6 +648,9 @@ impl Daemon {
                     source: EvidenceSource::Alpaca,
                     resource: need.resource.clone(),
                     max_age: Duration::seconds(max_age_secs),
+                    // Broker evidence comes from the Paper API itself, so it is
+                    // already its own independent source.
+                    acquisition_mode: EvidenceAcquisitionMode::VerifiedSource,
                 },
                 adapter,
                 now,
@@ -660,6 +670,9 @@ impl Daemon {
 
         for (need, need_artifact, bundle) in acquisitions {
             let resource = need.resource.clone();
+            if evidence_source(&need.source_family)? == EvidenceSource::NewsWeb {
+                self.validate_paper_news_acquisition(task, &need, &bundle.normalized)?;
+            }
             if matches!(
                 resource.as_str(),
                 PAPER_ACCOUNT_RESOURCE | PAPER_POSITIONS_RESOURCE | PAPER_OPEN_ORDERS_RESOURCE
@@ -685,6 +698,75 @@ impl Daemon {
             artifacts.insert(account.artifact_id.clone(), account.clone());
         }
         Ok((artifacts, account))
+    }
+
+    /// Canonical Paper consumption of provider-mediated news evidence.
+    ///
+    /// The acquisition identity Rust recorded at ingest time must still match the
+    /// policy this build derives, otherwise the run is reading evidence that was
+    /// acquired under a different rule and fails closed. Evidence that never
+    /// closed every source stays acquired and fully attributed, but it is not
+    /// canonical-verified: `citations_complete` is false, so the research layer
+    /// refuses it as directional ground.
+    fn validate_paper_news_acquisition(
+        &self,
+        task: &ClaimedAttempt,
+        need: &EvidenceNeed,
+        normalized: &Artifact,
+    ) -> Result<()> {
+        let payload: NormalizedEvidencePayload =
+            serde_json::from_slice(&self.store.read_blob(&normalized.blob)?)?;
+        let document = payload.value.get("source_document");
+        let expected = evidence_acquisition_mode(self.store.run_purpose(&task.run_id)?, need);
+        let recorded_mode = document
+            .and_then(|document| document.get("acquisition_mode"))
+            .and_then(serde_json::Value::as_str);
+        let Some(recorded_mode) = recorded_mode else {
+            // Absent identity is never upgraded into a verified acquisition.
+            tracing::warn!(
+                run_id = %task.run_id,
+                resource = %need.resource,
+                "news evidence carries no acquisition identity and stays unverified"
+            );
+            return Ok(());
+        };
+        if recorded_mode != expected.as_str() {
+            return Err(DaemonError::InvalidInput(format!(
+                "news evidence {} was acquired as {recorded_mode} but Paper policy requires {}",
+                need.resource,
+                expected.as_str()
+            )));
+        }
+        let recorded_policy = document
+            .and_then(|document| document.get("acquisition_policy_hash"))
+            .and_then(serde_json::Value::as_str);
+        let current_policy = akzio_domain::evidence_acquisition_policy_hash().to_string();
+        if recorded_policy != Some(current_policy.as_str()) {
+            return Err(DaemonError::InvalidInput(format!(
+                "news evidence {} was acquired under a different acquisition policy",
+                need.resource
+            )));
+        }
+        if !payload.quality.citations_complete {
+            tracing::warn!(
+                run_id = %task.run_id,
+                resource = %need.resource,
+                source_closure = document
+                    .and_then(|document| document.get("source_closure"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown"),
+                verified_source_count = document
+                    .and_then(|document| document.get("verified_source_count"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+                required_source_count = document
+                    .and_then(|document| document.get("required_source_count"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+                "news evidence did not close every source and is unusable for canonical grounds"
+            );
+        }
+        Ok(())
     }
 
     pub(super) async fn refresh_execution_snapshots(

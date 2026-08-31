@@ -13,6 +13,7 @@ async fn sync_and_async_materialization_preserve_confidence_semantics() {
         source: EvidenceSource::Alpaca,
         resource: "quote".to_owned(),
         max_age: Duration::seconds(30),
+        acquisition_mode: EvidenceAcquisitionMode::VerifiedSource,
     };
     let adapter = ParityAdapter {
         evidence: AcquiredEvidence {
@@ -109,6 +110,7 @@ fn acquisition_returns_uncommitted_artifacts_until_task_runtime_commits() {
                 source: EvidenceSource::Alpaca,
                 resource: "quote".to_owned(),
                 max_age: Duration::seconds(30),
+                acquisition_mode: EvidenceAcquisitionMode::VerifiedSource,
             },
             &fixture(now),
             now,

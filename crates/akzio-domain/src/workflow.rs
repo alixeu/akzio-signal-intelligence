@@ -9,7 +9,7 @@ use crate::contract::{TaskRecipe, TaskRecipeId};
 use crate::schema::V2_SCHEMA_VERSION;
 use crate::{
     ContentHash, DomainError, FailureDisposition, ResearchIntent, ResearchShard, RetryPolicy,
-    TaskBudget, TaskId,
+    RunPurpose, TaskBudget, TaskId,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -466,6 +466,93 @@ fn paper_need_source_family(resource: &str) -> &'static str {
     }
 }
 
+/// Whether Rust performs its own independent source-document acquisition after
+/// a provider-mediated search, or accepts provider attribution alone.
+///
+/// This is acquisition policy for provider-mediated evidence. A direct API
+/// transport is already its own independent source, so those families always
+/// report `VerifiedSource`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceAcquisitionMode {
+    /// One provider search, no independent fetch. The result may carry provider
+    /// attribution only and can never present itself as a source document.
+    DiscoveryOnly,
+    /// One provider search followed by an independent Rust fetch of every cited
+    /// source, exact quote binding, and per-source closure accounting.
+    VerifiedSource,
+}
+
+impl EvidenceAcquisitionMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DiscoveryOnly => "discovery_only",
+            Self::VerifiedSource => "verified_source",
+        }
+    }
+
+    pub const fn requires_independent_fetch(self) -> bool {
+        matches!(self, Self::VerifiedSource)
+    }
+}
+
+/// Identity of the acquisition mapping below. It is persisted next to acquired
+/// evidence so a later canonical consumer can detect that the policy changed
+/// instead of silently re-deriving a mode with newer code.
+pub const EVIDENCE_ACQUISITION_POLICY_VERSION: u32 = 1;
+
+/// Rust-owned acquisition policy. Neither model output, citation JSON, nor tool
+/// arguments participate: the mode is a function of the run purpose and the
+/// committed `EvidenceNeed` alone, so a model cannot promote `DiscoveryOnly`
+/// into `VerifiedSource`.
+pub fn evidence_acquisition_mode(
+    purpose: RunPurpose,
+    need: &EvidenceNeed,
+) -> EvidenceAcquisitionMode {
+    if need.source_family != "news_web" {
+        return EvidenceAcquisitionMode::VerifiedSource;
+    }
+    match purpose {
+        RunPurpose::Paper => EvidenceAcquisitionMode::VerifiedSource,
+        RunPurpose::Debug
+        | RunPurpose::PositionPlan
+        | RunPurpose::PaperDryRun
+        | RunPurpose::Replay
+        | RunPurpose::Shadow => EvidenceAcquisitionMode::DiscoveryOnly,
+    }
+}
+
+/// Hash the policy version together with the complete purpose-by-family
+/// mapping it produces, so any change to `evidence_acquisition_mode` changes
+/// the recorded identity.
+pub fn evidence_acquisition_policy_hash() -> ContentHash {
+    const PURPOSES: [RunPurpose; 6] = [
+        RunPurpose::Debug,
+        RunPurpose::PositionPlan,
+        RunPurpose::Paper,
+        RunPurpose::PaperDryRun,
+        RunPurpose::Replay,
+        RunPurpose::Shadow,
+    ];
+    let mut identity =
+        format!("akzio.evidence_acquisition_policy:v{EVIDENCE_ACQUISITION_POLICY_VERSION}");
+    for family in crate::GOVERNED_EVIDENCE_SOURCE_FAMILIES {
+        let need = EvidenceNeed {
+            schema_version: V2_SCHEMA_VERSION,
+            source_family: family.to_owned(),
+            resource: "policy.probe".to_owned(),
+            max_age_secs: 1,
+        };
+        for purpose in PURPOSES {
+            identity.push_str(&format!(
+                "|{family}:{purpose:?}={}",
+                evidence_acquisition_mode(purpose, &need).as_str()
+            ));
+        }
+    }
+    ContentHash::of_bytes(identity.as_bytes())
+}
+
 /// Raise any model-declared daily-bar need up to `PAPER_BARS_LIMIT`. A planner
 /// may widen a window but never shrink the entitlement below what a Paper shard
 /// needs, so this is a floor rather than a rejection.
@@ -598,5 +685,66 @@ mod tests {
         assert_eq!(needs[0].resource, "bars:TQQQ:1d:2026-01-01:252");
         assert_eq!(needs[1].resource, "bars:QQQ:1d:2026-01-01:400");
         assert_eq!(needs[2].resource, "news:QQQ:2026-01-01:2026-01-02:market");
+    }
+
+    #[test]
+    fn only_canonical_paper_news_requires_independent_verification() {
+        use super::{evidence_acquisition_mode, EvidenceAcquisitionMode};
+        use crate::RunPurpose;
+
+        let news = EvidenceNeed {
+            schema_version: V2_SCHEMA_VERSION,
+            source_family: "news_web".to_owned(),
+            resource: "news:QQQ:2026-01-01:2026-01-02:market".to_owned(),
+            max_age_secs: 300,
+        };
+        assert_eq!(
+            evidence_acquisition_mode(RunPurpose::Paper, &news),
+            EvidenceAcquisitionMode::VerifiedSource
+        );
+        for purpose in [
+            RunPurpose::Debug,
+            RunPurpose::PositionPlan,
+            RunPurpose::PaperDryRun,
+            RunPurpose::Replay,
+            RunPurpose::Shadow,
+        ] {
+            assert_eq!(
+                evidence_acquisition_mode(purpose, &news),
+                EvidenceAcquisitionMode::DiscoveryOnly,
+                "{purpose:?} must not trigger independent news fetches"
+            );
+        }
+
+        // Direct API families are their own independent source in every run.
+        for family in ["alpaca", "fred", "sec_edgar"] {
+            let need = EvidenceNeed {
+                source_family: family.to_owned(),
+                ..news.clone()
+            };
+            for purpose in [RunPurpose::Debug, RunPurpose::Paper] {
+                assert_eq!(
+                    evidence_acquisition_mode(purpose, &need),
+                    EvidenceAcquisitionMode::VerifiedSource
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn acquisition_policy_hash_is_stable_and_mapping_bound() {
+        let hash = super::evidence_acquisition_policy_hash();
+        assert_eq!(hash, super::evidence_acquisition_policy_hash());
+        assert_ne!(
+            hash,
+            crate::ContentHash::of_bytes(
+                format!(
+                    "akzio.evidence_acquisition_policy:v{}",
+                    super::EVIDENCE_ACQUISITION_POLICY_VERSION
+                )
+                .as_bytes()
+            ),
+            "the hash must bind the full mapping, not only its version"
+        );
     }
 }
