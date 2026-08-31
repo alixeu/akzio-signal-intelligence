@@ -392,6 +392,64 @@ pub(super) struct SourceDocumentSnapshot {
     pub(super) last_modified: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SourceDocumentFailureKind {
+    Redirect,
+    HttpStatus,
+    BodyTooLarge,
+    UnsupportedMediaType,
+    EmptyBody,
+    Transport,
+}
+
+impl SourceDocumentFailureKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Redirect => "redirect",
+            Self::HttpStatus => "http_status",
+            Self::BodyTooLarge => "body_too_large",
+            Self::UnsupportedMediaType => "unsupported_media_type",
+            Self::EmptyBody => "empty_body",
+            Self::Transport => "transport",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SourceDocumentFetchError {
+    kind: SourceDocumentFailureKind,
+    message: String,
+    status_code: Option<u16>,
+}
+
+impl SourceDocumentFetchError {
+    pub(super) fn new(kind: SourceDocumentFailureKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            status_code: None,
+        }
+    }
+
+    fn with_status(
+        kind: SourceDocumentFailureKind,
+        status_code: u16,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            status_code: Some(status_code),
+        }
+    }
+}
+
+impl std::fmt::Display for SourceDocumentFetchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
 /// Fetch one policy-validated source URI as an immutable response-body snapshot.
 /// Implementations must reject redirects, unsupported media types, empty bodies,
 /// and bodies larger than `MAX_SOURCE_DOCUMENT_BYTES`.
@@ -399,7 +457,7 @@ pub(super) trait SourceDocumentFetcher: Send + Sync {
     fn fetch<'a>(
         &'a self,
         uri: &'a str,
-    ) -> BoxFuture<'a, Result<SourceDocumentSnapshot, EvidenceAdapterError>>;
+    ) -> BoxFuture<'a, Result<SourceDocumentSnapshot, SourceDocumentFetchError>>;
 }
 
 #[derive(Clone)]
@@ -424,7 +482,7 @@ impl SourceDocumentFetcher for HttpSourceDocumentFetcher {
     fn fetch<'a>(
         &'a self,
         uri: &'a str,
-    ) -> BoxFuture<'a, Result<SourceDocumentSnapshot, EvidenceAdapterError>> {
+    ) -> BoxFuture<'a, Result<SourceDocumentSnapshot, SourceDocumentFetchError>> {
         Box::pin(async move {
             let response = self
                 .client
@@ -435,20 +493,37 @@ impl SourceDocumentFetcher for HttpSourceDocumentFetcher {
                 )
                 .send()
                 .await
-                .map_err(|error| EvidenceAdapterError::Transport(error.to_string()))?;
+                .map_err(|error| {
+                    SourceDocumentFetchError::new(
+                        SourceDocumentFailureKind::Transport,
+                        error.to_string(),
+                    )
+                })?;
             let status = response.status();
+            if status.is_redirection() {
+                return Err(SourceDocumentFetchError::with_status(
+                    SourceDocumentFailureKind::Redirect,
+                    status.as_u16(),
+                    format!(
+                        "source document returned redirect HTTP {} without redirect following",
+                        status
+                    ),
+                ));
+            }
             if !status.is_success() {
-                return Err(EvidenceAdapterError::Transport(format!(
-                    "source document returned HTTP {} without redirect following",
-                    status
-                )));
+                return Err(SourceDocumentFetchError::with_status(
+                    SourceDocumentFailureKind::HttpStatus,
+                    status.as_u16(),
+                    format!("source document returned HTTP {status}"),
+                ));
             }
             if response
                 .content_length()
                 .is_some_and(|length| length > MAX_SOURCE_DOCUMENT_BYTES as u64)
             {
-                return Err(EvidenceAdapterError::Transport(
-                    "source document exceeds byte limit".to_owned(),
+                return Err(SourceDocumentFetchError::new(
+                    SourceDocumentFailureKind::BodyTooLarge,
+                    "source document exceeds byte limit",
                 ));
             }
 
@@ -465,8 +540,9 @@ impl SourceDocumentFetcher for HttpSourceDocumentFetcher {
                         || matches!(value.as_str(), "application/json" | "application/xhtml+xml")
                 })
                 .ok_or_else(|| {
-                    EvidenceAdapterError::Transport(
-                        "source document media type is missing or unsupported".to_owned(),
+                    SourceDocumentFetchError::new(
+                        SourceDocumentFailureKind::UnsupportedMediaType,
+                        "source document media type is missing or unsupported",
                     )
                 })?;
             let etag = response
@@ -486,18 +562,24 @@ impl SourceDocumentFetcher for HttpSourceDocumentFetcher {
             let mut body = Vec::with_capacity(capacity);
             let mut stream = response.bytes_stream();
             while let Some(chunk) = stream.next().await {
-                let chunk =
-                    chunk.map_err(|error| EvidenceAdapterError::Transport(error.to_string()))?;
+                let chunk = chunk.map_err(|error| {
+                    SourceDocumentFetchError::new(
+                        SourceDocumentFailureKind::Transport,
+                        error.to_string(),
+                    )
+                })?;
                 if chunk.len() > MAX_SOURCE_DOCUMENT_BYTES.saturating_sub(body.len()) {
-                    return Err(EvidenceAdapterError::Transport(
-                        "source document exceeds byte limit".to_owned(),
+                    return Err(SourceDocumentFetchError::new(
+                        SourceDocumentFailureKind::BodyTooLarge,
+                        "source document exceeds byte limit",
                     ));
                 }
                 body.extend_from_slice(&chunk);
             }
             if body.is_empty() {
-                return Err(EvidenceAdapterError::Transport(
-                    "source document body is empty".to_owned(),
+                return Err(SourceDocumentFetchError::new(
+                    SourceDocumentFailureKind::EmptyBody,
+                    "source document body is empty",
                 ));
             }
 
@@ -522,6 +604,27 @@ struct SourceMaterialization {
     revision: Option<String>,
     dedupe_key: String,
     metadata: Value,
+}
+
+struct SourceDocumentResult {
+    citation: NativeWebCitation,
+    canonical_url: String,
+    fetched: Result<SourceDocumentSnapshot, SourceDocumentFetchError>,
+}
+
+fn canonical_source_url(uri: &str) -> Result<String, EvidenceAdapterError> {
+    let mut parsed = reqwest::Url::parse(uri)
+        .map_err(|error| EvidenceAdapterError::Transport(error.to_string()))?;
+    parsed.set_fragment(None);
+    Ok(parsed.to_string())
+}
+
+fn source_snapshot_identity(canonical_url: &str, discriminator: &str) -> String {
+    let mut identity = Vec::with_capacity(canonical_url.len() + discriminator.len() + 1);
+    identity.extend_from_slice(canonical_url.as_bytes());
+    identity.push(0);
+    identity.extend_from_slice(discriminator.as_bytes());
+    ContentHash::of_bytes(&identity).to_string()
 }
 
 impl SourceMaterialization {
@@ -575,77 +678,165 @@ impl SourceMaterialization {
         })
     }
 
-    /// Full citation quality requires one unique provider citation whose
-    /// non-trivial excerpt occurs byte-for-byte in this independent snapshot.
-    fn source_document(
-        snapshot: SourceDocumentSnapshot,
-        primary: &NativeWebCitation,
-        citation_count: usize,
-    ) -> Self {
-        let SourceDocumentSnapshot {
-            body,
-            media_type,
-            fetched_at,
-            status_code,
-            etag,
-            last_modified,
-        } = snapshot;
-        let citation = primary
-            .excerpt
-            .as_deref()
-            .map(str::trim)
-            .filter(|quote| {
-                (MIN_SOURCE_QUOTE_BYTES..=MAX_SOURCE_QUOTE_BYTES).contains(&quote.len())
-            })
-            .and_then(|quote| {
-                body.windows(quote.len())
-                    .position(|window| window == quote.as_bytes())
-                    .map(|start_byte| EvidenceCitation {
-                        start_byte,
-                        end_byte: start_byte + quote.len(),
-                        quote: quote.to_owned(),
-                    })
-            });
-        let citations_complete = citation_count == 1 && citation.is_some();
-        let body_bytes = body.len();
-        let content_hash = ContentHash::of_bytes(&body).to_string();
-        let status = match (citation.is_some(), citation_count) {
-            (true, 1) => "source_snapshot_exact_quote",
-            (true, _) => "source_snapshot_partial_citations",
-            (false, _) => "source_snapshot_without_exact_quote",
+    fn source_documents(
+        provider_raw: Vec<u8>,
+        documents: Vec<SourceDocumentResult>,
+    ) -> Result<Self, EvidenceAdapterError> {
+        let source_count = documents.len();
+        let mut raw = Vec::new();
+        let mut citations = Vec::new();
+        let mut source_artifacts = Vec::with_capacity(source_count);
+        let mut identity_parts = Vec::with_capacity(source_count);
+        let mut observed_at = None;
+        let mut successful_sources = 0_usize;
+        let mut verified_sources = 0_usize;
+        let mut sole_media_type = None;
+
+        for SourceDocumentResult {
+            citation,
+            canonical_url,
+            fetched,
+        } in documents
+        {
+            match fetched {
+                Ok(snapshot) => {
+                    successful_sources += 1;
+                    observed_at = Some(
+                        observed_at.map_or(snapshot.fetched_at, |current: DateTime<Utc>| {
+                            current.max(snapshot.fetched_at)
+                        }),
+                    );
+                    sole_media_type.get_or_insert_with(|| snapshot.media_type.clone());
+
+                    let source_start_byte = raw.len();
+                    raw.extend_from_slice(&snapshot.body);
+                    let source_end_byte = raw.len();
+                    let content_hash = ContentHash::of_bytes(&snapshot.body).to_string();
+                    let snapshot_id = source_snapshot_identity(&canonical_url, &content_hash);
+                    let exact_quote = citation
+                        .excerpt
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|quote| {
+                            (MIN_SOURCE_QUOTE_BYTES..=MAX_SOURCE_QUOTE_BYTES).contains(&quote.len())
+                        })
+                        .and_then(|quote| {
+                            snapshot
+                                .body
+                                .windows(quote.len())
+                                .position(|window| window == quote.as_bytes())
+                                .map(|relative_start| (quote, relative_start))
+                        });
+
+                    let claim_binding = exact_quote.map(|(quote, relative_start)| {
+                        verified_sources += 1;
+                        let start_byte = source_start_byte + relative_start;
+                        let end_byte = start_byte + quote.len();
+                        citations.push(EvidenceCitation {
+                            start_byte,
+                            end_byte,
+                            quote: quote.to_owned(),
+                        });
+                        serde_json::json!({
+                            "status": "exact_quote",
+                            "quote": quote,
+                            "source_start_byte": relative_start,
+                            "source_end_byte": relative_start + quote.len(),
+                            "bundle_start_byte": start_byte,
+                            "bundle_end_byte": end_byte,
+                        })
+                    });
+
+                    identity_parts.push(serde_json::json!({
+                        "canonical_url": canonical_url,
+                        "snapshot_id": snapshot_id,
+                        "content_hash": content_hash,
+                    }));
+                    source_artifacts.push(serde_json::json!({
+                        "status": "snapshot",
+                        "provider_url": citation.uri,
+                        "canonical_url": canonical_url,
+                        "snapshot_id": snapshot_id,
+                        "content_hash": content_hash,
+                        "media_type": snapshot.media_type,
+                        "body_bytes": snapshot.body.len(),
+                        "bundle_start_byte": source_start_byte,
+                        "bundle_end_byte": source_end_byte,
+                        "status_code": snapshot.status_code,
+                        "fetched_at": snapshot.fetched_at,
+                        "etag": snapshot.etag,
+                        "last_modified": snapshot.last_modified,
+                        "claim_binding": claim_binding.unwrap_or_else(|| serde_json::json!({
+                            "status": "missing_exact_quote",
+                        })),
+                    }));
+                }
+                Err(error) => {
+                    let failure_identity =
+                        source_snapshot_identity(&canonical_url, error.kind.as_str());
+                    identity_parts.push(serde_json::json!({
+                        "canonical_url": canonical_url,
+                        "failure_kind": error.kind.as_str(),
+                        "failure_identity": failure_identity,
+                    }));
+                    source_artifacts.push(serde_json::json!({
+                        "status": "fetch_failed",
+                        "provider_url": citation.uri,
+                        "canonical_url": canonical_url,
+                        "failure_kind": error.kind.as_str(),
+                        "failure_identity": failure_identity,
+                        "status_code": error.status_code,
+                        "message": error.message,
+                    }));
+                }
+            }
+        }
+
+        let identity_bytes = serde_json::to_vec(&identity_parts)
+            .map_err(|error| EvidenceAdapterError::Transport(error.to_string()))?;
+        let revision = ContentHash::of_bytes(&identity_bytes).to_string();
+        let citations_complete = source_count > 0 && verified_sources == source_count;
+        let completeness_ppm =
+            u32::try_from(verified_sources.saturating_mul(1_000_000) / source_count.max(1))
+                .unwrap_or(1_000_000);
+        let status = if citations_complete {
+            "source_snapshots_complete"
+        } else if successful_sources > 0 {
+            "source_snapshots_partial"
+        } else {
+            "provider_attributed_unverified"
+        };
+        let raw = if successful_sources > 0 {
+            raw
+        } else {
+            provider_raw
+        };
+        let media_type = match successful_sources {
+            0 => "application/json".to_owned(),
+            1 => sole_media_type.unwrap_or_else(|| "application/octet-stream".to_owned()),
+            _ => "application/vnd.akzio.news-web-source-bundle".to_owned(),
         };
 
-        Self {
-            raw: body,
-            media_type: media_type.clone(),
-            observed_at: fetched_at,
-            citations: citation.into_iter().collect(),
+        Ok(Self {
+            raw,
+            media_type,
+            observed_at: observed_at.unwrap_or_else(Utc::now),
+            citations,
             quality: EvidenceQuality {
-                completeness_ppm: if citations_complete {
-                    1_000_000
-                } else {
-                    500_000
-                },
+                completeness_ppm,
                 citations_complete,
                 normalized: true,
             },
-            revision: Some(content_hash.clone()),
-            dedupe_key: format!(
-                "source-document:{}:{content_hash}",
-                primary.document_id.as_deref().unwrap_or(&primary.uri)
-            ),
+            revision: Some(revision.clone()),
+            dedupe_key: format!("source-document-set:{revision}"),
             metadata: serde_json::json!({
                 "status": status,
-                "source_uri": &primary.uri,
-                "fetched_at": fetched_at,
-                "status_code": status_code,
-                "media_type": media_type,
-                "body_bytes": body_bytes,
-                "content_hash": content_hash,
-                "etag": etag,
-                "last_modified": last_modified,
+                "source_count": source_count,
+                "successful_source_count": successful_sources,
+                "verified_source_count": verified_sources,
+                "sources": source_artifacts,
             }),
-        }
+        })
     }
 }
 
@@ -781,18 +972,17 @@ impl ModelNativeWebEvidenceTransport {
         let provider_raw = serde_json::to_vec(&provider_value)
             .map_err(|error| EvidenceAdapterError::Transport(error.to_string()))?;
         let materialization = if let Some(fetcher) = &self.source_document {
-            match fetcher.fetch(&primary.uri).await {
-                Ok(snapshot) => {
-                    SourceMaterialization::source_document(snapshot, &primary, citations.len())
-                }
-                Err(error) => SourceMaterialization::provider_attributed(
-                    provider_raw,
-                    &citations,
-                    &primary,
-                    resource,
-                    Some(error.to_string()),
-                )?,
+            let mut documents = Vec::with_capacity(citations.len());
+            for citation in &citations {
+                let canonical_url = canonical_source_url(&citation.uri)?;
+                let fetched = fetcher.fetch(&canonical_url).await;
+                documents.push(SourceDocumentResult {
+                    citation: citation.clone(),
+                    canonical_url,
+                    fetched,
+                });
             }
+            SourceMaterialization::source_documents(provider_raw, documents)?
         } else {
             SourceMaterialization::provider_attributed(
                 provider_raw,
@@ -952,10 +1142,26 @@ mod source_document_fetcher_tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(
-            error,
-            EvidenceAdapterError::Transport(ref message) if message.contains("HTTP 302")
-        ));
+        assert_eq!(error.kind, SourceDocumentFailureKind::Redirect);
+        assert_eq!(error.status_code, Some(302));
+        assert!(error.message.contains("HTTP 302"));
+    }
+
+    #[tokio::test]
+    async fn source_document_fetcher_rejects_non_success_status() {
+        let uri = serve_once(
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let error = HttpSourceDocumentFetcher::new()
+            .unwrap()
+            .fetch(&uri)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind, SourceDocumentFailureKind::HttpStatus);
+        assert_eq!(error.status_code, Some(503));
+        assert!(error.message.contains("HTTP 503"));
     }
 
     #[tokio::test]
@@ -970,10 +1176,8 @@ mod source_document_fetcher_tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(
-            error,
-            EvidenceAdapterError::Transport(ref message) if message.contains("byte limit")
-        ));
+        assert_eq!(error.kind, SourceDocumentFailureKind::BodyTooLarge);
+        assert!(error.message.contains("byte limit"));
     }
 
     #[tokio::test]
