@@ -9,15 +9,40 @@ impl PaperScheduler {
     where
         C: BrokerSessionClock + ?Sized,
     {
+        let cohort = campaign
+            .spec
+            .cohort(campaign.status)
+            .ok_or(SchedulerError::WorkflowUnavailable)?
+            .clone();
+        let market_day = NaiveDate::parse_from_str(session_key, "%Y-%m-%d")
+            .map_err(|_| SchedulerError::InvalidSessionKey(session_key.to_owned()))?;
+        let Some(regime) = cohort.regime_for(market_day).map(str::to_owned) else {
+            return Ok(None);
+        };
         let campaign_id = campaign.spec.campaign_id.clone();
         let campaign_status = campaign.status;
-        if self
+        let existing_session_key = session_key.to_owned();
+        if let Some(existing) = self
             .store_executor
-            .execute(move |store| store.canary_session(&campaign_id, campaign_status))
+            .execute(move |store| {
+                store.canary_session_by_key(
+                    &campaign_id,
+                    campaign_status,
+                    &existing_session_key,
+                )
+            })
             .await??
-            .is_some()
         {
-            return Err(SchedulerError::WorkflowUnavailable);
+            let parent_run_id = existing.reservation.parent_run_id;
+            let slot = self
+                .store_executor
+                .execute(move |store| store.session_slot_for_run(&parent_run_id))
+                .await??
+                .ok_or(SchedulerError::WorkflowUnavailable)?;
+            return Ok(Some(SessionSlotReservation {
+                slot,
+                newly_reserved: false,
+            }));
         }
         let scheduler = self.clone();
         let Some((runtime_manifest, approval)) = self
@@ -38,6 +63,11 @@ impl PaperScheduler {
             if manifest_payload.runtime_identity_hash()? != *expected {
                 return Ok(None);
             }
+        }
+        if manifest_payload.code_revision != campaign.spec.source_revision
+            || manifest_payload.maximum_notional != campaign.spec.maximum_total_notional
+        {
+            return Ok(None);
         }
         let account_id = clock.paper_account_id().await?;
         if manifest_payload.broker_account_id != account_id
@@ -68,6 +98,7 @@ impl PaperScheduler {
             || candidate_installation.activated_at.is_some()
             || candidate_installation.baseline_contract_hash.as_ref()
                 != Some(&campaign.spec.active_contract_hash)
+            || candidate.contract_hash != cohort.candidate_contract_hash
         {
             return Err(SchedulerError::WorkflowUnavailable);
         }
@@ -86,6 +117,7 @@ impl PaperScheduler {
         if candidate_topology_artifact.kind != ArtifactKind::WorkflowGraph
             || candidate_topology_artifact.lifecycle != ArtifactLifecycle::RunScoped
             || candidate_topology.topology_id != STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID
+            || candidate_topology.topology_id != cohort.candidate_topology_id.0
         {
             return Err(SchedulerError::WorkflowUnavailable);
         }
@@ -225,6 +257,9 @@ impl PaperScheduler {
             campaign_id: campaign.spec.campaign_id.clone(),
             level: campaign.status,
             session_key: session_key.to_owned(),
+            cohort_id: Some(cohort.cohort_id),
+            market_day: Some(market_day),
+            regime: Some(regime),
             parent_run_id,
             contract_shadow_run_id,
             topology_shadow_run_id,

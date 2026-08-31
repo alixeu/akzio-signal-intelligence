@@ -471,13 +471,9 @@ pub(crate) fn compounded_ppm(values: &[i64]) -> Option<i64> {
 pub(crate) const fn policy_exposure_ppm(state: PolicyState) -> Option<u32> {
     match state {
         PolicyState::Memory(_) => None,
-        PolicyState::Contract(state) | PolicyState::Topology(state) => Some(match state {
-            CandidatePolicyState::Candidate => 0,
-            CandidatePolicyState::Canary10 => 100_000,
-            CandidatePolicyState::Canary25 => 250_000,
-            CandidatePolicyState::Canary50 => 500_000,
-            CandidatePolicyState::Active => 1_000_000,
-        }),
+        PolicyState::Contract(CandidatePolicyState::Active)
+        | PolicyState::Topology(CandidatePolicyState::Active) => Some(1_000_000),
+        PolicyState::Contract(_) | PolicyState::Topology(_) => None,
     }
 }
 

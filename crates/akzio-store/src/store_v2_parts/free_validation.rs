@@ -325,6 +325,39 @@ CREATE TABLE IF NOT EXISTS rebuild_canary_sessions (
     reserved_at TEXT NOT NULL,
     PRIMARY KEY (campaign_id, level_json)
 );
+CREATE TABLE IF NOT EXISTS rebuild_canary_cohort_sessions (
+    cohort_id TEXT NOT NULL,
+    campaign_id TEXT NOT NULL REFERENCES rebuild_canary_campaigns(campaign_id),
+    stage_json TEXT NOT NULL,
+    session_key TEXT NOT NULL UNIQUE,
+    reservation_json TEXT NOT NULL,
+    parent_run_id TEXT NOT NULL REFERENCES rebuild_runs(run_id),
+    contract_shadow_run_id TEXT NOT NULL REFERENCES rebuild_runs(run_id),
+    topology_shadow_run_id TEXT NOT NULL REFERENCES rebuild_runs(run_id),
+    bundle_shadow_run_id TEXT NOT NULL REFERENCES rebuild_runs(run_id),
+    scheduler_epoch INTEGER NOT NULL,
+    reserved_at TEXT NOT NULL,
+    PRIMARY KEY (cohort_id, session_key)
+);
+CREATE TABLE IF NOT EXISTS rebuild_canary_observations (
+    observation_id TEXT PRIMARY KEY,
+    cohort_id TEXT NOT NULL,
+    campaign_id TEXT NOT NULL REFERENCES rebuild_canary_campaigns(campaign_id),
+    stage_json TEXT NOT NULL,
+    session_key TEXT NOT NULL,
+    horizon_json TEXT NOT NULL,
+    observation_json TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    UNIQUE (cohort_id, session_key, horizon_json)
+);
+CREATE TABLE IF NOT EXISTS rebuild_canary_evaluations (
+    evaluation_id TEXT PRIMARY KEY,
+    cohort_id TEXT NOT NULL,
+    campaign_id TEXT NOT NULL REFERENCES rebuild_canary_campaigns(campaign_id),
+    stage_json TEXT NOT NULL,
+    evaluation_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS rebuild_observatory_configuration (
     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
     configuration_json BLOB NOT NULL
