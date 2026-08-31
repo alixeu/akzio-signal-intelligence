@@ -25,6 +25,8 @@ flowchart LR
 
 Rust 是状态、权限、Contract、预算、workflow gate、持久化、学习迁移和执行策略的唯一权威。模型不能访问任意文件、HTTP、Raw Evidence、SQLite 或交易凭据；`ContextManifest` 与 task/attempt-bound `ReadGrant` 是唯一资料通道。Debug、Replay、Shadow 与 Paper Dry Run 永远 noncanonical；只有 sealed Paper Outcome 可推动 memory 或 topology。
 
+当前唯一实现的生产模型协议是 **OpenAI Responses**。配置必须声明 `provider = "openai_responses"`；自定义 `base_url` 不会自动获得 native web、reasoning 或 continuation capability。项目没有原生 Anthropic Messages adapter，也没有经过验证的 xAI adapter；endpoint 兼容不代表语义兼容。详见 [OpenAI Responses Provider 边界](docs/architecture/AKZIO_OPENAI_RESPONSES_PROVIDER.md)。
+
 ## 操作面
 
 唯一业务控制面是带 `x-akzio-token` 认证的 loopback HTTP/SSE。CLI 和未来本地 UI 都调用它；没有 socket 回退、直接 Store 写入或 direct Paper submit/retry。

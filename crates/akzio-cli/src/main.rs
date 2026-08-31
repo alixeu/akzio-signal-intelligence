@@ -22,7 +22,7 @@ use akzio_domain::{
 };
 use akzio_execution::paper::AlpacaPaper;
 use akzio_learning::{evaluate_frozen_evidence, FrozenEvidenceRecord, FrozenEvidenceSet};
-use akzio_model::ModelConfig;
+use akzio_model::OpenAIResponsesConfig;
 use akzio_store::v2::{CanaryCampaignHead, DaemonLease, SessionSlot, StoredRun, TrajectoryEntry};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -220,7 +220,7 @@ enum PurposeArg {
 struct Config {
     daemon: DaemonSettings,
     execution: ExecutionSettings,
-    model: Option<ModelConfig>,
+    model: Option<OpenAIResponsesConfig>,
     #[serde(default)]
     credentials: CredentialsSettings,
     #[serde(default)]
@@ -291,7 +291,7 @@ struct ObservatoryEditableConfiguration {
     global_model: String,
     global_reasoning_effort: String,
     global_response_language: String,
-    stage_models: BTreeMap<String, akzio_model::ModelRouteConfig>,
+    stage_models: BTreeMap<String, akzio_model::OpenAIResponsesRouteConfig>,
     #[serde(rename = "alpacaAPIKey")]
     alpaca_api_key: String,
     #[serde(rename = "alpacaAPISecret")]

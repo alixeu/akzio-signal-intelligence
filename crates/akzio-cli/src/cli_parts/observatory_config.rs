@@ -16,6 +16,10 @@ fn handle_observatory_config(config_path: &Path, command: &ObservatoryConfigComm
             if let Some(model) = template_config.model.as_ref() {
                 let model_table = toml_section_mut(&mut document, "model")?;
                 model_table.insert(
+                    "provider".to_owned(),
+                    toml::Value::String(model.provider_identity().as_str().to_owned()),
+                );
+                model_table.insert(
                     "base_url".to_owned(),
                     toml::Value::String(initial_config_value(&model.base_url)),
                 );
@@ -91,7 +95,7 @@ fn update_observatory_configuration(
         .model
         .as_ref()
         .context("Observatory configuration requires [model]")?;
-    let model = ModelConfig {
+    let model = OpenAIResponsesConfig {
         base_url: configuration.llm_base_url.trim().to_owned(),
         model: configuration.global_model.trim().to_owned(),
         api_key: configuration.llm_api_key,
@@ -104,6 +108,10 @@ fn update_observatory_configuration(
 
     let mut document = read_config_document(config_path)?;
     let model_table = toml_section_mut(&mut document, "model")?;
+    model_table.insert(
+        "provider".to_owned(),
+        toml::Value::String(model.provider_identity().as_str().to_owned()),
+    );
     model_table.insert("base_url".to_owned(), toml::Value::String(model.base_url));
     model_table.insert("model".to_owned(), toml::Value::String(model.model));
     model_table.insert("api_key".to_owned(), toml::Value::String(model.api_key));

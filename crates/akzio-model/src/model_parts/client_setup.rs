@@ -12,8 +12,8 @@ impl ModelClient {
         )))
     }
 
-    pub fn from_config(config: &ModelConfig) -> Result<Self> {
-        Ok(Self::Responses(ResponsesClient::new(
+    pub fn from_openai_responses_config(config: &OpenAIResponsesConfig) -> Result<Self> {
+        Ok(Self::OpenAIResponses(OpenAIResponsesClient::new(
             &config.base_url,
             &config.api_key,
             &config.model,
@@ -21,20 +21,31 @@ impl ModelClient {
         )?))
     }
 
+    pub fn from_config(config: &ModelConfig) -> Result<Self> {
+        Self::from_openai_responses_config(config)
+    }
+
     pub fn capability_snapshot(&self) -> ModelCapabilitySnapshot {
         match self {
-            Self::Responses(client) => ModelCapabilitySnapshot {
-                provider_id: "responses".to_owned(),
-                model_id: client.model.clone(),
-                reasoning_effort: client.reasoning_effort.clone(),
-                supports_tool_calls: true,
-                supports_stateless_continuation: true,
-                native_web_tool: true,
-                streaming: Some(true),
-                declared_context_limit: None,
-                declared_max_output_tokens: None,
-                source: "adapter_declared".to_owned(),
-            },
+            Self::OpenAIResponses(client) => {
+                let declared = client.declared_capabilities();
+                ModelCapabilitySnapshot {
+                    provider_id: OPENAI_RESPONSES_PROVIDER_ID.to_owned(),
+                    model_id: client.model.clone(),
+                    reasoning_effort: client.reasoning_effort.clone(),
+                    supports_tool_calls: declared.supports_tool_calls,
+                    supports_stateless_continuation: declared.supports_stateless_continuation,
+                    native_web_tool: declared.native_web_tool,
+                    streaming: Some(declared.streaming),
+                    declared_context_limit: None,
+                    declared_max_output_tokens: None,
+                    source: if is_official_openai_base_url(&client.base_url) {
+                        "openai_responses_static_declared_unverified".to_owned()
+                    } else {
+                        "custom_endpoint_unverified".to_owned()
+                    },
+                }
+            }
             Self::Fixture(_) | Self::FixtureByPurpose(_) | Self::FixtureSequence(_) => {
                 ModelCapabilitySnapshot {
                     provider_id: "fixture".to_owned(),
@@ -46,18 +57,25 @@ impl ModelClient {
                     streaming: Some(false),
                     declared_context_limit: None,
                     declared_max_output_tokens: None,
-                    source: "adapter_declared".to_owned(),
+                    source: "fixture_static_declared_unverified".to_owned(),
                 }
             }
+        }
+    }
+
+    pub fn openai_responses_capabilities(&self) -> Option<OpenAIResponsesCapabilities> {
+        match self {
+            Self::OpenAIResponses(client) => Some(client.declared_capabilities()),
+            Self::Fixture(_) | Self::FixtureByPurpose(_) | Self::FixtureSequence(_) => None,
         }
     }
 
     /// Exact provider payload used for an individual turn, excluding auth.
     pub fn request_body(&self, request: &ModelRequest) -> Value {
         match self {
-            Self::Responses(client) => client.request_body(request),
+            Self::OpenAIResponses(client) => client.request_body(request),
             Self::Fixture(_) | Self::FixtureByPurpose(_) | Self::FixtureSequence(_) => {
-                responses_request_body("fixture", "none", request)
+                openai_responses_request_body("fixture", "none", request)
             }
         }
     }

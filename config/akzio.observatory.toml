@@ -17,6 +17,7 @@ transaction_cost_ppm = 100
 slippage_ppm = 50
 
 [model]
+provider = "openai_responses"
 base_url = "$LLM_GATEWAY_BASE_URL"
 model = "gpt-5.6-luna"
 api_key = "$LLM_GATEWAY_API_KEY"

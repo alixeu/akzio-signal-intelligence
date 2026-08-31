@@ -9,8 +9,8 @@ impl ModelClient {
         on_event: impl FnMut(ModelStreamEvent),
     ) -> Result<ModelResponse> {
         match self {
-            Self::Responses(client) => client.respond_with_events(request, on_event).await,
-            Self::Fixture(raw) => response_from_raw(
+            Self::OpenAIResponses(client) => client.respond_with_events(request, on_event).await,
+            Self::Fixture(raw) => openai_response_from_raw(
                 materialize_fixture(raw.clone(), &request),
                 self.request_body(&request),
             )
@@ -31,7 +31,7 @@ impl ModelClient {
                     .get_mut(key)
                     .and_then(VecDeque::pop_front)
                     .ok_or(ModelError::FixtureExhausted)?;
-                response_from_raw(
+                openai_response_from_raw(
                     materialize_fixture(raw, &request),
                     self.request_body(&request),
                 )
@@ -48,7 +48,7 @@ impl ModelClient {
                     .expect("fixture response sequence poisoned")
                     .pop_front()
                     .ok_or(ModelError::FixtureExhausted)?;
-                response_from_raw(
+                openai_response_from_raw(
                     materialize_fixture(raw, &request),
                     self.request_body(&request),
                 )
