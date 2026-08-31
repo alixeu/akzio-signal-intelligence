@@ -12,12 +12,14 @@ mod execution;
 mod learning;
 mod lease;
 mod lesson;
+mod maintenance;
 mod schema;
 mod trajectory;
 mod workflow;
 
 pub use canary::{CanaryCampaignHead, StoredCanarySession};
 pub use lesson::{LessonUsage, LessonWriteResult, StoredLesson};
+pub use maintenance::MaintenanceLeaseDeferral;
 
 include!("store_v2_parts/prelude.rs");
 include!("store_v2_parts/public_types.rs");

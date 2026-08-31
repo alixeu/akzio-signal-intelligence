@@ -1,27 +1,52 @@
 impl Daemon {
     pub(crate) async fn observer_snapshot(&self) -> Result<ObserverSnapshot> {
         let generated_at = Utc::now();
-        let recent_runs = self.store.recent_workflows(OBSERVER_RUN_LIMIT)?;
-        let current_run = recent_runs
-            .first()
-            .map(|workflow| self.observer_run_detail(&workflow.run.run_id))
-            .transpose()?;
-        let run_summaries = recent_runs
-            .iter()
-            .map(|workflow| self.observer_run_summary(&workflow.run.run_id))
-            .collect::<Result<Vec<_>>>()?;
-        let health = self.health()?;
-        let ready = self.ready().is_ok();
+        let operation = self.clone();
+        let (recent_runs, current_run, run_summaries, health, ready, outcome, learning) = self
+            .store_executor
+            .execute(move |_| -> Result<_> {
+                let recent_runs = operation.store.recent_workflows(OBSERVER_RUN_LIMIT)?;
+                let current_run = recent_runs
+                    .first()
+                    .map(|workflow| operation.observer_run_detail(&workflow.run.run_id))
+                    .transpose()?;
+                let run_summaries = recent_runs
+                    .iter()
+                    .map(|workflow| operation.observer_run_summary(&workflow.run.run_id))
+                    .collect::<Result<Vec<_>>>()?;
+                let health = operation.health()?;
+                let ready = operation.ready().is_ok();
+                let outcome = operation.observer_outcome(generated_at)?;
+                let learning = operation.observer_learning(generated_at)?;
+                Ok((
+                    recent_runs,
+                    current_run,
+                    run_summaries,
+                    health,
+                    ready,
+                    outcome,
+                    learning,
+                ))
+            })
+            .await??;
         let portfolio = self
             .observer_portfolio(generated_at, current_run.as_ref())
             .await;
-        let outcome = self.observer_outcome(generated_at)?;
-        let learning = self.observer_learning(generated_at)?;
+        let operation = self.clone();
+        let (event_cursor, approval) = self
+            .store_executor
+            .execute(move |_| -> Result<_> {
+                Ok((
+                    operation.store.event_cursor()?,
+                    operation.observer_approval(generated_at)?,
+                ))
+            })
+            .await??;
 
         Ok(ObserverSnapshot {
             schema_version: 2,
             generated_at,
-            event_cursor: self.store.event_cursor()?,
+            event_cursor,
             core: ObserverCoreStatus {
                 ready,
                 readiness_ppm: readiness_ppm(
@@ -32,7 +57,7 @@ impl Daemon {
                 ),
                 auto_paper: self.paper.auto_paper,
                 health,
-                approval: self.observer_approval(generated_at)?,
+                approval,
             },
             current_run,
             recent_runs,

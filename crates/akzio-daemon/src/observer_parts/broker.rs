@@ -150,7 +150,13 @@ impl Daemon {
         };
 
         if let Some(run) = current_run {
-            if let Ok(sparklines) = self.observer_position_sparklines(run) {
+            let operation = self.clone();
+            let run_id = run.workflow.run.run_id.clone();
+            if let Ok(Ok(sparklines)) = self
+                .store_executor
+                .execute(move |_| operation.observer_position_sparklines(&run_id))
+                .await
+            {
                 for position in &mut portfolio.positions {
                     position.sparkline_ppm = sparklines
                         .get(&position.symbol.to_ascii_uppercase())
@@ -198,21 +204,39 @@ impl Daemon {
                         .map(observer_broker_order_ids)
                         .unwrap_or_default();
                     match parse_fill_activities(&value, &order_ids) {
-                        Ok(fills) => {
-                            if let Some(run) = current_run {
-                                if let (Some(opening_positions), Some(opening_equity)) = (
-                                    self.observer_normalized_resource(
-                                        run,
-                                        PAPER_POSITIONS_RESOURCE,
-                                    ),
-                                    self.observer_normalized_resource(run, PAPER_ACCOUNT_RESOURCE)
-                                        .and_then(|account| {
-                                            account
-                                                .get("equity")
-                                                .and_then(parse_money_micros)
-                                                .map(|value| value.0)
-                                        }),
-                                ) {
+                            Ok(fills) => {
+                                if let Some(run) = current_run {
+                                    let operation = self.clone();
+                                    let run_id = run.workflow.run.run_id.clone();
+                                    let normalized = self
+                                        .store_executor
+                                        .execute(move |_| {
+                                            (
+                                                operation.observer_normalized_resource(
+                                                    &run_id,
+                                                    PAPER_POSITIONS_RESOURCE,
+                                                ),
+                                                operation.observer_normalized_resource(
+                                                    &run_id,
+                                                    PAPER_ACCOUNT_RESOURCE,
+                                                ),
+                                            )
+                                        })
+                                        .await
+                                        .ok();
+                                    if let Some((Some(opening_positions), Some(opening_equity))) =
+                                        normalized.map(|(positions, account)| {
+                                            (
+                                                positions,
+                                                account.and_then(|account| {
+                                                    account
+                                                        .get("equity")
+                                                        .and_then(parse_money_micros)
+                                                        .map(|value| value.0)
+                                                }),
+                                            )
+                                        })
+                                    {
                                     if let Ok(realized) =
                                         managed_realized_pnl(&opening_positions, &fills)
                                     {
@@ -260,7 +284,7 @@ impl Daemon {
 
     fn observer_normalized_resource(
         &self,
-        run: &ObserverRunDetail,
+        run_id: &RunId,
         resource: &str,
     ) -> Option<Value> {
         self.store
@@ -268,7 +292,7 @@ impl Daemon {
             .ok()?
             .into_iter()
             .find_map(|artifact| {
-                if artifact.origin.as_ref()?.run_id.as_ref()? != &run.workflow.run.run_id {
+                if artifact.origin.as_ref()?.run_id.as_ref()? != run_id {
                     return None;
                 }
                 let payload: NormalizedEvidencePayload =
@@ -279,7 +303,7 @@ impl Daemon {
 
     fn observer_position_sparklines(
         &self,
-        run: &ObserverRunDetail,
+        run_id: &RunId,
     ) -> Result<BTreeMap<String, Vec<i64>>> {
         let mut sparklines = BTreeMap::new();
         for artifact in self
@@ -290,7 +314,7 @@ impl Daemon {
                 .origin
                 .as_ref()
                 .and_then(|origin| origin.run_id.as_ref())
-                != Some(&run.workflow.run.run_id)
+                != Some(run_id)
             {
                 continue;
             }

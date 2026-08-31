@@ -8,6 +8,7 @@ impl PaperScheduler {
             return Err(SchedulerError::InvalidOwner);
         }
         Ok(Self {
+            store_executor: StoreExecutor::new(store.clone()),
             store,
             workflow,
             owner_id,
@@ -16,6 +17,11 @@ impl PaperScheduler {
             market_data_feed: None,
             runtime_identity_hash: None,
         })
+    }
+
+    pub fn with_store_executor(mut self, store_executor: StoreExecutor) -> Self {
+        self.store_executor = store_executor;
+        self
     }
 
     pub fn with_market_data_feed(mut self, market_data_feed: Option<AlpacaMarketDataFeed>) -> Self {

@@ -37,7 +37,10 @@ pub use catalogue::{
     EXECUTION_GATE_RECIPE_ID, PAPER_COMMIT_RECIPE_ID, RECONCILE_RECIPE_ID,
 };
 pub use planner::should_run_structured_critique;
-pub use store_executor::StoreExecutor;
+pub use store_executor::{
+    StoreExecutor, StoreExecutorTelemetry, StoreMaintenanceKind, StoreMaintenanceOutcome,
+    StoreMaintenanceState,
+};
 pub use task::TaskRuntime;
 
 #[derive(Debug, Error)]

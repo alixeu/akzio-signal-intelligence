@@ -19,3 +19,4 @@ include!("store_tests/agent_turns.rs");
 include!("store_tests/recovery.rs");
 include!("store_tests/attempt_queries.rs");
 include!("store_tests/lifecycle.rs");
+include!("store_tests/maintenance.rs");
