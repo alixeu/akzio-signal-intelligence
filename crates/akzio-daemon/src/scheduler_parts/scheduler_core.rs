@@ -1,3 +1,5 @@
+use super::*;
+
 impl PaperScheduler {
     pub fn new(
         store: V2Store,
@@ -45,7 +47,7 @@ impl PaperScheduler {
         Ok(self)
     }
 
-    fn current_approval_binding(&self) -> SchedulerResult<Option<(Artifact, Artifact)>> {
+    pub(super) fn current_approval_binding(&self) -> SchedulerResult<Option<(Artifact, Artifact)>> {
         let Some(approval) = self
             .store
             .latest_artifact_by_kind(ArtifactKind::PaperLaunchApproval)?
@@ -80,7 +82,7 @@ impl PaperScheduler {
         Ok(self.store.reserve_canary_session(&lease, reservation)?)
     }
 
-    fn paper_snapshot_artifacts(
+    pub(super) fn paper_snapshot_artifacts(
         &self,
         run_id: &RunId,
         session_key: &str,

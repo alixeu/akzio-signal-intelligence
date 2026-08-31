@@ -1,5 +1,7 @@
+use super::*;
+
 impl Daemon {
-    fn complete_canary_session(
+    pub(super) fn complete_canary_session(
         &self,
         lease: &DaemonLease,
         task: &ClaimedAttempt,
@@ -102,8 +104,7 @@ impl Daemon {
             DaemonError::InvalidInput("canary promotion policy missing".to_owned())
         })?;
         let evaluation_policy = EvaluationPolicy {
-            minimum_evidence_completeness_ppm: promotion_policy
-                .minimum_evidence_completeness_ppm,
+            minimum_evidence_completeness_ppm: promotion_policy.minimum_evidence_completeness_ppm,
             minimum_risk_recall_ppm: promotion_policy.minimum_risk_recall_ppm,
             minimum_fresh_pairs_per_horizon: promotion_policy
                 .required_paired_sessions_per_horizon
@@ -148,7 +149,9 @@ impl Daemon {
         let cohort = campaign
             .spec
             .cohort(session.reservation.level)
-            .ok_or_else(|| DaemonError::InvalidInput("canary cohort manifest missing".to_owned()))?;
+            .ok_or_else(|| {
+                DaemonError::InvalidInput("canary cohort manifest missing".to_owned())
+            })?;
         if session.reservation.cohort_id.as_ref() != Some(&cohort.cohort_id)
             || materialization.cost_model != cohort.cost_model
         {
@@ -159,9 +162,10 @@ impl Daemon {
         let market_day = session.reservation.market_day.ok_or_else(|| {
             DaemonError::InvalidInput("canary session market day missing".to_owned())
         })?;
-        let regime = session.reservation.regime.clone().ok_or_else(|| {
-            DaemonError::InvalidInput("canary session regime missing".to_owned())
-        })?;
+        let regime =
+            session.reservation.regime.clone().ok_or_else(|| {
+                DaemonError::InvalidInput("canary session regime missing".to_owned())
+            })?;
         let metrics = |outcome: &Outcome, horizon: OutcomeHorizon| -> Result<_> {
             outcome
                 .windows
@@ -169,9 +173,7 @@ impl Daemon {
                 .find(|window| window.horizon == horizon)
                 .map(CanaryPairedOutcomeMetrics::from_outcome_window)
                 .ok_or_else(|| {
-                    DaemonError::InvalidInput(format!(
-                        "canary outcome is missing {horizon:?}"
-                    ))
+                    DaemonError::InvalidInput(format!("canary outcome is missing {horizon:?}"))
                 })
         };
         let observations = OutcomeHorizon::ALL
@@ -212,12 +214,8 @@ impl Daemon {
             &observations,
             completed_at,
         )?;
-        let cohort_evaluation = evaluate_canary_cohort(
-            cohort,
-            promotion_policy,
-            &observations,
-            completed_at,
-        )?;
+        let cohort_evaluation =
+            evaluate_canary_cohort(cohort, promotion_policy, &observations, completed_at)?;
         let canary = CanaryCampaignRuntime::new(
             self.store.clone(),
             evaluation_policy

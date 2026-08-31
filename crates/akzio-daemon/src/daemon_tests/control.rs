@@ -66,7 +66,7 @@ async fn blocking_store_maintenance_keeps_http_responsive() {
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let started_at = std::time::Instant::now();
     let maintenance = tokio::spawn(http::run_store_maintenance(
-        daemon.store_executor.clone(),
+        daemon.maintenance(),
         StoreMaintenanceKind::Test,
         move |_| {
             started_tx.send(()).unwrap();
@@ -105,7 +105,9 @@ async fn blocking_store_maintenance_keeps_http_responsive() {
 async fn store_maintenance_join_error_maps_to_internal_server_error() {
     let directory = tempdir().unwrap();
     let status = http::run_store_maintenance(
-        StoreExecutor::new(V2Store::open(directory.path()).unwrap()),
+        application::Maintenance::new(StoreExecutor::new(
+            V2Store::open(directory.path()).unwrap(),
+        )),
         StoreMaintenanceKind::Test,
         |_| -> std::result::Result<(), StoreError> { panic!("fixture maintenance panic") },
     )

@@ -1,5 +1,7 @@
+use super::*;
+
 impl Daemon {
-    fn observer_artifacts(
+    pub(super) fn observer_artifacts(
         &self,
         trajectory: &[TrajectoryEntry],
         include: impl Fn(ArtifactKind) -> bool,
@@ -22,7 +24,10 @@ impl Daemon {
         Ok(artifacts)
     }
 
-    fn observer_artifact_view(&self, artifact: &Artifact) -> Result<Option<ObserverArtifactView>> {
+    pub(super) fn observer_artifact_view(
+        &self,
+        artifact: &Artifact,
+    ) -> Result<Option<ObserverArtifactView>> {
         let payload = match artifact.kind {
             ArtifactKind::WorkflowProposalDraft => {
                 self.typed_observer_payload::<WorkflowProposalDraft>(artifact)?
@@ -80,7 +85,7 @@ impl Daemon {
         )?)?)
     }
 
-    fn observer_approval(&self, now: DateTime<Utc>) -> Result<ObserverApprovalStatus> {
+    pub(super) fn observer_approval(&self, now: DateTime<Utc>) -> Result<ObserverApprovalStatus> {
         let Some(artifact) = self
             .store
             .latest_artifact_by_kind(ArtifactKind::PaperLaunchApproval)?
@@ -120,7 +125,7 @@ impl Daemon {
         })
     }
 
-    async fn observer_portfolio(
+    pub(super) async fn observer_portfolio(
         &self,
         observed_at: DateTime<Utc>,
         current_run: Option<&ObserverRunDetail>,
@@ -204,39 +209,39 @@ impl Daemon {
                         .map(observer_broker_order_ids)
                         .unwrap_or_default();
                     match parse_fill_activities(&value, &order_ids) {
-                            Ok(fills) => {
-                                if let Some(run) = current_run {
-                                    let operation = self.clone();
-                                    let run_id = run.workflow.run.run_id.clone();
-                                    let normalized = self
-                                        .store_executor
-                                        .execute(move |_| {
-                                            (
-                                                operation.observer_normalized_resource(
-                                                    &run_id,
-                                                    PAPER_POSITIONS_RESOURCE,
-                                                ),
-                                                operation.observer_normalized_resource(
-                                                    &run_id,
-                                                    PAPER_ACCOUNT_RESOURCE,
-                                                ),
-                                            )
-                                        })
-                                        .await
-                                        .ok();
-                                    if let Some((Some(opening_positions), Some(opening_equity))) =
-                                        normalized.map(|(positions, account)| {
-                                            (
-                                                positions,
-                                                account.and_then(|account| {
-                                                    account
-                                                        .get("equity")
-                                                        .and_then(parse_money_micros)
-                                                        .map(|value| value.0)
-                                                }),
-                                            )
-                                        })
-                                    {
+                        Ok(fills) => {
+                            if let Some(run) = current_run {
+                                let operation = self.clone();
+                                let run_id = run.workflow.run.run_id.clone();
+                                let normalized = self
+                                    .store_executor
+                                    .execute(move |_| {
+                                        (
+                                            operation.observer_normalized_resource(
+                                                &run_id,
+                                                PAPER_POSITIONS_RESOURCE,
+                                            ),
+                                            operation.observer_normalized_resource(
+                                                &run_id,
+                                                PAPER_ACCOUNT_RESOURCE,
+                                            ),
+                                        )
+                                    })
+                                    .await
+                                    .ok();
+                                if let Some((Some(opening_positions), Some(opening_equity))) =
+                                    normalized.map(|(positions, account)| {
+                                        (
+                                            positions,
+                                            account.and_then(|account| {
+                                                account
+                                                    .get("equity")
+                                                    .and_then(parse_money_micros)
+                                                    .map(|value| value.0)
+                                            }),
+                                        )
+                                    })
+                                {
                                     if let Ok(realized) =
                                         managed_realized_pnl(&opening_positions, &fills)
                                     {
@@ -282,11 +287,7 @@ impl Daemon {
         Ok(serde_json::from_slice(&acquired.raw)?)
     }
 
-    fn observer_normalized_resource(
-        &self,
-        run_id: &RunId,
-        resource: &str,
-    ) -> Option<Value> {
+    fn observer_normalized_resource(&self, run_id: &RunId, resource: &str) -> Option<Value> {
         self.store
             .recent_artifacts_by_kind(ArtifactKind::NormalizedEvidence, 500)
             .ok()?
@@ -301,10 +302,7 @@ impl Daemon {
             })
     }
 
-    fn observer_position_sparklines(
-        &self,
-        run_id: &RunId,
-    ) -> Result<BTreeMap<String, Vec<i64>>> {
+    fn observer_position_sparklines(&self, run_id: &RunId) -> Result<BTreeMap<String, Vec<i64>>> {
         let mut sparklines = BTreeMap::new();
         for artifact in self
             .store

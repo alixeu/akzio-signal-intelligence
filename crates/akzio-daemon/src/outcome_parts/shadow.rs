@@ -1,5 +1,7 @@
+use super::*;
+
 impl Daemon {
-    pub(super) async fn execute_shadow_evaluate(
+    pub(crate) async fn execute_shadow_evaluate(
         &self,
         task: &ClaimedAttempt,
         now: DateTime<Utc>,

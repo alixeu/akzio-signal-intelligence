@@ -294,8 +294,13 @@ pub struct PaperScheduler {
     runtime_identity_hash: Option<akzio_domain::ContentHash>,
 }
 
-include!("scheduler_parts/scheduler_core.rs");
-include!("scheduler_parts/scheduler_tick.rs");
-include!("scheduler_parts/canary.rs");
-include!("scheduler_parts/serve.rs");
-include!("scheduler_parts/lease.rs");
+#[path = "scheduler_parts/canary.rs"]
+mod canary;
+#[path = "scheduler_parts/lease.rs"]
+mod lease;
+#[path = "scheduler_parts/scheduler_core.rs"]
+mod scheduler_core;
+#[path = "scheduler_parts/scheduler_tick.rs"]
+mod scheduler_tick;
+#[path = "scheduler_parts/serve.rs"]
+mod serve;

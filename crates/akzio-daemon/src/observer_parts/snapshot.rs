@@ -1,3 +1,5 @@
+use super::*;
+
 impl Daemon {
     pub(crate) async fn observer_snapshot(&self) -> Result<ObserverSnapshot> {
         let generated_at = Utc::now();
@@ -174,7 +176,7 @@ impl Daemon {
         ObserverSection::available(now, history)
     }
 
-    async fn observer_qqq_bars(
+    pub(super) async fn observer_qqq_bars(
         &self,
         range: ObserverPortfolioRange,
         now: DateTime<Utc>,

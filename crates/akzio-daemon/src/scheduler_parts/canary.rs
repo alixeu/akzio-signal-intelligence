@@ -1,5 +1,7 @@
+use super::*;
+
 impl PaperScheduler {
-    async fn tick_canary<C>(
+    pub(super) async fn tick_canary<C>(
         &self,
         campaign: &akzio_store::v2::CanaryCampaignHead,
         session_key: &str,
@@ -25,11 +27,7 @@ impl PaperScheduler {
         if let Some(existing) = self
             .store_executor
             .execute(move |store| {
-                store.canary_session_by_key(
-                    &campaign_id,
-                    campaign_status,
-                    &existing_session_key,
-                )
+                store.canary_session_by_key(&campaign_id, campaign_status, &existing_session_key)
             })
             .await??
         {
@@ -83,7 +81,8 @@ impl PaperScheduler {
             .store_executor
             .execute(move |store| -> SchedulerResult<_> {
                 let artifact = store.artifact(&candidate_artifact_id)?;
-                let candidate: AgentContract = serde_json::from_slice(&store.read_blob(&artifact.blob)?)?;
+                let candidate: AgentContract =
+                    serde_json::from_slice(&store.read_blob(&artifact.blob)?)?;
                 let installation = store
                     .contract_installation(&candidate.contract_hash)?
                     .ok_or(SchedulerError::WorkflowUnavailable)?;
@@ -123,8 +122,8 @@ impl PaperScheduler {
         }
 
         let active_analyst = self
-        .workflow
-        .recipe(&akzio_domain::TaskRecipeId::new("research.analyst")?)?;
+            .workflow
+            .recipe(&akzio_domain::TaskRecipeId::new("research.analyst")?)?;
         if active_analyst.contract_hash.as_ref() != Some(&campaign.spec.active_contract_hash) {
             return Err(SchedulerError::WorkflowUnavailable);
         }
@@ -197,10 +196,8 @@ impl PaperScheduler {
         let contract_shadow = self
             .store_executor
             .execute(move |_| {
-                let graph = workflow.lower_shadow(
-                    &contract_proposal,
-                    Some(&candidate_contract_hash),
-                )?;
+                let graph =
+                    workflow.lower_shadow(&contract_proposal, Some(&candidate_contract_hash))?;
                 workflow.prepare_workflow_commit(
                     contract_shadow_run,
                     RunPurpose::Shadow,
@@ -243,12 +240,7 @@ impl PaperScheduler {
                     &bundle_refs,
                     Some(&bundle_contract_hash),
                 )?;
-                workflow.prepare_workflow_commit(
-                    bundle_shadow_run,
-                    RunPurpose::Shadow,
-                    graph,
-                    now,
-                )
+                workflow.prepare_workflow_commit(bundle_shadow_run, RunPurpose::Shadow, graph, now)
             })
             .await??;
 

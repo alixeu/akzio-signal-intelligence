@@ -4,6 +4,7 @@
 //! while the v2 Store and runtimes own durable state, contracts, context
 //! grants, task attempts, and workflow transitions.
 
+mod application;
 mod dispatch;
 mod evidence;
 mod http;
