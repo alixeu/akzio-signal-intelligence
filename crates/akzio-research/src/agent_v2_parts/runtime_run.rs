@@ -152,10 +152,14 @@ impl AgentRuntime {
             input_schema: output_schema.clone(),
         };
         let prefetched_capabilities = model.capability_snapshot();
+        let budget_policy = model.budget_policy();
+        budget.attach_budget_policy(&budget_policy)?;
+        let budget_policy_hash = budget_policy_hash(&budget_policy)?;
         let recovery_guard = AgentRecoveryGuard {
             contract_hash: installed.contract.contract_hash.clone(),
             context_manifest: manifest.payload.clone(),
             capability_snapshot_hash: capability_snapshot_hash(&prefetched_capabilities)?,
+            budget_policy_hash: budget_policy_hash.clone(),
             draft_tool_set_hash: advertised_tool_set_hash(&tools, None)?,
             submit_tool_set_hash: advertised_tool_set_hash(&[], Some(&terminal))?,
         };
@@ -181,7 +185,7 @@ impl AgentRuntime {
         loop {
             budget.check_wall()?;
             let max_output_tokens = budget.remaining_output_tokens()?;
-            let request = AgentModelRequest {
+            let mut request = AgentModelRequest {
                 contract_hash: installed.contract.contract_hash.clone(),
                 purpose: installed.contract.purpose.as_str().to_owned(),
                 phase,
@@ -209,15 +213,29 @@ impl AgentRuntime {
                 },
                 terminal: (phase == AgentTurnPhase::Submit).then(|| terminal.clone()),
             };
+            let provisional_input_tokens = estimate_tokens(&request)?;
+            request.max_output_tokens =
+                budget.output_tokens_for_call(provisional_input_tokens)?;
             let input_tokens = estimate_tokens(&request)?;
+            request.max_output_tokens = request
+                .max_output_tokens
+                .min(budget.output_tokens_for_call(input_tokens)?);
             let tool_set_hash = tool_set_hash(&request)?;
             let mut turn_attempt = 1_u8;
-            let (turn, capability_snapshot, capability_snapshot_hash, request_hash) = loop {
+            let (turn, runtime_snapshot, request_hash) = loop {
                 let capability_snapshot = prefetched_capabilities
                     .take()
                     .unwrap_or_else(|| model.capability_snapshot());
                 let capability_snapshot_hash = capability_snapshot_hash(&capability_snapshot)?;
-                if let Err(capability) = validate_model_capabilities(&capability_snapshot, &request)
+                let runtime_snapshot = AgentTurnRuntimeSnapshot {
+                    capability: capability_snapshot,
+                    capability_hash: capability_snapshot_hash,
+                    budget_policy: budget_policy.clone(),
+                    budget_policy_hash: budget_policy_hash.clone(),
+                    tool_set_hash: tool_set_hash.clone(),
+                };
+                if let Err(capability) =
+                    validate_model_capabilities(&runtime_snapshot.capability, &request)
                 {
                     let turn_now = logical_now(now, started.elapsed());
                     let failed_turn = self.record_failed_turn(
@@ -234,9 +252,7 @@ impl AgentRuntime {
                         None,
                         None,
                         false,
-                        &capability_snapshot,
-                        &capability_snapshot_hash,
-                        &tool_set_hash,
+                        &runtime_snapshot,
                     ).await?;
                     trace_refs.push(ArtifactRef {
                         artifact_id: failed_turn.artifact_id,
@@ -297,13 +313,8 @@ impl AgentRuntime {
                 budget.check_input(input_tokens)?;
                 budget.record_model_call()?;
                 match model.turn_with_events(request.clone(), on_event).await {
-                    Ok(turn) => {
-                        break (
-                            turn,
-                            capability_snapshot,
-                            capability_snapshot_hash,
-                            request_hash,
-                        );
+                        Ok(turn) => {
+                            break (turn, runtime_snapshot, request_hash);
                     }
                     Err(error) => {
                         let retryable = retryable_model_error(&error, &installed.contract.retry);
@@ -324,15 +335,13 @@ impl AgentRuntime {
                             Some(research_error_detail(&error)),
                             model_debug_trace(&error),
                             will_retry,
-                            &capability_snapshot,
-                            &capability_snapshot_hash,
-                            &tool_set_hash,
+                            &runtime_snapshot,
                         ).await?;
                         trace_refs.push(ArtifactRef {
                             artifact_id: failed_turn.artifact_id,
                             kind: ArtifactKind::AgentTurn,
                         });
-                        budget.record_input(input_tokens)?;
+                        budget.record_failed_turn(input_tokens)?;
                         if !will_retry {
                             return Err(error);
                         }
@@ -371,9 +380,7 @@ impl AgentRuntime {
                     None,
                     None,
                     false,
-                    &capability_snapshot,
-                    &capability_snapshot_hash,
-                    &tool_set_hash,
+                    &runtime_snapshot,
                 ).await?;
                 trace_refs.push(ArtifactRef {
                     artifact_id: failed_turn.artifact_id,
@@ -395,9 +402,7 @@ impl AgentRuntime {
                 },
                 &request,
                 &turn,
-                &capability_snapshot,
-                &capability_snapshot_hash,
-                &tool_set_hash,
+                &runtime_snapshot,
             ).await?;
             trace_refs.push(ArtifactRef {
                 artifact_id: turn_artifact.artifact_id,

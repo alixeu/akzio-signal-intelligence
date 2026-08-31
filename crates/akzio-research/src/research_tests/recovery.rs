@@ -56,6 +56,7 @@ fn recovery_guard(
         contract_hash: request.contract_hash.clone(),
         context_manifest: manifest.payload.clone(),
         capability_snapshot_hash: capability_snapshot_hash(&fixture_capabilities()).unwrap(),
+        budget_policy_hash: budget_policy_hash(&ModelBudgetPolicy::default()).unwrap(),
         draft_tool_set_hash: tool_set_hash(request).unwrap(),
         submit_tool_set_hash: tool_set_hash(request).unwrap(),
     }
@@ -110,6 +111,8 @@ fn write_recovery_turn_with_hash(
                 "request_hash": request_hash,
                 "capability_snapshot": capabilities,
                 "capability_snapshot_hash": capability_snapshot_hash(&capabilities).unwrap(),
+                "budget_policy": ModelBudgetPolicy::default(),
+                "budget_policy_hash": budget_policy_hash(&ModelBudgetPolicy::default()).unwrap(),
                 "tool_set_hash": tool_set_hash(request).unwrap(),
                 "request": request,
                 "response": response,
@@ -220,7 +223,9 @@ fn recovery_checkpoint_promotes_durable_draft_memo_to_submit() {
     response.telemetry = Some(AgentTurnTelemetry {
         latency_millis: 17,
         input_tokens: Some(23),
+        cached_input_tokens: None,
         output_tokens: Some(11),
+        reasoning_tokens: None,
     });
     write_recovery_turn(
         &fixture,
@@ -275,7 +280,9 @@ fn recovery_checkpoint_estimates_missing_usage_fields() {
     response.telemetry = Some(AgentTurnTelemetry {
         latency_millis: 19,
         input_tokens: None,
+        cached_input_tokens: None,
         output_tokens: None,
+        reasoning_tokens: None,
     });
     let expected_input = estimate_tokens(&request).unwrap();
     let expected_output = estimate_turn_output_tokens(&response).unwrap();
@@ -528,6 +535,14 @@ fn recovery_checkpoint_rejects_hash_and_context_drift() {
     assert!(!agent_recovery_checkpoint(&fixture.store, &child.permit, &hash_drift)
         .unwrap()
         .is_recovered());
+
+    let mut pricing_drift = recovery_guard(&child_manifest, &request);
+    pricing_drift.budget_policy_hash = akzio_domain::ContentHash::of_bytes(b"pricing-drift");
+    assert!(
+        !agent_recovery_checkpoint(&fixture.store, &child.permit, &pricing_drift)
+            .unwrap()
+            .is_recovered()
+    );
 
     let mut context_drift = recovery_guard(&child_manifest, &request);
     context_drift.context_manifest.estimated_tokens = context_drift
@@ -881,7 +896,9 @@ async fn agent_runtime_restores_budget_before_resuming_provider() {
     response.telemetry = Some(AgentTurnTelemetry {
         latency_millis: 1,
         input_tokens: Some(1),
+        cached_input_tokens: None,
         output_tokens: Some(128),
+        reasoning_tokens: None,
     });
     write_recovery_turn(
         &fixture,

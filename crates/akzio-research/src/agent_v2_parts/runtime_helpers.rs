@@ -125,16 +125,12 @@ impl AgentRuntime {
         record: TurnRecord,
         request: &AgentModelRequest,
         response: &AgentModelTurn,
-        capability_snapshot: &ModelCapabilitySnapshot,
-        capability_snapshot_hash: &akzio_domain::ContentHash,
-        tool_set_hash: &akzio_domain::ContentHash,
+        runtime_snapshot: &AgentTurnRuntimeSnapshot,
     ) -> ResearchResult<Artifact> {
         let request_hash = model_request_hash(request)?;
         let request = request.clone();
         let response = response.clone();
-        let capability_snapshot = capability_snapshot.clone();
-        let capability_snapshot_hash = capability_snapshot_hash.clone();
-        let tool_set_hash = tool_set_hash.clone();
+        let runtime_snapshot = runtime_snapshot.clone();
         self.store_executor
             .execute(move |store| {
                 let artifact = Artifact::new(
@@ -145,9 +141,11 @@ impl AgentRuntime {
                         "contract_hash": &record.contract.contract_hash,
                         "context_manifest": &record.manifest.artifact.artifact_id,
                         "request_hash": request_hash,
-                        "capability_snapshot": capability_snapshot,
-                        "capability_snapshot_hash": capability_snapshot_hash,
-                        "tool_set_hash": tool_set_hash,
+                        "capability_snapshot": runtime_snapshot.capability,
+                        "capability_snapshot_hash": runtime_snapshot.capability_hash,
+                        "budget_policy": runtime_snapshot.budget_policy,
+                        "budget_policy_hash": runtime_snapshot.budget_policy_hash,
+                        "tool_set_hash": runtime_snapshot.tool_set_hash,
                         "request": request,
                         "response": response,
                     }))?,
@@ -188,17 +186,13 @@ impl AgentRuntime {
         error_detail: Option<Value>,
         model_debug: Option<&ModelCallTrace>,
         will_retry: bool,
-        capability_snapshot: &ModelCapabilitySnapshot,
-        capability_snapshot_hash: &akzio_domain::ContentHash,
-        tool_set_hash: &akzio_domain::ContentHash,
+        runtime_snapshot: &AgentTurnRuntimeSnapshot,
     ) -> ResearchResult<Artifact> {
         let request_hash = model_request_hash(request)?;
         let request = request.clone();
         let error_class = error_class.to_owned();
         let model_debug = model_debug.cloned();
-        let capability_snapshot = capability_snapshot.clone();
-        let capability_snapshot_hash = capability_snapshot_hash.clone();
-        let tool_set_hash = tool_set_hash.clone();
+        let runtime_snapshot = runtime_snapshot.clone();
         self.store_executor
             .execute(move |store| {
                 let mut trace = json!({
@@ -207,9 +201,11 @@ impl AgentRuntime {
                     "contract_hash": &record.contract.contract_hash,
                     "context_manifest": &record.manifest.artifact.artifact_id,
                     "request_hash": request_hash,
-                    "capability_snapshot": capability_snapshot,
-                    "capability_snapshot_hash": capability_snapshot_hash,
-                    "tool_set_hash": tool_set_hash,
+                    "capability_snapshot": runtime_snapshot.capability,
+                    "capability_snapshot_hash": runtime_snapshot.capability_hash,
+                    "budget_policy": runtime_snapshot.budget_policy,
+                    "budget_policy_hash": runtime_snapshot.budget_policy_hash,
+                    "tool_set_hash": runtime_snapshot.tool_set_hash,
                     "request": request,
                     "error_class": error_class,
                     "will_retry": will_retry,
