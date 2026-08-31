@@ -1,3 +1,5 @@
+use super::*;
+
 impl Daemon {
     /// Worker supervision contains no research, execution, or learning policy.
     pub async fn serve_workers(&self, shutdown: watch::Receiver<bool>) -> Result<()> {
@@ -9,7 +11,7 @@ impl Daemon {
         self.serve_worker_pool(shutdown).await
     }
 
-    async fn serve_worker_pool(&self, shutdown: watch::Receiver<bool>) -> Result<()> {
+    pub(super) async fn serve_worker_pool(&self, shutdown: watch::Receiver<bool>) -> Result<()> {
         let daemon = self.clone();
         let handler: TaskHandler = Arc::new(move |task| {
             let daemon = daemon.clone();
@@ -44,7 +46,7 @@ impl Daemon {
             .unwrap_or(false);
         let metrics = self.store.metrics(Utc::now())?;
         Ok(DaemonHealth {
-        status: if self.paper.auto_paper && lease.is_none() {
+            status: if self.paper.auto_paper && lease.is_none() {
                 "paper_scheduler_fail_closed".to_owned()
             } else {
                 "ok".to_owned()

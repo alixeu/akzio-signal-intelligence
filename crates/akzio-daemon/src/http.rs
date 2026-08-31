@@ -659,7 +659,7 @@ async fn http_store_doctor(
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
     authorize(&daemon, &headers)?;
     run_store_maintenance(
-        daemon.store_executor.clone(),
+        daemon.maintenance(),
         StoreMaintenanceKind::Doctor,
         |store| store.verify_integrity(),
     )
@@ -735,7 +735,7 @@ async fn http_store_backup(
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
     authorize(&daemon, &headers)?;
     store_json(Ok(run_store_maintenance(
-        daemon.store_executor.clone(),
+        daemon.maintenance(),
         StoreMaintenanceKind::Backup,
         move |store| store.backup_to(request.target),
     )
@@ -749,7 +749,7 @@ async fn http_store_restore(
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
     authorize(&daemon, &headers)?;
     store_json(Ok(run_store_maintenance(
-        daemon.store_executor.clone(),
+        daemon.maintenance(),
         StoreMaintenanceKind::Restore,
         move |_| {
             akzio_store::v2::V2Store::restore_from(request.source, request.target)
@@ -766,7 +766,7 @@ async fn http_store_export_run(
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
     authorize(&daemon, &headers)?;
     store_json(Ok(run_store_maintenance(
-        daemon.store_executor.clone(),
+        daemon.maintenance(),
         StoreMaintenanceKind::ExportRun,
         move |store| {
             store.export_run(
@@ -1056,24 +1056,21 @@ where
 }
 
 pub(super) async fn run_store_maintenance<T>(
-    executor: StoreExecutor,
+    maintenance: crate::application::Maintenance,
     kind: StoreMaintenanceKind,
     work: impl FnOnce(V2Store) -> std::result::Result<T, StoreError> + Send + 'static,
 ) -> std::result::Result<T, StatusCode>
 where
     T: Send + 'static,
 {
-    executor
-        .execute_maintenance(kind, move |store| work(store).map_err(RuntimeError::from))
-        .await
-        .map_err(|error| {
-            tracing::error!(
-                operation = kind.as_str(),
-                error = %error,
-                "Store maintenance task failed"
-            );
-            StatusCode::INTERNAL_SERVER_ERROR
-        })
+    maintenance.run(kind, work).await.map_err(|error| {
+        tracing::error!(
+            operation = kind.as_str(),
+            error = %error,
+            "Store maintenance task failed"
+        );
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 fn authorize(daemon: &Daemon, headers: &HeaderMap) -> std::result::Result<(), StatusCode> {

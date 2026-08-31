@@ -1,5 +1,7 @@
+use super::*;
+
 impl Daemon {
-    fn observer_outcome(
+    pub(super) fn observer_outcome(
         &self,
         observed_at: DateTime<Utc>,
     ) -> Result<ObserverSection<ObserverOutcome>> {
@@ -162,7 +164,7 @@ impl Daemon {
         .map_err(DaemonError::Unavailable)
     }
 
-    fn observer_learning(
+    pub(super) fn observer_learning(
         &self,
         observed_at: DateTime<Utc>,
     ) -> Result<ObserverSection<ObserverLearning>> {

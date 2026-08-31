@@ -1,5 +1,7 @@
+use super::*;
+
 impl PaperScheduler {
-    fn acquire_or_renew(&self, now: DateTime<Utc>) -> SchedulerResult<DaemonLease> {
+    pub(super) fn acquire_or_renew(&self, now: DateTime<Utc>) -> SchedulerResult<DaemonLease> {
         let expires_at = now + self.lease_duration;
         let mut held = self
             .lease
@@ -21,7 +23,10 @@ impl PaperScheduler {
         Ok(lease)
     }
 
-    async fn acquire_or_renew_async(&self, now: DateTime<Utc>) -> SchedulerResult<DaemonLease> {
+    pub(super) async fn acquire_or_renew_async(
+        &self,
+        now: DateTime<Utc>,
+    ) -> SchedulerResult<DaemonLease> {
         let expires_at = now + self.lease_duration;
         let current = self
             .lease
@@ -54,12 +59,7 @@ impl PaperScheduler {
         let lease = self
             .store_executor
             .execute(move |store| {
-                store.acquire_daemon_lease(
-                    SCHEDULER_LEASE_NAME,
-                    &owner_id,
-                    now,
-                    expires_at,
-                )
+                store.acquire_daemon_lease(SCHEDULER_LEASE_NAME, &owner_id, now, expires_at)
             })
             .await??
             .ok_or(SchedulerError::NotLeader)?;

@@ -1,5 +1,7 @@
+use super::*;
+
 impl Daemon {
-    pub(super) async fn execute_outcome_worker(
+    pub(crate) async fn execute_outcome_worker(
         &self,
         task: &ClaimedAttempt,
         now: DateTime<Utc>,
@@ -73,7 +75,7 @@ impl Daemon {
             .collect::<Vec<_>>();
         let market_evidence = collected.materialization.market_evidence.clone();
         let retrospective_draft = if task.node.contract_hash.is_some() {
-        match self.agent_input_candidates(task) {
+            match self.agent_session().candidates(task) {
                 Ok(mut candidates) => {
                     candidates.extend(market_evidence.iter().cloned());
                     candidates.extend(prior_retrospectives.iter().cloned());

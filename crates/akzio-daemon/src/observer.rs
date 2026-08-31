@@ -284,8 +284,15 @@ pub(crate) struct ObserverPortfolioHistoryPoint {
     pub benchmark_equity_micros: Option<i64>,
 }
 
-include!("observer_parts/snapshot.rs");
-include!("observer_parts/runs.rs");
-include!("observer_parts/learning.rs");
-include!("observer_parts/broker.rs");
-include!("observer_parts/helpers.rs");
+#[path = "observer_parts/broker.rs"]
+mod broker;
+#[path = "observer_parts/helpers.rs"]
+mod helpers;
+#[path = "observer_parts/learning.rs"]
+mod learning;
+#[path = "observer_parts/runs.rs"]
+mod runs;
+#[path = "observer_parts/snapshot.rs"]
+mod snapshot;
+
+use helpers::*;

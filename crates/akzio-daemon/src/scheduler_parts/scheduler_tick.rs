@@ -1,3 +1,5 @@
+use super::*;
+
 impl PaperScheduler {
     pub async fn tick<C, P>(
         &self,
@@ -20,9 +22,9 @@ impl PaperScheduler {
             .await??
         {
             self.acquire_or_renew_async(now).await?;
-        return Ok(Some(SessionSlotReservation {
-            slot,
-            newly_reserved: false,
+            return Ok(Some(SessionSlotReservation {
+                slot,
+                newly_reserved: false,
             }));
         }
         if let Some(campaign) = self
@@ -118,8 +120,8 @@ impl PaperScheduler {
             .tasks
             .iter()
             .find_map(|(alias, task)| {
-            self.workflow
-                .recipe(&task.recipe_id)
+                self.workflow
+                    .recipe(&task.recipe_id)
                     .ok()
                     .filter(|recipe| recipe.allowed_evidence_sources.contains("alpaca"))
                     .map(|_| alias.clone())
@@ -128,8 +130,8 @@ impl PaperScheduler {
         let first_task = proposal
             .tasks
             .get_mut(&snapshot_alias)
-    .ok_or(SchedulerError::WorkflowUnavailable)?;
-    for need in paper_session_evidence_needs(&session_key) {
+            .ok_or(SchedulerError::WorkflowUnavailable)?;
+        for need in paper_session_evidence_needs(&session_key) {
             need.validate()?;
             let artifact = Artifact::new(
                 ArtifactKind::EvidenceNeed,
@@ -170,15 +172,15 @@ impl PaperScheduler {
             self.store_executor
                 .execute(move |_| {
                     workflow.reserve_paper_session_with_inputs_for_run_approved(
-                    &lease,
-                    run_id,
-                    &session_key,
-                    &proposal,
-                    &setup_artifacts,
-                    &runtime_manifest,
-                    &approval,
-                    now,
-                )
+                        &lease,
+                        run_id,
+                        &session_key,
+                        &proposal,
+                        &setup_artifacts,
+                        &runtime_manifest,
+                        &approval,
+                        now,
+                    )
                 })
                 .await??,
         ))
