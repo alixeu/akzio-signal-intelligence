@@ -80,6 +80,22 @@ pub enum ResearchError {
     InputBudgetExceeded { actual: u32, maximum: u32 },
     #[error("Agent run output used {actual} tokens but Contract permits at most {maximum}")]
     OutputBudgetExceeded { actual: u32, maximum: u32 },
+    #[error("hard cost budget configured without an immutable pricing snapshot")]
+    PricingUnavailable,
+    #[error("pricing snapshot identity and version must be non-empty")]
+    InvalidPricingSnapshot,
+    #[error("priced model route identity must be non-empty")]
+    InvalidPricingRoute,
+    #[error("provider usage detail exceeds its reported token total")]
+    InvalidProviderUsage,
+    #[error("provider call cost cannot be determined after missing usage")]
+    CostUsageUnknown,
+    #[error("Agent run cost reached {actual} micros but policy permits at most {maximum}")]
+    CostBudgetExceeded { actual: u64, maximum: u64 },
+    #[error("Agent run cost arithmetic overflowed")]
+    CostOverflow,
+    #[error("model pricing or cost policy changed within a durable Agent run")]
+    BudgetPolicyMismatch,
     #[error("Agent exceeded its Contract wall-time budget of {maximum_secs} seconds")]
     WallTimeExceeded { maximum_secs: u32 },
     #[error("Agent completed without a final output")]

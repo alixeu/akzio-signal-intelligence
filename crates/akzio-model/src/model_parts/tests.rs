@@ -493,3 +493,63 @@ fn native_web_contract_rejects_citations_beyond_the_limit() {
             if uri == "https://example.com/hidden"
     ));
 }
+
+#[test]
+fn response_usage_normalizes_responses_and_compatible_aliases() {
+    let response = response_from_raw(
+        json!({
+            "output_text": "ok",
+            "usage": {
+                "input_tokens": 120,
+                "input_tokens_details": {"cached_tokens": 20},
+                "output_tokens": 30,
+                "output_tokens_details": {"reasoning_tokens": 10}
+            }
+        }),
+        json!({}),
+    )
+    .unwrap();
+    assert_eq!(
+        response.usage,
+        ModelUsage {
+            input_tokens: Some(120),
+            cached_input_tokens: Some(20),
+            output_tokens: Some(30),
+            reasoning_tokens: Some(10),
+        }
+    );
+
+    let aliases = response_from_raw(
+        json!({
+            "output_text": "ok",
+            "usage": {
+                "prompt_tokens": 7,
+                "prompt_tokens_details": {"cached_tokens": 3},
+                "completion_tokens": 5,
+                "completion_tokens_details": {"reasoning_tokens": 2}
+            }
+        }),
+        json!({}),
+    )
+    .unwrap();
+    assert_eq!(aliases.usage.input_tokens, Some(7));
+    assert_eq!(aliases.usage.cached_input_tokens, Some(3));
+    assert_eq!(aliases.usage.output_tokens, Some(5));
+    assert_eq!(aliases.usage.reasoning_tokens, Some(2));
+}
+
+#[test]
+fn response_usage_preserves_missing_reasoning_and_missing_usage() {
+    let without_reasoning = response_from_raw(
+        json!({
+            "output_text": "ok",
+            "usage": {"input_tokens": 7, "output_tokens": 5}
+        }),
+        json!({}),
+    )
+    .unwrap();
+    assert_eq!(without_reasoning.usage.reasoning_tokens, None);
+
+    let missing = response_from_raw(json!({"output_text": "ok"}), json!({})).unwrap();
+    assert_eq!(missing.usage, ModelUsage::default());
+}

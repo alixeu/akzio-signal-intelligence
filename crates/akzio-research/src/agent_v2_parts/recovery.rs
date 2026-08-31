@@ -4,35 +4,79 @@ enum AgentRecoverySource {
     Recovered(Vec<AttemptId>),
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct AgentRecoveryUsage {
     latency_millis: u64,
     input_tokens: u64,
+    cached_input_tokens: u64,
     output_tokens: u64,
+    reasoning_tokens: u64,
+    cost_micros: u64,
+    cost_complete: bool,
+    usage_valid: bool,
+}
+
+impl Default for AgentRecoveryUsage {
+    fn default() -> Self {
+        Self {
+            latency_millis: 0,
+            input_tokens: 0,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+            reasoning_tokens: 0,
+            cost_micros: 0,
+            cost_complete: true,
+            usage_valid: true,
+        }
+    }
 }
 
 impl AgentRecoveryUsage {
-    fn record_failed(&mut self, request: &AgentModelRequest) -> Option<()> {
+    fn record_failed(
+        &mut self,
+        request: &AgentModelRequest,
+        policy: &ModelBudgetPolicy,
+    ) -> Option<()> {
         self.input_tokens = self
             .input_tokens
             .saturating_add(u64::from(estimate_tokens(request).ok()?));
+        if policy.pricing.is_some() {
+            self.cost_complete = false;
+        }
         Some(())
     }
 
-    fn record(&mut self, request: &AgentModelRequest, response: &AgentModelTurn) -> Option<()> {
-        let telemetry = response.telemetry.as_ref();
-        let input_tokens = telemetry
-            .and_then(|telemetry| telemetry.input_tokens)
-            .or_else(|| estimate_tokens(request).ok().map(u64::from))?;
-        let output_tokens = telemetry
-            .and_then(|telemetry| telemetry.output_tokens)
-            .or_else(|| estimate_turn_output_tokens(response).ok().map(u64::from))?;
-
-        self.latency_millis = self.latency_millis.saturating_add(
-            telemetry.map_or(0, |telemetry| telemetry.latency_millis),
+    fn record(
+        &mut self,
+        request: &AgentModelRequest,
+        response: &AgentModelTurn,
+        policy: &ModelBudgetPolicy,
+    ) -> Option<()> {
+        let usage = resolve_model_usage(
+            estimate_tokens(request).ok()?,
+            estimate_turn_output_tokens(response).ok()?,
+            response.telemetry.as_ref(),
         );
-        self.input_tokens = self.input_tokens.saturating_add(input_tokens);
-        self.output_tokens = self.output_tokens.saturating_add(output_tokens);
+        self.latency_millis = self.latency_millis.saturating_add(
+            response
+                .telemetry
+                .as_ref()
+                .map_or(0, |telemetry| telemetry.latency_millis),
+        );
+        self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(usage.cached_input_tokens.unwrap_or_default());
+        self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
+        self.reasoning_tokens = self
+            .reasoning_tokens
+            .saturating_add(usage.reasoning_tokens.unwrap_or_default());
+        if let Some(pricing) = &policy.pricing {
+            match usage_cost_micros(usage, pricing) {
+                Ok(cost) => self.cost_micros = self.cost_micros.saturating_add(cost),
+                Err(_) => self.usage_valid = false,
+            }
+        }
         Some(())
     }
 }
@@ -76,6 +120,7 @@ struct AgentRecoveryGuard {
     contract_hash: akzio_domain::ContentHash,
     context_manifest: akzio_domain::ContextManifestPayload,
     capability_snapshot_hash: akzio_domain::ContentHash,
+    budget_policy_hash: akzio_domain::ContentHash,
     draft_tool_set_hash: akzio_domain::ContentHash,
     submit_tool_set_hash: akzio_domain::ContentHash,
 }
@@ -97,6 +142,10 @@ struct StoredAgentTurnPayload {
     request_hash: akzio_domain::ContentHash,
     capability_snapshot: ModelCapabilitySnapshot,
     capability_snapshot_hash: akzio_domain::ContentHash,
+    #[serde(default)]
+    budget_policy: ModelBudgetPolicy,
+    #[serde(default)]
+    budget_policy_hash: Option<akzio_domain::ContentHash>,
     tool_set_hash: akzio_domain::ContentHash,
     request: AgentModelRequest,
     #[serde(default)]
@@ -216,6 +265,7 @@ impl<'a> AgentRecoveryReducer<'a> {
         payload: StoredAgentTurnPayload,
         completed: bool,
     ) -> Option<()> {
+        let payload_budget_policy_hash = budget_policy_hash(&payload.budget_policy).ok()?;
         if !self.expected_tools.is_empty()
             || payload.turn != self.checkpoint.next_model_turn
             || payload.contract_hash != self.guard.contract_hash
@@ -226,6 +276,11 @@ impl<'a> AgentRecoveryReducer<'a> {
             || payload.capability_snapshot_hash
                 != capability_snapshot_hash(&payload.capability_snapshot).ok()?
             || payload.capability_snapshot_hash != self.guard.capability_snapshot_hash
+            || payload
+                .budget_policy_hash
+                .as_ref()
+                .is_some_and(|hash| hash != &payload_budget_policy_hash)
+            || payload_budget_policy_hash != self.guard.budget_policy_hash
             || payload.tool_set_hash != tool_set_hash(&payload.request).ok()?
             || &payload.tool_set_hash != self.guard.tool_set_hash(payload.request.phase)
             || payload.request.phase != self.checkpoint.phase
@@ -238,7 +293,10 @@ impl<'a> AgentRecoveryReducer<'a> {
         self.checkpoint.trace_refs.push(reference);
         let Some(response) = payload.response else {
             (!completed).then_some(())?;
-            return self.checkpoint.usage.record_failed(&payload.request);
+            return self
+                .checkpoint
+                .usage
+                .record_failed(&payload.request, &payload.budget_policy);
         };
         if !completed {
             return None;
@@ -246,7 +304,9 @@ impl<'a> AgentRecoveryReducer<'a> {
 
         self.checkpoint.pending_tool_outputs.clear();
         self.checkpoint.continuation = Some(response.continuation.clone());
-        self.checkpoint.usage.record(&payload.request, &response)?;
+        self.checkpoint
+            .usage
+            .record(&payload.request, &response, &payload.budget_policy)?;
 
         match payload.request.phase {
             AgentTurnPhase::Draft if response.terminal_submission.is_none() => {

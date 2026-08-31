@@ -336,6 +336,7 @@ pub(super) fn response_from_raw(raw: Value, request_body: Value) -> Result<Model
     if output_text.is_empty() && tool_calls.is_empty() {
         return Err(ModelError::MissingOutput);
     }
+    let usage = normalize_usage(&raw);
     Ok(ModelResponse {
         output_text,
         tool_calls,
@@ -346,8 +347,41 @@ pub(super) fn response_from_raw(raw: Value, request_body: Value) -> Result<Model
                 .unwrap_or_default(),
         ),
         raw,
+        usage,
         request_body,
     })
+}
+
+fn usage_value(raw: &Value, pointers: &[&str]) -> Option<u64> {
+    pointers
+        .iter()
+        .find_map(|pointer| raw.pointer(pointer).and_then(Value::as_u64))
+}
+
+/// Normalize field names emitted by Responses-compatible providers without
+/// claiming their broader transport or continuation semantics are identical.
+fn normalize_usage(raw: &Value) -> ModelUsage {
+    ModelUsage {
+        input_tokens: usage_value(raw, &["/usage/input_tokens", "/usage/prompt_tokens"]),
+        cached_input_tokens: usage_value(
+            raw,
+            &[
+                "/usage/input_tokens_details/cached_tokens",
+                "/usage/prompt_tokens_details/cached_tokens",
+                "/usage/cache_read_input_tokens",
+                "/usage/cached_input_tokens",
+            ],
+        ),
+        output_tokens: usage_value(raw, &["/usage/output_tokens", "/usage/completion_tokens"]),
+        reasoning_tokens: usage_value(
+            raw,
+            &[
+                "/usage/output_tokens_details/reasoning_tokens",
+                "/usage/completion_tokens_details/reasoning_tokens",
+                "/usage/reasoning_tokens",
+            ],
+        ),
+    }
 }
 
 fn extract_refusal(response: &Value) -> Option<String> {

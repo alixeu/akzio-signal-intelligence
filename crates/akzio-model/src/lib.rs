@@ -164,6 +164,46 @@ pub struct ModelToolOutput {
     pub output: Value,
 }
 
+/// Provider usage normalized into Akzio-owned accounting categories.
+///
+/// Detail fields remain optional because Responses-compatible providers do not
+/// all report cache and reasoning breakdowns. Input/output totals are optional
+/// too, allowing the harness to distinguish reported usage from local estimates.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelUsage {
+    pub input_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+}
+
+/// Immutable, versioned price table selected for one model route.
+///
+/// Rates are micro-units of account currency per one million tokens. They are
+/// explicit configuration data, never changing vendor prices embedded in policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelPricingSnapshot {
+    pub identity: String,
+    pub version: String,
+    pub input_micros_per_million_tokens: u64,
+    pub cached_input_micros_per_million_tokens: u64,
+    pub output_micros_per_million_tokens: u64,
+    pub reasoning_micros_per_million_tokens: u64,
+}
+
+/// Optional whole-task cost authority supplied explicitly by the caller.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelBudgetPolicy {
+    #[serde(default)]
+    pub route_identity: Option<String>,
+    #[serde(default)]
+    pub max_cost_micros: Option<u64>,
+    #[serde(default)]
+    pub pricing: Option<ModelPricingSnapshot>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelContinuation {
     items: Vec<Value>,
@@ -271,6 +311,7 @@ pub struct ModelResponse {
     pub tool_calls: Vec<ModelToolCall>,
     pub continuation: ModelContinuation,
     pub raw: Value,
+    pub usage: ModelUsage,
     /// Provider payload without authorization headers or credentials.
     pub request_body: Value,
 }

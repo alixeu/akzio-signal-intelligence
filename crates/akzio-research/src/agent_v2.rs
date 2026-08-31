@@ -22,8 +22,9 @@ use akzio_domain::{
     ToolSpec, WorkflowNode, V2_DOMAIN_SCHEMA_VERSION,
 };
 use akzio_model::{
-    ModelCallTrace, ModelCapabilitySnapshot, ModelClient, ModelContinuation, ModelError,
-    ModelInput, ModelRequest, ModelToolChoice, ModelToolDefinition, ModelToolOutput,
+    ModelBudgetPolicy, ModelCallTrace, ModelCapabilitySnapshot, ModelClient, ModelContinuation,
+    ModelError, ModelInput, ModelPricingSnapshot, ModelRequest, ModelToolChoice,
+    ModelToolDefinition, ModelToolOutput, ModelUsage,
 };
 use akzio_runtime::v2::{RecipeCatalogue, RetryCause, RuntimeError, StoreExecutor};
 use akzio_store::v2::{StoreError, StoredContract, V2Store};
@@ -58,6 +59,7 @@ use tools::*;
 use validation::*;
 include!("agent_v2_parts/errors_catalogue.rs");
 include!("agent_v2_parts/model_types.rs");
+include!("agent_v2_parts/budget.rs");
 include!("agent_v2_parts/runtime_type.rs");
 include!("agent_v2_parts/recovery.rs");
 include!("agent_v2_parts/runtime_core.rs");
@@ -65,6 +67,7 @@ include!("agent_v2_parts/runtime_run.rs");
 include!("agent_v2_parts/runtime_helpers.rs");
 include!("agent_v2_parts/helpers.rs");
 include!("agent_v2_parts/decision_tests.rs");
+include!("agent_v2_parts/budget_tests.rs");
 
 #[cfg(test)]
 #[path = "tests.rs"]
