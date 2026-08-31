@@ -7,7 +7,39 @@ impl AgentRuntime {
             catalogue,
             grant_ttl,
             reasoning_events: None,
+            #[cfg(test)]
+            failpoint: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_failpoint(mut self, point: AgentFailpoint) -> Self {
+        self.failpoint = Some(Arc::new(AgentFailpointState {
+            point,
+            fired: std::sync::atomic::AtomicBool::new(false),
+        }));
+        self
+    }
+
+    #[cfg(test)]
+    fn hit_failpoint(&self, point: AgentFailpoint) -> ResearchResult<()> {
+        let Some(failpoint) = &self.failpoint else {
+            return Ok(());
+        };
+        if failpoint.point == point
+            && failpoint
+                .fired
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_ok()
+        {
+            return Err(ResearchError::InjectedFailpoint(format!("{point:?}")));
+        }
+        Ok(())
     }
 
     pub fn with_reasoning_events(

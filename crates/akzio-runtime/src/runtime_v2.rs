@@ -99,6 +99,9 @@ pub enum RuntimeError {
     MultipleAgentParents { task: String },
     #[error("task lease duration must be positive")]
     InvalidTaskLeaseDuration,
+    #[cfg(test)]
+    #[error("injected task failpoint: {0}")]
+    InjectedFailpoint(String),
     #[error("task retry backoff exceeds supported duration")]
     InvalidRetryBackoff,
     #[error("workflow node {0} diverges from its installed recipe")]

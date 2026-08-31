@@ -315,7 +315,9 @@ impl AgentRuntime {
                     };
                     let _ = sender.send(event);
                 });
-                budget.check_input(input_tokens)?;
+            #[cfg(test)]
+            self.hit_failpoint(AgentFailpoint::BeforeProviderRequest)?;
+            budget.check_input(input_tokens)?;
                 budget.record_model_call()?;
                 match model.turn_with_events(request.clone(), on_event).await {
                         Ok(turn) => {
@@ -395,6 +397,8 @@ impl AgentRuntime {
                     maximum_secs: installed.contract.budget.max_wall_time_secs,
                 });
             }
+            #[cfg(test)]
+            self.hit_failpoint(AgentFailpoint::AfterProviderResponseBeforeTurnPersist)?;
             let turn_now = logical_now(now, started.elapsed());
             let turn_artifact = self.record_turn(
                 TurnRecord {
@@ -413,6 +417,8 @@ impl AgentRuntime {
                 artifact_id: turn_artifact.artifact_id,
                 kind: ArtifactKind::AgentTurn,
             });
+            #[cfg(test)]
+            self.hit_failpoint(AgentFailpoint::AfterAgentTurnPersist)?;
             budget.record_turn(
                 input_tokens,
                 estimate_turn_output_tokens(&turn)?,
@@ -478,6 +484,9 @@ impl AgentRuntime {
             let submission = turn
                 .terminal_submission
                 .ok_or(ResearchError::MissingFinalOutput)?;
+
+            #[cfg(test)]
+            self.hit_failpoint(AgentFailpoint::BeforeFinalSubmission)?;
 
             let validation_runtime = self.clone();
             let validation_permit = permit.clone();
@@ -579,6 +588,8 @@ impl AgentRuntime {
                     )?)
                 })
                 .await??;
+            #[cfg(test)]
+            self.hit_failpoint(AgentFailpoint::AfterFinalSubmission)?;
             return Ok(output_artifact);
         }
     }

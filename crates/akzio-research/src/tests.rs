@@ -7,3 +7,4 @@ include!("research_tests/contract_schema.rs");
 include!("research_tests/runtime_guards.rs");
 include!("research_tests/budget.rs");
 include!("research_tests/recovery.rs");
+include!("research_tests/failpoints.rs");

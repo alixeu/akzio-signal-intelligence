@@ -6,6 +6,29 @@ pub struct AgentRuntime {
     catalogue: ContractCatalogue,
     grant_ttl: Duration,
     reasoning_events: Option<broadcast::Sender<AgentReasoningEvent>>,
+    #[cfg(test)]
+    failpoint: Option<Arc<AgentFailpointState>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AgentFailpoint {
+    BeforeProviderRequest,
+    AfterProviderResponseBeforeTurnPersist,
+    AfterAgentTurnPersist,
+    BeforeToolCallPersist,
+    AfterToolCallPersist,
+    BeforeToolResultPersist,
+    AfterToolResultPersist,
+    BeforeFinalSubmission,
+    AfterFinalSubmission,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct AgentFailpointState {
+    point: AgentFailpoint,
+    fired: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug)]
