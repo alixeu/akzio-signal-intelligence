@@ -20,7 +20,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 #[cfg(test)]
-use akzio_domain::ArtifactOrigin;
+use akzio_domain::{ArtifactOrigin, BlobRef};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
