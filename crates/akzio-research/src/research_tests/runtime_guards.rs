@@ -22,6 +22,8 @@ async fn model_client_adapter_debug_trace_retains_the_provider_request_and_resul
             manifest_artifact_id: ArtifactId(akzio_domain::ContentHash::of_bytes(
                 b"fixture-manifest",
             )),
+            read_grant_identity: None,
+            context_materialization_identity: None,
             context: vec![],
             continuation: None,
             tool_outputs: vec![],

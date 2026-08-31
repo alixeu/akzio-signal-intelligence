@@ -94,9 +94,10 @@ impl AgentRuntime {
         if !manifest.grant.matches_permit(permit) {
             return Err(ResearchError::GrantPermitMismatch);
         }
-        let context = self
-            .context_values(permit, &installed.contract, &manifest, now)
+        let context_materialization = self
+            .context_materialization(permit, &installed.contract, &manifest, now)
             .await?;
+        let context = context_materialization.model_context();
         let governance = String::from_utf8(
             self.read_authority_document(
                 &installed.contract,
@@ -135,11 +136,7 @@ impl AgentRuntime {
                 .await?,
         )?;
         let run_purpose = self.run_purpose_for(&permit.run_id).await?;
-        let tools = if !should_advertise_read_tools(
-            run_purpose,
-            context.len(),
-            installed.contract.budget.max_tool_calls,
-        ) {
+        let tools = if !should_advertise_read_tools(run_purpose) {
             Vec::new()
         } else {
             model_tool_definitions(&self.context, &installed.contract)?
@@ -158,6 +155,10 @@ impl AgentRuntime {
         let recovery_guard = AgentRecoveryGuard {
             contract_hash: installed.contract.contract_hash.clone(),
             context_manifest: manifest.payload.clone(),
+            read_grant_identity: context_materialization.read_grant_identity.clone(),
+            context_materialization_identity: context_materialization
+                .materialization_identity
+                .clone(),
             capability_snapshot_hash: capability_snapshot_hash(&prefetched_capabilities)?,
             budget_policy_hash: budget_policy_hash.clone(),
             draft_tool_set_hash: advertised_tool_set_hash(&tools, None)?,
@@ -192,6 +193,10 @@ impl AgentRuntime {
                 prompt: prompt.clone(),
                 objective: node.objective.clone(),
                 manifest_artifact_id: manifest.artifact.artifact_id.clone(),
+                read_grant_identity: Some(context_materialization.read_grant_identity.clone()),
+                context_materialization_identity: Some(
+                    context_materialization.materialization_identity.clone(),
+                ),
                 context: if continuation.is_none() {
                     context.clone()
                 } else {
@@ -421,6 +426,7 @@ impl AgentRuntime {
             if phase == AgentTurnPhase::Draft && !turn.tool_calls.is_empty() {
                 budget.record_tool_calls(turn.tool_calls.len() as u16)?;
                 for call in turn.tool_calls {
+                    budget.check_wall()?;
                     let call_id = call.call_id.clone();
                     let tool_runtime = self.clone();
                     let tool_permit = permit.clone();
@@ -440,6 +446,7 @@ impl AgentRuntime {
                             )
                         })
                         .await??;
+                    budget.check_wall()?;
                     trace_refs.push(ArtifactRef {
                         artifact_id: tool_result.artifact.artifact_id.clone(),
                         kind: ArtifactKind::ToolResult,

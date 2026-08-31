@@ -34,6 +34,10 @@ pub struct AgentModelRequest {
     pub prompt: String,
     pub objective: String,
     pub manifest_artifact_id: ArtifactId,
+    #[serde(default)]
+    pub read_grant_identity: Option<akzio_domain::ContentHash>,
+    #[serde(default)]
+    pub context_materialization_identity: Option<akzio_domain::ContentHash>,
     pub context: Vec<Value>,
     pub continuation: Option<ModelContinuation>,
     pub tool_outputs: Vec<ModelToolOutput>,

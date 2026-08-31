@@ -119,6 +119,8 @@ impl AgentRecoveryCheckpoint {
 struct AgentRecoveryGuard {
     contract_hash: akzio_domain::ContentHash,
     context_manifest: akzio_domain::ContextManifestPayload,
+    read_grant_identity: akzio_domain::ContentHash,
+    context_materialization_identity: akzio_domain::ContentHash,
     capability_snapshot_hash: akzio_domain::ContentHash,
     budget_policy_hash: akzio_domain::ContentHash,
     draft_tool_set_hash: akzio_domain::ContentHash,
@@ -270,6 +272,10 @@ impl<'a> AgentRecoveryReducer<'a> {
             || payload.turn != self.checkpoint.next_model_turn
             || payload.contract_hash != self.guard.contract_hash
             || payload.request.contract_hash != self.guard.contract_hash
+            || payload.request.read_grant_identity.as_ref()
+                != Some(&self.guard.read_grant_identity)
+            || payload.request.context_materialization_identity.as_ref()
+                != Some(&self.guard.context_materialization_identity)
             || payload.context_manifest != payload.request.manifest_artifact_id
             || manifest != self.guard.context_manifest
             || payload.request_hash != model_request_hash(&payload.request).ok()?

@@ -34,14 +34,99 @@ pub(super) fn artifact_id_tool_input_schema() -> Value {
     })
 }
 
+pub(super) fn read_range_tool_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "artifact_id": {"type": "string", "minLength": 1},
+            "start_byte": {"type": "integer", "minimum": 0},
+            "end_byte": {"type": "integer", "minimum": 1}
+        },
+        "required": ["artifact_id", "start_byte", "end_byte"],
+        "additionalProperties": false,
+    })
+}
+
+pub(super) fn search_context_tool_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "minLength": 1, "maxLength": 256},
+            "max_results": {"type": "integer", "minimum": 1, "maximum": 16}
+        },
+        "required": ["query", "max_results"],
+        "additionalProperties": false,
+    })
+}
+
+pub(super) fn compare_sources_tool_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "artifact_ids": {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 4,
+                "uniqueItems": true,
+                "items": {"type": "string", "minLength": 1}
+            }
+        },
+        "required": ["artifact_ids"],
+        "additionalProperties": false,
+    })
+}
+
+pub(super) fn context_tool_input_schema(name: &str) -> Option<Value> {
+    match name {
+        "read_artifact" | "read_document" | "read_claim_evidence" => {
+            Some(artifact_id_tool_input_schema())
+        }
+        "read_range" => Some(read_range_tool_input_schema()),
+        "search_context" => Some(search_context_tool_input_schema()),
+        "compare_sources" => Some(compare_sources_tool_input_schema()),
+        _ => None,
+    }
+}
+
 pub(super) fn evidence_read_tool_specs(store: &V2Store) -> ResearchResult<Vec<ToolSpec>> {
-    Ok(vec![ToolSpec {
-        name: "read_artifact".to_owned(),
-        description: "Read one artifact explicitly granted by ContextManifest.".to_owned(),
-        kind: ToolKind::ReadEvidence,
-        input_schema: store.put_json(&artifact_id_tool_input_schema())?,
-        strict: true,
-    }])
+    [
+        (
+            "read_document",
+            "Read one complete document explicitly granted by ContextManifest.",
+            artifact_id_tool_input_schema(),
+        ),
+        (
+            "read_range",
+            "Read one bounded byte range from a granted document.",
+            read_range_tool_input_schema(),
+        ),
+        (
+            "search_context",
+            "Search only documents selected by the active ContextManifest.",
+            search_context_tool_input_schema(),
+        ),
+        (
+            "read_claim_evidence",
+            "Read one granted claim and its granted evidence grounds.",
+            artifact_id_tool_input_schema(),
+        ),
+        (
+            "compare_sources",
+            "Read and compare two to four granted source documents.",
+            compare_sources_tool_input_schema(),
+        ),
+    ]
+    .into_iter()
+    .map(|(name, description, schema)| {
+        Ok(ToolSpec {
+            name: name.to_owned(),
+            description: description.to_owned(),
+            kind: ToolKind::ReadEvidence,
+            input_schema: store.put_json(&schema)?,
+            strict: true,
+        })
+    })
+    .collect()
 }
 
 pub(super) fn retrospective_draft_output_schema() -> Value {

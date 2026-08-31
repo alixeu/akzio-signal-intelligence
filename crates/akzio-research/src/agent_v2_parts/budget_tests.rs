@@ -113,10 +113,12 @@ mod cumulative_cost_budget_tests {
                 phase: AgentTurnPhase::Draft,
                 prompt: "fixture prompt".to_owned(),
                 objective: "fixture objective".to_owned(),
-                manifest_artifact_id: ArtifactId(akzio_domain::ContentHash::of_bytes(
-                    b"fixture-manifest",
-                )),
-                context: vec![],
+            manifest_artifact_id: ArtifactId(akzio_domain::ContentHash::of_bytes(
+                b"fixture-manifest",
+            )),
+            read_grant_identity: None,
+            context_materialization_identity: None,
+            context: vec![],
                 continuation: None,
                 tool_outputs: vec![],
                 continuation_instruction: None,
