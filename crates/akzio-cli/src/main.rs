@@ -17,8 +17,8 @@ use akzio_daemon::{
 };
 use akzio_domain::{
     content_hash_json, Artifact, ArtifactId, ArtifactKind, Asset, CanaryCampaignSpec, ContentHash,
-    LessonLifecycle, OutcomeCostModel, Retrospective, RunId, RunPurpose, RuntimeIdentity,
-    WorkflowStatus,
+    LessonLifecycle, OutcomeCostModel, ReleaseEvidenceBundle, Retrospective, RunId, RunPurpose,
+    RuntimeIdentity, WorkflowStatus,
 };
 use akzio_execution::paper::AlpacaPaper;
 use akzio_learning::{evaluate_frozen_evidence, FrozenEvidenceRecord, FrozenEvidenceSet};
@@ -179,6 +179,11 @@ enum StoreCommand {
         target: PathBuf,
         #[arg(long)]
         include_raw_model: bool,
+    },
+    ReleaseEvidence {
+        run_id: String,
+        #[arg(long)]
+        target: Option<PathBuf>,
     },
     Lesson {
         #[command(subcommand)]

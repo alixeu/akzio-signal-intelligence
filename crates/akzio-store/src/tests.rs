@@ -21,3 +21,4 @@ include!("store_tests/attempt_queries.rs");
 include!("store_tests/lifecycle.rs");
 include!("store_tests/maintenance.rs");
 include!("store_tests/failpoint_matrix.rs");
+include!("store_tests/release.rs");

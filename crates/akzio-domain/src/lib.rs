@@ -53,6 +53,7 @@ pub mod event;
 pub mod execution;
 pub mod ids;
 pub mod lesson;
+pub mod release;
 pub mod research;
 pub mod runtime_manifest;
 pub mod workflow;
@@ -71,6 +72,7 @@ pub use ids::{
     PolicyTransitionId, ReconciliationId,
 };
 pub use lesson::*;
+pub use release::*;
 pub use research::*;
 pub use runtime_manifest::*;
 pub use schema::FactorLimits;
