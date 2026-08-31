@@ -156,6 +156,10 @@ impl Daemon {
                 "/control/store/session/{session_key}",
                 get(http_store_session),
             )
+            .route(
+                "/control/store/release-evidence/{run_id}",
+                get(http_store_release_evidence),
+            )
             .route("/control/store/backup", post(http_store_backup))
             .route("/control/store/restore", post(http_store_restore))
             .route("/control/store/export-run", post(http_store_export_run))
@@ -723,6 +727,26 @@ async fn http_store_session(
         daemon.store_executor.clone(),
         "store.session",
         move |store| store.session_slot(&session_key),
+    )
+    .await
+    .map(Json)
+}
+
+async fn http_store_release_evidence(
+    State(daemon): State<Arc<Daemon>>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+) -> std::result::Result<Json<akzio_domain::ReleaseEvidenceBundle>, StatusCode> {
+    authorize(&daemon, &headers)?;
+    run_store_operation(
+        daemon.store_executor.clone(),
+        "store.release_evidence",
+        move |store| {
+            store.release_evidence_bundle(
+                &RunId(run_id),
+                &akzio_store::v2::ReleaseEvidenceExpectations::default(),
+            )
+        },
     )
     .await
     .map(Json)

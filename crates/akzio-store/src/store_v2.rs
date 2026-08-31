@@ -13,6 +13,7 @@ mod learning;
 mod lease;
 mod lesson;
 mod maintenance;
+mod release;
 mod schema;
 mod trajectory;
 mod workflow;

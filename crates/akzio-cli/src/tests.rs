@@ -419,3 +419,76 @@ fn help_has_no_unix_control_surface() {
     assert!(!help.to_ascii_lowercase().contains("unix"));
     assert!(Cli::try_parse_from(["akzio", "daemon", "unfreeze", "fixture reason"]).is_ok());
 }
+
+#[test]
+fn release_evidence_cli_supports_view_and_export() {
+    let view = Cli::try_parse_from(["akzio", "store", "release-evidence", "run-fixture"]).unwrap();
+    assert!(matches!(
+        view.command,
+        Command::Store {
+            command: StoreCommand::ReleaseEvidence {
+                ref run_id,
+                target: None,
+            }
+        } if run_id == "run-fixture"
+    ));
+
+    let directory = tempfile::tempdir().unwrap();
+    let target = directory.path().join("bundle.json");
+    let export = Cli::try_parse_from([
+        "akzio",
+        "store",
+        "release-evidence",
+        "run-fixture",
+        "--target",
+        target.to_str().unwrap(),
+    ])
+    .unwrap();
+    assert!(matches!(
+        export.command,
+        Command::Store {
+            command: StoreCommand::ReleaseEvidence {
+                target: Some(_),
+                ..
+            }
+        }
+    ));
+}
+
+#[test]
+fn release_evidence_export_is_deterministic_and_refuses_overwrite() {
+    let bundle =
+        akzio_domain::ReleaseEvidenceBundle::materialize(akzio_domain::ReleaseEvidenceBody {
+            run_id: RunId::new(),
+            purpose: RunPurpose::Debug,
+            environment: akzio_domain::ReleaseEvidenceEnvironment::OfflineFixture,
+            materialized_at: Utc::now(),
+            runtime: None,
+            workflow: None,
+            contracts: akzio_domain::ReleaseContractEvidence::default(),
+            provider_routes: Default::default(),
+            source_snapshots: Default::default(),
+            broker: None,
+            session: None,
+            daemon: None,
+            execution: None,
+            outcomes: Default::default(),
+            learning: None,
+            canary: None,
+            human_approval: None,
+            integrity: akzio_domain::ReleaseIntegrityEvidence {
+                config_hash_matches: false,
+                workflow_hash_matches: false,
+                broker_account_matches: false,
+                daemon_epoch_current: false,
+            },
+        })
+        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let target = directory.path().join("release").join("bundle.json");
+    export_release_evidence_bundle(&bundle, &target).unwrap();
+    let decoded: akzio_domain::ReleaseEvidenceBundle =
+        serde_json::from_slice(&std::fs::read(&target).unwrap()).unwrap();
+    assert_eq!(decoded.bundle_hash, bundle.bundle_hash);
+    assert!(export_release_evidence_bundle(&bundle, &target).is_err());
+}

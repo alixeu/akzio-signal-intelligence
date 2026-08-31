@@ -25,6 +25,15 @@ pub struct DaemonLease {
     pub expires_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReleaseEvidenceExpectations {
+    pub config_hash: Option<ContentHash>,
+    pub workflow_hash: Option<ContentHash>,
+    pub broker_account_fingerprint: Option<ContentHash>,
+    pub daemon_owner_id: Option<String>,
+    pub daemon_epoch: Option<u64>,
+}
+
 /// Exact Paper workflow frozen before its run is installed. A recovery must
 /// reuse this graph and its task IDs instead of recompiling a new plan.
 #[derive(Debug, Clone, PartialEq, Eq)]

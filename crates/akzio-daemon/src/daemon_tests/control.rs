@@ -54,6 +54,38 @@ async fn http_control_rejects_non_loopback_bind() {
     ));
 }
 
+#[tokio::test]
+async fn release_evidence_endpoint_materializes_store_owned_bundle() {
+    let directory = tempdir().unwrap();
+    let daemon = Daemon::with_model(
+        config(directory.path().to_path_buf()),
+        fixture_model_client(),
+    )
+    .unwrap();
+    let run_id = daemon.submit_default(RunPurpose::Debug).unwrap();
+    let response = daemon
+        .router()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(format!("/control/store/release-evidence/{run_id}"))
+                .header("x-akzio-token", "fixture-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let bundle: akzio_domain::ReleaseEvidenceBundle = serde_json::from_slice(&body).unwrap();
+    assert_eq!(bundle.body.run_id, run_id);
+    assert_eq!(
+        bundle.status,
+        akzio_domain::ReleaseEvidenceStatus::NotApprovable
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn blocking_store_maintenance_keeps_http_responsive() {
     let directory = tempdir().unwrap();

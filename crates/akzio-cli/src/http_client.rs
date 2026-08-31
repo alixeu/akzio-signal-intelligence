@@ -250,6 +250,17 @@ impl ControlApiClient {
         .await
     }
 
+    pub(crate) async fn store_release_evidence(
+        &self,
+        run_id: &RunId,
+    ) -> Result<ReleaseEvidenceBundle> {
+        self.json(self.request(
+            Method::GET,
+            self.endpoint(&["control", "store", "release-evidence", run_id.0.as_str()]),
+        ))
+        .await
+    }
+
     pub(crate) async fn store_backup(&self, target: &Path) -> Result<serde_json::Value> {
         self.json(
             self.request(Method::POST, self.endpoint(&["control", "store", "backup"]))
