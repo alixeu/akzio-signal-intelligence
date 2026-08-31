@@ -9,7 +9,9 @@ use std::{
 };
 use tokio::sync::broadcast;
 
-use akzio_context::v2::{ContextBroker, ContextError, ContextManifest};
+use akzio_context::v2::{
+    ContextBroker, ContextError, ContextManifest, ContextMaterialization, ContextReadResult,
+};
 #[cfg(test)]
 use akzio_domain::RuntimeTaskClass;
 use akzio_domain::{

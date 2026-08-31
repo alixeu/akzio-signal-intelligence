@@ -1,11 +1,5 @@
-fn should_advertise_read_tools(
-    purpose: RunPurpose,
-    context_len: usize,
-    max_tool_calls: u16,
-) -> bool {
-    context_len > 0
-        && context_len <= usize::from(max_tool_calls)
-        && purpose != RunPurpose::PaperDryRun
+fn should_advertise_read_tools(purpose: RunPurpose) -> bool {
+    purpose != RunPurpose::PaperDryRun
 }
 
 fn estimate_tokens<T: Serialize>(value: &T) -> ResearchResult<u32> {

@@ -31,6 +31,22 @@ fn recovery_request(
         .get(&manifest.payload.contract_hash)
         .unwrap()
         .contract;
+    let permit = TaskWritePermit {
+        run_id: manifest.grant.run_id.clone(),
+        task_id: manifest.grant.task_id.clone(),
+        attempt_id: manifest.grant.attempt_id.clone(),
+        lease_id: manifest.grant.lease_id.clone(),
+        epoch: manifest.grant.epoch,
+        contract_hash: Some(contract.contract_hash.clone()),
+    };
+    let materialization = ContextBroker::new(fixture.store.clone())
+        .materialize_for_agent(
+            &permit,
+            contract,
+            manifest,
+            manifest.grant.expires_at - Duration::milliseconds(1),
+        )
+        .unwrap();
     AgentModelRequest {
         contract_hash: contract.contract_hash.clone(),
         purpose: contract.purpose.as_str().to_owned(),
@@ -38,6 +54,8 @@ fn recovery_request(
         prompt: "recovery fixture".to_owned(),
         objective: "recover without replaying durable work".to_owned(),
         manifest_artifact_id: manifest.artifact.artifact_id.clone(),
+        read_grant_identity: Some(materialization.read_grant_identity),
+        context_materialization_identity: Some(materialization.materialization_identity),
         context: vec![],
         continuation,
         tool_outputs,
@@ -55,6 +73,11 @@ fn recovery_guard(
     AgentRecoveryGuard {
         contract_hash: request.contract_hash.clone(),
         context_manifest: manifest.payload.clone(),
+        read_grant_identity: request.read_grant_identity.clone().unwrap(),
+        context_materialization_identity: request
+            .context_materialization_identity
+            .clone()
+            .unwrap(),
         capability_snapshot_hash: capability_snapshot_hash(&fixture_capabilities()).unwrap(),
         budget_policy_hash: budget_policy_hash(&ModelBudgetPolicy::default()).unwrap(),
         draft_tool_set_hash: tool_set_hash(request).unwrap(),
@@ -552,6 +575,21 @@ fn recovery_checkpoint_rejects_hash_and_context_drift() {
     assert!(!agent_recovery_checkpoint(&fixture.store, &child.permit, &context_drift)
         .unwrap()
         .is_recovered());
+
+    let mut grant_drift = recovery_guard(&child_manifest, &request);
+    grant_drift.read_grant_identity = akzio_domain::ContentHash::of_bytes(b"grant-drift");
+    assert!(!agent_recovery_checkpoint(&fixture.store, &child.permit, &grant_drift)
+        .unwrap()
+        .is_recovered());
+
+    let mut materialization_drift = recovery_guard(&child_manifest, &request);
+    materialization_drift.context_materialization_identity =
+        akzio_domain::ContentHash::of_bytes(b"materialization-drift");
+    assert!(
+        !agent_recovery_checkpoint(&fixture.store, &child.permit, &materialization_drift)
+            .unwrap()
+            .is_recovered()
+    );
 }
 
 #[test]

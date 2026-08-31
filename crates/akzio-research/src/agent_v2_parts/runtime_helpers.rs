@@ -79,13 +79,13 @@ impl AgentRuntime {
         Ok((envelope.result, Some(note)))
     }
 
-    async fn context_values(
+    async fn context_materialization(
         &self,
         permit: &TaskWritePermit,
         contract: &AgentContract,
         manifest: &ContextManifest,
         now: DateTime<Utc>,
-    ) -> ResearchResult<Vec<Value>> {
+    ) -> ResearchResult<ContextMaterialization> {
         if !manifest.grant.matches_permit(permit) {
             return Err(ResearchError::GrantPermitMismatch);
         }
@@ -95,28 +95,7 @@ impl AgentRuntime {
         let manifest = manifest.clone();
         Ok(self
             .store_executor
-            .execute(move |_| {
-                manifest
-                    .payload
-                    .selections
-                    .iter()
-                    .map(|selection| {
-                        let (artifact, value) = context.read_document(
-                            &permit,
-                            &contract,
-                            &manifest.grant,
-                            &selection.artifact.artifact_id,
-                            now,
-                        )?;
-                        Ok(json!({
-                            "artifact_id": artifact.artifact_id,
-                            "kind": artifact.kind,
-                            "provenance": artifact.provenance,
-                            "value": value,
-                        }))
-                    })
-                    .collect::<std::result::Result<Vec<_>, ContextError>>()
-            })
+            .execute(move |_| context.materialize_for_agent(&permit, &contract, &manifest, now))
             .await??)
     }
 

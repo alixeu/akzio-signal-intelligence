@@ -311,11 +311,9 @@ fn validate_tool_specs(
     tool_grants: &[ToolGrant],
 ) -> Result<(), DomainError> {
     let mut names = BTreeSet::new();
-    let mut kinds = BTreeSet::new();
     for spec in tool_specs {
         spec.validate()?;
         if !names.insert(spec.name.as_str())
-            || !kinds.insert(spec.kind)
             || !tool_grants.iter().any(|grant| grant.kind == spec.kind)
         {
             return Err(DomainError::EmptyField {
