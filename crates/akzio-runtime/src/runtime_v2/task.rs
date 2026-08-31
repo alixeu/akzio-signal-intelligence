@@ -6,6 +6,24 @@ pub struct TaskRuntime {
     store: V2Store,
     store_executor: StoreExecutor,
     lease_duration: Duration,
+    #[cfg(test)]
+    failpoint: Option<std::sync::Arc<TaskFailpointState>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TaskFailpoint {
+    BeforeCommit,
+    AfterCommit,
+    BeforeFinish,
+    AfterFinish,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct TaskFailpointState {
+    point: TaskFailpoint,
+    fired: std::sync::atomic::AtomicBool,
 }
 
 impl TaskRuntime {
@@ -15,7 +33,39 @@ impl TaskRuntime {
             store: store.clone(),
             store_executor: StoreExecutor::new(store),
             lease_duration: Duration::seconds(30),
+            #[cfg(test)]
+            failpoint: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_failpoint(mut self, point: TaskFailpoint) -> Self {
+        self.failpoint = Some(std::sync::Arc::new(TaskFailpointState {
+            point,
+            fired: std::sync::atomic::AtomicBool::new(false),
+        }));
+        self
+    }
+
+    #[cfg(test)]
+    fn hit_failpoint(&self, point: TaskFailpoint) -> RuntimeResult<()> {
+        let Some(failpoint) = &self.failpoint else {
+            return Ok(());
+        };
+        if failpoint.point == point
+            && failpoint
+                .fired
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_ok()
+        {
+            return Err(RuntimeError::InjectedFailpoint(format!("{point:?}")));
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -132,6 +182,23 @@ impl TaskRuntime {
         completion: TaskCompletion,
         now: DateTime<Utc>,
     ) -> RuntimeResult<()> {
+        #[cfg(test)]
+        let failpoint_kind = match &completion {
+            TaskCompletion::Succeeded(_) => {
+                Some((TaskFailpoint::BeforeCommit, TaskFailpoint::AfterCommit))
+            }
+            TaskCompletion::NoOutput
+            | TaskCompletion::Failed
+            | TaskCompletion::Skipped
+            | TaskCompletion::Cancelled => {
+                Some((TaskFailpoint::BeforeFinish, TaskFailpoint::AfterFinish))
+            }
+            _ => None,
+        };
+        #[cfg(test)]
+        if let Some((before, _)) = failpoint_kind {
+            self.hit_failpoint(before)?;
+        }
         let retry_at = match &completion {
             TaskCompletion::Retry(cause) if self.retry_allowed(task, *cause) => {
                 Some(self.retry_at(task, now)?)
@@ -176,6 +243,10 @@ impl TaskRuntime {
                 Ok::<(), StoreError>(())
             })
             .await??;
+        #[cfg(test)]
+        if let Some((_, after)) = failpoint_kind {
+            self.hit_failpoint(after)?;
+        }
         Ok(())
     }
 

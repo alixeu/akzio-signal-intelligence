@@ -10,6 +10,7 @@ use akzio_domain::{
 use tempfile::tempdir;
 
 use super::*;
+use crate::runtime_v2::task::TaskFailpoint;
 
 fn budget() -> TaskBudget {
     TaskBudget {

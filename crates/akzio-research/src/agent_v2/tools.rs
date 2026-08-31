@@ -33,12 +33,16 @@ impl AgentRuntime {
             }],
             now,
         )?;
+        #[cfg(test)]
+        self.hit_failpoint(AgentFailpoint::BeforeToolCallPersist)?;
         self.store.write_task_artifact(
             permit,
             &call_artifact,
             LifecycleEventType::ToolCalled,
             now,
         )?;
+        #[cfg(test)]
+        self.hit_failpoint(AgentFailpoint::AfterToolCallPersist)?;
 
         match self.execute_tool_inner(permit, contract, grant, call, now) {
             Ok(result) => {
@@ -73,12 +77,16 @@ impl AgentRuntime {
                     source_refs,
                     now,
                 )?;
+                #[cfg(test)]
+                self.hit_failpoint(AgentFailpoint::BeforeToolResultPersist)?;
                 self.store.write_task_artifact(
                     permit,
                     &result_artifact,
                     LifecycleEventType::ToolCompleted,
                     now,
                 )?;
+                #[cfg(test)]
+                self.hit_failpoint(AgentFailpoint::AfterToolResultPersist)?;
                 Ok(ToolResult {
                     value: json!({
                         "call_id": call.call_id,

@@ -104,6 +104,9 @@ pub enum ResearchError {
     AmbiguousSubmission,
     #[error("Agent model refused the task: {0}")]
     ModelRefused(String),
+    #[cfg(test)]
+    #[error("injected Agent failpoint: {0}")]
+    InjectedFailpoint(String),
 }
 
 impl ResearchError {
