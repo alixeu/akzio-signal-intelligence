@@ -12,6 +12,26 @@ fn estimate_tokens<T: Serialize>(value: &T) -> ResearchResult<u32> {
     Ok(akzio_domain::estimate_json_tokens(value)?)
 }
 
+fn estimate_turn_output_tokens(turn: &AgentModelTurn) -> ResearchResult<u32> {
+    let assistant = turn
+        .assistant_text
+        .as_deref()
+        .map(|text| estimate_tokens(&text))
+        .transpose()?
+        .unwrap_or_default();
+    let tools = (!turn.tool_calls.is_empty())
+        .then(|| estimate_tokens(&turn.tool_calls))
+        .transpose()?
+        .unwrap_or_default();
+    let submission = turn
+        .terminal_submission
+        .as_ref()
+        .map(|submission| estimate_tokens(&submission.arguments))
+        .transpose()?
+        .unwrap_or_default();
+    Ok(assistant.saturating_add(tools).saturating_add(submission))
+}
+
 fn model_request_hash(request: &AgentModelRequest) -> ResearchResult<akzio_domain::ContentHash> {
     Ok(akzio_domain::content_hash_json(&serde_json::to_value(
         request,
@@ -70,6 +90,10 @@ fn model_error_result(error: &ModelError) -> Value {
             "error": "transport",
             "message": sanitize_provider_text(&error.to_string()),
         }),
+        ModelError::StreamIdleTimeout { idle_timeout } => json!({
+            "error": "stream_idle_timeout",
+            "idle_timeout_ms": idle_timeout.as_millis(),
+        }),
         ModelError::InvalidStream(_) => json!({"error": "invalid_stream"}),
         ModelError::Refused(message) => json!({"error": "refused", "message": message}),
         ModelError::Incomplete(reason) => json!({"error": "incomplete", "reason": reason}),
@@ -91,6 +115,10 @@ fn model_error_result(error: &ModelError) -> Value {
 fn model_client_error(error: ModelError, trace: Option<ModelCallTrace>) -> ResearchError {
     let (error_class, message) = match error {
         ModelError::Transport(error) => ("transport", sanitize_provider_text(&error.to_string())),
+        ModelError::StreamIdleTimeout { idle_timeout } => (
+            "transport",
+            format!("response stream idle for {idle_timeout:?}"),
+        ),
         ModelError::Http { status, body } if status.as_u16() == 429 => (
             "rate_limited",
             format!("HTTP 429: {}", sanitize_provider_text(&body)),

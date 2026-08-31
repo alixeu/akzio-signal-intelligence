@@ -29,18 +29,25 @@ func runPresentationChecks() {
 
     Check.suite("Run purpose gating") {
         Check.expect(RunPurpose.paper.submitsPaperOrders, "canonical Paper submits orders")
-        for purpose in [RunPurpose.debug, .paperDryRun, .replay, .shadow] {
+        for purpose in [RunPurpose.debug, .positionPlan, .paperDryRun, .replay, .shadow] {
             Check.expect(
                 !purpose.submitsPaperOrders,
                 "\(purpose.rawValue) must render Paper Commit as Not Applicable"
             )
         }
-    Check.expect(!RunPurpose.debug.isCanonical, "debug is noncanonical")
+        Check.expect(!RunPurpose.debug.isCanonical, "debug is noncanonical")
+        Check.expect(!RunPurpose.positionPlan.isCanonical, "position plan is noncanonical")
     Check.expect(!RunPurpose.paperDryRun.isCanonical, "dry run is noncanonical")
     Check.expect(!RunPurpose.replay.isCanonical, "replay is noncanonical")
     Check.expect(!RunPurpose.shadow.isCanonical, "shadow is comparison-only, not canonical learning")
-    Check.equal(RunPurpose.paperDryRun.rawValue, "paper_dry_run", "serde wire name")
-        Check.equal(RunPurpose.allCases.count, 5, "RunPurpose variant count")
+        Check.equal(RunPurpose.paperDryRun.rawValue, "paper_dry_run", "serde wire name")
+        Check.equal(RunPurpose.positionPlan.rawValue, "position_plan", "position plan wire name")
+        Check.equal(
+            RunPurpose.userLaunchModes,
+            [.debug, .positionPlan],
+            "only safe operator run modes are launchable"
+        )
+        Check.equal(RunPurpose.allCases.count, 6, "RunPurpose variant count")
     }
 
     Check.suite("Domain enum parity") {

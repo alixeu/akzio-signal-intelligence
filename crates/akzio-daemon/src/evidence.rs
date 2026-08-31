@@ -10,7 +10,9 @@ impl Daemon {
     ) -> Result<Vec<akzio_domain::Artifact>> {
         if task.node.input_artifacts.is_empty() {
             return match self.store.run_purpose(&task.run_id)? {
-                RunPurpose::Debug | RunPurpose::PaperDryRun => Ok(Vec::new()),
+                RunPurpose::Debug | RunPurpose::PositionPlan | RunPurpose::PaperDryRun => {
+                    Ok(Vec::new())
+                }
                 RunPurpose::Paper => Err(DaemonError::InvalidInput(
                     "Paper evidence gate requires at least one EvidenceNeed".to_owned(),
                 )),
@@ -78,7 +80,9 @@ impl Daemon {
                     )
                     .await?
             } else {
-                if purpose == RunPurpose::Debug && !self.fixture_mode {
+                if matches!(purpose, RunPurpose::Debug | RunPurpose::PositionPlan)
+                    && !self.fixture_mode
+                {
                     return Err(DaemonError::Unavailable(format!(
                         "real Debug evidence adapter is not configured for source {}",
                         source.as_str()

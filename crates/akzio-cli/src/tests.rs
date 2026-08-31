@@ -8,12 +8,28 @@ use tokio::{
 fn write_config(directory: &tempfile::TempDir, daemon: &str, assets: &str) -> PathBuf {
     let path = directory.path().join("akzio.toml");
     std::fs::write(
-            &path,
-            format!(
-                "[daemon]\nstore_root='store'\n{daemon}\ntoken_env='TOKEN'\n[execution]\nassets={assets}\n"
-            ),
-        )
-        .unwrap();
+        &path,
+        format!(
+            "[daemon]\nstore_root='store'\n{daemon}\ntoken_env='TOKEN'\n[execution]\nassets={assets}\n"
+        ),
+    )
+    .unwrap();
+    path
+}
+
+fn write_auto_paper_config(
+    directory: &tempfile::TempDir,
+    auto_paper: bool,
+    execution: &str,
+) -> PathBuf {
+    let path = directory.path().join("akzio.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "[daemon]\nstore_root='store'\nauto_paper={auto_paper}\nhttp_addr='127.0.0.1:1'\ntoken_env='TOKEN'\n[execution]\nassets=['TQQQ', 'QQQ', 'SOXX', 'SOXL']\n{execution}"
+        ),
+    )
+    .unwrap();
     path
 }
 
@@ -42,14 +58,17 @@ fn paper_session_command_accepts_broker_session_key() {
 }
 
 #[test]
+fn config_accepts_worker_only_without_paper_requirements() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = write_auto_paper_config(&directory, false, "");
+
+    assert!(load_config(&path).is_ok());
+}
+
+#[test]
 fn config_rejects_zero_cost_auto_paper() {
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("akzio.toml");
-    std::fs::write(
-            &path,
-            "[daemon]\nstore_root='store'\nauto_paper=true\nhttp_addr='127.0.0.1:1'\ntoken_env='TOKEN'\n[execution]\nassets=['TQQQ', 'QQQ', 'SOXX', 'SOXL']\n",
-        )
-        .unwrap();
+    let path = write_auto_paper_config(&directory, true, "");
 
     let error = load_config(&path).unwrap_err().to_string();
     assert!(error.contains("transaction_cost_ppm or slippage_ppm"));
@@ -58,15 +77,23 @@ fn config_rejects_zero_cost_auto_paper() {
 #[test]
 fn config_rejects_auto_paper_without_market_data_feed() {
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("akzio.toml");
-    std::fs::write(
-            &path,
-            "[daemon]\nstore_root='store'\nauto_paper=true\nhttp_addr='127.0.0.1:1'\ntoken_env='TOKEN'\n[execution]\nassets=['TQQQ', 'QQQ', 'SOXX', 'SOXL']\ntransaction_cost_ppm=1\nslippage_ppm=1\n",
-        )
-        .unwrap();
+    let path =
+        write_auto_paper_config(&directory, true, "transaction_cost_ppm=1\nslippage_ppm=1\n");
 
     let error = load_config(&path).unwrap_err().to_string();
     assert!(error.contains("execution.market_data_feed"));
+}
+
+#[test]
+fn config_accepts_complete_auto_paper_requirements() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = write_auto_paper_config(
+        &directory,
+        true,
+        "market_data_feed='iex'\ntransaction_cost_ppm=1\nslippage_ppm=1\n",
+    );
+
+    assert!(load_config(&path).is_ok());
 }
 
 #[test]

@@ -4,6 +4,7 @@
 //! marker from `V2Store`; callers must choose a new Store Root rather than run a
 //! silent in-place migration.
 
+mod attempt;
 mod blob;
 mod canary;
 mod doctor;

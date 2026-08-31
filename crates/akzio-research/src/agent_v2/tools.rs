@@ -222,9 +222,16 @@ pub(super) fn strict_artifact_id_argument(
 pub(super) fn tool_set_hash(
     request: &AgentModelRequest,
 ) -> ResearchResult<akzio_domain::ContentHash> {
+    advertised_tool_set_hash(&request.tools, request.terminal.as_ref())
+}
+
+pub(super) fn advertised_tool_set_hash(
+    tools: &[AgentToolDefinition],
+    terminal: Option<&AgentTerminalDefinition>,
+) -> ResearchResult<akzio_domain::ContentHash> {
     Ok(akzio_domain::content_hash_json(&json!({
-        "tools": request.tools,
-        "terminal": request.terminal,
+        "tools": tools,
+        "terminal": terminal,
     }))?)
 }
 

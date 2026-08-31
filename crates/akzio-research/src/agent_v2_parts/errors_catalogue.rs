@@ -76,9 +76,9 @@ pub enum ResearchError {
     ToolBudgetExceeded,
     #[error("Agent exceeded its derived provider-call budget")]
     ModelCallBudgetExceeded,
-    #[error("Agent request used {actual} tokens but Contract permits at most {maximum}")]
+    #[error("Agent run input used {actual} tokens but Contract permits at most {maximum}")]
     InputBudgetExceeded { actual: u32, maximum: u32 },
-    #[error("Agent output used {actual} tokens but Contract permits at most {maximum}")]
+    #[error("Agent run output used {actual} tokens but Contract permits at most {maximum}")]
     OutputBudgetExceeded { actual: u32, maximum: u32 },
     #[error("Agent exceeded its Contract wall-time budget of {maximum_secs} seconds")]
     WallTimeExceeded { maximum_secs: u32 },
@@ -104,7 +104,6 @@ impl ResearchError {
 }
 
 pub type ResearchResult<T> = Result<T, ResearchError>;
-
 
 struct CanonicalContractDefinition {
     purpose: &'static str,
@@ -292,24 +291,24 @@ fn canonical_active_contract(
         format!(
             "{role_prompt}\n\nFor directional grounds, use normalized evidence with one payload-scoped asset and set domain to bars=price_market_structure, series=macro, or news=news_event. For descriptive paper account, positions, open orders, fills, quotes, or clock evidence, set role=descriptive and domain=null; do not invent a shard."
         )
-        } else {
-            role_prompt
-        };
-        let role_prompt = if definition.purpose == RESEARCH_ANALYST_RECIPE_ID {
-            format!(
+    } else {
+        role_prompt
+    };
+    let role_prompt = if definition.purpose == RESEARCH_ANALYST_RECIPE_ID {
+        format!(
                 "{role_prompt}\n\nFor descriptive grounds over paper.* evidence, always set assets to an empty array."
             )
-        } else {
-            role_prompt
-        };
-        let role_prompt = if definition.purpose == RESEARCH_SYNTHESIZER_RECIPE_ID {
-            format!(
+    } else {
+        role_prompt
+    };
+    let role_prompt = if definition.purpose == RESEARCH_SYNTHESIZER_RECIPE_ID {
+        format!(
                 "{role_prompt}\n\nCopy every selected Claim reference unchanged into result.claims; if no Claim is selected, leave claims empty. Never put a normalized_evidence ID in claims or critiques."
             )
-        } else {
-            role_prompt
-        };
-        let prompt = PromptBundle {
+    } else {
+        role_prompt
+    };
+    let prompt = PromptBundle {
         version: ACTIVE_PROMPT_BUNDLE_VERSION,
         governance: store.put_bytes(SHARED_GOVERNANCE_PROMPT.as_bytes(), "text/plain")?,
         role: store.put_bytes(role_prompt.as_bytes(), "text/plain")?,
@@ -389,7 +388,6 @@ fn evidence_read_grants() -> Vec<ToolGrant> {
     }]
 }
 
-
 fn active_retry_policy() -> RetryPolicy {
     RetryPolicy {
         max_attempts: 2,
@@ -408,14 +406,14 @@ fn research_output_source_refs(
 ) -> ResearchResult<Vec<ArtifactRef>> {
     let refs = match kind {
         ArtifactKind::Claim => {
-        let claim: ResearchClaim = serde_json::from_value(output.clone()).map_err(|error| {
-            ResearchError::InvalidOutput(format!("invalid Claim payload: {error}"))
-        })?;
-        claim
-            .validate()
-            .map_err(|error| ResearchError::InvalidOutput(error.to_string()))?;
-        validate_claim_ground_scopes(store, &claim, manifest)?;
-        claim.source_refs()
+            let claim: ResearchClaim = serde_json::from_value(output.clone()).map_err(|error| {
+                ResearchError::InvalidOutput(format!("invalid Claim payload: {error}"))
+            })?;
+            claim
+                .validate()
+                .map_err(|error| ResearchError::InvalidOutput(error.to_string()))?;
+            validate_claim_ground_scopes(store, &claim, manifest)?;
+            claim.source_refs()
         }
         ArtifactKind::Critique => {
             let critique: ResearchCritique =
@@ -467,21 +465,21 @@ fn research_output_source_refs(
                         "invalid DecisionProposal payload: {error}"
                     ))
                 })?;
-        proposal
-            .validate()
-            .map_err(|error| ResearchError::InvalidOutput(error.to_string()))?;
+            proposal
+                .validate()
+                .map_err(|error| ResearchError::InvalidOutput(error.to_string()))?;
 
-        for reference in proposal.claims.iter().chain(proposal.critiques.iter()) {
-            let artifact = store.artifact(&reference.artifact_id)?;
-            if artifact.kind != reference.kind {
-                return Err(ResearchError::InvalidOutput(format!(
+            for reference in proposal.claims.iter().chain(proposal.critiques.iter()) {
+                let artifact = store.artifact(&reference.artifact_id)?;
+                if artifact.kind != reference.kind {
+                    return Err(ResearchError::InvalidOutput(format!(
                     "DecisionProposal reference kind {:?} does not match stored artifact kind {:?}",
                     reference.kind, artifact.kind
                 )));
+                }
             }
-        }
 
-        let selected = manifest
+            let selected = manifest
                 .payload
                 .selections
                 .iter()
@@ -523,23 +521,23 @@ fn research_output_source_refs(
                 .claims
                 .iter()
                 .chain(proposal.critiques.iter())
-        .chain(proposal.evidence.iter())
-        .cloned()
-        .collect::<Vec<_>>();
-        let mut claims = Vec::new();
+                .chain(proposal.evidence.iter())
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut claims = Vec::new();
 
-        for reference in proposal.claims.iter().chain(proposal.critiques.iter()) {
-            let artifact = store.artifact(&reference.artifact_id)?;
-            let payload = store.read_blob(&artifact.blob)?;
+            for reference in proposal.claims.iter().chain(proposal.critiques.iter()) {
+                let artifact = store.artifact(&reference.artifact_id)?;
+                let payload = store.read_blob(&artifact.blob)?;
                 let source_refs = match reference.kind {
                     ArtifactKind::Claim => {
                         let claim: ResearchClaim = serde_json::from_slice(&payload)?;
-                    claim
-                        .validate()
-                        .map_err(|error| ResearchError::InvalidOutput(error.to_string()))?;
-                    validate_claim_ground_scopes(store, &claim, manifest)?;
-                    claims.push(claim.clone());
-                    claim.source_refs()
+                        claim
+                            .validate()
+                            .map_err(|error| ResearchError::InvalidOutput(error.to_string()))?;
+                        validate_claim_ground_scopes(store, &claim, manifest)?;
+                        claims.push(claim.clone());
+                        claim.source_refs()
                     }
                     ArtifactKind::Critique => {
                         let critique: ResearchCritique = serde_json::from_slice(&payload)?;
@@ -559,11 +557,11 @@ fn research_output_source_refs(
                             .to_owned(),
                     ));
                 }
-            refs.extend(source_refs);
-        }
-        validate_decision_evidence_sufficiency(&proposal, &claims)
-            .map_err(|error| ResearchError::InvalidOutput(error.to_string()))?;
-        refs.sort();
+                refs.extend(source_refs);
+            }
+            validate_decision_evidence_sufficiency(&proposal, &claims)
+                .map_err(|error| ResearchError::InvalidOutput(error.to_string()))?;
+            refs.sort();
             refs.dedup();
             refs
         }
@@ -592,7 +590,12 @@ fn validate_claim_ground_scopes(
         .payload
         .selections
         .iter()
-        .map(|selection| (selection.artifact.artifact_id.clone(), selection.artifact.clone()))
+        .map(|selection| {
+            (
+                selection.artifact.artifact_id.clone(),
+                selection.artifact.clone(),
+            )
+        })
         .collect::<BTreeMap<_, _>>();
 
     for ground in &claim.grounds {
@@ -630,6 +633,7 @@ fn validate_claim_ground_scopes(
 
         if ground.role == EvidenceGroundRole::Directional {
             if ground.evidence.kind != ArtifactKind::NormalizedEvidence
+                || !evidence_has_complete_citations(&payload)
                 || domain.is_none()
                 || scope.is_none()
                 || ground.assets.is_empty()
@@ -638,7 +642,7 @@ fn validate_claim_ground_scopes(
                     .is_some_and(|assets| !ground.assets.is_subset(assets))
             {
                 return Err(ResearchError::InvalidOutput(
-                    "directional ground must bind exactly one asset to a scoped normalized evidence artifact"
+                    "directional ground must bind exactly one asset to a scoped, citation-complete normalized evidence artifact"
                         .to_owned(),
                 ));
             }
@@ -657,17 +661,30 @@ fn validate_claim_ground_scopes(
     Ok(())
 }
 
+fn evidence_has_complete_citations(payload: &Value) -> bool {
+    payload
+        .pointer("/quality/citations_complete")
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
 fn evidence_asset_scope(payload: &Value) -> ResearchResult<Option<BTreeSet<Asset>>> {
     let resource = payload.get("resource").and_then(Value::as_str);
     if let Some(resource) = resource {
-        if let Some(symbol) = resource.strip_prefix("bars:").and_then(|value| value.split(':').next()) {
+        if let Some(symbol) = resource
+            .strip_prefix("bars:")
+            .and_then(|value| value.split(':').next())
+        {
             let asset = Asset::try_from(symbol).map_err(|error| {
                 ResearchError::InvalidOutput(format!("invalid bar asset scope: {error}"))
             })?;
             return Ok(Some(BTreeSet::from([asset])));
         }
 
-        if let Some(symbol) = resource.strip_prefix("news:").and_then(|value| value.split(':').next()) {
+        if let Some(symbol) = resource
+            .strip_prefix("news:")
+            .and_then(|value| value.split(':').next())
+        {
             let asset = Asset::try_from(symbol).map_err(|error| {
                 ResearchError::InvalidOutput(format!("invalid news asset scope: {error}"))
             })?;
@@ -718,11 +735,10 @@ fn evidence_domain(payload: &Value) -> ResearchResult<Option<ResearchShard>> {
     }
     if resource.starts_with("series:") {
         let series = resource.split(':').nth(1).unwrap_or_default();
-        return Ok(matches!(
-            series,
-            "DFF" | "DFII10" | "VIXCLS" | "DGS2" | "DGS10"
-        )
-        .then_some(ResearchShard::Macro));
+        return Ok(
+            matches!(series, "DFF" | "DFII10" | "VIXCLS" | "DGS2" | "DGS10")
+                .then_some(ResearchShard::Macro),
+        );
     }
     Ok(None)
 }

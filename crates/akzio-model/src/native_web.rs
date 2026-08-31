@@ -214,8 +214,14 @@ impl NativeWebPolicy {
     pub fn extract_citations(&self, raw: &Value) -> Result<Vec<NativeWebCitation>> {
         let mut citations = Vec::new();
         collect_citations(raw, &mut citations);
-        citations.sort_by(|left, right| left.uri.cmp(&right.uri));
-        citations.dedup_by(|left, right| left.uri == right.uri);
+        let mut merged = BTreeMap::<String, NativeWebCitation>::new();
+        for citation in citations {
+            merged
+                .entry(citation.uri.clone())
+                .and_modify(|existing| existing.merge_missing(&citation))
+                .or_insert(citation);
+        }
+        let citations = merged.into_values().collect::<Vec<_>>();
         if citations.is_empty() {
             return Err(ModelError::NativeWebCitationsMissing);
         }
@@ -248,6 +254,26 @@ impl NativeWebPolicy {
             });
         }
         Ok(())
+    }
+}
+
+impl NativeWebCitation {
+    fn merge_missing(&mut self, candidate: &Self) {
+        if self.title.is_none() {
+            self.title.clone_from(&candidate.title);
+        }
+        if self.excerpt.is_none() {
+            self.excerpt.clone_from(&candidate.excerpt);
+        }
+        if self.published_at.is_none() {
+            self.published_at.clone_from(&candidate.published_at);
+        }
+        if self.revision.is_none() {
+            self.revision.clone_from(&candidate.revision);
+        }
+        if self.document_id.is_none() {
+            self.document_id.clone_from(&candidate.document_id);
+        }
     }
 }
 

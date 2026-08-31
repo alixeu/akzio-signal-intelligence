@@ -127,7 +127,10 @@ impl WorkflowRuntime {
             return Err(RuntimeError::FrozenPaperWorkflow(run_id.clone()));
         }
         let mut draft = draft;
-        if matches!(purpose, RunPurpose::Debug | RunPurpose::PaperDryRun) {
+        if matches!(
+            purpose,
+            RunPurpose::Debug | RunPurpose::PositionPlan | RunPurpose::PaperDryRun
+        ) {
             let synthesizer_recipe = TaskRecipeId::new(SYNTHESIZER_RECIPE_ID)?;
             prepare_debug_draft(
                 &mut draft,
@@ -220,7 +223,10 @@ impl WorkflowRuntime {
         purpose: RunPurpose,
         now: DateTime<Utc>,
     ) -> RuntimeResult<(WorkflowProposal, Vec<Artifact>, Artifact)> {
-        if matches!(purpose, RunPurpose::Debug | RunPurpose::PaperDryRun) {
+        if matches!(
+            purpose,
+            RunPurpose::Debug | RunPurpose::PositionPlan | RunPurpose::PaperDryRun
+        ) {
             let synthesizer_recipe = TaskRecipeId::new(SYNTHESIZER_RECIPE_ID)?;
             prepare_debug_draft(
                 &mut draft,

@@ -79,17 +79,17 @@ impl Daemon {
         Ok(())
     }
 
-    pub(super) fn request_cancel(&self, run_id: &RunId, reason: &str) -> Result<u64> {
-        Ok(u64::from(self.task_runtime.request_cancel(
-            run_id,
-            reason,
-            Utc::now(),
-        )?))
+    pub(super) async fn request_cancel(&self, run_id: &RunId, reason: &str) -> Result<u64> {
+        Ok(u64::from(
+            self.task_runtime
+                .request_cancel(run_id, reason, Utc::now())
+                .await?,
+        ))
     }
 
     pub(super) fn retry_run(&self, source_run_id: &RunId) -> Result<RunId> {
         match self.store.run_purpose(source_run_id)? {
-            RunPurpose::Debug | RunPurpose::PaperDryRun => {}
+            RunPurpose::Debug | RunPurpose::PositionPlan | RunPurpose::PaperDryRun => {}
             RunPurpose::Paper => {
                 return Err(DaemonError::InvalidInput(
                     "Paper runs are scheduler-owned and cannot be retried by an operator"

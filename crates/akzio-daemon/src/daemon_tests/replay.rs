@@ -56,6 +56,7 @@ async fn retry_starts_a_fresh_terminal_nonpaper_run() {
     let source_run_id = daemon.submit_default(RunPurpose::Debug).unwrap();
     daemon
         .request_cancel(&source_run_id, "fixture cancellation request")
+        .await
         .unwrap();
 
     let run_id = daemon.retry_run(&source_run_id).unwrap();
@@ -68,7 +69,7 @@ async fn retry_starts_a_fresh_terminal_nonpaper_run() {
 }
 
 #[test]
-fn direct_submit_allows_only_debug_and_paper_dry_run() {
+fn direct_submit_allows_only_operator_owned_noncanonical_runs() {
     let directory = tempdir().unwrap();
     let daemon = Daemon::with_model(
         config(directory.path().to_path_buf()),
@@ -84,7 +85,50 @@ fn direct_submit_allows_only_debug_and_paper_dry_run() {
     }
 
     assert!(daemon.submit_default(RunPurpose::Debug).is_ok());
+    assert!(daemon.submit_default(RunPurpose::PositionPlan).is_ok());
     assert!(daemon.submit_default(RunPurpose::PaperDryRun).is_ok());
+}
+
+#[tokio::test]
+async fn http_submit_accepts_position_plan_and_persists_purpose() {
+    let directory = tempdir().unwrap();
+    let daemon = Daemon::with_model(
+        config(directory.path().to_path_buf()),
+        fixture_model_client(),
+    )
+    .unwrap();
+    let response = daemon
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/runs")
+                .header("x-akzio-token", "fixture-token")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"purpose":"position_plan"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let run_id = serde_json::from_slice::<RunSubmissionResponse>(
+        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap()
+    .run_id;
+    assert_eq!(
+        daemon.store().run_purpose(&run_id).unwrap(),
+        RunPurpose::PositionPlan
+    );
+    let graph = daemon.store().workflow_snapshot(&run_id).unwrap().revision.graph;
+    assert!(graph
+        .nodes
+        .iter()
+        .all(|node| !matches!(
+            node.recipe_id.as_str(),
+            "gate.execution" | "gate.paper" | "gate.reconcile" | "gate.evaluate"
+        )));
 }
 
 #[test]

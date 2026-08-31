@@ -52,8 +52,8 @@ impl WorkerPool {
 
     /// Recover work owned by a process that stopped without finishing its
     /// leases.  It is safe to call before every pool start and is idempotent.
-    pub fn recover_abandoned(&self) -> Result<u64, RuntimeError> {
-        self.runtime.recover_expired_tasks(Utc::now())
+    pub async fn recover_abandoned(&self) -> Result<u64, RuntimeError> {
+        self.runtime.recover_expired_tasks(Utc::now()).await
     }
 
     /// Run the configured worker count until `shutdown` becomes true.
@@ -66,8 +66,27 @@ impl WorkerPool {
         handler: TaskHandler,
         shutdown: watch::Receiver<bool>,
     ) -> Result<(), RuntimeError> {
-        self.recover_abandoned()?;
+        let runtime = self.runtime.clone();
+        self.serve_with_recovery(handler, shutdown, move || {
+            recover_expired_tasks(runtime.clone())
+        })
+        .await
+    }
+
+    async fn serve_with_recovery<F, Fut>(
+        &self,
+        handler: TaskHandler,
+        shutdown: watch::Receiver<bool>,
+        mut recover: F,
+    ) -> Result<(), RuntimeError>
+    where
+        F: FnMut() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<u64, RuntimeError>> + Send + 'static,
+    {
+        recover().await?;
+        let recovery_interval = self.runtime.recovery_interval()?;
         let mut workers = tokio::task::JoinSet::new();
+        workers.spawn(recovery_loop(recover, recovery_interval, shutdown.clone()));
         for index in 0..self.config.normalized_worker_count() {
             let runtime = self.runtime.clone();
             let handler = handler.clone();
@@ -93,6 +112,37 @@ impl WorkerPool {
         (0..self.config.normalized_worker_count())
             .map(|index| format!("{}-{index}", self.config.worker_prefix))
             .collect()
+    }
+}
+
+async fn recover_expired_tasks(runtime: TaskRuntime) -> Result<u64, RuntimeError> {
+    runtime.recover_expired_tasks(Utc::now()).await
+}
+
+async fn recovery_loop<F, Fut>(
+    mut recover: F,
+    interval: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), RuntimeError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<u64, RuntimeError>>,
+{
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(());
+                }
+            }
+            _ = ticker.tick() => {
+                recover().await?;
+            }
+        }
     }
 }
 
@@ -306,5 +356,184 @@ mod tests {
             pool.worker_ids().into_iter().collect::<BTreeSet<_>>().len(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn idle_workers_do_not_drive_recovery() {
+        let directory = tempdir().unwrap();
+        let runtime = TaskRuntime::new(V2Store::open(directory.path()).unwrap())
+            .with_lease_duration(chrono::Duration::seconds(3))
+            .unwrap();
+        let pool = WorkerPool::new(
+            runtime,
+            WorkerPoolConfig {
+                worker_count: 8,
+                idle_poll: Duration::from_millis(1),
+                worker_prefix: "idle".to_owned(),
+            },
+        );
+        let recoveries = Arc::new(AtomicUsize::new(0));
+        let observed = recoveries.clone();
+        let handler: TaskHandler = Arc::new(|_| Box::pin(async { TaskCompletion::Failed }));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            pool.serve_with_recovery(handler, shutdown_rx, move || {
+                let recoveries = recoveries.clone();
+                async move {
+                    recoveries.fetch_add(1, Ordering::SeqCst);
+                    Ok(0)
+                }
+            })
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while observed.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        shutdown_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+
+        assert_eq!(observed.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn recovery_ticker_requeues_expired_tasks() {
+        let directory = tempdir().unwrap();
+        let store = V2Store::open(directory.path()).unwrap();
+        let mut graph = workflow();
+        graph
+            .nodes
+            .iter_mut()
+            .for_each(|node| node.retry.max_attempts = 2);
+        let run_id = RunId::new();
+        let now = Utc::now();
+        let graph_artifact = Artifact::new(
+            ArtifactKind::WorkflowGraph,
+            store.put_json(&graph).unwrap(),
+            "fixture.workflow",
+            ArtifactLifecycle::RunScoped,
+            provenance(now),
+            None,
+            vec![],
+            now,
+        )
+        .unwrap();
+        store
+            .commit_workflow(&WorkflowCommit {
+                run: StoredRun {
+                    run_id: run_id.clone(),
+                    purpose: RunPurpose::Debug,
+                    topology_id: graph.topology_id.clone(),
+                    graph_artifact_id: graph_artifact.artifact_id.clone(),
+                    created_at: now,
+                },
+                graph: graph_artifact,
+                nodes: graph.nodes,
+            })
+            .unwrap();
+        store
+            .claim_next_task("crashed", now, chrono::Duration::milliseconds(1))
+            .unwrap()
+            .unwrap();
+
+        let completed = Arc::new(AtomicUsize::new(0));
+        let handler: TaskHandler = {
+            let completed = completed.clone();
+            Arc::new(move |_| {
+                let completed = completed.clone();
+                Box::pin(async move {
+                    completed.fetch_add(1, Ordering::SeqCst);
+                    TaskCompletion::NoOutput
+                })
+            })
+        };
+        let pool = WorkerPool::new(
+            TaskRuntime::new(store.clone())
+                .with_lease_duration(chrono::Duration::milliseconds(30))
+                .unwrap(),
+            WorkerPoolConfig {
+                worker_count: 4,
+                idle_poll: Duration::from_millis(1),
+                worker_prefix: "recovery".to_owned(),
+            },
+        );
+        let recovery_calls = Arc::new(AtomicUsize::new(0));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn({
+            let recovery_calls = recovery_calls.clone();
+            let recovery_store = store.clone();
+            async move {
+                pool.serve_with_recovery(handler, shutdown_rx, move || {
+                    let call = recovery_calls.fetch_add(1, Ordering::SeqCst);
+                    let store = recovery_store.clone();
+                    async move {
+                        let at = now + chrono::Duration::milliseconds(i64::from(call > 0) * 2);
+                        Ok(store.recover_expired_tasks(at)?)
+                    }
+                })
+                .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while completed.load(Ordering::SeqCst) < 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        shutdown_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+
+        assert_eq!(
+            store
+                .events_after(&run_id, 0, 100)
+                .unwrap()
+                .iter()
+                .filter(|event| event.event_type == "task.recovered")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_error_stops_the_pool() {
+        let directory = tempdir().unwrap();
+        let runtime = TaskRuntime::new(V2Store::open(directory.path()).unwrap())
+            .with_lease_duration(chrono::Duration::milliseconds(3))
+            .unwrap();
+        let pool = WorkerPool::new(runtime, WorkerPoolConfig::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler: TaskHandler = Arc::new(|_| Box::pin(async { TaskCompletion::Failed }));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let result = tokio::time::timeout(Duration::from_secs(1), {
+            let calls = calls.clone();
+            pool.serve_with_recovery(handler, shutdown_rx, move || {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if call == 0 {
+                        Ok(0)
+                    } else {
+                        Err(RuntimeError::Store(StoreError::Integrity(
+                            "fixture recovery failure".to_owned(),
+                        )))
+                    }
+                }
+            })
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            result,
+            Err(RuntimeError::Store(StoreError::Integrity(message)))
+                if message == "fixture recovery failure"
+        ));
     }
 }

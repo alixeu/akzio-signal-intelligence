@@ -7,7 +7,8 @@ impl AgentRuntime {
         model: &dyn AgentModel,
         now: DateTime<Utc>,
     ) -> ResearchResult<Artifact> {
-        self.run_inner(permit, node, candidates, model, now, None)
+        let mut budget = AgentRunBudget::new(&node.budget, &node.retry);
+        self.run_inner(permit, node, candidates, model, now, &mut budget)
             .await
     }
 
@@ -20,7 +21,7 @@ impl AgentRuntime {
         now: DateTime<Utc>,
         budget: &mut AgentRunBudget,
     ) -> ResearchResult<Artifact> {
-        self.run_inner(permit, node, candidates, model, now, Some(budget))
+        self.run_inner(permit, node, candidates, model, now, budget)
             .await
     }
 
@@ -31,9 +32,9 @@ impl AgentRuntime {
         candidates: impl IntoIterator<Item = ArtifactRef>,
         model: &dyn AgentModel,
         now: DateTime<Utc>,
-        mut shared_budget: Option<&mut AgentRunBudget>,
+        budget: &mut AgentRunBudget,
     ) -> ResearchResult<Artifact> {
-        self.validate_authority_permit(permit)?;
+        self.validate_authority_permit(permit).await?;
         if permit.task_id != node.task_id {
             return Err(ResearchError::TaskMismatch);
         }
@@ -51,49 +52,64 @@ impl AgentRuntime {
         {
             return Err(ResearchError::NodePolicyMismatch);
         }
+        let candidates = candidates.into_iter().collect::<Vec<_>>();
         let manifest = if let Some(parent_task_id) = &node.parent_task_id {
             if !node.dependencies.contains(parent_task_id) {
                 return Err(ResearchError::InvalidOutput(
                     "parent task is not a declared dependency".to_owned(),
                 ));
             }
-            let proof = self.load_parent_succeeded_attempt(&permit.run_id, parent_task_id)?;
+            let proof = self
+                .load_parent_succeeded_attempt(&permit.run_id, parent_task_id)
+                .await?;
             let parent_contract_hash = proof.contract_hash.as_ref().ok_or_else(|| {
                 ResearchError::InvalidOutput("parent attempt has no contract hash".to_owned())
             })?;
-            let parent_contract = &self.catalogue.get(parent_contract_hash)?.contract;
-            self.context.assemble_child_from_proof(
-                &proof,
-                parent_contract,
-                permit,
-                &installed.contract,
-                now,
-                self.grant_ttl,
-            )?
+            let context = self.context.clone();
+            let parent_contract = self.catalogue.get(parent_contract_hash)?.contract.clone();
+            let contract = installed.contract.clone();
+            let permit = permit.clone();
+            let grant_ttl = self.grant_ttl;
+            self.store_executor
+                .execute(move |_| {
+                    context.assemble_child_from_proof(
+                        &proof,
+                        &parent_contract,
+                        &permit,
+                        &contract,
+                        now,
+                        grant_ttl,
+                    )
+                })
+                .await??
         } else {
-            self.context
-                .assemble(permit, &installed.contract, candidates, now, self.grant_ttl)?
+            let context = self.context.clone();
+            let contract = installed.contract.clone();
+            let permit = permit.clone();
+            let grant_ttl = self.grant_ttl;
+            self.store_executor
+                .execute(move |_| context.assemble(&permit, &contract, candidates, now, grant_ttl))
+                .await??
         };
         if !manifest.grant.matches_permit(permit) {
             return Err(ResearchError::GrantPermitMismatch);
         }
-        let context = self.context_values(permit, &installed.contract, &manifest, now)?;
+        let context = self
+            .context_values(permit, &installed.contract, &manifest, now)
+            .await?;
         let governance = String::from_utf8(
-            self.context.read_authority_document(
+            self.read_authority_document(
                 &installed.contract,
                 &installed.contract.prompt.governance,
-            )?,
+            )
+            .await?,
         )
-                .map_err(|_| {
-                    ResearchError::InvalidOutput("governance prompt is not UTF-8".to_owned())
-                })?;
+        .map_err(|_| ResearchError::InvalidOutput("governance prompt is not UTF-8".to_owned()))?;
         let role = String::from_utf8(
-            self.context.read_authority_document(
-                &installed.contract,
-                &installed.contract.prompt.role,
-            )?,
+            self.read_authority_document(&installed.contract, &installed.contract.prompt.role)
+                .await?,
         )
-            .map_err(|_| ResearchError::InvalidOutput("role prompt is not UTF-8".to_owned()))?;
+        .map_err(|_| ResearchError::InvalidOutput("role prompt is not UTF-8".to_owned()))?;
         let response_language = model.response_language().unwrap_or("简体中文").trim();
         let reference_ledger = manifest
             .payload
@@ -114,12 +130,11 @@ impl AgentRuntime {
             "{prompt}\n\nSubmission invariant: result.claims and result.hard_blockers must not both be empty; copy at least one selected claim reference when claims are available."
         );
         let output_schema: Value = serde_json::from_slice(
-            &self.context.read_authority_document(
-                &installed.contract,
-                &installed.contract.output.schema,
-            )?,
+            &self
+                .read_authority_document(&installed.contract, &installed.contract.output.schema)
+                .await?,
         )?;
-        let run_purpose = self.run_purpose_for(&permit.run_id)?;
+        let run_purpose = self.run_purpose_for(&permit.run_id).await?;
         let tools = if !should_advertise_read_tools(
             run_purpose,
             context.len(),
@@ -127,33 +142,45 @@ impl AgentRuntime {
         ) {
             Vec::new()
         } else {
- model_tool_definitions(&self.context, &installed.contract)?
+            model_tool_definitions(&self.context, &installed.contract)?
         };
-        let mut continuation = None;
-        let mut pending_tool_outputs = Vec::new();
-        let mut trace_refs = Vec::new();
-        let mut tool_calls = 0_u16;
-        let mut model_turn = 0_u16;
-        let mut provider_calls = 0_u32;
-        let max_provider_calls = u32::from(installed.contract.retry.max_attempts)
-            .saturating_mul(u32::from(installed.contract.budget.max_tool_calls) + 3);
-        let mut phase = AgentTurnPhase::Draft;
+        let terminal = AgentTerminalDefinition {
+            description: format!(
+                "Submit the final {} contract output for Rust validation. This has no side effects.",
+                installed.contract.purpose.as_str()
+            ),
+            input_schema: output_schema.clone(),
+        };
+        let prefetched_capabilities = model.capability_snapshot();
+        let recovery_guard = AgentRecoveryGuard {
+            contract_hash: installed.contract.contract_hash.clone(),
+            context_manifest: manifest.payload.clone(),
+            capability_snapshot_hash: capability_snapshot_hash(&prefetched_capabilities)?,
+            draft_tool_set_hash: advertised_tool_set_hash(&tools, None)?,
+            submit_tool_set_hash: advertised_tool_set_hash(&[], Some(&terminal))?,
+        };
+        let recovery_permit = permit.clone();
+        let recovery = self
+            .store_executor
+            .execute(move |store| {
+                agent_recovery_checkpoint(&store, &recovery_permit, &recovery_guard)
+            })
+            .await??;
+        let mut prefetched_capabilities = Some(prefetched_capabilities);
+        if matches!(&recovery.source, AgentRecoverySource::Recovered(_)) {
+            budget.restore(&recovery)?;
+        }
+        let mut continuation = recovery.continuation;
+        let mut pending_tool_outputs = recovery.pending_tool_outputs;
+        let mut trace_refs = recovery.trace_refs;
+        let mut model_turn = recovery.next_model_turn;
+        let mut phase = recovery.phase;
         let mut submission_attempts = 0_u8;
-        let started = shared_budget
-            .as_ref()
-            .map(|budget| budget.started)
-            .unwrap_or_else(Instant::now);
-        let wall_time =
-            StdDuration::from_secs(u64::from(installed.contract.budget.max_wall_time_secs));
+        let started = budget.started;
+        let wall_time = budget.wall_time;
         loop {
-            if let Some(budget) = shared_budget.as_deref_mut() {
-                budget.check_wall()?;
-            }
-            if started.elapsed() > wall_time {
-                return Err(ResearchError::WallTimeExceeded {
-                    maximum_secs: installed.contract.budget.max_wall_time_secs,
-                });
-            }
+            budget.check_wall()?;
+            let max_output_tokens = budget.remaining_output_tokens()?;
             let request = AgentModelRequest {
                 contract_hash: installed.contract.contract_hash.clone(),
                 purpose: installed.contract.purpose.as_str().to_owned(),
@@ -174,42 +201,30 @@ impl AgentRuntime {
                     "The research memo is complete. Call submit_result exactly once with the final contract output. Do not call any other tool or add assistant text."
                         .to_owned()
                 }),
-                max_output_tokens: installed.contract.budget.max_output_tokens,
+                max_output_tokens,
                 tools: if phase == AgentTurnPhase::Draft {
                     tools.clone()
                 } else {
                     Vec::new()
                 },
-                terminal: (phase == AgentTurnPhase::Submit).then(|| AgentTerminalDefinition {
-                    description: format!(
-                        "Submit the final {} contract output for Rust validation. This has no side effects.",
-                        installed.contract.purpose.as_str()
-                    ),
-                    input_schema: output_schema.clone(),
-                }),
-        };
-        let input_tokens = estimate_tokens(&request)?;
-        if let Some(budget) = shared_budget.as_deref_mut() {
-            budget.record_input(input_tokens)?;
-        } else if input_tokens > installed.contract.budget.max_input_tokens {
-            return Err(ResearchError::InputBudgetExceeded {
-                actual: input_tokens,
-                maximum: installed.contract.budget.max_input_tokens,
-                });
-            }
+                terminal: (phase == AgentTurnPhase::Submit).then(|| terminal.clone()),
+            };
+            let input_tokens = estimate_tokens(&request)?;
             let tool_set_hash = tool_set_hash(&request)?;
             let mut turn_attempt = 1_u8;
             let (turn, capability_snapshot, capability_snapshot_hash, request_hash) = loop {
-                let capability_snapshot = model.capability_snapshot();
+                let capability_snapshot = prefetched_capabilities
+                    .take()
+                    .unwrap_or_else(|| model.capability_snapshot());
                 let capability_snapshot_hash = capability_snapshot_hash(&capability_snapshot)?;
                 if let Err(capability) = validate_model_capabilities(&capability_snapshot, &request)
                 {
                     let turn_now = logical_now(now, started.elapsed());
                     let failed_turn = self.record_failed_turn(
-                        &TurnRecord {
-                            permit,
-                            contract: &installed.contract,
-                            manifest: &manifest,
+                        TurnRecord {
+                            permit: permit.clone(),
+                            contract: installed.contract.clone(),
+                            manifest: manifest.clone(),
                             turn: model_turn,
                             attempt: turn_attempt,
                             now: turn_now,
@@ -222,7 +237,7 @@ impl AgentRuntime {
                         &capability_snapshot,
                         &capability_snapshot_hash,
                         &tool_set_hash,
-                    )?;
+                    ).await?;
                     trace_refs.push(ArtifactRef {
                         artifact_id: failed_turn.artifact_id,
                         kind: ArtifactKind::AgentTurn,
@@ -230,12 +245,18 @@ impl AgentRuntime {
                     return Err(capability);
                 }
                 let request_hash = model_request_hash(&request)?;
-                self.validate_authority_permit(permit)?;
-                self.store.append_task_event(
-                    permit,
-                    LifecycleEventType::AgentTurnStarted,
-                    logical_now(now, started.elapsed()),
-                )?;
+                self.validate_authority_permit(permit).await?;
+                let event_permit = permit.clone();
+                let event_now = logical_now(now, started.elapsed());
+                self.store_executor
+                    .execute(move |store| {
+                        store.append_task_event(
+                            &event_permit,
+                            LifecycleEventType::AgentTurnStarted,
+                            event_now,
+                        )
+                    })
+                    .await??;
                 let sender = self.reasoning_events.clone();
                 let run_id = permit.run_id.clone();
                 let task_id = permit.task_id.clone();
@@ -273,12 +294,8 @@ impl AgentRuntime {
                     };
                     let _ = sender.send(event);
                 });
-            if let Some(budget) = shared_budget.as_deref_mut() {
+                budget.check_input(input_tokens)?;
                 budget.record_model_call()?;
-            } else if provider_calls >= max_provider_calls {
-                return Err(ResearchError::ModelCallBudgetExceeded);
-            }
-                provider_calls = provider_calls.saturating_add(1);
                 match model.turn_with_events(request.clone(), on_event).await {
                     Ok(turn) => {
                         break (
@@ -294,10 +311,10 @@ impl AgentRuntime {
                             retryable && turn_attempt < installed.contract.retry.max_attempts;
                         let turn_now = logical_now(now, started.elapsed());
                         let failed_turn = self.record_failed_turn(
-                            &TurnRecord {
-                                permit,
-                                contract: &installed.contract,
-                                manifest: &manifest,
+                            TurnRecord {
+                                permit: permit.clone(),
+                                contract: installed.contract.clone(),
+                                manifest: manifest.clone(),
                                 turn: model_turn,
                                 attempt: turn_attempt,
                                 now: turn_now,
@@ -310,11 +327,12 @@ impl AgentRuntime {
                             &capability_snapshot,
                             &capability_snapshot_hash,
                             &tool_set_hash,
-                        )?;
+                        ).await?;
                         trace_refs.push(ArtifactRef {
                             artifact_id: failed_turn.artifact_id,
                             kind: ArtifactKind::AgentTurn,
                         });
+                        budget.record_input(input_tokens)?;
                         if !will_retry {
                             return Err(error);
                         }
@@ -340,10 +358,10 @@ impl AgentRuntime {
             if started.elapsed() > wall_time {
                 let turn_now = logical_now(now, started.elapsed());
                 let failed_turn = self.record_failed_turn(
-                    &TurnRecord {
-                        permit,
-                        contract: &installed.contract,
-                        manifest: &manifest,
+                    TurnRecord {
+                        permit: permit.clone(),
+                        contract: installed.contract.clone(),
+                        manifest: manifest.clone(),
                         turn: model_turn,
                         attempt: turn_attempt,
                         now: turn_now,
@@ -356,7 +374,7 @@ impl AgentRuntime {
                     &capability_snapshot,
                     &capability_snapshot_hash,
                     &tool_set_hash,
-                )?;
+                ).await?;
                 trace_refs.push(ArtifactRef {
                     artifact_id: failed_turn.artifact_id,
                     kind: ArtifactKind::AgentTurn,
@@ -367,10 +385,10 @@ impl AgentRuntime {
             }
             let turn_now = logical_now(now, started.elapsed());
             let turn_artifact = self.record_turn(
-                &TurnRecord {
-                    permit,
-                    contract: &installed.contract,
-                    manifest: &manifest,
+                TurnRecord {
+                    permit: permit.clone(),
+                    contract: installed.contract.clone(),
+                    manifest: manifest.clone(),
                     turn: model_turn,
                     attempt: turn_attempt,
                     now: turn_now,
@@ -380,34 +398,43 @@ impl AgentRuntime {
                 &capability_snapshot,
                 &capability_snapshot_hash,
                 &tool_set_hash,
-            )?;
+            ).await?;
             trace_refs.push(ArtifactRef {
                 artifact_id: turn_artifact.artifact_id,
                 kind: ArtifactKind::AgentTurn,
             });
+            budget.record_turn(
+                input_tokens,
+                estimate_turn_output_tokens(&turn)?,
+                turn.telemetry.as_ref(),
+            )?;
             continuation = Some(turn.continuation.clone());
             pending_tool_outputs.clear();
             if phase == AgentTurnPhase::Draft && turn.terminal_submission.is_some() {
                 return Err(ResearchError::AmbiguousSubmission);
             }
             if phase == AgentTurnPhase::Draft && !turn.tool_calls.is_empty() {
-                let next = tool_calls.saturating_add(turn.tool_calls.len() as u16);
-                if let Some(budget) = shared_budget.as_deref_mut() {
-                    budget.record_tool_calls(turn.tool_calls.len() as u16)?;
-                }
-                if next > installed.contract.budget.max_tool_calls {
-                    return Err(ResearchError::ToolBudgetExceeded);
-                }
+                budget.record_tool_calls(turn.tool_calls.len() as u16)?;
                 for call in turn.tool_calls {
                     let call_id = call.call_id.clone();
-                    let tool_result = self.execute_tool(
-                        permit,
-                        &installed.contract,
-                        &manifest.grant,
-                        &call,
-                        &request_hash,
-                        turn_now,
-                    )?;
+                    let tool_runtime = self.clone();
+                    let tool_permit = permit.clone();
+                    let tool_contract = installed.contract.clone();
+                    let tool_grant = manifest.grant.clone();
+                    let tool_request_hash = request_hash.clone();
+                    let tool_result = self
+                        .store_executor
+                        .execute(move |_| {
+                            tool_runtime.execute_tool(
+                                &tool_permit,
+                                &tool_contract,
+                                &tool_grant,
+                                &call,
+                                &tool_request_hash,
+                                turn_now,
+                            )
+                        })
+                        .await??;
                     trace_refs.push(ArtifactRef {
                         artifact_id: tool_result.artifact.artifact_id.clone(),
                         kind: ArtifactKind::ToolResult,
@@ -417,27 +444,18 @@ impl AgentRuntime {
                         output: tool_result.value,
                     });
                 }
-                tool_calls = next;
                 model_turn = model_turn.saturating_add(1);
                 continue;
             }
             if phase == AgentTurnPhase::Draft {
-                let memo = turn
+                if turn
                     .assistant_text
                     .as_deref()
-                    .filter(|text| !text.trim().is_empty())
-                    .ok_or(ResearchError::MissingFinalOutput)?;
-                let output_tokens = estimate_tokens(&memo)?;
-            if output_tokens > installed.contract.budget.max_output_tokens {
-                return Err(ResearchError::OutputBudgetExceeded {
-                    actual: output_tokens,
-                    maximum: installed.contract.budget.max_output_tokens,
-                });
-            }
-            if let Some(budget) = shared_budget.as_deref_mut() {
-                budget.record_output(output_tokens)?;
-            }
-            phase = AgentTurnPhase::Submit;
+                    .is_none_or(|text| text.trim().is_empty())
+                {
+                    return Err(ResearchError::MissingFinalOutput);
+                }
+                phase = AgentTurnPhase::Submit;
                 model_turn = model_turn.saturating_add(1);
                 continue;
             }
@@ -448,39 +466,41 @@ impl AgentRuntime {
             let submission = turn
                 .terminal_submission
                 .ok_or(ResearchError::MissingFinalOutput)?;
-            let output_tokens = estimate_tokens(&submission.arguments)?;
-        if output_tokens > installed.contract.budget.max_output_tokens {
-            return Err(ResearchError::OutputBudgetExceeded {
-                actual: output_tokens,
-                maximum: installed.contract.budget.max_output_tokens,
-            });
-        }
-        if let Some(budget) = shared_budget.as_deref_mut() {
-            budget.record_output(output_tokens)?;
-        }
 
-            let validated = (|| {
-                validate_submission_schema(
-                    &self.store,
-                    &installed.contract,
-                    &submission.arguments,
-                )?;
-                let (output, deliberation_note) = self.extract_deliberation(
-                    permit,
-                    &installed.contract,
-                    &manifest,
-                    submission.arguments.clone(),
-                    turn_now,
-                )?;
-                validate_output_schema(&self.store, &installed.contract, &output)?;
-                let research_sources = research_output_source_refs(
-                    &self.store,
-                    installed.contract.output.artifact_kind,
-                    &output,
-                    &manifest,
-                )?;
-                Ok::<_, ResearchError>((output, deliberation_note, research_sources))
-            })();
+            let validation_runtime = self.clone();
+            let validation_permit = permit.clone();
+            let validation_contract = installed.contract.clone();
+            let validation_manifest = manifest.clone();
+            let validation_arguments = submission.arguments.clone();
+            let validated = self
+                .store_executor
+                .execute(move |_| {
+                    validate_submission_schema(
+                        &validation_runtime.store,
+                        &validation_contract,
+                        &validation_arguments,
+                    )?;
+                    let (output, deliberation_note) = validation_runtime.extract_deliberation(
+                        &validation_permit,
+                        &validation_contract,
+                        &validation_manifest,
+                        validation_arguments,
+                        turn_now,
+                    )?;
+                    validate_output_schema(
+                        &validation_runtime.store,
+                        &validation_contract,
+                        &output,
+                    )?;
+                    let research_sources = research_output_source_refs(
+                        &validation_runtime.store,
+                        validation_contract.output.artifact_kind,
+                        &output,
+                        &validation_manifest,
+                    )?;
+                    Ok::<_, ResearchError>((output, deliberation_note, research_sources))
+                })
+                .await?;
 
             let (output, deliberation_note, research_sources) = match validated {
                 Ok(validated) => validated,
@@ -502,41 +522,51 @@ impl AgentRuntime {
                 }
                 Err(error) => return Err(error),
             };
-            if let Some(note) = deliberation_note {
-                self.store.write_task_artifact(
-                    permit,
-                    &note,
-                    LifecycleEventType::DeliberationNoteCreated,
-                    turn_now,
-                )?;
+            if let Some(note) = &deliberation_note {
                 trace_refs.push(ArtifactRef {
-                    artifact_id: note.artifact_id,
+                    artifact_id: note.artifact_id.clone(),
                     kind: ArtifactKind::DeliberationNote,
                 });
             }
-            let output_artifact = Artifact::new(
-                installed.contract.output.artifact_kind,
-                self.store.put_json(&output)?,
-                format!("agent.{}", installed.contract.purpose.as_str()),
-                ArtifactLifecycle::RunScoped,
-                ArtifactProvenance {
-                    source_family: "akzio.agent".to_owned(),
-                    observed_at: None,
-                    retrieved_at: turn_now,
-                    source_uri: None,
-                    confidence_ppm: 1_000_000,
-                    producer_contract_hash: Some(installed.contract.contract_hash.clone()),
-                },
-                Some(permit.artifact_origin()),
-                std::iter::once(ArtifactRef {
-                    artifact_id: manifest.artifact.artifact_id.clone(),
-                    kind: ArtifactKind::ContextManifest,
+            let output_sources = std::iter::once(ArtifactRef {
+                artifact_id: manifest.artifact.artifact_id.clone(),
+                kind: ArtifactKind::ContextManifest,
+            })
+            .chain(trace_refs)
+            .chain(research_sources)
+            .collect();
+            let output_permit = permit.clone();
+            let output_contract = installed.contract.clone();
+            let output_artifact = self
+                .store_executor
+                .execute(move |store| {
+                    if let Some(note) = deliberation_note {
+                        store.write_task_artifact(
+                            &output_permit,
+                            &note,
+                            LifecycleEventType::DeliberationNoteCreated,
+                            turn_now,
+                        )?;
+                    }
+                    Ok::<_, ResearchError>(Artifact::new(
+                        output_contract.output.artifact_kind,
+                        store.put_json(&output)?,
+                        format!("agent.{}", output_contract.purpose.as_str()),
+                        ArtifactLifecycle::RunScoped,
+                        ArtifactProvenance {
+                            source_family: "akzio.agent".to_owned(),
+                            observed_at: None,
+                            retrieved_at: turn_now,
+                            source_uri: None,
+                            confidence_ppm: 1_000_000,
+                            producer_contract_hash: Some(output_contract.contract_hash.clone()),
+                        },
+                        Some(output_permit.artifact_origin()),
+                        output_sources,
+                        turn_now,
+                    )?)
                 })
-                .chain(trace_refs)
-                .chain(research_sources)
-                .collect(),
-                turn_now,
-            )?;
+                .await??;
             return Ok(output_artifact);
         }
     }

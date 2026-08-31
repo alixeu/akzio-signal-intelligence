@@ -5,9 +5,16 @@ extension LiveProjection {
         guard let portfolio = payload.portfolio.data else { return unavailablePortfolio }
         let currentArtifacts = payload.currentRun?.artifacts ?? []
         let plan = currentArtifacts.last(where: { $0.kind == "execution_plan" })
+        let isPositionPlan = payload.currentRun?.workflow.run.purpose
+            == RunPurpose.positionPlan.rawValue
+        let positionPlan = isPositionPlan
+            ? currentArtifacts.last(where: { $0.kind == "decision_context" })
+            : nil
         let receipts = currentArtifacts.filter { $0.kind == "order_receipt" }
         let reconciliationArtifact = currentArtifacts.last(where: { $0.kind == "reconciliation" })
-        let targetWeights = plan?.payload["target"]?["weights"]?.object ?? [:]
+        let targetWeights = plan?.payload["target"]?["weights"]?.object
+            ?? positionPlan?.payload["target"]?["weights"]?.object
+            ?? [:]
         let positions = portfolio.positions.compactMap { position -> PositionPresentation? in
             guard let asset = TradableAsset(rawValue: position.symbol.uppercased()) else { return nil }
             let actual = liveRatio(position.marketValueMicros, portfolio.equityMicros)
@@ -23,8 +30,13 @@ extension LiveProjection {
                 targetPpm: target
             )
         }
-        let allocations = positions.map {
-            AllocationRow(label: $0.asset.rawValue, actualPpm: $0.actualPpm, targetPpm: $0.targetPpm)
+        let positionsByAsset = Dictionary(uniqueKeysWithValues: positions.map { ($0.asset, $0) })
+        let allocations = TradableAsset.allCases.map { asset in
+            AllocationRow(
+                label: asset.rawValue,
+                actualPpm: positionsByAsset[asset]?.actualPpm ?? 0,
+                targetPpm: targetWeights[asset.rawValue.lowercased()]?.int ?? 0
+            )
         }
         let planOrders = plan?.payload["orders"]?.array ?? []
         let orders = receipts.compactMap { receipt -> OrderPresentation? in
@@ -72,7 +84,11 @@ extension LiveProjection {
                 symbol: "checkmark.seal",
                 isActive: currentArtifacts.contains { $0.kind == "decision" }
             ),
-            AllocationFlowStage(title: "Plan", symbol: "list.bullet.rectangle", isActive: plan != nil),
+            AllocationFlowStage(
+                title: "Plan",
+                symbol: "list.bullet.rectangle",
+                isActive: plan != nil || positionPlan != nil
+            ),
             AllocationFlowStage(title: "Broker", symbol: "building.columns", isActive: !receipts.isEmpty),
             AllocationFlowStage(
                 title: "Reconcile",

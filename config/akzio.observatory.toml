@@ -6,6 +6,8 @@ http_addr = "127.0.0.1:7342"
 token_env = "AKZIO_DAEMON_TOKEN"
 observer_token_env = "AKZIO_OBSERVER_TOKEN"
 worker_count = 4
+# Constructs Alpaca Paper from environment credentials and fails closed before
+# scheduler startup when credentials, endpoint, or Paper prerequisites are invalid.
 auto_paper = true
 
 [execution]

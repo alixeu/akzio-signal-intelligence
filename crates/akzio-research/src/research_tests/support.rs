@@ -84,6 +84,21 @@ fn missing_model_output_keeps_invalid_output_classification() {
 }
 
 #[test]
+fn stream_idle_timeout_keeps_transport_retry_semantics() {
+    let timeout = std::time::Duration::from_millis(40);
+    let error = ModelError::StreamIdleTimeout {
+        idle_timeout: timeout,
+    };
+
+    assert_eq!(model_error_result(&error)["error"], "stream_idle_timeout");
+    assert_eq!(model_error_result(&error)["idle_timeout_ms"], 40);
+    assert!(matches!(
+        model_client_error(error, None),
+        ResearchError::Model(message) if message.contains("response stream idle")
+    ));
+}
+
+#[test]
 fn only_invalid_output_errors_request_task_retry() {
     let invalid = [
         ResearchError::InvalidOutput("invalid JSON".to_owned()),

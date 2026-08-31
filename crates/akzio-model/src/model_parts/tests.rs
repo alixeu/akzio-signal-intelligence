@@ -326,6 +326,41 @@ fn native_web_contract_rejects_unallowlisted_query_and_uri() {
 }
 
 #[test]
+fn native_web_citation_deduplication_keeps_richer_metadata() {
+    let policy = NativeWebPolicy::default();
+    let citations = policy
+        .extract_citations(&json!({
+            "output": [{
+                "type": "web_search_call",
+                "status": "completed",
+                "action": {
+                    "type": "search",
+                    "query": "QQQ filing",
+                    "sources": [{"url": "https://reuters.com/article"}]
+                }
+            }],
+            "citations": [{
+                "url": "https://reuters.com/article",
+                "title": "Source title",
+                "text": "Exact source excerpt",
+                "published_at": "2026-08-29T12:00:00Z"
+            }]
+        }))
+        .unwrap();
+
+    assert_eq!(citations.len(), 1);
+    assert_eq!(citations[0].title.as_deref(), Some("Source title"));
+    assert_eq!(
+        citations[0].excerpt.as_deref(),
+        Some("Exact source excerpt")
+    );
+    assert_eq!(
+        citations[0].published_at.as_deref(),
+        Some("2026-08-29T12:00:00Z")
+    );
+}
+
+#[test]
 fn native_web_contract_requires_citations_and_bounds_results() {
     let policy = NativeWebPolicy::default();
     let call = ModelToolCall {

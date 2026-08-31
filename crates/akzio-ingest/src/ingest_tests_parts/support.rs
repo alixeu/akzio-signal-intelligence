@@ -102,15 +102,15 @@ fn fixture_adapters_are_source_typed() {
                 max_age: Duration::seconds(30),
             },
         )
-            .unwrap();
+        .unwrap();
         assert_eq!(response.normalized["fixture"], true);
         assert!(matches!(
             EvidenceAdapter::acquire(
                 &adapter,
                 &EvidenceRequest {
-                source: other,
-                resource: "resource".to_owned(),
-                max_age: Duration::seconds(30),
+                    source: other,
+                    resource: "resource".to_owned(),
+                    max_age: Duration::seconds(30),
                 },
             ),
             Err(EvidenceAdapterError::SourceMismatch)
@@ -221,11 +221,22 @@ fn evidence_need(
     task: &akzio_store::v2::ClaimedAttempt,
     now: DateTime<Utc>,
 ) -> ArtifactRef {
+    evidence_need_for(store, task, "alpaca", "quote", 30, now)
+}
+
+fn evidence_need_for(
+    store: &V2Store,
+    task: &akzio_store::v2::ClaimedAttempt,
+    source_family: &str,
+    resource: &str,
+    max_age_secs: u64,
+    now: DateTime<Utc>,
+) -> ArtifactRef {
     let payload = akzio_domain::EvidenceNeed {
         schema_version: V2_DOMAIN_SCHEMA_VERSION,
-        source_family: "alpaca".to_owned(),
-        resource: "quote".to_owned(),
-        max_age_secs: 30,
+        source_family: source_family.to_owned(),
+        resource: resource.to_owned(),
+        max_age_secs,
     };
     let artifact = Artifact::new(
         ArtifactKind::EvidenceNeed,

@@ -481,6 +481,7 @@ async fn http_cancel(
     let run_id = RunId(run_id);
     daemon
         .request_cancel(&run_id, "operator cancellation request")
+        .await
         .map(|cancelled_tasks| {
             Json(RunCancellationResponse {
                 run_id,
@@ -601,9 +602,9 @@ async fn http_store_doctor(
     headers: HeaderMap,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
     authorize(&daemon, &headers)?;
-    daemon
-        .store
-        .verify_integrity()
+    let store = daemon.store.clone();
+    run_store_maintenance("store.doctor", move || store.verify_integrity())
+        .await?
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -655,7 +656,10 @@ async fn http_store_backup(
     Json(request): Json<StoreBackupRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
     authorize(&daemon, &headers)?;
-    store_json(daemon.store.backup_to(request.target))
+    let store = daemon.store.clone();
+    store_json(
+        run_store_maintenance("store.backup", move || store.backup_to(request.target)).await?,
+    )
 }
 
 async fn http_store_restore(
@@ -664,9 +668,13 @@ async fn http_store_restore(
     Json(request): Json<StoreRestoreRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
     authorize(&daemon, &headers)?;
-    let store = akzio_store::v2::V2Store::restore_from(request.source, request.target)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    store_json(store.metrics(Utc::now()))
+    store_json(
+        run_store_maintenance("store.restore", move || {
+            akzio_store::v2::V2Store::restore_from(request.source, request.target)
+                .and_then(|store| store.metrics(Utc::now()))
+        })
+        .await?,
+    )
 }
 
 async fn http_store_export_run(
@@ -675,11 +683,17 @@ async fn http_store_export_run(
     Json(request): Json<StoreExportRunRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
     authorize(&daemon, &headers)?;
-    store_json(daemon.store.export_run(
-        &RunId(request.run_id),
-        request.target,
-        request.include_raw_model,
-    ))
+    let store = daemon.store.clone();
+    store_json(
+        run_store_maintenance("store.export_run", move || {
+            store.export_run(
+                &RunId(request.run_id),
+                request.target,
+                request.include_raw_model,
+            )
+        })
+        .await?,
+    )
 }
 
 async fn http_store_lessons(
@@ -872,6 +886,25 @@ fn store_json<T: Serialize>(
                 .map(Json)
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
         })
+}
+
+pub(super) async fn run_store_maintenance<T>(
+    operation: &'static str,
+    work: impl FnOnce() -> std::result::Result<T, StoreError> + Send + 'static,
+) -> std::result::Result<std::result::Result<T, StoreError>, StatusCode>
+where
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(work).await.map_err(|error| {
+        tracing::error!(
+            operation,
+            error = %error,
+            cancelled = error.is_cancelled(),
+            panic = error.is_panic(),
+            "Store maintenance task failed"
+        );
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 fn authorize(daemon: &Daemon, headers: &HeaderMap) -> std::result::Result<(), StatusCode> {

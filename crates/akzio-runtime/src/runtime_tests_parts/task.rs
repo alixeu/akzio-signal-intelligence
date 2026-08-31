@@ -151,7 +151,7 @@ async fn task_runtime_replays_exhausted_retry_as_terminal_failure() {
 }
 
 #[tokio::test]
-async fn task_runtime_recovers_expired_attempt_and_honors_cancel_requests() {
+async fn task_runtime_recovery_is_explicit_and_honors_cancel_requests() {
     let root = tempdir().unwrap();
     let store = V2Store::open(root.path()).unwrap();
     let workflow = WorkflowRuntime::new(store.clone(), catalogue());
@@ -184,6 +184,16 @@ async fn task_runtime_recovers_expired_attempt_and_honors_cancel_requests() {
     let old_permit = abandoned.permit.clone();
     let old_attempt_id = old_permit.attempt_id.clone();
     let old_epoch = old_permit.epoch;
+    assert!(!tasks
+        .run_one("pre-recovery-worker", |_| async {
+            panic!("run_one must not recover expired tasks")
+        })
+        .await
+        .unwrap());
+    assert_eq!(
+        tasks.recover_expired_tasks(Utc::now()).await.unwrap(),
+        1
+    );
     assert!(tasks
         .run_one("recovery-worker", move |task| {
             assert_ne!(task.permit.attempt_id, old_attempt_id);

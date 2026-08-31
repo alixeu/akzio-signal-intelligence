@@ -25,7 +25,7 @@ use akzio_model::{
     ModelCallTrace, ModelCapabilitySnapshot, ModelClient, ModelContinuation, ModelError,
     ModelInput, ModelRequest, ModelToolChoice, ModelToolDefinition, ModelToolOutput,
 };
-use akzio_runtime::v2::{RecipeCatalogue, RetryCause, RuntimeError};
+use akzio_runtime::v2::{RecipeCatalogue, RetryCause, RuntimeError, StoreExecutor};
 use akzio_store::v2::{StoreError, StoredContract, V2Store};
 use chrono::{DateTime, Duration, Utc};
 use futures::future::BoxFuture;
@@ -59,6 +59,7 @@ use validation::*;
 include!("agent_v2_parts/errors_catalogue.rs");
 include!("agent_v2_parts/model_types.rs");
 include!("agent_v2_parts/runtime_type.rs");
+include!("agent_v2_parts/recovery.rs");
 include!("agent_v2_parts/runtime_core.rs");
 include!("agent_v2_parts/runtime_run.rs");
 include!("agent_v2_parts/runtime_helpers.rs");

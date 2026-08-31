@@ -1,107 +1,70 @@
-@/Users/alixeu/.codex/RTK.md
+# Akzio v2 项目规则
 
-# Akzio v2 agent instructions
+## 项目定位
 
-This repository is a Rust 2021 workspace for a local, Paper-only Multi-Agent Research System. It is v2-only: do not recreate compatibility code for old `orchestrator-*` crates, Phase 0–8, FileStore layouts, prompts or `outputs/store`.
+- 本仓库是 Rust 2021 workspace，构建本地、仅支持 Alpaca Paper 的多智能体研究系统。
+- 项目只维护 v2；不要恢复旧 `orchestrator-*` crates、Phase 0–8、FileStore、旧 prompts 或 `outputs/store` 兼容路径。
+- Live Trading 不受支持；`AlpacaPaper::new` 必须在任何 HTTP I/O 前拒绝非 Paper endpoint。
 
-## Source of truth
+## 权威与数据边界
 
-- Rust owns state, authorization, contracts, task budgets, workflow gates, persistence, learning transitions and execution policy.
-- `V2Store` is the only persistence authority. Do not add parallel JSON state, caches that change semantics, or direct SQLite writes outside `akzio-store`.
-- Evidence, claims, decisions, execution and memory must retain provenance and valid `source_refs`.
-- `akzio-context` is the only route by which agent tasks obtain documents. Do not give model code arbitrary filesystem or raw-evidence access.
-- Live Trading is unsupported. `AlpacaPaper::new` must reject non-Paper endpoints.
-- Debug and Paper Dry Run are noncanonical: they must not promote memory or topology.
+- Rust 是状态、授权、contracts、任务预算、workflow gates、持久化、学习迁移和执行策略的唯一权威。
+- `V2Store` 是唯一持久化权威。不要增加改变语义的并行 JSON 状态、缓存，或在 `akzio-store` 之外直接写 SQLite。
+- Evidence、Claim、Decision、Execution 和 Memory 必须保留 provenance 与有效 `source_refs`。
+- `akzio-context` 是 agent task 获取文档的唯一通道；模型代码不得获得任意文件系统、raw evidence、SQLite 或交易凭据访问权。
+- 生成的 Store Root、BLOB、socket、报告、凭据和本地配置覆盖不得进入 Git。
 
-## Architecture boundaries
+## 模块边界
 
-| Area | Owns |
+| Crate | 职责 |
 | --- | --- |
-| `akzio-domain` | Stable schemas and validation, no I/O |
-| `akzio-store` | SQLite-embedded CAS BLOBs, event log, task/daemon leases, Doctor |
-| `akzio-runtime` | Workflow compilation, planner patches, task lifecycle/recovery |
-| `akzio-research` | Agent contracts and model-mediated research only |
-| `akzio-execution` | Rust decision/execution gates and Paper broker protocol |
-| `akzio-learning` | Outcome evaluation and bounded policy state transitions |
-| `akzio-daemon` | Process leadership, scheduling, transport and task dispatch |
+| `akzio-domain` | 稳定 schema 与验证；无 I/O |
+| `akzio-store` | SQLite-embedded CAS BLOB、事件日志、task/daemon lease、Doctor |
+| `akzio-context` | 文档、manifest 与受控上下文访问 |
+| `akzio-runtime` | workflow 编译、planner patch、task 生命周期与恢复 |
+| `akzio-research` | agent contracts 与 model-mediated research |
+| `akzio-execution` | Rust 决策/执行 gates 与 Paper broker protocol |
+| `akzio-learning` | outcome evaluation 与有界 policy state transition |
+| `akzio-daemon` | 进程领导权、调度、transport 与 task dispatch |
 
-Do not combine these concerns in `akzio-daemon` dispatch code. If a change is a policy, put it in its owning domain/runtime crate; if it is a durable invariant, enforce it in `akzio-store` too.
+不要把 policy 或 durable invariant 堆进 `akzio-daemon` dispatch：policy 放在所属 domain/runtime crate，持久化不变量同时由 `akzio-store` 强制执行。
 
-## Paper scheduling and safety
+## Paper 调度与执行边界
 
-- Paper runs are scheduler-owned. Never restore a direct CLI/API `Paper` submit or retry path.
-- The scheduler uses Alpaca Paper's market clock; it must create no more than one durable session slot per broker session date.
-- A session slot stores the exact workflow plan before run creation. Recovery must reuse that plan and its task IDs.
-- Every scheduler write must validate the active daemon lease owner and epoch. Stale leaders may not submit, mark or overwrite a slot.
-- Execution remains Rust-gated: validate account, quotes, allocation, turnover, blockers, plan hash and idempotency before broker submission.
+- Paper run 由 scheduler 独占管理；不得恢复直接 CLI/API Paper submit 或 retry 路径。
+- scheduler 使用 Alpaca Paper market clock；每个 broker session date 最多创建一个 durable session slot。
+- session slot 必须在创建 run 前保存完整 workflow plan；恢复时复用该 plan 及其 task IDs。
+- 所有 scheduler 写入必须校验当前 daemon lease owner 与 epoch；stale leader 不得提交、标记或覆盖 slot。
+- broker submission 前必须由 Rust 校验 account、quotes、allocation、turnover、blockers、plan hash 与 idempotency。
 
-## Learning and topology
+## 学习与拓扑边界
 
-- Canonical learning is Paper-only and outcome-backed. Never learn from Debug, Dry Run, current predictions or unsealed market data.
-- Memory and topology state are immutable-document histories; do not mutate a prior record in place.
-- Shadow pairs must reference parent Decision, ExecutionContext and candidate Decision. Pair completion must remain idempotent even when timestamps collide.
-- Promotion requires fresh paired outcomes at each canary level. Lower risk recall or evidence completeness rolls a candidate back.
+- canonical learning 只能来自 sealed Paper outcomes。Debug、Replay、Paper Dry Run、当前预测和未封存市场数据均不得提升 Memory 或 Topology。
+- Memory 与 Topology 是不可变文档历史，不得原地修改旧记录。
+- shadow pair 必须引用 parent Decision、ExecutionContext 与 candidate Decision；即使 timestamp 冲突，完成操作也必须保持幂等。
+- promotion 在每个 canary level 都需要 fresh paired outcomes；risk recall 或 evidence completeness 下降时回滚 candidate。
+- 真实 Paper、T+1/T+3/T+5 outcome、learning transition 与最终人工批准是不同证据层级，不得相互替代。
 
-## Execution waves and code-generation discipline
+## 验证与完成标准
 
-Follow the plan in order. Do not reopen a completed wave unless current evidence shows a regression.
-
-- **R0–R10 implementation wave:** domain, Store, Context/Evidence, contracts, workflow/replay, learning, execution, daemon/HTTP, CLI and final offline cleanup. Treat these as complete only when the current tree passes their exit evidence; historical prose is not proof.
-- **Paper canary wave:** a real Alpaca Paper run may validate broker/session/receipt/reconciliation behavior, but only that run and its durable evidence are canonical proof. Fixture, Debug, Dry Run and Replay are never real-Paper proof.
-- **Outcome wave:** after a real Paper run, the scheduler must wait for real T+1, T+3 and T+5 sessions. Only sealed Paper outcomes may create Retrospective, Experience, Evaluation or Policy Transition. Never fabricate, backfill or mock these artifacts.
-- **Approval wave:** final human launch approval remains separate from code, offline tests and a Paper canary.
-
-Current checkpoint (2026-08-18; refresh from Store before relying on it):
-
-- Run `77395cfd-8d03-405d-9b47-ca99b19525f1` completed a real Paper canary on 2026-08-17; four orders filled and reconciliation completed.
-- Its `learning.outcome_worker` is still queued for `2026-08-18T22:00:00Z`; only `OutcomeSchedule` exists so far.
-- T+1/T+3/T+5 sealing, Retrospective, Experience, Policy Evaluation/Transition and final human approval are not complete.
-
-For every code-generation task:
-
-1. Start with a narrow inventory and identify the current wave and owner crate.
-2. Reuse existing types/helpers; make the smallest change that satisfies the wave exit gate.
-3. Keep policy in its owner crate and durable invariants in `akzio-store`; do not introduce speculative abstractions, parallel state, or compatibility layers.
-4. Preserve serialization, hashes, provenance, source closure, lifecycle, transaction boundaries, leases, gates and replay semantics unless the plan explicitly changes them.
-5. Run the narrowest relevant test immediately, then the required workspace checks before declaring the wave complete.
-6. Report four separate states: implemented, offline-verified, real-Paper-verified and outcome/learning-verified. Never collapse them into one “done”.
-
-When a task is only a refactor or storage change, prove behavioral equivalence first; do not mix it with schema-version, `ExecutionPlan` serde/hash, Paper gate, transaction-boundary or learning-policy changes.
-
-## Code navigation
-
-Use CodeGraph for structural questions only when its index reflects the v2 tree. If it only contains deleted v1 files, use current filesystem/Cargo/tests as truth and rebuild the index before relying on it.
-
-Use `rg` for literal text and `rg --files` for discovery. Start nontrivial work with:
+- 代码修改先运行最窄的相关测试；宣称 workspace 级完成前运行：
 
 ```bash
-rtk git status --short --untracked-files=all
+cargo fmt --all
+cargo check --workspace
+cargo clippy --workspace --all-targets
+cargo test --workspace
+cargo run -p akzio-cli -- run fixture-debug
+cargo run -p akzio-cli -- store doctor
 ```
 
-## Verification
+- refactor 或 storage change 必须先证明行为等价；不要顺带改变 schema version、`ExecutionPlan` serde/hash、Paper gate、transaction boundary 或 learning policy。
+- 交付时分别报告：implemented、offline-verified、real-Paper-verified、outcome/learning-verified。
 
-For code changes, run the narrow crate tests while iterating, then:
+## Observatory App
 
-```bash
-rtk cargo fmt --all
-rtk cargo check --workspace
-rtk cargo clippy --workspace --all-targets
-rtk cargo test --workspace
-rtk cargo run -p akzio-cli -- run fixture-debug
-rtk cargo run -p akzio-cli -- store doctor
-```
-
-Keep generated Store Roots, blobs, sockets, reports, credentials and local config overrides out of Git. Preserve unrelated dirty work; do not reset, clean or checkout the workspace.
-
-## Observatory App build and package
-
-Use `scripts/update_app_and_submit_debug.sh` when the distributable macOS App must be rebuilt and packaged. The script:
-
-1. runs `apps/AkzioMac/Scripts/build_app.sh`, so the App bundle receives a freshly built SwiftUI executable and bundled `akzio-core`;
-2. applies the existing ad-hoc self-use signature;
-3. removes repository build intermediates from `target/`, `apps/AkzioMac/.build/` and `apps/AkzioMac/dist/dmg-stage/`, while retaining `apps/AkzioMac/dist/Akzio Observatory.app`;
-4. prints the final packaged App path.
-
-This script is packaging-only: it does not launch or restart the App, start a daemon, submit a run, or perform runtime verification. Quit and reopen the App after rebuilding if it was already open. Debug remains noncanonical and must not be treated as Paper or learning verification.
-
-The packaged App itself must contain `Contents/MacOS/akzio-core`. On App startup, `RustCoreSupervisor` launches that bundled core with `daemon serve`; the core owns the Paper scheduler/cron loop. The App must resolve its persistent configuration from `~/.akzio/config.toml` and force the core Store root to `~/.akzio/store` through `AKZIO_STORE_ROOT`. A scheduler message such as `Paper scheduler waiting: broker market is closed` means the scheduler is running and waiting for the next eligible Paper session; it is distinct from `Rust core unavailable`.
+- 需要生成可分发 macOS App 时使用 `scripts/update_app_and_submit_debug.sh`。
+- 该脚本只负责构建、签名、清理构建中间物并保留 `apps/AkzioMac/dist/Akzio Observatory.app`；它不会启动 App、daemon 或 run，也不构成运行时、Paper 或 learning 验证。
+- App bundle 必须包含 `Contents/MacOS/akzio-core`。启动时 `RustCoreSupervisor` 以 `daemon serve` 运行该 core。
+- 持久配置来自 `~/.akzio/config.toml`，core Store root 通过 `AKZIO_STORE_ROOT` 固定为 `~/.akzio/store`。
+- `Paper scheduler waiting: broker market is closed` 表示 scheduler 正在等待可用 Paper session，不等同于 `Rust core unavailable`。

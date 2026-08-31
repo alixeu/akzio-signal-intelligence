@@ -27,6 +27,54 @@ async fn planner_task_runs_agent_runtime_and_commits_graph_patch() {
 }
 
 #[tokio::test]
+async fn position_plan_completes_with_target_and_without_execution_artifacts() {
+    let directory = tempdir().unwrap();
+    let daemon = Daemon::with_model(
+        config(directory.path().to_path_buf()),
+        fixture_model_client(),
+    )
+    .unwrap();
+    let run_id = daemon.submit_default(RunPurpose::PositionPlan).unwrap();
+
+    for _ in 0..32 {
+        if !daemon.run_one("position-plan-fixture").await.unwrap() {
+            break;
+        }
+    }
+
+    let snapshot = daemon.store().workflow_snapshot(&run_id).unwrap();
+    assert_eq!(snapshot.status, WorkflowStatus::Completed);
+    let artifacts = daemon
+        .store()
+        .events_after(&run_id, 0, 512)
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| event.artifact_id)
+        .filter_map(|artifact_id| daemon.store().artifact(&artifact_id).ok())
+        .collect::<Vec<_>>();
+    let context = artifacts
+        .iter()
+        .find(|artifact| artifact.kind == ArtifactKind::DecisionContext)
+        .expect("position plan must persist DecisionContext");
+    let context: DecisionContext =
+        serde_json::from_slice(&daemon.store().read_blob(&context.blob).unwrap()).unwrap();
+    context.validate().unwrap();
+
+    for forbidden in [
+        ArtifactKind::ExecutionPlan,
+        ArtifactKind::ExecutionContext,
+        ArtifactKind::ExecutionVerdict,
+        ArtifactKind::ExecutionCommitment,
+        ArtifactKind::OrderReceipt,
+        ArtifactKind::Reconciliation,
+        ArtifactKind::OutcomeSchedule,
+    ] {
+        assert!(artifacts.iter().all(|artifact| artifact.kind != forbidden));
+    }
+    daemon.store().verify_integrity().unwrap();
+}
+
+#[tokio::test]
 async fn planner_accepts_a_real_debug_shape_with_one_analyst_task() {
     let directory = tempdir().unwrap();
     let planner = serde_json::json!({

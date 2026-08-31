@@ -5,6 +5,8 @@
 //! not perform I/O or decide whether a candidate is good; those decisions are
 //! owned by `akzio-learning`.
 
+use std::collections::BTreeSet;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -159,7 +161,7 @@ impl CanarySessionReservation {
             &self.topology_shadow_run_id,
             &self.bundle_shadow_run_id,
         ];
-        if run_ids.windows(2).any(|pair| pair[0] == pair[1]) {
+        if run_ids.iter().copied().collect::<BTreeSet<_>>().len() != run_ids.len() {
             return Err(DomainError::EmptyField {
                 field: "canary_campaign.session.run_ids",
             });
@@ -202,6 +204,16 @@ mod tests {
             bundle_shadow_run_id: RunId::new(),
             scheduler_epoch: 1,
             reserved_at: chrono::Utc::now(),
+        };
+        assert!(reservation.validate().is_err());
+
+        let duplicate = RunId::new();
+        let reservation = CanarySessionReservation {
+            parent_run_id: duplicate.clone(),
+            contract_shadow_run_id: RunId::new(),
+            topology_shadow_run_id: duplicate,
+            bundle_shadow_run_id: RunId::new(),
+            ..reservation
         };
         assert!(reservation.validate().is_err());
         let _ = CanaryVerdict::Defer;

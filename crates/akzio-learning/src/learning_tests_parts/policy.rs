@@ -115,8 +115,10 @@ fn topology_forward_promotion_is_disabled_and_degradation_rolls_back() {
     assert_eq!(
         next_state_with_fresh_pairs(
             PolicyState::Topology(CandidatePolicyState::Canary50),
+            None,
             true,
-            [1, 1, 1],
+            [0, 0, 0],
+            2,
         ),
         PolicyState::Topology(CandidatePolicyState::Candidate)
     );

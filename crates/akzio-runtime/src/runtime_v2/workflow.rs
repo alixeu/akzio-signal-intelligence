@@ -26,6 +26,9 @@ impl WorkflowRuntime {
             RunPurpose::Debug => {
                 "Run a bounded real-LLM debug workflow against production governed evidence."
             }
+            RunPurpose::PositionPlan => {
+                "Produce a bounded real-LLM target position plan against production governed evidence, then stop before execution."
+            }
             RunPurpose::PaperDryRun => {
                 "Run a bounded real-LLM debug workflow against governed TQQQ fixture evidence."
             }

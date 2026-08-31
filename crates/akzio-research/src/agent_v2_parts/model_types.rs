@@ -123,10 +123,10 @@ struct ToolResult {
     artifact: Artifact,
 }
 
-struct TurnRecord<'a> {
-    permit: &'a TaskWritePermit,
-    contract: &'a AgentContract,
-    manifest: &'a ContextManifest,
+struct TurnRecord {
+    permit: TaskWritePermit,
+    contract: AgentContract,
+    manifest: ContextManifest,
     turn: u16,
     attempt: u8,
     now: DateTime<Utc>,

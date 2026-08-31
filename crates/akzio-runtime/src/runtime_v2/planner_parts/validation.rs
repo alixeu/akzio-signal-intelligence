@@ -146,9 +146,6 @@ impl WorkflowRuntime {
         }
 
         let decision = required_terminal(&terminals, &self.catalogue.terminals.decision_gate)?;
-        let execution = required_terminal(&terminals, &self.catalogue.terminals.execution_gate)?;
-        let reconcile = required_terminal(&terminals, &self.catalogue.terminals.reconcile)?;
-        let evaluate = required_terminal(&terminals, &self.catalogue.terminals.evaluate)?;
         let paper = terminals
             .get(&self.catalogue.terminals.paper_commit)
             .copied();
@@ -198,6 +195,21 @@ impl WorkflowRuntime {
                 self.catalogue.terminals.decision_gate.clone(),
             ));
         }
+        if purpose == RunPurpose::PositionPlan {
+            for recipe_id in [
+                &self.catalogue.terminals.execution_gate,
+                &self.catalogue.terminals.reconcile,
+                &self.catalogue.terminals.evaluate,
+            ] {
+                if terminals.contains_key(recipe_id) {
+                    return Err(RuntimeError::UnexpectedTerminalGate(recipe_id.clone()));
+                }
+            }
+            return Ok(());
+        }
+        let execution = required_terminal(&terminals, &self.catalogue.terminals.execution_gate)?;
+        let reconcile = required_terminal(&terminals, &self.catalogue.terminals.reconcile)?;
+        let evaluate = required_terminal(&terminals, &self.catalogue.terminals.evaluate)?;
         if execution.dependencies != vec![decision.task_id.clone()] {
             return Err(RuntimeError::InvalidTerminalDependencies(
                 self.catalogue.terminals.execution_gate.clone(),

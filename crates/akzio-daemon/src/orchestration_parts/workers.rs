@@ -141,7 +141,7 @@ impl Daemon {
     /// surface rejects Paper before any workflow or broker side effect.
     pub fn submit_default(&self, purpose: RunPurpose) -> Result<RunId> {
         match purpose {
-            RunPurpose::Debug | RunPurpose::PaperDryRun => {}
+            RunPurpose::Debug | RunPurpose::PositionPlan | RunPurpose::PaperDryRun => {}
             RunPurpose::Paper => {
                 return Err(DaemonError::InvalidInput(
                     "Paper runs are scheduler-owned and unavailable until the fenced scheduler is wired"

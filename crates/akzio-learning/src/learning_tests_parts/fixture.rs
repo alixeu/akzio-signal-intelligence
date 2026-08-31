@@ -1,5 +1,9 @@
 impl RuntimeFixture {
     fn new() -> Self {
+        Self::with_policy(EvaluationPolicy::default())
+    }
+
+    fn with_policy(policy: EvaluationPolicy) -> Self {
         let root = tempdir().unwrap();
         let store = V2Store::open(root.path()).unwrap();
         let now = fixture_time();
@@ -244,7 +248,7 @@ impl RuntimeFixture {
             .zip(candidate_outcomes.iter())
             .map(|(decision, outcome)| (artifact_reference(decision), artifact_reference(outcome)))
             .collect();
-        let runtime = EvaluationRuntime::new(store.clone(), EvaluationPolicy::default()).unwrap();
+        let runtime = EvaluationRuntime::new(store.clone(), policy).unwrap();
         let active_topology = ArtifactRef {
             artifact_id: paper_run.graph_artifact_id.clone(),
             kind: ArtifactKind::WorkflowGraph,
@@ -288,8 +292,18 @@ impl RuntimeFixture {
         batch: usize,
         subject: &PolicySubject,
     ) {
+        self.record_pair_horizons_for(permit, batch, subject, OutcomeHorizon::ALL);
+    }
+
+    fn record_pair_horizons_for(
+        &self,
+        permit: &TaskWritePermit,
+        batch: usize,
+        subject: &PolicySubject,
+        horizons: impl IntoIterator<Item = OutcomeHorizon>,
+    ) {
         let (candidate_decision, candidate_outcome) = &self.candidates[batch];
-        for horizon in OutcomeHorizon::ALL {
+        for horizon in horizons {
             self.runtime
                 .record_shadow_pair(
                     permit,
@@ -328,6 +342,50 @@ impl RuntimeFixture {
         candidate_policy: Option<CandidatePolicyInput>,
         materialization: OutcomeMaterializationInput,
     ) -> EvaluationResult {
+        self.runtime
+            .evaluate(self.evaluation_input(
+                permit,
+                hypothesis_id,
+                subject,
+                candidate_policy,
+                materialization,
+            ))
+            .unwrap()
+    }
+
+    fn evaluate_at_state_for(
+        &self,
+        permit: TaskWritePermit,
+        hypothesis_id: &str,
+        subject: PolicySubject,
+        candidate_policy: Option<CandidatePolicyInput>,
+        materialization: OutcomeMaterializationInput,
+        target_state: PolicyState,
+    ) -> EvaluationResult {
+        self.runtime
+            .evaluate_with_lease_at_state(
+                None,
+                self.evaluation_input(
+                    permit,
+                    hypothesis_id,
+                    subject,
+                    candidate_policy,
+                    materialization,
+                ),
+                None,
+                target_state,
+            )
+            .unwrap()
+    }
+
+    fn evaluation_input(
+        &self,
+        permit: TaskWritePermit,
+        hypothesis_id: &str,
+        subject: PolicySubject,
+        candidate_policy: Option<CandidatePolicyInput>,
+        materialization: OutcomeMaterializationInput,
+    ) -> EvaluationInput {
         let contract_hash = match &subject {
             PolicySubject::Contract(hash) => hash.clone(),
             _ => ContentHash::of_bytes(b"active-contract"),
@@ -336,18 +394,16 @@ impl RuntimeFixture {
             PolicySubject::Topology(topology_id) => topology_id.clone(),
             _ => TopologyId("active-topology".to_owned()),
         };
-        self.runtime
-            .evaluate(EvaluationInput {
-                permit,
-                subject,
-                hypothesis_id: hypothesis_id.to_owned(),
-                materialization,
-                contract_hash,
-                topology_id,
-                candidate_policy,
-                token_cost: Some(10),
-                latency_millis: Some(20),
-            })
-            .unwrap()
+        EvaluationInput {
+            permit,
+            subject,
+            hypothesis_id: hypothesis_id.to_owned(),
+            materialization,
+            contract_hash,
+            topology_id,
+            candidate_policy,
+            token_cost: Some(10),
+            latency_millis: Some(20),
+        }
     }
 }

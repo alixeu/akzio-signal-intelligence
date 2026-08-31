@@ -165,7 +165,10 @@ public final class RustCoreSupervisor {
         state = .stopped
     }
 
-    public func submitDebugRun() async throws -> String {
+    public func submitRun(purpose: RunPurpose) async throws -> String {
+        guard RunPurpose.userLaunchModes.contains(purpose) else {
+            throw CoreLaunchError.runRejected
+        }
         guard state == .ready,
               let connection,
               let controlToken
@@ -174,7 +177,7 @@ public final class RustCoreSupervisor {
         request.httpMethod = "POST"
         request.setValue(controlToken, forHTTPHeaderField: "x-akzio-token")
         request.setValue("application/json", forHTTPHeaderField: "content-type")
-        request.httpBody = Data(#"{"purpose":"debug"}"#.utf8)
+        request.httpBody = try JSONEncoder().encode(RunSubmissionRequest(purpose: purpose))
         request.timeoutInterval = 5
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let response = response as? HTTPURLResponse,
@@ -315,7 +318,7 @@ enum CoreLaunchError: LocalizedError {
         case .exitedBeforeReady: "Rust core exited before becoming ready"
         case .readyTimeout: "Rust core did not become ready within 15 seconds"
         case .notReady: "Rust core is not ready"
-        case .runRejected: "Rust core rejected the Debug run"
+        case .runRejected: "Rust core rejected the run"
         }
     }
 }
@@ -326,4 +329,8 @@ private struct RunSubmission: Decodable {
     enum CodingKeys: String, CodingKey {
         case runID = "run_id"
     }
+}
+
+private struct RunSubmissionRequest: Encodable {
+    let purpose: RunPurpose
 }

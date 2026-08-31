@@ -165,6 +165,20 @@ impl WorkflowRuntime {
             &self.catalogue.terminals.decision_gate,
             decision_dependencies,
         )?;
+        if purpose == RunPurpose::PositionPlan {
+            nodes.push(evidence);
+            nodes.push(decision);
+            if nodes.len() > self.catalogue.max_nodes {
+                return Err(RuntimeError::WorkflowNodeLimit);
+            }
+            let graph = WorkflowGraph {
+                schema_version: V2_DOMAIN_SCHEMA_VERSION,
+                topology_id,
+                nodes,
+            };
+            graph.validate()?;
+            return Ok(graph);
+        }
         let execution = self.gate_node(
             &self.catalogue.terminals.execution_gate,
             vec![decision.task_id.clone()],

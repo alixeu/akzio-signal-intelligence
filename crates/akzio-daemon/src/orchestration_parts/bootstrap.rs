@@ -52,7 +52,7 @@ impl Daemon {
         }
         production_evidence.insert(
             EvidenceSource::NewsWeb,
-            model_native_web_evidence_transport(model.clone(), EvidenceSource::NewsWeb),
+            model_native_web_evidence_transport(model.clone(), EvidenceSource::NewsWeb)?,
         );
         let outcome_worker_enabled =
             auto_paper && production_evidence.contains_key(&EvidenceSource::Alpaca);
@@ -106,8 +106,10 @@ impl Daemon {
         };
         let workflow =
             WorkflowRuntime::new(store.clone(), active.recipes).with_fixture_mode(fixture_mode);
+        let store_executor = StoreExecutor::new(store.clone());
         let (reasoning_events, _) = broadcast::channel(1_024);
         let agents = AgentRuntime::new(store.clone(), agent_catalogue, Duration::minutes(5))
+            .with_store_executor(store_executor.clone())
             .with_reasoning_events(reasoning_events.clone());
         let decision_runtime = V2DecisionRuntime::new(store.clone(), Default::default())?;
         let execution_runtime =
@@ -121,7 +123,7 @@ impl Daemon {
         .with_runtime_identity_hash(config.runtime_identity_hash.clone());
 
         Ok(Self {
-            task_runtime: TaskRuntime::new(store.clone()),
+            task_runtime: TaskRuntime::new(store.clone()).with_store_executor(store_executor),
             workflow,
             agents,
             model: ModelClientAdapter::with_debug(model, model_debug),

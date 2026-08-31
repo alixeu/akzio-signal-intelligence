@@ -7,6 +7,7 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use reqwest::{Client, StatusCode};
@@ -36,6 +37,8 @@ pub enum ModelError {
     EmptyReasoningEffort,
     #[error("model response transport failed: {0}")]
     Transport(#[from] reqwest::Error),
+    #[error("model response stream was idle for {idle_timeout:?}")]
+    StreamIdleTimeout { idle_timeout: Duration },
     #[error("model returned HTTP {status}: {body}")]
     Http { status: StatusCode, body: String },
     #[error("model response stream is invalid: {0}")]

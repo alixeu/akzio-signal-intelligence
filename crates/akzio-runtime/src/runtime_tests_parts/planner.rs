@@ -20,6 +20,29 @@ fn planner_graph_gets_non_bypassable_terminal_gates() {
 }
 
 #[test]
+fn position_plan_graph_stops_after_decision_gate() {
+    let root = tempdir().unwrap();
+    let runtime = WorkflowRuntime::new(V2Store::open(root.path()).unwrap(), catalogue());
+    let graph = runtime
+        .bootstrap(RunPurpose::PositionPlan, "active")
+        .unwrap();
+    let recipes = graph
+        .nodes
+        .iter()
+        .map(|node| node.recipe_id.as_str())
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(graph.nodes.len(), 3);
+    assert!(recipes.contains("research.planner"));
+    assert!(recipes.contains("gate.evidence"));
+    assert!(recipes.contains("gate.decision"));
+    for forbidden in ["gate.execution", "gate.paper", "gate.reconcile", "gate.evaluate"] {
+        assert!(!recipes.contains(forbidden));
+    }
+    graph.validate().unwrap();
+}
+
+#[test]
 fn structured_critique_requires_material_uncertainty_or_opposed_stances() {
     let clean = claim(ClaimStance::Neutral, 499_999, 500_001, false);
     assert!(!should_run_structured_critique(&[clean]));

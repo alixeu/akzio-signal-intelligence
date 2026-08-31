@@ -4,7 +4,7 @@ import SwiftUI
 //
 // One observable source of truth for the shell: which scenario is loaded, which
 // route is visible, which selections each page holds, and the resolved motion /
-// render policies. Rust stays authoritative; the only App-triggered run is Debug.
+// render policies. Rust stays authoritative over every App-triggered run purpose.
 @MainActor
 @Observable
 public final class ObservatoryStore {
@@ -18,8 +18,9 @@ public final class ObservatoryStore {
     public let coreSupervisor = RustCoreSupervisor.shared
     public var coreConfigurationDraft = CoreCredentialStore.savedDraft()
     public private(set) var coreCredentialStatus = CoreCredentialStore.status()
-    public private(set) var debugRunInFlight = false
-    public private(set) var debugRunMessage = ""
+    public private(set) var selectedRunPurpose: RunPurpose = .debug
+    public private(set) var runInFlight = false
+    public private(set) var runMessage = ""
     private var liveProjection: LiveProjection?
     private var livePayload: ObserverSnapshotPayload?
     private var observerTask: Task<Void, Never>?
@@ -263,29 +264,36 @@ public final class ObservatoryStore {
         }
     }
 
-    public func runDebug() async {
-        guard !debugRunInFlight else { return }
+    public func selectRunPurpose(_ purpose: RunPurpose) {
+        guard RunPurpose.userLaunchModes.contains(purpose), !runInFlight else { return }
+        selectedRunPurpose = purpose
+        runMessage = ""
+    }
+
+    public func runSelectedPurpose() async {
+        guard !runInFlight else { return }
         guard isLive else {
-            debugRunMessage = "Run is unavailable in Mock mode"
+            runMessage = "Run is unavailable in Mock mode"
             return
         }
-        debugRunInFlight = true
-        debugRunMessage = "Starting Rust Core…"
-        defer { debugRunInFlight = false }
+        let purpose = selectedRunPurpose
+        runInFlight = true
+        runMessage = "Starting Rust Core…"
+        defer { runInFlight = false }
         if coreSupervisor.state != .ready {
             guard let connection = await coreSupervisor.start() else {
-                debugRunMessage = coreSupervisor.state.detail ?? coreSupervisor.state.label
+                runMessage = coreSupervisor.state.detail ?? coreSupervisor.state.label
                 if coreSupervisor.state == .needsConfiguration { openSettings(.core) }
                 return
             }
             connect(connection)
         }
         do {
-            _ = try await coreSupervisor.submitDebugRun()
-            debugRunMessage = "Run submitted"
+            _ = try await coreSupervisor.submitRun(purpose: purpose)
+            runMessage = "Run submitted"
             navigate(to: .workflow)
         } catch {
-            debugRunMessage = error.localizedDescription
+            runMessage = error.localizedDescription
         }
     }
 

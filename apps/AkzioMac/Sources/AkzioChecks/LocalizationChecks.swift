@@ -14,6 +14,19 @@ func runLocalizationChecks() {
             "Chinese real-model run action"
         )
         Check.equal(
+            L10n.text("Position plan only", language: .simplifiedChinese),
+            "仅仓位计划",
+            "Chinese position-plan mode"
+        )
+        Check.equal(
+            L10n.text(
+                "Generate target positions and stop before execution.",
+                language: .simplifiedChinese
+            ),
+            "生成目标仓位并在执行前停止。",
+            "Chinese position-plan safety description"
+        )
+        Check.equal(
             L10n.text("Application & Core", language: .simplifiedChinese),
             "应用与核心",
             "Chinese settings shell"

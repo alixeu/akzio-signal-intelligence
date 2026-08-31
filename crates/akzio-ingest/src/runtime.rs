@@ -372,7 +372,7 @@ pub struct EvidenceProvenance {
 impl EvidenceProvenance {
     fn validate(
         &self,
-        raw_len: usize,
+        raw: &[u8],
         source_uri: &str,
         observed_at: DateTime<Utc>,
     ) -> Result<(), EvidenceRuntimeError> {
@@ -395,7 +395,8 @@ impl EvidenceProvenance {
         }
         for citation in &self.citations {
             if citation.start_byte >= citation.end_byte
-                || citation.end_byte > raw_len
+                || raw.get(citation.start_byte..citation.end_byte)
+                    != Some(citation.quote.as_bytes())
                 || citation.quote.trim().is_empty()
             {
                 return Err(EvidenceRuntimeError::InvalidCitation);
@@ -471,10 +472,21 @@ pub use adapters::{
 pub fn model_native_web_evidence_transport(
     client: ModelClient,
     source: EvidenceSource,
-) -> std::sync::Arc<dyn AsyncEvidenceAdapter> {
-    std::sync::Arc::new(adapters::ModelNativeWebEvidenceTransport::for_source(
-        client, source,
+) -> EvidenceRuntimeResult<std::sync::Arc<dyn AsyncEvidenceAdapter>> {
+    Ok(std::sync::Arc::new(
+        adapters::ModelNativeWebEvidenceTransport::for_source(client, source)?,
     ))
+}
+
+#[cfg(test)]
+fn model_native_web_evidence_transport_with_fetcher(
+    client: ModelClient,
+    source: EvidenceSource,
+    fetcher: std::sync::Arc<dyn adapters::SourceDocumentFetcher>,
+) -> std::sync::Arc<dyn AsyncEvidenceAdapter> {
+    std::sync::Arc::new(
+        adapters::ModelNativeWebEvidenceTransport::for_source_with_fetcher(client, source, fetcher),
+    )
 }
 #[derive(Debug, Error)]
 pub enum EvidenceRuntimeError {

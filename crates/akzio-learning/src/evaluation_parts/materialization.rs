@@ -225,9 +225,13 @@ impl EvaluationRuntime {
             })
             .transpose()?;
         let candidate_policy_ref = candidate_policy_artifact.as_ref().map(reference);
-        let next = target_state.unwrap_or_else(|| {
-            next_state_with_fresh_pairs(current, degraded, fresh_pairs_by_horizon)
-        });
+        let next = next_state_with_fresh_pairs(
+            current,
+            target_state,
+            degraded,
+            fresh_pairs_by_horizon,
+            self.policy.minimum_fresh_pairs_per_horizon,
+        );
         if !input.subject.accepts_state(next) {
             return Err(EvaluationError::SubjectStateMismatch);
         }

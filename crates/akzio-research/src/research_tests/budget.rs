@@ -3,7 +3,7 @@ async fn agent_runtime_records_complete_tool_trace_and_contract_validated_claim(
     let root = tempdir().unwrap();
     let store = V2Store::open(root.path()).unwrap();
     let mut contract = contract(&store);
-    contract.budget.max_output_tokens = 512;
+    contract.budget.max_output_tokens = 1_024;
     contract.contract_hash = contract.expected_hash().unwrap();
     let catalogue = ContractCatalogue::install(&store, [contract.clone()], Utc::now()).unwrap();
     let node = WorkflowNode {

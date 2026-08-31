@@ -17,4 +17,5 @@ include!("store_tests/events.rs");
 include!("store_tests/store_ops.rs");
 include!("store_tests/agent_turns.rs");
 include!("store_tests/recovery.rs");
+include!("store_tests/attempt_queries.rs");
 include!("store_tests/lifecycle.rs");

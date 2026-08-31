@@ -1,5 +1,5 @@
-#[test]
-fn cancellation_and_freeze_are_durable_store_owned_transitions() {
+#[tokio::test]
+async fn cancellation_and_freeze_are_durable_store_owned_transitions() {
     let directory = tempdir().unwrap();
     let daemon = Daemon::with_model(
         config(directory.path().to_path_buf()),
@@ -10,6 +10,7 @@ fn cancellation_and_freeze_are_durable_store_owned_transitions() {
     assert_eq!(
         daemon
             .request_cancel(&run_id, "fixture cancellation request")
+            .await
             .unwrap(),
         1
     );
@@ -51,6 +52,55 @@ async fn http_control_rejects_non_loopback_bind() {
             .await,
         Err(DaemonError::InvalidInput(_))
     ));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn blocking_store_maintenance_keeps_http_responsive() {
+    let directory = tempdir().unwrap();
+    let daemon = Daemon::with_model(
+        config(directory.path().to_path_buf()),
+        fixture_model_client(),
+    )
+    .unwrap();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let started_at = std::time::Instant::now();
+    let maintenance = tokio::spawn(http::run_store_maintenance("store.fixture", move || {
+        started_tx.send(()).unwrap();
+        let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+        Ok(())
+    }));
+
+    started_rx.await.unwrap();
+    let started_promptly = started_at.elapsed() < std::time::Duration::from_secs(2);
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        daemon.router().oneshot(
+            Request::builder()
+                .uri("/health")
+                .header("x-akzio-token", "fixture-token")
+                .body(Body::empty())
+                .unwrap(),
+        ),
+    )
+    .await;
+    let _ = release_tx.send(());
+    maintenance.await.unwrap().unwrap().unwrap();
+
+    assert!(started_promptly, "maintenance ran on the Tokio event loop");
+    assert_eq!(response.unwrap().unwrap().status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn store_maintenance_join_error_maps_to_internal_server_error() {
+    let status = http::run_store_maintenance(
+        "store.fixture",
+        || -> std::result::Result<(), StoreError> { panic!("fixture maintenance panic") },
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 }
 
 #[tokio::test]
@@ -360,6 +410,7 @@ async fn http_sse_resumes_from_the_requested_cursor() {
     let run_id = daemon.submit_default(RunPurpose::Debug).unwrap();
     daemon
         .request_cancel(&run_id, "fixture cancellation request")
+        .await
         .unwrap();
     let events = daemon.store().events_after(&run_id, 0, 16).unwrap();
     assert!(events.len() >= 2);

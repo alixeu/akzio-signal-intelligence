@@ -11,8 +11,10 @@ struct RunStatusBar: View {
     let observerState: ObserverConnectionState
     let namespace: Namespace.ID?
     let canRun: Bool
+    let selectedRunPurpose: RunPurpose
     let runInFlight: Bool
     let runMessage: String
+    let onSelectRunPurpose: (RunPurpose) -> Void
     let onRun: () -> Void
     let onOpenSettings: () -> Void
     let onCopyRunID: () -> Void
@@ -102,6 +104,7 @@ struct RunStatusBar: View {
             marketChip
             dataChip
             latencyChip
+            runModePicker
             Button(action: onRun) {
                 HStack(spacing: 5) {
                     if runInFlight {
@@ -115,12 +118,12 @@ struct RunStatusBar: View {
             .buttonStyle(PressableButtonStyle())
             .disabled(!canRun || runInFlight)
             .help(L10n.text(
-                "Start one real-model run in Debug safety mode. Paper submission remains scheduler-owned.",
+                selectedRunPurpose.launchModeDescription,
                 language: language
             ))
             Menu {
                 Section(L10n.text("Run controls", language: language)) {
-                    Text(L10n.text("Real model · Debug safety mode", language: language))
+                    Text(L10n.text(selectedRunPurpose.launchModeSummary, language: language))
                     if !runMessage.isEmpty {
                         Text(L10n.text(runMessage, language: language))
                     }
@@ -139,6 +142,40 @@ struct RunStatusBar: View {
             .frame(width: 26)
         .accessibilityLabel(L10n.text("Run controls", language: language))
         }
+    }
+
+    private var runModePicker: some View {
+        Menu {
+            Section(L10n.text("Run mode", language: language)) {
+                ForEach(RunPurpose.userLaunchModes, id: \.self) { purpose in
+                    Button {
+                        onSelectRunPurpose(purpose)
+                    } label: {
+                        Label(
+                            L10n.text(purpose.launchModeName, language: language),
+                            systemImage: purpose == selectedRunPurpose
+                                ? "checkmark.circle.fill"
+                                : "circle"
+                        )
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: selectedRunPurpose == .positionPlan
+                    ? "list.bullet.rectangle"
+                    : "point.3.connected.trianglepath.dotted")
+                Text(L10n.text(selectedRunPurpose.launchModeName, language: language))
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .semibold))
+            }
+            .lineLimit(1)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .disabled(runInFlight)
+        .help(L10n.text(selectedRunPurpose.launchModeDescription, language: language))
     }
 
     private var marketChip: some View {

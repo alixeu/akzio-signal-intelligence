@@ -104,7 +104,7 @@ impl EvidenceRuntime {
             return Err(EvidenceRuntimeError::InvalidAcquisition);
         }
         acquired.provenance.validate(
-            acquired.raw.len(),
+            &acquired.raw,
             &acquired.source_uri,
             acquired.observed_at,
         )?;

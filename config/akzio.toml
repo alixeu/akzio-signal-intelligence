@@ -6,7 +6,8 @@ token_env = "AKZIO_DAEMON_TOKEN"
 # a distinct value; never reuse AKZIO_DAEMON_TOKEN in the SwiftUI app.
 # observer_token_env = "AKZIO_OBSERVER_TOKEN"
 worker_count = 4
-# Paper sessions require an injected scheduler loop. The CLI fails closed if this is true.
+# false starts only the loopback API and workers. true constructs Alpaca Paper
+# from environment credentials, preflights the workflow, and starts the scheduler.
 auto_paper = false
 
 [execution]

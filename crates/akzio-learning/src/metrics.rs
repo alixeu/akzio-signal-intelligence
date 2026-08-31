@@ -208,14 +208,16 @@ pub(super) fn marginal_utility(outcome: &Outcome) -> i64 {
 /// gates; contract/topology promotion remains owned by their canary policy.
 pub(super) fn next_state_with_fresh_pairs(
     current: PolicyState,
+    target: Option<PolicyState>,
     degraded: bool,
     fresh_pairs_by_horizon: [u64; 3],
+    minimum_fresh_pairs_per_horizon: u64,
 ) -> PolicyState {
     use CandidatePolicyState as Candidate;
     use MemoryLifecycle as Memory;
 
-    if degraded {
-        return match current {
+    let next = if degraded {
+        match current {
             PolicyState::Memory(Memory::Contested) => PolicyState::Memory(Memory::Retired),
             PolicyState::Memory(Memory::Retired) => current,
             PolicyState::Memory(_) => PolicyState::Memory(Memory::Contested),
@@ -223,15 +225,65 @@ pub(super) fn next_state_with_fresh_pairs(
             | PolicyState::Topology(Candidate::Candidate) => current,
             PolicyState::Contract(_) => PolicyState::Contract(Candidate::Candidate),
             PolicyState::Topology(_) => PolicyState::Topology(Candidate::Candidate),
-        };
-    }
-    if fresh_pairs_by_horizon.iter().all(|count| *count > 0) {
-        match current {
+        }
+    } else {
+        target.unwrap_or(match current {
             PolicyState::Memory(Memory::Candidate) => PolicyState::Memory(Memory::Active),
             PolicyState::Memory(Memory::Active) => PolicyState::Memory(Memory::Proven),
             _ => current,
-        }
+        })
+    };
+
+    if !is_forward_transition(current, next)
+        || fresh_pairs_by_horizon
+            .iter()
+            .all(|&count| count >= minimum_fresh_pairs_per_horizon)
+    {
+        next
     } else {
         current
     }
+}
+
+fn is_forward_transition(from: PolicyState, to: PolicyState) -> bool {
+    use CandidatePolicyState as Candidate;
+    use MemoryLifecycle as Memory;
+
+    matches!(
+        (from, to),
+        (
+            PolicyState::Memory(Memory::Candidate),
+            PolicyState::Memory(Memory::Active)
+        ) | (
+            PolicyState::Memory(Memory::Active),
+            PolicyState::Memory(Memory::Proven)
+        ) | (
+            PolicyState::Memory(Memory::Contested),
+            PolicyState::Memory(Memory::Active)
+        ) | (
+            PolicyState::Contract(Candidate::Candidate),
+            PolicyState::Contract(Candidate::Canary10)
+        ) | (
+            PolicyState::Contract(Candidate::Canary10),
+            PolicyState::Contract(Candidate::Canary25)
+        ) | (
+            PolicyState::Contract(Candidate::Canary25),
+            PolicyState::Contract(Candidate::Canary50)
+        ) | (
+            PolicyState::Contract(Candidate::Canary50),
+            PolicyState::Contract(Candidate::Active)
+        ) | (
+            PolicyState::Topology(Candidate::Candidate),
+            PolicyState::Topology(Candidate::Canary10)
+        ) | (
+            PolicyState::Topology(Candidate::Canary10),
+            PolicyState::Topology(Candidate::Canary25)
+        ) | (
+            PolicyState::Topology(Candidate::Canary25),
+            PolicyState::Topology(Candidate::Canary50)
+        ) | (
+            PolicyState::Topology(Candidate::Canary50),
+            PolicyState::Topology(Candidate::Active)
+        )
+    )
 }
