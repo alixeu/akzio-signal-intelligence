@@ -65,11 +65,15 @@ async fn blocking_store_maintenance_keeps_http_responsive() {
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let started_at = std::time::Instant::now();
-    let maintenance = tokio::spawn(http::run_store_maintenance("store.fixture", move || {
-        started_tx.send(()).unwrap();
-        let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
-        Ok(())
-    }));
+    let maintenance = tokio::spawn(http::run_store_maintenance(
+        daemon.store_executor.clone(),
+        StoreMaintenanceKind::Test,
+        move |_| {
+            started_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+            Ok(())
+        },
+    ));
 
     started_rx.await.unwrap();
     let started_promptly = started_at.elapsed() < std::time::Duration::from_secs(2);
@@ -77,7 +81,7 @@ async fn blocking_store_maintenance_keeps_http_responsive() {
         std::time::Duration::from_secs(2),
         daemon.router().oneshot(
             Request::builder()
-                .uri("/health")
+                .uri("/control/store/executor")
                 .header("x-akzio-token", "fixture-token")
                 .body(Body::empty())
                 .unwrap(),
@@ -85,17 +89,25 @@ async fn blocking_store_maintenance_keeps_http_responsive() {
     )
     .await;
     let _ = release_tx.send(());
-    maintenance.await.unwrap().unwrap().unwrap();
+    maintenance.await.unwrap().unwrap();
 
     assert!(started_promptly, "maintenance ran on the Tokio event loop");
-    assert_eq!(response.unwrap().unwrap().status(), StatusCode::OK);
+    let response = response.unwrap().unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status["maintenance"]["state"], "running");
 }
 
 #[tokio::test]
 async fn store_maintenance_join_error_maps_to_internal_server_error() {
+    let directory = tempdir().unwrap();
     let status = http::run_store_maintenance(
-        "store.fixture",
-        || -> std::result::Result<(), StoreError> { panic!("fixture maintenance panic") },
+        StoreExecutor::new(V2Store::open(directory.path()).unwrap()),
+        StoreMaintenanceKind::Test,
+        |_| -> std::result::Result<(), StoreError> { panic!("fixture maintenance panic") },
     )
     .await
     .unwrap_err();

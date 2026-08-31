@@ -119,10 +119,12 @@ impl Daemon {
             workflow.clone(),
             format!("akzio-daemon-{}", RunId::new()),
         )?
+        .with_store_executor(store_executor.clone())
         .with_market_data_feed(config.market_data_feed)
         .with_runtime_identity_hash(config.runtime_identity_hash.clone());
 
         Ok(Self {
+            store_executor: store_executor.clone(),
             task_runtime: TaskRuntime::new(store.clone()).with_store_executor(store_executor),
             workflow,
             agents,
@@ -165,6 +167,7 @@ impl Daemon {
 
     pub fn paper_workflow_source(&self) -> StorePaperWorkflowSource {
         StorePaperWorkflowSource::new(self.store.clone())
+            .with_store_executor(self.store_executor.clone())
             .with_bootstrap(self.workflow.clone(), "active")
     }
 

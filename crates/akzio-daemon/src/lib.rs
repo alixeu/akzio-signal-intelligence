@@ -73,8 +73,8 @@ use akzio_research::v2::{
 pub use akzio_research::{contract_component_hash, prompt_component_hash};
 pub use akzio_runtime::topology_component_hash;
 use akzio_runtime::v2::{
-    should_run_structured_critique, RetryCause, RuntimeError, StoreExecutor, TaskCompletion,
-    TaskRuntime, WorkflowRuntime,
+    should_run_structured_critique, RetryCause, RuntimeError, StoreExecutor, StoreMaintenanceKind,
+    StoreMaintenanceState, TaskCompletion, TaskRuntime, WorkflowRuntime,
 };
 use akzio_store::v2::{
     ClaimedAttempt, DaemonLease, LessonUsage, StoreAlert, StoreError, StoreMetrics, StoredEvent,
@@ -233,6 +233,7 @@ struct DaemonPaperState {
 #[derive(Clone)]
 pub struct Daemon {
     store: V2Store,
+    store_executor: StoreExecutor,
     workflow: WorkflowRuntime,
     task_runtime: TaskRuntime,
     agents: AgentRuntime,

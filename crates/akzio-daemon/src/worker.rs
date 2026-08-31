@@ -182,10 +182,11 @@ mod tests {
     };
 
     use akzio_domain::{
-        Artifact, ArtifactKind, ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance,
-        FailureDisposition, RetryPolicy, RunId, RunPurpose, TaskBudget, TaskId, TaskRecipeId,
-        TaskStatus, WorkflowGraph, WorkflowNode, V2_DOMAIN_SCHEMA_VERSION,
+        Artifact, ArtifactKind, ArtifactLifecycle, ArtifactProvenance, FailureDisposition,
+        RetryPolicy, RunId, RunPurpose, TaskBudget, TaskId, TaskRecipeId, WorkflowGraph,
+        WorkflowNode, V2_DOMAIN_SCHEMA_VERSION,
     };
+    use akzio_runtime::v2::{StoreExecutor, StoreMaintenanceKind};
     use akzio_store::v2::{StoredRun, V2Store, WorkflowCommit};
     use chrono::Utc;
     use tempfile::tempdir;
@@ -277,51 +278,33 @@ mod tests {
             .unwrap();
 
         let completed = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum_active = Arc::new(AtomicUsize::new(0));
         let handler: TaskHandler = {
             let completed = completed.clone();
-            let handler_store = store.clone();
+            let active = active.clone();
+            let maximum_active = maximum_active.clone();
             Arc::new(move |task| {
                 let completed = completed.clone();
-                let store = handler_store.clone();
+                let active = active.clone();
+                let maximum_active = maximum_active.clone();
                 Box::pin(async move {
-                    let now = Utc::now();
-                    let artifact = Artifact::new(
-                        ArtifactKind::AgentTurn,
-                        store
-                            .put_bytes(b"fixture worker completion", "text/plain")
-                            .unwrap(),
-                        "fixture.worker",
-                        ArtifactLifecycle::RunScoped,
-                        ArtifactProvenance {
-                            source_family: "fixture.worker".to_owned(),
-                            observed_at: Some(now),
-                            retrieved_at: now,
-                            source_uri: None,
-                            confidence_ppm: 1_000_000,
-                            producer_contract_hash: task.permit.contract_hash.clone(),
-                        },
-                        Some(ArtifactOrigin {
-                            run_id: Some(task.run_id.clone()),
-                            task_id: Some(task.node.task_id.clone()),
-                            attempt_id: Some(task.permit.attempt_id.clone()),
-                            contract_hash: task.permit.contract_hash.clone(),
-                        }),
-                        vec![],
-                        now,
-                    )
-                    .unwrap();
-                    store
-                        .commit_attempt(&task.permit, &[artifact], TaskStatus::Succeeded, now)
-                        .unwrap();
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum_active.fetch_max(current, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
                     completed.fetch_add(1, Ordering::SeqCst);
-                    TaskCompletion::Committed
+                    drop(task);
+                    TaskCompletion::NoOutput
                 })
             })
         };
         let pool = WorkerPool::new(
-            TaskRuntime::new(store.clone()),
+            TaskRuntime::new(store.clone())
+                .with_lease_duration(chrono::Duration::milliseconds(30))
+                .unwrap(),
             WorkerPoolConfig {
-                worker_count: 2,
+                worker_count: 4,
                 idle_poll: Duration::from_millis(5),
                 worker_prefix: "test".to_owned(),
             },
@@ -342,6 +325,7 @@ mod tests {
         shutdown_tx.send(true).unwrap();
         task.await.unwrap().unwrap();
         assert_eq!(completed.load(Ordering::SeqCst), 4);
+        assert_eq!(maximum_active.load(Ordering::SeqCst), 4);
         assert_eq!(
             store
                 .events_after(&run_id, 0, 100)
@@ -354,8 +338,76 @@ mod tests {
         assert!(store.verify_integrity().is_ok());
         assert_eq!(
             pool.worker_ids().into_iter().collect::<BTreeSet<_>>().len(),
-            2
+            4
         );
+    }
+
+    #[tokio::test]
+    async fn drained_maintenance_preserves_heartbeat_and_blocks_false_recovery() {
+        let directory = tempdir().unwrap();
+        let store = V2Store::open(directory.path().join("store")).unwrap();
+        let backup_root = directory.path().join("backup");
+        let now = Utc::now();
+        let graph = workflow();
+        let run_id = RunId::new();
+        let graph_artifact = Artifact::new(
+            ArtifactKind::WorkflowGraph,
+            store.put_json(&graph).unwrap(),
+            "fixture.workflow",
+            ArtifactLifecycle::RunScoped,
+            provenance(now),
+            None,
+            vec![],
+            now,
+        )
+        .unwrap();
+        store
+            .commit_workflow(&WorkflowCommit {
+                run: StoredRun {
+                    run_id: run_id.clone(),
+                    purpose: RunPurpose::Debug,
+                    topology_id: graph.topology_id.clone(),
+                    graph_artifact_id: graph_artifact.artifact_id.clone(),
+                    created_at: now,
+                },
+                graph: graph_artifact,
+                nodes: graph.nodes,
+            })
+            .unwrap();
+        let executor = StoreExecutor::new(store.clone());
+        let runtime = TaskRuntime::new(store.clone())
+            .with_store_executor(executor.clone())
+            .with_lease_duration(chrono::Duration::milliseconds(30))
+            .unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let worker_runtime = runtime.clone();
+        let worker = tokio::spawn(async move {
+            worker_runtime
+                .run_one("maintenance-worker", move |_| async move {
+                    started_tx.send(()).unwrap();
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    TaskCompletion::NoOutput
+                })
+                .await
+        });
+        started_rx.await.unwrap();
+
+        executor
+            .execute_maintenance(StoreMaintenanceKind::Backup, move |store| {
+                std::thread::sleep(Duration::from_millis(70));
+                store.backup_to(backup_root)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(runtime.recover_expired_tasks(Utc::now()).await.unwrap(), 0);
+        assert!(worker.await.unwrap().unwrap());
+        assert!(!store
+            .events_after(&run_id, 0, 100)
+            .unwrap()
+            .iter()
+            .any(|event| event.event_type == "task.recovered"));
+        store.verify_integrity().unwrap();
     }
 
     #[tokio::test]

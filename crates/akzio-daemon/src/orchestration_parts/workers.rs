@@ -74,66 +74,69 @@ impl Daemon {
             expires_at: now + Duration::hours(request.valid_hours),
             created_at: now,
         };
-        let manifest_hash = manifest_payload.manifest_hash()?;
-        let manifest = Artifact::new(
-            ArtifactKind::RuntimeManifest,
-            self.store.put_json(&manifest_payload)?,
-            "runtime.manifest",
-            ArtifactLifecycle::Canonical,
-            ArtifactProvenance {
-                source_family: "akzio.operator".to_owned(),
-                observed_at: None,
-                retrieved_at: now,
-                source_uri: None,
-                confidence_ppm: 1_000_000,
-                producer_contract_hash: None,
-            },
-            None,
-            vec![],
-            now,
-        )?;
-        let mut approval_payload = PaperLaunchApproval {
-            schema_version: akzio_domain::V2_DOMAIN_SCHEMA_VERSION,
-            operator_identity: request.operator,
-            runtime_manifest: ArtifactRef {
-                artifact_id: manifest.artifact_id.clone(),
-                kind: ArtifactKind::RuntimeManifest,
-            },
-            runtime_manifest_hash: manifest_hash.clone(),
-            scope: PaperApprovalScope::Canary,
-            reason: request.reason,
-            approved_at: now,
-            expires_at: manifest_payload.expires_at,
-            approval_hash: ContentHash::of_bytes(b"pending"),
-        };
-        approval_payload.approval_hash = approval_payload.unsigned_hash()?;
-        let approval = Artifact::new(
-            ArtifactKind::PaperLaunchApproval,
-            self.store.put_json(&approval_payload)?,
-            "operator.paper_approval",
-            ArtifactLifecycle::Canonical,
-            ArtifactProvenance {
-                source_family: "akzio.operator".to_owned(),
-                observed_at: None,
-                retrieved_at: now,
-                source_uri: None,
-                confidence_ppm: 1_000_000,
-                producer_contract_hash: None,
-            },
-            None,
-            vec![approval_payload.runtime_manifest.clone()],
-            now,
-        )?;
-        self.store
-            .write_paper_approval_binding(&manifest, &approval)?;
-        Ok(PaperApprovalResponse {
-            session_key: request.session_key,
-            runtime_manifest_artifact_id: manifest.artifact_id,
-            runtime_manifest_hash: manifest_hash,
-            approval_artifact_id: approval.artifact_id,
-            approval_hash: approval_payload.approval_hash,
-            expires_at: approval_payload.expires_at,
-        })
+        self.store_executor
+            .execute(move |store| -> Result<_> {
+                let manifest_hash = manifest_payload.manifest_hash()?;
+                let manifest = Artifact::new(
+                    ArtifactKind::RuntimeManifest,
+                    store.put_json(&manifest_payload)?,
+                    "runtime.manifest",
+                    ArtifactLifecycle::Canonical,
+                    ArtifactProvenance {
+                        source_family: "akzio.operator".to_owned(),
+                        observed_at: None,
+                        retrieved_at: now,
+                        source_uri: None,
+                        confidence_ppm: 1_000_000,
+                        producer_contract_hash: None,
+                    },
+                    None,
+                    vec![],
+                    now,
+                )?;
+                let mut approval_payload = PaperLaunchApproval {
+                    schema_version: akzio_domain::V2_DOMAIN_SCHEMA_VERSION,
+                    operator_identity: request.operator,
+                    runtime_manifest: ArtifactRef {
+                        artifact_id: manifest.artifact_id.clone(),
+                        kind: ArtifactKind::RuntimeManifest,
+                    },
+                    runtime_manifest_hash: manifest_hash.clone(),
+                    scope: PaperApprovalScope::Canary,
+                    reason: request.reason,
+                    approved_at: now,
+                    expires_at: manifest_payload.expires_at,
+                    approval_hash: ContentHash::of_bytes(b"pending"),
+                };
+                approval_payload.approval_hash = approval_payload.unsigned_hash()?;
+                let approval = Artifact::new(
+                    ArtifactKind::PaperLaunchApproval,
+                    store.put_json(&approval_payload)?,
+                    "operator.paper_approval",
+                    ArtifactLifecycle::Canonical,
+                    ArtifactProvenance {
+                        source_family: "akzio.operator".to_owned(),
+                        observed_at: None,
+                        retrieved_at: now,
+                        source_uri: None,
+                        confidence_ppm: 1_000_000,
+                        producer_contract_hash: None,
+                    },
+                    None,
+                    vec![approval_payload.runtime_manifest.clone()],
+                    now,
+                )?;
+                store.write_paper_approval_binding(&manifest, &approval)?;
+                Ok(PaperApprovalResponse {
+                    session_key: request.session_key,
+                    runtime_manifest_artifact_id: manifest.artifact_id,
+                    runtime_manifest_hash: manifest_hash,
+                    approval_artifact_id: approval.artifact_id,
+                    approval_hash: approval_payload.approval_hash,
+                    expires_at: approval_payload.expires_at,
+                })
+            })
+            .await?
     }
 
     /// Paper sessions are scheduler-owned and require a frozen session slot.

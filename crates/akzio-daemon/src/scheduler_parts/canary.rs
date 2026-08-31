@@ -9,18 +9,31 @@ impl PaperScheduler {
     where
         C: BrokerSessionClock + ?Sized,
     {
+        let campaign_id = campaign.spec.campaign_id.clone();
+        let campaign_status = campaign.status;
         if self
-            .store
-            .canary_session(&campaign.spec.campaign_id, campaign.status)?
+            .store_executor
+            .execute(move |store| store.canary_session(&campaign_id, campaign_status))
+            .await??
             .is_some()
         {
             return Err(SchedulerError::WorkflowUnavailable);
         }
-        let Some((runtime_manifest, approval)) = self.current_approval_binding()? else {
+        let scheduler = self.clone();
+        let Some((runtime_manifest, approval)) = self
+            .store_executor
+            .execute(move |_| scheduler.current_approval_binding())
+            .await??
+        else {
             return Ok(None);
         };
-        let manifest_payload: RuntimeManifest =
-            serde_json::from_slice(&self.store.read_blob(&runtime_manifest.blob)?)?;
+        let manifest_blob = runtime_manifest.blob.clone();
+        let manifest_payload: RuntimeManifest = serde_json::from_slice(
+            &self
+                .store_executor
+                .execute(move |store| store.read_blob(&manifest_blob))
+                .await??,
+        )?;
         if let Some(expected) = &self.runtime_identity_hash {
             if manifest_payload.runtime_identity_hash()? != *expected {
                 return Ok(None);
@@ -35,16 +48,19 @@ impl PaperScheduler {
             return Ok(None);
         }
 
-        let candidate_artifact = self
-            .store
-            .artifact(&campaign.spec.candidate_contract.artifact_id)?;
-        let candidate: AgentContract =
-            serde_json::from_slice(&self.store.read_blob(&candidate_artifact.blob)?)?;
+        let candidate_artifact_id = campaign.spec.candidate_contract.artifact_id.clone();
+        let (candidate_artifact, candidate, candidate_installation) = self
+            .store_executor
+            .execute(move |store| -> SchedulerResult<_> {
+                let artifact = store.artifact(&candidate_artifact_id)?;
+                let candidate: AgentContract = serde_json::from_slice(&store.read_blob(&artifact.blob)?)?;
+                let installation = store
+                    .contract_installation(&candidate.contract_hash)?
+                    .ok_or(SchedulerError::WorkflowUnavailable)?;
+                Ok((artifact, candidate, installation))
+            })
+            .await??;
         candidate.validate()?;
-        let candidate_installation = self
-            .store
-            .contract_installation(&candidate.contract_hash)?
-            .ok_or(SchedulerError::WorkflowUnavailable)?;
         if candidate_artifact.kind != ArtifactKind::Contract
             || candidate_artifact.lifecycle != ArtifactLifecycle::Canonical
             || candidate.purpose.as_str() != "research.analyst"
@@ -56,11 +72,16 @@ impl PaperScheduler {
             return Err(SchedulerError::WorkflowUnavailable);
         }
 
-        let candidate_topology_artifact = self
-            .store
-            .artifact(&campaign.spec.candidate_topology.artifact_id)?;
-        let candidate_topology: akzio_domain::WorkflowGraph =
-            serde_json::from_slice(&self.store.read_blob(&candidate_topology_artifact.blob)?)?;
+        let candidate_topology_id = campaign.spec.candidate_topology.artifact_id.clone();
+        let (candidate_topology_artifact, candidate_topology) = self
+            .store_executor
+            .execute(move |store| -> SchedulerResult<_> {
+                let artifact = store.artifact(&candidate_topology_id)?;
+                let topology: akzio_domain::WorkflowGraph =
+                    serde_json::from_slice(&store.read_blob(&artifact.blob)?)?;
+                Ok((artifact, topology))
+            })
+            .await??;
         candidate_topology.validate()?;
         if candidate_topology_artifact.kind != ArtifactKind::WorkflowGraph
             || candidate_topology_artifact.lifecycle != ArtifactLifecycle::RunScoped
@@ -76,9 +97,17 @@ impl PaperScheduler {
             return Err(SchedulerError::WorkflowUnavailable);
         }
 
-        let lease = self.acquire_or_renew(now)?;
+        let lease = self.acquire_or_renew_async(now).await?;
         let parent_run_id = RunId::new();
-        let setup_artifacts = self.paper_snapshot_artifacts(&parent_run_id, session_key, now)?;
+        let scheduler = self.clone();
+        let snapshot_run_id = parent_run_id.clone();
+        let snapshot_session_key = session_key.to_owned();
+        let setup_artifacts = self
+            .store_executor
+            .execute(move |_| {
+                scheduler.paper_snapshot_artifacts(&snapshot_run_id, &snapshot_session_key, now)
+            })
+            .await??;
         let mut parent_proposal = self.workflow.approved_paper_proposal("active")?;
         parent_proposal
             .tasks
@@ -91,15 +120,23 @@ impl PaperScheduler {
                 kind: ArtifactKind::EvidenceNeed,
             })
             .collect();
+        let workflow = self.workflow.clone();
+        let prepared_parent_run_id = parent_run_id.clone();
+        let prepared_session_key = session_key.to_owned();
+        let prepared_parent_proposal = parent_proposal.clone();
+        let prepared_setup_artifacts = setup_artifacts.clone();
         let (parent_reservation, parent_proposal_artifact) = self
-            .workflow
-            .prepare_approved_paper_session_with_inputs_for_run(
-                parent_run_id.clone(),
-                session_key,
-                &parent_proposal,
-                &setup_artifacts,
-                now,
-            )?;
+            .store_executor
+            .execute(move |_| {
+                workflow.prepare_approved_paper_session_with_inputs_for_run(
+                    prepared_parent_run_id,
+                    &prepared_session_key,
+                    &prepared_parent_proposal,
+                    &prepared_setup_artifacts,
+                    now,
+                )
+            })
+            .await??;
         let snapshot_refs = parent_reservation
             .workflow
             .nodes
@@ -116,39 +153,72 @@ impl PaperScheduler {
             .evidence_needs = snapshot_refs.clone();
         let active_contract_hash = active_analyst
             .contract_hash
-            .as_ref()
+            .clone()
             .ok_or(SchedulerError::WorkflowUnavailable)?;
 
         let contract_shadow_run_id = RunId::new();
         let topology_shadow_run_id = RunId::new();
         let bundle_shadow_run_id = RunId::new();
-        let contract_shadow = self.workflow.prepare_workflow_commit(
-            contract_shadow_run_id.clone(),
-            RunPurpose::Shadow,
-            self.workflow
-                .lower_shadow(&contract_proposal, Some(&candidate.contract_hash))?,
-            now,
-        )?;
-        let topology_shadow = self.workflow.prepare_workflow_commit(
-            topology_shadow_run_id.clone(),
-            RunPurpose::Shadow,
-            self.workflow.lower_shadow_from_graph(
-                &candidate_topology,
-                &snapshot_refs,
-                Some(active_contract_hash),
-            )?,
-            now,
-        )?;
-        let bundle_shadow = self.workflow.prepare_workflow_commit(
-            bundle_shadow_run_id.clone(),
-            RunPurpose::Shadow,
-            self.workflow.lower_shadow_from_graph(
-                &candidate_topology,
-                &snapshot_refs,
-                Some(&candidate.contract_hash),
-            )?,
-            now,
-        )?;
+        let workflow = self.workflow.clone();
+        let candidate_contract_hash = candidate.contract_hash.clone();
+        let contract_shadow_run = contract_shadow_run_id.clone();
+        let contract_shadow = self
+            .store_executor
+            .execute(move |_| {
+                let graph = workflow.lower_shadow(
+                    &contract_proposal,
+                    Some(&candidate_contract_hash),
+                )?;
+                workflow.prepare_workflow_commit(
+                    contract_shadow_run,
+                    RunPurpose::Shadow,
+                    graph,
+                    now,
+                )
+            })
+            .await??;
+        let workflow = self.workflow.clone();
+        let topology = candidate_topology.clone();
+        let topology_refs = snapshot_refs.clone();
+        let topology_active_hash = active_contract_hash.clone();
+        let topology_shadow_run = topology_shadow_run_id.clone();
+        let topology_shadow = self
+            .store_executor
+            .execute(move |_| {
+                let graph = workflow.lower_shadow_from_graph(
+                    &topology,
+                    &topology_refs,
+                    Some(&topology_active_hash),
+                )?;
+                workflow.prepare_workflow_commit(
+                    topology_shadow_run,
+                    RunPurpose::Shadow,
+                    graph,
+                    now,
+                )
+            })
+            .await??;
+        let workflow = self.workflow.clone();
+        let bundle_topology = candidate_topology;
+        let bundle_refs = snapshot_refs;
+        let bundle_contract_hash = candidate.contract_hash.clone();
+        let bundle_shadow_run = bundle_shadow_run_id.clone();
+        let bundle_shadow = self
+            .store_executor
+            .execute(move |_| {
+                let graph = workflow.lower_shadow_from_graph(
+                    &bundle_topology,
+                    &bundle_refs,
+                    Some(&bundle_contract_hash),
+                )?;
+                workflow.prepare_workflow_commit(
+                    bundle_shadow_run,
+                    RunPurpose::Shadow,
+                    graph,
+                    now,
+                )
+            })
+            .await??;
 
         let canary_reservation = CanarySessionReservation {
             schema_version: V2_DOMAIN_SCHEMA_VERSION,
@@ -162,15 +232,20 @@ impl PaperScheduler {
             scheduler_epoch: lease.epoch,
             reserved_at: now,
         };
-        let parent = self.store.reserve_canary_session_with_workflows(
-            &lease,
-            &parent_reservation,
-            &parent_proposal_artifact,
-            &runtime_manifest,
-            &approval,
-            &[contract_shadow, topology_shadow, bundle_shadow],
-            &canary_reservation,
-        )?;
+        let parent = self
+            .store_executor
+            .execute(move |store| {
+                store.reserve_canary_session_with_workflows(
+                    &lease,
+                    &parent_reservation,
+                    &parent_proposal_artifact,
+                    &runtime_manifest,
+                    &approval,
+                    &[contract_shadow, topology_shadow, bundle_shadow],
+                    &canary_reservation,
+                )
+            })
+            .await??;
         Ok(Some(parent))
     }
 }

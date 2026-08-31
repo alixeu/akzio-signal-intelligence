@@ -20,7 +20,7 @@ use akzio_domain::{
 };
 use akzio_execution::paper::AlpacaPaper;
 use akzio_ingest::AlpacaMarketDataFeed;
-use akzio_runtime::v2::{RuntimeError, WorkflowRuntime};
+use akzio_runtime::v2::{RuntimeError, StoreExecutor, WorkflowRuntime};
 use akzio_store::v2::{
     DaemonLease, SessionSlotReservation, StoreError, StoredCanarySession, V2Store,
 };
@@ -121,7 +121,10 @@ impl BrokerSessionClock for AlpacaPaperSessionClock {
 /// Provides only a Rust-validated `WorkflowProposal`; it cannot create a Run
 /// or bypass the scheduler lease.
 pub trait PaperWorkflowSource: Send + Sync {
-    fn proposal(&self, session_key: &str) -> SchedulerResult<WorkflowProposal>;
+    fn proposal<'a>(
+        &'a self,
+        session_key: &'a str,
+    ) -> Pin<Box<dyn Future<Output = SchedulerResult<WorkflowProposal>> + Send + 'a>>;
 }
 
 #[derive(Clone)]
@@ -135,6 +138,7 @@ pub struct StaticPaperWorkflowSource {
 #[derive(Clone)]
 pub struct StorePaperWorkflowSource {
     store: V2Store,
+    store_executor: StoreExecutor,
     bootstrap: Option<(WorkflowRuntime, String)>,
 }
 
@@ -147,9 +151,15 @@ impl StaticPaperWorkflowSource {
 impl StorePaperWorkflowSource {
     pub fn new(store: V2Store) -> Self {
         Self {
+            store_executor: StoreExecutor::new(store.clone()),
             store,
             bootstrap: None,
         }
+    }
+
+    pub fn with_store_executor(mut self, store_executor: StoreExecutor) -> Self {
+        self.store_executor = store_executor;
+        self
     }
 
     pub fn with_bootstrap(
@@ -194,10 +204,8 @@ impl StorePaperWorkflowSource {
         }
         Ok(false)
     }
-}
 
-impl PaperWorkflowSource for StorePaperWorkflowSource {
-    fn proposal(&self, _session_key: &str) -> SchedulerResult<WorkflowProposal> {
+    fn proposal_sync(&self) -> SchedulerResult<WorkflowProposal> {
         let candidate_subject = PolicySubject::Topology(TopologyId(
             STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID.to_owned(),
         ));
@@ -251,15 +259,33 @@ impl PaperWorkflowSource for StorePaperWorkflowSource {
     }
 }
 
+impl PaperWorkflowSource for StorePaperWorkflowSource {
+    fn proposal<'a>(
+        &'a self,
+        _session_key: &'a str,
+    ) -> Pin<Box<dyn Future<Output = SchedulerResult<WorkflowProposal>> + Send + 'a>> {
+        Box::pin(async move {
+            let source = self.clone();
+            self.store_executor
+                .execute(move |_| source.proposal_sync())
+                .await?
+        })
+    }
+}
+
 impl PaperWorkflowSource for StaticPaperWorkflowSource {
-    fn proposal(&self, _session_key: &str) -> SchedulerResult<WorkflowProposal> {
-        Ok(self.proposal.clone())
+    fn proposal<'a>(
+        &'a self,
+        _session_key: &'a str,
+    ) -> Pin<Box<dyn Future<Output = SchedulerResult<WorkflowProposal>> + Send + 'a>> {
+        Box::pin(async move { Ok(self.proposal.clone()) })
     }
 }
 
 #[derive(Clone)]
 pub struct PaperScheduler {
     store: V2Store,
+    store_executor: StoreExecutor,
     workflow: WorkflowRuntime,
     owner_id: String,
     lease_duration: Duration,
