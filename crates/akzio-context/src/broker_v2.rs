@@ -51,6 +51,12 @@ pub enum ContextError {
     InvalidComparison,
     #[error("claim evidence read requires a claim artifact")]
     ExpectedClaim,
+    /// The Lesson-off arm of a paired experiment was requested against a
+    /// baseline that carried no Lesson. The two arms would be byte-identical, so
+    /// the comparison would report a null effect from a treatment that never
+    /// varied.
+    #[error("lesson ablation requires a baseline manifest that selected a lesson")]
+    NoLessonToAblate,
 }
 
 pub type ContextResult<T> = Result<T, ContextError>;

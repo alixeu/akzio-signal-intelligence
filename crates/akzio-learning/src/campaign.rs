@@ -15,10 +15,15 @@ use chrono::{DateTime, Utc};
 
 const PPM_ONE: u32 = 1_000_000;
 
+/// One horizon of a canary comparison.
+///
+/// `risk_recall_ppm` stays `Option` so an unmeasured window never masquerades
+/// as measured-zero. See `CanaryPairedOutcomeMetrics` for the same invariant on
+/// the persisted side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CanaryHorizonMetrics {
     pub evidence_completeness_ppm: u32,
-    pub risk_recall_ppm: u32,
+    pub risk_recall_ppm: Option<u32>,
     pub utility_ppm: i64,
 }
 
@@ -26,7 +31,7 @@ impl CanaryHorizonMetrics {
     pub fn from_outcome_window(window: &akzio_domain::OutcomeWindow) -> Self {
         Self {
             evidence_completeness_ppm: window.evidence_completeness_ppm,
-            risk_recall_ppm: window.risk_recall_ppm.unwrap_or_default(),
+            risk_recall_ppm: window.risk_recall_ppm,
             utility_ppm: window.utility_ppm,
         }
     }
@@ -47,6 +52,9 @@ impl CanarySubjectComparison {
         Ok(Self { parent, candidate })
     }
 
+    /// Rollback requires *observed* degradation. A horizon whose risk recall was
+    /// never measured yields `Defer`: absent evidence is not evidence of harm,
+    /// but it also must not buy a promotion.
     pub fn verdict(&self, minimum_ppm: u32) -> CanaryVerdict {
         if self
             .candidate
@@ -54,13 +62,27 @@ impl CanarySubjectComparison {
             .zip(self.parent.iter())
             .any(|(candidate, parent)| {
                 candidate.evidence_completeness_ppm < minimum_ppm
-                    || candidate.risk_recall_ppm < minimum_ppm
                     || candidate.evidence_completeness_ppm < parent.evidence_completeness_ppm
-                    || candidate.risk_recall_ppm < parent.risk_recall_ppm
                     || candidate.utility_ppm < parent.utility_ppm
+                    || candidate
+                        .risk_recall_ppm
+                        .is_some_and(|value| value < minimum_ppm)
+                    || match (candidate.risk_recall_ppm, parent.risk_recall_ppm) {
+                        (Some(candidate), Some(parent)) => candidate < parent,
+                        _ => false,
+                    }
             })
         {
             return CanaryVerdict::Rollback;
+        }
+
+        if self
+            .candidate
+            .iter()
+            .chain(self.parent.iter())
+            .any(|metrics| metrics.risk_recall_ppm.is_none())
+        {
+            return CanaryVerdict::Defer;
         }
 
         let parent_utility = self
@@ -145,6 +167,7 @@ pub fn evaluate_canary_cohort(
     let mut paired_sessions_by_horizon = [0_u64; 3];
     let mut rollback = false;
     let mut confidence_insufficient = false;
+    let mut risk_recall_unmeasured = false;
     let mut utility_sums = [[0_i128; 3]; 3];
     let mut utility_counts = [[0_u64; 3]; 3];
     let mut observation_hashes = Vec::with_capacity(observations.len());
@@ -171,6 +194,7 @@ pub fn evaluate_canary_cohort(
         .enumerate()
         {
             rollback |= subject_requires_rollback(subject, policy);
+            risk_recall_unmeasured |= subject_risk_recall_unmeasured(subject);
             confidence_insufficient |= subject.parent.confidence_ppm
                 < policy.minimum_confidence_ppm
                 || subject.candidate.confidence_ppm < policy.minimum_confidence_ppm;
@@ -206,7 +230,7 @@ pub fn evaluate_canary_cohort(
         });
     let verdict = if rollback {
         CanaryVerdict::Rollback
-    } else if coverage_insufficient || confidence_insufficient {
+    } else if coverage_insufficient || confidence_insufficient || risk_recall_unmeasured {
         CanaryVerdict::Defer
     } else if utility_insufficient {
         CanaryVerdict::Hold
@@ -259,15 +283,26 @@ fn validate_observation_manifest(
     Ok(())
 }
 
+/// Rollback fires only on measured degradation. Unmeasured risk recall is
+/// routed to `Defer` by `subject_risk_recall_unmeasured`, never to `Rollback`.
 fn subject_requires_rollback(
     subject: &CanaryPairedSubjectMetrics,
     policy: &CanaryPromotionPolicy,
 ) -> bool {
     subject.candidate.evidence_completeness_ppm < policy.minimum_evidence_completeness_ppm
-        || subject.candidate.risk_recall_ppm < policy.minimum_risk_recall_ppm
         || subject.candidate.evidence_completeness_ppm < subject.parent.evidence_completeness_ppm
-        || subject.candidate.risk_recall_ppm < subject.parent.risk_recall_ppm
         || subject.candidate.cost_adjusted_utility_ppm < subject.parent.cost_adjusted_utility_ppm
+        || subject
+            .candidate
+            .risk_recall_ppm
+            .is_some_and(|value| value < policy.minimum_risk_recall_ppm)
+        || match (
+            subject.candidate.risk_recall_ppm,
+            subject.parent.risk_recall_ppm,
+        ) {
+            (Some(candidate), Some(parent)) => candidate < parent,
+            _ => false,
+        }
         || subject.candidate.drawdown_ppm
             > subject
                 .parent
@@ -278,6 +313,10 @@ fn subject_requires_rollback(
                 .parent
                 .tail_loss_ppm
                 .saturating_add(policy.maximum_tail_loss_delta_ppm)
+}
+
+const fn subject_risk_recall_unmeasured(subject: &CanaryPairedSubjectMetrics) -> bool {
+    !subject.risk_recall_is_measured()
 }
 
 const fn horizon_index(horizon: OutcomeHorizon) -> usize {
@@ -472,7 +511,7 @@ mod tests {
             parent: CanaryPairedOutcomeMetrics {
                 observed_trading_day,
                 evidence_completeness_ppm: 950_000,
-                risk_recall_ppm: 950_000,
+                risk_recall_ppm: Some(950_000),
                 cost_adjusted_utility_ppm: parent_utility,
                 drawdown_ppm: 1_000,
                 tail_loss_ppm: 1_000,
@@ -481,7 +520,7 @@ mod tests {
             candidate: CanaryPairedOutcomeMetrics {
                 observed_trading_day,
                 evidence_completeness_ppm: 950_000,
-                risk_recall_ppm: 950_000,
+                risk_recall_ppm: Some(950_000),
                 cost_adjusted_utility_ppm: candidate_utility,
                 drawdown_ppm: 1_100,
                 tail_loss_ppm: 1_100,
@@ -534,12 +573,12 @@ mod tests {
         CanarySubjectComparison {
             parent: [CanaryHorizonMetrics {
                 evidence_completeness_ppm: 950_000,
-                risk_recall_ppm: 950_000,
+                risk_recall_ppm: Some(950_000),
                 utility_ppm: parent_utility,
             }; 3],
             candidate: [CanaryHorizonMetrics {
                 evidence_completeness_ppm: 950_000,
-                risk_recall_ppm: 950_000,
+                risk_recall_ppm: Some(950_000),
                 utility_ppm: candidate_utility,
             }; 3],
         }
@@ -565,13 +604,58 @@ mod tests {
         assert_eq!(hold.verdict(900_000), CanaryVerdict::Hold);
 
         let mut degraded = subject(1, 2);
-        degraded.candidate[1].risk_recall_ppm = 899_999;
+        degraded.candidate[1].risk_recall_ppm = Some(899_999);
         let rollback = CanaryBundleComparison {
             contract: degraded,
             topology: subject(1, 2),
             bundle: subject(1, 2),
         };
         assert_eq!(rollback.verdict(900_000), CanaryVerdict::Rollback);
+    }
+
+    /// Unmeasured risk recall must never be read as a quality regression. Before
+    /// `risk_recall_ppm` became `Option` an unmeasured window collapsed to 0 and
+    /// forced a rollback on absent evidence.
+    #[test]
+    fn unmeasured_risk_recall_defers_instead_of_rolling_back() {
+        let mut unmeasured = subject(1, 2);
+        unmeasured.candidate[1].risk_recall_ppm = None;
+        let comparison = CanaryBundleComparison {
+            contract: unmeasured,
+            topology: subject(1, 2),
+            bundle: subject(1, 2),
+        };
+        assert_eq!(
+            comparison.verdict(900_000),
+            CanaryVerdict::Defer,
+            "an unmeasured window carries no risk evidence, so it can neither \
+             advance nor roll back"
+        );
+
+        // A measured zero is genuine degradation and still rolls back.
+        let mut measured_zero = subject(1, 2);
+        measured_zero.candidate[1].risk_recall_ppm = Some(0);
+        let rollback = CanaryBundleComparison {
+            contract: measured_zero,
+            topology: subject(1, 2),
+            bundle: subject(1, 2),
+        };
+        assert_eq!(rollback.verdict(900_000), CanaryVerdict::Rollback);
+    }
+
+    /// Rollback outranks Defer: real degradation elsewhere is not masked by an
+    /// unmeasured window.
+    #[test]
+    fn measured_degradation_outranks_an_unmeasured_window() {
+        let mut mixed = subject(1, 2);
+        mixed.candidate[0].risk_recall_ppm = None;
+        mixed.candidate[1].risk_recall_ppm = Some(899_999);
+        let comparison = CanaryBundleComparison {
+            contract: mixed,
+            topology: subject(1, 2),
+            bundle: subject(1, 2),
+        };
+        assert_eq!(comparison.verdict(900_000), CanaryVerdict::Rollback);
     }
 
     #[test]
@@ -645,12 +729,35 @@ mod tests {
             "risk_on",
             OutcomeHorizon::T1,
         )];
-        observations[0].bundle.candidate.risk_recall_ppm = 899_999;
+        observations[0].bundle.candidate.risk_recall_ppm = Some(899_999);
 
         let evaluation = evaluate_canary_cohort(&cohort, &policy, &observations, Utc::now())
             .expect("valid cohort evaluation");
 
         assert_eq!(evaluation.verdict, CanaryVerdict::Rollback);
+    }
+
+    /// Cohort-level counterpart of the comparison test: a complete, otherwise
+    /// advancing cohort must defer rather than advance when any paired subject
+    /// lacks a measured risk recall.
+    #[test]
+    fn cohort_with_an_unmeasured_risk_recall_defers_rather_than_advancing() {
+        let policy = promotion_policy();
+        let cohort = cohort(&policy);
+        let baseline = complete_observations(&cohort);
+        assert_eq!(
+            evaluate_canary_cohort(&cohort, &policy, &baseline, Utc::now())
+                .expect("valid cohort evaluation")
+                .verdict,
+            CanaryVerdict::Advance,
+            "the fully measured cohort is the control for this test"
+        );
+
+        let mut observations = baseline;
+        observations[0].contract.candidate.risk_recall_ppm = None;
+        let evaluation = evaluate_canary_cohort(&cohort, &policy, &observations, Utc::now())
+            .expect("valid cohort evaluation");
+        assert_eq!(evaluation.verdict, CanaryVerdict::Defer);
     }
 
     #[test]

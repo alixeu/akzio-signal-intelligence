@@ -20,6 +20,19 @@ impl V2Store {
             );
             CREATE INDEX IF NOT EXISTS rebuild_lesson_events_cursor
                 ON rebuild_lesson_events(event_id);
+            CREATE TABLE IF NOT EXISTS rebuild_lesson_evidence (
+                evidence_id TEXT PRIMARY KEY,
+                lesson_id TEXT NOT NULL,
+                lesson_artifact_id TEXT NOT NULL REFERENCES rebuild_artifacts(artifact_id),
+                decision_context_artifact_id TEXT NOT NULL REFERENCES rebuild_artifacts(artifact_id),
+                outcome_artifact_id TEXT NOT NULL REFERENCES rebuild_artifacts(artifact_id),
+                attribution TEXT NOT NULL,
+                evidence_json TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                UNIQUE(lesson_id, decision_context_artifact_id, outcome_artifact_id)
+            );
+            CREATE INDEX IF NOT EXISTS rebuild_lesson_evidence_by_lesson
+                ON rebuild_lesson_evidence(lesson_id);
             "#,
         )?;
         Ok(())
@@ -155,6 +168,95 @@ impl V2Store {
                 )));
             }
             self.verify_lesson_payload(connection, &artifact, &payload)?;
+        }
+        self.verify_lesson_evidence(connection, &head_ids)?;
+        Ok(())
+    }
+
+    /// Doctor pass for the evidence ledger: the key columns must agree with the
+    /// payload, `evidence_id` must be the payload's own identity hash, every
+    /// reference must resolve to an artifact of the declared kind, and every
+    /// `lesson_id` must still have a head.
+    fn verify_lesson_evidence(
+        &self,
+        connection: &Connection,
+        head_ids: &BTreeSet<LessonId>,
+    ) -> StoreResult<()> {
+        if !lesson_evidence_table_exists(connection)? {
+            return Ok(());
+        }
+        let mut statement = connection.prepare(
+            "SELECT evidence_id, lesson_id, lesson_artifact_id, decision_context_artifact_id, outcome_artifact_id, attribution, evidence_json, recorded_at FROM rebuild_lesson_evidence ORDER BY evidence_id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+
+        for (
+            evidence_id,
+            lesson_id,
+            lesson_artifact_id,
+            decision_context_id,
+            outcome_id,
+            attribution,
+            evidence_json,
+            recorded_at,
+        ) in rows
+        {
+            let record: LessonEvidence = serde_json::from_str(&evidence_json)?;
+            record.validate()?;
+            let lesson_id = LessonId(lesson_id);
+            if !head_ids.contains(&lesson_id) {
+                return Err(StoreError::Integrity(format!(
+                    "lesson evidence {evidence_id} has no lesson head"
+                )));
+            }
+            if record.identity_hash()?.as_str() != evidence_id {
+                return Err(StoreError::Integrity(format!(
+                    "lesson evidence {evidence_id} disagrees with its identity hash"
+                )));
+            }
+            let (payload_lesson, payload_context, payload_outcome) = record.idempotency_key();
+            if payload_lesson != lesson_id.0
+                || payload_context != decision_context_id
+                || payload_outcome != outcome_id
+                || record.lesson_artifact.artifact_id.0.as_str() != lesson_artifact_id
+                || record.attribution.as_str() != attribution
+            {
+                return Err(StoreError::Integrity(format!(
+                    "lesson evidence {evidence_id} key columns disagree with its payload"
+                )));
+            }
+            if parse_time(&recorded_at)? != record.recorded_at {
+                return Err(StoreError::Integrity(format!(
+                    "lesson evidence {evidence_id} recorded_at disagrees with its payload"
+                )));
+            }
+            for reference in [
+                &record.lesson_artifact,
+                &record.decision_context,
+                &record.outcome,
+            ] {
+                let referenced = read_artifact(connection, &reference.artifact_id)?;
+                referenced.validate()?;
+                if referenced.kind != reference.kind {
+                    return Err(StoreError::Integrity(format!(
+                        "lesson evidence {evidence_id} reference kind mismatch"
+                    )));
+                }
+            }
         }
         Ok(())
     }

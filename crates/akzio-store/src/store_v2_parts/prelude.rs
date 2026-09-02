@@ -397,6 +397,69 @@ pub struct TrajectoryToolLifecycle {
     pub lifecycle: String,
 }
 
+/// Real provider token usage for one run, aggregated from the persisted
+/// `AgentTurn` artifacts rather than from any context-size estimate.
+///
+/// `ContextManifestPayload::estimated_tokens` counts BLOB bytes the broker put in
+/// front of the model; it is not what the provider billed, it omits the prompt
+/// bundle, tool schemas, reasoning and output entirely, and it says nothing about
+/// the extra calls a lesson-generation, ranking or curation step makes. Only
+/// these per-turn counts can serve as a token basis for a budget-matched
+/// comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RunModelUsage {
+    /// Distinct `AgentTurn` artifacts, i.e. provider calls, including failed
+    /// ones: a failed turn still consumed input tokens.
+    pub turns: u64,
+    /// Turns whose persisted telemetry reported no token counts at all.
+    pub turns_missing_usage: u64,
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub latency_millis: u64,
+}
+
+impl RunModelUsage {
+    /// Every token the provider charged for, cached input included: a cached
+    /// prompt is cheaper, not free, and dropping it would understate a
+    /// context-heavy arm.
+    pub const fn billable_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.cached_input_tokens)
+            .saturating_add(self.output_tokens)
+            .saturating_add(self.reasoning_tokens)
+    }
+
+    /// True only when at least one turn was seen and every one of them reported
+    /// usage.
+    pub const fn is_complete(&self) -> bool {
+        self.turns > 0 && self.turns_missing_usage == 0
+    }
+
+    /// The token basis, or `None` when it would be a partial sum.
+    ///
+    /// A run with unreported turns must report *no* cost rather than an
+    /// understated one: in a token-matched comparison an understated arm looks
+    /// like the cheaper arm, which is the same failure as passing an estimate off
+    /// as a measurement.
+    pub const fn billable_tokens_if_complete(&self) -> Option<u64> {
+        if self.is_complete() {
+            Some(self.billable_tokens())
+        } else {
+            None
+        }
+    }
+
+    pub const fn latency_millis_if_complete(&self) -> Option<u64> {
+        if self.is_complete() {
+            Some(self.latency_millis)
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct StoredTrajectoryTurn {
     turn: Option<u32>,
@@ -426,6 +489,24 @@ struct StoredTrajectoryTelemetry {
     latency_millis: Option<u64>,
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
+    /// Read for cost aggregation only; the redacted `TrajectoryEntry` projection
+    /// deliberately does not carry these.
+    #[serde(default)]
+    cached_input_tokens: Option<u64>,
+    #[serde(default)]
+    reasoning_tokens: Option<u64>,
+}
+
+impl StoredTrajectoryTelemetry {
+    /// A turn with no token field at all was never accounted for; a turn that
+    /// reported any category is accounted for, with the absent categories read as
+    /// zero because the provider did not charge for them.
+    fn reported_usage(&self) -> bool {
+        self.input_tokens.is_some()
+            || self.cached_input_tokens.is_some()
+            || self.output_tokens.is_some()
+            || self.reasoning_tokens.is_some()
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]

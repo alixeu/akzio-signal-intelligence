@@ -74,7 +74,7 @@ fn paired_observations(
                 let parent = akzio_domain::CanaryPairedOutcomeMetrics {
                     observed_trading_day,
                     evidence_completeness_ppm: 950_000,
-                    risk_recall_ppm: 950_000,
+                    risk_recall_ppm: Some(950_000),
                     cost_adjusted_utility_ppm: 1_000,
                     drawdown_ppm: 1_000,
                     tail_loss_ppm: 1_000,

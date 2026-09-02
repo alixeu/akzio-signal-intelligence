@@ -230,6 +230,14 @@ impl Daemon {
             return Ok(true);
         }
 
+        // Each candidate arm is charged its own shadow run, not the parent's:
+        // `shadow_run_ids` is ordered contract, topology, bundle, and each
+        // candidate schedule names the decision that run produced.
+        let candidate_usage = shadow_outcomes
+            .iter()
+            .map(|(_, _, schedule)| self.store.model_usage_for_producing_run(&schedule.decision))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
         let current_contract = self
             .store
             .policy_head(&contract_subject)?
@@ -254,8 +262,8 @@ impl Daemon {
                     },
                     candidate: campaign.spec.candidate_contract.clone(),
                 }),
-                token_cost: None,
-                latency_millis: None,
+                token_cost: candidate_usage[0].billable_tokens_if_complete(),
+                latency_millis: candidate_usage[0].latency_millis_if_complete(),
             },
             retrospective_draft,
             canary.target_policy_state(
@@ -287,8 +295,8 @@ impl Daemon {
                     baseline: parent_topology,
                     candidate: campaign.spec.candidate_topology.clone(),
                 }),
-                token_cost: None,
-                latency_millis: None,
+                token_cost: candidate_usage[1].billable_tokens_if_complete(),
+                latency_millis: candidate_usage[1].latency_millis_if_complete(),
             },
             retrospective_draft,
             canary.target_policy_state(
@@ -315,8 +323,8 @@ impl Daemon {
             contract_hash: candidate_contract_hash,
             topology_id: TopologyId(candidate_topology_id),
             candidate_policy: None,
-            token_cost: None,
-            latency_millis: None,
+            token_cost: candidate_usage[2].billable_tokens_if_complete(),
+            latency_millis: candidate_usage[2].latency_millis_if_complete(),
         };
         if verdict == akzio_domain::CanaryVerdict::Advance {
             if let Some(draft) = retrospective_draft {

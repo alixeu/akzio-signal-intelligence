@@ -1,10 +1,19 @@
 use super::*;
 
+/// Index the model's per-asset up-probabilities by horizon.
+///
+/// Deliberately returns the per-asset probabilities rather than a
+/// portfolio-weighted scalar. `positive_return_probability_ppm` forecasts a
+/// single asset's own direction, so the only event it can be scored against is
+/// that asset's realized direction. A position-weighted average of marginal
+/// probabilities is not the probability that the portfolio return is positive
+/// (that needs the assets' joint distribution), and weighting by the target
+/// portfolio would fold the allocation decision into the forecast-quality
+/// measurement.
 pub(super) fn index_forecasts(
-    target: &TargetPortfolio,
     forecasts: &[Forecast],
-) -> EvaluationRuntimeResult<BTreeMap<OutcomeHorizon, u32>> {
-    let mut by_horizon = BTreeMap::<OutcomeHorizon, BTreeMap<Asset, &Forecast>>::new();
+) -> EvaluationRuntimeResult<BTreeMap<OutcomeHorizon, BTreeMap<Asset, u32>>> {
+    let mut by_horizon = BTreeMap::<OutcomeHorizon, BTreeMap<Asset, u32>>::new();
     for forecast in forecasts {
         forecast.validate()?;
         let horizon = match forecast.horizon {
@@ -12,8 +21,12 @@ pub(super) fn index_forecasts(
             DecisionHorizon::T3 => OutcomeHorizon::T3,
             DecisionHorizon::T5 => OutcomeHorizon::T5,
         };
-        let by_asset = by_horizon.entry(horizon).or_default();
-        if by_asset.insert(forecast.asset, forecast).is_some() {
+        if by_horizon
+            .entry(horizon)
+            .or_default()
+            .insert(forecast.asset, forecast.positive_return_probability_ppm)
+            .is_some()
+        {
             return Err(EvaluationError::InvalidMaterialization(
                 "duplicate forecast horizon",
             ));
@@ -24,50 +37,64 @@ pub(super) fn index_forecasts(
             "missing forecast horizon",
         ));
     }
+    for by_asset in by_horizon.values() {
+        if by_asset.len() != 1
+            && (by_asset.len() != Asset::EXECUTABLE.len()
+                || Asset::EXECUTABLE
+                    .into_iter()
+                    .any(|asset| !by_asset.contains_key(&asset)))
+        {
+            return Err(EvaluationError::InvalidMaterialization(
+                "forecast asset coverage",
+            ));
+        }
+    }
+    Ok(by_horizon)
+}
 
-    OutcomeHorizon::ALL
-        .into_iter()
-        .map(|horizon| {
-            let by_asset = by_horizon
-                .get(&horizon)
-                .expect("forecast horizon presence checked above");
-            let probability = if by_asset.len() == 1 {
-                by_asset
-                    .values()
-                    .next()
-                    .expect("single forecast presence checked above")
-                    .positive_return_probability_ppm
-            } else {
-                if by_asset.len() != Asset::EXECUTABLE.len()
-                    || Asset::EXECUTABLE
-                        .into_iter()
-                        .any(|asset| !by_asset.contains_key(&asset))
-                {
-                    return Err(EvaluationError::InvalidMaterialization(
-                        "forecast asset coverage",
-                    ));
-                }
-                let weighted = target
-                    .weights
-                    .iter()
-                    .try_fold(0_i128, |sum, (asset, weight)| {
-                        sum.checked_add(
-                            i128::from(weight.0)
-                                * i128::from(
-                                    by_asset
-                                        .get(asset)
-                                        .expect("forecast asset coverage checked above")
-                                        .positive_return_probability_ppm,
-                                ),
-                        )
-                        .ok_or(EvaluationError::ArithmeticOverflow)
-                    })?;
-                u32::try_from(weighted / i128::from(PPM_ONE))
-                    .map_err(|_| EvaluationError::ArithmeticOverflow)?
-            };
-            Ok((horizon, probability))
-        })
-        .collect()
+/// Brier score for one binary forecast, in ppm.
+///
+/// `(p - o)^2` where `o` is 1 when the asset actually rose. Lower is better and
+/// the range is `[0, PPM_ONE]`.
+fn asset_brier_ppm(probability_ppm: u32, realized_positive: bool) -> u32 {
+    let outcome_ppm = if realized_positive {
+        i64::from(PPM_ONE)
+    } else {
+        0
+    };
+    let difference = i64::from(probability_ppm) - outcome_ppm;
+    let squared = i128::from(difference) * i128::from(difference) / i128::from(PPM_ONE);
+    u32::try_from(squared).unwrap_or(PPM_ONE)
+}
+
+/// Macro-average the per-asset Brier scores for one horizon and convert to the
+/// higher-is-better quality scale that `calibration_ppm` is consumed on.
+///
+/// The average is unweighted on purpose: weighting by target portfolio would
+/// make forecast quality depend on the allocation decision. The polarity flip is
+/// required because `CanaryPairedOutcomeMetrics::from_outcome_window` maps
+/// `calibration_ppm` onto `confidence_ppm`, which the promotion policy gates
+/// with `>= minimum_confidence_ppm`. Storing a raw Brier there would reward
+/// worse forecasts.
+pub(super) fn calibration_quality_ppm(
+    probabilities_by_asset: &BTreeMap<Asset, u32>,
+    baseline_prices: &BTreeMap<Asset, MoneyMicros>,
+    future_prices: &BTreeMap<Asset, MoneyMicros>,
+) -> EvaluationRuntimeResult<Option<u32>> {
+    if probabilities_by_asset.is_empty() {
+        return Ok(None);
+    }
+    let mut total_brier_ppm = 0_u128;
+    for (asset, probability_ppm) in probabilities_by_asset {
+        let realized = return_ppm(
+            price(baseline_prices, *asset)?,
+            price(future_prices, *asset)?,
+        )?;
+        total_brier_ppm += u128::from(asset_brier_ppm(*probability_ppm, realized > 0));
+    }
+    let mean_brier_ppm = u32::try_from(total_brier_ppm / probabilities_by_asset.len() as u128)
+        .map_err(|_| EvaluationError::ArithmeticOverflow)?;
+    Ok(Some(PPM_ONE.saturating_sub(mean_brier_ppm)))
 }
 
 pub(super) fn index_observations<'a>(
@@ -206,10 +233,15 @@ pub(super) fn marginal_utility(outcome: &Outcome) -> i64 {
 
 /// Promote memory only after a fresh T+1/T+3/T+5 evaluation passes quality
 /// gates; contract/topology promotion remains owned by their canary policy.
+///
+/// `risk_recall_measured` is a hard precondition for any forward transition.
+/// When risk recall was never measured the subject holds its current state:
+/// unmeasured evidence must not be readable as either a pass or a failure.
 pub(super) fn next_state_with_fresh_pairs(
     current: PolicyState,
     target: Option<PolicyState>,
     degraded: bool,
+    risk_recall_measured: bool,
     fresh_pairs_by_horizon: [u64; 3],
     minimum_fresh_pairs_per_horizon: u64,
 ) -> PolicyState {
@@ -234,10 +266,15 @@ pub(super) fn next_state_with_fresh_pairs(
         })
     };
 
-    if !is_forward_transition(current, next)
-        || fresh_pairs_by_horizon
-            .iter()
-            .all(|&count| count >= minimum_fresh_pairs_per_horizon)
+    if !is_forward_transition(current, next) {
+        return next;
+    }
+    if !risk_recall_measured {
+        return current;
+    }
+    if fresh_pairs_by_horizon
+        .iter()
+        .all(|&count| count >= minimum_fresh_pairs_per_horizon)
     {
         next
     } else {

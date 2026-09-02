@@ -121,6 +121,113 @@ impl V2Store {
         Ok(entries)
     }
 
+    /// Aggregate the real provider usage persisted for one run.
+    ///
+    /// Counted per distinct `AgentTurn` artifact, not per event: a single turn is
+    /// announced by `AgentTurnStarted` and closed by one of `AgentTurn`,
+    /// `AgentTurnCompleted`, `AgentTurnFailed` or `AgentTurnRetryableFailed`, and
+    /// several of those can name the same artifact. The artifact is the provider
+    /// call, so it is the unit of cost.
+    pub fn run_model_usage(&self, run_id: &RunId) -> StoreResult<RunModelUsage> {
+        const PAGE_SIZE: usize = 256;
+        let mut after = 0_i64;
+        let mut counted = BTreeSet::new();
+        let mut usage = RunModelUsage::default();
+        loop {
+            let page = self.events_after(run_id, after, PAGE_SIZE)?;
+            if page.is_empty() {
+                break;
+            }
+            after = page.last().expect("non-empty usage page").cursor;
+            for event in &page {
+                if !matches!(
+                    event.lifecycle_kind()?,
+                    LifecycleEventType::AgentTurn
+                        | LifecycleEventType::AgentTurnCompleted
+                        | LifecycleEventType::AgentTurnFailed
+                        | LifecycleEventType::AgentTurnRetryableFailed
+                ) {
+                    continue;
+                }
+                let Some(artifact_id) = event.artifact_id.as_ref() else {
+                    continue;
+                };
+                if !counted.insert(artifact_id.clone()) {
+                    continue;
+                }
+                let artifact = self.artifact(artifact_id)?;
+                if artifact.kind != ArtifactKind::AgentTurn {
+                    return Err(StoreError::Integrity(format!(
+                        "usage event {} references {:?}, expected agent_turn",
+                        event.cursor, artifact.kind
+                    )));
+                }
+                usage.turns += 1;
+                let payload: StoredTrajectoryTurn =
+                    match serde_json::from_slice(&self.read_blob(&artifact.blob)?) {
+                        Ok(payload) => payload,
+                        // An unreadable turn payload is an unaccounted call, not a
+                        // free one.
+                        Err(_) => {
+                            usage.turns_missing_usage += 1;
+                            continue;
+                        }
+                    };
+                let telemetry = payload
+                    .response
+                    .as_ref()
+                    .and_then(|response| response.telemetry.as_ref())
+                    .or(payload.telemetry.as_ref());
+                let Some(telemetry) = telemetry.filter(|telemetry| telemetry.reported_usage())
+                else {
+                    usage.turns_missing_usage += 1;
+                    continue;
+                };
+                usage.input_tokens = usage
+                    .input_tokens
+                    .saturating_add(telemetry.input_tokens.unwrap_or_default());
+                usage.cached_input_tokens = usage
+                    .cached_input_tokens
+                    .saturating_add(telemetry.cached_input_tokens.unwrap_or_default());
+                usage.output_tokens = usage
+                    .output_tokens
+                    .saturating_add(telemetry.output_tokens.unwrap_or_default());
+                usage.reasoning_tokens = usage
+                    .reasoning_tokens
+                    .saturating_add(telemetry.reasoning_tokens.unwrap_or_default());
+                usage.latency_millis = usage
+                    .latency_millis
+                    .saturating_add(telemetry.latency_millis.unwrap_or_default());
+            }
+            if page.len() < PAGE_SIZE {
+                break;
+            }
+        }
+        Ok(usage)
+    }
+
+    /// Aggregate the usage of the run that produced `artifact`.
+    ///
+    /// The cost that belongs next to a policy's realized utility is what the
+    /// *decision* run spent, not what the later outcome-collection run spent, and
+    /// the producing run is only recoverable from the artifact's own origin.
+    pub fn model_usage_for_producing_run(
+        &self,
+        artifact: &ArtifactRef,
+    ) -> StoreResult<RunModelUsage> {
+        let stored = self.artifact(&artifact.artifact_id)?;
+        if stored.kind != artifact.kind {
+            return Err(StoreError::Integrity(format!(
+                "artifact {} is {:?}, expected {:?}",
+                artifact.artifact_id.0, stored.kind, artifact.kind
+            )));
+        }
+        let Some(run_id) = stored.origin.and_then(|origin| origin.run_id) else {
+            return Ok(RunModelUsage::default());
+        };
+        self.run_model_usage(&run_id)
+    }
+
     /// Return the newest redacted trajectory entries in durable cursor order.
     /// The hard cap keeps observer reads bounded even for long-running tasks.
     pub fn recent_trajectory(

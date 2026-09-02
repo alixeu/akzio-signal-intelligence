@@ -113,6 +113,136 @@ impl V2Store {
         })
     }
 
+    /// Append observational evidence linking Lesson revisions to sealed outcomes.
+    ///
+    /// Idempotent on `(lesson_id, decision_context, outcome)`: reprocessing the
+    /// same triple is a no-op, and a *different* payload on an existing triple is
+    /// an integrity error because the ledger is immutable. Keyed on the stable
+    /// `lesson_id` rather than the Lesson artifact so that a later lifecycle
+    /// transition, which writes a new artifact, does not orphan prior evidence.
+    pub fn record_lesson_evidence(
+        &self,
+        records: &[LessonEvidence],
+        now: DateTime<Utc>,
+    ) -> StoreResult<u64> {
+        self.ensure_lesson_tables()?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut inserted = 0_u64;
+        for record in records {
+            record.validate()?;
+            if record.recorded_at > now {
+                return Err(StoreError::InvalidLearningCommit(
+                    "lesson_evidence.recorded_at",
+                ));
+            }
+            let (lesson_id, decision_context_id, outcome_id) = record.idempotency_key();
+            if transaction
+                .query_row(
+                    "SELECT 1 FROM rebuild_lesson_heads WHERE lesson_id = ?1",
+                    params![lesson_id.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .is_none()
+            {
+                return Err(StoreError::InvalidLearningCommit("lesson_evidence.lesson"));
+            }
+            // Provenance closure: every reference must resolve to a real artifact
+            // of the declared kind before the record becomes durable.
+            for reference in [
+                &record.lesson_artifact,
+                &record.decision_context,
+                &record.outcome,
+            ] {
+                let artifact = read_artifact(&transaction, &reference.artifact_id)?;
+                artifact.validate()?;
+                if artifact.kind != reference.kind {
+                    return Err(StoreError::InvalidLearningCommit(
+                        "lesson_evidence.reference_kind",
+                    ));
+                }
+            }
+
+            let evidence_id = record.identity_hash()?;
+            let evidence_json = serde_json::to_string(record)?;
+            let existing: Option<String> = transaction
+                .query_row(
+                    "SELECT evidence_json FROM rebuild_lesson_evidence WHERE lesson_id = ?1 AND decision_context_artifact_id = ?2 AND outcome_artifact_id = ?3",
+                    params![
+                        lesson_id.as_str(),
+                        decision_context_id.as_str(),
+                        outcome_id.as_str(),
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if let Some(existing) = existing {
+                let existing: LessonEvidence = serde_json::from_str(&existing)?;
+                // Compared on the observation, not on `recorded_at`: a genuine
+                // reprocess of the same sealed decision arrives with a later
+                // timestamp and must stay a no-op that keeps the first record.
+                if !existing.describes_same_observation(record) {
+                    return Err(StoreError::Integrity(format!(
+                        "lesson evidence for {lesson_id} is immutable"
+                    )));
+                }
+                continue;
+            }
+            transaction.execute(
+                "INSERT INTO rebuild_lesson_evidence (evidence_id, lesson_id, lesson_artifact_id, decision_context_artifact_id, outcome_artifact_id, attribution, evidence_json, recorded_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    evidence_id.as_str(),
+                    lesson_id.as_str(),
+                    record.lesson_artifact.artifact_id.0.as_str(),
+                    decision_context_id.as_str(),
+                    outcome_id.as_str(),
+                    record.attribution.as_str(),
+                    evidence_json,
+                    record.recorded_at.to_rfc3339(),
+                ],
+            )?;
+            inserted += 1;
+        }
+        transaction.commit()?;
+        Ok(inserted)
+    }
+
+    pub fn lesson_evidence(&self, lesson_id: &LessonId) -> StoreResult<Vec<LessonEvidence>> {
+        let connection = self.connection()?;
+        if ensure_lesson_table_set(&connection)? != 3 {
+            return Ok(Vec::new());
+        }
+        let mut statement = connection.prepare(
+            "SELECT evidence_json FROM rebuild_lesson_evidence WHERE lesson_id = ?1 ORDER BY recorded_at, evidence_id",
+        )?;
+        let rows = statement
+            .query_map(params![lesson_id.0.as_str()], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        drop(connection);
+        rows.into_iter()
+            .map(|row| {
+                let record: LessonEvidence = serde_json::from_str(&row)?;
+                record.validate()?;
+                Ok(record)
+            })
+            .collect()
+    }
+
+    /// Observational rollup only. See `LessonEvidence` for why these counts
+    /// cannot be read as the Lesson's causal effect.
+    pub fn lesson_evidence_summary(
+        &self,
+        lesson_id: &LessonId,
+    ) -> StoreResult<LessonEvidenceSummary> {
+        Ok(LessonEvidenceSummary::from_records(
+            &self.lesson_evidence(lesson_id)?,
+        ))
+    }
+
     pub fn lesson(&self, lesson_id: &LessonId) -> StoreResult<Option<StoredLesson>> {
         let mut connection = self.connection()?;
         if ensure_lesson_table_set(&connection)? == 0 {

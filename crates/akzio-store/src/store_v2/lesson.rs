@@ -1,6 +1,9 @@
 use super::*;
 
-use akzio_domain::{Artifact, ArtifactKind, ArtifactLifecycle, ArtifactRef, LessonOrigin};
+use akzio_domain::{
+    Artifact, ArtifactKind, ArtifactLifecycle, ArtifactRef, LessonEvidence, LessonEvidenceSummary,
+    LessonOrigin,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredLesson {

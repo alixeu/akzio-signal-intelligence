@@ -5,6 +5,7 @@
 mod campaign;
 mod evaluation;
 mod frozen_eval;
+mod lesson_evidence;
 mod outcome_schedule;
 
 use akzio_domain::{ArtifactProvenance, TaskWritePermit};

@@ -254,6 +254,39 @@ impl ContextBroker {
             return Err(ContextError::BudgetExceeded);
         }
 
+        self.mint_manifest(
+            permit,
+            contract,
+            selections,
+            total_bytes,
+            estimated_tokens,
+            Vec::new(),
+            now,
+            grant_ttl,
+        )
+    }
+
+    /// Persist a manifest over an already-budgeted selection list and mint its
+    /// grant.
+    ///
+    /// `extra_source_refs` records lineage that is not itself a selection — the
+    /// baseline manifest an ablation arm was derived from. Only
+    /// `ArtifactKind::ContextManifest` refs belong there, because
+    /// `validate_manifest_closure` reconstructs the expected `source_refs` as the
+    /// selections plus exactly those.
+    #[allow(clippy::too_many_arguments)]
+    fn mint_manifest(
+        &self,
+        permit: &TaskWritePermit,
+        contract: &AgentContract,
+        selections: Vec<ContextSelection>,
+        total_bytes: u64,
+        estimated_tokens: u32,
+        extra_source_refs: Vec<ArtifactRef>,
+        now: DateTime<Utc>,
+        grant_ttl: Duration,
+    ) -> ContextResult<ContextManifest> {
+        let policy = &contract.context;
         let input_hash = manifest_input_hash(&selections)?;
         let payload = ContextManifestPayload {
             schema_version: V2_DOMAIN_SCHEMA_VERSION,
@@ -287,6 +320,7 @@ impl ContextBroker {
             selections
                 .iter()
                 .map(|selection| selection.artifact.clone())
+                .chain(extra_source_refs)
                 .collect(),
             now,
         )?;
@@ -316,6 +350,79 @@ impl ContextBroker {
             payload,
             grant,
         })
+    }
+
+    /// Derive the Lesson-off arm of a paired experiment from the Lesson-on
+    /// manifest.
+    ///
+    /// Deliberately **not** a re-run of `assemble` with Lessons suppressed. The
+    /// budget filler there skips an oversized candidate and keeps going, so
+    /// removing the Lessons frees artifact, byte and token capacity that the next
+    /// candidates immediately refill — and the two arms would then differ by
+    /// whatever moved in rather than by the Lessons. Copying the baseline's
+    /// non-Lesson selections verbatim makes that refill structurally impossible:
+    /// the filler never runs.
+    ///
+    /// The result names the baseline manifest in its `source_refs`, which is what
+    /// pairs the two arms durably and content-addressably.
+    pub fn assemble_lesson_ablation(
+        &self,
+        permit: &TaskWritePermit,
+        contract: &AgentContract,
+        baseline: &ContextManifest,
+        now: DateTime<Utc>,
+        grant_ttl: Duration,
+    ) -> ContextResult<ContextManifest> {
+        // The ablation copies the selection list only and mints its own grant, so
+        // an expired baseline grant is not a read-authority leak. The baseline's
+        // closure must still be intact, or the arm would be derived from an
+        // unverified selection list.
+        self.validate_manifest_closure(permit, contract, baseline, now, false)?;
+        let policy = &contract.context;
+        let mut total_bytes = 0_u64;
+        let mut estimated_tokens = 0_u32;
+        let mut selections = Vec::with_capacity(baseline.payload.selections.len());
+        let mut ablated = 0_usize;
+        for selection in &baseline.payload.selections {
+            if selection.artifact.kind == ArtifactKind::Lesson {
+                ablated += 1;
+                continue;
+            }
+            // Overlay eligibility reads the mutable policy head. If a kept
+            // artifact has since become ineligible the arms are no longer
+            // comparable, so fail instead of silently dropping it and
+            // reintroducing the very asymmetry this method exists to prevent.
+            let artifact = self.store.artifact(&selection.artifact.artifact_id)?;
+            self.assert_context_permitted(policy, &artifact)?;
+            if !self.overlay_is_eligible(&artifact)? {
+                return Err(ContextError::ForbiddenArtifact {
+                    artifact_id: selection.artifact.artifact_id.clone(),
+                });
+            }
+            total_bytes = total_bytes.saturating_add(artifact.blob.bytes);
+            estimated_tokens = estimated_tokens.saturating_add(selection.estimated_tokens);
+            selections.push(selection.clone());
+        }
+        if ablated == 0 {
+            return Err(ContextError::NoLessonToAblate);
+        }
+        if selections.len() < usize::from(policy.min_artifacts) {
+            return Err(ContextError::BudgetExceeded);
+        }
+
+        self.mint_manifest(
+            permit,
+            contract,
+            selections,
+            total_bytes,
+            estimated_tokens,
+            vec![ArtifactRef {
+                artifact_id: baseline.artifact.artifact_id.clone(),
+                kind: ArtifactKind::ContextManifest,
+            }],
+            now,
+            grant_ttl,
+        )
     }
 
     fn learning_candidates(

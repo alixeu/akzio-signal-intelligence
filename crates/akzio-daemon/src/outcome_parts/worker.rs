@@ -205,6 +205,13 @@ impl Daemon {
             return Ok(TaskCompletion::Committed);
         }
 
+        // Real provider usage, aggregated from the decision run's persisted
+        // turns. Not this worker's run: the cost that belongs beside a policy's
+        // realized utility is what producing the decision spent. `None` when any
+        // turn went unreported, so a partial sum never reads as a cheap arm.
+        let decision_usage = self
+            .store
+            .model_usage_for_producing_run(&schedule.decision)?;
         let input = EvaluationInput {
             permit: task.permit.clone(),
             subject: PolicySubject::Memory(MemoryId("paper:default".to_owned())),
@@ -213,8 +220,8 @@ impl Daemon {
             contract_hash,
             topology_id: TopologyId("paper-outcome".to_owned()),
             candidate_policy: None,
-            token_cost: None,
-            latency_millis: None,
+            token_cost: decision_usage.billable_tokens_if_complete(),
+            latency_millis: decision_usage.latency_millis_if_complete(),
         };
         if let Some(draft) = retrospective_draft.as_ref() {
             let result = evaluation.evaluate_with_lease_and_retrospective(

@@ -12,7 +12,7 @@ pub fn materialize_outcome(
     input.cost_model.validate()?;
     validate_prices(&input.baseline_prices)?;
 
-    let forecasts = index_forecasts(&input.target, &input.forecasts)?;
+    let forecasts = index_forecasts(&input.forecasts)?;
     let observations = index_observations(&input.schedule, &input.observations)?;
     let mut market_evidence = input.market_evidence.clone();
     market_evidence.sort();
@@ -20,7 +20,7 @@ pub fn materialize_outcome(
 
     let mut windows = Vec::with_capacity(OutcomeHorizon::ALL.len());
     for horizon in OutcomeHorizon::ALL {
-        let _forecast_probability_ppm = forecasts
+        let probabilities_by_asset = forecasts
             .get(&horizon)
             .expect("index_forecasts requires all horizons");
         let observation = observations
@@ -48,7 +48,11 @@ pub fn materialize_outcome(
             transaction_cost_ppm: input.cost_model.transaction_cost_ppm,
             slippage_ppm: input.cost_model.slippage_ppm,
             utility_ppm,
-            calibration_ppm: None,
+            calibration_ppm: calibration_quality_ppm(
+                probabilities_by_asset,
+                &input.baseline_prices,
+                &observation.future_prices,
+            )?,
             evidence_completeness_ppm: bounded_ratio_ppm(
                 observation.expected_evidence_count,
                 observation.observed_evidence_count,

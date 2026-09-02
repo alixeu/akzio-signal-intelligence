@@ -46,13 +46,27 @@ impl Default for EvaluationPolicy {
 }
 
 impl EvaluationPolicy {
+    /// Degradation must rest on observed evidence, never on absent evidence.
+    /// A window whose `risk_recall_ppm` is `None` was never measured, so it
+    /// cannot prove degradation; `risk_recall_is_measured` gates promotion
+    /// separately so an unmeasured outcome neither promotes nor demotes.
     pub fn outcome_is_degraded(&self, outcome: &Outcome) -> bool {
         outcome.windows.iter().any(|window| {
             window.evidence_completeness_ppm < self.minimum_evidence_completeness_ppm
                 || window
                     .risk_recall_ppm
-                    .is_none_or(|value| value < self.minimum_risk_recall_ppm)
+                    .is_some_and(|value| value < self.minimum_risk_recall_ppm)
         })
+    }
+
+    /// True only when every window carries a measured risk recall. Forward
+    /// policy transitions require this; without it an outcome that silently
+    /// skipped risk measurement could buy a promotion.
+    pub fn risk_recall_is_measured(&self, outcome: &Outcome) -> bool {
+        outcome
+            .windows
+            .iter()
+            .all(|window| window.risk_recall_ppm.is_some())
     }
 
     fn validate(&self) -> Result<(), EvaluationError> {
@@ -281,7 +295,7 @@ pub type EvaluationRuntimeResult<T> = Result<T, EvaluationError>;
 
 #[derive(Debug, Clone)]
 pub struct EvaluationRuntime {
-    store: V2Store,
+    pub(crate) store: V2Store,
     policy: EvaluationPolicy,
 }
 
@@ -294,9 +308,9 @@ include!("evaluation_parts/materialize_partial.rs");
 #[path = "metrics.rs"]
 mod metrics;
 use metrics::{
-    bounded_ratio_ppm, execution_verdict, index_forecasts, index_observations, marginal_utility,
-    next_state_with_fresh_pairs, portfolio_return_ppm, price, reference, require_canonical_purpose,
-    return_ppm, stable_id, validate_prices,
+    bounded_ratio_ppm, calibration_quality_ppm, execution_verdict, index_forecasts,
+    index_observations, marginal_utility, next_state_with_fresh_pairs, portfolio_return_ppm, price,
+    reference, require_canonical_purpose, return_ppm, stable_id, validate_prices,
 };
 #[cfg(test)]
 #[path = "tests.rs"]

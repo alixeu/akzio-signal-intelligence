@@ -39,6 +39,7 @@ impl EvaluationRuntime {
         let pair_snapshot = self.store.policy_shadow_pair_snapshot(&input.subject)?;
         let fresh_pairs_by_horizon = pair_snapshot.counts_by_horizon;
         let degraded = self.policy.outcome_is_degraded(&outcome);
+        let risk_recall_measured = self.policy.risk_recall_is_measured(&outcome);
 
         let origin = input.permit.artifact_origin();
         let provenance = crate::trusted_learning_provenance(&input.permit, created_at);
@@ -229,6 +230,7 @@ impl EvaluationRuntime {
             current,
             target_state,
             degraded,
+            risk_recall_measured,
             fresh_pairs_by_horizon,
             self.policy.minimum_fresh_pairs_per_horizon,
         );

@@ -117,6 +117,7 @@ fn topology_forward_promotion_is_disabled_and_degradation_rolls_back() {
             PolicyState::Topology(CandidatePolicyState::Canary50),
             None,
             true,
+            true,
             [0, 0, 0],
             2,
         ),

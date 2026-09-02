@@ -217,11 +217,18 @@ impl CanaryCohortManifest {
     }
 }
 
+/// Paired canary metrics for one horizon.
+///
+/// `risk_recall_ppm` stays `Option` all the way to the verdict so that
+/// "measured zero recall" and "not measured yet" never collapse into the same
+/// value. Collapsing them with `unwrap_or_default` would make an unmeasured
+/// window indistinguishable from total risk-detection failure and force a
+/// rollback on absent evidence rather than on observed degradation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CanaryPairedOutcomeMetrics {
     pub observed_trading_day: NaiveDate,
     pub evidence_completeness_ppm: u32,
-    pub risk_recall_ppm: u32,
+    pub risk_recall_ppm: Option<u32>,
     pub cost_adjusted_utility_ppm: i64,
     pub drawdown_ppm: u32,
     pub tail_loss_ppm: u32,
@@ -233,7 +240,7 @@ impl CanaryPairedOutcomeMetrics {
         Self {
             observed_trading_day: window.observed_trading_day,
             evidence_completeness_ppm: window.evidence_completeness_ppm,
-            risk_recall_ppm: window.risk_recall_ppm.unwrap_or_default(),
+            risk_recall_ppm: window.risk_recall_ppm,
             cost_adjusted_utility_ppm: window.utility_ppm,
             drawdown_ppm: negative_ppm(window.portfolio_return_ppm),
             tail_loss_ppm: negative_ppm(window.utility_ppm),
@@ -241,15 +248,22 @@ impl CanaryPairedOutcomeMetrics {
         }
     }
 
+    /// False when risk recall was never measured for this window. Callers must
+    /// defer instead of promoting or rolling back on an unmeasured metric.
+    pub const fn risk_recall_is_measured(&self) -> bool {
+        self.risk_recall_ppm.is_some()
+    }
+
     pub fn validate(&self) -> Result<(), DomainError> {
         if [
-            self.evidence_completeness_ppm,
+            Some(self.evidence_completeness_ppm),
             self.risk_recall_ppm,
-            self.drawdown_ppm,
-            self.tail_loss_ppm,
-            self.confidence_ppm,
+            Some(self.drawdown_ppm),
+            Some(self.tail_loss_ppm),
+            Some(self.confidence_ppm),
         ]
         .into_iter()
+        .flatten()
         .any(|value| value > 1_000_000)
         {
             return Err(DomainError::InvalidBudget {
@@ -267,6 +281,13 @@ pub struct CanaryPairedSubjectMetrics {
 }
 
 impl CanaryPairedSubjectMetrics {
+    /// False when either side of the pair lacks a measured risk recall. An
+    /// unmeasured pair carries no risk evidence at all, so it can neither
+    /// justify promotion nor prove degradation.
+    pub const fn risk_recall_is_measured(&self) -> bool {
+        self.parent.risk_recall_is_measured() && self.candidate.risk_recall_is_measured()
+    }
+
     pub fn validate(&self) -> Result<(), DomainError> {
         self.parent.validate()?;
         self.candidate.validate()?;
@@ -574,11 +595,12 @@ mod tests {
     use chrono::NaiveDate;
 
     use super::{
-        CanaryCampaignStatus, CanaryCohortManifest, CanaryPromotionPolicy,
-        CanarySessionReservation, CanaryVerdict,
+        CanaryCampaignStatus, CanaryCohortManifest, CanaryPairedOutcomeMetrics,
+        CanaryPromotionPolicy, CanarySessionReservation, CanaryVerdict,
     };
     use crate::{
-        Asset, ContentHash, OutcomeCostModel, RunId, TopologyId, V2_DOMAIN_SCHEMA_VERSION,
+        content_hash_json, Asset, ContentHash, OutcomeCostModel, RunId, TopologyId,
+        V2_DOMAIN_SCHEMA_VERSION,
     };
 
     fn policy() -> CanaryPromotionPolicy {
@@ -680,6 +702,82 @@ mod tests {
         let mut reused = manifest;
         reused.promotion_dataset_id = reused.generation_dataset_id.clone();
         assert!(reused.seal().validate().is_err());
+    }
+
+    /// `risk_recall_ppm` moved from `u32` to `Option<u32>`. Every already
+    /// persisted canary observation must keep byte-identical JSON, because
+    /// `observation_id` and `observation_set_hash` are derived from that JSON
+    /// and the Store rejects a row whose payload no longer matches. This test
+    /// is the licence for the type change: serde renders `Some(v)` as the bare
+    /// `v`, so only newly written unmeasured rows carry `null`.
+    #[test]
+    fn legacy_measured_risk_recall_round_trips_without_changing_its_hash() {
+        let legacy = serde_json::json!({
+            "observed_trading_day": "2026-08-25",
+            "evidence_completeness_ppm": 950_000,
+            "risk_recall_ppm": 950_000,
+            "cost_adjusted_utility_ppm": 1_000,
+            "drawdown_ppm": 1_000,
+            "tail_loss_ppm": 1_000,
+            "confidence_ppm": 900_000,
+        });
+
+        let decoded: CanaryPairedOutcomeMetrics =
+            serde_json::from_value(legacy.clone()).expect("legacy row decodes into Option");
+        assert_eq!(
+            decoded.risk_recall_ppm,
+            Some(950_000),
+            "a legacy bare number must decode as measured, not as unmeasured"
+        );
+        assert!(decoded.risk_recall_is_measured());
+
+        let reencoded = serde_json::to_value(decoded).expect("metrics serialize");
+        assert_eq!(
+            reencoded, legacy,
+            "re-encoding a legacy row must be byte-identical or every persisted \
+             observation_id and observation_set_hash would change"
+        );
+        assert_eq!(
+            content_hash_json(&reencoded).unwrap(),
+            content_hash_json(&legacy).unwrap()
+        );
+    }
+
+    /// Unmeasured is a distinct wire value, and it must not validate as a
+    /// measured zero.
+    #[test]
+    fn unmeasured_risk_recall_is_null_and_never_reads_as_measured_zero() {
+        let unmeasured = CanaryPairedOutcomeMetrics {
+            observed_trading_day: NaiveDate::from_ymd_opt(2026, 8, 25).unwrap(),
+            evidence_completeness_ppm: 950_000,
+            risk_recall_ppm: None,
+            cost_adjusted_utility_ppm: 1_000,
+            drawdown_ppm: 1_000,
+            tail_loss_ppm: 1_000,
+            confidence_ppm: 900_000,
+        };
+        unmeasured.validate().unwrap();
+        assert!(!unmeasured.risk_recall_is_measured());
+        assert_eq!(
+            serde_json::to_value(unmeasured).unwrap()["risk_recall_ppm"],
+            serde_json::Value::Null
+        );
+
+        let measured_zero = CanaryPairedOutcomeMetrics {
+            risk_recall_ppm: Some(0),
+            ..unmeasured
+        };
+        assert!(measured_zero.risk_recall_is_measured());
+        assert_ne!(measured_zero, unmeasured);
+
+        let out_of_range = CanaryPairedOutcomeMetrics {
+            risk_recall_ppm: Some(1_000_001),
+            ..unmeasured
+        };
+        assert!(
+            out_of_range.validate().is_err(),
+            "the ppm bound must still apply to a measured value"
+        );
     }
 
     #[test]

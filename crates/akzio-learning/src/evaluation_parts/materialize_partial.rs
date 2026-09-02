@@ -14,7 +14,7 @@ pub fn materialize_partial_outcome(
     input.cost_model.validate()?;
     validate_prices(&input.baseline_prices)?;
 
-    let forecasts = index_forecasts(&input.target, &input.forecasts)?;
+    let forecasts = index_forecasts(&input.forecasts)?;
     let mut observations = BTreeMap::new();
     for observation in &input.observations {
         if !observation
@@ -45,7 +45,7 @@ pub fn materialize_partial_outcome(
     market_evidence.dedup();
     let mut windows = Vec::with_capacity(observations.len());
     for (horizon, observation) in observations {
-        let _forecast_probability_ppm = forecasts
+        let probabilities_by_asset = forecasts
             .get(&horizon)
             .expect("index_forecasts requires all horizons");
         let portfolio_return_ppm = portfolio_return_ppm(
@@ -70,7 +70,11 @@ pub fn materialize_partial_outcome(
             transaction_cost_ppm: input.cost_model.transaction_cost_ppm,
             slippage_ppm: input.cost_model.slippage_ppm,
             utility_ppm,
-            calibration_ppm: None,
+            calibration_ppm: calibration_quality_ppm(
+                probabilities_by_asset,
+                &input.baseline_prices,
+                &observation.future_prices,
+            )?,
             evidence_completeness_ppm: bounded_ratio_ppm(
                 observation.expected_evidence_count,
                 observation.observed_evidence_count,

@@ -10,12 +10,12 @@ pub mod v2 {
         ExecutionCommit, ExecutionCommitResult, LessonUsage, LessonWriteResult,
         MaintenanceLeaseDeferral, PolicyEvaluationCommit, PolicyEvaluationResult, PolicyHead,
         PolicyShadowPairSnapshot, PolicyTransitionRecord, ReleaseEvidenceExpectations,
-        RetryTaskResult, RunExportArtifact, RunExportManifest, SessionReservation, SessionSlot,
-        SessionSlotReservation, ShadowPairCompletion, ShadowPairWriteResult, StorageInventory,
-        StoreAlert, StoreError, StoreMetrics, StoreResult as Result, StoredActiveAttempt,
-        StoredCanarySession, StoredContract, StoredEvent, StoredLesson, StoredRun,
-        StoredShadowPair, StoredTask, StoredTaskSnapshot, SucceededAttemptProof, TrajectoryEntry,
-        TrajectoryModelMetadata, TrajectoryToolLifecycle, V2Store, WorkflowCommit,
+        RetryTaskResult, RunExportArtifact, RunExportManifest, RunModelUsage, SessionReservation,
+        SessionSlot, SessionSlotReservation, ShadowPairCompletion, ShadowPairWriteResult,
+        StorageInventory, StoreAlert, StoreError, StoreMetrics, StoreResult as Result,
+        StoredActiveAttempt, StoredCanarySession, StoredContract, StoredEvent, StoredLesson,
+        StoredRun, StoredShadowPair, StoredTask, StoredTaskSnapshot, SucceededAttemptProof,
+        TrajectoryEntry, TrajectoryModelMetadata, TrajectoryToolLifecycle, V2Store, WorkflowCommit,
         WorkflowPatchCommit, WorkflowRevision, WorkflowSnapshot,
     };
 }
