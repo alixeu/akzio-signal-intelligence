@@ -1,0 +1,526 @@
+//! Stateless Responses API adapter.
+//!
+//! Akzio owns every durable turn, context manifest, and tool result. The
+//! provider only receives the current, replayable turn and may request one of
+//! the Rust-approved tools declared by an agent contract.
+
+use std::{
+    collections::{BTreeMap, VecDeque},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+use reqwest::{Client, StatusCode};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
+use serde_json::{json, Value};
+use thiserror::Error;
+
+mod fixture;
+mod native_web;
+mod responses;
+mod schema;
+
+use fixture::*;
+pub use native_web::{NativeWebCitation, NativeWebPolicy, NativeWebQuery};
+pub use responses::{extract_output_text, extract_tool_calls, OpenAIResponsesClient};
+use responses::{openai_response_from_raw, openai_responses_request_body};
+use schema::*;
+
+#[derive(Debug, Error)]
+pub enum ModelError {
+    #[error("model base URL is empty")]
+    EmptyBaseUrl,
+    #[error("model API key is empty")]
+    EmptyApiKey,
+    #[error("model name is empty")]
+    EmptyModel,
+    #[error("model reasoning effort is empty")]
+    EmptyReasoningEffort,
+    #[error("model response transport failed: {0}")]
+    Transport(#[from] reqwest::Error),
+    #[error("model response stream was idle for {idle_timeout:?}")]
+    StreamIdleTimeout { idle_timeout: Duration },
+    #[error("model returned HTTP {status}: {body}")]
+    Http { status: StatusCode, body: String },
+    #[error("model response stream is invalid: {0}")]
+    InvalidStream(String),
+    #[error("model refused the request: {0}")]
+    Refused(String),
+    #[error("model response is incomplete: {0}")]
+    Incomplete(String),
+    #[error("model response has neither output text nor a tool call")]
+    MissingOutput,
+    #[error("model capability probe failed: {0}")]
+    CapabilityProbe(String),
+    #[error("fixture response sequence is exhausted")]
+    FixtureExhausted,
+    #[error("native web tool is not configured")]
+    NativeWebUnavailable,
+    #[error("native web tool call is not allowed")]
+    NativeWebToolNotAllowed,
+    #[error("native web tool arguments are invalid")]
+    NativeWebArgumentsInvalid,
+    #[error("native web result has no verifiable citations")]
+    NativeWebCitationsMissing,
+    #[error("native web citation URI is not allowlisted: {uri} ({reason})")]
+    NativeWebUnsafeCitation { uri: String, reason: String },
+    #[error("native web result exceeds the configured limit")]
+    NativeWebLimitExceeded,
+}
+
+pub type Result<T> = std::result::Result<T, ModelError>;
+
+/// Test-fixture placeholder resolved from the current model request's governed context.
+pub const FIXTURE_CONTEXT_EVIDENCE_ID: &str = "$fixture.context.first_evidence_id";
+/// Test-fixture placeholder resolved from the current model request's governed context.
+pub const FIXTURE_CONTEXT_CLAIM_ID: &str = "$fixture.context.first_claim_id";
+
+fn default_reasoning_effort() -> String {
+    "medium".to_owned()
+}
+
+fn default_response_language() -> String {
+    "简体中文".to_owned()
+}
+
+pub const OPENAI_RESPONSES_PROVIDER_ID: &str = "openai_responses";
+pub const OPENAI_RESPONSES_OFFICIAL_BASE_URL: &str = "https://api.openai.com/v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ModelProviderIdentity {
+    #[serde(rename = "openai_responses", alias = "openai")]
+    OpenAIResponses,
+}
+
+impl ModelProviderIdentity {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAIResponses => OPENAI_RESPONSES_PROVIDER_ID,
+        }
+    }
+}
+
+/// Per-purpose OpenAI Responses route settings.
+///
+/// The API key is intentionally redacted from `Debug` output and never copied
+/// into a durable AgentTurn trace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenAIResponsesRouteConfig {
+    pub model: String,
+    pub reasoning_effort: String,
+    #[serde(default)]
+    pub response_language: Option<String>,
+    #[serde(default)]
+    pub release_date: Option<String>,
+    #[serde(default)]
+    pub knowledge_cutoff: Option<String>,
+}
+
+/// Configuration for the only production provider implemented by this crate.
+#[derive(Clone, PartialEq)]
+pub struct OpenAIResponsesConfig {
+    pub base_url: String,
+    pub model: String,
+    pub release_date: Option<String>,
+    pub knowledge_cutoff: Option<String>,
+    pub api_key: String,
+    pub reasoning_effort: String,
+    pub response_language: String,
+    pub debug: bool,
+    pub routes: BTreeMap<String, OpenAIResponsesRouteConfig>,
+}
+
+/// Compatibility aliases for callers while configuration and documentation
+/// migrate to provider-specific names.
+pub type ModelConfig = OpenAIResponsesConfig;
+pub type ModelRouteConfig = OpenAIResponsesRouteConfig;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpenAIResponsesConfigWire {
+    #[serde(default)]
+    provider: Option<ModelProviderIdentity>,
+    base_url: String,
+    model: String,
+    #[serde(default)]
+    release_date: Option<String>,
+    #[serde(default)]
+    knowledge_cutoff: Option<String>,
+    api_key: String,
+    #[serde(default = "default_reasoning_effort")]
+    reasoning_effort: String,
+    #[serde(default = "default_response_language")]
+    response_language: String,
+    #[serde(default)]
+    debug: bool,
+    #[serde(default)]
+    routes: BTreeMap<String, OpenAIResponsesRouteConfig>,
+}
+
+impl<'de> Deserialize<'de> for OpenAIResponsesConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = OpenAIResponsesConfigWire::deserialize(deserializer)?;
+        if wire.provider.is_none() && !is_official_openai_base_url(&wire.base_url) {
+            return Err(D::Error::custom(format!(
+                "legacy model config with custom base_url {} is ambiguous; add provider = \"{}\" to explicitly select OpenAI Responses semantics",
+                wire.base_url, OPENAI_RESPONSES_PROVIDER_ID
+            )));
+        }
+        Ok(Self {
+            base_url: wire.base_url,
+            model: wire.model,
+            release_date: wire.release_date,
+            knowledge_cutoff: wire.knowledge_cutoff,
+            api_key: wire.api_key,
+            reasoning_effort: wire.reasoning_effort,
+            response_language: wire.response_language,
+            debug: wire.debug,
+            routes: wire.routes,
+        })
+    }
+}
+
+impl std::fmt::Debug for OpenAIResponsesConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpenAIResponsesConfig")
+            .field("provider", &OPENAI_RESPONSES_PROVIDER_ID)
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("release_date", &self.release_date)
+            .field("knowledge_cutoff", &self.knowledge_cutoff)
+            .field("api_key", &"<redacted>")
+            .field("reasoning_effort", &self.reasoning_effort)
+            .field("response_language", &self.response_language)
+            .field("routes", &self.routes)
+            .field("debug", &self.debug)
+            .finish()
+    }
+}
+
+impl OpenAIResponsesConfig {
+    pub const fn provider_identity(&self) -> ModelProviderIdentity {
+        ModelProviderIdentity::OpenAIResponses
+    }
+
+    pub fn for_route(&self, route: &OpenAIResponsesRouteConfig) -> Self {
+        Self {
+            base_url: self.base_url.clone(),
+            model: route.model.clone(),
+            release_date: route
+                .release_date
+                .clone()
+                .or_else(|| self.release_date.clone()),
+            knowledge_cutoff: route
+                .knowledge_cutoff
+                .clone()
+                .or_else(|| self.knowledge_cutoff.clone()),
+            api_key: self.api_key.clone(),
+            reasoning_effort: route.reasoning_effort.clone(),
+            response_language: route
+                .response_language
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(&self.response_language)
+                .to_owned(),
+            debug: self.debug,
+            routes: BTreeMap::new(),
+        }
+    }
+}
+
+fn is_official_openai_base_url(base_url: &str) -> bool {
+    base_url.trim().trim_end_matches('/') == OPENAI_RESPONSES_OFFICIAL_BASE_URL
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+    pub strict: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelToolCall {
+    pub call_id: String,
+    pub name: String,
+    pub arguments: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelToolOutput {
+    pub call_id: String,
+    pub output: Value,
+}
+
+/// Provider usage normalized into Akzio-owned accounting categories.
+///
+/// Detail fields remain optional because Responses-compatible providers do not
+/// all report cache and reasoning breakdowns. Input/output totals are optional
+/// too, allowing the harness to distinguish reported usage from local estimates.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelUsage {
+    pub input_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+}
+
+/// Immutable, versioned price table selected for one model route.
+///
+/// Rates are micro-units of account currency per one million tokens. They are
+/// explicit configuration data, never changing vendor prices embedded in policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelPricingSnapshot {
+    pub identity: String,
+    pub version: String,
+    pub input_micros_per_million_tokens: u64,
+    pub cached_input_micros_per_million_tokens: u64,
+    pub output_micros_per_million_tokens: u64,
+    pub reasoning_micros_per_million_tokens: u64,
+}
+
+/// Optional whole-task cost authority supplied explicitly by the caller.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelBudgetPolicy {
+    #[serde(default)]
+    pub route_identity: Option<String>,
+    #[serde(default)]
+    pub max_cost_micros: Option<u64>,
+    #[serde(default)]
+    pub pricing: Option<ModelPricingSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelContinuation {
+    items: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fixture_input: Option<String>,
+}
+
+impl ModelContinuation {
+    pub fn from_items(items: Vec<Value>) -> Self {
+        Self {
+            items,
+            fixture_input: None,
+        }
+    }
+
+    fn with_fixture_input(mut self, fixture_input: Option<String>) -> Self {
+        self.fixture_input = fixture_input;
+        self
+    }
+
+    pub fn items(&self) -> &[Value] {
+        &self.items
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelToolChoice {
+    None,
+    Auto,
+    RequiredFunction(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ModelInput {
+    Fresh {
+        text: String,
+    },
+    Continue {
+        continuation: ModelContinuation,
+        tool_outputs: Vec<ModelToolOutput>,
+        instruction: Option<String>,
+    },
+}
+
+pub const NATIVE_WEB_SEARCH_TOOL: &str = "web_search";
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelRequest {
+    pub instructions: String,
+    pub input: ModelInput,
+    pub max_output_tokens: u32,
+    pub tools: Vec<ModelToolDefinition>,
+    pub tool_choice: ModelToolChoice,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixture_key: Option<String>,
+}
+
+/// Adapter-declared capabilities for one model client.
+///
+/// This is descriptive metadata only: it is not a provider handshake and
+/// never grants tools, context, or execution authority.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCapabilityBasis {
+    #[default]
+    Unknown,
+    StaticDeclared,
+    RuntimeNegotiated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenAIResponsesCapabilities {
+    pub supports_tool_calls: bool,
+    pub supports_stateless_continuation: bool,
+    pub reasoning_items: bool,
+    pub encrypted_continuation: bool,
+    pub native_web_tool: bool,
+    pub streaming: bool,
+    pub basis: ModelCapabilityBasis,
+    pub verified: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCapabilitySnapshot {
+    pub provider_id: String,
+    pub model_id: String,
+    pub reasoning_effort: String,
+    pub supports_tool_calls: bool,
+    pub supports_stateless_continuation: bool,
+    pub native_web_tool: bool,
+    #[serde(default)]
+    pub streaming: Option<bool>,
+    #[serde(default)]
+    pub declared_context_limit: Option<u32>,
+    #[serde(default)]
+    pub declared_max_output_tokens: Option<u32>,
+    #[serde(default)]
+    pub reasoning_items: Option<bool>,
+    #[serde(default)]
+    pub encrypted_continuation: Option<bool>,
+    #[serde(default)]
+    pub native_web_tool_verified: bool,
+    #[serde(default)]
+    pub basis: ModelCapabilityBasis,
+    #[serde(default)]
+    pub verified: bool,
+    pub source: String,
+}
+
+impl ModelCapabilitySnapshot {
+    pub fn unknown() -> Self {
+        Self {
+            provider_id: "unknown".to_owned(),
+            model_id: "unknown".to_owned(),
+            reasoning_effort: "unknown".to_owned(),
+            supports_tool_calls: false,
+            supports_stateless_continuation: false,
+            native_web_tool: false,
+            streaming: None,
+            declared_context_limit: None,
+            declared_max_output_tokens: None,
+            reasoning_items: None,
+            encrypted_continuation: None,
+            native_web_tool_verified: false,
+            basis: ModelCapabilityBasis::Unknown,
+            verified: false,
+            source: "unknown".to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCapabilityProbeSet {
+    pub default: ModelCapabilitySnapshot,
+    pub routes: BTreeMap<String, ModelCapabilitySnapshot>,
+}
+
+impl ModelCapabilityProbeSet {
+    pub fn snapshot_for(&self, purpose: &str) -> &ModelCapabilitySnapshot {
+        self.routes.get(purpose).unwrap_or(&self.default)
+    }
+
+    pub fn validate_for_config(&self, config: &OpenAIResponsesConfig) -> Result<()> {
+        validate_probed_snapshot(
+            &self.default,
+            &config.model,
+            &config.reasoning_effort,
+            "default",
+        )?;
+        if self.routes.len() != config.routes.len() {
+            return Err(ModelError::CapabilityProbe(
+                "route capability set does not match configured routes".to_owned(),
+            ));
+        }
+        for (purpose, route) in &config.routes {
+            let snapshot = self.routes.get(purpose).ok_or_else(|| {
+                ModelError::CapabilityProbe(format!(
+                    "missing capability snapshot for route {purpose}"
+                ))
+            })?;
+            validate_probed_snapshot(snapshot, &route.model, &route.reasoning_effort, purpose)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_probed_snapshot(
+    snapshot: &ModelCapabilitySnapshot,
+    model: &str,
+    reasoning_effort: &str,
+    route: &str,
+) -> Result<()> {
+    if snapshot.provider_id != OPENAI_RESPONSES_PROVIDER_ID
+        || snapshot.model_id != model
+        || snapshot.reasoning_effort != reasoning_effort
+        || !snapshot.verified
+        || snapshot.basis != ModelCapabilityBasis::RuntimeNegotiated
+        || !snapshot.supports_tool_calls
+        || !snapshot.supports_stateless_continuation
+        || snapshot.streaming != Some(true)
+    {
+        return Err(ModelError::CapabilityProbe(format!(
+            "route {route} did not verify required OpenAI Responses behavior"
+        )));
+    }
+    Ok(())
+}
+
+/// Provider-facing request/result pair retained only inside a RunScoped
+/// AgentTurn when local model debugging is enabled.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelCallTrace {
+    pub request: Value,
+    pub result: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelResponse {
+    pub output_text: String,
+    pub tool_calls: Vec<ModelToolCall>,
+    pub continuation: ModelContinuation,
+    pub raw: Value,
+    pub usage: ModelUsage,
+    /// Provider payload without authorization headers or credentials.
+    pub request_body: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelStreamEvent {
+    ReasoningStart,
+    ReasoningDelta(String),
+    ReasoningEnd,
+}
+
+#[derive(Debug, Clone)]
+pub enum ModelClient {
+    OpenAIResponses(OpenAIResponsesClient),
+    Fixture(Value),
+    FixtureByPurpose(Arc<Mutex<BTreeMap<String, VecDeque<Value>>>>),
+    FixtureSequence(Arc<Mutex<VecDeque<Value>>>),
+}
+include!("model_client/client_setup.rs");
+include!("model_client/client_response.rs");
+include!("model_client/capability_probe.rs");

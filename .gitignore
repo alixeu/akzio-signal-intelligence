@@ -1,0 +1,34 @@
+.DS_Store
+
+# Rust
+/target/
+**/*.rs.bk
+
+
+# Local runtime outputs
+/report/
+/outputs/
+/tmp/
+/.akzio/
+/config/local*.yaml
+/config/*.local.yaml
+/config/*.local.toml
+*.log
+*.cdx.json
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Codex and local indexes
+.codegraph/
+!AGENTS.md
+
+# Editor state
+.idea/
+.vscode/
+
+# Akzio Observatory (SwiftUI presentation shell)
+apps/.build/
+apps/dist/

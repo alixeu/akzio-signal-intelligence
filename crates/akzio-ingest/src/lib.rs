@@ -1,0 +1,33 @@
+//! Rust-owned allowlisted evidence acquisition for Akzio.
+//!
+//! Agents cannot access an HTTP client, filesystem, or raw evidence through
+//! this crate. They receive only Store-sealed artifacts through Context grants.
+
+mod direct;
+mod financial_content;
+mod paper_decode;
+mod quant_features;
+pub mod runtime;
+
+pub use akzio_domain::EvidenceAcquisitionMode;
+pub use direct::{FredDirectTransport, SecEdgarDirectTransport};
+pub use paper_decode::{
+    common_bar_dates, decode_paper_account, decode_paper_account_components, decode_paper_clock,
+    decode_paper_quotes, parse_daily_bars, parse_money_micros, provider_money, PaperDecodeError,
+    PaperDecodeResult,
+};
+pub use quant_features::{QuantFeatureSnapshot, QUANT_FEATURE_FORMULA_VERSION};
+pub use runtime::validate_outcome_price_window;
+pub use runtime::{
+    model_native_web_evidence_transport, validate_daily_bar_payload, AcquiredEvidence,
+    AlpacaMarketDataFeed, AlpacaPaperEvidenceTransport, AsyncEvidenceAdapter, EvidenceAdapter,
+    EvidenceAdapterError, EvidenceBundle, EvidenceCitation, EvidenceContaminationCertificate,
+    EvidenceProvenance, EvidenceQuality, EvidenceRequest, EvidenceRuntime, EvidenceRuntimeError,
+    EvidenceRuntimeResult, EvidenceSource, EvidenceTimeBasis, FixtureEvidenceAdapter,
+    GovernedResource, NormalizedEvidencePayload,
+};
+
+/// US ETF session date, including UTC evening/day-boundary differences.
+pub fn market_session_day(at: chrono::DateTime<chrono::Utc>) -> chrono::NaiveDate {
+    at.with_timezone(&chrono_tz::America::New_York).date_naive()
+}

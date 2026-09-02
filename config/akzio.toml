@@ -1,0 +1,29 @@
+[daemon]
+store_root = ".akzio/store"
+http_addr = "127.0.0.1:7342"
+# The CLI generates or reads
+# `.daemon-token` under `store_root` with owner-only permissions.
+worker_count = 4
+# false starts only the loopback API and workers. true constructs Alpaca Paper
+# from environment credentials, preflights the workflow, and starts the scheduler.
+auto_paper = false
+
+[execution]
+experiment_profile = "fixture"
+assets = ["TQQQ", "QQQ", "SOXX", "SOXL"]
+market_data_feed = "iex"
+# Explicit parts-per-million assumptions used only when sealing Outcome windows.
+# Keep zero for fixtures; Paper launch approval must set audited values.
+transaction_cost_ppm = 0
+slippage_ppm = 0
+
+# Copy this file to config/akzio.local.toml before adding a real API key, then
+# start the daemon with `--config config/akzio.local.toml`.
+[model]
+provider = "openai_responses"
+base_url = "$LLM_GATEWAY_BASE_URL"
+model = "gpt-5.6-luna"
+api_key = "$LLM_GATEWAY_API_KEY"
+reasoning_effort = "low"
+response_language = "简体中文"
+debug = false

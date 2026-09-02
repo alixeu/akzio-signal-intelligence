@@ -1,0 +1,43 @@
+[workspace]
+members = [
+    "crates/akzio-domain",
+    "crates/akzio-store",
+    "crates/akzio-context",
+    "crates/akzio-ingest",
+    "crates/akzio-runtime",
+    "crates/akzio-execution",
+    "crates/akzio-learning",
+    "crates/akzio-model",
+    "crates/akzio-research",
+    "crates/akzio-daemon",
+    "crates/akzio-cli",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.96"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1.0.95"
+chrono = { version = "0.4.39", features = ["serde"] }
+chrono-tz = "0.10"
+clap = { version = "4.5.26", features = ["derive", "env"] }
+futures = "0.3.31"
+regex = "1.11.1"
+reqwest = { version = "0.13.4", default-features = false, features = ["cookies", "json", "query", "rustls", "stream"] }
+async-stream = "0.3.6"
+axum = "0.8.4"
+serde = { version = "1.0.217", features = ["derive"] }
+serde_json = "1.0.135"
+sha2 = "0.10.8"
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+thiserror = "2.0.11"
+toml = "0.8"
+tokio = { version = "1.43.0", features = ["full"] }
+tracing = "0.1.41"
+unicode-normalization = "0.1.24"
+uuid = { version = "1.12.0", features = ["v4", "serde"] }
+zstd = "0.13.3"
