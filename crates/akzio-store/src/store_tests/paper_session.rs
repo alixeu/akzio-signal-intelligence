@@ -148,7 +148,7 @@ fn approved_paper_reservation_rejects_mismatched_proposal_and_keeps_store_atomic
         setup_artifacts: vec![],
         reserved_at: now,
     };
-    let mut wrong_proposal = proposal.clone();
+    let mut wrong_proposal = proposal;
     wrong_proposal.origin = Some(ArtifactOrigin {
         run_id: Some(RunId::new()),
         task_id: None,
@@ -304,7 +304,7 @@ fn approved_paper_reservation_is_idempotent_for_duplicate_session() {
         ArtifactKind::WorkflowProposal,
         &serde_json::to_string(&proposal_payload).unwrap(),
         Some(ArtifactOrigin {
-            run_id: Some(run.run_id.clone()),
+            run_id: Some(run.run_id),
             task_id: None,
             attempt_id: None,
             contract_hash: None,
@@ -544,7 +544,7 @@ fn session_slot_is_fenced_and_reuses_the_frozen_workflow() {
             &first_lease,
             &ExecutionCommit {
                 session_key: session_key.to_owned(),
-                permit: claimed.permit.clone(),
+                permit: claimed.permit,
                 commitment,
                 committed_at: successor_now,
             },

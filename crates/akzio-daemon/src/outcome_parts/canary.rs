@@ -92,11 +92,11 @@ impl Daemon {
         }
         let parent_snapshot = self.store.workflow_snapshot(&task.run_id)?;
         let parent_topology = ArtifactRef {
-            artifact_id: parent_snapshot.revision.graph_artifact.artifact_id.clone(),
+            artifact_id: parent_snapshot.revision.graph_artifact.artifact_id,
             kind: ArtifactKind::WorkflowGraph,
         };
-        let candidate_contract_hash = candidate_contract.contract_hash.clone();
-        let candidate_topology_id = candidate_topology.topology_id.clone();
+        let candidate_contract_hash = candidate_contract.contract_hash;
+        let candidate_topology_id = candidate_topology.topology_id;
         let contract_subject = PolicySubject::Contract(candidate_contract_hash.clone());
         let topology_subject = PolicySubject::Topology(TopologyId(candidate_topology_id.clone()));
         let bundle_subject = PolicySubject::Memory(MemoryId("paper:default".to_owned()));
@@ -257,7 +257,7 @@ impl Daemon {
                 topology_id: TopologyId(candidate_topology_id.clone()),
                 candidate_policy: Some(CandidatePolicyInput {
                     baseline: ArtifactRef {
-                        artifact_id: active_contract.artifact.artifact_id.clone(),
+                        artifact_id: active_contract.artifact.artifact_id,
                         kind: ArtifactKind::Contract,
                     },
                     candidate: campaign.spec.candidate_contract.clone(),

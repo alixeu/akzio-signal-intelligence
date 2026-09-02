@@ -33,7 +33,7 @@ fn child_projection_filters_by_child_policy_and_is_stable() {
             artifact_id: parent.artifact.artifact_id.clone(),
             kind: ArtifactKind::ContextManifest,
         }),
-        outputs: vec![semantic, trace, raw, wrong_source, normalized.clone()],
+        outputs: vec![semantic, trace, raw, wrong_source, normalized],
     };
     let projection = derive_child_projection(
         &proof,
@@ -56,7 +56,7 @@ fn child_projection_filters_by_child_policy_and_is_stable() {
     );
 
     let empty_projection = ContextProjection {
-        parent_manifest: proof.context_manifest.clone().unwrap(),
+        parent_manifest: proof.context_manifest.unwrap(),
         allowed: Vec::new(),
         reason: "parent_attempt_projection".to_owned(),
     };

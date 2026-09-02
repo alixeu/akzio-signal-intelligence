@@ -351,7 +351,7 @@ fn accepted_verdict_creates_one_fenced_commitment_and_reuses_it() {
         )
         .unwrap();
     let allocation_ref = ArtifactRef {
-        artifact_id: allocation_artifact.artifact_id.clone(),
+        artifact_id: allocation_artifact.artifact_id,
         kind: ArtifactKind::ExecutionPlan,
     };
     let execution_context_payload = ExecutionContext {
@@ -365,7 +365,7 @@ fn accepted_verdict_creates_one_fenced_commitment_and_reuses_it() {
         factor_exposure: Some(allocation.factor_exposure.clone()),
         turnover_ppm: Some(allocation.turnover_ppm),
         plan_hash: Some(allocation.plan_hash.clone()),
-        broker_session: Some(allocation.broker_session.clone()),
+        broker_session: Some(allocation.broker_session),
         frozen: false,
         created_at: now,
     };
@@ -398,7 +398,7 @@ fn accepted_verdict_creates_one_fenced_commitment_and_reuses_it() {
         )
         .unwrap();
     let context_ref = ArtifactRef {
-        artifact_id: context.artifact_id.clone(),
+        artifact_id: context.artifact_id,
         kind: ArtifactKind::ExecutionContext,
     };
     let verdict = Artifact::new(
@@ -425,7 +425,7 @@ fn accepted_verdict_creates_one_fenced_commitment_and_reuses_it() {
         )
         .unwrap();
     let verdict_ref = ArtifactRef {
-        artifact_id: verdict.artifact_id.clone(),
+        artifact_id: verdict.artifact_id,
         kind: ArtifactKind::ExecutionVerdict,
     };
     let input = PaperCommitmentInput {

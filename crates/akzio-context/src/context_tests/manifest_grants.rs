@@ -28,7 +28,7 @@ fn restore_manifest_for_proof_accepts_parent_manifest_source_ref() {
         attempt_id: permit.attempt_id.clone(),
         lease_id: permit.lease_id.clone(),
         epoch: permit.epoch,
-        contract_hash: permit.contract_hash.clone(),
+        contract_hash: permit.contract_hash,
         context_manifest: Some(ArtifactRef {
             artifact_id: nested.artifact_id.clone(),
             kind: ArtifactKind::ContextManifest,
@@ -77,13 +77,13 @@ fn context_is_explicit_and_raw_is_only_granted_by_closure() {
         )
         .unwrap();
 
-    let broker = ContextBroker::new(store.clone());
+    let broker = ContextBroker::new(store);
     let manifest = broker
         .assemble(
             &permit,
             &contract,
             [ArtifactRef {
-                artifact_id: normalized.artifact_id.clone(),
+                artifact_id: normalized.artifact_id,
                 kind: ArtifactKind::NormalizedEvidence,
             }],
             Utc::now(),
@@ -187,7 +187,7 @@ fn unrelated_artifact_is_not_visible_to_the_grant() {
     store
         .write_task_artifact(&permit, &second, LifecycleEventType::Evidence, Utc::now())
         .unwrap();
-    let broker = ContextBroker::new(store.clone());
+    let broker = ContextBroker::new(store);
     let manifest = broker
         .assemble(
             &permit,
@@ -216,7 +216,7 @@ fn unrelated_artifact_is_not_visible_to_the_grant() {
 fn read_rejects_a_forged_readable_set() {
     let (_root, store, permit, contract, manifest, raw, now) = manifest_fixture();
     let broker = ContextBroker::new(store);
-    let mut forged_grant = manifest.grant.clone();
+    let mut forged_grant = manifest.grant;
     forged_grant.readable.insert(raw.artifact_id.clone());
 
     assert!(matches!(
@@ -230,7 +230,7 @@ fn read_raw_rejects_a_forged_raw_source_closure() {
     let (_root, store, permit, contract, manifest, raw, now) = manifest_fixture();
     let broker = ContextBroker::new(store);
     let selected = manifest.payload.selections[0].artifact.artifact_id.clone();
-    let mut forged_grant = manifest.grant.clone();
+    let mut forged_grant = manifest.grant;
     forged_grant.raw_source_closure.insert(selected);
 
     assert!(matches!(

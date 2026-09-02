@@ -118,7 +118,7 @@ mod decision_proposal_tests {
             contract_hash: contract_hash.clone(),
             selections: vec![
                 akzio_domain::ContextSelection {
-                    artifact: claim_ref.clone(),
+                    artifact: claim_ref,
                     reason: "approved claim".to_owned(),
                     estimated_tokens: 1,
                 },
@@ -147,14 +147,14 @@ mod decision_proposal_tests {
             artifact: manifest_artifact.clone(),
             payload: manifest_payload,
             grant: akzio_domain::ReadGrant {
-                manifest_artifact_id: manifest_artifact.artifact_id.clone(),
+                manifest_artifact_id: manifest_artifact.artifact_id,
                 run_id: RunId::new(),
                 task_id: TaskId::new(),
                 attempt_id: akzio_domain::AttemptId::new(),
                 lease_id: akzio_domain::LeaseId::new(),
                 epoch: 1,
                 contract_hash,
-                readable: BTreeSet::from([claim.artifact_id.clone(), evidence.artifact_id.clone()]),
+                readable: BTreeSet::from([claim.artifact_id, evidence.artifact_id]),
                 raw_source_closure: BTreeSet::new(),
                 expires_at: now + Duration::hours(1),
             },
@@ -162,7 +162,7 @@ mod decision_proposal_tests {
 
         let dropped = proposal(
             Vec::new(),
-            vec![evidence_ref.clone()],
+            vec![evidence_ref],
             vec![akzio_domain::HardBlocker::MissingEvidence],
         );
         let dropped_error = research_output_source_refs(

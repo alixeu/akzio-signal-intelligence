@@ -82,7 +82,7 @@ impl V2ExecutionRuntime {
             let allocation = self.allocation.allocate_with_limit(
                 &AllocationInput {
                     decision_context_ref: input.decision_context.clone(),
-                    decision_context: decision.clone(),
+                    decision_context: decision,
                     account_snapshot_ref: input.account_snapshot.clone().expect("checked above"),
                     account: account_payload.clone(),
                     quote_snapshot_ref: input.quote_snapshot.clone().expect("checked above"),
@@ -156,7 +156,7 @@ impl V2ExecutionRuntime {
         context_sources.extend(input.account_snapshot.clone());
         context_sources.extend(input.quote_snapshot.clone());
         context_sources.extend(input.market_clock_snapshot.clone());
-        context_sources.extend(execution_plan_ref.clone());
+        context_sources.extend(execution_plan_ref);
         let execution_context = self.artifact(
             ArtifactKind::ExecutionContext,
             "execution.context",

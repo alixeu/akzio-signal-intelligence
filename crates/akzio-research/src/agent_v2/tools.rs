@@ -47,7 +47,7 @@ impl AgentRuntime {
         match self.execute_tool_inner(permit, contract, grant, call, now) {
             Ok(result) => {
                 let mut source_refs = vec![ArtifactRef {
-                    artifact_id: call_artifact.artifact_id.clone(),
+                    artifact_id: call_artifact.artifact_id,
                     kind: ArtifactKind::ToolCall,
                 }];
                 source_refs.extend(result.artifacts.iter().map(|artifact| ArtifactRef {
@@ -121,7 +121,7 @@ impl AgentRuntime {
                     },
                     Some(permit.artifact_origin()),
                     vec![ArtifactRef {
-                        artifact_id: call_artifact.artifact_id.clone(),
+                        artifact_id: call_artifact.artifact_id,
                         kind: ArtifactKind::ToolCall,
                     }],
                     now,

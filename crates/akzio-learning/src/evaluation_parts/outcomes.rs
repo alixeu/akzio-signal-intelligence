@@ -84,7 +84,7 @@ impl EvaluationRuntime {
         {
             existing
         } else {
-            let sources = std::iter::once(materialization.schedule_artifact.clone())
+            let sources = std::iter::once(materialization.schedule_artifact)
                 .chain(outcome.market_evidence.iter().cloned())
                 .collect();
             self.artifact(

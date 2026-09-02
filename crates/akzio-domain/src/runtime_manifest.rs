@@ -265,7 +265,7 @@ mod tests {
             },
             RuntimeIdentity {
                 market_data_feed: "sip".to_owned(),
-                ..base.clone()
+                ..base
             },
         ];
 

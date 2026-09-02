@@ -108,7 +108,9 @@ impl WorkflowRuntime {
                 task.finished_at = None;
                 replay.saw_task_start = true;
             }
-            LifecycleEventType::AgentTurnStarted => {
+            LifecycleEventType::AgentTurnStarted
+            | LifecycleEventType::TaskRetryExhausted
+            | LifecycleEventType::TaskRecoveryExhausted => {
                 let task = Self::replay_task_mut(run_id, replay, event)?;
                 Self::assert_active_attempt(run_id, task, event)?;
             }
@@ -151,10 +153,6 @@ impl WorkflowRuntime {
                 task.status = TaskStatus::Cancelled;
                 task.active_attempt_id = None;
                 task.finished_at = Some(event.created_at);
-            }
-            LifecycleEventType::TaskRetryExhausted | LifecycleEventType::TaskRecoveryExhausted => {
-                let task = Self::replay_task_mut(run_id, replay, event)?;
-                Self::assert_active_attempt(run_id, task, event)?;
             }
             LifecycleEventType::RunCancelRequested => {
                 if event.task_id.is_some() || event.attempt_id.is_some() {

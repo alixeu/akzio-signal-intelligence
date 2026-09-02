@@ -25,7 +25,7 @@ fn workflow_commit_accepts_out_of_order_nodes_and_preserves_dependencies() {
     };
     store
         .commit_workflow(&WorkflowCommit {
-            run: run.clone(),
+            run,
             graph: graph_artifact,
             nodes: graph.nodes,
         })

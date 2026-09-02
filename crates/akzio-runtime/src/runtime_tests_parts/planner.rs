@@ -418,7 +418,7 @@ fn dynamic_patch_extends_research_without_replacing_terminal_chain() {
         planner_output
     );
     assert!(second.source_refs.contains(&ArtifactRef {
-        artifact_id: first.artifact_id.clone(),
+        artifact_id: first.artifact_id,
         kind: ArtifactKind::WorkflowGraph,
     }));
     let proposal_ref = second

@@ -147,7 +147,7 @@ fn contract_candidate_materializes_a_bound_policy_artifact() {
     let (baseline, baseline_ref) = fixture_contract(&fixture.store, "baseline", now);
     let (candidate, candidate_ref) = fixture_contract(&fixture.store, "candidate", now);
     assert!(baseline.permits_candidate(&candidate));
-    let subject = PolicySubject::Contract(candidate.contract_hash.clone());
+    let subject = PolicySubject::Contract(candidate.contract_hash);
     let permit = fixture.claim_evaluation("contract-candidate");
     let task_id = permit.task_id.clone();
     let result = fixture.evaluate_for(

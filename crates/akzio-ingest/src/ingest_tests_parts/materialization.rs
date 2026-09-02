@@ -155,7 +155,7 @@ fn acquisition_returns_uncommitted_artifacts_until_task_runtime_commits() {
         store
             .artifacts_referencing(&need.artifact_id, Some(ArtifactKind::NormalizedEvidence))
             .unwrap(),
-        vec![sealed.normalized.clone()]
+        vec![sealed.normalized]
     );
     let events_after = store.events_after(&run_id, 0, 10).unwrap();
     assert_eq!(events_after.len(), events_before.len() + 3);

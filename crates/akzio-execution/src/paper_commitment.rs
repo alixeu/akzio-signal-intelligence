@@ -221,7 +221,6 @@ impl V2PaperCommitmentRuntime {
             execution_context: execution_context.clone(),
             plan_hash: context
                 .plan_hash
-                .clone()
                 .ok_or(PaperCommitmentError::PlanHashMismatch)?,
             broker_session: input.session_key.clone(),
             client_order_ids,

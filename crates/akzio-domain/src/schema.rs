@@ -92,7 +92,7 @@ mod tests {
         .unwrap();
         artifact.validate().unwrap();
 
-        let mut substituted = artifact.clone();
+        let mut substituted = artifact;
         substituted.producer = "different".to_owned();
         assert_eq!(substituted.validate(), Err(DomainError::InvalidContentHash));
     }

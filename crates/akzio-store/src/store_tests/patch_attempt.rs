@@ -79,7 +79,7 @@ fn workflow_patch_rolls_back_proposal_graph_tasks_events_and_planner_completion(
         .commit_workflow(&WorkflowCommit {
             run: run.clone(),
             graph: graph_artifact.clone(),
-            nodes: graph.nodes.clone(),
+            nodes: graph.nodes,
         })
         .unwrap();
     let claimed = store
@@ -302,7 +302,7 @@ fn workflow_patch_rolls_back_proposal_graph_tasks_events_and_planner_completion(
         store
             .committed_attempt_outputs(&planner_task_id, &claimed.permit.attempt_id)
             .unwrap(),
-        vec![proposal_artifact.clone()]
+        vec![proposal_artifact]
     );
     let stored_graph = store.artifact(&next_graph_artifact.artifact_id).unwrap();
     assert_eq!(stored_graph.artifact_id, next_graph_artifact.artifact_id);

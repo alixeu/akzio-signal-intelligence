@@ -423,7 +423,7 @@ mod tests {
             .reconcile(&ReconciliationInput {
                 permit: permit.clone(),
                 commitment: ArtifactRef {
-                    artifact_id: commitment.artifact_id.clone(),
+                    artifact_id: commitment.artifact_id,
                     kind: ArtifactKind::ExecutionCommitment,
                 },
                 reprice: None,

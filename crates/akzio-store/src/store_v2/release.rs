@@ -29,8 +29,7 @@ impl V2Store {
         .map(|kind| canonical_run_artifacts(&connection, run_id, kind))
         .collect::<StoreResult<Vec<_>>>()?
         .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
+        .flatten();
         let plans = canonical_run_artifacts(&connection, run_id, ArtifactKind::ExecutionPlan)?;
         let commitments =
             canonical_run_artifacts(&connection, run_id, ArtifactKind::ExecutionCommitment)?;

@@ -1352,37 +1352,32 @@ mod source_document_fetcher_tests {
     }
 
     #[tokio::test]
-    async fn source_document_fetcher_refuses_redirects() {
-        let uri = serve_once(
-            b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/blocked\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        )
-        .await;
-        let error = HttpSourceDocumentFetcher::new()
-            .unwrap()
-            .fetch(&uri)
-            .await
-            .unwrap_err();
+    async fn source_document_fetcher_rejects_redirects_and_non_success_statuses() {
+        let cases: &[(&[u8], SourceDocumentFailureKind, u16)] = &[
+            (
+                b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/blocked\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                SourceDocumentFailureKind::Redirect,
+                302,
+            ),
+            (
+                b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                SourceDocumentFailureKind::HttpStatus,
+                503,
+            ),
+        ];
 
-        assert_eq!(error.kind, SourceDocumentFailureKind::Redirect);
-        assert_eq!(error.status_code, Some(302));
-        assert!(error.message.contains("HTTP 302"));
-    }
+        for (response, expected_kind, expected_status) in cases {
+            let uri = serve_once(response).await;
+            let error = HttpSourceDocumentFetcher::new()
+                .unwrap()
+                .fetch(&uri)
+                .await
+                .unwrap_err();
 
-    #[tokio::test]
-    async fn source_document_fetcher_rejects_non_success_status() {
-        let uri = serve_once(
-            b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        )
-        .await;
-        let error = HttpSourceDocumentFetcher::new()
-            .unwrap()
-            .fetch(&uri)
-            .await
-            .unwrap_err();
-
-        assert_eq!(error.kind, SourceDocumentFailureKind::HttpStatus);
-        assert_eq!(error.status_code, Some(503));
-        assert!(error.message.contains("HTTP 503"));
+            assert_eq!(&error.kind, expected_kind);
+            assert_eq!(error.status_code, Some(*expected_status));
+            assert!(error.message.contains(&format!("HTTP {expected_status}")));
+        }
     }
 
     #[tokio::test]

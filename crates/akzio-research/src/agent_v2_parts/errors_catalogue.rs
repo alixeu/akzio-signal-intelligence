@@ -112,8 +112,9 @@ pub enum ResearchError {
 impl ResearchError {
     pub fn retry_cause(&self) -> Option<RetryCause> {
         match self {
-            Self::InvalidOutput(_) | Self::MissingFinalOutput => Some(RetryCause::InvalidOutput),
-            Self::ModelDebug {
+            Self::InvalidOutput(_)
+            | Self::MissingFinalOutput
+            | Self::ModelDebug {
                 error_class: "invalid_output",
                 ..
             } => Some(RetryCause::InvalidOutput),

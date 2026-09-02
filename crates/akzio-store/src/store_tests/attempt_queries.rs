@@ -52,7 +52,7 @@ fn attempt_queries_preserve_retry_recovery_lineage_and_exact_event_scope() {
             .attempt_relation(&third.attempt_id)
             .unwrap()
             .map(|relation| (relation.parent_attempt_id, relation.relation)),
-        Some((second.attempt_id.clone(), AttemptRelationKind::Recovery))
+        Some((second.attempt_id, AttemptRelationKind::Recovery))
     );
     assert_eq!(fixture.store.attempt_relation(&first.attempt_id).unwrap(), None);
     assert_eq!(fixture.store.attempt_relation(&AttemptId::new()).unwrap(), None);

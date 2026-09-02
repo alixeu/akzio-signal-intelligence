@@ -85,14 +85,14 @@ fn fixture_with(configure: impl FnOnce(&mut AgentContract)) -> Fixture {
         input_artifacts: vec![],
         priority: 50,
         budget: contract.budget.clone(),
-        retry: contract.retry.clone(),
+        retry: contract.retry,
         on_failure: FailureDisposition::FailRun,
         parent_task_id: None,
     };
     let graph = WorkflowGraph {
         schema_version: V2_DOMAIN_SCHEMA_VERSION,
         topology_id: "test".to_owned(),
-        nodes: vec![node.clone()],
+        nodes: vec![node],
     };
     let graph_artifact = Artifact::new(
         ArtifactKind::WorkflowGraph,

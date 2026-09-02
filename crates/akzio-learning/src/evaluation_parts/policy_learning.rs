@@ -28,7 +28,7 @@ impl EvaluationRuntime {
         let outcome_artifact = self.artifact_with_lifecycle(
             ArtifactKind::Outcome,
             &outcome,
-            std::iter::once(materialization.schedule_artifact.clone())
+            std::iter::once(materialization.schedule_artifact)
                 .chain(outcome.market_evidence.iter().cloned())
                 .collect(),
             ArtifactLifecycle::RunScoped,
@@ -71,7 +71,7 @@ impl EvaluationRuntime {
         source_refs.dedup();
         let retrospective = Retrospective {
             schema_version: V2_DOMAIN_SCHEMA_VERSION,
-            outcome_id: outcome.outcome_id.clone(),
+            outcome_id: outcome.outcome_id,
             horizon,
             status,
             summary,

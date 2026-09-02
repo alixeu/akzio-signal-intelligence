@@ -163,16 +163,14 @@ impl V2Store {
                     )));
                 }
                 usage.turns += 1;
-                let payload: StoredTrajectoryTurn =
-                    match serde_json::from_slice(&self.read_blob(&artifact.blob)?) {
-                        Ok(payload) => payload,
-                        // An unreadable turn payload is an unaccounted call, not a
-                        // free one.
-                        Err(_) => {
-                            usage.turns_missing_usage += 1;
-                            continue;
-                        }
-                    };
+                let Ok(payload) = serde_json::from_slice::<StoredTrajectoryTurn>(
+                    &self.read_blob(&artifact.blob)?,
+                ) else {
+                    // An unreadable turn payload is an unaccounted call, not a
+                    // free one.
+                    usage.turns_missing_usage += 1;
+                    continue;
+                };
                 let telemetry = payload
                     .response
                     .as_ref()

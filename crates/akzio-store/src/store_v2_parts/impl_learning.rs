@@ -232,14 +232,14 @@ impl V2Store {
                 experience.decision_context.clone(),
                 experience.execution_context.clone(),
                 experience.policy_verdict.clone(),
-                experience.outcome.clone(),
+                experience.outcome,
                 retrospective_ref.clone(),
             ],
         ) || !has_exact_source_refs(
             &commit.evaluation,
             &[
                 evaluation.outcome.clone(),
-                evaluation.experience.clone(),
+                evaluation.experience,
                 retrospective_ref,
             ],
         ) {
@@ -441,8 +441,8 @@ impl V2Store {
         allowed_purposes: &[RunPurpose],
     ) -> StoreResult<()> {
         let verdict_ref = match &schedule.execution {
-            OutcomeExecutionLineage::NoOrder { execution_verdict } => execution_verdict,
-            OutcomeExecutionLineage::ReconciledPaper {
+            OutcomeExecutionLineage::NoOrder { execution_verdict }
+            | OutcomeExecutionLineage::ReconciledPaper {
                 execution_verdict, ..
             } => execution_verdict,
         };

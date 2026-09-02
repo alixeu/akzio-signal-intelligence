@@ -146,14 +146,14 @@ impl NativeWebPolicy {
     /// search is not a function call, so its Rust-owned bounds must be checked
     /// against `output[].action` rather than `ModelToolCall`.
     pub fn validate_provider_response(&self, raw: &Value) -> Result<()> {
-        let calls = raw
+        let mut calls = raw
             .get("output")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
             .filter(|item| item.get("type").and_then(Value::as_str) == Some("web_search_call"))
-            .collect::<Vec<_>>();
-        if calls.is_empty() {
+            .peekable();
+        if calls.peek().is_none() {
             return Err(ModelError::NativeWebUnavailable);
         }
 

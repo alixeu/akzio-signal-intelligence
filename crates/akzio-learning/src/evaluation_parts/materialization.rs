@@ -191,7 +191,7 @@ impl EvaluationRuntime {
             vec![
                 evaluation.outcome.clone(),
                 evaluation.experience.clone(),
-                retrospective_ref.clone(),
+                retrospective_ref,
             ],
             &origin,
             &provenance,

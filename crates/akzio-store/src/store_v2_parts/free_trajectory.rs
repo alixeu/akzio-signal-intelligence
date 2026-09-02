@@ -279,24 +279,21 @@ fn validate_agent_turn_lifecycle_events(
             event_type,
             artifact_id,
         } = row?;
-        let key = match (&task_id, &attempt_id) {
-            (Some(task_id), Some(attempt_id)) => {
-                (event_run_id.clone(), task_id.clone(), attempt_id.clone())
+        let key = if let (Some(task_id), Some(attempt_id)) = (&task_id, &attempt_id) {
+            (event_run_id.clone(), task_id.clone(), attempt_id.clone())
+        } else {
+            if matches!(
+                event_type,
+                LifecycleEventType::AgentTurnStarted
+                    | LifecycleEventType::AgentTurnCompleted
+                    | LifecycleEventType::AgentTurnRetryableFailed
+                    | LifecycleEventType::AgentTurnFailed
+            ) {
+                return Err(StoreError::Integrity(format!(
+                    "agent lifecycle event at cursor {cursor} has incomplete task attempt lineage"
+                )));
             }
-            _ => {
-                if matches!(
-                    event_type,
-                    LifecycleEventType::AgentTurnStarted
-                        | LifecycleEventType::AgentTurnCompleted
-                        | LifecycleEventType::AgentTurnRetryableFailed
-                        | LifecycleEventType::AgentTurnFailed
-                ) {
-                    return Err(StoreError::Integrity(format!(
-                        "agent lifecycle event at cursor {cursor} has incomplete task attempt lineage"
-                    )));
-                }
-                continue;
-            }
+            continue;
         };
         let state = states.entry(key.clone()).or_default();
         match event_type {

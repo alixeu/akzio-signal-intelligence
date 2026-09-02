@@ -211,11 +211,7 @@ fn handle_sse_data(
             }
         }
         Some("response.reasoning_summary_text.done") => end_reasoning(stream, on_event),
-        Some("response.completed") => {
-            end_reasoning(stream, on_event);
-            stream.response = event.get("response").cloned();
-        }
-        Some("response.incomplete") => {
+        Some("response.completed") | Some("response.incomplete") => {
             end_reasoning(stream, on_event);
             stream.response = event.get("response").cloned();
         }

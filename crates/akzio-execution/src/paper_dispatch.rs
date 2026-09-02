@@ -263,7 +263,6 @@ impl V2PaperDispatchRuntime {
         }
         let plan_reference = context
             .execution_plan
-            .clone()
             .ok_or(PaperDispatchError::MissingAllocationPlan)?;
         if !context_artifact.source_refs.contains(&plan_reference) {
             return Err(PaperDispatchError::MissingAllocationPlan);

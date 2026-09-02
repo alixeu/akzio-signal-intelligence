@@ -360,7 +360,7 @@ impl V2Store {
             .ok_or_else(|| StoreError::MissingContractInstallation(candidate_hash.clone()))?;
         let Some(baseline_hash) = candidate.baseline_contract_hash.as_ref() else {
             return Err(StoreError::ContractActivationConflict(
-                candidate.contract.purpose.clone(),
+                candidate.contract.purpose,
             ));
         };
 

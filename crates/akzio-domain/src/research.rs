@@ -87,7 +87,6 @@ impl ResearchIntent {
             "alpaca" => ResearchShard::PriceMarketStructure,
             "fred" => ResearchShard::Macro,
             "sec_edgar" => ResearchShard::FundamentalsSemiconductor,
-            "news_web" => ResearchShard::NewsEvent,
             _ => ResearchShard::NewsEvent,
         }
     }
@@ -417,7 +416,7 @@ mod tests {
 
         let resolution = ResearchResolution {
             schema_version: V2_DOMAIN_SCHEMA_VERSION,
-            claim: critique.target.clone(),
+            claim: critique.target,
             critique: reference(ArtifactKind::Critique, b"critique"),
             disposition: ResolutionDisposition::Unresolved,
             rationale: "Fresh evidence is required before the conflict can close.".to_owned(),

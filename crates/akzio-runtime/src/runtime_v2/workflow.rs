@@ -81,7 +81,7 @@ impl WorkflowRuntime {
                 graph_artifact_id: graph_artifact.artifact_id.clone(),
                 created_at: now,
             },
-            graph: graph_artifact.clone(),
+            graph: graph_artifact,
             nodes: graph.nodes,
         })
     }

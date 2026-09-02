@@ -335,7 +335,7 @@ mod tests {
             format!("contract:{}", experience.contract_hash)
         );
 
-        let mut mismatched = transition.clone();
+        let mut mismatched = transition;
         mismatched.subject = PolicySubject::Memory(MemoryId::new());
         assert!(mismatched.validate().is_err());
 

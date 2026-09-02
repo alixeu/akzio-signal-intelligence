@@ -38,7 +38,7 @@ fn permit_for_contract(
     let graph = WorkflowGraph {
         schema_version: V2_DOMAIN_SCHEMA_VERSION,
         topology_id: "test".to_owned(),
-        nodes: vec![node.clone()],
+        nodes: vec![node],
     };
     let graph_artifact = Artifact::new(
         ArtifactKind::WorkflowGraph,

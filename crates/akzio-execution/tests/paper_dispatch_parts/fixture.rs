@@ -225,7 +225,7 @@ fn prepared_commitment() -> PreparedCommitment {
         factor_exposure: Some(allocation.factor_exposure.clone()),
         turnover_ppm: Some(allocation.turnover_ppm),
         plan_hash: Some(allocation.plan_hash.clone()),
-        broker_session: Some(allocation.broker_session.clone()),
+        broker_session: Some(allocation.broker_session),
         frozen: false,
         created_at: now,
     };

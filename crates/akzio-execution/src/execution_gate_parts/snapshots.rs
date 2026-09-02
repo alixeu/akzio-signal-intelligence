@@ -124,14 +124,11 @@ impl V2ExecutionRuntime {
             AllocationError::DecisionRejected => {
                 blockers.insert(HardBlocker::NoExecutableOrder);
             }
-            AllocationError::SessionMismatch => {
+            AllocationError::SessionMismatch | AllocationError::Domain(_) => {
                 blockers.insert(HardBlocker::InvalidProvenance);
             }
             AllocationError::MarketClosed => {
                 blockers.insert(HardBlocker::MarketClosed);
-            }
-            AllocationError::Domain(_) => {
-                blockers.insert(HardBlocker::InvalidProvenance);
             }
             AllocationError::Execution(error) => match error {
                 ExecutionError::ForbiddenAsset(_) | ExecutionError::InvalidWeight(_) => {

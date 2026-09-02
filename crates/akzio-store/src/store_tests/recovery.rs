@@ -92,7 +92,7 @@ fn retry_attempts_close_started_turns_and_preserve_attempt_order() {
     );
     assert_eq!(
         lifecycle[0].attempt_id,
-        Some(fixture.permit.attempt_id.clone())
+        Some(fixture.permit.attempt_id)
     );
     assert_eq!(
         lifecycle[2].attempt_id,

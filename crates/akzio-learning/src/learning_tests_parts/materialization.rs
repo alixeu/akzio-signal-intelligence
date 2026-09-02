@@ -450,7 +450,7 @@ fn daemon_collection_path_yields_unmeasured_recall_that_holds_state() {
     );
 
     // With risk recall actually measured and passing, the same chain promotes.
-    let mut measured = outcome.clone();
+    let mut measured = outcome;
     for window in &mut measured.windows {
         window.evidence_completeness_ppm = 1_000_000;
         window.risk_recall_ppm = Some(1_000_000);

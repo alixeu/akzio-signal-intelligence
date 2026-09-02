@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use akzio_domain::{
-    ArtifactId, Asset, ContentHash, DecisionId, FactorLimits, FailureDisposition, MoneyMicros,
-    Position, Quote, RetryPolicy, RunId, SoftWarning, TargetPortfolio, TaskBudget, TaskId,
-    TaskRecipeId, WeightPpm, WorkflowGraph, WorkflowNode, V2_DOMAIN_SCHEMA_VERSION,
+    Asset, ContentHash, DecisionId, FactorLimits, FailureDisposition, MoneyMicros, Position, Quote,
+    RetryPolicy, RunId, SoftWarning, TargetPortfolio, TaskBudget, TaskId, TaskRecipeId, WeightPpm,
+    WorkflowGraph, WorkflowNode, V2_DOMAIN_SCHEMA_VERSION,
 };
 use akzio_store::v2::{StoredRun, WorkflowCommit};
 use tempfile::tempdir;
@@ -380,16 +380,21 @@ fn missing_snapshots_are_durable_no_order() {
 }
 
 #[test]
-fn stale_account_is_durable_no_order() {
-    let fixture = fixture(
-        RunPurpose::Paper,
-        6,
-        0,
-        true,
-        gate_policy(1_000_000, 1_000_000),
-    );
-    let output = fixture.runtime.evaluate(&fixture.input).unwrap();
-    assert!(blockers(&fixture.store, &output).contains(&HardBlocker::StaleAccount));
+fn stale_snapshots_are_durable_no_order() {
+    for (account_age, quote_age, expected) in [
+        (6, 0, HardBlocker::StaleAccount),
+        (0, 6, HardBlocker::StaleQuote),
+    ] {
+        let fixture = fixture(
+            RunPurpose::Paper,
+            account_age,
+            quote_age,
+            true,
+            gate_policy(1_000_000, 1_000_000),
+        );
+        let output = fixture.runtime.evaluate(&fixture.input).unwrap();
+        assert!(blockers(&fixture.store, &output).contains(&expected));
+    }
 }
 
 #[test]
@@ -406,31 +411,16 @@ fn closed_market_is_durable_no_order() {
 }
 
 #[test]
-fn factor_limit_is_derived_from_plan() {
-    let fixture = fixture(
-        RunPurpose::Paper,
-        0,
-        0,
-        true,
+fn allocation_limits_are_derived_from_plan_and_account() {
+    for policy in [
         gate_policy(50_000, 1_000_000),
-    );
-    let output = fixture.runtime.evaluate(&fixture.input).unwrap();
-    assert!(output.execution_plan.is_none());
-    assert!(blockers(&fixture.store, &output).contains(&HardBlocker::NoExecutableOrder));
-}
-
-#[test]
-fn turnover_limit_is_derived_from_account_and_orders() {
-    let fixture = fixture(
-        RunPurpose::Paper,
-        0,
-        0,
-        true,
         gate_policy(1_000_000, 50_000),
-    );
-    let output = fixture.runtime.evaluate(&fixture.input).unwrap();
-    assert!(output.execution_plan.is_none());
-    assert!(blockers(&fixture.store, &output).contains(&HardBlocker::NoExecutableOrder));
+    ] {
+        let fixture = fixture(RunPurpose::Paper, 0, 0, true, policy);
+        let output = fixture.runtime.evaluate(&fixture.input).unwrap();
+        assert!(output.execution_plan.is_none());
+        assert!(blockers(&fixture.store, &output).contains(&HardBlocker::NoExecutableOrder));
+    }
 }
 
 #[test]
@@ -447,32 +437,10 @@ fn noncanonical_run_is_durable_no_order() {
 }
 
 #[test]
-fn stale_quote_is_durable_no_order() {
-    let fixture = fixture(
-        RunPurpose::Paper,
-        0,
-        6,
-        true,
-        gate_policy(1_000_000, 1_000_000),
-    );
-    let output = fixture.runtime.evaluate(&fixture.input).unwrap();
-    assert!(blockers(&fixture.store, &output).contains(&HardBlocker::StaleQuote));
-}
-
-#[test]
 fn policy_must_be_explicit_and_validated() {
     let mut policy = execution_policy();
     policy.max_new_notional = MoneyMicros::ZERO;
     let directory = tempdir().unwrap();
     let store = V2Store::open(directory.path()).unwrap();
     assert!(V2ExecutionRuntime::new(store, policy, gate_policy(1_000_000, 1_000_000)).is_err());
-}
-
-#[test]
-fn artifact_reference_helper_preserves_identity() {
-    let reference = ArtifactRef {
-        artifact_id: ArtifactId(akzio_domain::ContentHash::of_bytes(b"artifact")),
-        kind: ArtifactKind::ExecutionPlan,
-    };
-    assert_eq!(reference.kind, ArtifactKind::ExecutionPlan);
 }

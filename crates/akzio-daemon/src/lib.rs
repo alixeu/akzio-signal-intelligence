@@ -432,7 +432,7 @@ fn debug_fixture_evidence(
             published_at: None,
             observed_at: now,
             revision: Some("debug-v1".to_owned()),
-            source_uri: source_uri.clone(),
+            source_uri,
             dedupe_key: format!("akzio-debug-fixture:{resource}"),
             citations: Vec::new(),
         },

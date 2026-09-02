@@ -120,9 +120,7 @@ impl ContractCatalogue {
             contract.validate()?;
             model_tool_definitions(&ContextBroker::new(store.clone()), &contract)?;
             if by_hash.contains_key(&contract.contract_hash) {
-                return Err(ResearchError::DuplicateContract(
-                    contract.contract_hash.clone(),
-                ));
+                return Err(ResearchError::DuplicateContract(contract.contract_hash));
             }
             let identity = (contract.contract_id.clone(), contract.version);
             if by_identity.contains_key(&identity) {

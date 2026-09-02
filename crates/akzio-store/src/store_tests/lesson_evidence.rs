@@ -55,7 +55,7 @@ impl LessonEvidenceFixture {
             source.blob.clone(),
             "fixture.lesson_evidence",
             ArtifactLifecycle::Canonical,
-            source.provenance.clone(),
+            source.provenance,
             None,
             vec![],
             fixture.now,

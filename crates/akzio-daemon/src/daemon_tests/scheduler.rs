@@ -295,7 +295,7 @@ async fn auto_paper_source_skips_a_proposal_carrying_a_foreign_planner_need() {
             producer_contract_hash: claimed.permit.contract_hash.clone(),
         },
         Some(ArtifactOrigin {
-            run_id: Some(old_run_id.clone()),
+            run_id: Some(old_run_id),
             task_id: Some(claimed.permit.task_id.clone()),
             attempt_id: Some(claimed.permit.attempt_id.clone()),
             contract_hash: claimed.permit.contract_hash.clone(),
@@ -327,7 +327,7 @@ async fn auto_paper_source_skips_a_proposal_carrying_a_foreign_planner_need() {
             depends_on: vec![],
             priority: 90,
             evidence_needs: vec![ArtifactRef {
-                artifact_id: need_artifact.artifact_id.clone(),
+                artifact_id: need_artifact.artifact_id,
                 kind: ArtifactKind::EvidenceNeed,
             }],
         },
@@ -354,7 +354,7 @@ async fn auto_paper_source_skips_a_proposal_carrying_a_foreign_planner_need() {
         .get_mut("synthesizer")
         .unwrap()
         .evidence_needs = vec![ArtifactRef {
-        artifact_id: snapshot.artifact_id.clone(),
+        artifact_id: snapshot.artifact_id,
         kind: ArtifactKind::EvidenceNeed,
     }];
     assert!(!source

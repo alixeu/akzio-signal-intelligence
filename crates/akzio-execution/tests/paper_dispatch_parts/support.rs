@@ -73,7 +73,7 @@ fn workflow() -> WorkflowGraph {
                 parent_task_id: None,
             },
             WorkflowNode {
-                task_id: dispatch_task_id.clone(),
+                task_id: dispatch_task_id,
                 recipe_id: TaskRecipeId::new("execution.dispatch").unwrap(),
                 contract_hash: None,
                 objective: "dispatch paper execution".to_owned(),

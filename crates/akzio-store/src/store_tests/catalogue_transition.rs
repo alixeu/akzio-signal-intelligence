@@ -234,7 +234,7 @@ fn contract_policy_transitions_activate_and_rollback_catalogue_history() {
         fixture
             .store
             .record_policy_evaluation(&PolicyEvaluationCommit {
-                permit: permit.clone(),
+                permit,
                 final_retrospective: retrospective,
                 outcome,
                 experience: experience_artifact,
@@ -312,7 +312,7 @@ fn contract_policy_transitions_activate_and_rollback_catalogue_history() {
     fixture
         .store
         .record_policy_evaluation(&PolicyEvaluationCommit {
-            permit: promotion_permit.clone(),
+            permit: promotion_permit,
             final_retrospective: promotion_retrospective,
             outcome: promotion_outcome,
             experience: promoted_experience_artifact,
@@ -430,7 +430,7 @@ fn contract_policy_transitions_activate_and_rollback_catalogue_history() {
     fixture
         .store
         .record_policy_evaluation(&PolicyEvaluationCommit {
-            permit: rollback_permit.clone(),
+            permit: rollback_permit,
             final_retrospective: rollback_retrospective,
             outcome: rollback_outcome,
             experience: rollback_experience_artifact,

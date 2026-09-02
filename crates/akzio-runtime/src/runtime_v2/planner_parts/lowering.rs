@@ -206,7 +206,7 @@ impl WorkflowRuntime {
             previous_graph_artifact_id: previous_graph_artifact.artifact_id.clone(),
             planner_output: planner_output.clone(),
             evidence_needs,
-            proposal: proposal_artifact.clone(),
+            proposal: proposal_artifact,
             next_graph: next_artifact.clone(),
             added_nodes,
             updated_nodes: vec![evidence, decision],

@@ -110,7 +110,7 @@ impl ContextBroker {
             .iter()
             .map(|selection| selection.artifact.clone())
             .collect::<BTreeSet<_>>();
-        let mut expected_source_refs = selected.clone();
+        let mut expected_source_refs = selected;
         expected_source_refs.extend(
             artifact
                 .source_refs

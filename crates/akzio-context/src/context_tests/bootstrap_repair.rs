@@ -132,7 +132,7 @@ fn repair_is_explicit_and_cannot_expand_a_grant() {
             &wrong_contract,
             &manifest.grant,
             vec![ArtifactRef {
-                artifact_id: normalized.artifact_id.clone(),
+                artifact_id: normalized.artifact_id,
                 kind: ArtifactKind::NormalizedEvidence,
             }],
             &serde_json::json!({"repair": "wrong-contract"}),

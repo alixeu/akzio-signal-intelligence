@@ -24,7 +24,7 @@ fn child_projection_from_proof_rejects_stale_parent_and_trace_outputs() {
         &parent_permit,
         ArtifactKind::ToolResult,
         vec![ArtifactRef {
-            artifact_id: call.artifact_id.clone(),
+            artifact_id: call.artifact_id,
             kind: ArtifactKind::ToolCall,
         }],
         "trace",
@@ -50,7 +50,7 @@ fn child_projection_from_proof_rejects_stale_parent_and_trace_outputs() {
         .current_succeeded_attempt(&parent_permit.run_id, &parent_permit.task_id)
         .unwrap();
 
-    let mut stale = current.clone();
+    let mut stale = current;
     stale.epoch = stale.epoch.saturating_add(1);
     assert!(matches!(
         broker.assemble_child_from_proof(

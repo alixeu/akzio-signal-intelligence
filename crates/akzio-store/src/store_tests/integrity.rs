@@ -457,7 +457,7 @@ fn doctor_rejects_run_scoped_evidence_cited_across_runs() {
             contract_hash: fixture.permit.contract_hash.clone(),
         }),
         vec![ArtifactRef {
-            artifact_id: parent.artifact_id.clone(),
+            artifact_id: parent.artifact_id,
             kind: ArtifactKind::NormalizedEvidence,
         }],
         fixture.now,

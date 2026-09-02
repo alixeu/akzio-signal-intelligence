@@ -63,15 +63,7 @@ impl V2Store {
                     .ok_or_else(|| StoreError::MissingContractInstallation(contract_hash.clone()))
             })
             .transpose()?;
-        let (worker_budget, worker_retry, worker_on_failure) = worker_policy
-            .map(|stored| {
-                (
-                    stored.contract.budget,
-                    stored.contract.retry,
-                    stored.contract.on_failure,
-                )
-            })
-            .unwrap_or_else(|| {
+        let (worker_budget, worker_retry, worker_on_failure) = worker_policy.map_or_else(|| {
                 (
                     TaskBudget {
                         max_input_tokens: 1_024,
@@ -87,6 +79,12 @@ impl V2Store {
                         retry_invalid_output: false,
                     },
                     FailureDisposition::FailRun,
+                )
+            }, |stored| {
+                (
+                    stored.contract.budget,
+                    stored.contract.retry,
+                    stored.contract.on_failure,
                 )
             });
         let mut worker_inputs = vec![schedule_ref];

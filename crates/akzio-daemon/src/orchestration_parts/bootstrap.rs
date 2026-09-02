@@ -54,7 +54,7 @@ impl Daemon {
         }
         production_evidence.insert(
             EvidenceSource::NewsWeb,
-            model_native_web_evidence_transport(model.clone(), EvidenceSource::NewsWeb)?,
+            model_native_web_evidence_transport(model, EvidenceSource::NewsWeb)?,
         );
         let outcome_worker_enabled =
             auto_paper && production_evidence.contains_key(&EvidenceSource::Alpaca);

@@ -47,7 +47,7 @@ fn deliberation_scores_are_additive_for_old_records_and_validated_for_new_runs()
     ];
     legacy_oversized.validate().unwrap();
 
-    let mut unscored_new_output = old.deliberation.clone();
+    let mut unscored_new_output = old.deliberation;
     unscored_new_output.assessment_source = Some("model_assessed".to_owned());
     assert!(unscored_new_output.validate_model_assessment().is_err());
     legacy_oversized.assessment_source = Some("model_assessed".to_owned());

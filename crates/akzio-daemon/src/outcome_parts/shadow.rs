@@ -161,7 +161,7 @@ impl Daemon {
             },
             Some(task.permit.artifact_origin()),
             std::iter::once(ArtifactRef {
-                artifact_id: schedule_artifact.artifact_id.clone(),
+                artifact_id: schedule_artifact.artifact_id,
                 kind: ArtifactKind::OutcomeSchedule,
             })
             .chain(collected.materialization.market_evidence.iter().cloned())
