@@ -9,8 +9,8 @@ use akzio_domain::{
     ContextProjection, ContextQuarantine, ContextQuarantineReason, ContextSelection, ContextTrust,
     DecisionHorizon, DomainError, Experience, FinancialContentAssessment, FinancialContentPolicy,
     Lesson, LessonLifecycle, LessonScope, LifecycleEventType, PolicyState, ReadGrant,
-    RegimeClassificationKind, RegimeSnapshot, ResearchClaim, ResearchCritique, TaskWritePermit,
-    DOMAIN_SCHEMA_VERSION, RESEARCH_ANALYST_RECIPE_ID, RESEARCH_CRITIC_RECIPE_ID,
+    RegimeClassificationKind, RegimeSnapshot, ResearchClaim, ResearchCritique, TaskBudget,
+    TaskWritePermit, DOMAIN_SCHEMA_VERSION, RESEARCH_ANALYST_RECIPE_ID, RESEARCH_CRITIC_RECIPE_ID,
     RESEARCH_SYNTHESIZER_RECIPE_ID,
 };
 use akzio_store::{Store, StoreError, SucceededAttemptProof};
@@ -53,6 +53,10 @@ pub enum ContextError {
     AuthorityBlobNotDeclared,
     #[error("context byte range is invalid")]
     InvalidRange,
+    #[error(
+        "document exceeds 32 KiB tool response limit; use read_range with at most 32768 bytes"
+    )]
+    DocumentRequiresRange,
     #[error("context search request is invalid")]
     InvalidSearch,
     #[error("context source comparison is invalid")]

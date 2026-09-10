@@ -27,3 +27,18 @@ api_key = "$LLM_GATEWAY_API_KEY"
 reasoning_effort = "low"
 response_language = "简体中文"
 debug = false
+
+# Agent resource defaults; role overrides use the same fields.
+# Input is cumulative across LLM requests in one Attempt, not a context window.
+# Output and timeout retain their per-role defaults when omitted.
+[agent.budget.default]
+max_input_tokens = 1000000
+max_tool_calls = "unlimited"
+
+# Optional finite limit for one role:
+# [agent.budget.analyst]
+# max_tool_calls = 8
+# max_output_tokens = 12000
+# timeout_seconds = 180
+# Also supported: planner, critic, synthesizer, outcome_worker.
+# See docs/agent-budget-configuration.md.

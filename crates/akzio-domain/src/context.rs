@@ -37,6 +37,10 @@ pub struct ContextSelection {
     pub artifact: ArtifactRef,
     pub reason: String,
     pub estimated_tokens: u32,
+    /// Size of the compact model projection, when this manifest uses the
+    /// separated source/projection budget. Legacy manifests leave it absent.
+    #[serde(default)]
+    pub projected_bytes: Option<u64>,
     #[serde(default)]
     pub trust: ContextTrust,
 }
@@ -62,6 +66,10 @@ pub struct ContextManifestPayload {
     #[serde(default)]
     pub quarantined: Vec<ContextQuarantine>,
     pub total_bytes: u64,
+    /// Sum of compact projection bytes. Legacy manifests use `total_bytes`
+    /// for both source and model-visible content.
+    #[serde(default)]
+    pub projected_bytes: Option<u64>,
     pub estimated_tokens: u32,
     pub input_hash: ContentHash,
 }
@@ -71,7 +79,8 @@ impl ContextManifestPayload {
         if self.schema_version != SCHEMA_VERSION
             || self.selections.len() < usize::from(policy.min_artifacts)
             || self.selections.len() > usize::from(policy.max_artifacts)
-            || self.total_bytes > policy.max_bytes
+            || self.total_bytes > policy.max_source_bytes.unwrap_or(policy.max_bytes)
+            || self.projected_bytes.unwrap_or(self.total_bytes) > policy.max_bytes
             || self.estimated_tokens > policy.max_tokens
         {
             return Err(DomainError::InvalidBudget {

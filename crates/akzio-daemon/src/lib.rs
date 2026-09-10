@@ -5,7 +5,9 @@
 //! grants, task attempts, and workflow transitions.
 
 mod application;
+mod debug;
 mod dispatch;
+pub use debug::{DebugForkRequest, DebugPrepareRequest};
 mod evidence;
 mod http;
 mod observer;
@@ -356,6 +358,9 @@ pub fn runtime_governance_identity(
 
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
+    pub agent_budget: akzio_domain::AgentBudgetConfig,
+    pub debug_control: Option<DebugCoreConfig>,
+    pub outcome_processing: bool,
     pub store_root: PathBuf,
     pub http_token: String,
     pub worker_count: usize,
@@ -386,6 +391,8 @@ struct DaemonPaperState {
 
 #[derive(Clone)]
 pub struct Daemon {
+    debug_control: Option<DebugCoreConfig>,
+    outcome_processing: bool,
     store: Store,
     store_executor: StoreExecutor,
     workflow: WorkflowRuntime,
@@ -393,6 +400,8 @@ pub struct Daemon {
     agents: AgentRuntime,
     model: ModelClientAdapter,
     stage_models: Arc<BTreeMap<String, ModelClientAdapter>>,
+    news_web_status: String,
+    news_web_route: String,
     reasoning_events: broadcast::Sender<AgentReasoningEvent>,
     fixture_evidence: Arc<FixtureEvidence>,
     fixture_mode: bool,
@@ -406,6 +415,14 @@ pub struct Daemon {
     paper: DaemonPaperState,
 }
 
+#[derive(Debug, Clone)]
+pub struct DebugCoreConfig {
+    pub code_revision: String,
+    pub runtime_identity: ContentHash,
+    pub decision_policy_status: String,
+    pub decision_policy_input_hash: Option<ContentHash>,
+}
+
 impl Daemon {
     fn model_for(&self, purpose: &str) -> &ModelClientAdapter {
         self.stage_models.get(purpose).unwrap_or(&self.model)
@@ -416,6 +433,14 @@ impl Daemon {
 pub struct DaemonHealth {
     pub status: String,
     pub frozen: bool,
+    pub decision_policy_status: String,
+    pub decision_policy_hash: ContentHash,
+    pub decision_policy_input_hash: Option<ContentHash>,
+    pub decision_capable: bool,
+    #[serde(default)]
+    pub news_web_status: String,
+    #[serde(default)]
+    pub news_web_route: String,
     pub scheduler_owner: Option<String>,
     pub scheduler_epoch: Option<u64>,
     pub metrics: StoreMetrics,

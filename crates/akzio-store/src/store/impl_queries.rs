@@ -357,7 +357,8 @@ impl Store {
                 return Err(StoreError::WorkflowGraphMismatch);
             }
             if let Some(previous) = &previous {
-                if revision.created_at < previous.created_at
+                if revision.graph.agent_budgets != previous.graph.agent_budgets
+                    || revision.created_at < previous.created_at
                     || revision.graph_artifact.source_refs.len() != 2
                     || !revision.graph_artifact.source_refs.iter().any(|reference| {
                         reference.artifact_id == previous.graph_artifact.artifact_id

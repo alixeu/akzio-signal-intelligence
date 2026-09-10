@@ -3,6 +3,10 @@
 //! The root surface exports only the source-incompatible CAS, SQLite graph,
 //! append-only events, permits, leases, slots, policy transitions, and Doctor.
 mod store;
+pub use crate::store::{
+    DebugArtifactView, DebugAttemptView, DebugBundleIntegrity, DebugBundleManifest,
+    DebugBundleRawAccess, DebugNodeView, DebugRunView,
+};
 
 pub use crate::store::{
     AlertSeverity, BackupManifest, CanaryCampaignHead, ClaimedAttempt, DaemonLease,

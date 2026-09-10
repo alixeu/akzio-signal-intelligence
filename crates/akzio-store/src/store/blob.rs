@@ -1,3 +1,4 @@
+use super::debug::{environment_identity, read_session};
 use super::*;
 
 pub(super) fn initialize_staging(connection: &Connection) -> StoreResult<()> {
@@ -94,9 +95,13 @@ impl Store {
     ) -> StoreResult<RunExportManifest> {
         self.verify_integrity()?;
         let workflow = self.workflow_snapshot(run_id)?;
-        if include_raw_model && workflow.run.purpose != RunPurpose::Debug {
+        let access_connection = self.connection()?;
+        if include_raw_model
+            && !raw_model_export_allowed(&access_connection, run_id, workflow.run.purpose)
+        {
             return Err(StoreError::RawModelExportNotAllowed(workflow.run.purpose));
         }
+        drop(access_connection);
         let target = target.as_ref().to_path_buf();
         if target.starts_with(self.root()) {
             return Err(StoreError::BackupInsideStoreRoot(target));
@@ -385,7 +390,31 @@ impl Store {
     }
 }
 
-fn stage_blob_bytes(
+/// Raw model detail is a capability of a legacy Debug run or of a matching
+/// isolated DebugSession.  RunPurpose alone is deliberately insufficient for
+/// Paper/PositionPlan, and a caller-provided flag cannot manufacture the
+/// isolated identity.
+pub(super) fn raw_model_export_allowed(
+    connection: &Connection,
+    run_id: &RunId,
+    purpose: RunPurpose,
+) -> bool {
+    if purpose == RunPurpose::Debug {
+        return true;
+    }
+    let Ok(Some(session)) = read_session(connection, run_id) else {
+        return false;
+    };
+    let Ok(store_identity) = environment_identity(connection) else {
+        return false;
+    };
+    session.identity.run_id == *run_id
+        && session.identity.run_purpose == purpose
+        && session.identity.learning_scope == akzio_domain::DebugLearningScope::Isolated
+        && store_identity.as_deref() == Some(session.identity.store_identity.as_str())
+}
+
+pub(super) fn stage_blob_bytes(
     connection: &Connection,
     bytes: &[u8],
     media_type: String,

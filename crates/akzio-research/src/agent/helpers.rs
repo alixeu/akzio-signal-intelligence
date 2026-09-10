@@ -205,3 +205,133 @@ fn model_error_class(error: &ResearchError) -> &'static str {
         _ => "other",
     }
 }
+
+// A narrowing of the installed schema, bound to this immutable manifest. Full
+// identities remain the wire and stored representation; no fuzzy ID repair.
+fn bind_reference_schema(schema: &mut Value, refs: &[Value]) {
+    match schema {
+        Value::Object(object) => {
+            if let Some(properties) = object.get_mut("properties").and_then(Value::as_object_mut) {
+                let kinds = properties.get("kind").and_then(|k|k.get("enum")).and_then(Value::as_array).cloned();
+                if let Some(id) = properties.get_mut("artifact_id") {
+                    id["enum"] = Value::Array(refs.iter().filter(|r|kinds.as_ref().is_none_or(|k|k.contains(&r["kind"])))
+                        .map(|r|r["artifact_id"].clone()).collect());
+                    if kinds.is_some() { properties.remove("kind"); }
+                }
+                if let Some(basis) = properties.get_mut("basis_artifact_ids") {
+                    basis["items"]["enum"] = Value::Array(refs.iter().map(|r|r["artifact_id"].clone()).collect());
+                }
+                if kinds.is_some() {
+                    if let Some(required) = object.get_mut("required").and_then(Value::as_array_mut) {
+                        required.retain(|v|v.as_str()!=Some("kind"));
+                    }
+                }
+            }
+            for (key,value) in object { if key!="enum" {bind_reference_schema(value, refs);} }
+        }
+        Value::Array(values) => for value in values { bind_reference_schema(value, refs); },
+        _ => {}
+    }
+}
+
+fn resolve_reference_kinds(value: &mut Value, refs: &[Value]) -> ResearchResult<()> {
+    match value {
+        Value::Object(object) => {
+            if let Some(id)=object.get("artifact_id") {
+                if !object.contains_key("kind") {
+                    let reference=refs.iter().find(|r|&r["artifact_id"]==id).ok_or_else(||
+                        ResearchError::InvalidOutput("reference ID is outside this attempt's Manifest".into()))?;
+                    object.insert("kind".into(),reference["kind"].clone());
+                }
+            }
+            for value in object.values_mut() {resolve_reference_kinds(value,refs)?;}
+        }
+        Value::Array(values) => for value in values {resolve_reference_kinds(value,refs)?;},
+        _ => {}
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod reference_binding_tests {
+    use super::*;
+    #[test]
+    fn thesis_expiry_requires_timezone_timestamp_not_calendar_date() {
+        let schema = decision_proposal_output_schema();
+        let expiry = &schema["properties"]["forecasts"]["items"]["properties"]["thesis"]["properties"]["thesis_valid_until"];
+        assert!(validate_schema_value(&json!("2026-09-14"), expiry, "$").is_err());
+        assert!(validate_schema_value(&json!("2026-09-14T20:00:00Z"), expiry, "$").is_ok());
+        assert!(validate_schema_value(&json!("2026-09-14T16:00:00-04:00"), expiry, "$").is_ok());
+    }
+    #[test]
+    fn exact_reference_schema_is_manifest_bound_and_rejects_truncation() {
+        let id = "a".repeat(64);
+        let mut schema = json!({"type":"object","properties":{"artifact_id":{"type":"string"}},"required":["artifact_id"]});
+        bind_reference_schema(&mut schema, &[json!({"artifact_id":id,"kind":"normalized_evidence"})]);
+
+        assert!(validate_schema_value(&json!({"artifact_id":id}), &schema, "$").is_ok());
+        assert!(validate_schema_value(&json!({"artifact_id":"a".repeat(63)}), &schema, "$").is_err());
+        assert!(validate_schema_value(&json!({"artifact_id":"b".repeat(64)}), &schema, "$").is_err());
+    }
+}
+
+#[cfg(test)]
+mod cumulative_budget_tests {
+    use super::*;
+    #[test]
+    fn over_budget_request_never_authorizes_a_provider_turn() {
+        let policy = TaskBudget { max_input_tokens: 48000, max_output_tokens: 5000, max_wall_time_secs: 120, max_tool_calls: akzio_domain::budget::ToolCallLimit::Limited(2) };
+        let mut budget = AgentRunBudget::new(&policy, &RetryPolicy::none());
+        budget.record_input(30825).unwrap();
+        assert!(matches!(budget.authorize_model_call(17236), Err(ResearchError::InputBudgetExceeded { actual: 48061, maximum: 48000 })));
+        assert_eq!(budget.model_calls, 0);
+        assert_eq!(budget.input_tokens, 30825);
+    }
+
+    #[test]
+    fn failed_provider_turn_remains_charged_before_repair() {
+        let policy = TaskBudget { max_input_tokens: 48000, max_output_tokens: 6000, max_wall_time_secs: 120, max_tool_calls: akzio_domain::budget::ToolCallLimit::Limited(4) };
+        let mut budget = AgentRunBudget::new(&policy, &RetryPolicy::none());
+        budget.record_turn(10000, 1000, None).unwrap();
+        budget.record_failed_turn(14000).unwrap();
+        assert_eq!(budget.input_tokens, 24000);
+        budget.check_input(16000).unwrap();
+        assert_eq!(budget.input_tokens, 24000);
+        budget.record_turn(16000, 1000, None).unwrap();
+        assert_eq!(budget.input_tokens, 40000);
+        assert!(budget.check_input(8001).is_err());
+    }
+
+    #[test]
+    fn reservation_is_not_a_charge_and_repair_overflow_is_rejected() {
+        let policy=TaskBudget {max_input_tokens:48000,max_output_tokens:6000,max_wall_time_secs:120,max_tool_calls: akzio_domain::budget::ToolCallLimit::Limited(4)};
+        let mut budget=AgentRunBudget::new(&policy,&RetryPolicy::none());
+        budget.check_input(8117 * 2).unwrap();
+        assert_eq!(budget.input_tokens,0);
+        for observed in [10662,14112,16093] {budget.record_input(observed).unwrap();}
+        assert_eq!(budget.input_tokens,40867);
+        assert!(matches!(budget.check_input(15987),Err(ResearchError::InputBudgetExceeded{actual:56854,maximum:48000})));
+        assert_eq!(budget.input_tokens,40867);
+    }
+}
+
+#[cfg(test)]
+mod wire_reference_tests {
+    use super::*;
+    #[test]
+    fn wire_ids_are_kind_filtered_and_resolve_without_widening_authority() {
+        let refs=vec![json!({"artifact_id":"a".repeat(64),"kind":"normalized_evidence"}),json!({"artifact_id":"b".repeat(64),"kind":"claim"})];
+        let mut schema=artifact_ref_schema(&["normalized_evidence","semantic_detail"]);
+        bind_reference_schema(&mut schema,&refs);
+        assert!(validate_schema_value(&json!({"artifact_id":"b".repeat(64)}),&schema,"$").is_err());
+        let mut value=json!({"artifact_id":"a".repeat(64)});
+        assert!(validate_schema_value(&value,&schema,"$").is_ok());
+        resolve_reference_kinds(&mut value,&refs).unwrap();
+        assert_eq!(value,refs[0]);
+        assert!(resolve_reference_kinds(&mut json!({"artifact_id":"a".repeat(63)}),&refs).is_err());
+        // Explicit wrong kinds are never silently corrected; original validation rejects them.
+        let mut wrong=json!({"artifact_id":"a".repeat(64),"kind":"claim"});
+        resolve_reference_kinds(&mut wrong,&refs).unwrap();
+        assert_eq!(wrong["kind"],"claim");
+    }
+}

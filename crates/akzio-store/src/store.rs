@@ -7,6 +7,8 @@
 mod attempt;
 mod blob;
 mod canary;
+mod debug;
+mod debug_bundle;
 mod doctor;
 mod execution;
 mod experiment;
@@ -21,6 +23,8 @@ mod trajectory;
 mod workflow;
 
 pub use canary::{CanaryCampaignHead, StoredCanarySession};
+pub use debug::{DebugArtifactView, DebugAttemptView, DebugNodeView, DebugRunView};
+pub use debug_bundle::{DebugBundleIntegrity, DebugBundleManifest, DebugBundleRawAccess};
 pub use lesson::{LessonRevalidationScan, LessonUsage, LessonWriteResult, StoredLesson};
 pub use maintenance::MaintenanceLeaseDeferral;
 

@@ -72,6 +72,7 @@ fn finish_permitted_task(
     if !post_terminal_worker {
         refresh_run_status(transaction, &permit.run_id, now)?;
     }
+    debug::settle_attempt(transaction, permit, &enum_name(status), now)?;
     Ok(status)
 }
 
@@ -238,6 +239,9 @@ fn validate_event_shape(
     }
 
     let valid = match event_type {
+        LifecycleEventType::DebugControlChanged => !has_task_id && !has_attempt_id && has_artifact_id,
+        LifecycleEventType::StageAcceptanceRecorded => has_task_id && has_attempt_id && has_artifact_id,
+        LifecycleEventType::DebugBudgetObserved => has_task_id && has_attempt_id && has_artifact_id,
         LifecycleEventType::WorkflowCreated => !has_task_id && !has_attempt_id && has_artifact_id,
         LifecycleEventType::SchedulerSnapshotNeedCreated
         | LifecycleEventType::SchedulerWorkflowProposalCreated => {

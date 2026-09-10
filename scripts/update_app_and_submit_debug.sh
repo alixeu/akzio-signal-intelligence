@@ -7,7 +7,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_ROOT="$ROOT/apps"
 BUILD_SCRIPT="$APP_ROOT/Scripts/build_app.sh"
 SIGN_SCRIPT="$APP_ROOT/Scripts/sign_app.sh"
-APP_BUNDLE="$APP_ROOT/dist/akzio.app"
+APP_BUNDLE="${AKZIO_APP_BUNDLE:-$APP_ROOT/dist/akzio.app}"
 
 echo "==> rebuilding Observatory app"
 "$BUILD_SCRIPT"
@@ -24,6 +24,7 @@ fi
 echo "==> applying ad-hoc self-use signature"
 "$SIGN_SCRIPT" "$APP_BUNDLE"
 
+if [[ "${AKZIO_PRESERVE_BUILD_PRODUCTS:-0}" != "1" ]]; then
 echo "==> removing repository build intermediates"
 for intermediate in \
   "$ROOT/target" \
@@ -35,5 +36,6 @@ do
     rm -rf -- "$intermediate"
   fi
 done
+fi
 
 echo "packaged: $APP_BUNDLE"

@@ -109,17 +109,8 @@ impl Store {
         reservation: &SessionReservation,
         proposal: Option<&Artifact>,
     ) -> StoreResult<()> {
-        for artifact in &reservation.setup_artifacts {
-            append_event(
-                transaction,
-                &reservation.workflow.run.run_id,
-                None,
-                None,
-                LifecycleEventType::SchedulerSnapshotNeedCreated,
-                Some(&artifact.artifact_id),
-                reservation.reserved_at,
-            )?;
-        }
+        Self::append_run_setup_events(transaction, &reservation.workflow.run.run_id,
+            &reservation.setup_artifacts, reservation.reserved_at)?;
         if let Some(proposal) = proposal {
             append_event(
                 transaction,
@@ -130,6 +121,16 @@ impl Store {
                 Some(&proposal.artifact_id),
                 reservation.reserved_at,
             )?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn append_run_setup_events(
+        transaction: &Transaction<'_>, run_id: &RunId, setup: &[Artifact], now: DateTime<Utc>,
+    ) -> StoreResult<()> {
+        for artifact in setup {
+            append_event(transaction, run_id, None, None,
+                LifecycleEventType::SchedulerSnapshotNeedCreated, Some(&artifact.artifact_id), now)?;
         }
         Ok(())
     }

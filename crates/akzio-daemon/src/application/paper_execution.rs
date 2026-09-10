@@ -17,23 +17,6 @@ impl<'a> PaperExecution<'a> {
         Self { daemon }
     }
 
-    pub(crate) async fn session_is_current(&self, task: &ClaimedAttempt) -> Result<bool> {
-        let Some(paper) = self.daemon.paper.paper_observer.as_ref() else {
-            return Ok(true);
-        };
-        let expected = self
-            .daemon
-            .store
-            .session_slot_for_run(&task.run_id)?
-            .map(|slot| slot.session_key)
-            .ok_or_else(|| DaemonError::InvalidInput("Paper run has no session slot".to_owned()))?;
-        let clock = paper
-            .market_clock()
-            .await
-            .map_err(|error| DaemonError::InvalidInput(error.to_string()))?;
-        Ok(clock.is_open && clock.session_date.to_string() == expected)
-    }
-
     pub(crate) fn decision_gate(
         &self,
         task: &ClaimedAttempt,
@@ -58,16 +41,24 @@ impl<'a> PaperExecution<'a> {
         let decision_context = self
             .daemon
             .terminal_input(task, ArtifactKind::DecisionContext)?;
-        let (account_snapshot, quote_snapshot, market_clock_snapshot) = if self
-            .daemon
-            .production_evidence
-            .contains_key(&EvidenceSource::Alpaca)
-            && self.daemon.store.run_purpose(&task.run_id)? == RunPurpose::Paper
-        {
-            self.daemon.refresh_execution_snapshots(task, now).await?
-        } else {
-            self.daemon.execution_snapshot_inputs(task)?
-        };
+        let (account_snapshot, quote_snapshot, market_clock_snapshot, quote_validation_error) =
+            if self
+                .daemon
+                .production_evidence
+                .contains_key(&EvidenceSource::Alpaca)
+                && self.daemon.store.run_purpose(&task.run_id)? == RunPurpose::Paper
+            {
+                let refreshed = self.daemon.refresh_execution_snapshots(task, now).await?;
+                (
+                    refreshed.account,
+                    refreshed.quotes,
+                    refreshed.clock,
+                    refreshed.quote_error,
+                )
+            } else {
+                let (account, quotes, clock) = self.daemon.execution_snapshot_inputs(task)?;
+                (account, quotes, clock, None)
+            };
         let gate_now = Utc::now();
         let pretrade_safety = self.pretrade_safety_evidence(
             task,
@@ -88,6 +79,7 @@ impl<'a> PaperExecution<'a> {
                 decision_context,
                 account_snapshot,
                 quote_snapshot,
+                quote_validation_error,
                 market_clock_snapshot,
                 pretrade_safety,
                 now: gate_now,
@@ -601,6 +593,13 @@ impl<'a> PaperExecution<'a> {
         let commitment = self
             .daemon
             .terminal_input(task, ArtifactKind::ExecutionCommitment)?;
+        if self.daemon.store.block_debug_broker_task(
+            &task.permit,
+            &[verdict.clone(), commitment.clone()],
+            now,
+        )? {
+            return Ok(TaskCompletion::DeferredUntil(now + Duration::seconds(1)));
+        }
         let broker = self.daemon.paper.paper_broker.as_ref().ok_or_else(|| {
             DaemonError::Unavailable(
                 "Paper reconciliation requires an injected Alpaca Paper broker adapter".to_owned(),

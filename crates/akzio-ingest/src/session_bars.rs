@@ -138,14 +138,37 @@ fn session_closes(
 
 impl AlpacaPaperEvidenceTransport {
     async fn bounded_json(&self, url: &reqwest::Url) -> Result<Value, EvidenceAdapterError> {
-        let response = self
-            .client
-            .get(url.clone())
-            .header("APCA-API-KEY-ID", &self.key_id)
-            .header("APCA-API-SECRET-KEY", &self.secret_key)
-            .send()
-            .await
-            .map_err(|_| EvidenceAdapterError::Transport("provider request failed".to_owned()))?;
+        // These are read-only GETs; use the same bounded connection retry as
+        // the other Alpaca acquisition path. HTTP policy failures are not retried.
+        let mut attempt = 1_u64;
+        let response = loop {
+            match self
+                .client
+                .get(url.clone())
+                .header("APCA-API-KEY-ID", &self.key_id)
+                .header("APCA-API-SECRET-KEY", &self.secret_key)
+                .send()
+                .await
+            {
+                Ok(response) => break response,
+                Err(error) if attempt < 5 && (error.is_connect() || error.is_timeout()) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(250 * attempt)).await;
+                    attempt += 1;
+                }
+                Err(error) => {
+                    return Err(EvidenceAdapterError::Transport(
+                        if error.is_timeout() {
+                            "provider request timeout"
+                        } else if error.is_connect() {
+                            "provider connection failed"
+                        } else {
+                            "provider request failed"
+                        }
+                        .to_owned(),
+                    ))
+                }
+            }
+        };
         classify_evidence_response(&response)?;
         let mut bytes = Vec::new();
         let mut stream = response.bytes_stream();

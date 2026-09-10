@@ -1,6 +1,7 @@
 const CAPABILITY_PROBE_TOOL: &str = "akzio_capability_probe";
 const CAPABILITY_PROBE_COMPLETE_TOOL: &str = "akzio_capability_probe_complete";
 const CAPABILITY_PROBE_SOURCE: &str = "runtime_function_tool_stateless_continuation_probe_v1";
+const NATIVE_WEB_PROBE_SOURCE: &str = "native_web_required_search_probe_v2";
 
 pub async fn probe_configured_model_capabilities(
     config: &OpenAIResponsesConfig,
@@ -37,6 +38,31 @@ impl ModelClient {
 async fn probe_openai_responses_capabilities(
     client: &OpenAIResponsesClient,
 ) -> Result<ModelCapabilitySnapshot> {
+    probe_openai_responses_capabilities_audited(client)
+        .await
+        .map(|(snapshot, _)| snapshot)
+}
+
+/// Minimal provider-only audit; deliberately excludes headers and continuation payloads.
+impl ModelClient {
+    pub async fn probe_capabilities_audited(
+        &self,
+    ) -> Result<(ModelCapabilitySnapshot, Vec<Value>)> {
+        match self {
+            Self::OpenAIResponses(client) => {
+                probe_openai_responses_capabilities_audited(client).await
+            }
+            _ => Err(ModelError::CapabilityProbe(
+                "real provider required for audited preflight".into(),
+            )),
+        }
+    }
+}
+
+async fn probe_openai_responses_capabilities_audited(
+    client: &OpenAIResponsesClient,
+) -> Result<(ModelCapabilitySnapshot, Vec<Value>)> {
+    let started = std::time::Instant::now();
     let first = client
         .respond(capability_probe_request(
             CAPABILITY_PROBE_TOOL,
@@ -54,9 +80,11 @@ async fn probe_openai_responses_capabilities(
                 "initial response did not return the required function call".to_owned(),
             )
         })?;
+    let first_audit = capability_response_audit(&first, started.elapsed());
     let (reasoning_items, encrypted_continuation) =
         continuation_observations(first.continuation.items());
 
+    let started = std::time::Instant::now();
     let second = client
         .respond(capability_probe_request(
             CAPABILITY_PROBE_COMPLETE_TOOL,
@@ -84,23 +112,232 @@ async fn probe_openai_responses_capabilities(
         ));
     }
 
-    Ok(ModelCapabilitySnapshot {
-        provider_id: OPENAI_RESPONSES_PROVIDER_ID.to_owned(),
-        model_id: client.model.clone(),
-        reasoning_effort: client.reasoning_effort.clone(),
-        supports_tool_calls: true,
-        supports_stateless_continuation: true,
-        native_web_tool: false,
-        streaming: Some(true),
-        declared_context_limit: None,
-        declared_max_output_tokens: None,
-        reasoning_items,
-        encrypted_continuation,
-        native_web_tool_verified: false,
-        basis: ModelCapabilityBasis::RuntimeNegotiated,
-        verified: true,
-        source: CAPABILITY_PROBE_SOURCE.to_owned(),
-    })
+    let audit = vec![
+        first_audit,
+        capability_response_audit(&second, started.elapsed()),
+    ];
+    let (
+        native_web_tool,
+        native_web_tool_verified,
+        native_web_status,
+        native_web_audit,
+    ) =
+        probe_native_web_tool(client).await;
+    let mut audit = audit;
+    if let Some(native_web_audit) = native_web_audit {
+        audit.push(native_web_audit);
+    }
+    Ok((
+        ModelCapabilitySnapshot {
+            provider_id: OPENAI_RESPONSES_PROVIDER_ID.to_owned(),
+            model_id: client.model.clone(),
+            reasoning_effort: client.reasoning_effort.clone(),
+            supports_tool_calls: true,
+            supports_stateless_continuation: true,
+            native_web_tool,
+            streaming: Some(true),
+            declared_context_limit: None,
+            declared_max_output_tokens: None,
+            reasoning_items,
+            encrypted_continuation,
+            native_web_tool_verified,
+            native_web_status,
+            basis: ModelCapabilityBasis::RuntimeNegotiated,
+            verified: true,
+            source: format!("{CAPABILITY_PROBE_SOURCE}+{NATIVE_WEB_PROBE_SOURCE}"),
+        },
+        audit,
+    ))
+}
+
+async fn probe_native_web_tool(
+    client: &OpenAIResponsesClient,
+) -> (bool, bool, NativeWebCapabilityStatus, Option<Value>) {
+    let policy = NativeWebPolicy::default();
+    let request = ModelRequest {
+        instructions: "Use the Rust-approved native web search once and return the source URLs.".to_owned(),
+        input: ModelInput::Fresh {
+            text: "Search for one recent Reuters article about QQQ.".to_owned(),
+        },
+        max_output_tokens: 256,
+        reasoning_effort: None,
+        tools: vec![policy.tool_definition()],
+        // A capability probe must test the hosted tool itself. `auto` is
+        // allowed to produce text without searching and therefore cannot
+        // distinguish an unsupported tool from a model choice not to search.
+        tool_choice: ModelToolChoice::Required,
+        fixture_key: None,
+    };
+    match client.respond(request).await {
+        Ok(response) => {
+            let validation = policy
+                .validate_provider_response(&response.raw)
+                .and_then(|_| policy.extract_citations(&response.raw).map(|_| ()));
+            let verified = validation.is_ok();
+            let status = match &validation {
+                Ok(()) => NativeWebCapabilityStatus::Verified,
+                Err(error) => native_web_failure_status(Some(&response.raw), error),
+            };
+            (
+                verified,
+                verified,
+                status,
+                Some(json!({
+                    "capability": "native_web",
+                    "verified": verified,
+                    "status": status,
+                    "validation": validation.as_ref().err().map(safe_model_error),
+                    "response_id": response.raw.get("id"),
+                    "actual_model": response.raw.get("model"),
+                    "usage": response.usage,
+                    "web_search_calls": response.raw.get("output").and_then(Value::as_array).map(|items| items.iter().filter(|item| item.get("type").and_then(Value::as_str) == Some("web_search_call")).count()),
+                })),
+            )
+        }
+        Err(error) => {
+            let status = native_web_failure_status(None, &error);
+            (
+                false,
+                false,
+                status,
+                Some(json!({
+                "capability": "native_web",
+                "verified": false,
+                "status": status,
+                "error": safe_model_error(&error),
+            })),
+            )
+        }
+    }
+}
+
+fn native_web_failure_status(raw: Option<&Value>, error: &ModelError) -> NativeWebCapabilityStatus {
+    if let Some(raw) = raw {
+        let calls = raw
+            .get("output")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("web_search_call"))
+            .collect::<Vec<_>>();
+        if calls.is_empty() {
+            return NativeWebCapabilityStatus::NotCalled;
+        }
+        let has_search_action = calls.iter().any(|call| {
+            call.pointer("/action/type").and_then(Value::as_str) == Some("search")
+        });
+        if !has_search_action {
+            return NativeWebCapabilityStatus::NoVerifiableSources;
+        }
+        let has_sources = calls.iter().any(|call| {
+            call.pointer("/action/sources")
+                .and_then(Value::as_array)
+                .is_some_and(|sources| !sources.is_empty())
+        });
+        if !has_sources
+            && matches!(
+                error,
+                ModelError::NativeWebArgumentsInvalid | ModelError::NativeWebCitationsMissing
+            )
+        {
+            return NativeWebCapabilityStatus::NoVerifiableSources;
+        }
+    }
+
+    match error {
+        ModelError::Http { status, body } => match status.as_u16() {
+            401 | 403 => NativeWebCapabilityStatus::AuthorizationDenied,
+            408 | 500..=599 => NativeWebCapabilityStatus::TemporaryProviderError,
+            429 => NativeWebCapabilityStatus::RateLimited,
+            _ if provider_declares_unsupported_tool(body) => {
+                NativeWebCapabilityStatus::ToolUnsupported
+            }
+            _ => NativeWebCapabilityStatus::ProviderRouteError,
+        },
+        ModelError::Transport(_) => NativeWebCapabilityStatus::TransportError,
+        ModelError::StreamIdleTimeout { .. } => NativeWebCapabilityStatus::TemporaryProviderError,
+        ModelError::NativeWebCitationsMissing => NativeWebCapabilityStatus::NoVerifiableSources,
+        ModelError::NativeWebUnsafeCitation { .. } => {
+            NativeWebCapabilityStatus::SourceValidationFailed
+        }
+        ModelError::NativeWebUnavailable => NativeWebCapabilityStatus::NoVerifiableSources,
+        ModelError::NativeWebToolNotAllowed => NativeWebCapabilityStatus::ToolUnsupported,
+        ModelError::NativeWebArgumentsInvalid | ModelError::NativeWebLimitExceeded => {
+            NativeWebCapabilityStatus::InvalidResponse
+        }
+        _ => NativeWebCapabilityStatus::InvalidResponse,
+    }
+}
+
+fn provider_declares_unsupported_tool(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    let mut text = String::new();
+    collect_error_text(&value, &mut text);
+    let text = text.to_ascii_lowercase();
+    [
+        "unsupported tool",
+        "tool is not supported",
+        "tool not supported",
+        "unknown tool",
+        "web_search is not available",
+        "web_search is not supported",
+        "does not support web_search",
+    ]
+    .into_iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn collect_error_text(value: &Value, output: &mut String) {
+    match value {
+        Value::String(value) => {
+            if !output.is_empty() {
+                output.push(' ');
+            }
+            output.push_str(value);
+        }
+        Value::Array(values) => values
+            .iter()
+            .for_each(|value| collect_error_text(value, output)),
+        Value::Object(values) => values
+            .values()
+            .for_each(|value| collect_error_text(value, output)),
+        _ => {}
+    }
+}
+
+fn safe_model_error(error: &ModelError) -> Value {
+    match error {
+        ModelError::Http { status, .. } => json!({
+            "kind": "http",
+            "status": status.as_u16(),
+        }),
+        ModelError::Transport(_) => json!({"kind": "transport"}),
+        ModelError::StreamIdleTimeout { idle_timeout } => json!({
+            "kind": "stream_idle_timeout",
+            "timeout_ms": idle_timeout.as_millis(),
+        }),
+        ModelError::NativeWebCitationsMissing => json!({"kind": "no_verifiable_sources"}),
+        ModelError::NativeWebUnsafeCitation { .. } => {
+            json!({"kind": "source_validation_failed"})
+        }
+        ModelError::NativeWebUnavailable => json!({"kind": "no_verifiable_sources"}),
+        ModelError::NativeWebToolNotAllowed => json!({"kind": "tool_unsupported"}),
+        ModelError::NativeWebArgumentsInvalid | ModelError::NativeWebLimitExceeded => {
+            json!({"kind": "invalid_response"})
+        }
+        ModelError::CapabilityProbe(_) => json!({"kind": "capability_probe"}),
+        ModelError::Refused(_) => json!({"kind": "refused"}),
+        ModelError::Incomplete(_) => json!({"kind": "incomplete"}),
+        ModelError::MissingOutput => json!({"kind": "missing_output"}),
+        ModelError::FixtureExhausted => json!({"kind": "fixture_exhausted"}),
+        ModelError::EmptyBaseUrl
+        | ModelError::EmptyApiKey
+        | ModelError::EmptyModel
+        | ModelError::EmptyReasoningEffort => json!({"kind": "configuration"}),
+        ModelError::InvalidStream(_) => json!({"kind": "invalid_stream"}),
+    }
 }
 
 fn capability_probe_request(tool_name: &str, input: ModelInput) -> ModelRequest {
@@ -108,6 +345,7 @@ fn capability_probe_request(tool_name: &str, input: ModelInput) -> ModelRequest 
         instructions: "Perform only the required Akzio capability probe function call.".to_owned(),
         input,
         max_output_tokens: 96,
+        reasoning_effort: None,
         tools: vec![ModelToolDefinition {
             name: tool_name.to_owned(),
             description: "Return a minimal capability-probe acknowledgement.".to_owned(),
@@ -142,3 +380,111 @@ fn continuation_observations(items: &[Value]) -> (Option<bool>, Option<bool>) {
     )
 }
 
+fn capability_response_audit(response: &ModelResponse, elapsed: std::time::Duration) -> Value {
+    json!({
+        "provider": OPENAI_RESPONSES_PROVIDER_ID,
+        "requested_model": response.request_body.get("model"),
+        "actual_model": response.raw.get("model"),
+        "provider_request_id": response.provider_request_id,
+        "response_id": response.raw.get("id"),
+        "usage": response.usage,
+        "latency_millis": elapsed.as_millis(),
+        "tools_offered": response.request_body.get("tools"),
+        "tool_choice": response.request_body.get("tool_choice"),
+        "tool_calls": response.tool_calls,
+        "stream": response.request_body.get("stream"),
+        "probe_version": CAPABILITY_PROBE_SOURCE,
+    })
+}
+
+#[cfg(test)]
+mod capability_audit_tests {
+    use super::*;
+
+    #[test]
+    fn required_web_probe_serializes_as_required_tool_choice() {
+        let request = ModelRequest {
+            instructions: "probe".to_owned(),
+            input: ModelInput::Fresh {
+                text: "search".to_owned(),
+            },
+            max_output_tokens: 256,
+            reasoning_effort: None,
+            tools: vec![NativeWebPolicy::default().tool_definition()],
+            tool_choice: ModelToolChoice::Required,
+            fixture_key: None,
+        };
+        let body = openai_responses_request_body("gpt-test", "low", &request);
+        assert_eq!(body["tool_choice"], "required");
+        assert_eq!(body["tools"][0]["type"], NATIVE_WEB_SEARCH_TOOL);
+    }
+
+    #[test]
+    fn native_web_probe_classifies_no_call_no_sources_and_route_failures() {
+        assert_eq!(
+            native_web_failure_status(
+                Some(&json!({"output": []})),
+                &ModelError::NativeWebUnavailable,
+            ),
+            NativeWebCapabilityStatus::NotCalled
+        );
+        assert_eq!(
+            native_web_failure_status(
+                Some(&json!({
+                    "output": [{"type":"web_search_call", "action":{"type":"search"}}]
+                })),
+                &ModelError::NativeWebArgumentsInvalid,
+            ),
+            NativeWebCapabilityStatus::NoVerifiableSources
+        );
+        assert_eq!(
+            native_web_failure_status(
+                None,
+                &ModelError::Http {
+                    status: reqwest::StatusCode::BAD_REQUEST,
+                    body: json!({"error":{"message":"web_search is not supported by this model"}}).to_string(),
+                },
+            ),
+            NativeWebCapabilityStatus::ToolUnsupported
+        );
+        assert_eq!(
+            native_web_failure_status(
+                None,
+                &ModelError::Http {
+                    status: reqwest::StatusCode::BAD_GATEWAY,
+                    body: "gateway failure".to_owned(),
+                },
+            ),
+            NativeWebCapabilityStatus::TemporaryProviderError
+        );
+        assert_eq!(
+            native_web_failure_status(
+                None,
+                &ModelError::Http {
+                    status: reqwest::StatusCode::BAD_REQUEST,
+                    body: json!({"error":{"code":"model_not_found"}}).to_string(),
+                },
+            ),
+            NativeWebCapabilityStatus::ProviderRouteError
+        );
+    }
+
+    #[test]
+    fn audit_preserves_provider_ids_and_unknown_usage_without_raw_response() {
+        let response = ModelResponse {
+            provider_request_id: Some("provider-request".into()),
+            output_text: String::new(),
+            tool_calls: vec![],
+            continuation: ModelContinuation::from_items(vec![]),
+            raw: json!({"id":"provider-response", "model":"actual", "secret":"never export"}),
+            usage: ModelUsage::default(),
+            request_body: json!({"model":"requested", "stream":true}),
+        };
+        let audit = capability_response_audit(&response, std::time::Duration::from_millis(12));
+        assert_eq!(audit["provider_request_id"], "provider-request");
+        assert_eq!(audit["response_id"], "provider-response");
+        assert_eq!(audit["actual_model"], "actual");
+        assert!(audit["usage"]["input_tokens"].is_null());
+        assert!(!audit.to_string().contains("never export"));
+    }
+}

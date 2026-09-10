@@ -1,3 +1,10 @@
+// The Attempt wall-time remains the Contract's fixed total. Draft needs the
+// larger share because it may perform a real provider call plus bounded reads;
+// Submit is deliberately kept within the remaining 30% and cannot extend the
+// Attempt. The previous 55/45 split killed legitimate high-reasoning Drafts at
+// 66s even when the Contract still had 54s left.
+const DRAFT_WALL_TIME_FRACTION: f32 = 0.70;
+
 impl AgentRuntime {
     pub async fn run(
         &self,
@@ -46,7 +53,22 @@ impl AgentRuntime {
             return Err(ResearchError::ContractMismatch);
         }
         let installed = self.catalogue.get(contract_hash)?;
-        if node.budget != installed.contract.budget
+        let run_id = permit.run_id.clone();
+        let task_id = permit.task_id.clone();
+        let frozen = self
+            .store_executor
+            .execute(move |store| {
+                store.workflow_snapshot(&run_id).map(|snapshot| {
+                    snapshot
+                        .tasks
+                        .into_iter()
+                        .find(|task| task.node.task_id == task_id)
+                        .map(|task| task.node.budget)
+                })
+            })
+            .await??;
+        if frozen.as_ref() != Some(&node.budget)
+            || budget.resolved_policy() != node.budget
             || node.retry != installed.contract.retry
             || node.on_failure != installed.contract.on_failure
         {
@@ -95,7 +117,7 @@ impl AgentRuntime {
             return Err(ResearchError::GrantPermitMismatch);
         }
         let context_materialization = self
-            .context_materialization(permit, &installed.contract, &manifest, now)
+            .context_materialization(permit, &installed.contract, &manifest, &node.budget, now)
             .await?;
         let context = context_materialization.model_context();
         let governance = String::from_utf8(
@@ -125,20 +147,33 @@ impl AgentRuntime {
             .collect::<Vec<_>>();
         let reference_ledger = serde_json::to_string(&reference_ledger)?;
         let prompt = format!(
-            "{governance}\n\n{role}\n\nDuring Draft, use granted read tools as needed, then return a concise, auditable research memo in {response_language}. State conclusions, evidence, counter-evidence, and uncertainty without exposing hidden chain-of-thought. During Submit, call submit_result exactly once; keep JSON property names, enum literals, identifiers, symbols, and cited source text unchanged.\n\nTop-level ContextManifest references (copy exact artifact_id and kind into result references; a blocked decision still preserves selected claims and their grounds):\n{reference_ledger}"
+            "{governance}\n\n{role}\n\nDuring Draft, use granted read tools as needed, then return a concise, auditable research memo in {response_language}. State conclusions, evidence, counter-evidence, and uncertainty without exposing hidden chain-of-thought. During Submit, call submit_result exactly once; keep JSON property names, enum literals, identifiers, symbols, and cited source text unchanged.\n\nTop-level ContextManifest references (copy exact artifact_id and kind into result references; a blocked decision still preserves selected claims and their grounds):\n{reference_ledger}\n\nWire Submit references contain only artifact_id, not kind. Rust resolves kind from this immutable ledger. Select only IDs allowed by the specific field schema; a Claim is not an evidence ground."
         );
         let prompt = if installed.contract.output.artifact_kind == ArtifactKind::DecisionProposal {
             format!(
-                "{prompt}\n\nSubmission invariant: result.claims and result.hard_blockers must not both be empty; copy at least one selected claim reference when claims are available."
+                "{prompt}\n\nSubmission invariant: result.claims and result.hard_blockers must not both be empty; copy at least one selected claim reference when claims are available. result.research_allocation is mandatory: include all four executable assets exactly once, explicit integer-ppm cash, and make the four asset weights plus cash sum to 1000000."
             )
         } else {
             prompt
         };
-        let output_schema: Value = serde_json::from_slice(
+        let prompt = format!(
+            "{prompt}\n\nResolved Attempt resource budget: {}. max_input_tokens is the cumulative input across all LLM requests in this Attempt, not the provider context window. Draft and Submit share this budget.",
+            serde_json::to_string(&node.budget)?
+        );
+        let mut output_schema: Value = serde_json::from_slice(
             &self
                 .read_authority_document(&installed.contract, &installed.contract.output.schema)
                 .await?,
         )?;
+        bind_reference_schema(
+            &mut output_schema,
+            &manifest
+                .payload
+                .selections
+                .iter()
+                .map(|s| json!(s.artifact))
+                .collect::<Vec<_>>(),
+        );
         let run_purpose = self.run_purpose_for(&permit.run_id).await?;
         let tools = if !should_advertise_read_tools(run_purpose) {
             Vec::new()
@@ -147,7 +182,7 @@ impl AgentRuntime {
         };
         let terminal = AgentTerminalDefinition {
             description: format!(
-                "Submit the final {} contract output for Rust validation. This has no side effects.",
+                "Submit the final {} contract output for Rust validation. Reference objects use only artifact_id: Rust resolves kind from the immutable Manifest before canonical validation. This has no side effects.",
                 installed.contract.purpose.as_str()
             ),
             input_schema: output_schema.clone(),
@@ -179,6 +214,8 @@ impl AgentRuntime {
         if matches!(&recovery.source, AgentRecoverySource::Recovered(_)) {
             budget.restore(&recovery)?;
         }
+        self.observe_debug_budget(permit, budget, "AttemptBudgetReady")
+            .await?;
         let mut continuation = recovery.continuation;
         let mut pending_tool_outputs = recovery.pending_tool_outputs;
         let mut trace_refs = recovery.trace_refs;
@@ -196,7 +233,8 @@ impl AgentRuntime {
             let submit_reserve = (budget.max_output_tokens / 2).max(1);
             if phase == AgentTurnPhase::Draft
                 && (budget.remaining_output_tokens()? <= submit_reserve
-                    || budget.started.elapsed() >= budget.wall_time.mul_f32(0.55))
+                    || budget.started.elapsed()
+                        >= budget.wall_time.mul_f32(DRAFT_WALL_TIME_FRACTION))
             {
                 return Err(ResearchError::InvalidOutput(
                     "draft_incomplete: reserved Submit budget reached before a memo was completed"
@@ -214,12 +252,26 @@ impl AgentRuntime {
             } else {
                 budget.remaining_output_tokens()?
             };
+            let max_output_tokens = if phase == AgentTurnPhase::Draft
+                && installed.contract.purpose.as_str() == akzio_domain::RESEARCH_CRITIC_RECIPE_ID
+            {
+                max_output_tokens.min(700)
+            } else if phase == AgentTurnPhase::Draft
+                && installed.contract.purpose.as_str()
+                    == akzio_domain::RESEARCH_SYNTHESIZER_RECIPE_ID
+            {
+                max_output_tokens.min(1_800)
+            } else {
+                max_output_tokens
+            };
 
             let mut request = AgentModelRequest {
                 contract_hash: installed.contract.contract_hash.clone(),
                 purpose: installed.contract.purpose.as_str().to_owned(),
                 phase,
-                prompt: prompt.clone(),
+                prompt: if phase == AgentTurnPhase::Draft && !budget.max_tool_calls.allows(u64::from(budget.tool_calls) + 1) {
+                    format!("{prompt}\nRead tool budget exhausted. Complete the concise Draft memo using available facts; explicitly preserve insufficient evidence. Rust will then request Submit.")
+                } else { prompt.clone() },
                 objective: node.objective.clone(),
                 manifest_artifact_id: manifest.artifact.artifact_id.clone(),
                 read_grant_identity: Some(context_materialization.read_grant_identity.clone()),
@@ -236,11 +288,30 @@ impl AgentRuntime {
                 continuation_instruction: (phase == AgentTurnPhase::Submit
                     && pending_tool_outputs.is_empty())
                 .then(|| {
-                    "Draft memo is complete. Use that memo and the authorized evidence to call submit_result exactly once; preserve unresolved gaps in the final contract output. Do not call any other tool or add assistant text."
+                    "Draft memo is complete. Call submit_result exactly once. Before submitting: use exact IDs from the schema and their original kinds, exact task horizon, scoped evidence gaps, and matching source/resource pairs. Unavailable evidence may be reported with supplemental_needs=[]; do not invent replacement requests. Preserve uncertainty and missing support. No other tools or assistant text."
                         .to_owned()
                 }),
                 max_output_tokens,
-                tools: if phase == AgentTurnPhase::Draft {
+                // Draft and Submit have separate, audited phase costs. Analyst
+                // Drafts use medium reasoning so the fixed 120s Attempt can
+                // still reach Submit; the model, evidence, output contract,
+                // and target semantics are unchanged. Submit is deterministic
+                // schema formatting and uses low reasoning.
+                reasoning_effort: if phase == AgentTurnPhase::Submit
+                    || installed.contract.purpose.as_str()
+                        == akzio_domain::RESEARCH_CRITIC_RECIPE_ID
+                {
+                    Some("low".to_owned())
+                } else if matches!(
+                    installed.contract.purpose.as_str(),
+                    RESEARCH_ANALYST_RECIPE_ID
+                        | akzio_domain::RESEARCH_SYNTHESIZER_RECIPE_ID
+                ) {
+                    Some("medium".to_owned())
+                } else {
+                    None
+                },
+                tools: if phase == AgentTurnPhase::Draft && budget.max_tool_calls.allows(u64::from(budget.tool_calls) + 1) {
                     tools.clone()
                 } else {
                     Vec::new()
@@ -281,6 +352,8 @@ impl AgentRuntime {
                     .unwrap_or_else(|| model.capability_snapshot());
                 let capability_snapshot_hash = capability_snapshot_hash(&capability_snapshot)?;
                 let runtime_snapshot = AgentTurnRuntimeSnapshot {
+                    resolved_budget: node.budget.clone(),
+                    budget_usage: budget.debug_observation("RequestProvenance"),
                     capability: capability_snapshot,
                     capability_hash: capability_snapshot_hash,
                     budget_policy: budget_policy.clone(),
@@ -315,6 +388,9 @@ impl AgentRuntime {
                     });
                     return Err(capability);
                 }
+                // Reject locally before opening a durable Provider turn.
+                // A budget rejection must not leave AgentTurnStarted unmatched.
+                budget.authorize_model_call(input_tokens)?;
                 let request_hash = model_request_hash(&request)?;
                 self.validate_authority_permit(permit).await?;
                 let event_permit = permit.clone();
@@ -365,10 +441,10 @@ impl AgentRuntime {
                     };
                     let _ = sender.send(event);
                 });
-                budget.check_input(input_tokens)?;
-                budget.record_model_call()?;
+                self.observe_debug_budget(permit, budget, "BeforeLLM")
+                    .await?;
                 let phase_deadline = if phase == AgentTurnPhase::Draft {
-                    wall_time.mul_f32(0.55)
+                    wall_time.mul_f32(DRAFT_WALL_TIME_FRACTION)
                 } else {
                     wall_time
                 };
@@ -379,7 +455,7 @@ impl AgentRuntime {
                 .await
                 .unwrap_or_else(|_| {
                     Err(ResearchError::WallTimeExceeded {
-                        maximum_secs: installed.contract.budget.max_wall_time_secs,
+                        maximum_secs: node.budget.max_wall_time_secs,
                     })
                 });
                 match call {
@@ -417,6 +493,8 @@ impl AgentRuntime {
                             kind: ArtifactKind::AgentTurn,
                         });
                         budget.record_failed_turn(input_tokens)?;
+                        self.observe_debug_budget(permit, budget, "FailedTurnAccounted")
+                            .await?;
                         if draft_deadline {
                             return Err(error);
                         }
@@ -432,7 +510,7 @@ impl AgentRuntime {
                         );
                         if backoff > wall_time.saturating_sub(started.elapsed()) {
                             return Err(ResearchError::WallTimeExceeded {
-                                maximum_secs: installed.contract.budget.max_wall_time_secs,
+                                maximum_secs: node.budget.max_wall_time_secs,
                             });
                         }
                         if !backoff.is_zero() {
@@ -470,7 +548,7 @@ impl AgentRuntime {
                     kind: ArtifactKind::AgentTurn,
                 });
                 return Err(ResearchError::WallTimeExceeded {
-                    maximum_secs: installed.contract.budget.max_wall_time_secs,
+                    maximum_secs: node.budget.max_wall_time_secs,
                 });
             }
             let turn_now = logical_now(now, started.elapsed());
@@ -499,12 +577,19 @@ impl AgentRuntime {
                 turn.telemetry.as_ref(),
             )?;
             continuation = Some(turn.continuation.clone());
+            self.observe_debug_budget(permit, budget, "TurnAccounted")
+                .await?;
             pending_tool_outputs.clear();
             if phase == AgentTurnPhase::Draft && turn.terminal_submission.is_some() {
                 return Err(ResearchError::AmbiguousSubmission);
             }
             if phase == AgentTurnPhase::Draft && !turn.tool_calls.is_empty() {
-                budget.record_tool_calls(turn.tool_calls.len() as u16)?;
+                budget.record_tool_calls(
+                    u32::try_from(turn.tool_calls.len())
+                        .map_err(|_| ResearchError::ToolBudgetExceeded)?,
+                )?;
+                self.observe_debug_budget(permit, budget, "ToolCallsAccounted")
+                    .await?;
                 for call in turn.tool_calls {
                     budget.check_wall()?;
                     let call_id = call.call_id.clone();
@@ -564,11 +649,20 @@ impl AgentRuntime {
             let validation_permit = permit.clone();
             let validation_contract = installed.contract.clone();
             let validation_manifest = manifest.clone();
-            let validation_arguments = submission.arguments.clone();
+            let mut validation_arguments = submission.arguments.clone();
             let validation_objective = node.objective.clone();
             let validated = self
                 .store_executor
                 .execute(move |_| {
+                    resolve_reference_kinds(
+                        &mut validation_arguments,
+                        &validation_manifest
+                            .payload
+                            .selections
+                            .iter()
+                            .map(|s| json!(s.artifact))
+                            .collect::<Vec<_>>(),
+                    )?;
                     validate_submission_schema(
                         &validation_runtime.store,
                         &validation_contract,
@@ -622,6 +716,29 @@ impl AgentRuntime {
                     Ok::<_, ResearchError>((output, deliberation_note, research_sources))
                 })
                 .await?;
+
+            if let Err(ResearchError::InvalidOutput(message)) = &validated {
+                let permit = permit.clone();
+                let message = message.clone();
+                let stage = installed.contract.purpose.as_str().to_owned();
+                let evidence_refs = trace_refs.last().cloned().into_iter().collect();
+                self.store_executor.execute(move |store| {
+                    if store.debug_session(&permit.run_id)?.is_some() {
+                        store.record_stage_acceptance(&akzio_domain::StageAcceptance {
+                            version: 1, run_id: permit.run_id.clone(), task_id: permit.task_id.clone(),
+                            attempt_id: permit.attempt_id.clone(), stage,
+                            business_result: "SubmitRejected".into(), test_result: akzio_domain::AcceptanceResult::Fail,
+                            checks: vec![akzio_domain::AcceptanceCheck {
+                                check_id: "agent.submit_validation".into(), category: akzio_domain::AcceptanceCategory::Schema,
+                                expected: "Canonical schema, scope and evidence validation".into(), actual: message.clone(),
+                                result: akzio_domain::AcceptanceResult::Fail, evidence_refs,
+                                message: "Original rejected submission; preserved before any repair request".into(),
+                            }], created_at: turn_now,
+                        })?;
+                    }
+                    Ok::<_, akzio_store::StoreError>(())
+                }).await??;
+            }
 
             let (output, deliberation_note, research_sources) = match validated {
                 Ok(validated) => validated,
@@ -691,5 +808,19 @@ impl AgentRuntime {
                 .await??;
             return Ok(output_artifact);
         }
+    }
+}
+
+#[cfg(test)]
+mod wall_time_split_tests {
+    use super::*;
+
+    #[test]
+    fn draft_phase_keeps_more_than_the_old_fifty_five_percent_cut() {
+        let total = std::time::Duration::from_secs(120);
+        let draft = total.mul_f32(DRAFT_WALL_TIME_FRACTION);
+        assert_eq!(draft.as_secs(), 84);
+        assert!(draft > total.mul_f32(0.55));
+        assert!(draft < total);
     }
 }

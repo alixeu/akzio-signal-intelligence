@@ -94,6 +94,7 @@ impl EvaluationRuntime {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn seal_outcome_for_evaluation_fenced(
         &self,
         lease: &DaemonLease,

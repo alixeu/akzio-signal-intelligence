@@ -501,6 +501,7 @@ impl Store {
         assert_daemon_lease(&transaction, lease, now)?;
         assert_permit(&transaction, permit)?;
         assert_paper_run(&transaction, &permit.run_id)?;
+        debug::assert_broker_write(&transaction, &permit.run_id)?;
         assert_paper_effect_artifact(&transaction, effect, &permit.run_id)?;
         validate_paper_effect_events(&transaction, Some(&permit.run_id))?;
         if paper_effect_terminal_exists(&transaction, &permit.run_id, &effect.artifact_id)? {

@@ -26,6 +26,11 @@ pub enum EvidenceAdapterError {
     Pending(String),
     #[error("permanent provider request error (HTTP {0})")]
     Permanent(u16),
+    #[error("native web evidence {kind:?}: {reason}")]
+    NativeWeb {
+        kind: NativeWebFailureKind,
+        reason: String,
+    },
     #[error("governed evidence policy rejected {evidence_source:?} {resource}: {reason}")]
     Policy {
         evidence_source: EvidenceSource,
@@ -34,7 +39,32 @@ pub enum EvidenceAdapterError {
     },
 }
 
-fn model_error(error: ModelError, source: EvidenceSource, resource: &str) -> EvidenceAdapterError {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeWebFailureKind {
+    NotCalled,
+    ToolUnsupported,
+    NoVerifiableSources,
+    SourceValidationFailed,
+    InvalidResponse,
+}
+
+impl NativeWebFailureKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotCalled => "web_search_not_called",
+            Self::ToolUnsupported => "web_search_tool_unsupported",
+            Self::NoVerifiableSources => "web_search_no_verifiable_sources",
+            Self::SourceValidationFailed => "web_search_source_validation_failed",
+            Self::InvalidResponse => "web_search_invalid_response",
+        }
+    }
+}
+
+fn model_error(
+    error: ModelError,
+    _source: EvidenceSource,
+    _resource: &str,
+) -> EvidenceAdapterError {
     let reason = error.to_string();
     match error {
         ModelError::Http { status, .. } if matches!(status.as_u16(), 401 | 403) => {
@@ -56,13 +86,105 @@ fn model_error(error: ModelError, source: EvidenceSource, resource: &str) -> Evi
         | ModelError::NativeWebArgumentsInvalid
         | ModelError::NativeWebCitationsMissing
         | ModelError::NativeWebUnsafeCitation { .. }
-        | ModelError::NativeWebLimitExceeded => EvidenceAdapterError::Policy {
-            evidence_source: source,
-            resource: resource.to_owned(),
-            reason,
+        | ModelError::NativeWebLimitExceeded => EvidenceAdapterError::NativeWeb {
+            kind: native_web_failure_kind(&error),
+            reason: native_web_failure_reason(&error),
         },
         _ => EvidenceAdapterError::Transport(reason),
     }
+}
+
+fn native_web_failure_kind(error: &ModelError) -> NativeWebFailureKind {
+    match error {
+        ModelError::NativeWebUnavailable => NativeWebFailureKind::NotCalled,
+        ModelError::NativeWebToolNotAllowed => NativeWebFailureKind::ToolUnsupported,
+        ModelError::NativeWebCitationsMissing => NativeWebFailureKind::NoVerifiableSources,
+        ModelError::NativeWebUnsafeCitation { .. } => NativeWebFailureKind::SourceValidationFailed,
+        ModelError::NativeWebArgumentsInvalid | ModelError::NativeWebLimitExceeded => {
+            NativeWebFailureKind::InvalidResponse
+        }
+        _ => NativeWebFailureKind::InvalidResponse,
+    }
+}
+
+fn native_web_failure_reason(error: &ModelError) -> String {
+    match error {
+        ModelError::NativeWebUnavailable => "provider did not return a completed search".to_owned(),
+        ModelError::NativeWebToolNotAllowed => "provider tool was not allowed".to_owned(),
+        ModelError::NativeWebCitationsMissing => "provider returned no citations".to_owned(),
+        ModelError::NativeWebUnsafeCitation { .. } => {
+            "provider citation failed the source allowlist".to_owned()
+        }
+        ModelError::NativeWebArgumentsInvalid => {
+            "provider search action shape is invalid".to_owned()
+        }
+        ModelError::NativeWebLimitExceeded => "provider search exceeded Rust bounds".to_owned(),
+        _ => "native web contract rejected response".to_owned(),
+    }
+}
+
+fn model_policy_error(
+    error: ModelError,
+    source: EvidenceSource,
+    resource: &str,
+    stage: &str,
+) -> EvidenceAdapterError {
+    model_policy_error_with_raw(error, source, resource, stage, None)
+}
+
+fn model_policy_error_with_raw(
+    error: ModelError,
+    source: EvidenceSource,
+    resource: &str,
+    stage: &str,
+    raw: Option<&Value>,
+) -> EvidenceAdapterError {
+    match model_error(error, source, resource) {
+        EvidenceAdapterError::Policy {
+            evidence_source,
+            resource,
+            reason,
+        } => EvidenceAdapterError::Policy {
+            evidence_source,
+            resource,
+            reason: format!("{stage}: {reason}"),
+        },
+        EvidenceAdapterError::NativeWeb { kind, reason } => EvidenceAdapterError::NativeWeb {
+            kind: raw.map_or(kind, |raw| native_web_failure_kind_for_response(raw, kind)),
+            reason: format!("{stage}: {reason}"),
+        },
+        other => other,
+    }
+}
+
+fn native_web_failure_kind_for_response(
+    raw: &Value,
+    fallback: NativeWebFailureKind,
+) -> NativeWebFailureKind {
+    let calls = raw
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("web_search_call"))
+        .collect::<Vec<_>>();
+    if calls.is_empty() {
+        return NativeWebFailureKind::NotCalled;
+    }
+    if calls
+        .iter()
+        .any(|call| call.pointer("/action/type").and_then(Value::as_str) != Some("search"))
+    {
+        return NativeWebFailureKind::NoVerifiableSources;
+    }
+    if calls.iter().all(|call| {
+        call.pointer("/action/sources")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty)
+    }) {
+        return NativeWebFailureKind::NoVerifiableSources;
+    }
+    fallback
 }
 
 pub trait EvidenceAdapter: Send + Sync {
@@ -385,17 +507,18 @@ impl AlpacaPaperEvidenceTransport {
         };
         classify_evidence_response(&response)?;
         let status = response.status();
-        let body = response
+        let mut body = response
             .bytes()
             .await
-            .map_err(|error| EvidenceAdapterError::Transport(error.to_string()))?;
+            .map_err(|error| EvidenceAdapterError::Transport(error.to_string()))?
+            .to_vec();
         if !status.is_success() {
             return Err(EvidenceAdapterError::Transport(format!(
                 "Alpaca returned HTTP {}",
                 status.as_u16()
             )));
         }
-        let normalized: Value = serde_json::from_slice(&body)
+        let mut normalized: Value = serde_json::from_slice(&body)
             .map_err(|error| EvidenceAdapterError::DataQuality(error.to_string()))?;
         if resource.starts_with("bars:") {
             validate_daily_bar_payload(&normalized)
@@ -410,6 +533,51 @@ impl AlpacaPaperEvidenceTransport {
                 ));
             }
         } else if resource.starts_with("option_chain:") {
+            // Same bounded-page policy as daily bars. Never publish a partial chain.
+            let mut pages = vec![String::from_utf8(body.clone()).map_err(|_| {
+                EvidenceAdapterError::DataQuality("option page is not UTF-8".into())
+            })?];
+            let mut tokens = std::collections::BTreeSet::new();
+            while let Some(token) = normalized
+                .get("next_page_token")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+            {
+                if pages.len() >= 16 || !tokens.insert(token.clone()) {
+                    return Err(EvidenceAdapterError::DataQuality(
+                        "option pagination limit or repeated cursor".into(),
+                    ));
+                }
+                let mut next = Url::parse(&url).map_err(|_| {
+                    EvidenceAdapterError::DataQuality("invalid option endpoint".into())
+                })?;
+                next.query_pairs_mut().append_pair("page_token", &token);
+                let response = self
+                    .client
+                    .get(next)
+                    .header("APCA-API-KEY-ID", &self.key_id)
+                    .header("APCA-API-SECRET-KEY", &self.secret_key)
+                    .send()
+                    .await
+                    .map_err(|_| {
+                        EvidenceAdapterError::Transport("option page request failed".into())
+                    })?;
+                classify_evidence_response(&response)?;
+                let raw = response.text().await.map_err(|_| {
+                    EvidenceAdapterError::Transport("option page body read failed".into())
+                })?;
+                let page: Value = serde_json::from_str(&raw).map_err(|_| {
+                    EvidenceAdapterError::DataQuality("option page JSON invalid".into())
+                })?;
+                merge_option_chain_page(&mut normalized, &page)?;
+                pages.push(raw);
+            }
+            if pages.len() > 1 {
+                body = serde_json::to_vec(&serde_json::json!({"pages":pages})).map_err(|_| {
+                    EvidenceAdapterError::DataQuality("option page bundle invalid".into())
+                })?;
+            }
             validate_option_chain_payload(&normalized)?;
         }
         let observed_at = Utc::now();
@@ -489,7 +657,8 @@ fn validate_option_chain_payload(value: &Value) -> Result<(), EvidenceAdapterErr
         .iter()
         .filter(|(_, snapshot)| {
             snapshot
-                .get("implied_volatility")
+                .get("impliedVolatility")
+                .or_else(|| snapshot.get("implied_volatility"))
                 .and_then(Value::as_f64)
                 .is_some_and(|iv| iv.is_finite() && iv > 0.0)
         })
@@ -497,7 +666,7 @@ fn validate_option_chain_payload(value: &Value) -> Result<(), EvidenceAdapterErr
         .collect::<std::collections::BTreeSet<_>>();
     if expirations.len() < 2 {
         return Err(EvidenceAdapterError::Transport(
-            "Alpaca option chain does not contain two IV expiration buckets".to_owned(),
+            format!("Alpaca option chain lacks two IV buckets; contracts={}; first_contracts={:?}; fields={:?}", snapshots.len(), snapshots.keys().take(2).collect::<Vec<_>>(), snapshots.values().next().and_then(Value::as_object).map(|v|v.keys().collect::<Vec<_>>())),
         ));
     }
     Ok(())
@@ -1245,8 +1414,12 @@ impl ModelNativeWebEvidenceTransport {
                 .to_string(),
             },
             max_output_tokens: 2_000,
+            reasoning_effort: None,
             tools: vec![self.policy.tool_definition()],
-            tool_choice: ModelToolChoice::Auto,
+            // News evidence must come from an actual hosted search. `auto`
+            // permits a text-only response and would turn "not called" into
+            // an indistinguishable adapter failure.
+            tool_choice: ModelToolChoice::Required,
             fixture_key: None,
         };
         // One acquisition performs exactly one provider request; the response may
@@ -1260,16 +1433,32 @@ impl ModelNativeWebEvidenceTransport {
         let provider_search_ms = search_started.elapsed().as_millis();
         self.policy
             .validate_provider_response(&response.raw)
-            .map_err(|error| model_error(error, source, resource))?;
+            .map_err(|error| {
+                model_policy_error_with_raw(
+                    error,
+                    source,
+                    resource,
+                    "provider_response",
+                    Some(&response.raw),
+                )
+            })?;
         if !response.tool_calls.is_empty() {
             self.policy
                 .validate_tool_calls(&response.tool_calls)
-                .map_err(|error| model_error(error, source, resource))?;
+                .map_err(|error| model_policy_error(error, source, resource, "tool_call"))?;
         }
         let citations = self
             .policy
             .extract_citations(&response.raw)
-            .map_err(|error| model_error(error, source, resource))?;
+            .map_err(|error| {
+                model_policy_error_with_raw(
+                    error,
+                    source,
+                    resource,
+                    "citations",
+                    Some(&response.raw),
+                )
+            })?;
         // Full URL safety closes before any network request, and covers every
         // citation rather than only the one that becomes `source_uri`.
         for citation in &citations {
@@ -1480,3 +1669,106 @@ impl AsyncEvidenceAdapter for FixtureEvidenceAdapter {
 mod session_bars;
 pub(crate) use session_bars::classify_evidence_response;
 pub use session_bars::validate_outcome_price_window;
+
+fn merge_option_chain_page(target: &mut Value, page: &Value) -> Result<(), EvidenceAdapterError> {
+    let incoming = page
+        .get("snapshots")
+        .and_then(Value::as_object)
+        .ok_or_else(|| EvidenceAdapterError::DataQuality("option page snapshots missing".into()))?;
+    let current = target
+        .get_mut("snapshots")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| EvidenceAdapterError::DataQuality("option snapshots missing".into()))?;
+    for (symbol, snapshot) in incoming {
+        if current.insert(symbol.clone(), snapshot.clone()).is_some() {
+            return Err(EvidenceAdapterError::DataQuality(
+                "duplicate option contract across pages".into(),
+            ));
+        }
+    }
+    target["next_page_token"] = page.get("next_page_token").cloned().unwrap_or(Value::Null);
+    Ok(())
+}
+
+#[cfg(test)]
+mod option_pagination_tests {
+    use super::*;
+    #[test]
+    fn provider_camel_case_iv_passes_without_weakening_bucket_requirement() {
+        let complete = serde_json::json!({"snapshots": {
+            "SOXL260918C00050000": {"impliedVolatility":0.5},
+            "SOXL261016C00050000": {"impliedVolatility":0.6}
+        }});
+        assert!(validate_option_chain_payload(&complete).is_ok());
+        let missing =
+            serde_json::json!({"snapshots":{"SOXL260918C00050000":{"impliedVolatility":0.5}}});
+        assert!(validate_option_chain_payload(&missing).is_err());
+    }
+    #[test]
+    fn merges_complete_chain_and_rejects_duplicate_contracts() {
+        let mut first =
+            serde_json::json!({"snapshots":{"contract-a":{}},"next_page_token":"cursor"});
+        let second = serde_json::json!({"snapshots":{"contract-b":{}},"next_page_token":null});
+        merge_option_chain_page(&mut first, &second).unwrap();
+        assert_eq!(first["snapshots"].as_object().unwrap().len(), 2);
+        assert!(first["next_page_token"].is_null());
+        assert!(merge_option_chain_page(&mut first, &second).is_err());
+        assert!(merge_option_chain_page(&mut first, &serde_json::json!({})).is_err());
+    }
+}
+
+#[cfg(test)]
+mod native_web_error_tests {
+    use super::*;
+
+    #[test]
+    fn native_web_failures_keep_their_diagnostic_class() {
+        let error = model_error(
+            ModelError::NativeWebCitationsMissing,
+            EvidenceSource::NewsWeb,
+            "news:QQQ:2026-09-04:2026-09-11:market",
+        );
+        assert!(matches!(
+            error,
+            EvidenceAdapterError::NativeWeb {
+                kind: NativeWebFailureKind::NoVerifiableSources,
+                ..
+            }
+        ));
+
+        let error = model_policy_error(
+            ModelError::NativeWebUnsafeCitation {
+                uri: "https://example.invalid".to_owned(),
+                reason: "not allowlisted".to_owned(),
+            },
+            EvidenceSource::NewsWeb,
+            "news:QQQ:2026-09-04:2026-09-11:market",
+            "citations",
+        );
+        assert!(matches!(
+            error,
+            EvidenceAdapterError::NativeWeb {
+                kind: NativeWebFailureKind::SourceValidationFailed,
+                reason,
+            } if reason.starts_with("citations:")
+        ));
+    }
+
+    #[test]
+    fn provider_response_shape_distinguishes_not_called_from_no_sources() {
+        assert_eq!(
+            native_web_failure_kind_for_response(
+                &serde_json::json!({"output": []}),
+                NativeWebFailureKind::InvalidResponse,
+            ),
+            NativeWebFailureKind::NotCalled
+        );
+        assert_eq!(
+            native_web_failure_kind_for_response(
+                &serde_json::json!({"output": [{"type":"web_search_call", "action":{"type":"search"}}]}),
+                NativeWebFailureKind::InvalidResponse,
+            ),
+            NativeWebFailureKind::NoVerifiableSources
+        );
+    }
+}

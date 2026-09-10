@@ -8,7 +8,7 @@ impl Daemon {
         model_config: ModelConfig,
         model_capabilities: ModelCapabilityProbeSet,
     ) -> Result<Self> {
-        let debug = model_config.debug;
+        let debug = model_config.debug || config.debug_control.is_some();
         let auto_paper = config.auto_paper;
         let market_data_feed = config.market_data_feed;
         if auto_paper && market_data_feed.is_none() {
@@ -53,7 +53,7 @@ impl Daemon {
         daemon.model = ModelClientAdapter::with_response_language(
             model.clone(),
             debug,
-            model_config.response_language,
+            model_config.response_language.clone(),
         )
         .with_capability_snapshot(model_capabilities.default.clone());
         daemon.stage_models = Arc::new(stage_models);
@@ -68,16 +68,41 @@ impl Daemon {
         if let Ok(fred) = FredDirectTransport::from_env() {
             production_evidence.insert(EvidenceSource::Fred, Arc::new(fred));
         }
-        if model_capabilities.default.native_web_tool_verified
-            && model_capabilities.default.native_web_tool
+        let (news_model, news_capability) =
+            if let Some(route) = model_config.routes.get("evidence.news_web") {
+                let capability = model_capabilities
+                    .routes
+                    .get("evidence.news_web")
+                    .cloned()
+                    .ok_or_else(|| {
+                        ModelError::CapabilityProbe(
+                            "missing capability snapshot for route evidence.news_web".to_owned(),
+                        )
+                    })?;
+                (
+                    ModelClient::from_config(&model_config.for_route(route))?,
+                    capability,
+                )
+            } else {
+                (model.clone(), model_capabilities.default.clone())
+            };
+        daemon.news_web_status = news_capability.native_web_status.as_str().to_owned();
+        daemon.news_web_route = if model_config.routes.contains_key("evidence.news_web") {
+            "evidence.news_web".to_owned()
+        } else {
+            "default".to_owned()
+        };
+        if news_capability.native_web_tool_verified
+            && news_capability.native_web_tool
+            && news_capability.native_web_status == akzio_model::NativeWebCapabilityStatus::Verified
         {
             production_evidence.insert(
                 EvidenceSource::NewsWeb,
-                model_native_web_evidence_transport(model, EvidenceSource::NewsWeb)?,
+                model_native_web_evidence_transport(news_model, EvidenceSource::NewsWeb)?,
             );
         }
         let outcome_worker_enabled =
-            auto_paper && production_evidence.contains_key(&EvidenceSource::Alpaca);
+            daemon.outcome_processing && production_evidence.contains_key(&EvidenceSource::Alpaca);
         if auto_paper && !production_evidence.contains_key(&EvidenceSource::Alpaca) {
             return Err(DaemonError::InvalidInput(
                 "auto_paper requires Alpaca Paper evidence adapter".to_owned(),
@@ -89,8 +114,17 @@ impl Daemon {
             ));
         }
         daemon.production_evidence = Arc::new(production_evidence);
-        daemon.outcome_scheduling_runtime = OutcomeSchedulingRuntime::new(daemon.store.clone())
-            .with_worker_enabled(outcome_worker_enabled);
+        daemon.outcome_processing = outcome_worker_enabled;
+        daemon.task_runtime = daemon
+            .task_runtime
+            .with_outcome_processing(outcome_worker_enabled);
+        if outcome_worker_enabled {
+            daemon.store.ensure_pending_outcome_workers(Utc::now())?;
+        }
+        // Persist future work even while processing is disabled. Enabling the
+        // adapter later must not require another T0 Run to discover old outcomes.
+        daemon.outcome_scheduling_runtime =
+            OutcomeSchedulingRuntime::new(daemon.store.clone()).with_worker_enabled(true);
         Ok(daemon)
     }
 
@@ -118,7 +152,14 @@ impl Daemon {
         model_debug: bool,
         fixture_mode: bool,
     ) -> Result<Self> {
+        config.agent_budget.validate()?;
         let store = Store::open(&config.store_root)?;
+        if config.debug_control.is_some() && config.auto_paper {
+            return Err(DaemonError::InvalidInput(
+                "Debug Core requires auto_paper=false".into(),
+            ));
+        }
+        store.configure_debug_environment(config.debug_control.is_some())?;
         let active = ActiveResearchCatalogue::install(&store, Utc::now())?;
         let agent_catalogue = if fixture_mode {
             active.contracts.clone()
@@ -126,8 +167,9 @@ impl Daemon {
             let candidate = active.install_analyst_freshness_candidate(&store, Utc::now())?;
             active.contracts.with_installed_candidate(candidate)?
         };
-        let workflow =
-            WorkflowRuntime::new(store.clone(), active.recipes).with_fixture_mode(fixture_mode);
+        let workflow = WorkflowRuntime::new(store.clone(), active.recipes)
+            .with_agent_budgets(&config.agent_budget)?
+            .with_fixture_mode(fixture_mode);
         let store_executor = StoreExecutor::new(store.clone());
         let (reasoning_events, _) = broadcast::channel(1_024);
         if config.historical_evaluation_condition.is_some()
@@ -150,6 +192,7 @@ impl Daemon {
         let decision_runtime = DecisionRuntime::new(store.clone(), config.decision_policy.clone())?;
         let execution_runtime =
             ExecutionRuntime::new(store.clone(), Default::default(), Default::default())?;
+        let fixture_capabilities = model.capability_snapshot();
         let scheduler = PaperScheduler::new(
             store.clone(),
             workflow.clone(),
@@ -160,12 +203,24 @@ impl Daemon {
         .with_runtime_identity_hash(config.runtime_identity_hash.clone());
 
         Ok(Self {
+            debug_control: config.debug_control.clone(),
+            outcome_processing: config.outcome_processing,
             store_executor: store_executor.clone(),
-            task_runtime: TaskRuntime::new(store.clone()).with_store_executor(store_executor),
+            task_runtime: TaskRuntime::new(store.clone())
+                .with_store_executor(store_executor)
+                .with_outcome_processing(config.outcome_processing)
+                .with_debug_identity(
+                    config
+                        .debug_control
+                        .as_ref()
+                        .map(|d| d.runtime_identity.clone()),
+                ),
             workflow,
             agents,
             model: ModelClientAdapter::with_debug(model, model_debug),
             stage_models: Arc::new(BTreeMap::new()),
+            news_web_status: fixture_capabilities.native_web_status.as_str().to_owned(),
+            news_web_route: "fixture".to_owned(),
             reasoning_events,
             fixture_evidence: Arc::new(fixture_evidence),
             fixture_mode,

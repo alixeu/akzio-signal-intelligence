@@ -28,9 +28,12 @@ public enum AkzioColor {
 
     // MARK: Sidebar reference surface
     //
-    // The reference changes the navigation geometry, not Akzio's dark palette.
-    // Keep the rail materially heavier than the page and reserve gold for focus.
+    // The sidebar follows the same theme surface as the page; the glass material,
+    // edge and depth provide separation without introducing a second solid palette.
     public static let sidebarSurface = raisedSurface
+    public static func sidebarSurface(for theme: SettingsPresentation.Theme) -> Color {
+        surface(for: theme)
+    }
     public static let sidebarSelection = primaryGold.opacity(0.18)
     public static let sidebarAccent = primaryGold
     public static let sidebarPrimaryText = primaryText

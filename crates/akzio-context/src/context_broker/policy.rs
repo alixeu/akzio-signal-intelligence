@@ -263,7 +263,13 @@ fn governed_internal_source(artifact: &Artifact) -> bool {
     use ArtifactKind::*;
     match artifact.provenance.source_family.as_str() {
         "akzio.ingest" => {
-            artifact.kind == SemanticDetail && matches!(artifact.producer.as_str(), "evidence.collection_status" | "canary.evidence_snapshot")
+            artifact.kind == SemanticDetail
+                && matches!(
+                    artifact.producer.as_str(),
+                    "evidence.collection_status"
+                        | "canary.evidence_snapshot"
+                        | "evidence.option_projection"
+                )
         }
         "akzio.agent" => {
             matches!(

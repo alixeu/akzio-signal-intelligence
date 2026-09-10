@@ -131,13 +131,21 @@ async fn serve(config: &Config, config_path: &Path) -> Result<()> {
         .model
         .clone()
         .context("missing [model] configuration for daemon serve")?;
-    let decision_policy = decision_policy_from_config(config, config_path)?;
+    let loaded_policy = load_decision_policy_from_config(config, config_path)?;
+    let decision_policy = loaded_policy.policy.clone();
+    let (decision_policy_status, decision_policy_input_hash) =
+        decision_policy_audit(&loaded_policy);
     let model_capabilities = probe_configured_model_capabilities(&model)
         .await
         .context("probe configured model capabilities before daemon startup")?;
-    let runtime_identity_hash = if auto_paper {
+    let runtime_identity_hash = if auto_paper || config.daemon.debug_control {
         Some(
-            runtime_identity_from_config(config, config_path, &model_capabilities)?
+            runtime_identity_from_config_with_policy(
+                config,
+                config_path,
+                &model_capabilities,
+                &decision_policy,
+            )?
                 .identity_hash()?,
         )
     } else {
@@ -163,6 +171,14 @@ async fn serve(config: &Config, config_path: &Path) -> Result<()> {
         .transpose()?;
     let daemon = Daemon::open(
         DaemonConfig {
+            agent_budget: config.agent.budget.clone(),
+            debug_control: if config.daemon.debug_control { Some(akzio_daemon::DebugCoreConfig {
+                code_revision: source_revision()?,
+                runtime_identity: runtime_identity_hash.clone().context("Debug runtime identity missing")?,
+                decision_policy_status,
+                decision_policy_input_hash,
+            }) } else { None },
+            outcome_processing: config.daemon.outcome_processing,
             store_root: config.daemon.store_root.clone(),
             http_token: token,
             worker_count: config.daemon.worker_count.unwrap_or(4),
@@ -187,7 +203,7 @@ async fn serve(config: &Config, config_path: &Path) -> Result<()> {
         }
         let _ = shutdown_tx.send(true);
     });
-    let paper = if auto_paper {
+    let paper = if auto_paper || config.daemon.debug_control {
         Some(AlpacaPaper::from_env().context("construct Alpaca Paper client")?)
     } else {
         None
@@ -268,10 +284,23 @@ async fn wait_for_parent_stdin_eof() -> Result<()> {
 }
 
 fn fixture_daemon(config: &Config) -> Result<Daemon> {
+    if config.execution.decision_policy_path.is_some() {
+        bail!(
+            "fixture runtime does not consume execution.decision_policy_path; use daemon serve with an isolated Store"
+        );
+    }
     Ok(Daemon::with_model(
         DaemonConfig {
+            agent_budget: config.agent.budget.clone(),
+            debug_control: if config.daemon.debug_control { Some(akzio_daemon::DebugCoreConfig {
+                code_revision: source_revision()?,
+                runtime_identity: ContentHash::of_bytes(source_revision()?.as_bytes()),
+                decision_policy_status: "fixture_default".into(),
+                decision_policy_input_hash: None,
+            }) } else {None},
+            outcome_processing: config.daemon.outcome_processing,
             store_root: config.daemon.store_root.clone(),
-            http_token: "fixture-only".to_owned(),
+            http_token: if config.daemon.debug_control {daemon_token(&config.daemon)?} else {"fixture-only".to_owned()},
             worker_count: config.daemon.worker_count.unwrap_or(2),
             auto_paper: false,
             market_data_feed: config.execution.market_data_feed,

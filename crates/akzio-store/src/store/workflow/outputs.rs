@@ -92,6 +92,7 @@ impl Store {
                     None,
                     now,
                 )?;
+                debug::settle_attempt(&transaction, &permit, "abandoned_for_recovery", now)?;
             } else {
                 append_event(
                     &transaction,

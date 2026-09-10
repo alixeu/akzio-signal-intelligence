@@ -86,7 +86,14 @@ impl ExecutionRuntime {
         }
 
         let account = self.load_account(input, &mut blockers)?;
-        let quotes = self.load_quotes(input, &mut blockers)?;
+        let quotes = self.load_quotes(
+            input,
+            &mut blockers,
+            input.quote_validation_error.is_some(),
+        )?;
+        if input.quote_validation_error.is_some() {
+            blockers.insert(HardBlocker::InvalidQuote);
+        }
         let clock = self.load_clock(input, &mut blockers)?;
         self.derive_snapshot_blockers(
             account.as_ref().map(|(_, payload)| payload),

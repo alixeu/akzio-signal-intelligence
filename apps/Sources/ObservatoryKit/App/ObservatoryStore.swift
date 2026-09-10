@@ -25,6 +25,16 @@ public final class ObservatoryStore {
     private var livePayload: ObserverSnapshotPayload?
     private var observerTask: Task<Void, Never>?
     private var observerClient: ObserverClient?
+    private(set) var debugListing: DebugRunList?
+    private(set) var debugRun: DebugRunPayload?
+    private(set) var debugBusy = false
+    private(set) var debugMessage = ""
+    private(set) var externalDebugCore = false
+    var selectedDebugRunID: String?
+    var selectedDebugTaskID: String?
+    var debugEnabled: Bool { externalDebugCore || debugListing?.enabled == true }
+    var debugEndpoint: String { observerEndpoint }
+    var debugConnected: Bool { if case .connected = observerState { return true }; return false }
     private var livePortfolioHistory: [EquityRange: [EquityPoint]] = [:]
     private var liveReasoningRecords: [String: LiveReasoningRecord] = [:]
     private var liveReasoningSequence: Int64 = 0
@@ -238,6 +248,23 @@ public final class ObservatoryStore {
         guard autoStartsCore else { return }
         dataMode = .live
         observerState = .connecting
+        let environment = ProcessInfo.processInfo.environment
+        if let endpoint = environment["AKZIO_DEBUG_ENDPOINT"],
+           let root = environment["AKZIO_DEBUG_STORE_ROOT"] {
+            externalDebugCore = true
+            observerEndpoint = endpoint
+            do {
+                controlToken = try String(contentsOf: URL(fileURLWithPath: root).appending(path: ".daemon-token"), encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
+                guard let url = URL(string: endpoint) else { throw ObserverClientError.invalidEndpoint }
+                let client = try ObserverClient(endpoint: url, token: controlToken)
+                let listing = try await client.debugRuns()
+                guard listing.enabled, listing.store_identity != nil else { throw DebugAPIError(message: "Endpoint is not an isolated Debug Core") }
+                debugListing = listing
+                navigate(to: .workflow)
+                connectObserver()
+            } catch { observerState = .offline(error.localizedDescription) }
+            return
+        }
         guard let connection = await coreSupervisor.start() else {
             observerState = .offline(coreSupervisor.state.detail ?? coreSupervisor.state.label)
             if coreSupervisor.state == .needsConfiguration {
@@ -336,6 +363,7 @@ public final class ObservatoryStore {
                     do {
                         let payload = try await client.fetchSnapshot()
                         apply(payload)
+                        try await refreshDebug(using: client)
                         await refreshPortfolioHistory(using: client, range: equityRange)
                         observerState = .connected(payload.generatedAt)
                         retrySeconds = 1
@@ -344,6 +372,7 @@ public final class ObservatoryStore {
                         case .invalidate:
                             let refreshed = try await client.fetchSnapshot()
                             apply(refreshed)
+                            try await refreshDebug(using: client)
                             await refreshPortfolioHistory(using: client, range: equityRange)
                             observerState = .connected(refreshed.generatedAt)
                         case .reasoning(let payload, let receivedAt):
@@ -522,5 +551,69 @@ public final class ObservatoryStore {
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "HH:mm:ss"
         return formatter.string(from: date)
+    }
+}
+
+extension ObservatoryStore {
+    private func refreshDebug(using client: ObserverClient) async throws {
+        let listing = try await client.debugRuns()
+        if externalDebugCore && !listing.enabled { throw DebugAPIError(message: "Debug Core identity changed") }
+        debugListing = listing
+        guard listing.enabled else { return }
+        if selectedDebugRunID == nil { selectedDebugRunID = listing.runs.first?.id }
+        if let id = selectedDebugRunID {
+            debugRun = try await client.debugRun(id)
+            if selectedDebugTaskID == nil { selectedDebugTaskID = debugRun?.nodes.first?.id }
+        }
+    }
+
+    func selectDebugRun(_ id: String) async {
+        guard let observerClient else { return }
+        selectedDebugRunID = id
+        selectedDebugTaskID = nil
+        do { try await refreshDebug(using: observerClient) }
+        catch { debugMessage = error.localizedDescription; observerState = .stale(error.localizedDescription) }
+    }
+
+    func controlDebug(_ action: String, task: String? = nil) async {
+        guard debugConnected, !debugBusy, let client = observerClient, let run = debugRun else { return }
+        if let task { selectedDebugTaskID = task }
+        debugBusy = true
+        defer { debugBusy = false }
+        do {
+            _ = try await client.debugControl(run: run.session.runID, action: action, revision: run.session.revision, task: task)
+            debugMessage = "Core accepted \(action)."
+            try await refreshDebug(using: client)
+        } catch {
+            debugMessage = error.localizedDescription
+            // A CAS conflict requires fresh authority; it must never be retried with a guessed revision.
+            try? await refreshDebug(using: client)
+        }
+    }
+
+    func prepareDebug(session: String, fixture: Bool, purpose: String) async {
+        guard debugConnected, !debugBusy, let client = observerClient else { return }
+        debugBusy = true
+        defer { debugBusy = false }
+        do {
+            let session = try await client.debugPrepare(session: session, fixture: fixture, purpose: purpose)
+            selectedDebugRunID = session.runID
+            selectedDebugTaskID = nil
+            try await refreshDebug(using: client)
+            debugMessage = "Prepared and paused. Broker writes are disabled."
+        } catch { debugMessage = error.localizedDescription }
+    }
+
+    func forkDebug(task: String?, reason: String) async {
+        guard debugConnected, !debugBusy, let client = observerClient, let run = debugRun else { return }
+        debugBusy = true
+        defer { debugBusy = false }
+        do {
+            let session = try await client.debugFork(run: run.session.runID, task: task, reason: reason, experimentID: UUID().uuidString.lowercased())
+            selectedDebugRunID = session.runID
+            selectedDebugTaskID = nil
+            try await refreshDebug(using: client)
+            debugMessage = "New experiment created; parent artifacts remain immutable."
+        } catch { debugMessage = error.localizedDescription }
     }
 }

@@ -84,6 +84,7 @@ impl AgentRuntime {
         permit: &TaskWritePermit,
         contract: &AgentContract,
         manifest: &ContextManifest,
+        effective_budget: &TaskBudget,
         now: DateTime<Utc>,
     ) -> ResearchResult<ContextMaterialization> {
         if !manifest.grant.matches_permit(permit) {
@@ -93,10 +94,25 @@ impl AgentRuntime {
         let permit = permit.clone();
         let contract = contract.clone();
         let manifest = manifest.clone();
+        let effective_budget = effective_budget.clone();
         Ok(self
             .store_executor
-            .execute(move |_| context.materialize_for_agent(&permit, &contract, &manifest, now))
+            .execute(move |_| {
+                context.materialize_for_agent_with_budget(
+                    &permit,
+                    &contract,
+                    &manifest,
+                    &effective_budget,
+                    now,
+                )
+            })
             .await??)
+    }
+
+    async fn observe_debug_budget(&self,permit:&TaskWritePermit,budget:&AgentRunBudget,boundary:&str)->ResearchResult<()> {
+        let permit=permit.clone();let snapshot=budget.debug_observation(boundary);
+        self.store_executor.execute(move|store|store.observe_debug_budget(&permit,&snapshot,chrono::Utc::now())).await??;
+        Ok(())
     }
 
     async fn record_turn(
@@ -113,6 +129,10 @@ impl AgentRuntime {
         self.store_executor
             .execute(move |store| {
                 let mut trace = record.request_trace(&request, &request_hash, &runtime_snapshot);
+                trace["lifecycle"] = json!({
+                    "status": "completed",
+                    "completed_at_utc": record.now,
+                });
                 trace["response"] = json!(response);
                 let artifact = record.stage_artifact(&store, &trace)?;
                 store.write_task_artifact(
@@ -145,6 +165,10 @@ impl AgentRuntime {
         self.store_executor
             .execute(move |store| {
                 let mut trace = record.request_trace(&request, &request_hash, &runtime_snapshot);
+                trace["lifecycle"] = json!({
+                    "status": "failed",
+                    "completed_at_utc": record.now,
+                });
                 trace["error_class"] = json!(error_class);
                 trace["will_retry"] = json!(will_retry);
                 if let Some(error_detail) = error_detail {
@@ -178,16 +202,33 @@ impl TurnRecord {
         runtime_snapshot: &AgentTurnRuntimeSnapshot,
     ) -> Value {
         json!({
+            "trace_schema_version": 1,
             "turn": self.turn,
             "attempt": self.attempt,
+            "call_id": format!("agent-turn:{}", request_hash),
             "contract_hash": &self.contract.contract_hash,
             "context_manifest": &self.manifest.artifact.artifact_id,
+            "read_grant_snapshot": {
+                "authority": "observation_only; runtime derives a fresh grant from the persisted manifest",
+                "run_id": self.manifest.grant.run_id,
+                "task_id": self.manifest.grant.task_id,
+                "attempt_id": self.manifest.grant.attempt_id,
+                "contract_hash": self.manifest.grant.contract_hash,
+                "readable": self.manifest.grant.readable,
+                "expires_at": self.manifest.grant.expires_at,
+            },
             "request_hash": request_hash,
             "capability_snapshot": runtime_snapshot.capability,
             "capability_snapshot_hash": runtime_snapshot.capability_hash,
+            "resolved_budget": runtime_snapshot.resolved_budget,
+            "budget_usage": runtime_snapshot.budget_usage,
             "budget_policy": runtime_snapshot.budget_policy,
             "budget_policy_hash": runtime_snapshot.budget_policy_hash,
             "tool_set_hash": runtime_snapshot.tool_set_hash,
+            // `request` is retained for compatibility. `domain_request` is
+            // the explicit audit name; the actual provider wire body, when
+            // Debug is authorized, is `model_debug.request`.
+            "domain_request": request,
             "request": request,
         })
     }

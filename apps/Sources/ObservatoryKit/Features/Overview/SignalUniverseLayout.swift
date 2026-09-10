@@ -6,6 +6,7 @@ import SwiftUI
 // functions of the snapshot, so the canvas and the interactive overlay agree and a
 // screenshot is reproducible.
 struct UniverseNode: Identifiable, Hashable {
+    let id: String
     let stage: WorkflowStageKind
     let status: AkzioStatus
     let orbit: Int
@@ -13,7 +14,6 @@ struct UniverseNode: Identifiable, Hashable {
     let angle: Double
     let isCurrent: Bool
 
-    var id: String { stage.id }
     var tone: AkzioTone { status.style.tone }
 }
 
@@ -51,6 +51,7 @@ enum SignalUniverseLayout {
             for (slot, node) in members.enumerated() {
                 result.append(
                     UniverseNode(
+                        id: node.id,
                         stage: node.stage,
                         status: node.status,
                         orbit: orbitIndex,

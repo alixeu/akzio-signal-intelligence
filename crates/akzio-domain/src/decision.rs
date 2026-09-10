@@ -1,7 +1,10 @@
 //! Typed decision inputs and risk findings.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::{
     artifact::{ArtifactKind, ArtifactRef},
@@ -41,6 +44,7 @@ pub enum HardBlocker {
     CapacityLimit,
     ComplianceViolation,
     DependencyDegraded,
+    InvalidQuote,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -361,6 +365,99 @@ pub struct DecisionContext {
     pub horizon_trace: Option<HorizonDecisionTrace>,
     #[serde(default)]
     pub investment_logic: Option<InvestmentLogicTrace>,
+    /// Per-asset eligibility diagnostics.  This is deliberately additive so
+    /// older DecisionContext blobs remain readable while new decisions expose
+    /// the independent evidence, claim, calibration, and risk checks.
+    #[serde(default)]
+    pub asset_eligibility: BTreeMap<Asset, AssetEligibility>,
+    #[serde(default)]
+    pub runtime_trace: Option<DecisionEvaluationTrace>,
+    /// The model's research composition and Rust's research-layer review. This
+    /// is intentionally separate from `target`, which is the execution-side
+    /// portfolio and may remain zero or unassessed.
+    #[serde(default)]
+    pub research_plan: Option<ResearchPlanReview>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionEligibilityReason {
+    MissingEvidence,
+    UnverifiedClaim,
+    MissingCalibration,
+    InsufficientCalibrationSamples,
+    RiskUnknown,
+    RiskRejected,
+    ConfidenceTooLow,
+    HorizonConflict,
+    NoDirectionalSignal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssetEligibility {
+    pub directional_evidence: bool,
+    pub claim_verified: bool,
+    pub calibration: bool,
+    pub risk: bool,
+    pub eligible: bool,
+    #[serde(default)]
+    pub reasons: Vec<DecisionEligibilityReason>,
+}
+
+impl AssetEligibility {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        let mut reasons = self.reasons.clone();
+        reasons.sort();
+        reasons.dedup();
+        if reasons != self.reasons
+            || (self.eligible && !self.reasons.is_empty())
+            || (self.eligible
+                && !(self.directional_evidence
+                    && self.claim_verified
+                    && self.calibration
+                    && self.risk))
+        {
+            return Err(DomainError::InvalidBudget {
+                field: "decision_context.asset_eligibility",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Rust-owned rule evaluation captured at the point a DecisionGate predicate
+/// runs. This is an audit trace, not a second decision implementation and it
+/// contains no model private reasoning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionRuleEvaluation {
+    pub rule_id: String,
+    pub rule_version: String,
+    pub source_location: String,
+    pub inputs: Value,
+    pub operator: Option<String>,
+    pub threshold: Option<Value>,
+    pub evaluated: bool,
+    pub result: String,
+    pub reason_code: String,
+    pub explanation: String,
+    #[serde(default)]
+    pub asset: Option<Asset>,
+    #[serde(default)]
+    pub horizon: Option<DecisionHorizon>,
+    #[serde(default)]
+    pub before: Option<Value>,
+    #[serde(default)]
+    pub after: Option<Value>,
+    pub short_circuited: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct DecisionEvaluationTrace {
+    pub version: u32,
+    pub first_zeroing_branch: Option<String>,
+    #[serde(default)]
+    pub asset_first_exclusion: BTreeMap<Asset, String>,
+    pub rules: Vec<DecisionRuleEvaluation>,
 }
 
 /// Deterministic ex-ante risk certificate emitted with every DecisionContext.
@@ -499,6 +596,22 @@ impl DecisionContext {
         if let Some(trace) = &self.investment_logic {
             trace.validate()?;
         }
+        if let Some(research_plan) = &self.research_plan {
+            research_plan.validate()?;
+        }
+        if self
+            .asset_eligibility
+            .keys()
+            .any(|asset| !Asset::EXECUTABLE.contains(asset))
+            || self
+                .asset_eligibility
+                .values()
+                .any(|eligibility| eligibility.validate().is_err())
+        {
+            return Err(DomainError::InvalidBudget {
+                field: "decision_context.asset_eligibility",
+            });
+        }
         if self.accepted()
             && self.target.weights.values().any(|weight| weight.0 > 0)
             && (self.portfolio_risk.risk_model_hash.is_none()
@@ -561,6 +674,225 @@ impl Forecast {
     }
 }
 
+/// One asset-level research intention emitted by the synthesizer. This is a
+/// target-composition statement, not an order quantity or execution permit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResearchAssetAllocation {
+    pub asset: Asset,
+    pub target_weight_ppm: WeightPpm,
+    #[serde(default)]
+    pub supporting_horizons: Vec<DecisionHorizon>,
+    #[serde(default)]
+    pub evidence_refs: Vec<ArtifactRef>,
+    pub rationale: String,
+    #[serde(default)]
+    pub abstention_reason: Option<String>,
+}
+
+impl ResearchAssetAllocation {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if !Asset::EXECUTABLE.contains(&self.asset)
+            || self.target_weight_ppm.0 > WeightPpm::SCALE
+            || self.rationale.trim().is_empty()
+        {
+            return Err(DomainError::EmptyField {
+                field: "research_allocation.asset",
+            });
+        }
+        let mut horizons = self.supporting_horizons.clone();
+        horizons.sort();
+        horizons.dedup();
+        if horizons != self.supporting_horizons {
+            return Err(DomainError::InvalidBudget {
+                field: "research_allocation.supporting_horizons",
+            });
+        }
+        let mut evidence_refs = self.evidence_refs.clone();
+        evidence_refs.sort();
+        evidence_refs.dedup();
+        if evidence_refs != self.evidence_refs
+            || self.evidence_refs.iter().any(|reference| {
+                !matches!(
+                    reference.kind,
+                    ArtifactKind::Claim
+                        | ArtifactKind::Critique
+                        | ArtifactKind::NormalizedEvidence
+                        | ArtifactKind::SemanticDetail
+                )
+            })
+        {
+            return Err(DomainError::EmptyField {
+                field: "research_allocation.evidence_refs",
+            });
+        }
+        if self.target_weight_ppm.0 > 0 {
+            if self.supporting_horizons.is_empty() || self.evidence_refs.is_empty() {
+                return Err(DomainError::EmptyField {
+                    field: "research_allocation.non_zero_support",
+                });
+            }
+            if self.abstention_reason.is_some() {
+                return Err(DomainError::EmptyField {
+                    field: "research_allocation.non_zero_abstention",
+                });
+            }
+        } else if self
+            .abstention_reason
+            .as_deref()
+            .is_none_or(|reason| reason.trim().is_empty())
+        {
+            return Err(DomainError::EmptyField {
+                field: "research_allocation.zero_reason",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Complete model-proposed research composition. Cash is explicit so the wire
+/// contract cannot confuse an unallocated residual with broker cash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResearchAllocationPlan {
+    pub cash_weight_ppm: WeightPpm,
+    pub allocations: Vec<ResearchAssetAllocation>,
+}
+
+impl ResearchAllocationPlan {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.cash_weight_ppm.0 > WeightPpm::SCALE
+            || self.allocations.len() != Asset::EXECUTABLE.len()
+        {
+            return Err(DomainError::InvalidTargetUniverse);
+        }
+        let mut assets = BTreeSet::new();
+        let mut gross = 0_u32;
+        for allocation in &self.allocations {
+            allocation.validate()?;
+            if !assets.insert(allocation.asset) {
+                return Err(DomainError::InvalidTargetUniverse);
+            }
+            gross = gross.checked_add(allocation.target_weight_ppm.0).ok_or(
+                DomainError::InvalidBudget {
+                    field: "research_allocation.gross_weight",
+                },
+            )?;
+        }
+        if assets.len() != Asset::EXECUTABLE.len()
+            || !Asset::EXECUTABLE
+                .into_iter()
+                .all(|asset| assets.contains(&asset))
+            || gross.checked_add(self.cash_weight_ppm.0) != Some(WeightPpm::SCALE)
+        {
+            return Err(DomainError::InvalidBudget {
+                field: "research_allocation.weights",
+            });
+        }
+        Ok(())
+    }
+
+    pub fn weight(&self, asset: Asset) -> WeightPpm {
+        self.allocations
+            .iter()
+            .find(|allocation| allocation.asset == asset)
+            .map_or(WeightPpm::ZERO, |allocation| allocation.target_weight_ppm)
+    }
+
+    pub fn has_non_zero_target(&self) -> bool {
+        self.allocations
+            .iter()
+            .any(|allocation| allocation.target_weight_ppm.0 > 0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResearchPlanStatus {
+    QualifiedRecommendation,
+    ExplicitCash,
+    BlockedByResearch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResearchExecutionStatus {
+    NotApplicable,
+    Blocked,
+    PendingExecutionGate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResearchPlanAdjustment {
+    #[serde(default)]
+    pub asset: Option<Asset>,
+    pub from_weight_ppm: WeightPpm,
+    pub to_weight_ppm: WeightPpm,
+    pub reasons: Vec<String>,
+}
+
+impl ResearchPlanAdjustment {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.from_weight_ppm.0 > WeightPpm::SCALE
+            || self.to_weight_ppm.0 > WeightPpm::SCALE
+            || self.reasons.is_empty()
+            || self.reasons.iter().any(|reason| reason.trim().is_empty())
+        {
+            return Err(DomainError::InvalidBudget {
+                field: "research_allocation.adjustment",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Rust's auditable review of the model's research intention. The raw
+/// proposal is retained, while `validated` is the research-layer composition
+/// after evidence-scope and static weight checks. Execution readiness is a
+/// separate state and is never inferred from a non-zero research target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResearchPlanReview {
+    pub raw: ResearchAllocationPlan,
+    pub validated: ResearchAllocationPlan,
+    pub adjustments: Vec<ResearchPlanAdjustment>,
+    pub status: ResearchPlanStatus,
+    pub execution_status: ResearchExecutionStatus,
+    #[serde(default)]
+    pub execution_blockers: Vec<String>,
+}
+
+impl ResearchPlanReview {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        self.raw.validate()?;
+        self.validated.validate()?;
+        for adjustment in &self.adjustments {
+            adjustment.validate()?;
+        }
+        if self
+            .execution_blockers
+            .iter()
+            .any(|blocker| blocker.trim().is_empty())
+        {
+            return Err(DomainError::EmptyField {
+                field: "research_allocation.execution_blockers",
+            });
+        }
+        if matches!(self.status, ResearchPlanStatus::QualifiedRecommendation)
+            && !self.validated.has_non_zero_target()
+        {
+            return Err(DomainError::InvalidBudget {
+                field: "research_allocation.status",
+            });
+        }
+        if matches!(self.status, ResearchPlanStatus::ExplicitCash)
+            && self.validated.has_non_zero_target()
+        {
+            return Err(DomainError::InvalidBudget {
+                field: "research_allocation.status",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Schema-bounded model output. It can request a decision, but cannot embed a
 /// grant, permit, endpoint, order, or free-form execution authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -568,6 +900,11 @@ pub struct DecisionDraft {
     pub summary: String,
     pub confidence_ppm: u32,
     pub forecasts: Vec<Forecast>,
+    /// Required by new DecisionProposal contracts. Optional on the Rust type
+    /// only so older fixture/test blobs remain decodable before the gate emits
+    /// a structured missing-field error.
+    #[serde(default)]
+    pub research_allocation: Option<ResearchAllocationPlan>,
     pub claims: Vec<ArtifactRef>,
     pub critiques: Vec<ArtifactRef>,
     pub evidence: Vec<ArtifactRef>,
@@ -652,7 +989,11 @@ impl DecisionDraft {
                 });
             }
         }
-        validate_forecasts(&self.forecasts)
+        validate_forecasts(&self.forecasts).and_then(|_| {
+            self.research_allocation
+                .as_ref()
+                .map_or(Ok(()), ResearchAllocationPlan::validate)
+        })
     }
 }
 
@@ -660,7 +1001,14 @@ pub fn validate_decision_evidence_sufficiency(
     draft: &DecisionDraft,
     claims: &[ResearchClaim],
 ) -> Result<(), DomainError> {
-    let has_gaps = claims.iter().any(|claim| !claim.evidence_gaps.is_empty());
+    let has_gaps = claims.iter().any(|claim| {
+        claim.evidence_gaps.iter().any(|gap| {
+            draft.forecasts.iter().any(|forecast| {
+                !forecast.is_neutral()
+                    && gap.blocks_slot(forecast.asset, forecast.horizon, claim.horizon)
+            })
+        })
+    });
     let has_incomplete_evidence = draft
         .soft_warnings
         .contains(&SoftWarning::IncompleteEvidence);
@@ -687,13 +1035,13 @@ pub fn validate_decision_evidence_sufficiency(
             })
             .filter_map(|ground| ground.domain)
             .collect::<std::collections::BTreeSet<_>>();
-        [
-            ResearchShard::PriceMarketStructure,
-            ResearchShard::Macro,
-            ResearchShard::NewsEvent,
-        ]
-        .into_iter()
-        .all(|domain| domains.contains(&domain))
+        // Price structure and macro are the minimum directional research
+        // basis. News remains an explicit coverage signal and execution-side
+        // risk input, but an unavailable NewsWeb adapter must not erase a
+        // clearly scoped price/macro research recommendation.
+        [ResearchShard::PriceMarketStructure, ResearchShard::Macro]
+            .into_iter()
+            .all(|domain| domains.contains(&domain))
     };
 
     if draft
@@ -726,6 +1074,8 @@ pub struct Decision {
     pub targets: TargetPortfolio,
     pub confidence_ppm: u32,
     pub forecasts: Vec<Forecast>,
+    #[serde(default)]
+    pub research_plan: Option<ResearchPlanReview>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -766,7 +1116,11 @@ impl Decision {
                 field: "decision.forecast_validity",
             });
         }
-        self.targets.validate_universe()
+        self.targets.validate_universe().and_then(|_| {
+            self.research_plan
+                .as_ref()
+                .map_or(Ok(()), ResearchPlanReview::validate)
+        })
     }
 }
 
@@ -815,7 +1169,11 @@ pub fn validate_verified_forecast_slots(
                 claim.horizon == forecast.horizon
                     && critiques.iter().any(|critique| {
                         critique.target == *reference
-                            && !critique.blocker
+                            && !critique.blocks_slot(
+                                forecast.asset,
+                                forecast.horizon,
+                                claim.horizon,
+                            )
                             && critique.verification_status
                                 == crate::ClaimVerificationStatus::Supported
                     })
@@ -855,7 +1213,7 @@ pub fn research_coverage_is_complete(
                         && critiques.iter().any(|v| {
                             &v.target == reference
                                 && v.verification_status == ClaimVerificationStatus::Supported
-                                && !v.blocker
+                                && !v.blocks_slot(asset, horizon, claim.horizon)
                                 && v.validate().is_ok()
                         })
                 })
@@ -872,4 +1230,192 @@ pub fn research_coverage_is_complete(
             .all(|d| domains.contains(&d))
         })
     })
+}
+
+#[cfg(test)]
+mod research_allocation_tests {
+    use super::*;
+    use crate::ArtifactId;
+
+    fn evidence_ref() -> ArtifactRef {
+        ArtifactRef {
+            artifact_id: ArtifactId(ContentHash::of_bytes(b"research-allocation-evidence")),
+            kind: ArtifactKind::NormalizedEvidence,
+        }
+    }
+
+    fn zero(asset: Asset) -> ResearchAssetAllocation {
+        ResearchAssetAllocation {
+            asset,
+            target_weight_ppm: WeightPpm::ZERO,
+            supporting_horizons: Vec::new(),
+            evidence_refs: Vec::new(),
+            rationale: format!("No qualified research basis for {asset:?}."),
+            abstention_reason: Some("explicit research abstention".to_owned()),
+        }
+    }
+
+    #[test]
+    fn research_allocation_requires_explicit_cash_and_zero_reason() {
+        let plan = ResearchAllocationPlan {
+            cash_weight_ppm: WeightPpm(900_000),
+            allocations: vec![
+                ResearchAssetAllocation {
+                    asset: Asset::Tqqq,
+                    target_weight_ppm: WeightPpm(100_000),
+                    supporting_horizons: vec![DecisionHorizon::T1],
+                    evidence_refs: vec![evidence_ref()],
+                    rationale: "Price and macro support a bounded T1 research target.".to_owned(),
+                    abstention_reason: None,
+                },
+                zero(Asset::Qqq),
+                zero(Asset::Soxx),
+                zero(Asset::Soxl),
+            ],
+        };
+        assert!(plan.validate().is_ok());
+
+        let mut no_reason = plan.clone();
+        no_reason.allocations[1].abstention_reason = None;
+        assert!(no_reason.validate().is_err());
+
+        let mut wrong_cash = plan;
+        wrong_cash.cash_weight_ppm = WeightPpm(899_999);
+        assert!(wrong_cash.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod scoped_blocker_tests {
+    use super::*;
+    use crate::{
+        ArtifactId, ClaimStance, ClaimVerificationEvidence, ClaimVerificationStatus,
+        CritiqueSeverity, EvidenceGap, EvidenceGapImpact, EvidenceGround, ResearchCritique,
+        SourceAuthority, TemporalValidity,
+    };
+    use std::collections::BTreeSet;
+
+    fn evidence_ref(label: &str) -> ArtifactRef {
+        ArtifactRef {
+            artifact_id: ArtifactId(ContentHash::of_bytes(label.as_bytes())),
+            kind: ArtifactKind::NormalizedEvidence,
+        }
+    }
+
+    fn directional_ground(label: &str, asset: Asset, domain: ResearchShard) -> EvidenceGround {
+        EvidenceGround {
+            evidence: evidence_ref(label),
+            support: format!("authoritative support for {asset:?} {domain:?}"),
+            role: EvidenceGroundRole::Directional,
+            assets: BTreeSet::from([asset]),
+            domain: Some(domain),
+        }
+    }
+
+    #[test]
+    fn scoped_critique_blocker_does_not_block_another_asset_slot() {
+        let claim_ref = ArtifactRef {
+            artifact_id: ArtifactId(ContentHash::of_bytes(b"claim")),
+            kind: ArtifactKind::Claim,
+        };
+        let mut grounds = Vec::new();
+        for asset in [Asset::Tqqq, Asset::Qqq] {
+            grounds.push(directional_ground(
+                &format!("{asset:?}-price"),
+                asset,
+                ResearchShard::PriceMarketStructure,
+            ));
+            grounds.push(directional_ground(
+                &format!("{asset:?}-macro"),
+                asset,
+                ResearchShard::Macro,
+            ));
+            grounds.push(directional_ground(
+                &format!("{asset:?}-news"),
+                asset,
+                ResearchShard::NewsEvent,
+            ));
+        }
+        let critique_ground = grounds[0].clone();
+        let claim = ResearchClaim {
+            schema_version: DOMAIN_SCHEMA_VERSION,
+            topic: "T1 multi-asset claim".to_owned(),
+            statement: "Both assets have independently grounded T1 evidence".to_owned(),
+            horizon: DecisionHorizon::T1,
+            stance: ClaimStance::Bullish,
+            materiality_ppm: 600_000,
+            confidence_ppm: 800_000,
+            grounds: grounds.clone(),
+            evidence_gaps: vec![EvidenceGap {
+                topic: "TQQQ news unavailable".to_owned(),
+                rationale: "Only TQQQ lacks its T1 news domain".to_owned(),
+                impact: EvidenceGapImpact::BlocksDirectionalForecast,
+                assets: BTreeSet::from([Asset::Tqqq]),
+                horizons: BTreeSet::from([DecisionHorizon::T1]),
+                supplemental_needs: Vec::new(),
+            }],
+        };
+        let critique = ResearchCritique {
+            schema_version: DOMAIN_SCHEMA_VERSION,
+            target: claim_ref.clone(),
+            topic: "T1 multi-asset review".to_owned(),
+            severity: CritiqueSeverity::Low,
+            blocker: true,
+            rationale: "The blocker is scoped to TQQQ only".to_owned(),
+            grounds: vec![critique_ground.clone()],
+            evidence_gaps: claim.evidence_gaps.clone(),
+            verification_status: ClaimVerificationStatus::Supported,
+            supporting_refs: vec![ClaimVerificationEvidence {
+                evidence: critique_ground.evidence.clone(),
+                authority: SourceAuthority::Official,
+                temporal_validity: TemporalValidity::ValidAtDecisionCutoff,
+            }],
+            conflicting_refs: Vec::new(),
+        };
+        let forecast = Forecast {
+            asset: Asset::Qqq,
+            horizon: DecisionHorizon::T1,
+            positive_return_probability_ppm: 700_000,
+            expected_return_ppm: 10_000,
+            thesis: Some(ForecastThesis {
+                thesis_valid_until: Utc::now() + chrono::Duration::days(1),
+                expected_holding_period_days: DecisionHorizon::T1.trading_days(),
+                exit_condition: "test exit".to_owned(),
+                invalidation_conditions: vec!["test invalidation".to_owned()],
+            }),
+        };
+        let draft = DecisionDraft {
+            summary: "scoped blocker regression".to_owned(),
+            confidence_ppm: 800_000,
+            forecasts: vec![forecast],
+            research_allocation: None,
+            claims: vec![claim_ref],
+            critiques: vec![ArtifactRef {
+                artifact_id: ArtifactId(ContentHash::of_bytes(b"critique")),
+                kind: ArtifactKind::Critique,
+            }],
+            evidence: grounds.into_iter().map(|ground| ground.evidence).collect(),
+            material_conflicts: Vec::new(),
+            hard_blockers: Vec::new(),
+            soft_warnings: Vec::new(),
+            applied_learning_refs: Vec::new(),
+            rejected_learning_refs: Vec::new(),
+        };
+        assert!(critique.blocks_slot(Asset::Tqqq, DecisionHorizon::T1, DecisionHorizon::T1));
+        assert!(!critique.blocks_slot(Asset::Qqq, DecisionHorizon::T1, DecisionHorizon::T1));
+        let mut global_critique = critique.clone();
+        global_critique.evidence_gaps.clear();
+        assert!(global_critique.blocks_slot(Asset::Qqq, DecisionHorizon::T1, DecisionHorizon::T1));
+
+        let result = validate_verified_forecast_slots(
+            &draft,
+            &[(draft.claims[0].clone(), claim)],
+            &[critique],
+        );
+
+        assert!(
+            result.is_ok(),
+            "a blocker scoped to TQQQ must not reject the fully grounded QQQ slot: {result:?}"
+        );
+    }
 }

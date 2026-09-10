@@ -110,7 +110,8 @@ impl Store {
             )?;
             let parent_id = ArtifactId(ContentHash::new(parent_id)?);
             let parent = read_artifact(&connection, &parent_id)?;
-            let allowed = self.canary_cross_run_reference_allowed(&connection, &child, &parent)?;
+            let allowed = debug::cross_run_reference_allowed(&connection, &child, &parent)?
+                || self.canary_cross_run_reference_allowed(&connection, &child, &parent)?;
             if !allowed {
                 return Err(StoreError::Integrity(format!(
                     "artifact {artifact_id} ({:?}, {}) cites RunScoped {} ({:?}, {}) from another run",

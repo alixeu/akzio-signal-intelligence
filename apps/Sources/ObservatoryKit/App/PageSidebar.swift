@@ -6,6 +6,7 @@ import SwiftUI
 // then the routes used to inspect the live Core.
 struct PageSidebar: View {
     let route: AppRoute
+    let theme: SettingsPresentation.Theme
     let onSelect: (AppRoute) -> Void
     let onOpenSettings: () -> Void
     let onToggleSidebar: () -> Void
@@ -21,11 +22,11 @@ struct PageSidebar: View {
             row(.scenarioGallery)
             settingsRow
         }
-        .padding(.horizontal, AkzioLayout.s2)
+        .padding(.horizontal, AkzioLayout.sidebarHorizontalPadding)
         .padding(.bottom, AkzioLayout.s3)
         .frame(width: AkzioLayout.sidebarWidth, alignment: .leading)
         .frame(maxHeight: .infinity, alignment: .topLeading)
-        .background(AkzioColor.sidebarSurface)
+        .akzioGlassBackdrop(AkzioColor.sidebarSurface(for: theme), radius: 0)
         .overlay(alignment: .trailing) {
             Rectangle()
                 .fill(AkzioColor.sidebarHairline)

@@ -12,9 +12,11 @@ extension LiveProjection {
             : nil
         let receipts = currentArtifacts.filter { $0.kind == "order_receipt" }
         let reconciliationArtifact = currentArtifacts.last(where: { $0.kind == "reconciliation" })
-        let targetWeights = plan?.payload["target"]?["weights"]?.object
-            ?? positionPlan?.payload["target"]?["weights"]?.object
-            ?? [:]
+        let targetWeights: [String: JSONValue] = if isPositionPlan {
+            Self.researchTargetWeights(positionPlan?.payload["research_plan"]?["validated"])
+        } else {
+            plan?.payload["target"]?["weights"]?.object ?? [:]
+        }
         let positions = portfolio.positions.compactMap { position -> PositionPresentation? in
             guard let asset = TradableAsset(rawValue: position.symbol.uppercased()) else { return nil }
             let actual = liveRatio(position.marketValueMicros, portfolio.equityMicros)
@@ -123,8 +125,23 @@ extension LiveProjection {
                 isElevated: payload.health.frozen
             ),
             verdict: verdict,
-            reconciliation: reconciliation
+            reconciliation: reconciliation,
+            allocationSubtitle: isPositionPlan
+                ? "Research target · execution N/A"
+                : "Actual vs Target"
         )
+    }
+
+    private static func researchTargetWeights(_ plan: JSONValue?) -> [String: JSONValue] {
+        guard let rows = plan?["allocations"]?.array else { return [:] }
+        var result: [String: JSONValue] = [:]
+        for row in rows {
+            guard let asset = row["asset"]?.string,
+                  let weight = row["target_weight_ppm"]
+            else { continue }
+            result[asset.lowercased()] = weight
+        }
+        return result
     }
 
 }

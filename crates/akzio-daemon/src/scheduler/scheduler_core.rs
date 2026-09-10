@@ -43,7 +43,7 @@ impl PaperScheduler {
         Ok(self)
     }
 
-    pub(super) fn current_approval_binding(&self) -> SchedulerResult<Option<(Artifact, Artifact)>> {
+    pub(crate) fn current_approval_binding(&self) -> SchedulerResult<Option<(Artifact, Artifact)>> {
         let Some(approval) = self
             .store
             .latest_artifact_by_kind(ArtifactKind::PaperLaunchApproval)?
@@ -78,7 +78,7 @@ impl PaperScheduler {
         Ok(self.store.reserve_canary_session(&lease, reservation)?)
     }
 
-    pub(super) fn paper_snapshot_artifacts(
+    pub(crate) fn paper_snapshot_artifacts(
         &self,
         run_id: &RunId,
         session_key: &str,

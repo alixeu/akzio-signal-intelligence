@@ -21,9 +21,14 @@ impl ExecutionRuntime {
         &self,
         input: &ExecutionGateInput,
         blockers: &mut BTreeSet<HardBlocker>,
+        invalid_quote: bool,
     ) -> ExecutionGateResult<Option<(Artifact, QuoteSnapshot)>> {
         let Some(reference) = &input.quote_snapshot else {
-            blockers.insert(HardBlocker::MissingQuote);
+            blockers.insert(if invalid_quote {
+                HardBlocker::InvalidQuote
+            } else {
+                HardBlocker::MissingQuote
+            });
             return Ok(None);
         };
         let artifact = self.load_expected(reference, ArtifactKind::NormalizedEvidence)?;
@@ -137,9 +142,12 @@ impl ExecutionRuntime {
                 ExecutionError::GrossExposureExceeded(_) => {
                     blockers.insert(HardBlocker::FactorLimit);
                 }
-                ExecutionError::MissingQuote(_) | ExecutionError::InvalidQuote(_) => {
-                    blockers.insert(HardBlocker::MissingQuote);
-                }
+            ExecutionError::MissingQuote(_) => {
+                blockers.insert(HardBlocker::MissingQuote);
+            }
+            ExecutionError::InvalidQuote(_) => {
+                blockers.insert(HardBlocker::InvalidQuote);
+            }
                 ExecutionError::StaleQuote(_) => {
                     blockers.insert(HardBlocker::StaleQuote);
                 }

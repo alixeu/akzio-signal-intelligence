@@ -3,7 +3,10 @@
 use super::*;
 
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+// Hosted reasoning responses can legitimately pause longer than 30 seconds
+// between chunks. This remains a bounded transport timeout; the Agent
+// Contract's 120s total wall-time and phase deadline still govern the call.
+const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct OpenAIResponsesClient {
@@ -116,6 +119,11 @@ impl OpenAIResponsesClient {
             .send()
             .await?;
         let status = response.status();
+        let provider_request_id = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
         if !status.is_success() {
             return Err(ModelError::Http {
                 status,
@@ -178,7 +186,10 @@ impl OpenAIResponsesClient {
         let raw = stream.response.ok_or_else(|| {
             ModelError::InvalidStream("missing response.completed event".to_owned())
         })?;
-        openai_response_from_raw(raw, body)
+        openai_response_from_raw(raw, body).map(|mut result| {
+            result.provider_request_id = provider_request_id;
+            result
+        })
     }
 }
 
@@ -272,7 +283,7 @@ pub(super) fn openai_responses_request_body(
         "instructions": request.instructions,
         "input": input,
         "max_output_tokens": request.max_output_tokens,
-        "reasoning": {"effort": reasoning_effort, "summary": "auto"},
+        "reasoning": {"effort": request.reasoning_effort.as_deref().unwrap_or(reasoning_effort), "summary": "auto"},
         "include": ["reasoning.encrypted_content"],
         "store": false,
         "stream": true,
@@ -321,6 +332,7 @@ pub(super) fn openai_responses_request_body(
     match &request.tool_choice {
         ModelToolChoice::None => {}
         ModelToolChoice::Auto => body["tool_choice"] = json!("auto"),
+        ModelToolChoice::Required => body["tool_choice"] = json!("required"),
         ModelToolChoice::RequiredFunction(name) => {
             body["tool_choice"] = json!({"type": "function", "name": name});
         }
@@ -346,15 +358,25 @@ pub(super) fn openai_response_from_raw(raw: Value, request_body: Value) -> Resul
         return Err(ModelError::MissingOutput);
     }
     let usage = normalize_usage(&raw);
+    // store=false has no server-side conversation. Keep the actual input as
+    // well as this output, including earlier tool results and the initial
+    // authorized context. Returning only output silently forgets that context.
+    let mut transcript = match request_body.get("input") {
+        Some(Value::String(text)) => vec![json!({"role":"user","content":text})],
+        Some(Value::Array(items)) => items.clone(),
+        _ => Vec::new(),
+    };
+    transcript.extend(
+        raw.get("output")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+    );
     Ok(ModelResponse {
+        provider_request_id: None,
         output_text,
         tool_calls,
-        continuation: ModelContinuation::from_items(
-            raw.get("output")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default(),
-        ),
+        continuation: ModelContinuation::from_items(transcript),
         raw,
         usage,
         request_body,
@@ -472,4 +494,36 @@ pub(super) fn parse_tool_call(value: &Value) -> Option<ModelToolCall> {
         name,
         arguments,
     })
+}
+
+#[cfg(test)]
+mod transcript_regression {
+    use super::*;
+
+    #[test]
+    fn stream_idle_timeout_is_bounded_but_allows_hosted_reasoning_pause() {
+        assert_eq!(DEFAULT_STREAM_IDLE_TIMEOUT, Duration::from_secs(60));
+        assert!(DEFAULT_STREAM_IDLE_TIMEOUT < Duration::from_secs(120));
+    }
+
+    #[test]
+    fn stateless_continuation_retains_initial_context_and_prior_tool_results() {
+        let output = json!({"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"memo"}]}]});
+        let first =
+            openai_response_from_raw(output.clone(), json!({"input":"authorized context A"}))
+                .unwrap();
+        assert_eq!(
+            first.continuation.items()[0]["content"],
+            "authorized context A"
+        );
+        let mut items = first.continuation.items().to_vec();
+        items.push(json!({"type":"function_call_output","call_id":"call_A","output":"evidence A"}));
+        let second = openai_response_from_raw(output, json!({"input":items})).unwrap();
+        assert_eq!(
+            second.continuation.items()[0]["content"],
+            "authorized context A"
+        );
+        assert_eq!(second.continuation.items()[2]["output"], "evidence A");
+        assert_eq!(second.continuation.items().len(), 4);
+    }
 }

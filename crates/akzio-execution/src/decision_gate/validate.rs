@@ -114,6 +114,7 @@ impl DecisionRuntime {
         }
 
         let mut total_bytes = 0_u64;
+        let mut projected_bytes = 0_u64;
         let mut estimated_tokens = 0_u32;
         for selection in &payload.selections {
             let artifact = self.store.artifact(&selection.artifact.artifact_id)?;
@@ -128,14 +129,22 @@ impl DecisionRuntime {
             {
                 return Err(DecisionGateError::InvalidManifestClosure);
             }
-            let tokens = estimate_tokens(artifact.blob.bytes);
-            if tokens != selection.estimated_tokens {
+            let legacy_tokens = estimate_tokens(artifact.blob.bytes);
+            if selection.projected_bytes.is_none() && legacy_tokens != selection.estimated_tokens {
                 return Err(DecisionGateError::InvalidManifestClosure);
             }
             total_bytes = total_bytes.saturating_add(artifact.blob.bytes);
-            estimated_tokens = estimated_tokens.saturating_add(tokens);
+            projected_bytes = projected_bytes.saturating_add(
+                selection
+                    .projected_bytes
+                    .unwrap_or(artifact.blob.bytes),
+            );
+            estimated_tokens = estimated_tokens.saturating_add(selection.estimated_tokens);
         }
-        if total_bytes != payload.total_bytes || estimated_tokens != payload.estimated_tokens {
+        if total_bytes != payload.total_bytes
+            || projected_bytes != payload.projected_bytes.unwrap_or(total_bytes)
+            || estimated_tokens != payload.estimated_tokens
+        {
             return Err(DecisionGateError::InvalidManifestClosure);
         }
         for quarantine in &payload.quarantined {
@@ -185,6 +194,13 @@ impl DecisionRuntime {
             .iter()
             .chain(draft.critiques.iter())
             .chain(draft.evidence.iter())
+            .chain(
+                draft
+                    .research_allocation
+                    .iter()
+                    .flat_map(|plan| plan.allocations.iter())
+                    .flat_map(|allocation| allocation.evidence_refs.iter()),
+            )
             .chain(draft.applied_learning_refs.iter())
             .chain(draft.rejected_learning_refs.iter())
             .chain(

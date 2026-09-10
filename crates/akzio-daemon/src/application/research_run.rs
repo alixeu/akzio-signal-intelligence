@@ -40,7 +40,10 @@ impl<'a> ResearchRun<'a> {
             .run(task, candidates.clone(), now, &mut agent_budget)
             .await?;
         if task.node.recipe_id.as_str() == akzio_domain::RESEARCH_ANALYST_RECIPE_ID
-            && self.daemon.store.run_purpose(&task.run_id)? == RunPurpose::Paper
+            && matches!(
+                self.daemon.store.run_purpose(&task.run_id)?,
+                RunPurpose::Paper | RunPurpose::PositionPlan
+            )
         {
             let claim: ResearchClaim =
                 serde_json::from_slice(&self.daemon.store.read_blob(&output.blob)?)?;
@@ -49,14 +52,9 @@ impl<'a> ResearchRun<'a> {
                     && !gap.supplemental_needs.is_empty()
             });
             if has_supplemental_request {
-                if !self
-                    .daemon
-                    .paper_execution()
-                    .session_is_current(task)
-                    .await?
-                {
+                if !self.research_session_is_current(task)? {
                     return Err(DaemonError::InvalidInput(
-                        "Paper broker session changed before supplemental evidence collection"
+                        "Research session changed before supplemental evidence collection"
                             .to_owned(),
                     ));
                 }
@@ -95,16 +93,11 @@ impl<'a> ResearchRun<'a> {
                         .await
                     {
                         Ok(supplemental_refs) => {
-                            if !self
-                                .daemon
-                                .paper_execution()
-                                .session_is_current(task)
-                                .await?
-                            {
+                            if !self.research_session_is_current(task)? {
                                 return Err(DaemonError::InvalidInput(
-                                            "Paper broker session changed before supplemental analyst round"
-                                                .to_owned(),
-                                        ));
+                                    "Research session changed before supplemental analyst round"
+                                        .to_owned(),
+                                ));
                             }
                             let mut refined_candidates = candidates;
                             refined_candidates.extend(supplemental_refs);
@@ -147,6 +140,16 @@ impl<'a> ResearchRun<'a> {
         }
     }
 
+    fn research_session_is_current(&self, task: &ClaimedAttempt) -> Result<bool> {
+        let expected = self.daemon.research_session_key(&task.run_id)?;
+        // Preserve the session date boundary. Market openness belongs to ExecutionGate.
+        Ok(Utc::now()
+            .with_timezone(&chrono_tz::America::New_York)
+            .date_naive()
+            .to_string()
+            == expected)
+    }
+
     fn validate_canonical_evidence_manifest(
         &self,
         task: &ClaimedAttempt,
@@ -155,7 +158,7 @@ impl<'a> ResearchRun<'a> {
         let purpose = self.daemon.store.run_purpose(&task.run_id)?;
         if !matches!(
             purpose,
-            RunPurpose::Paper | RunPurpose::Replay | RunPurpose::Shadow
+            RunPurpose::Paper | RunPurpose::PositionPlan | RunPurpose::Replay | RunPurpose::Shadow
         ) {
             return Ok(());
         }
@@ -167,16 +170,8 @@ impl<'a> ResearchRun<'a> {
             .filter_map(|artifact| self.daemon.store.read_blob(&artifact.blob).ok())
             .filter_map(|bytes| serde_json::from_slice::<NormalizedEvidencePayload>(&bytes).ok())
             .collect::<Vec<_>>();
-        let session_key = if purpose == RunPurpose::Paper {
-            self.daemon
-                .store
-                .session_slot_for_run(&task.run_id)?
-                .map(|slot| slot.session_key)
-                .ok_or_else(|| {
-                    DaemonError::InvalidInput(
-                        "canonical Paper evidence manifest has no session slot".to_owned(),
-                    )
-                })?
+        let session_key = if matches!(purpose, RunPurpose::Paper | RunPurpose::PositionPlan) {
+            self.daemon.research_session_key(&task.run_id)?
         } else {
             let cutoffs = payloads
                 .iter()

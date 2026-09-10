@@ -67,6 +67,7 @@ public struct PortfolioPresentation: Sendable, Hashable {
     public let risk: RiskPresentation
     public let verdict: ExecutionVerdictKind
     public let reconciliation: ReconciliationState
+    public let allocationSubtitle: String
 
     public init(
         equityMicros: Int64,
@@ -86,7 +87,8 @@ public struct PortfolioPresentation: Sendable, Hashable {
         flow: [AllocationFlowStage],
         risk: RiskPresentation,
         verdict: ExecutionVerdictKind,
-        reconciliation: ReconciliationState
+        reconciliation: ReconciliationState,
+        allocationSubtitle: String = "Actual vs Target"
     ) {
         self.equityMicros = equityMicros
         self.todayPnlMicros = todayPnlMicros
@@ -106,6 +108,7 @@ public struct PortfolioPresentation: Sendable, Hashable {
         self.risk = risk
         self.verdict = verdict
         self.reconciliation = reconciliation
+        self.allocationSubtitle = allocationSubtitle
     }
 
     public var equityValue: Double { Double(equityMicros) / PpmFormatter.ppmPerUnit }

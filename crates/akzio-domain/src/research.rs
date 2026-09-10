@@ -169,6 +169,21 @@ impl ResearchIntent {
                 self.source_family.clone(),
             ));
         }
+        // A market-price adapter cannot satisfy an explicit news acquisition.
+        // This rejects the observed cross-domain request; it is not a general
+        // natural-language classifier and does not manufacture a replacement.
+        let query = self.query.to_lowercase();
+        if self.source_family == "alpaca"
+            && (self.resource == "bars" || self.resource.starts_with("bars:"))
+            && (query.contains("新闻")
+                || query
+                    .split(|c: char| !c.is_alphanumeric())
+                    .any(|w| w == "news"))
+        {
+            return Err(DomainError::EmptyField {
+                field: "research.intent.news_requires_news_source",
+            });
+        }
         if let (Some(start), Some(end)) = (self.window_start, self.window_end) {
             if end < start || end.signed_duration_since(start) > Duration::days(366) {
                 return Err(DomainError::InvalidBudget {
@@ -315,6 +330,33 @@ pub struct ResearchCritique {
 }
 
 impl ResearchCritique {
+    /// Return whether this critique's safety blocker applies to one concrete
+    /// asset/horizon slot. A blocker with no directional gap is a genuine
+    /// claim-wide blocker. When blocking gaps carry scope, the scope is the
+    /// authority: an unrelated asset/horizon must not be rejected merely
+    /// because the enclosing Claim has `blocker = true`.
+    pub fn blocks_slot(
+        &self,
+        asset: Asset,
+        horizon: DecisionHorizon,
+        claim_horizon: DecisionHorizon,
+    ) -> bool {
+        if !self.blocker {
+            return false;
+        }
+        let blocking_gaps = self
+            .evidence_gaps
+            .iter()
+            .filter(|gap| gap.impact == EvidenceGapImpact::BlocksDirectionalForecast)
+            .collect::<Vec<_>>();
+        if blocking_gaps.is_empty() {
+            return true;
+        }
+        blocking_gaps
+            .into_iter()
+            .any(|gap| gap.blocks_slot(asset, horizon, claim_horizon))
+    }
+
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION
             || self.target.kind != ArtifactKind::Claim
@@ -349,6 +391,16 @@ impl ResearchCritique {
         {
             return Err(DomainError::EmptyField {
                 field: "research.claim_verification.ground_closure",
+            });
+        }
+        if !self.blocker
+            && self
+                .evidence_gaps
+                .iter()
+                .any(|gap| gap.impact == EvidenceGapImpact::BlocksDirectionalForecast)
+        {
+            return Err(DomainError::EmptyField {
+                field: "research.critique.blocking_gap_requires_blocker_true",
             });
         }
         match self.verification_status {
@@ -492,4 +544,59 @@ fn ground_refs(grounds: &[EvidenceGround]) -> Vec<ArtifactRef> {
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+#[cfg(test)]
+mod acquisition_semantics_tests {
+    use super::*;
+    #[test]
+    fn news_cannot_be_acquired_as_price_bars_but_gap_may_remain_unfilled() {
+        let intent = ResearchIntent {
+            schema_version: DOMAIN_SCHEMA_VERSION,
+            source_family: "alpaca".into(),
+            resource: "bars".into(),
+            query: "获取资产专属新闻".into(),
+            assets: BTreeSet::new(),
+            window_start: None,
+            window_end: None,
+            max_age_secs: 86400,
+            max_results: 1,
+        };
+        assert!(intent.validate().is_err());
+        let gap = EvidenceGap {
+            topic: "news unavailable".into(),
+            rationale: "No news adapter available; directional support remains insufficient".into(),
+            impact: EvidenceGapImpact::BlocksDirectionalForecast,
+            assets: BTreeSet::new(),
+            horizons: BTreeSet::new(),
+            supplemental_needs: vec![],
+        };
+        assert!(gap.validate().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod critique_blocking_gap_tests {
+    use super::*;
+    #[test]
+    fn supported_price_does_not_clear_direction_blocking_gap() {
+        let mut critique: ResearchCritique = serde_json::from_value(serde_json::json!({
+            "schema_version": DOMAIN_SCHEMA_VERSION,
+            "target": {"artifact_id":"a".repeat(64),"kind":"claim"},
+            "topic":"QQQ t1 price", "severity":"low", "rationale":"Price supports the scoped claim; news remains missing",
+            "verification_status":"supported", "blocker":false,
+            "grounds":[{"evidence":{"artifact_id":"b".repeat(64),"kind":"normalized_evidence"},"role":"directional","assets":["QQQ"],"domain":"price_market_structure","support":"Price-only support"}],
+            "supporting_refs":[{"evidence":{"artifact_id":"b".repeat(64),"kind":"normalized_evidence"},"authority":"official","temporal_validity":"valid_at_decision_cutoff"}],
+            "conflicting_refs":[],
+            "evidence_gaps":[{"topic":"news","rationale":"Unavailable news","assets":["QQQ"],"horizons":["t1"],"impact":"blocks_directional_forecast","supplemental_needs":[]}]
+        })).unwrap();
+        assert!(matches!(
+            critique.validate(),
+            Err(DomainError::EmptyField {
+                field: "research.critique.blocking_gap_requires_blocker_true"
+            })
+        ));
+        critique.blocker = true;
+        assert!(critique.validate().is_ok());
+    }
 }

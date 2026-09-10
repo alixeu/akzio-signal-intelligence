@@ -7,10 +7,14 @@ async fn main() -> Result<()> {
     if let Command::ModelQualification { command } = &cli.command {
         return handle_model_qualification(command);
     }
+    if let Command::Calibration { command } = &cli.command {
+        return handle_calibration(command, &cli.config);
+    }
     let config_path = cli.config.clone();
     let config = load_config(&config_path)?;
 
     match cli.command {
+        Command::Debug { command } => dispatch_debug(command, &config, &config_path).await,
         Command::ObservatoryConfig { .. } => unreachable!("handled before config loading"),
         Command::Daemon { command } => {
             dispatch_control(Command::Daemon { command }, &config, &config_path).await
@@ -28,5 +32,7 @@ async fn main() -> Result<()> {
             dispatch_control(Command::Canary { command }, &config, &config_path).await
         }
         Command::ModelQualification { .. } => unreachable!("handled before config loading"),
+        Command::Calibration { .. } => unreachable!("handled before config loading"),
+        Command::Evidence { command } => run_evidence_command(&command, &config).await,
     }
 }

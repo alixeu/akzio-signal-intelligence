@@ -9,6 +9,9 @@ impl Store {
         schedule: &Artifact,
         now: DateTime<Utc>,
     ) -> StoreResult<()> {
+        if self.run_purpose(&permit.run_id)? != RunPurpose::Paper {
+            return Err(StoreError::InvalidLearningCommit("outcome_schedule.paper_purpose"));
+        }
         if schedule.kind != ArtifactKind::OutcomeSchedule {
             return Err(StoreError::InvalidLearningCommit(
                 "outcome_schedule.worker_kind",
@@ -55,7 +58,7 @@ impl Store {
         )?
         .map(|(hash, _)| hash)
         .or_else(|| schedule.provenance.producer_contract_hash.clone());
-        // AgentRuntime rejects a task whose durable policy diverges from its contract.
+        // The Run graph freezes role budgets independently of Contract safety defaults.
         let worker_policy = worker_contract_hash
             .as_ref()
             .map(|contract_hash| {
@@ -63,14 +66,14 @@ impl Store {
                     .ok_or_else(|| StoreError::MissingContractInstallation(contract_hash.clone()))
             })
             .transpose()?;
-        let (worker_budget, worker_retry, worker_on_failure) = worker_policy.map_or_else(
+        let (mut worker_budget, worker_retry, worker_on_failure) = worker_policy.map_or_else(
             || {
                 (
                     TaskBudget {
                         max_input_tokens: 1_024,
                         max_output_tokens: 1_024,
                         max_wall_time_secs: 120,
-                        max_tool_calls: 0,
+                        max_tool_calls: akzio_domain::budget::ToolCallLimit::Limited(0),
                     },
                     RetryPolicy {
                         max_attempts: u8::MAX,
@@ -90,6 +93,10 @@ impl Store {
                 )
             },
         );
+        let frozen = self.workflow_snapshot_with_connection(&transaction, &permit.run_id)?;
+        if let Some(budget) = frozen.revision.graph.agent_budgets.get(POST_TERMINAL_WORKER_RECIPE_ID) {
+            worker_budget = budget.clone();
+        }
         let mut worker_inputs = vec![schedule_ref];
         worker_inputs.extend(schedule.source_refs.clone());
         let deliberation_note_ids = transaction
@@ -150,14 +157,16 @@ impl Store {
             on_failure: worker_on_failure,
             parent_task_id: None,
         };
-        commit_attempt_transaction(
-            &transaction,
-            permit,
-            std::slice::from_ref(schedule),
-            TaskStatus::Succeeded,
-            now,
-        )?;
+        let already_committed:bool=transaction.query_row("SELECT status='succeeded' FROM rebuild_attempts WHERE attempt_id=?1",params![permit.attempt_id.0],|r|r.get(0))?;
+        if already_committed {
+            // Reattach missing future work using immutable success proof, never
+            // revive a completed task permit or republish its outputs.
+            assert_idempotent_outcome_schedule_commit(&transaction,permit,schedule)?;
+        } else {
+            commit_attempt_transaction(&transaction,permit,std::slice::from_ref(schedule),TaskStatus::Succeeded,now)?;
+        }
         insert_task_node(&transaction, &permit.run_id, &worker, now)?;
+        debug::post_terminal_enqueued(&transaction,&permit.run_id,now)?;
         append_event(
             &transaction,
             &permit.run_id,
@@ -169,6 +178,23 @@ impl Store {
         )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Discover old Paper schedules that were committed while outcome processing
+    /// was disabled. The existing commit path checks their original success proof.
+    pub fn ensure_pending_outcome_workers(&self,now:DateTime<Utc>)->StoreResult<usize> {
+        let pending={
+            let connection=self.connection()?;
+            let rows=connection.prepare("SELECT r.run_id,t.task_id,p.attempt_id,p.lease_id,p.epoch,t.contract_hash,a.artifact_id FROM rebuild_artifacts a JOIN rebuild_attempt_outputs o ON o.artifact_id=a.artifact_id JOIN rebuild_attempts p ON p.attempt_id=o.attempt_id JOIN rebuild_tasks t ON t.task_id=p.task_id JOIN rebuild_runs r ON r.run_id=p.run_id WHERE a.kind='outcome_schedule' AND r.purpose='paper' AND r.status='completed' AND p.status='succeeded' AND t.status='succeeded' AND NOT EXISTS(SELECT 1 FROM rebuild_tasks w WHERE w.run_id=r.run_id AND w.recipe_id='learning.outcome_worker') AND NOT EXISTS(SELECT 1 FROM rebuild_artifacts final WHERE final.kind='outcome' AND json_extract(final.origin_json,'$.run_id')=r.run_id) ORDER BY a.created_at LIMIT 1000")?
+                .query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,u64>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,String>(6)?)))?.collect::<Result<Vec<_>,_>>()?;
+            rows
+        };
+        for (run,task,attempt,lease,epoch,contract,id) in &pending {
+            let permit=TaskWritePermit{run_id:RunId(run.clone()),task_id:TaskId(task.clone()),attempt_id:AttemptId(attempt.clone()),lease_id:LeaseId(lease.clone()),epoch:*epoch,contract_hash:contract.as_deref().map(ContentHash::new).transpose()?};
+            let schedule=self.artifact(&ArtifactId(ContentHash::new(id.clone())?))?;
+            self.commit_outcome_schedule_with_worker(&permit,&schedule,now)?;
+        }
+        Ok(pending.len())
     }
 
     /// Commits sealed Paper or Shadow outcomes through a purpose-aware path.

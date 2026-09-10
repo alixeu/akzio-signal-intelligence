@@ -71,6 +71,22 @@ impl AgentRuntime {
                 })
             }
             Err(error) => {
+                let range_hint = if matches!(
+                    error,
+                    ResearchError::Context(akzio_context::ContextError::DocumentRequiresRange)
+                ) {
+                    call.arguments
+                        .get("artifact_id")
+                        .cloned()
+                        .and_then(|v| serde_json::from_value::<ArtifactId>(v).ok())
+                        .map(|id| {
+                            self.context
+                                .document_range_metadata(permit, contract, grant, &id, now)
+                        })
+                        .transpose()?
+                } else {
+                    None
+                };
                 let result_artifact = self.tool_artifact(
                     permit,
                     contract,
@@ -81,6 +97,7 @@ impl AgentRuntime {
                         "name": call.name,
                         "ok": false,
                         "error": {
+                            "range_metadata": range_hint,
                             "code": tool_error_code(&error),
                             "message": error.to_string(),
                         },
@@ -97,6 +114,16 @@ impl AgentRuntime {
                     LifecycleEventType::ToolFailed,
                     now,
                 )?;
+                if matches!(
+                    error,
+                    ResearchError::Context(akzio_context::ContextError::DocumentRequiresRange)
+                ) {
+                    return Ok(ToolResult {
+                        value: json!({"call_id":call.call_id,"ok":false,
+                            "error":{"code":"document_requires_range","message":error.to_string(),"range_metadata":range_hint}}),
+                        artifact: result_artifact,
+                    });
+                }
                 Err(error)
             }
         }

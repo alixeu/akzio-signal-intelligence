@@ -121,7 +121,7 @@ impl Store {
             .ok_or_else(|| StoreError::MissingContractInstallation(hash.clone()))?;
         node.task_id = TaskId::new();
         node.contract_hash = Some(hash);
-        node.budget = installed.contract.budget;
+        node.budget = snapshot.revision.graph.agent_budgets.get(POST_TERMINAL_WORKER_RECIPE_ID).cloned().unwrap_or(installed.contract.budget);
         node.retry = installed.contract.retry;
         node.on_failure = installed.contract.on_failure;
         node.objective = "[narrative_repair] Repair T5 narrative from the immutable sealed Outcome; no new prices or execution.".to_owned();

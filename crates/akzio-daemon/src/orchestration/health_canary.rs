@@ -17,13 +17,16 @@ impl Daemon {
             let daemon = daemon.clone();
             Box::pin(async move { daemon.execute_task(task).await })
         });
-        WorkerPool::new(
+        let pool = WorkerPool::new(
             self.task_runtime.clone(),
             self.transport.worker_pool.clone(),
-        )
-        .with_lesson_revalidation(self.store.clone())
-        .serve(handler, shutdown)
-        .await?;
+        );
+        let pool = if self.debug_enabled() {
+            pool
+        } else {
+            pool.with_lesson_revalidation(self.store.clone())
+        };
+        pool.serve(handler, shutdown).await?;
         Ok(())
     }
 
@@ -46,6 +49,21 @@ impl Daemon {
             .transpose()?
             .unwrap_or(false);
         let metrics = self.store.metrics(Utc::now())?;
+        let policy = self.decision_runtime.policy();
+        let decision_policy_status = self
+            .debug_control
+            .as_ref()
+            .map(|config| config.decision_policy_status.clone())
+            .filter(|status| !status.is_empty())
+            .unwrap_or_else(|| {
+                if policy.decision_capable() {
+                    "ready_for_current_decision".to_owned()
+                } else if policy.asset_calibrations.is_empty() {
+                    "unconfigured_fail_closed".to_owned()
+                } else {
+                    "validated_but_insufficient_samples".to_owned()
+                }
+            });
         Ok(DaemonHealth {
             status: if self.paper.auto_paper && lease.is_none() {
                 "paper_scheduler_fail_closed".to_owned()
@@ -53,6 +71,15 @@ impl Daemon {
                 "ok".to_owned()
             },
             frozen,
+            decision_policy_status,
+            decision_policy_hash: policy.policy_hash()?,
+            decision_policy_input_hash: self
+                .debug_control
+                .as_ref()
+                .and_then(|config| config.decision_policy_input_hash.clone()),
+            decision_capable: policy.decision_capable(),
+            news_web_status: self.news_web_status.clone(),
+            news_web_route: self.news_web_route.clone(),
             scheduler_owner: lease.as_ref().map(|lease| lease.owner_id.clone()),
             scheduler_epoch: lease.map(|lease| lease.epoch),
             alerts: metrics.alerts(),

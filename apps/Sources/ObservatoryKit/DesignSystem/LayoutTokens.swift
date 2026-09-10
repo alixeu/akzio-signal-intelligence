@@ -14,9 +14,22 @@ public enum AkzioLayout {
     public static let s8: CGFloat = 32
 
     public static let pageMargin: CGFloat = 20
-    public static let statusBarHeight: CGFloat = 44
-    /// Matches the roughly 314pt Codex sidebar at a 2x Retina scale.
-    public static let sidebarWidth: CGFloat = 316
+    public static let statusBarHeight: CGFloat = 48
+    /// Minimum fixed width that fits the longest English navigation label
+    /// ("Scenario Gallery") with the icon, row padding and sidebar breathing room.
+    public static let sidebarWidth: CGFloat = 224
+    public static let sidebarHorizontalPadding: CGFloat = 16
+    /// The compact sidebar control sits to the right of the native traffic lights,
+    /// with a visible left breathing room before the control.
+    public static let collapsedSidebarToggleLeading: CGFloat = 72
+    public static let collapsedSidebarToggleSize: CGFloat = 36
+    /// Breathing room between the compact control and the first status value.
+    public static let collapsedSidebarToggleGap: CGFloat = 8
+    public static let collapsedSidebarContentLeading: CGFloat =
+        collapsedSidebarToggleLeading + collapsedSidebarToggleSize + collapsedSidebarToggleGap
+    public static var collapsedSidebarToggleTop: CGFloat {
+        max(0, (statusBarHeight - collapsedSidebarToggleSize) / 2)
+    }
     public static let inspectorWidth: CGFloat = 300
     public static let workflowInspectorWidth: CGFloat = 520
     public static let inspectorOverlayMaxHeight: CGFloat = 560

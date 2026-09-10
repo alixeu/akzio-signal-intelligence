@@ -328,6 +328,9 @@ impl ModelContinuation {
 pub enum ModelToolChoice {
     None,
     Auto,
+    /// Require at least one tool call. This is used by probes and governed
+    /// acquisition requests that must not silently fall back to plain text.
+    Required,
     RequiredFunction(String),
 }
 
@@ -351,6 +354,11 @@ pub struct ModelRequest {
     pub instructions: String,
     pub input: ModelInput,
     pub max_output_tokens: u32,
+    /// Optional phase-local override. A structured Submit call may use a
+    /// lower reasoning effort than the research Draft while retaining the
+    /// same requested/actual model identity and audited route snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     pub tools: Vec<ModelToolDefinition>,
     pub tool_choice: ModelToolChoice,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -402,11 +410,53 @@ pub struct ModelCapabilitySnapshot {
     pub encrypted_continuation: Option<bool>,
     #[serde(default)]
     pub native_web_tool_verified: bool,
+    /// Result of the bounded hosted-web probe. `native_web_tool = false` is
+    /// deliberately not enough to explain whether the route declined the
+    /// tool, never called it, or returned unusable sources.
+    #[serde(default)]
+    pub native_web_status: NativeWebCapabilityStatus,
     #[serde(default)]
     pub basis: ModelCapabilityBasis,
     #[serde(default)]
     pub verified: bool,
     pub source: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeWebCapabilityStatus {
+    #[default]
+    NotProbed,
+    Verified,
+    NotCalled,
+    NoVerifiableSources,
+    SourceValidationFailed,
+    ToolUnsupported,
+    AuthorizationDenied,
+    RateLimited,
+    TemporaryProviderError,
+    ProviderRouteError,
+    TransportError,
+    InvalidResponse,
+}
+
+impl NativeWebCapabilityStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotProbed => "not_probed",
+            Self::Verified => "verified",
+            Self::NotCalled => "not_called",
+            Self::NoVerifiableSources => "no_verifiable_sources",
+            Self::SourceValidationFailed => "source_validation_failed",
+            Self::ToolUnsupported => "tool_unsupported",
+            Self::AuthorizationDenied => "authorization_denied",
+            Self::RateLimited => "rate_limited",
+            Self::TemporaryProviderError => "temporary_provider_error",
+            Self::ProviderRouteError => "provider_route_error",
+            Self::TransportError => "transport_error",
+            Self::InvalidResponse => "invalid_response",
+        }
+    }
 }
 
 impl ModelCapabilitySnapshot {
@@ -424,6 +474,7 @@ impl ModelCapabilitySnapshot {
             reasoning_items: None,
             encrypted_continuation: None,
             native_web_tool_verified: false,
+            native_web_status: NativeWebCapabilityStatus::NotProbed,
             basis: ModelCapabilityBasis::Unknown,
             verified: false,
             source: "unknown".to_owned(),
@@ -480,6 +531,9 @@ fn validate_probed_snapshot(
         || !snapshot.supports_tool_calls
         || !snapshot.supports_stateless_continuation
         || snapshot.streaming != Some(true)
+        || snapshot.native_web_tool != snapshot.native_web_tool_verified
+        || (snapshot.native_web_tool
+            && snapshot.native_web_status != NativeWebCapabilityStatus::Verified)
     {
         return Err(ModelError::CapabilityProbe(format!(
             "route {route} did not verify required OpenAI Responses behavior"
@@ -498,6 +552,9 @@ pub struct ModelCallTrace {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelResponse {
+    /// Provider request identifier only; no response or authorization headers.
+    #[serde(default)]
+    pub provider_request_id: Option<String>,
     pub output_text: String,
     pub tool_calls: Vec<ModelToolCall>,
     pub continuation: ModelContinuation,

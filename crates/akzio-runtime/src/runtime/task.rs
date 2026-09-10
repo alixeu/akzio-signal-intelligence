@@ -4,6 +4,8 @@ use super::*;
 pub struct TaskRuntime {
     store_executor: StoreExecutor,
     lease_duration: Duration,
+    outcome_processing: bool,
+    debug_identity: Option<ContentHash>,
 }
 
 impl TaskRuntime {
@@ -11,6 +13,8 @@ impl TaskRuntime {
         Self {
             store_executor: StoreExecutor::new(store),
             lease_duration: Duration::seconds(30),
+            outcome_processing: true,
+            debug_identity: None,
         }
     }
 
@@ -24,6 +28,16 @@ impl TaskRuntime {
 
     pub fn with_store_executor(mut self, store_executor: StoreExecutor) -> Self {
         self.store_executor = store_executor;
+        self
+    }
+
+    pub fn with_outcome_processing(mut self, enabled: bool) -> Self {
+        self.outcome_processing = enabled;
+        self
+    }
+
+    pub fn with_debug_identity(mut self, identity: Option<ContentHash>) -> Self {
+        self.debug_identity = identity;
         self
     }
 
@@ -92,13 +106,28 @@ impl TaskRuntime {
         F: FnOnce(ClaimedAttempt) -> Fut,
         Fut: Future<Output = TaskCompletion>,
     {
+        if !self.outcome_processing && workload == akzio_store::TaskWorkload::Outcome {
+            return Ok(false);
+        }
+        let workload = if self.outcome_processing {
+            workload
+        } else {
+            akzio_store::TaskWorkload::Session
+        };
         let now = Utc::now();
         let worker_id = worker_id.to_owned();
         let lease_duration = self.lease_duration;
+        let identity = self.debug_identity.clone();
         let Some(task) = self
             .store_executor
             .execute(move |store| {
-                store.claim_next_task_for_workload(&worker_id, now, lease_duration, workload)
+                store.claim_next_task_for_workload_with_identity(
+                    &worker_id,
+                    now,
+                    lease_duration,
+                    workload,
+                    identity.as_ref(),
+                )
             })
             .await??
         else {
@@ -110,25 +139,33 @@ impl TaskRuntime {
             return Ok(true);
         }
 
-        let mut heartbeat = tokio::time::interval(self.recovery_interval()?);
-        heartbeat.tick().await;
-        let mut handler = Box::pin(handle(task.clone()));
-        let timeout = tokio::time::sleep(StdDuration::from_secs(u64::from(
-            task.node.budget.max_wall_time_secs,
-        )));
-        tokio::pin!(timeout);
-        let completion = loop {
-            tokio::select! {
-                result = &mut handler => break result,
-                _ = heartbeat.tick() => {
+        let completion = {
+            let mut heartbeat = tokio::time::interval(self.recovery_interval()?);
+            heartbeat.tick().await;
+            let mut handler = Box::pin(handle(task.clone()));
+            // Keep polling the handler while heartbeat Store work waits. A queued
+            // semaphore permit may already belong to that handler; awaiting a
+            // heartbeat inside a select branch would prevent it from releasing it.
+            let monitor = async {
+                loop {
+                    heartbeat.tick().await;
                     if self.cancel_requested(&task.run_id).await? {
-                        break TaskCompletion::Cancelled;
+                        return Ok::<_, RuntimeError>(TaskCompletion::Cancelled);
                     }
                     self.heartbeat(&task.permit).await?;
                 }
-                _ = &mut timeout => break TaskCompletion::Retry(RetryCause::Timeout),
+            };
+            tokio::pin!(monitor);
+            let timeout = tokio::time::sleep(StdDuration::from_secs(u64::from(
+                task.node.budget.max_wall_time_secs,
+            )));
+            tokio::pin!(timeout);
+            tokio::select! {
+                result = &mut handler => result,
+                result = &mut monitor => result?,
+                _ = &mut timeout => TaskCompletion::Retry(RetryCause::Timeout),
             }
-        };
+        }; // Drop both futures and any queued permits before terminal Store work.
         self.finish(&task, completion, Utc::now()).await?;
         Ok(true)
     }

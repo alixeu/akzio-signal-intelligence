@@ -16,6 +16,7 @@ struct RunStatusBar: View {
     let runMessage: String
     let onSelectRunPurpose: (RunPurpose) -> Void
     let onRun: () -> Void
+    let leadingPadding: CGFloat
     let onOpenSettings: () -> Void
     let onCopyRunID: () -> Void
     let onRevealRun: () -> Void
@@ -32,7 +33,7 @@ struct RunStatusBar: View {
             controls
         }
         .padding(.trailing, AkzioLayout.s4)
-        .padding(.leading, AkzioLayout.s4)
+        .padding(.leading, leadingPadding)
         .frame(
             minHeight: AkzioLayout.statusBarHeight,
             idealHeight: AkzioLayout.statusBarHeight,
@@ -46,14 +47,22 @@ struct RunStatusBar: View {
 
     // MARK: Left
 
+    @ViewBuilder
     private var identity: some View {
         HStack(spacing: AkzioLayout.s2) {
-            Text(run.shortId)
-                .akzioMono(11, color: AkzioColor.primaryText)
-                .sharedElement(.runIdentifier, in: namespace)
-            Text(run.idPrefix)
-                .akzioMono(10, color: AkzioColor.mutedText)
-                .help(run.runId)
+            if run.runId.caseInsensitiveCompare(MissingValue.unavailable.rawValue) == .orderedSame {
+                Text(L10n.text(MissingValue.unavailable.rawValue, language: language))
+                    .akzioMono(11, color: AkzioColor.mutedText)
+                    .help("No active run is currently available.")
+            } else {
+                Text(run.shortId)
+                    .akzioMono(11, color: AkzioColor.primaryText)
+                    .sharedElement(.runIdentifier, in: namespace)
+                    .help("Run ID: \(run.runId)")
+                Text(run.idPrefix)
+                    .akzioMono(10, color: AkzioColor.mutedText)
+                    .help("Run ID prefix: \(run.runId)")
+            }
             PillTag(L10n.text(run.purpose.displayName, language: language), tone: run.purpose.tone)
         }
     }

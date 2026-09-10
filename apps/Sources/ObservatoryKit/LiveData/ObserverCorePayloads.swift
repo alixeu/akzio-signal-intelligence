@@ -62,6 +62,10 @@ struct ObserverApprovalPayload: Decodable, Sendable {
 struct ObserverHealthPayload: Decodable, Sendable {
     let status: String
     let frozen: Bool
+    let decisionPolicyStatus: String?
+    let decisionCapable: Bool?
+    let newsWebStatus: String?
+    let newsWebRoute: String?
     let schedulerOwner: String?
     let schedulerEpoch: UInt64?
     let alerts: [ObserverAlertPayload]
@@ -69,6 +73,10 @@ struct ObserverHealthPayload: Decodable, Sendable {
     enum CodingKeys: String, CodingKey {
         case status
         case frozen
+        case decisionPolicyStatus = "decision_policy_status"
+        case decisionCapable = "decision_capable"
+        case newsWebStatus = "news_web_status"
+        case newsWebRoute = "news_web_route"
         case schedulerOwner = "scheduler_owner"
         case schedulerEpoch = "scheduler_epoch"
         case alerts

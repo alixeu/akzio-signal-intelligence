@@ -24,7 +24,7 @@ pub use runtime::{
     EvidenceAdapterError, EvidenceBundle, EvidenceCitation, EvidenceContaminationCertificate,
     EvidenceProvenance, EvidenceQuality, EvidenceRequest, EvidenceRuntime, EvidenceRuntimeError,
     EvidenceRuntimeResult, EvidenceSource, EvidenceTimeBasis, FixtureEvidenceAdapter,
-    GovernedResource, NormalizedEvidencePayload,
+    GovernedResource, NativeWebFailureKind, NormalizedEvidencePayload,
 };
 
 /// US ETF session date, including UTC evening/day-boundary differences.

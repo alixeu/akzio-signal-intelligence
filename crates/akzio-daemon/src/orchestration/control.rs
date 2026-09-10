@@ -90,6 +90,11 @@ impl Daemon {
     }
 
     pub(crate) fn retry_run(&self, source_run_id: &RunId) -> Result<RunId> {
+        if self.debug_enabled() {
+            return Err(DaemonError::InvalidInput(
+                "use debug retry-node or debug fork for a controlled experiment".into(),
+            ));
+        }
         match self.store.run_purpose(source_run_id)? {
             RunPurpose::Debug | RunPurpose::PositionPlan | RunPurpose::PaperDryRun => {}
             RunPurpose::Paper => {

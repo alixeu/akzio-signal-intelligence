@@ -27,9 +27,10 @@ impl<'a> AgentSession<'a> {
 
     pub(crate) fn candidates(&self, task: &ClaimedAttempt) -> Result<Vec<ArtifactRef>> {
         let mut candidates = BTreeMap::<ArtifactId, ArtifactRef>::new();
+        let expand_research_sources = should_expand_research_sources(task.node.recipe_id.as_str());
 
         for reference in &task.node.input_artifacts {
-            self.append_candidate(&mut candidates, reference)?;
+            self.append_candidate(&mut candidates, reference, expand_research_sources)?;
         }
 
         if let Some(parent_task_id) = &task.node.parent_task_id {
@@ -96,6 +97,7 @@ impl<'a> AgentSession<'a> {
                                 artifact_id: artifact.artifact_id,
                                 kind: artifact.kind,
                             },
+                            expand_research_sources,
                         )?;
                     }
                 }
@@ -116,7 +118,17 @@ impl<'a> AgentSession<'a> {
         &self,
         candidates: &mut BTreeMap<ArtifactId, ArtifactRef>,
         reference: &ArtifactRef,
+        expand_research_sources: bool,
     ) -> Result<()> {
+        if let Some(existing) = candidates.get(&reference.artifact_id) {
+            if existing.kind != reference.kind {
+                return Err(DaemonError::InvalidInput(format!(
+                    "artifact {} kind changed from {:?} to {:?}",
+                    reference.artifact_id, existing.kind, reference.kind
+                )));
+            }
+            return Ok(());
+        }
         let artifact = self.daemon.store.artifact(&reference.artifact_id)?;
         if artifact.kind != reference.kind {
             return Err(DaemonError::InvalidInput(format!(
@@ -135,7 +147,7 @@ impl<'a> AgentSession<'a> {
                     .iter()
                     .filter(|source| source.kind == ArtifactKind::NormalizedEvidence)
                 {
-                    self.append_candidate(candidates, source)?;
+                    self.append_candidate(candidates, source, expand_research_sources)?;
                 }
             }
             candidates.insert(
@@ -145,7 +157,71 @@ impl<'a> AgentSession<'a> {
                     kind: artifact.kind,
                 },
             );
+            if expand_research_sources {
+                for source in research_output_source_refs(artifact.kind, &artifact.source_refs) {
+                    self.append_candidate(candidates, &source, expand_research_sources)?;
+                }
+            }
         }
         Ok(())
+    }
+}
+
+fn research_output_source_refs(
+    kind: ArtifactKind,
+    source_refs: &[ArtifactRef],
+) -> Vec<ArtifactRef> {
+    if !matches!(kind, ArtifactKind::Claim | ArtifactKind::Critique) {
+        return Vec::new();
+    }
+    source_refs
+        .iter()
+        .filter(|reference| {
+            matches!(
+                reference.kind,
+                ArtifactKind::Claim
+                    | ArtifactKind::Critique
+                    | ArtifactKind::NormalizedEvidence
+                    | ArtifactKind::SemanticDetail
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+fn should_expand_research_sources(recipe_id: &str) -> bool {
+    recipe_id == akzio_domain::RESEARCH_SYNTHESIZER_RECIPE_ID
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn research_output_candidates_include_their_context_source_closure() {
+        let source = ArtifactRef {
+            artifact_id: ArtifactId(akzio_domain::ContentHash::of_bytes(b"projection")),
+            kind: ArtifactKind::SemanticDetail,
+        };
+        let claim = ArtifactRef {
+            artifact_id: ArtifactId(akzio_domain::ContentHash::of_bytes(b"claim")),
+            kind: ArtifactKind::Claim,
+        };
+
+        let refs =
+            research_output_source_refs(ArtifactKind::Critique, &[claim.clone(), source.clone()]);
+
+        assert!(refs.contains(&claim));
+        assert!(refs.contains(&source));
+    }
+
+    #[test]
+    fn only_synthesizer_expands_research_output_sources() {
+        assert!(should_expand_research_sources(
+            akzio_domain::RESEARCH_SYNTHESIZER_RECIPE_ID
+        ));
+        assert!(!should_expand_research_sources(
+            akzio_domain::RESEARCH_CRITIC_RECIPE_ID
+        ));
     }
 }

@@ -65,6 +65,25 @@ struct LiveProjection: Sendable {
                 isElevatedRisk: payload.health.frozen || payload.health.status != "ok"
             ),
             HealthMetric(
+                id: "decision-policy",
+                label: "Decision Policy",
+                value: payload.health.decisionPolicyStatus ?? "Unknown",
+                fraction: nil,
+                isElevatedRisk: payload.health.decisionCapable != true
+            ),
+            HealthMetric(
+                id: "news-web",
+                label: "News Evidence",
+                value: payload.health.newsWebStatus.map { status in
+                    if let route = payload.health.newsWebRoute, !route.isEmpty {
+                        return "\(status) · \(route)"
+                    }
+                    return status
+                } ?? "Unknown",
+                fraction: nil,
+                isElevatedRisk: payload.health.newsWebStatus != "verified"
+            ),
+            HealthMetric(
                 id: "alerts",
                 label: "Store Alerts",
                 value: String(payload.health.alerts.count),
@@ -136,35 +155,39 @@ struct LiveProjection: Sendable {
         let trajectory = detail?.trajectory ?? []
         var analystIndex = 0
         var taskStages: [String: WorkflowStageKind] = [:]
+        var stageOccurrences: [String: Int] = [:]
         let nodes = workflow.tasks.map { task -> WorkflowNodePresentation in
             let stage = stage(for: task.node.recipeID, analystIndex: &analystIndex)
             taskStages[task.node.taskID] = stage
             let position = WorkflowLayout.position(stage)
+            let occurrence = stageOccurrences[stage.id, default: 0]
+            stageOccurrences[stage.id] = occurrence + 1
             let confidence = trajectory
                 .filter { $0.taskID == task.node.taskID }
                 .compactMap(\.deliberation)
                 .last
                 .map { Int($0.confidencePpm) }
             return WorkflowNodePresentation(
+                taskID: task.node.taskID,
                 stage: stage,
                 taskStatus: taskStatus(task.taskStatus),
                 isApplicable: true,
                 confidencePpm: confidence,
                 column: position.column,
-                row: position.row
+                row: position.row + occurrence
             )
         }
         let edges = workflow.tasks.flatMap { task -> [WorkflowEdgePresentation] in
-            guard let target = taskStages[task.node.taskID] else { return [] }
+            guard taskStages[task.node.taskID] != nil else { return [] }
             return task.node.dependencies.compactMap { dependency in
                 taskStages[dependency].map {
-                    WorkflowEdgePresentation(from: $0, to: target, kind: .sequential)
+                    _ in WorkflowEdgePresentation(fromTask: dependency, toTask: task.node.taskID, kind: .sequential)
                 }
             }
         }
         let activeTask = workflow.tasks.first { taskStatus($0.taskStatus) == .running }
             ?? workflow.tasks.first { taskStatus($0.taskStatus) == .leased }
-        let activeStage = activeTask.flatMap { taskStages[$0.node.taskID] }
+        let activeStageID = activeTask?.node.taskID
         let artifactsByID = Dictionary(
             uniqueKeysWithValues: (detail?.artifacts ?? []).map { ($0.artifactID, $0) }
         )
@@ -172,7 +195,7 @@ struct LiveProjection: Sendable {
             task -> (String, StageInspectorPresentation)? in
             guard let stage = taskStages[task.node.taskID] else { return nil }
             return (
-                stage.id,
+                task.node.taskID,
                 stageInspector(
                 task: task,
                 stage: stage,
@@ -183,7 +206,7 @@ struct LiveProjection: Sendable {
             )
         }
         let stageInspectors = Dictionary(uniqueKeysWithValues: inspectorPairs)
-        let inspector = activeStage.flatMap { stageInspectors[$0.id] }
+        let inspector = activeStageID.flatMap { stageInspectors[$0] }
             ?? StageInspectorPresentation(
                 stageTitle: workflowStatus(workflow.status).displayName,
                 status: workflowStatus(workflow.status).status,
@@ -201,7 +224,7 @@ struct LiveProjection: Sendable {
         return WorkflowPresentation(
             nodes: nodes,
             edges: edges,
-            activeStageID: activeStage?.id,
+            activeStageID: activeStageID,
             inspector: inspector,
             observedTradingDays: Int(outcome?.completedTradingSessions ?? 0),
             totalTradingDays: 5,

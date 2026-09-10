@@ -28,6 +28,21 @@ fn financial_content_assessment(value: &Value) -> Option<FinancialContentAssessm
 }
 
 impl ContextBroker {
+    /// Measure what the model receives separately from the original CAS
+    /// document. Full source bytes remain bounded by max_source_bytes and
+    /// range-read authorization; compact projection bytes consume max_bytes.
+    fn projection_budget(&self, artifact: &Artifact) -> ContextResult<(u64, u32)> {
+        let value = self.document_value(artifact)?;
+        let projection = compact_governed_projection(artifact.kind, value);
+        let bytes = u64::try_from(serde_json::to_vec(&projection)?.len())
+            .map_err(|_| ContextError::BudgetExceeded)?;
+        Ok((bytes, estimate_tokens_from_bytes(bytes)))
+    }
+
+    fn source_budget(policy: &ContextPolicy) -> u64 {
+        policy.max_source_bytes.unwrap_or(policy.max_bytes)
+    }
+
     fn partition_untrusted_context(
         &self,
         artifacts: Vec<Artifact>,
@@ -274,6 +289,7 @@ impl ContextBroker {
         let policy = &child_contract.context;
         let mut selections = Vec::with_capacity(allowed.len());
         let mut total_bytes = 0_u64;
+        let mut projected_bytes = 0_u64;
         let mut estimated_tokens = 0_u32;
         for artifact in allowed {
             let reference = ArtifactRef {
@@ -285,21 +301,29 @@ impl ContextBroker {
             if !self.overlay_is_eligible(&artifact)? {
                 continue;
             }
-            let tokens = estimate_tokens_from_bytes(artifact.blob.bytes);
-            let next_bytes = total_bytes.saturating_add(artifact.blob.bytes);
+            let (projected, tokens) = self.projection_budget(&artifact)?;
+            let next_source_bytes = total_bytes.saturating_add(artifact.blob.bytes);
+            let next_projected_bytes = projected_bytes.saturating_add(projected);
             let next_tokens = estimated_tokens.saturating_add(tokens);
             if selections.len() >= usize::from(policy.max_artifacts)
-                || next_bytes > policy.max_bytes
+                || next_source_bytes > Self::source_budget(policy)
+                || next_projected_bytes > policy.max_bytes
                 || next_tokens > policy.max_tokens
             {
                 continue;
             }
-            total_bytes = next_bytes;
+            total_bytes = next_source_bytes;
+            projected_bytes = next_projected_bytes;
             estimated_tokens = next_tokens;
             selections.push(ContextSelection {
                 artifact: reference,
-                reason: projection.reason.clone(),
+                reason: if artifact.producer == "evidence.option_projection" {
+                    "option_chain_projection".to_owned()
+                } else {
+                    projection.reason.clone()
+                },
                 estimated_tokens: tokens,
+                projected_bytes: Some(projected),
                 trust: context_trust(artifact.kind),
             });
         }
@@ -326,6 +350,7 @@ impl ContextBroker {
             selections: selections.clone(),
             quarantined: quarantined.clone(),
             total_bytes,
+            projected_bytes: Some(projected_bytes),
             estimated_tokens,
         };
         payload.validate(policy)?;
@@ -478,7 +503,9 @@ impl ContextBroker {
                     .or_default()
                     .push(artifact.clone());
             }
-            if artifact.kind != ArtifactKind::NormalizedEvidence {
+            let option_projection = artifact.kind == ArtifactKind::SemanticDetail
+                && artifact.producer == "evidence.option_projection";
+            if artifact.kind != ArtifactKind::NormalizedEvidence && !option_projection {
                 continue;
             }
             let payload: Value = serde_json::from_slice(&self.store.read_blob(&artifact.blob)?)?;
@@ -489,14 +516,17 @@ impl ContextBroker {
             let domain = parts.next().unwrap_or_default();
             let scope = parts.next().unwrap_or_default();
             let key = match domain {
-                "bars" | "news" if Asset::try_from(scope).is_ok() => format!("1:{scope}:{domain}"),
+                "bars" | "news" | "option_chain" if Asset::try_from(scope).is_ok() => {
+                    format!("1:{scope}:{domain}")
+                }
                 "series" if matches!(scope, "DFF" | "DFII10" | "VIXCLS") => format!("2:{scope}"),
                 _ => continue,
             };
             by_key.entry(key).or_default().push(artifact.clone());
         }
         let mut selected = Vec::new();
-        let mut bytes = 0_u64;
+        let mut source_bytes = 0_u64;
+        let mut projected_bytes = 0_u64;
         let mut tokens = 0_u32;
         for candidates in by_key.values_mut() {
             candidates.sort_by_key(|a| {
@@ -507,13 +537,16 @@ impl ContextBroker {
                 )
             });
             if let Some(artifact) = candidates.iter().find(|a| {
-                bytes.saturating_add(a.blob.bytes) <= policy.max_bytes
-                    && tokens.saturating_add(estimate_tokens_from_bytes(a.blob.bytes))
-                        <= policy.max_tokens
+                let (projected, estimated) = self.projection_budget(a).unwrap_or((u64::MAX, u32::MAX));
+                source_bytes.saturating_add(a.blob.bytes) <= Self::source_budget(policy)
+                    && projected_bytes.saturating_add(projected) <= policy.max_bytes
+                    && tokens.saturating_add(estimated) <= policy.max_tokens
                     && selected.len() < usize::from(policy.max_artifacts)
             }) {
-                bytes += artifact.blob.bytes;
-                tokens += estimate_tokens_from_bytes(artifact.blob.bytes);
+                let (projected, estimated) = self.projection_budget(artifact)?;
+                source_bytes += artifact.blob.bytes;
+                projected_bytes += projected;
+                tokens += estimated;
                 selected.push(artifact.clone());
             }
         }

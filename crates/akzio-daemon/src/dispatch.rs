@@ -33,6 +33,33 @@ impl Daemon {
                         _ => {}
                     }
                 }
+                if self.debug_enabled() {
+                    // Persist the failure while the original attempt still owns its lease.
+                    // The existing inspector redacts diagnostics before UI/API projection.
+                    let acceptance = akzio_domain::StageAcceptance {
+                        version: 1,
+                        run_id: task.run_id.clone(),
+                        task_id: task.node.task_id.clone(),
+                        attempt_id: task.permit.attempt_id.clone(),
+                        stage: task.node.recipe_id.as_str().into(),
+                        business_result: "Failed".into(),
+                        test_result: akzio_domain::AcceptanceResult::Blocked,
+                        checks: vec![akzio_domain::AcceptanceCheck {
+                            check_id: "runtime.failure".into(),
+                            category: akzio_domain::AcceptanceCategory::Persistence,
+                            expected: "stage reaches a valid business boundary".into(),
+                            actual: error.to_string(),
+                            result: akzio_domain::AcceptanceResult::Blocked,
+                            evidence_refs: vec![],
+                            message: "Original failed attempt; no downstream permission granted"
+                                .into(),
+                        }],
+                        created_at: Utc::now(),
+                    };
+                    if let Err(record_error) = self.store.record_stage_acceptance(&acceptance) {
+                        tracing::warn!(error = %record_error, "failed to persist Debug failure diagnostic");
+                    }
+                }
                 eprintln!(
                     "daemon task failed closed run_id={} task_id={} recipe={} error={error}",
                     task.run_id, task.node.task_id, task.node.recipe_id

@@ -8,6 +8,9 @@ use crate::DomainError;
 /// and HTTP compatibility; this type is the validation boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleEventType {
+    DebugControlChanged,
+    StageAcceptanceRecorded,
+    DebugBudgetObserved,
     AgentTurn,
     AgentTurnStarted,
     AgentTurnCompleted,
@@ -88,6 +91,9 @@ pub enum LifecycleEventType {
 impl LifecycleEventType {
     pub fn parse(value: &str) -> Result<Self, DomainError> {
         let event = match value {
+            "debug.control_changed" => Self::DebugControlChanged,
+            "debug.acceptance_recorded" => Self::StageAcceptanceRecorded,
+            "debug.budget_observed" => Self::DebugBudgetObserved,
             "agent.turn" => Self::AgentTurn,
             "agent.turn_started" => Self::AgentTurnStarted,
             "agent.turn_completed" => Self::AgentTurnCompleted,
@@ -163,6 +169,9 @@ impl LifecycleEventType {
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::DebugControlChanged => "debug.control_changed",
+            Self::StageAcceptanceRecorded => "debug.acceptance_recorded",
+            Self::DebugBudgetObserved => "debug.budget_observed",
             Self::AgentTurn => "agent.turn",
             Self::AgentTurnStarted => "agent.turn_started",
             Self::AgentTurnCompleted => "agent.turn_completed",

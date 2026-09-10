@@ -21,6 +21,12 @@ struct WorkflowPage: View {
 
     var body: some View {
         PageScaffold(route: .workflow) {
+            if store.debugEnabled {
+                ScrollView {
+                    DebugWorkflowPanel(store: store)
+                        .frame(maxWidth: .infinity, alignment: .topLeading)
+                }
+            } else {
             VStack(alignment: .leading, spacing: AkzioLayout.s4) {
                 StagedSection(index: 0) {
                     WorkflowProgressStrip(workflow: workflow, namespace: namespace)
@@ -47,7 +53,9 @@ struct WorkflowPage: View {
                     }
                 }
             }
+            }
         } toolbar: {
+            if !store.debugEnabled {
             CanvasToolbar(
                 scale: $scale,
                 offset: $offset,
@@ -57,6 +65,7 @@ struct WorkflowPage: View {
                 highlightsCriticalPath: $highlightsCriticalPath,
                 collapsesOptional: $collapsesOptional
             )
+            }
         }
     }
 

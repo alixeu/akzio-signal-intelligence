@@ -309,7 +309,7 @@ pub struct TaskBudget {
     pub max_input_tokens: u32,
     pub max_output_tokens: u32,
     pub max_wall_time_secs: u32,
-    pub max_tool_calls: u16,
+    pub max_tool_calls: crate::budget::ToolCallLimit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

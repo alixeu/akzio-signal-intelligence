@@ -1,0 +1,14 @@
+# Offline controller proof only. No credentials, network providers or Broker.
+[daemon]
+# Keep checkpoints outside build products removed by distribution packaging.
+store_root = ".akzio/debug-controller-store"
+http_addr = "127.0.0.1:17342"
+worker_count = 8
+auto_paper = false
+debug_control = true
+outcome_processing = true
+
+[execution]
+experiment_profile = "fixture"
+assets = ["TQQQ", "QQQ", "SOXX", "SOXL"]
+market_data_feed = "sip"

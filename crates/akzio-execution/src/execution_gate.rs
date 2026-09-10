@@ -45,6 +45,10 @@ pub struct ExecutionGateInput {
     pub decision_context: ArtifactRef,
     pub account_snapshot: Option<ArtifactRef>,
     pub quote_snapshot: Option<ArtifactRef>,
+    /// Set when the execution refresh received a quote payload but Rust
+    /// rejected it before sealing a QuoteSnapshot.  This distinguishes an
+    /// invalid quote from a missing broker response in the durable verdict.
+    pub quote_validation_error: Option<String>,
     pub market_clock_snapshot: Option<ArtifactRef>,
     pub pretrade_safety: Option<PreTradeSafetyEvidence>,
     pub now: DateTime<Utc>,

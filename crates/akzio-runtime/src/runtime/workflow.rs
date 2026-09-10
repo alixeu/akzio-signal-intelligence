@@ -18,6 +18,9 @@ impl WorkflowRuntime {
                 field: "workflow.topology_id",
             }));
         }
+        if purpose == RunPurpose::PositionPlan {
+            return self.lower(purpose, &self.approved_research_proposal(topology_id)?);
+        }
         let recipe = self.catalogue.recipe(&self.catalogue.planner)?;
         let objective = match purpose {
             RunPurpose::Debug if self.fixture_mode => {
@@ -42,7 +45,7 @@ impl WorkflowRuntime {
             dependencies: vec![],
             input_artifacts: vec![],
             priority: recipe.priority_ceiling,
-            budget: recipe.budget.clone(),
+            budget: self.resolved_budget(recipe),
             retry: recipe.retry.clone(),
             on_failure: recipe.on_failure,
             parent_task_id: None,
@@ -248,6 +251,14 @@ impl WorkflowRuntime {
         &self,
         topology_id: impl Into<String>,
     ) -> RuntimeResult<WorkflowProposal> {
+        self.approved_research_proposal(topology_id)
+    }
+
+    /// Shared Rust-owned T1/T3/T5 research. Purpose selects the terminal chain in lower().
+    pub fn approved_research_proposal(
+        &self,
+        topology_id: impl Into<String>,
+    ) -> RuntimeResult<WorkflowProposal> {
         let topology_id = topology_id.into();
         let analyst = self
             .catalogue
@@ -277,7 +288,7 @@ impl WorkflowRuntime {
         }
         tasks.insert("synthesizer".to_owned(), akzio_domain::WorkflowProposalTask {
             recipe_id: synthesizer.recipe_id.clone(),
-            objective: "Synthesize exactly 12 asset/horizon forecasts using the supplied coverage and verification matrix. Neutralize each unsupported slot and preserve independently supported slots. Rust alone decides portfolio allocation and execution.".to_owned(),
+            objective: "Synthesize exactly 12 asset/horizon forecasts and a research-only four-asset plus cash composition using the supplied coverage and verification matrix. Neutralize unsupported slots, preserve independently supported slots, and cite the evidence behind every nonzero research target. Rust validates the research composition and remains the sole authority for execution permission.".to_owned(),
             depends_on: synthesis_inputs, priority: synthesizer.priority_ceiling, evidence_needs: Vec::new(),
         });
         let proposal = WorkflowProposal {

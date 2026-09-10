@@ -1,6 +1,7 @@
 //! Rust-owned Paper execution policy and deterministic order planning.
 
 pub mod allocation;
+pub mod calibration;
 pub mod decision_gate;
 pub mod execution_gate;
 pub mod paper;
@@ -11,9 +12,16 @@ pub mod reconciliation;
 pub mod snapshot;
 
 pub use allocation::{AllocationError, AllocationInput, AllocationRuntime};
+pub use calibration::{
+    build_offline_decision_policy, DecisionPolicyArtifact, DecisionPolicyProvenance,
+    HistoricalForecastProvenance, HistoricalForecastSample, HistoricalPricePoint,
+    HistoricalPriceSeries, OfflineCalibrationError, OfflineCalibrationInput,
+    OfflineCalibrationResult, OfflineRiskLimits,
+};
 pub use decision_gate::{
     AssetRiskCalibration, DecisionGateError, DecisionGateInput, DecisionGateOutput, DecisionPolicy,
     DecisionRuntime, ForecastCalibrationBin, ForecastCalibrationScope, FrozenForecastCalibration,
+    PortfolioRiskModel,
 };
 pub use execution_gate::{
     ExecutionGateError, ExecutionGateInput, ExecutionGateOutput, ExecutionRuntime,

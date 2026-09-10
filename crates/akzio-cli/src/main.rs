@@ -22,11 +22,14 @@ use akzio_domain::{
     RunPurpose, RuntimeIdentity, WorkflowStatus,
 };
 use akzio_execution::{paper::AlpacaPaper, DecisionPolicy};
+use akzio_ingest::{
+    model_native_web_evidence_transport, EvidenceAcquisitionMode, EvidenceRequest, EvidenceSource,
+};
 use akzio_model::{
     probe_configured_model_capabilities, ModelCapabilityProbeSet, OpenAIResponsesConfig,
     OPENAI_RESPONSES_PROVIDER_ID,
 };
-use akzio_store::{CanaryCampaignHead, SessionSlot, StoredRun, TrajectoryEntry};
+use akzio_store::{CanaryCampaignHead, SessionSlot, Store, StoredRun, TrajectoryEntry};
 use anyhow::{bail, Context, Result};
 use chrono::{NaiveDate, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -46,6 +49,10 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    Debug {
+        #[command(subcommand)]
+        command: DebugCommand,
+    },
     ObservatoryConfig {
         #[arg(long)]
         config: PathBuf,
@@ -71,6 +78,54 @@ enum Command {
     ModelQualification {
         #[command(subcommand)]
         command: ModelQualificationCommand,
+    },
+    Calibration {
+        #[command(subcommand)]
+        command: CalibrationCommand,
+    },
+    Evidence {
+        #[command(subcommand)]
+        command: EvidenceCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CalibrationCommand {
+    Build {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    Export {
+        #[arg(long)]
+        store: PathBuf,
+        #[arg(long)]
+        risk_limits: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long, default_value_t = 30)]
+        min_samples: u32,
+        #[arg(long)]
+        training_start: Option<String>,
+        #[arg(long)]
+        training_end: Option<String>,
+    },
+    Inspect {
+        #[arg(long)]
+        input: PathBuf,
+    },
+    Validate {
+        #[arg(long)]
+        input: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EvidenceCommand {
+    Preflight {
+        #[arg(long)]
+        resource: String,
     },
 }
 
@@ -228,6 +283,8 @@ enum PurposeArg {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
+    #[serde(default)]
+    agent: akzio_domain::AgentSettings,
     daemon: DaemonSettings,
     execution: ExecutionSettings,
     model: Option<OpenAIResponsesConfig>,
@@ -240,6 +297,10 @@ struct Config {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DaemonSettings {
+    #[serde(default)]
+    debug_control: bool,
+    #[serde(default = "default_outcome_processing")]
+    outcome_processing: bool,
     store_root: PathBuf,
     http_addr: SocketAddr,
     worker_count: Option<usize>,
@@ -356,4 +417,6 @@ include!("cli/dispatch.rs");
 include!("cli/observatory_config.rs");
 include!("cli/identity.rs");
 include!("cli/run_commands.rs");
+include!("cli/debug_commands.rs");
 include!("cli/model_qualification.rs");
+include!("cli/calibration.rs");

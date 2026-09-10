@@ -231,6 +231,19 @@ impl Store {
             .ok_or_else(|| StoreError::MissingContractInstallation(candidate.contract_hash.clone()))
     }
 
+    /// Atomically publish bounded research inputs and a non-executing PositionPlan.
+    pub fn commit_position_plan(&self, workflow: &WorkflowCommit, setup: &[Artifact]) -> StoreResult<()> {
+        if workflow.run.purpose != RunPurpose::PositionPlan { return Err(StoreError::PermitOriginMismatch); }
+        self.validate_workflow_commit(workflow)?;
+        let mut connection = self.connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        insert_artifact_batch(&tx, setup)?;
+        Self::commit_workflow_transaction(&tx, workflow)?;
+        Self::append_run_setup_events(&tx, &workflow.run.run_id, setup, workflow.run.created_at)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn commit_workflow(&self, commit: &WorkflowCommit) -> StoreResult<()> {
         self.validate_workflow_commit(commit)?;
 
@@ -394,6 +407,9 @@ impl Store {
         let previous_graph: WorkflowGraph =
             serde_json::from_slice(&self.read_blob(&previous_graph_artifact.blob)?)?;
         previous_graph.validate()?;
+        if graph.agent_budgets != previous_graph.agent_budgets {
+            return Err(StoreError::WorkflowGraphMismatch);
+        }
         let previous_nodes = previous_graph
             .nodes
             .iter()

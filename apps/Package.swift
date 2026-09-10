@@ -19,5 +19,6 @@ let package = Package(
             path: "Sources/AkzioObservatory",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
+        .executableTarget(name: "DebugContractChecks", dependencies: ["ObservatoryKit"], path: "Tests/ObservatoryKitTests", swiftSettings: [.swiftLanguageMode(.v5)]),
     ]
 )

@@ -220,3 +220,6 @@ include!("paper/reconcile.rs");
 include!("paper/transport.rs");
 include!("paper/broker.rs");
 include!("paper/protocol.rs");
+
+#[cfg(test)]
+mod recovery_tests;

@@ -103,6 +103,7 @@ impl Store {
             None,
             now,
         )?;
+        debug::settle_attempt(&transaction, permit, "deferred", now)?;
         transaction.commit()?;
         Ok(())
     }
@@ -139,6 +140,7 @@ impl Store {
                 None,
                 now,
             )?;
+            debug::settle_attempt(&transaction, permit, "retry_scheduled", now)?;
             transaction.commit()?;
             return Ok(RetryTaskResult::Requeued);
         }
@@ -180,6 +182,13 @@ impl Store {
         lease_for: Duration,
         workload: TaskWorkload,
     ) -> StoreResult<Option<ClaimedAttempt>> {
+        self.claim_next_task_for_workload_with_identity(worker_id,now,lease_for,workload,None)
+    }
+
+    pub fn claim_next_task_for_workload_with_identity(
+        &self, worker_id:&str, now:DateTime<Utc>, lease_for:Duration,
+        workload:TaskWorkload, runtime_identity:Option<&ContentHash>,
+    ) -> StoreResult<Option<ClaimedAttempt>> {
         if worker_id.trim().is_empty() {
             return Err(StoreError::Domain(DomainError::EmptyField {
                 field: "worker_id",
@@ -193,7 +202,12 @@ impl Store {
         t.budget_json, t.retry_json, t.on_failure, t.parent_task_id, t.input_artifacts_json
                     FROM rebuild_tasks AS t
                     JOIN rebuild_runs AS r ON r.run_id = t.run_id
+                    LEFT JOIN rebuild_debug_sessions AS debug ON debug.run_id = t.run_id
                WHERE t.status = 'queued' AND t.ready_at <= ?1
+                 AND (debug.run_id IS NOT NULL OR NOT EXISTS (SELECT 1 FROM rebuild_metadata WHERE key='debug_environment'))
+                 AND (debug.run_id IS NULL OR (debug.runtime_identity = ?4 AND (debug.status = 'running'
+                      OR (debug.status = 'stepping' AND debug.permitted_task_id = t.task_id
+                          AND debug.active_attempt_id IS NULL))))
                  AND (?3 = 0 OR (?3 = 1 AND t.recipe_id != ?2) OR (?3 = 2 AND t.recipe_id = ?2))
                  AND (r.status IN ('queued', 'running')
                       OR (r.status = 'completed' AND t.recipe_id = ?2))
@@ -206,7 +220,7 @@ impl Store {
                         WHERE d.task_id = t.task_id AND p.status NOT IN ('succeeded', 'skipped')
                       )
                     ORDER BY t.ready_at ASC, t.priority DESC, t.task_id ASC LIMIT 1"#,
-                params![now.to_rfc3339(), POST_TERMINAL_WORKER_RECIPE_ID, workload.query_code()],
+                params![now.to_rfc3339(), POST_TERMINAL_WORKER_RECIPE_ID, workload.query_code(),runtime_identity.map(ContentHash::as_str)],
             row_to_node,
             )
             .optional()?;
@@ -292,6 +306,7 @@ impl Store {
                 now,
             )?;
         }
+        debug::consume_claim(&transaction, &permit, now)?;
         transaction.commit()?;
         Ok(Some(ClaimedAttempt {
             run_id,

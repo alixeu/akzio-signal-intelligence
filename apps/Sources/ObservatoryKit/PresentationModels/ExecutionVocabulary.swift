@@ -2,7 +2,7 @@ import Foundation
 
 // MARK: - Decision & execution vocabulary
 
-/// `HardBlocker` — crates/akzio-domain/src/decision.rs:13 (all 21 variants)
+/// `HardBlocker` — crates/akzio-domain/src/decision.rs:13 (all 22 variants)
 public enum HardBlocker: String, CaseIterable, Sendable, Identifiable {
     case unsupportedUniverse = "unsupported_universe"
     case noExecutableOrder = "no_executable_order"
@@ -11,6 +11,7 @@ public enum HardBlocker: String, CaseIterable, Sendable, Identifiable {
     case invalidProvenance = "invalid_provenance"
     case materialConflict = "material_conflict"
     case staleQuote = "stale_quote"
+    case invalidQuote = "invalid_quote"
     case missingQuote = "missing_quote"
     case staleAccount = "stale_account"
     case missingAccount = "missing_account"

@@ -513,7 +513,7 @@ pub(super) fn decision_proposal_output_schema() -> Value {
                         "thesis": {
                             "type": "object",
                             "properties": {
-                                "thesis_valid_until": { "type": "string", "minLength": 20 },
+                                "thesis_valid_until": { "type": "string", "minLength": 20, "pattern": RFC3339_TIMESTAMP_PATTERN, "description": "Thesis expiry as a full RFC3339 timestamp with timezone, never a date-only value. This timestamp is not a trading-session count." },
                                 "expected_holding_period_days": { "type": "integer", "enum": [1, 3, 5] },
                                 "exit_condition": { "type": "string", "minLength": 1 },
                                 "invalidation_conditions": {
@@ -537,6 +537,33 @@ pub(super) fn decision_proposal_output_schema() -> Value {
                     ],
                     "additionalProperties": false
                 }
+            },
+            "research_allocation": {
+                "type": "object",
+                "description": "Research-only target composition. It is not an order or execution permit.",
+                "properties": {
+                    "cash_weight_ppm": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+                    "allocations": {
+                        "type": "array",
+                        "minItems": 4,
+                        "maxItems": 4,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "asset": { "type": "string", "enum": ["TQQQ", "QQQ", "SOXX", "SOXL"] },
+                                "target_weight_ppm": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+                                "supporting_horizons": { "type": "array", "maxItems": 3, "uniqueItems": true, "items": { "type": "string", "enum": ["t1", "t3", "t5"] } },
+                                "evidence_refs": { "type": "array", "items": artifact_ref_schema(&["claim", "critique", "normalized_evidence", "semantic_detail"]) },
+                                "rationale": { "type": "string", "minLength": 1 },
+                                "abstention_reason": { "type": ["string", "null"] }
+                            },
+                            "required": ["asset", "target_weight_ppm", "supporting_horizons", "evidence_refs", "rationale", "abstention_reason"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["cash_weight_ppm", "allocations"],
+                "additionalProperties": false
             },
             "claims": { "type": "array", "items": artifact_ref_schema(&["claim"]) },
             "critiques": { "type": "array", "items": artifact_ref_schema(&["critique"]) },
@@ -592,7 +619,7 @@ pub(super) fn decision_proposal_output_schema() -> Value {
             }
         },
         "required": [
-            "summary", "confidence_ppm", "forecasts", "claims", "critiques",
+            "summary", "confidence_ppm", "forecasts", "research_allocation", "claims", "critiques",
             "evidence", "material_conflicts", "hard_blockers", "soft_warnings"
         ],
         "additionalProperties": false

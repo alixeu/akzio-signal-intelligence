@@ -96,6 +96,7 @@ impl WorkflowRuntime {
         let graph = WorkflowGraph {
             schema_version: DOMAIN_SCHEMA_VERSION,
             topology_id: candidate.topology_id.clone(),
+            agent_budgets: candidate.agent_budgets.clone(),
             nodes,
         };
         graph.validate()?;
@@ -156,7 +157,9 @@ impl WorkflowRuntime {
                 RuntimeError::MissingEvidenceGate(self.catalogue.terminals.evidence_gate.clone())
             })?;
         let evidence_task_id = nodes[evidence_index].task_id.clone();
-        let mut added_nodes = self.lower_research_nodes(&proposal)?;
+        let mut frozen_runtime = self.clone();
+        frozen_runtime.agent_budgets = previous_graph.agent_budgets.clone();
+        let mut added_nodes = frozen_runtime.lower_research_nodes(&proposal)?;
         self.attach_evidence_gate(&mut added_nodes, &evidence_task_id);
         nodes.extend(added_nodes.iter().cloned());
         let decision_index = nodes
@@ -183,6 +186,7 @@ impl WorkflowRuntime {
         let graph = WorkflowGraph {
             schema_version: DOMAIN_SCHEMA_VERSION,
             topology_id: previous_graph.topology_id.clone(),
+            agent_budgets: previous_graph.agent_budgets.clone(),
             nodes,
         };
         graph.validate()?;

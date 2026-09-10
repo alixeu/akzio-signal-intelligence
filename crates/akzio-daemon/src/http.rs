@@ -1,6 +1,7 @@
 //! Authenticated loopback HTTP transport.
 
 use super::*;
+include!("http_debug.rs");
 use crate::observer::{
     ObserverPortfolioHistory, ObserverPortfolioRange, ObserverRunDetail, ObserverSection,
     ObserverSnapshot,
@@ -35,6 +36,12 @@ struct StoreExportRunRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct StoreExportDebugBundleRequest {
+    run_id: String,
+    target: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
 struct StoreEventsQuery {
     after: Option<i64>,
     limit: Option<usize>,
@@ -56,6 +63,17 @@ struct StoreLessonTransitionRequest {
 impl Daemon {
     pub fn router(&self) -> Router {
         Router::new()
+            .route(
+                "/v1/debug/runs",
+                get(http_debug_runs).post(http_debug_prepare),
+            )
+            .route("/v1/debug/runs/{run_id}", get(http_debug_inspect))
+            .route("/v1/debug/runs/{run_id}/control", post(http_debug_control))
+            .route("/v1/debug/runs/{run_id}/fork", post(http_debug_fork))
+            .route(
+                "/v1/debug/runs/{run_id}/acceptance",
+                post(http_debug_acceptance),
+            )
             .route("/health", get(http_health))
             .route("/ready", get(http_ready))
             .route("/v1/observer/snapshot", get(http_observer_snapshot))
@@ -98,6 +116,10 @@ impl Daemon {
             .route("/control/store/backup", post(http_store_backup))
             .route("/control/store/restore", post(http_store_restore))
             .route("/control/store/export-run", post(http_store_export_run))
+            .route(
+                "/control/store/export-debug-bundle",
+                post(http_store_export_debug_bundle),
+            )
             .route("/control/store/events/{run_id}", get(http_store_events))
             .route("/control/store/lessons", get(http_store_lessons))
             .route("/control/store/lessons/add", post(http_store_lesson_add))
@@ -138,10 +160,13 @@ impl Daemon {
                 "daemon HTTP control API must bind a loopback address".to_owned(),
             ));
         }
-        axum::serve(listener, self.router())
-            .with_graceful_shutdown(wait_for_shutdown(shutdown))
-            .await
-            .map_err(DaemonError::Io)
+        axum::serve(
+            listener,
+            self.router().layer(axum::Extension(shutdown.clone())),
+        )
+        .with_graceful_shutdown(wait_for_shutdown(shutdown))
+        .await
+        .map_err(DaemonError::Io)
     }
 }
 
@@ -153,6 +178,14 @@ async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
         if *shutdown.borrow() {
             return;
         }
+    }
+}
+
+// Close transport streams on graceful shutdown without cancelling task futures.
+async fn wait_for_stream_shutdown(shutdown: &Option<axum::Extension<watch::Receiver<bool>>>) {
+    match shutdown {
+        Some(receiver) => wait_for_shutdown(receiver.0.clone()).await,
+        None => std::future::pending::<()>().await,
     }
 }
 
@@ -230,6 +263,7 @@ async fn http_observer_events(
     State(daemon): State<Arc<Daemon>>,
     Query(query): Query<EventQuery>,
     headers: HeaderMap,
+    shutdown: Option<axum::Extension<watch::Receiver<bool>>>,
 ) -> std::result::Result<
     Sse<impl futures::Stream<Item = std::result::Result<Event, Infallible>>>,
     StatusCode,
@@ -242,6 +276,7 @@ async fn http_observer_events(
     let stream = stream! {
         loop {
             tokio::select! {
+                _ = wait_for_stream_shutdown(&shutdown) => break,
                 event = reasoning_events.recv() => match event {
                     Ok(event) => match serde_json::to_string(&event) {
                         Ok(data) => yield Ok(Event::default()
@@ -292,6 +327,7 @@ async fn http_events(
     Path(run_id): Path<String>,
     Query(query): Query<EventQuery>,
     headers: HeaderMap,
+    shutdown: Option<axum::Extension<watch::Receiver<bool>>>,
 ) -> std::result::Result<
     Sse<impl futures::Stream<Item = std::result::Result<Event, Infallible>>>,
     StatusCode,
@@ -305,6 +341,7 @@ async fn http_events(
     let stream = stream! {
         loop {
             tokio::select! {
+                _ = wait_for_stream_shutdown(&shutdown) => break,
                 event = reasoning_events.recv() => match event {
                     Ok(event) if event.run_id() == &run_id => {
                         match serde_json::to_string(&event) {
@@ -693,9 +730,9 @@ async fn http_store_export_run(
     Json(request): Json<StoreExportRunRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
     authorize(&daemon, &headers)?;
-    store_json(Ok(run_store_maintenance(
-        daemon.maintenance(),
-        StoreMaintenanceKind::ExportRun,
+    store_json(Ok(run_store_operation(
+        daemon.store_executor.clone(),
+        "store.export_run",
         move |store| {
             store.export_run(
                 &RunId(request.run_id),
@@ -703,6 +740,20 @@ async fn http_store_export_run(
                 request.include_raw_model,
             )
         },
+    )
+    .await?))
+}
+
+async fn http_store_export_debug_bundle(
+    State(daemon): State<Arc<Daemon>>,
+    headers: HeaderMap,
+    Json(request): Json<StoreExportDebugBundleRequest>,
+) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
+    authorize(&daemon, &headers)?;
+    store_json(Ok(run_store_operation(
+        daemon.store_executor.clone(),
+        "store.export_debug_bundle",
+        move |store| store.export_debug_bundle(&RunId(request.run_id), request.target),
     )
     .await?))
 }

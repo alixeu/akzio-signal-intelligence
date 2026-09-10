@@ -6,6 +6,9 @@ impl Store {
         lease: Option<&DaemonLease>,
         commit: &PolicyEvaluationCommit,
     ) -> StoreResult<PolicyEvaluationResult> {
+        if self.debug_learning_isolated(&commit.permit.run_id)? {
+            return Err(StoreError::DebugControl("isolated_learning_cannot_enter_canonical_policy".into()));
+        }
         commit.subject.validate()?;
         if !commit.subject.accepts_state(commit.from) || !commit.subject.accepts_state(commit.to) {
             return Err(StoreError::InvalidLearningCommit(

@@ -169,6 +169,7 @@ struct ReplayedWorkflow {
 
 #[derive(Debug, Clone)]
 pub struct WorkflowRuntime {
+    agent_budgets: BTreeMap<String, TaskBudget>,
     store: Store,
     catalogue: RecipeCatalogue,
     fixture_mode: bool,
@@ -180,7 +181,24 @@ impl WorkflowRuntime {
             store,
             catalogue,
             fixture_mode: false,
+            agent_budgets: akzio_domain::AgentBudgetConfig::default().resolved(),
         }
+    }
+
+    pub fn with_agent_budgets(
+        mut self,
+        config: &akzio_domain::AgentBudgetConfig,
+    ) -> RuntimeResult<Self> {
+        config.validate()?;
+        self.agent_budgets = config.resolved();
+        Ok(self)
+    }
+
+    fn resolved_budget(&self, recipe: &TaskRecipe) -> TaskBudget {
+        self.agent_budgets
+            .get(recipe.purpose.as_str())
+            .cloned()
+            .unwrap_or_else(|| recipe.budget.clone())
     }
 
     pub fn with_fixture_mode(mut self, enabled: bool) -> Self {

@@ -322,7 +322,7 @@ fn rust_gate_recipe(recipe_id: &str, task_class: RuntimeTaskClass) -> RuntimeRes
             max_input_tokens: 1,
             max_output_tokens: 1,
             max_wall_time_secs,
-            max_tool_calls: 0,
+            max_tool_calls: akzio_domain::budget::ToolCallLimit::Limited(0),
         },
         retry,
         on_failure: FailureDisposition::FailRun,

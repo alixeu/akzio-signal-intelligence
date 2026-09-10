@@ -45,64 +45,87 @@ public struct AppShell: View {
         shell
             .modifier(WindowTitlebarInsetModifier(enabled: !rendersOffscreen))
             .background(windowActivityObservers)
-            .background(WindowChromeConfigurator())
+            .background(WindowChromeConfigurator(desktopBlurEnabled: desktopBlurEnabled))
             .task { await store.bootstrapCore() }
+    }
+
+    private var desktopBlurEnabled: Bool {
+        !rendersOffscreen
+            && !reduceTransparency
+            && !store.settings.reduceTransparencyOverride
+            && !store.highContrast
+    }
+
+    private var desktopShadeOpacity: Double {
+        // The AppKit material performs the Gaussian blur. This scrim only lowers
+        // luminance so the blurred desktop reads as atmosphere, like macOS's
+        // dark translucent capsules, instead of a readable bright window.
+        min(0.56, max(0.42, 0.42 + (1 - store.settings.glassTransparency) * 0.20))
+    }
+
+    private var mainContent: some View {
+                    VStack(spacing: 0) {
+                        if store.debugEnabled {
+                            DebugEnvironmentBanner(store: store)
+                        } else {
+                        RunStatusBar(
+                            run: store.displayRun,
+                            health: store.displayHealth,
+                            observerState: store.observerState,
+                            namespace: shared,
+                            canRun: store.isLive && !store.debugEnabled,
+                            selectedRunPurpose: store.selectedRunPurpose,
+                            runInFlight: store.runInFlight,
+                            runMessage: store.runMessage,
+                            onSelectRunPurpose: store.selectRunPurpose,
+                            onRun: { Task { await store.runSelectedPurpose() } },
+                            leadingPadding: sidebarVisible
+                                ? AkzioLayout.s4
+                                : AkzioLayout.collapsedSidebarContentLeading,
+                            onOpenSettings: store.toggleSettings,
+                            onCopyRunID: copyRunID,
+                            onRevealRun: { store.revealRunInArchive(store.displayRun.runId) }
+                        )
+                        }
+                        RouteHost(store: store)
+                    }
     }
 
     private var shell: some View {
         GeometryReader { proxy in
-            ZStack(alignment: .top) {
-                HStack(alignment: .top, spacing: 0) {
-                    if sidebarVisible {
-                        PageSidebar(
-                            route: store.route,
-                            onSelect: { store.navigate(to: $0) },
-                            onOpenSettings: store.toggleSettings,
-                            onToggleSidebar: toggleSidebar
-                        )
-                        .frame(maxHeight: .infinity, alignment: .top)
-                    }
-                VStack(spacing: 0) {
-                    RunStatusBar(
-                        run: store.displayRun,
-                        health: store.displayHealth,
-                observerState: store.observerState,
-                namespace: shared,
-                canRun: store.isLive,
-                selectedRunPurpose: store.selectedRunPurpose,
-                runInFlight: store.runInFlight,
-                runMessage: store.runMessage,
-                onSelectRunPurpose: store.selectRunPurpose,
-                onRun: { Task { await store.runSelectedPurpose() } },
-                        onOpenSettings: store.toggleSettings,
-                        onCopyRunID: copyRunID,
-                        onRevealRun: { store.revealRunInArchive(store.displayRun.runId) }
-                    )
-                        RouteHost(store: store)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-            }
-            .frame(width: proxy.size.width, height: proxy.size.height, alignment: .top)
-            .disabled(store.settingsPresented)
-            .accessibilityHidden(store.settingsPresented)
+            ZStack(alignment: .topLeading) {
+                if desktopBlurEnabled {
+                    Color.black
+                        .opacity(desktopShadeOpacity)
+                        .ignoresSafeArea()
+                        .allowsHitTesting(false)
+                }
+
+                shellContent
+                    .frame(width: proxy.size.width, height: proxy.size.height, alignment: .top)
+                    .disabled(store.settingsPresented)
+                    .accessibilityHidden(store.settingsPresented)
 
             if !sidebarVisible {
                 Button(action: toggleSidebar) {
                     Image(systemName: "sidebar.left")
                         .font(.system(size: 16, weight: .medium))
                         .foregroundStyle(AkzioColor.sidebarPrimaryText)
-                        .frame(width: 36, height: 36)
+                        .frame(
+                            width: AkzioLayout.collapsedSidebarToggleSize,
+                            height: AkzioLayout.collapsedSidebarToggleSize
+                        )
                         .background {
                             Circle()
-                                .fill(AkzioColor.sidebarSurface)
+                            .fill(AkzioColor.sidebarSurface(for: store.settings.theme))
                                 .overlay {
                                     Circle().stroke(AkzioColor.sidebarHairline, lineWidth: 1)
                                 }
                         }
                 }
                 .buttonStyle(.plain)
-                .padding(.leading, AkzioLayout.s3)
-                .padding(.top, AkzioLayout.s2)
+                .padding(.leading, AkzioLayout.collapsedSidebarToggleLeading)
+                .padding(.top, AkzioLayout.collapsedSidebarToggleTop)
                 .help("Show Sidebar")
                 .accessibilityLabel("Show Sidebar")
             }
@@ -142,6 +165,24 @@ public struct AppShell: View {
             store.windowActive = phase == .active
         }
         .preferredColorScheme(.dark)
+    }
+
+    @ViewBuilder
+    private var shellContent: some View {
+        HStack(alignment: .top, spacing: 0) {
+            if sidebarVisible {
+                PageSidebar(
+                    route: store.route,
+                    theme: store.settings.theme,
+                    onSelect: { store.navigate(to: $0) },
+                    onOpenSettings: store.toggleSettings,
+                    onToggleSidebar: toggleSidebar
+                )
+                .frame(maxHeight: .infinity, alignment: .top)
+            }
+            mainContent
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        }
     }
 
     /// Window width decides the layout mode. Measured once per resize, written to the

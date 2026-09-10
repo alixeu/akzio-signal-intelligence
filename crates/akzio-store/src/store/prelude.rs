@@ -40,7 +40,7 @@ use thiserror::Error;
 const DATABASE_FILE: &str = "akzio.sqlite3";
 const EXPORT_DATABASE_FILE: &str = "akzio-export.sqlite3";
 const POST_TERMINAL_WORKER_RECIPE_ID: &str = akzio_domain::LEARNING_OUTCOME_WORKER_RECIPE_ID;
-const STORE_SCHEMA_VERSION: u32 = 15;
+const STORE_SCHEMA_VERSION: u32 = 16;
 const BLOB_ENCODING_IDENTITY: &str = "identity";
 const BLOB_ENCODING_ZSTD: &str = "zstd";
 const BLOB_ENCODING_SLICE_V1: &str = "slice-v1";
@@ -53,6 +53,10 @@ const BLOB_MAX_DEPENDENCY_DEPTH: usize = 32;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
+    #[error("debug control: {0}")]
+    DebugControl(String),
+    #[error("BLOCKED_BY_DEBUG_POLICY: broker writes are forbidden")]
+    DebugBrokerWriteForbidden,
     #[error(transparent)]
     Sql(#[from] rusqlite::Error),
     #[error("I/O at {path}: {source}")]
@@ -179,7 +183,7 @@ pub enum StoreError {
     BackupInsideStoreRoot(PathBuf),
     #[error("invalid backup source: {0}")]
     InvalidBackup(PathBuf),
-    #[error("raw model export is only allowed for Debug runs, got {0:?}")]
+    #[error("raw model export requires a legacy Debug run or a matching isolated DebugSession, got {0:?}")]
     RawModelExportNotAllowed(RunPurpose),
 }
 

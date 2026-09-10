@@ -298,6 +298,17 @@ impl Daemon {
                 next_outcome_check_at(now)?
             }));
         }
+        if self.store.debug_learning_isolated(&task.run_id)? {
+            evaluation.seal_outcome_with_retrospective_fenced(
+                &outcome_lease,
+                &task.permit,
+                collected.materialization,
+                retrospective_draft.as_ref(),
+                &diagnostic,
+                Utc::now(),
+            )?;
+            return Ok(TaskCompletion::Committed);
+        }
         if let Some(session) = self.store.canary_session_for_run(&task.run_id)? {
             let materialization = collected.materialization;
             let (parent_outcome, _) = evaluation.seal_outcome_for_evaluation_fenced(

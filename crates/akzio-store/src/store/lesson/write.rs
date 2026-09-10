@@ -8,6 +8,9 @@ impl Store {
         source: &Artifact,
         now: DateTime<Utc>,
     ) -> StoreResult<LessonWriteResult> {
+        if self.debug_environment()?.is_some() && matches!(lesson.lifecycle, LessonLifecycle::Active | LessonLifecycle::Contested) {
+            return Err(StoreError::InvalidLearningCommit("debug_learning_isolated"));
+        }
         self.ensure_lesson_tables()?;
         lesson.validate()?;
         source.validate()?;
@@ -485,6 +488,9 @@ impl Store {
         reason: &str,
         now: DateTime<Utc>,
     ) -> StoreResult<StoredLesson> {
+        if self.debug_environment()?.is_some() && matches!(lifecycle,LessonLifecycle::Active|LessonLifecycle::Contested) {
+            return Err(StoreError::DebugControl("isolated_learning_cannot_activate_lessons".into()));
+        }
         self.ensure_lesson_tables()?;
         if actor.trim().is_empty() || reason.trim().is_empty() {
             return Err(StoreError::InvalidLearningCommit(

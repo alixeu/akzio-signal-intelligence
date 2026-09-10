@@ -90,19 +90,23 @@ struct GlassSurfaceModifier: ViewModifier {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.akzioReduceTransparencyOverride) private var reduceTransparencyOverride
     @Environment(\.akzioHighContrast) private var highContrast
+    @Environment(\.akzioRendersOffscreen) private var rendersOffscreen
 
     private var liquidGlass: Glass {
         let variant: Glass
         switch level {
         case .base:
-            // Content cards should reveal the page behind them. `regular`
-            // reads as frosted chrome and is reserved for floating layers.
-            variant = .clear
+            // Keep low-transparency cards light, but add a frosted backdrop when
+            // the user turns transparency up so underlying text does not remain
+            // perfectly sharp through the surface.
+            variant = transparency > 0.35 ? .regular : .clear
         case .elevated, .modal:
             variant = .regular
         }
 
-        let tintOpacity = max(0, min(1, 1 - transparency))
+        // A glass surface should remain lightly tinted even at the most
+        // transparent setting; the native material supplies the Gaussian blur.
+        let tintOpacity = max(0.28, min(1, 1 - transparency))
         return variant.tint(AkzioColor.raisedSurface.opacity(tintOpacity))
     }
 
@@ -122,6 +126,7 @@ struct GlassSurfaceModifier: ViewModifier {
             || reduceTransparency
             || reduceTransparencyOverride
             || highContrast
+            || rendersOffscreen
             || insideGlass
         if opaque {
             #if DEBUG
@@ -192,6 +197,12 @@ private struct GlassBackdropModifier: ViewModifier {
         max(0, min(1, 1 - transparency))
     }
 
+    private var frostedSurfaceOpacity: Double {
+        // Keep a small amount of tint behind the material so transparent cards
+        // separate from dense content without becoming opaque panels.
+        max(0.28, surfaceOpacity)
+    }
+
     private var surfaceTint: Color {
         transparency <= 0.001 ? AkzioColor.elevatedSurface : tint
     }
@@ -210,16 +221,16 @@ private struct GlassBackdropModifier: ViewModifier {
                 shape.fill(surfaceTint)
             } else {
                 shape
-                    .fill(surfaceTint.opacity(surfaceOpacity))
+                    .fill(surfaceTint.opacity(frostedSurfaceOpacity))
                     .glassEffect(.regular, in: shape)
             }
         }
     }
 }
 
-/// The window background stays physically transparent so foreground Liquid
-/// Glass can refract the desktop. Unlike a regular glass backdrop, this layer
-/// must not blur the entire window into one large frosted sheet.
+/// The SwiftUI window tint sits above the full-window AppKit desktop blur. The
+/// actual Gaussian blur is installed by `WindowChromeConfigurator`, so this
+/// layer only controls how strongly the blurred desktop is darkened.
 private struct WindowBackdropModifier: ViewModifier {
     let tint: Color
 
@@ -237,12 +248,20 @@ private struct WindowBackdropModifier: ViewModifier {
         transparency <= 0.001 ? AkzioColor.elevatedSurface : tint
     }
 
+    private var desktopTintOpacity: Double {
+        // The real desktop blur is supplied by NSVisualEffectView behind the
+        // window. Let the material reveal soft shapes and colour from the
+        // desktop, while keeping the tint strong enough that text does not
+        // remain readable through the window.
+        min(0.40, max(0.28, 0.18 + surfaceOpacity * 0.62))
+    }
+
     func body(content: Content) -> some View {
         content.background {
             if reduceTransparency || reduceTransparencyOverride || highContrast || rendersOffscreen {
                 surfaceTint
             } else {
-                surfaceTint.opacity(surfaceOpacity)
+                surfaceTint.opacity(desktopTintOpacity)
             }
         }
     }

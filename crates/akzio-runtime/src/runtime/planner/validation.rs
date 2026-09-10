@@ -115,7 +115,7 @@ impl WorkflowRuntime {
                 None
             };
             if (node.contract_hash != recipe.contract_hash && candidate_contract.is_none())
-                || node.budget != recipe.budget
+                || node.budget != graph.agent_budgets.get(recipe.purpose.as_str()).cloned().unwrap_or_else(|| recipe.budget.clone())
                 || node.retry != recipe.retry
                 || node.on_failure != recipe.on_failure
                 || node.priority > recipe.priority_ceiling

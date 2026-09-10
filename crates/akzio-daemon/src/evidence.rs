@@ -2,6 +2,20 @@
 
 use super::*;
 
+#[derive(Debug)]
+pub(super) struct ExecutionSnapshotRefresh {
+    pub account: Option<ArtifactRef>,
+    pub quotes: Option<ArtifactRef>,
+    pub clock: Option<ArtifactRef>,
+    pub quote_error: Option<String>,
+}
+
+struct ExecutionAcquisitionMaterialization {
+    artifacts: BTreeMap<ArtifactId, Artifact>,
+    account: Option<Artifact>,
+    quote_error: Option<String>,
+}
+
 impl Daemon {
     pub(super) async fn acquire_evidence(
         &self,
@@ -10,30 +24,71 @@ impl Daemon {
     ) -> Result<Vec<akzio_domain::Artifact>> {
         if task.node.input_artifacts.is_empty() {
             return match self.store.run_purpose(&task.run_id)? {
-                RunPurpose::Debug | RunPurpose::PositionPlan | RunPurpose::PaperDryRun => {
-                    Ok(Vec::new())
-                }
-                RunPurpose::Paper => Err(DaemonError::InvalidInput(
-                    "Paper evidence gate requires at least one EvidenceNeed".to_owned(),
+                RunPurpose::Debug | RunPurpose::PaperDryRun => Ok(Vec::new()),
+                RunPurpose::Paper | RunPurpose::PositionPlan => Err(DaemonError::InvalidInput(
+                    "Research evidence gate requires at least one EvidenceNeed".to_owned(),
                 )),
                 purpose => Err(DaemonError::InvalidInput(format!(
                     "unsupported empty evidence gate for {purpose:?} run"
                 ))),
             };
         }
-        if self.store.run_purpose(&task.run_id)? == RunPurpose::Paper {
+        let purpose = self.store.run_purpose(&task.run_id)?;
+        if matches!(purpose, RunPurpose::Paper | RunPurpose::PositionPlan) {
             self.validate_paper_evidence_policy(task)?;
-            let results = futures::future::join_all(
-                task.node
-                    .input_artifacts
-                    .iter()
-                    .map(|reference| self.acquire_evidence_need(task, reference, now)),
-            )
-            .await;
-            let mut acquisitions = Vec::new();
+            let mut research_inputs = Vec::new();
             let mut statuses = Vec::new();
+            for reference in &task.node.input_artifacts {
+                let need: EvidenceNeed = self.read_artifact_payload(reference)?;
+                if need.criticality() == akzio_domain::EvidenceCriticality::ExecutionSafety {
+                    statuses.push(serde_json::json!({"need": reference, "resource": need.resource,
+                        "criticality": need.criticality(), "status": "deferred_to_execution", "diagnostic": "none"}));
+                } else {
+                    research_inputs.push(reference.clone());
+                }
+            }
+            // Live snapshots are frozen after acquisition, before any Agent can
+            // consume them. Historical/fixture acquisition retains its supplied cutoff.
+            let (results, now) = if self.fixture_mode {
+                (
+                    futures::future::join_all(
+                        research_inputs
+                            .iter()
+                            .map(|reference| self.acquire_evidence_need(task, reference, now)),
+                    )
+                    .await,
+                    now,
+                )
+            } else {
+                let acquired = futures::future::join_all(
+                    research_inputs
+                        .iter()
+                        .map(|reference| self.acquire_live_paper_evidence(task, reference, now)),
+                )
+                .await;
+                let cutoff = Utc::now();
+                let results = research_inputs
+                    .iter()
+                    .zip(acquired)
+                    .map(|(reference, result)| {
+                        let (need, artifact, request, acquired) = result?;
+                        let runtime = EvidenceRuntime::new(self.store.clone(), [request.source]);
+                        let bundle = runtime.materialize_validated(
+                            &task.permit,
+                            reference,
+                            &request,
+                            acquired,
+                            cutoff,
+                        )?;
+                        Ok((need, artifact, bundle))
+                    })
+                    .collect::<Vec<Result<_>>>();
+                (results, cutoff)
+            };
+            let mut acquisitions = Vec::new();
+
             let mut safety_failure = None;
-            for (reference, result) in task.node.input_artifacts.iter().zip(results) {
+            for (reference, result) in research_inputs.iter().zip(results) {
                 let need: EvidenceNeed = self.read_artifact_payload(reference)?;
                 let criticality = need.criticality();
                 let result = result.and_then(|bundle| {
@@ -47,6 +102,18 @@ impl Daemon {
                         acquisitions.push(bundle);
                         ("available", "none")
                     }
+                    Err(
+                        error @ DaemonError::Evidence(
+                            akzio_ingest::EvidenceRuntimeError::TemporalContamination,
+                        ),
+                    ) => {
+                        // Keep every need's diagnostic, but fail the entire gate even
+                        // when the contaminated need is optional research evidence.
+                        if safety_failure.is_none() {
+                            safety_failure = Some(error);
+                        }
+                        ("unavailable", "temporal_contamination")
+                    }
                     Err(error) => {
                         // Store and lineage failures are not provider coverage gaps.
                         if matches!(
@@ -54,7 +121,6 @@ impl Daemon {
                             DaemonError::Store(_)
                                 | DaemonError::Evidence(
                                     akzio_ingest::EvidenceRuntimeError::Store(_)
-                                        | akzio_ingest::EvidenceRuntimeError::TemporalContamination
                                         | akzio_ingest::EvidenceRuntimeError::InvalidEvidenceNeed
                                         | akzio_ingest::EvidenceRuntimeError::UnsafeSourceUri
                                         | akzio_ingest::EvidenceRuntimeError::SourceNotAllowed(_)
@@ -63,11 +129,9 @@ impl Daemon {
                             return Err(error);
                         }
                         let category = evidence_failure_category(&error);
-                        if criticality == akzio_domain::EvidenceCriticality::ExecutionSafety
-                            && safety_failure.is_none()
-                        {
-                            safety_failure = Some(error);
-                        }
+                        // ExecutionSafety needs were deferred before acquisition.
+                        // Provider coverage failures here are research gaps; the
+                        // temporal and provenance failures above still fail closed.
                         ("unavailable", category)
                     }
                 };
@@ -90,8 +154,8 @@ impl Daemon {
                 LifecycleEventType::EvidenceNormalized,
                 now,
             )?;
-            // Retain successful acquisition evidence even when a broker safety
-            // requirement fails. No Execution gate can consume a partial account.
+            // Retain successful acquisitions for diagnosis; temporal contamination
+            // still blocks research regardless of criticality.
             if let Some(error) = safety_failure {
                 for (_, _, bundle) in &acquisitions {
                     for artifact in [&bundle.raw, &bundle.normalized] {
@@ -229,14 +293,50 @@ impl Daemon {
         Ok(artifacts.into_values().collect())
     }
 
+    /// Research identity is frozen in scheduler-owned needs, independent of market openness.
+    pub(super) fn research_session_key(&self, run_id: &RunId) -> Result<String> {
+        if self.store.run_purpose(run_id)? == RunPurpose::Paper {
+            return self
+                .store
+                .session_slot_for_run(run_id)?
+                .map(|slot| slot.session_key)
+                .ok_or_else(|| DaemonError::InvalidInput("Paper run has no session slot".into()));
+        }
+        let snapshot = self.store.workflow_snapshot(run_id)?;
+        let gate = snapshot
+            .tasks
+            .iter()
+            .find(|t| t.node.recipe_id.as_str() == akzio_runtime::EVIDENCE_GATE_RECIPE_ID)
+            .ok_or_else(|| DaemonError::InvalidInput("research evidence gate missing".into()))?;
+        let mut sessions = BTreeSet::new();
+        for reference in &gate.node.input_artifacts {
+            let need: EvidenceNeed = self.read_artifact_payload(reference)?;
+            if need.resource.starts_with("option_chain:") {
+                if let Some(date) = need.resource.split(':').nth(2) {
+                    NaiveDate::parse_from_str(date, "%Y-%m-%d").map_err(|_| {
+                        DaemonError::InvalidInput("invalid research session".into())
+                    })?;
+                    sessions.insert(date.to_owned());
+                }
+            }
+        }
+        if sessions.len() != 1 {
+            return Err(DaemonError::InvalidInput(
+                "research needs require one frozen session".into(),
+            ));
+        }
+        Ok(sessions.into_iter().next().expect("one session"))
+    }
+
     fn validate_paper_evidence_policy(&self, task: &ClaimedAttempt) -> Result<()> {
-        let session_key = self
-            .store
-            .session_slot_for_run(&task.run_id)?
-            .map(|slot| slot.session_key)
-            .ok_or_else(|| DaemonError::InvalidInput("Paper run has no session slot".to_owned()))?;
+        let session_key = self.research_session_key(&task.run_id)?;
+        let purpose = self.store.run_purpose(&task.run_id)?;
         let expected = akzio_domain::paper_session_evidence_needs(&session_key)
             .into_iter()
+            .filter(|need| {
+                purpose != RunPurpose::PositionPlan
+                    || need.criticality() != akzio_domain::EvidenceCriticality::ExecutionSafety
+            })
             .collect::<BTreeSet<_>>();
         let mut actual = BTreeSet::new();
 
@@ -311,11 +411,7 @@ impl Daemon {
         candidates: &[ArtifactRef],
         now: DateTime<Utc>,
     ) -> Result<Vec<(ArtifactRef, Artifact, EvidenceNeed)>> {
-        let session_key = self
-            .store
-            .session_slot_for_run(&task.run_id)?
-            .map(|slot| slot.session_key)
-            .ok_or_else(|| DaemonError::InvalidInput("Paper run has no session slot".to_owned()))?;
+        let session_key = self.research_session_key(&task.run_id)?;
         let session_date = NaiveDate::parse_from_str(&session_key, "%Y-%m-%d").map_err(|_| {
             DaemonError::InvalidInput("Paper run has invalid session slot".to_owned())
         })?;
@@ -616,6 +712,51 @@ impl Daemon {
             .map_err(|_| DaemonError::InvalidInput("invalid supplemental evidence date".to_owned()))
     }
 
+    async fn acquire_live_paper_evidence(
+        &self,
+        task: &ClaimedAttempt,
+        reference: &ArtifactRef,
+        acquisition_started_at: DateTime<Utc>,
+    ) -> Result<(
+        EvidenceNeed,
+        Artifact,
+        EvidenceRequest,
+        akzio_ingest::AcquiredEvidence,
+    )> {
+        let artifact = self.store.artifact(&reference.artifact_id)?;
+        let need: EvidenceNeed = serde_json::from_slice(&self.store.read_blob(&artifact.blob)?)?;
+        need.validate()
+            .map_err(|e| DaemonError::InvalidInput(e.to_string()))?;
+        let source = evidence_source(&need.source_family)?;
+        let request = EvidenceRequest {
+            source,
+            resource: need.resource.clone(),
+            max_age: Duration::seconds(i64::try_from(need.max_age_secs).map_err(|_| {
+                DaemonError::InvalidInput("EvidenceNeed max_age_secs exceeds i64".into())
+            })?),
+            acquisition_mode: evidence_acquisition_mode(
+                self.store.run_purpose(&task.run_id)?,
+                &need,
+            ),
+        };
+        let adapter = self.production_evidence.get(&source).ok_or_else(|| {
+            DaemonError::Unavailable(format!(
+                "Paper evidence requires {} adapter",
+                source.as_str()
+            ))
+        })?;
+        let acquired = EvidenceRuntime::new(self.store.clone(), [source])
+            .acquire_validated_async(
+                &task.permit,
+                reference,
+                &request,
+                adapter.as_ref(),
+                acquisition_started_at,
+            )
+            .await?;
+        Ok((need, artifact, request, acquired))
+    }
+
     async fn acquire_evidence_need(
         &self,
         task: &ClaimedAttempt,
@@ -712,22 +853,22 @@ impl Daemon {
             DaemonError::InvalidInput("EvidenceNeed max_age_secs exceeds i64".to_owned())
         })?;
         let runtime = EvidenceRuntime::new(self.store.clone(), [EvidenceSource::Alpaca]);
-        let bundle = runtime
-            .acquire_and_normalize_async(
-                permit,
-                reference,
-                &EvidenceRequest {
-                    source: EvidenceSource::Alpaca,
-                    resource: need.resource.clone(),
-                    max_age: Duration::seconds(max_age_secs),
-                    // Broker evidence comes from the Paper API itself, so it is
-                    // already its own independent source.
-                    acquisition_mode: EvidenceAcquisitionMode::VerifiedSource,
-                },
-                adapter,
-                now,
-            )
+        let request = EvidenceRequest {
+            source: EvidenceSource::Alpaca,
+            resource: need.resource.clone(),
+            max_age: Duration::seconds(max_age_secs),
+            // Broker evidence comes from the Paper API itself.
+            acquisition_mode: EvidenceAcquisitionMode::VerifiedSource,
+        };
+        let acquired = runtime
+            .acquire_validated_async(permit, reference, &request, adapter, now)
             .await?;
+        // Execution snapshots describe the account at execution time. Their
+        // availability can be the HTTP receipt time, after acquisition began.
+        // Keep the actual receipt timestamp and validate against the current
+        // host clock; never advance the cutoff to an untrusted provider time.
+        let bundle =
+            runtime.materialize_validated(permit, reference, &request, acquired, Utc::now())?;
         Ok((need, need_artifact, bundle))
     }
 
@@ -845,11 +986,7 @@ impl Daemon {
         &self,
         task: &ClaimedAttempt,
         now: DateTime<Utc>,
-    ) -> Result<(
-        Option<ArtifactRef>,
-        Option<ArtifactRef>,
-        Option<ArtifactRef>,
-    )> {
+    ) -> Result<ExecutionSnapshotRefresh> {
         let adapter = self
             .production_evidence
             .get(&EvidenceSource::Alpaca)
@@ -947,7 +1084,12 @@ impl Daemon {
             .await?,
         );
 
-        let (artifacts, account) = self.materialize_paper_acquisitions(task, acquisitions, now)?;
+        let materialized = self.materialize_execution_acquisitions(task, acquisitions, now)?;
+        let ExecutionAcquisitionMaterialization {
+            artifacts,
+            account,
+            quote_error,
+        } = materialized;
         account.ok_or_else(|| {
             DaemonError::InvalidInput(
                 "Paper execution refresh did not materialize account snapshot".to_owned(),
@@ -982,12 +1124,17 @@ impl Daemon {
                 kind: ArtifactKind::NormalizedEvidence,
             });
         }
-        if account.is_none() || quotes.is_none() || clock.is_none() {
+        if account.is_none() || clock.is_none() {
             return Err(DaemonError::InvalidInput(
-                "Paper execution refresh did not seal all snapshots".to_owned(),
+                "Paper execution refresh did not seal account and clock snapshots".to_owned(),
             ));
         }
-        Ok((account, quotes, clock))
+        Ok(ExecutionSnapshotRefresh {
+            account,
+            quotes,
+            clock,
+            quote_error,
+        })
     }
     fn materialize_paper_single_snapshot(
         &self,
@@ -1031,7 +1178,7 @@ impl Daemon {
                 &task.permit,
                 &[normalized],
                 "execution.snapshot.quotes",
-                &decode_paper_quotes(&payload.value, session_key, payload.observed_at)?,
+                &validated_paper_quotes(&payload.value, session_key, payload.observed_at)?,
                 payload.observed_at,
                 Some(payload.provenance.source_uri.clone()),
                 now,
@@ -1050,6 +1197,68 @@ impl Daemon {
         }
         .map_err(|error| DaemonError::InvalidInput(error.to_string()))?;
         Ok(Some(materialized))
+    }
+
+    fn materialize_execution_acquisitions(
+        &self,
+        task: &ClaimedAttempt,
+        acquisitions: Vec<(EvidenceNeed, Artifact, EvidenceBundle)>,
+        now: DateTime<Utc>,
+    ) -> Result<ExecutionAcquisitionMaterialization> {
+        let mut artifacts = BTreeMap::new();
+        let mut account_components = BTreeMap::new();
+        let mut quote_error = None;
+        for (need, need_artifact, bundle) in acquisitions {
+            let resource = need.resource.clone();
+            if matches!(
+                resource.as_str(),
+                PAPER_ACCOUNT_RESOURCE | PAPER_POSITIONS_RESOURCE | PAPER_OPEN_ORDERS_RESOURCE
+            ) || resource.starts_with("paper.fills:")
+            {
+                account_components
+                    .insert(resource, (need_artifact.clone(), bundle.normalized.clone()));
+            } else if resource == PAPER_QUOTES_RESOURCE {
+                match self.materialize_paper_single_snapshot(
+                    task,
+                    &need_artifact,
+                    &need,
+                    &bundle.normalized,
+                    now,
+                ) {
+                    Ok(Some(snapshot)) => {
+                        artifacts.insert(snapshot.artifact_id.clone(), snapshot);
+                    }
+                    Ok(None) => {}
+                    Err(error)
+                        if error
+                            .to_string()
+                            .contains("Execution BLOCKED: InvalidQuote") =>
+                    {
+                        quote_error = Some(error.to_string());
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else if let Some(snapshot) = self.materialize_paper_single_snapshot(
+                task,
+                &need_artifact,
+                &need,
+                &bundle.normalized,
+                now,
+            )? {
+                artifacts.insert(snapshot.artifact_id.clone(), snapshot);
+            }
+            artifacts.insert(bundle.raw.artifact_id.clone(), bundle.raw);
+            artifacts.insert(bundle.normalized.artifact_id.clone(), bundle.normalized);
+        }
+        let account = self.materialize_paper_account_components(task, &account_components, now)?;
+        if let Some(account) = &account {
+            artifacts.insert(account.artifact_id.clone(), account.clone());
+        }
+        Ok(ExecutionAcquisitionMaterialization {
+            artifacts,
+            account,
+            quote_error,
+        })
     }
 
     fn materialize_paper_account_components(
@@ -1161,9 +1370,27 @@ fn evidence_failure_category(error: &DaemonError) -> &'static str {
         DaemonError::Evidence(R::Adapter(A::Pending(_))) => "pending",
         DaemonError::Evidence(R::Adapter(A::Transport(_))) => "transport",
         DaemonError::Evidence(R::Adapter(A::Permanent(_))) => "permanent_provider_error",
+        DaemonError::Evidence(R::Adapter(A::NativeWeb { kind, .. })) => kind.as_str(),
         DaemonError::Evidence(R::StaleEvidence) => "stale_content",
         DaemonError::Evidence(_) => "data_quality",
         DaemonError::Unavailable(_) => "adapter_unavailable",
         _ => "validation_failure",
     }
+}
+
+fn validated_paper_quotes(
+    value: &serde_json::Value,
+    broker_session: String,
+    observed_at: chrono::DateTime<chrono::Utc>,
+) -> Result<QuoteSnapshot> {
+    let snapshot = decode_paper_quotes(value, broker_session, observed_at)?;
+    for (asset, quote) in &snapshot.quotes {
+        if quote.bid.0 <= 0 || quote.ask.0 <= quote.bid.0 {
+            return Err(DaemonError::InvalidInput(format!(
+                "Execution BLOCKED: InvalidQuote({asset}): bid={} ask={}",
+                quote.bid.0, quote.ask.0
+            )));
+        }
+    }
+    Ok(snapshot)
 }

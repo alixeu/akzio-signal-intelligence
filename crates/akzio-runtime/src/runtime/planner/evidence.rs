@@ -60,7 +60,7 @@ impl WorkflowRuntime {
                         .collect(),
                     input_artifacts: task.evidence_needs.clone(),
                     priority: task.priority,
-                    budget: recipe.budget.clone(),
+                    budget: self.resolved_budget(recipe),
                     retry: recipe.retry.clone(),
                     on_failure: recipe.on_failure,
                     parent_task_id: (agent_parents.len() == 1)
@@ -171,6 +171,7 @@ impl WorkflowRuntime {
                 return Err(RuntimeError::WorkflowNodeLimit);
             }
             let graph = WorkflowGraph {
+                agent_budgets: self.agent_budgets.clone(),
                 schema_version: DOMAIN_SCHEMA_VERSION,
                 topology_id,
                 nodes,
@@ -204,6 +205,7 @@ impl WorkflowRuntime {
             return Err(RuntimeError::WorkflowNodeLimit);
         }
         let graph = WorkflowGraph {
+                agent_budgets: self.agent_budgets.clone(),
             schema_version: DOMAIN_SCHEMA_VERSION,
             topology_id,
             nodes,
@@ -259,7 +261,7 @@ impl WorkflowRuntime {
             dependencies,
             input_artifacts: vec![],
             priority: recipe.priority_ceiling,
-            budget: recipe.budget.clone(),
+            budget: self.resolved_budget(recipe),
             retry: recipe.retry.clone(),
             on_failure: recipe.on_failure,
             parent_task_id: None,

@@ -146,6 +146,8 @@ public enum L10n {
         "Frozen": "已冻结",
         "Store Alerts": "存储告警",
         "Event Cursor": "事件游标",
+        "Decision Policy": "决策校准政策",
+        "News Evidence": "新闻证据",
         "Observer snapshot synchronized": "观察器快照已同步",
         "Unavailable from observer": "观察器未提供此数据",
         "This page stays unavailable until Rust publishes its durable data.": "Rust 尚未发布对应的持久化数据，因此本页保持不可用。",

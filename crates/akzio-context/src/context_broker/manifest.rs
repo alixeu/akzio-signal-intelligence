@@ -237,6 +237,7 @@ impl ContextBroker {
         let mut selected = Vec::with_capacity(persisted_payload.selections.len());
         let mut readable = BTreeSet::new();
         let mut total_bytes = 0_u64;
+        let mut projected_bytes = 0_u64;
         let mut estimated_tokens = 0_u32;
         for selection in &persisted_payload.selections {
             if !readable.insert(selection.artifact.artifact_id.clone()) {
@@ -249,12 +250,23 @@ impl ContextBroker {
             }
             self.assert_context_permitted(&contract.context, &artifact)?;
             self.assert_context_run(permit, &artifact)?;
-            let tokens = estimate_tokens_from_bytes(artifact.blob.bytes);
-            if selection.estimated_tokens != tokens {
+            let legacy_tokens = estimate_tokens_from_bytes(artifact.blob.bytes);
+            let (_, projected_tokens) = self.projection_budget(&artifact)?;
+            let expected_tokens = if selection.projected_bytes.is_some() {
+                projected_tokens
+            } else {
+                legacy_tokens
+            };
+            if selection.estimated_tokens != expected_tokens {
                 return Err(ContextError::InvalidManifestClosure);
             }
             total_bytes = total_bytes.saturating_add(artifact.blob.bytes);
-            estimated_tokens = estimated_tokens.saturating_add(tokens);
+            projected_bytes = projected_bytes.saturating_add(
+                selection
+                    .projected_bytes
+                    .unwrap_or(artifact.blob.bytes),
+            );
+            estimated_tokens = estimated_tokens.saturating_add(selection.estimated_tokens);
             selected.push(selection.artifact.clone());
         }
         let required_inputs = selected
@@ -284,6 +296,7 @@ impl ContextBroker {
             || manifest.grant.raw_source_closure
                 != self.raw_closure(&contract.context, &persisted_payload.selections)?
             || persisted_payload.total_bytes != total_bytes
+            || persisted_payload.projected_bytes.unwrap_or(total_bytes) != projected_bytes
             || persisted_payload.estimated_tokens != estimated_tokens
             || persisted_payload.input_hash != manifest_input_hash(&persisted_payload.selections)?
         {
@@ -361,6 +374,23 @@ impl ContextBroker {
             }
             if self.overlay_is_eligible(&artifact)? {
                 self.assert_context_run(permit, &artifact)?;
+                let artifact = if artifact.kind == ArtifactKind::NormalizedEvidence
+                    && policy.permitted_kinds.contains(&ArtifactKind::SemanticDetail)
+                    && (policy.permitted_source_families.is_empty()
+                        || policy
+                            .permitted_source_families
+                            .contains("akzio.ingest"))
+                    && self
+                        .document_value(&artifact)?
+                        .get("resource")
+                        .and_then(Value::as_str)
+                        .is_some_and(|resource| resource.starts_with("option_chain:"))
+                {
+                    self.option_projection_artifact(permit, contract, &artifact, now)?
+                } else {
+                    artifact
+                };
+                self.assert_context_run(permit, &artifact)?;
                 eligible.push(artifact);
             }
         }
@@ -436,14 +466,17 @@ impl ContextBroker {
         let required = self.required_role_inputs(contract, &artifacts)?;
         artifacts.sort_by_key(|artifact| !required.contains(&artifact.artifact_id));
         let mut total_bytes = 0_u64;
+        let mut projected_bytes = 0_u64;
         let mut estimated_tokens = 0_u32;
         let mut selections = Vec::new();
         for artifact in artifacts {
-            let tokens = estimate_tokens_from_bytes(artifact.blob.bytes);
-            let next_bytes = total_bytes.saturating_add(artifact.blob.bytes);
+            let (projected, tokens) = self.projection_budget(&artifact)?;
+            let next_source_bytes = total_bytes.saturating_add(artifact.blob.bytes);
+            let next_projected_bytes = projected_bytes.saturating_add(projected);
             let next_tokens = estimated_tokens.saturating_add(tokens);
             if selections.len() >= usize::from(policy.max_artifacts)
-                || next_bytes > policy.max_bytes
+                || next_source_bytes > Self::source_budget(policy)
+                || next_projected_bytes > policy.max_bytes
                 || next_tokens > policy.max_tokens
             {
                 if required.contains(&artifact.artifact_id) {
@@ -457,15 +490,21 @@ impl ContextBroker {
                 }
                 continue;
             }
-            total_bytes = next_bytes;
+            total_bytes = next_source_bytes;
+            projected_bytes = next_projected_bytes;
             estimated_tokens = next_tokens;
             selections.push(ContextSelection {
                 artifact: ArtifactRef {
                     artifact_id: artifact.artifact_id,
                     kind: artifact.kind,
                 },
-                reason: selection_reason(artifact.kind).to_owned(),
+                reason: if artifact.producer == "evidence.option_projection" {
+                    "option_chain_projection".to_owned()
+                } else {
+                    selection_reason(artifact.kind).to_owned()
+                },
                 estimated_tokens: tokens,
+                projected_bytes: Some(projected),
                 trust: context_trust(artifact.kind),
             });
         }
@@ -491,10 +530,11 @@ impl ContextBroker {
             if !self.overlay_is_eligible(&artifact)? {
                 continue;
             }
-            let tokens = estimate_tokens_from_bytes(artifact.blob.bytes);
+            let (projected, tokens) = self.projection_budget(&artifact)?;
             total_bytes = total_bytes.saturating_add(artifact.blob.bytes);
             estimated_tokens = estimated_tokens.saturating_add(tokens);
             selection.estimated_tokens = tokens;
+            selection.projected_bytes = Some(projected);
             revalidated.push(selection);
         }
         let selections = revalidated;
@@ -543,12 +583,17 @@ impl ContextBroker {
             .collect::<Result<Vec<_>, _>>()?;
         self.required_role_inputs(contract, &role_inputs)?;
         let input_hash = manifest_input_hash(&selections)?;
+        let projected_bytes = selections
+            .iter()
+            .map(|selection| selection.projected_bytes.unwrap_or(0))
+            .sum::<u64>();
         let payload = ContextManifestPayload {
             schema_version: DOMAIN_SCHEMA_VERSION,
             contract_hash: contract.contract_hash.clone(),
             selections: selections.clone(),
             quarantined: quarantined.clone(),
             total_bytes,
+            projected_bytes: Some(projected_bytes),
             estimated_tokens,
             input_hash,
         };

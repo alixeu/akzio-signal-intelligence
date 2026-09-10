@@ -152,6 +152,7 @@ impl PaperDispatchRuntime {
         input: &PaperDispatchInput,
     ) -> PaperDispatchResult<PaperDispatchOutput> {
         self.require_paper_run(&input.permit)?;
+        self.store.assert_debug_broker_write(&input.permit.run_id)?;
         let CommittedPlanContext {
             commitment_artifact,
             commitment,

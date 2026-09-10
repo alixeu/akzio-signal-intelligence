@@ -30,6 +30,7 @@ public enum WorkflowEdgeKind: String, Sendable, CaseIterable {
 }
 
 public struct WorkflowNodePresentation: Sendable, Hashable, Identifiable {
+    public let taskID: String?
     public let stage: WorkflowStageKind
     public let taskStatus: TaskStatus
     public let isApplicable: Bool
@@ -41,9 +42,10 @@ public struct WorkflowNodePresentation: Sendable, Hashable, Identifiable {
     public let column: Int
     public let row: Int
 
-    public var id: String { stage.id }
+    public var id: String { taskID ?? stage.id }
 
     public init(
+        taskID: String? = nil,
         stage: WorkflowStageKind,
         taskStatus: TaskStatus,
         isApplicable: Bool = true,
@@ -53,6 +55,7 @@ public struct WorkflowNodePresentation: Sendable, Hashable, Identifiable {
         column: Int,
         row: Int
     ) {
+        self.taskID = taskID
         self.stage = stage
         self.taskStatus = taskStatus
         self.isApplicable = isApplicable
@@ -83,6 +86,11 @@ public struct WorkflowEdgePresentation: Sendable, Hashable, Identifiable {
     public init(from: WorkflowStageKind, to: WorkflowStageKind, kind: WorkflowEdgeKind) {
         self.from = from.id
         self.to = to.id
+        self.kind = kind
+    }
+    public init(fromTask: String, toTask: String, kind: WorkflowEdgeKind) {
+        self.from = fromTask
+        self.to = toTask
         self.kind = kind
     }
 }

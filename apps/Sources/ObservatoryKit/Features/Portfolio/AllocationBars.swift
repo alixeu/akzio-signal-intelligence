@@ -6,12 +6,18 @@ import SwiftUI
 // value; the target tick never moves unless the policy changes.
 struct AllocationBars: View {
     let rows: [AllocationRow]
+    let subtitle: String
+
+    init(rows: [AllocationRow], subtitle: String = "Actual vs Target") {
+        self.rows = rows
+        self.subtitle = subtitle
+    }
 
     @Environment(\.motionPolicy) private var policy
     @Environment(\.appLanguage) private var language
 
     var body: some View {
-        SectionCard(title: "Allocation", subtitle: "Actual vs Target") {
+        SectionCard(title: "Allocation", subtitle: subtitle) {
             VStack(alignment: .leading, spacing: AkzioLayout.s3) {
                 ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
                     bar(row).staggeredReveal(index: index)

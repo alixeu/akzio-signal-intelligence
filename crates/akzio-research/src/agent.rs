@@ -15,11 +15,11 @@ use akzio_context::{
 use akzio_domain::{
     validate_decision_evidence_sufficiency, AgentContract, AgentOutputEnvelope, Artifact,
     ArtifactId, ArtifactKind, ArtifactLifecycle, ArtifactProvenance, ArtifactRef, Asset,
-    ContextPolicy, ContractId, ContractPurpose, DecisionDraft, DeliberationPolicy, DomainError,
-    EvidenceGroundRole, FailureDisposition, LifecycleEventType, OutputContract, PromptBundle,
-    ReadGrant, ResearchClaim, ResearchCritique, ResearchResolution, ResearchShard, RetryPolicy,
-    RunPurpose, TaskBudget, TaskRecipeId, TaskWritePermit, TerminationPolicy, ToolGrant, ToolKind,
-    ToolSpec, WorkflowNode, DOMAIN_SCHEMA_VERSION,
+    ClaimVerificationStatus, ContextPolicy, ContractId, ContractPurpose, DecisionDraft,
+    DeliberationPolicy, DomainError, EvidenceGroundRole, FailureDisposition, LifecycleEventType,
+    OutputContract, PromptBundle, ReadGrant, ResearchClaim, ResearchCritique, ResearchResolution,
+    ResearchShard, RetryPolicy, RunPurpose, TaskBudget, TaskRecipeId, TaskWritePermit,
+    TerminationPolicy, ToolGrant, ToolKind, ToolSpec, WorkflowNode, DOMAIN_SCHEMA_VERSION,
 };
 use akzio_model::{
     ModelBudgetPolicy, ModelCallTrace, ModelCapabilitySnapshot, ModelClient, ModelContinuation,

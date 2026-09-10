@@ -21,6 +21,8 @@ impl fmt::Display for ArtifactId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactKind {
+    /// Run-scoped operational audit; never research evidence or canonical learning.
+    DebugRecord,
     RawEvidence,
     NormalizedEvidence,
     SemanticDetail,
@@ -312,6 +314,26 @@ impl Artifact {
                 Err(DomainError::EmptyField {
                     field: "artifact.normalized_source_refs",
                 })
+            }
+            ArtifactKind::DebugRecord => {
+                if self.lifecycle != ArtifactLifecycle::RunScoped
+                    || !matches!(
+                        self.producer.as_str(),
+                        "debug.session_identity"
+                            | "debug.control"
+                            | "debug.stage_acceptance"
+                            | "debug.budget_snapshot"
+                    )
+                    || self
+                        .source_refs
+                        .iter()
+                        .any(|r| r.kind == ArtifactKind::RawEvidence)
+                {
+                    return Err(DomainError::EmptyField {
+                        field: "artifact.debug_record_scope",
+                    });
+                }
+                Ok(())
             }
             ArtifactKind::SemanticDetail => {
                 // A collection status describes attempted needs, including

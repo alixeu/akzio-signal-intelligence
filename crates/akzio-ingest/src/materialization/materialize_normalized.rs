@@ -130,8 +130,7 @@ impl EvidenceRuntime {
         confidence_ppm: u32,
         now: DateTime<Utc>,
     ) -> EvidenceRuntimeResult<EvidenceBundle> {
-        Self::validate_acquisition(&acquired, request, now)?;
-        let time_basis = Self::time_basis(request, &acquired, now)?;
+        let time_basis = Self::validate_acquired_evidence(request, &acquired, now)?;
         let contamination_certificate =
             EvidenceContaminationCertificate::for_time_basis(&time_basis)?;
         let mut normalized_value = acquired.normalized.clone();
@@ -214,6 +213,16 @@ impl EvidenceRuntime {
             now,
         )?;
         Ok(EvidenceBundle { raw, normalized })
+    }
+
+    /// Shared read-only validation for adapter preflight and CAS materialization.
+    pub fn validate_acquired_evidence(
+        request: &EvidenceRequest,
+        acquired: &AcquiredEvidence,
+        cutoff: DateTime<Utc>,
+    ) -> EvidenceRuntimeResult<EvidenceTimeBasis> {
+        Self::validate_acquisition(acquired, request, cutoff)?;
+        Self::time_basis(request, acquired, cutoff)
     }
 
     fn time_basis(
@@ -343,4 +352,38 @@ fn latest_fred_observation_date(value: &Value) -> Option<DateTime<Utc>> {
 
 fn binding_byte(binding: &Value, field: &str) -> EvidenceRuntimeResult<usize> {
     claim_binding_byte(binding, field).ok_or(EvidenceRuntimeError::InvalidCitation)
+}
+
+#[cfg(test)]
+mod live_snapshot_cutoff_tests {
+    use super::*;
+
+    #[test]
+    fn receipt_time_requires_completed_snapshot_and_future_data_stays_blocked() {
+        let started = Utc::now();
+        let received = started + Duration::milliseconds(10);
+        let frozen = received + Duration::milliseconds(10);
+        let mut basis = EvidenceTimeBasis {
+            event_time: None,
+            released_at: None,
+            available_at: received,
+            retrieved_at: received,
+            decision_clock: DecisionClock {
+                decision_cutoff: started,
+            },
+            vintage: None,
+            revision: None,
+        };
+        assert!(matches!(
+            basis.validate(),
+            Err(EvidenceRuntimeError::TemporalContamination)
+        ));
+        basis.decision_clock.decision_cutoff = frozen;
+        assert!(basis.validate().is_ok());
+        basis.event_time = Some(frozen + Duration::seconds(1));
+        assert!(matches!(
+            basis.validate(),
+            Err(EvidenceRuntimeError::TemporalContamination)
+        ));
+    }
 }

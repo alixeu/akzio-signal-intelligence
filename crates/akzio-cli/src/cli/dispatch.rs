@@ -1,5 +1,6 @@
 async fn dispatch_control(command: Command, config: &Config, config_path: &Path) -> Result<()> {
     match command {
+        Command::Debug { command } => dispatch_debug(command, config, config_path).await,
         Command::Daemon { command } => match command {
             DaemonAction::Serve => serve(config, config_path).await,
             DaemonAction::Health => {
@@ -64,6 +65,12 @@ async fn dispatch_control(command: Command, config: &Config, config_path: &Path)
         }
         Command::ModelQualification { .. } => {
             bail!("model qualification commands are handled before control dispatch")
+        }
+        Command::Calibration { .. } => {
+            bail!("calibration commands are handled before config loading")
+        }
+        Command::Evidence { .. } => {
+            bail!("evidence commands are handled by the local CLI")
         }
     }
 }

@@ -11,7 +11,11 @@ APP_NAME="akzio"
 VERSION="${VERSION:-1.0.0}"
 BUILD_NUMBER="${BUILD_NUMBER:-1}"
 DIST="$ROOT/dist"
-BUNDLE="$DIST/$APP_NAME.app"
+BUNDLE="${AKZIO_APP_BUNDLE:-$DIST/$APP_NAME.app}"
+if [[ "${AKZIO_PRESERVE_BUILD_PRODUCTS:-0}" == "1" && -e "$BUNDLE" ]]; then
+    echo "error: preservation mode requires a new AKZIO_APP_BUNDLE destination" >&2
+    exit 1
+fi
 
 echo "==> swift build ($CONFIG)"
 swift build --package-path "$ROOT" -c "$CONFIG" --product AkzioObservatory
@@ -21,10 +25,12 @@ echo "==> cargo build (release)"
 cargo build --manifest-path "$REPO_ROOT/Cargo.toml" --release -p akzio-cli
 
 echo "==> laying out bundle"
-rm -rf "$BUNDLE"
+if [[ "${AKZIO_PRESERVE_BUILD_PRODUCTS:-0}" != "1" ]]; then
+    rm -rf "$BUNDLE"
+fi
 mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources"
 cp "$BIN_PATH/AkzioObservatory" "$BUNDLE/Contents/MacOS/AkzioObservatory"
-cp "$REPO_ROOT/target/release/akzio" "$BUNDLE/Contents/MacOS/akzio-core"
+cp "${CARGO_TARGET_DIR:-$REPO_ROOT/target}/release/akzio" "$BUNDLE/Contents/MacOS/akzio-core"
 cp "$REPO_ROOT/config/akzio.observatory.toml" \
     "$BUNDLE/Contents/Resources/akzio.observatory.toml"
 chmod 755 "$BUNDLE/Contents/MacOS/AkzioObservatory" "$BUNDLE/Contents/MacOS/akzio-core"

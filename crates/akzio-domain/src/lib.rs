@@ -40,7 +40,9 @@ macro_rules! id_type {
     };
 }
 
+pub mod budget;
 mod core;
+pub use budget::{AgentBudgetConfig, AgentSettings};
 mod schema;
 
 pub mod artifact;
@@ -48,6 +50,7 @@ pub mod behavior;
 pub mod canary;
 pub mod context;
 pub mod contract;
+pub mod debug;
 pub mod decision;
 pub mod evaluation;
 pub mod event;
@@ -71,6 +74,7 @@ pub use canary::*;
 pub use context::*;
 pub use contract::*;
 pub use core::*;
+pub use debug::*;
 pub use decision::*;
 pub use evaluation::*;
 pub use event::*;

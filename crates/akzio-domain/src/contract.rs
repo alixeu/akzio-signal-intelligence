@@ -42,7 +42,12 @@ pub struct ContextPolicy {
     /// first governed evidence requests from an intentionally empty context.
     pub min_artifacts: u16,
     pub max_artifacts: u16,
+    /// Maximum bytes of the compact model projection. The optional source cap
+    /// below is a separate bounded authorization for original CAS documents;
+    /// it is not silently treated as model input.
     pub max_bytes: u64,
+    #[serde(default)]
+    pub max_source_bytes: Option<u64>,
     pub max_tokens: u32,
     pub allow_raw_reread: bool,
 }
@@ -53,6 +58,7 @@ impl ContextPolicy {
             || self.min_artifacts > self.max_artifacts
             || self.max_artifacts == 0
             || self.max_bytes == 0
+            || self.max_source_bytes == Some(0)
             || self.max_tokens == 0
         {
             return Err(DomainError::InvalidBudget {
@@ -271,6 +277,11 @@ impl CandidateCapabilityCeiling {
             && context.min_artifacts >= self.context.min_artifacts
             && context.max_artifacts <= self.context.max_artifacts
             && context.max_bytes <= self.context.max_bytes
+            && context.max_source_bytes.unwrap_or(context.max_bytes)
+                <= self
+                    .context
+                    .max_source_bytes
+                    .unwrap_or(self.context.max_bytes)
             && context.max_tokens <= self.context.max_tokens
             && (!context.allow_raw_reread || self.context.allow_raw_reread)
             && tool_grants.iter().all(|requested| {

@@ -90,6 +90,19 @@ pub fn fixture_model_client() -> ModelClient {
             })
         })
         .collect::<Vec<_>>();
+    let research_allocations = akzio_domain::Asset::EXECUTABLE
+        .into_iter()
+        .map(|asset| {
+            serde_json::json!({
+                "asset": asset.symbol(),
+                "target_weight_ppm": 0,
+                "supporting_horizons": [],
+                "evidence_refs": [],
+                "rationale": "The deterministic fixture contains no directional research basis.",
+                "abstention_reason": "fixture has no qualified directional evidence"
+            })
+        })
+        .collect::<Vec<_>>();
     let responses = |output: Value| {
         let output = serde_json::json!({
             "result": output,
@@ -136,6 +149,10 @@ pub fn fixture_model_client() -> ModelClient {
                 "summary": "fixture decision draft",
                 "confidence_ppm": 500000,
                 "forecasts": forecasts,
+                "research_allocation": {
+                    "cash_weight_ppm": 1000000,
+                    "allocations": research_allocations
+                },
                 "claims": [{
                     "artifact_id": akzio_model::FIXTURE_CONTEXT_CLAIM_ID,
                     "kind": "claim"

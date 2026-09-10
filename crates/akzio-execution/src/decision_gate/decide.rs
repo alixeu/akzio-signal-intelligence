@@ -23,6 +23,11 @@ impl DecisionRuntime {
         let draft: DecisionDraft = serde_json::from_slice(&self.store.read_blob(&proposal.blob)?)?;
         draft.validate()?;
         self.validate_draft_closure(&draft, &selected)?;
+        let raw_research_plan = draft.research_allocation.as_ref().ok_or(
+            DomainError::EmptyField {
+                field: "decision_draft.research_allocation",
+            },
+        )?;
         // Semantic evidence sufficiency is unconditional. A producer contract
         // that is not installed, or that predates the rule, cannot vouch for
         // claim semantics, so the gate rejects the proposal rather than
@@ -89,6 +94,13 @@ impl DecisionRuntime {
             &critiques,
         )
         .map_err(|_| DecisionGateError::InsufficientClaimEvidence)?;
+        let research_plan = self.review_research_plan(
+            raw_research_plan,
+            &draft.forecasts,
+            &claim_records,
+            &critique_records,
+            &input.permit.run_id,
+        )?;
         let active_claims = draft
             .claims
             .iter()
@@ -112,8 +124,12 @@ impl DecisionRuntime {
             .iter()
             .map(|(_, claim)| (*claim).clone())
             .collect::<Vec<_>>();
-        let critical_claim_unverified =
-            has_unverified_critical_claim(&active_refs, &active_payloads, &critiques);
+        let critical_claim_unverified = has_unverified_critical_claim(
+            &active_refs,
+            &active_payloads,
+            &critiques,
+            &draft.forecasts,
+        );
 
         let policy_influences = draft
             .applied_learning_refs
@@ -166,9 +182,11 @@ impl DecisionRuntime {
         if !horizon_trace.conflicts.is_empty() {
             hard_blockers.insert(HardBlocker::HorizonConflict);
         }
-        let (target, portfolio_risk) =
-            self.policy
-                .target_with_risk(input.now, effective_confidence_ppm, &draft.forecasts)?;
+        let (target, portfolio_risk, runtime_trace) = self.policy.target_with_risk_traced(
+            input.now,
+            effective_confidence_ppm,
+            &draft.forecasts,
+        )?;
         let evidence_cutoff = selected
             .iter()
             .filter_map(|reference| self.store.artifact(&reference.artifact_id).ok())
@@ -359,6 +377,17 @@ impl DecisionRuntime {
         {
             hard_blockers.insert(HardBlocker::UnverifiedClaim);
         }
+        let asset_eligibility = build_asset_eligibility(
+            &self.policy,
+            input.now,
+            effective_confidence_ppm,
+            &draft.forecasts,
+            &claim_records,
+            &critique_records,
+            &horizon_trace,
+            &portfolio_risk,
+            &target,
+        );
         let context_payload = DecisionContext {
             schema_version: DOMAIN_SCHEMA_VERSION,
             decision_id: akzio_domain::DecisionId::new(),
@@ -380,6 +409,9 @@ impl DecisionRuntime {
             validity: Some(validity),
             horizon_trace: Some(horizon_trace),
             investment_logic: Some(investment_logic),
+            asset_eligibility,
+            runtime_trace: Some(runtime_trace),
+            research_plan: Some(research_plan.clone()),
         };
         context_payload.validate()?;
 
@@ -410,6 +442,7 @@ impl DecisionRuntime {
             targets: target,
             confidence_ppm: effective_confidence_ppm,
             forecasts: draft.forecasts,
+            research_plan: Some(research_plan),
             created_at: input.now,
         };
         decision_payload.validate()?;
@@ -432,6 +465,177 @@ impl DecisionRuntime {
             decision_context,
             decision,
         })
+    }
+
+    fn review_research_plan(
+        &self,
+        raw: &ResearchAllocationPlan,
+        forecasts: &[Forecast],
+        claims: &[(Artifact, ResearchClaim)],
+        critiques: &[(Artifact, ResearchCritique)],
+        run_id: &akzio_domain::RunId,
+    ) -> DecisionGateResult<ResearchPlanReview> {
+        raw.validate()?;
+        let mut validated = raw.clone();
+        let mut reasons_by_asset = BTreeMap::<Asset, Vec<String>>::new();
+
+        for allocation in &mut validated.allocations {
+            if allocation.target_weight_ppm.0 == 0 {
+                continue;
+            }
+            let original_horizons = allocation.supporting_horizons.clone();
+            let supported_horizons = original_horizons
+                .iter()
+                .copied()
+                .filter(|horizon| {
+                    forecasts.iter().any(|forecast| {
+                        forecast.asset == allocation.asset
+                            && forecast.horizon == *horizon
+                            && !forecast.is_neutral()
+                            && research_slot_supported(
+                                allocation.asset,
+                                *horizon,
+                                claims,
+                                critiques,
+                            )
+                    })
+                })
+                .collect::<Vec<_>>();
+            if supported_horizons != original_horizons {
+                reasons_by_asset
+                    .entry(allocation.asset)
+                    .or_default()
+                    .push("unsupported_research_horizon_removed".to_owned());
+                allocation.supporting_horizons = supported_horizons;
+            }
+            if allocation.supporting_horizons.is_empty() {
+                allocation.target_weight_ppm = WeightPpm::ZERO;
+                allocation.abstention_reason = Some(
+                    "Rust blocked the requested target because no listed horizon passed the research evidence and critique checks."
+                        .to_owned(),
+                );
+                reasons_by_asset
+                    .entry(allocation.asset)
+                    .or_default()
+                    .push("research_support_missing".to_owned());
+            }
+        }
+
+        let gross = validated
+            .allocations
+            .iter()
+            .try_fold(0_u32, |sum, allocation| {
+                sum.checked_add(allocation.target_weight_ppm.0)
+            })
+            .ok_or(DomainError::InvalidBudget {
+                field: "research_allocation.gross_weight",
+            })?;
+        if gross > self.policy.max_gross_weight.0 {
+            for allocation in &mut validated.allocations {
+                let before = allocation.target_weight_ppm.0;
+                let after = u32::try_from(
+                    u64::from(before) * u64::from(self.policy.max_gross_weight.0)
+                        / u64::from(gross),
+                )
+                .map_err(|_| DomainError::InvalidBudget {
+                    field: "research_allocation.gross_weight",
+                })?;
+                if after != before {
+                    allocation.target_weight_ppm = WeightPpm(after);
+                    if after == 0 {
+                        allocation.abstention_reason = Some(
+                            "Rust removed the target after the static gross exposure cap reduced it below one ppm."
+                                .to_owned(),
+                        );
+                    }
+                    reasons_by_asset
+                        .entry(allocation.asset)
+                        .or_default()
+                        .push("static_gross_weight_limit".to_owned());
+                }
+            }
+        }
+        let validated_gross = validated
+            .allocations
+            .iter()
+            .try_fold(0_u32, |sum, allocation| {
+                sum.checked_add(allocation.target_weight_ppm.0)
+            })
+            .ok_or(DomainError::InvalidBudget {
+                field: "research_allocation.gross_weight",
+            })?;
+        validated.cash_weight_ppm = WeightPpm(WeightPpm::SCALE - validated_gross);
+
+        let mut adjustments = Vec::new();
+        for asset in Asset::EXECUTABLE {
+            let before = raw.weight(asset);
+            let after = validated.weight(asset);
+            let reasons = reasons_by_asset.remove(&asset).unwrap_or_default();
+            if before != after || !reasons.is_empty() {
+                adjustments.push(ResearchPlanAdjustment {
+                    asset: Some(asset),
+                    from_weight_ppm: before,
+                    to_weight_ppm: after,
+                    reasons: if reasons.is_empty() {
+                        vec!["rust_research_validation".to_owned()]
+                    } else {
+                        reasons
+                    },
+                });
+            }
+        }
+        if raw.cash_weight_ppm != validated.cash_weight_ppm {
+            adjustments.push(ResearchPlanAdjustment {
+                asset: None,
+                from_weight_ppm: raw.cash_weight_ppm,
+                to_weight_ppm: validated.cash_weight_ppm,
+                reasons: vec!["cash_recomputed_after_rust_validation".to_owned()],
+            });
+        }
+
+        validated.validate()?;
+        let status = if validated.has_non_zero_target() {
+            ResearchPlanStatus::QualifiedRecommendation
+        } else if raw.has_non_zero_target() {
+            ResearchPlanStatus::BlockedByResearch
+        } else {
+            ResearchPlanStatus::ExplicitCash
+        };
+        let purpose = self.store.run_purpose(run_id)?;
+        let (execution_status, execution_blockers) = if matches!(
+            status,
+            ResearchPlanStatus::BlockedByResearch
+        ) {
+            (
+                ResearchExecutionStatus::Blocked,
+                vec!["research_plan_blocked".to_owned()],
+            )
+        } else if purpose == RunPurpose::PositionPlan {
+            (
+                ResearchExecutionStatus::NotApplicable,
+                vec!["position_plan_does_not_enter_execution".to_owned()],
+            )
+        } else if !self.policy.decision_capable() {
+            (
+                ResearchExecutionStatus::Blocked,
+                vec!["decision_policy_not_ready".to_owned()],
+            )
+        } else {
+            (
+                ResearchExecutionStatus::PendingExecutionGate,
+                vec!["execution_gate_not_run".to_owned()],
+            )
+        };
+        let review = ResearchPlanReview {
+            raw: raw.clone(),
+            validated,
+            adjustments,
+            status,
+            execution_status,
+            execution_blockers,
+        };
+        review.validate()?;
+        Ok(review)
     }
 
     fn consensus_diversity_assessment(
@@ -606,10 +810,54 @@ impl DecisionRuntime {
     }
 }
 
+fn research_slot_supported(
+    asset: Asset,
+    horizon: DecisionHorizon,
+    claims: &[(Artifact, ResearchClaim)],
+    critiques: &[(Artifact, ResearchCritique)],
+) -> bool {
+    claims.iter().any(|(artifact, claim)| {
+        if claim.horizon != horizon
+            || claim.stance == akzio_domain::ClaimStance::Neutral
+            || claim.evidence_gaps.iter().any(|gap| gap.blocks_slot(asset, horizon, claim.horizon))
+        {
+            return false;
+        }
+        let domains = claim
+            .grounds
+            .iter()
+            .filter(|ground| {
+                ground.role == akzio_domain::EvidenceGroundRole::Directional
+                    && ground.assets.contains(&asset)
+            })
+            .filter_map(|ground| ground.domain)
+            .collect::<BTreeSet<_>>();
+        if ![
+            akzio_domain::ResearchShard::PriceMarketStructure,
+            akzio_domain::ResearchShard::Macro,
+        ]
+        .into_iter()
+        .all(|domain| domains.contains(&domain))
+        {
+            return false;
+        }
+        let claim_ref = ArtifactRef {
+            artifact_id: artifact.artifact_id.clone(),
+            kind: ArtifactKind::Claim,
+        };
+        critiques.iter().any(|(_, critique)| {
+            critique.target == claim_ref
+                && critique.verification_status == ClaimVerificationStatus::Supported
+                && !critique.blocks_slot(asset, horizon, claim.horizon)
+        })
+    })
+}
+
 fn has_unverified_critical_claim(
     claim_refs: &[ArtifactRef],
     claims: &[ResearchClaim],
     critiques: &[ResearchCritique],
+    forecasts: &[Forecast],
 ) -> bool {
     claim_refs
         .iter()
@@ -624,8 +872,189 @@ fn has_unverified_critical_claim(
             let Some(verification) = matching.next() else {
                 return true;
             };
-            matching.next().is_some()
+            if matching.next().is_some()
                 || verification.verification_status != ClaimVerificationStatus::Supported
-                || verification.blocker
+            {
+                return true;
+            }
+            forecasts
+                .iter()
+                .filter(|forecast| {
+                    !forecast.is_neutral()
+                        && forecast.horizon == claim.horizon
+                        && claim.grounds.iter().any(|ground| {
+                            ground.role == akzio_domain::EvidenceGroundRole::Directional
+                                && ground.assets.contains(&forecast.asset)
+                        })
+                })
+                .any(|forecast| {
+                    verification.blocks_slot(
+                        forecast.asset,
+                        forecast.horizon,
+                        claim.horizon,
+                    )
+                })
         })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_asset_eligibility(
+    policy: &DecisionPolicy,
+    decision_at: DateTime<Utc>,
+    confidence_ppm: u32,
+    forecasts: &[Forecast],
+    claims: &[(Artifact, ResearchClaim)],
+    critiques: &[(Artifact, ResearchCritique)],
+    horizon_trace: &HorizonDecisionTrace,
+    portfolio_risk: &PortfolioRiskAssessment,
+    target: &TargetPortfolio,
+) -> BTreeMap<Asset, AssetEligibility> {
+    Asset::EXECUTABLE
+        .into_iter()
+        .map(|asset| {
+            let active_forecasts = forecasts
+                .iter()
+                .filter(|forecast| forecast.asset == asset && !forecast.is_neutral())
+                .collect::<Vec<_>>();
+            let directional_forecast_present = !active_forecasts.is_empty();
+            let claim_verified = directional_forecast_present
+                && active_forecasts.iter().all(|forecast| {
+                    claims.iter().any(|(artifact, claim)| {
+                        claim.horizon == forecast.horizon
+                            && critiques.iter().any(|(_, critique)| {
+                                critique.target
+                                    == ArtifactRef {
+                                        artifact_id: artifact.artifact_id.clone(),
+                                        kind: ArtifactKind::Claim,
+                                    }
+                                    && critique.verification_status
+                                        == ClaimVerificationStatus::Supported
+                                    && !critique.blocks_slot(
+                                        asset,
+                                        forecast.horizon,
+                                        claim.horizon,
+                                    )
+                            })
+                    })
+                });
+            let directional_evidence = directional_forecast_present
+                && active_forecasts.iter().all(|forecast| {
+                    let domains = claims
+                        .iter()
+                        .filter(|(artifact, claim)| {
+                            claim.horizon == forecast.horizon
+                                && !claim.evidence_gaps.iter().any(|gap| {
+                                    gap.blocks_slot(asset, forecast.horizon, claim.horizon)
+                                })
+                                && critiques.iter().any(|(_, critique)| {
+                                    critique.target
+                                        == ArtifactRef {
+                                            artifact_id: artifact.artifact_id.clone(),
+                                            kind: ArtifactKind::Claim,
+                                        }
+                                        && critique.verification_status
+                                            == ClaimVerificationStatus::Supported
+                                        && !critique.blocks_slot(
+                                            asset,
+                                            forecast.horizon,
+                                            claim.horizon,
+                                        )
+                                })
+                        })
+                        .flat_map(|(_, claim)| &claim.grounds)
+                        .filter(|ground| {
+                            ground.role == akzio_domain::EvidenceGroundRole::Directional
+                                && ground.assets.contains(&asset)
+                        })
+                        .filter_map(|ground| ground.domain)
+                        .collect::<BTreeSet<_>>();
+                    [
+                        akzio_domain::ResearchShard::PriceMarketStructure,
+                        akzio_domain::ResearchShard::Macro,
+                        akzio_domain::ResearchShard::NewsEvent,
+                    ]
+                    .into_iter()
+                    .all(|domain| domains.contains(&domain))
+                });
+
+            let risk_calibration = policy.asset_calibrations.get(&asset);
+            let insufficient_samples = risk_calibration
+                .is_some_and(|calibration| calibration.sample_count < policy.min_calibration_samples);
+            let risk_calibration_ok = risk_calibration.is_some_and(|calibration| {
+                calibration.sample_count >= policy.min_calibration_samples
+                    && calibration.brier_score_ppm <= policy.max_brier_score_ppm
+            });
+            let forecast_calibration_ok = directional_forecast_present
+                && forecasts
+                    .iter()
+                    .filter(|forecast| forecast.asset == asset && !forecast.is_neutral())
+                    .all(|forecast| policy.calibrated_forecast(decision_at, forecast).is_some());
+            let calibration = risk_calibration_ok && forecast_calibration_ok;
+
+            let risk = risk_calibration_ok
+                && policy.portfolio_risk_model.sample_count >= policy.min_calibration_samples
+                && policy.portfolio_risk_model.max_expected_shortfall_ppm > 0
+                && policy.portfolio_risk_model.max_gap_loss_ppm > 0
+                && policy
+                    .portfolio_risk_model
+                    .covariance_ppm_squared
+                    .get(&asset)
+                    .and_then(|row| row.get(&asset))
+                    .is_some_and(|value| *value > 0)
+                && (portfolio_risk.risk_model_hash.is_some()
+                    || target.weights.values().all(|weight| weight.0 == 0));
+
+            let mut reasons = Vec::new();
+            if !directional_forecast_present {
+                reasons.push(DecisionEligibilityReason::NoDirectionalSignal);
+            } else {
+                if !directional_evidence {
+                    reasons.push(DecisionEligibilityReason::MissingEvidence);
+                }
+                if !claim_verified {
+                    reasons.push(DecisionEligibilityReason::UnverifiedClaim);
+                }
+                if risk_calibration.is_none() || !forecast_calibration_ok {
+                    reasons.push(DecisionEligibilityReason::MissingCalibration);
+                }
+                if insufficient_samples {
+                    reasons.push(DecisionEligibilityReason::InsufficientCalibrationSamples);
+                }
+            }
+            if !risk {
+                reasons.push(DecisionEligibilityReason::RiskUnknown);
+            }
+            if confidence_ppm < policy.min_confidence_ppm {
+                reasons.push(DecisionEligibilityReason::ConfidenceTooLow);
+            }
+            if horizon_trace
+                .conflicts
+                .iter()
+                .any(|conflict| conflict.asset == asset)
+            {
+                reasons.push(DecisionEligibilityReason::HorizonConflict);
+            }
+            if directional_forecast_present
+                && target.weights.get(&asset).is_none_or(|weight| weight.0 == 0)
+                && reasons.is_empty()
+            {
+                reasons.push(DecisionEligibilityReason::NoDirectionalSignal);
+            }
+            reasons.sort();
+            reasons.dedup();
+            let eligible = target.weights.get(&asset).is_some_and(|weight| weight.0 > 0)
+                && reasons.is_empty();
+            (
+                asset,
+                AssetEligibility {
+                    directional_evidence,
+                    claim_verified,
+                    calibration,
+                    risk,
+                    eligible,
+                    reasons,
+                },
+            )
+        })
+        .collect()
 }

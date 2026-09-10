@@ -71,13 +71,19 @@ fn initialize(connection: &mut Connection, root: &Path) -> StoreResult<()> {
         return Err(StoreError::IncompatibleStoreRoot(root.to_path_buf()));
     }
     match version.as_deref() {
-        None | Some("14") | Some("15") => {}
+        None | Some("14") | Some("15") | Some("16") => {}
         Some("13") => migration::migrate_v13_to_v14(connection, root)?,
         Some(_) => {
             return Err(StoreError::IncompatibleStoreRoot(PathBuf::from(
                 DATABASE_FILE,
             )));
         }
+    }
+    if version.as_deref().is_some_and(|v| v != "16") {
+        let active: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM rebuild_tasks WHERE status='running') OR EXISTS(SELECT 1 FROM rebuild_daemon_leases WHERE expires_at > ?1)",
+            params![Utc::now().to_rfc3339()], |row| row.get(0))?;
+        if active {return Err(StoreError::DebugControl("stop old workers and drain active leases before Store 16 migration".into()));}
     }
     connection.execute_batch(
         "BEGIN;
@@ -381,6 +387,19 @@ CREATE TABLE IF NOT EXISTS rebuild_observatory_configuration (
     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
     configuration_json BLOB NOT NULL
 );
+CREATE TABLE IF NOT EXISTS rebuild_debug_sessions (
+    run_id TEXT PRIMARY KEY REFERENCES rebuild_runs(run_id) ON DELETE CASCADE,
+    identity_artifact_id TEXT NOT NULL REFERENCES rebuild_artifacts(artifact_id),
+    runtime_identity TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('running','pause_requested','paused','stepping','completed','aborted')),
+    execution_mode TEXT NOT NULL CHECK(execution_mode IN ('manual','continuous')),
+    permitted_task_id TEXT REFERENCES rebuild_tasks(task_id),
+    active_attempt_id TEXT REFERENCES rebuild_attempts(attempt_id),
+    paused_at_task_id TEXT REFERENCES rebuild_tasks(task_id),
+    updated_at TEXT NOT NULL,
+    CHECK(permitted_task_id IS NULL OR (status = 'stepping' AND active_attempt_id IS NULL))
+);
 CREATE INDEX IF NOT EXISTS rebuild_tasks_claimable
     ON rebuild_tasks(status, ready_at, priority);
 CREATE INDEX IF NOT EXISTS rebuild_events_cursor
@@ -418,6 +437,10 @@ COMMIT;",
     // older initializer. Never infer or rewrite CAS/commitment payloads here.
     if version.as_deref() == Some("15") {
         connection.execute_batch("CREATE INDEX IF NOT EXISTS rebuild_artifacts_run_kind ON rebuild_artifacts (json_extract(origin_json, '$.run_id'), kind, created_at, artifact_id);")?;
+    }
+    if version.is_some() && version.as_deref() != Some("16") {
+        // Additive scheduling metadata only. Old workers reject v16 on reopen.
+        connection.execute("UPDATE rebuild_metadata SET value = '16' WHERE key = 'schema_version'", [])?;
     }
     Ok(())
 }

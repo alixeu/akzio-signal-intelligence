@@ -17,7 +17,13 @@ impl From<PurposeArg> for RunPurpose {
 
 impl ControlApiClient {
     pub(crate) fn from_config(config: &Config) -> Result<Self> {
-        Self::new(config.daemon.http_addr, daemon_token(&config.daemon)?)
+        // A read-only inspect must not create credentials or chmod a Store file.
+        let token = validate_daemon_token(
+            fs::read_to_string(daemon_token_path(&config.daemon))
+                .context("read existing daemon token; start the intended Core first")?,
+            "existing daemon token",
+        )?;
+        Self::new(config.daemon.http_addr, token)
     }
 
     pub(crate) fn new(address: SocketAddr, token: String) -> Result<Self> {
@@ -74,6 +80,74 @@ impl ControlApiClient {
     pub(crate) async fn health(&self) -> Result<DaemonHealth> {
         self.json(self.request(Method::GET, self.endpoint(&["health"])))
             .await
+    }
+
+    pub(crate) async fn debug_prepare(
+        &self,
+        value: &akzio_daemon::DebugPrepareRequest,
+    ) -> Result<serde_json::Value> {
+        self.json(
+            self.request(Method::POST, self.endpoint(&["v1", "debug", "runs"]))
+                .json(value),
+        )
+        .await
+    }
+    pub(crate) async fn debug_inspect(
+        &self,
+        run: &str,
+        task: Option<&str>,
+        attempt: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let mut url = self.endpoint(&["v1", "debug", "runs", run]);
+        if let Some(task) = task {
+            url.query_pairs_mut().append_pair("task", task);
+        }
+        if let Some(attempt) = attempt {
+            url.query_pairs_mut().append_pair("attempt", attempt);
+        }
+        self.json(self.request(Method::GET, url)).await
+    }
+    pub(crate) async fn debug_control(
+        &self,
+        run: &str,
+        value: &akzio_domain::DebugControlRequest,
+    ) -> Result<serde_json::Value> {
+        self.json(
+            self.request(
+                Method::POST,
+                self.endpoint(&["v1", "debug", "runs", run, "control"]),
+            )
+            .json(value),
+        )
+        .await
+    }
+    pub(crate) async fn debug_fork(
+        &self,
+        run: &str,
+        value: &akzio_daemon::DebugForkRequest,
+    ) -> Result<serde_json::Value> {
+        self.json(
+            self.request(
+                Method::POST,
+                self.endpoint(&["v1", "debug", "runs", run, "fork"]),
+            )
+            .json(value),
+        )
+        .await
+    }
+    pub(crate) async fn debug_acceptance(
+        &self,
+        run: &str,
+        value: &akzio_domain::StageAcceptance,
+    ) -> Result<serde_json::Value> {
+        self.json(
+            self.request(
+                Method::POST,
+                self.endpoint(&["v1", "debug", "runs", run, "acceptance"]),
+            )
+            .json(value),
+        )
+        .await
     }
 
     pub(crate) async fn ready(&self) -> Result<DaemonHealth> {
@@ -307,6 +381,24 @@ impl ControlApiClient {
                 "run_id": run_id,
                 "target": target,
                 "include_raw_model": include_raw_model,
+            })),
+        )
+        .await
+    }
+
+    pub(crate) async fn store_export_debug_bundle(
+        &self,
+        run_id: &str,
+        target: &Path,
+    ) -> Result<serde_json::Value> {
+        self.json(
+            self.request(
+                Method::POST,
+                self.endpoint(&["control", "store", "export-debug-bundle"]),
+            )
+            .json(&serde_json::json!({
+                "run_id": run_id,
+                "target": target,
             })),
         )
         .await

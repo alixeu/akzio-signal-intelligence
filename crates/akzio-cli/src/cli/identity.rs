@@ -1,3 +1,5 @@
+use akzio_execution::DecisionPolicyArtifact;
+
 fn configured_synthesizer_identity(model: &OpenAIResponsesConfig) -> Result<(String, ContentHash)> {
     let route = model.routes.get("research.synthesizer");
     let model_id = route
@@ -15,9 +17,23 @@ fn configured_synthesizer_identity(model: &OpenAIResponsesConfig) -> Result<(Str
     Ok((model_id, version_hash))
 }
 
-fn decision_policy_from_config(config: &Config, config_path: &Path) -> Result<DecisionPolicy> {
+#[derive(Debug, Clone)]
+struct LoadedDecisionPolicy {
+    policy: DecisionPolicy,
+    status: String,
+    input_hash: Option<ContentHash>,
+}
+
+fn load_decision_policy_from_config(
+    config: &Config,
+    config_path: &Path,
+) -> Result<LoadedDecisionPolicy> {
     let Some(policy_path) = config.execution.decision_policy_path.as_ref() else {
-        return Ok(DecisionPolicy::default());
+        return Ok(LoadedDecisionPolicy {
+            policy: DecisionPolicy::default(),
+            status: "unconfigured".to_owned(),
+            input_hash: None,
+        });
     };
     let resolved = if policy_path.is_absolute() {
         policy_path.clone()
@@ -29,11 +45,30 @@ fn decision_policy_from_config(config: &Config, config_path: &Path) -> Result<De
     };
     let bytes = fs::read(&resolved)
         .with_context(|| format!("read frozen decision policy {}", resolved.display()))?;
-    let policy: DecisionPolicy = serde_json::from_slice(&bytes)
+    let input_hash = ContentHash::of_bytes(&bytes);
+    let artifact = DecisionPolicyArtifact::decode_strict(&bytes)
         .with_context(|| format!("decode frozen decision policy {}", resolved.display()))?;
+    let policy = artifact.policy;
     policy
         .validate()
         .with_context(|| format!("validate frozen decision policy {}", resolved.display()))?;
+
+    let provider_id = artifact
+        .provenance
+        .provider_id
+        .as_deref()
+        .context("frozen decision policy has no provider identity")?;
+    if provider_id != OPENAI_RESPONSES_PROVIDER_ID {
+        bail!("frozen decision policy provider identity does not match OpenAI Responses");
+    }
+    let model_route = artifact
+        .provenance
+        .model_route
+        .as_deref()
+        .context("frozen decision policy has no model route identity")?;
+    if model_route != "research.synthesizer" {
+        bail!("frozen decision policy must be scoped to research.synthesizer");
+    }
 
     if let Some(scope) = &policy.active_forecast_calibration {
         let model = config
@@ -47,13 +82,32 @@ fn decision_policy_from_config(config: &Config, config_path: &Path) -> Result<De
             );
         }
     }
-    Ok(policy)
+    let status = decision_policy_status(&policy);
+    Ok(LoadedDecisionPolicy {
+        policy,
+        status: status.to_owned(),
+        input_hash: Some(input_hash),
+    })
+}
+
+fn decision_policy_audit(loaded: &LoadedDecisionPolicy) -> (String, Option<ContentHash>) {
+    (loaded.status.clone(), loaded.input_hash.clone())
 }
 
 fn runtime_identity_from_config(
     config: &Config,
     config_path: &Path,
     model_capabilities: &ModelCapabilityProbeSet,
+) -> Result<RuntimeIdentity> {
+    let loaded = load_decision_policy_from_config(config, config_path)?;
+    runtime_identity_from_config_with_policy(config, config_path, model_capabilities, &loaded.policy)
+}
+
+fn runtime_identity_from_config_with_policy(
+    config: &Config,
+    config_path: &Path,
+    model_capabilities: &ModelCapabilityProbeSet,
+    decision_policy: &DecisionPolicy,
 ) -> Result<RuntimeIdentity> {
     let model = config
         .model
@@ -64,8 +118,7 @@ fn runtime_identity_from_config(
         .market_data_feed
         .context("Paper runtime requires execution.market_data_feed")?;
     let provider_id = model.provider_identity().as_str().to_owned();
-    let decision_policy = decision_policy_from_config(config, config_path)?;
-    let policy_identity = runtime_policy_identity(&decision_policy)?;
+    let policy_identity = runtime_policy_identity(decision_policy)?;
     model_capabilities.validate_for_config(model)?;
     let mut model_capability_hashes = BTreeMap::from([(
         "default".to_owned(),
@@ -272,6 +325,7 @@ fn validate_model_settings(model: &OpenAIResponsesConfig) -> Result<()> {
                 | "research.critic"
                 | "research.synthesizer"
                 | "learning.outcome_worker"
+                | "evidence.news_web"
         ) {
             bail!("unsupported model route {purpose}");
         }
@@ -359,6 +413,7 @@ fn apply_config_environment(config: &Config) {
 
 fn load_config(path: &Path) -> Result<Config> {
     let mut config = read_config_file(path)?;
+    config.agent.budget.validate().context("invalid agent.budget configuration")?;
     if let Some(model) = config.model.as_mut() {
         model.base_url = resolve_env_placeholder(&model.base_url, "model.base_url")?;
         model.api_key = resolve_env_placeholder(&model.api_key, "model.api_key")?;
@@ -388,6 +443,7 @@ fn load_config(path: &Path) -> Result<Config> {
                     | "research.critic"
                     | "research.synthesizer"
                     | "learning.outcome_worker"
+                    | "evidence.news_web"
             ) {
                 bail!("unsupported model route {purpose}");
             }
@@ -519,4 +575,170 @@ fn load_config(path: &Path) -> Result<Config> {
         }
     }
     Ok(config)
+}
+
+#[cfg(test)]
+mod agent_budget_config_tests {
+
+    #[test]
+    fn budget_toml_defaults_role_override_and_million_input() {
+        let absent: akzio_domain::AgentSettings = toml::from_str("").unwrap();
+        for (purpose, output, timeout) in [
+            ("research.planner", 2000, 120),
+            ("research.analyst", 6000, 120),
+            ("research.critic", 4000, 120),
+            ("research.synthesizer", 5000, 120),
+            ("learning.outcome_worker", 4000, 180),
+        ] {
+            assert_eq!(
+                absent.budget.resolve(purpose).unwrap(),
+                akzio_domain::TaskBudget {
+                    max_input_tokens: 1_000_000,
+                    max_output_tokens: output,
+                    max_tool_calls: akzio_domain::budget::ToolCallLimit::Unlimited,
+                    max_wall_time_secs: timeout,
+                }
+            );
+        }
+        let root: super::Config = toml::from_str(
+            r#"
+[daemon]
+store_root = ".akzio/budget-config-test"
+http_addr = "127.0.0.1:17342"
+[execution]
+assets = ["TQQQ", "QQQ", "SOXX", "SOXL"]
+[agent.budget.analyst]
+max_input_tokens = 1000000
+"#,
+        )
+        .unwrap();
+        root.agent.budget.validate().unwrap();
+        assert_eq!(
+            root.agent
+                .budget
+                .resolve("research.analyst")
+                .unwrap()
+                .max_input_tokens,
+            1_000_000
+        );
+        let config: akzio_domain::AgentSettings = toml::from_str(
+            r#"
+[budget.default]
+max_output_tokens = 7000
+[budget.analyst]
+max_input_tokens = 1000000
+max_output_tokens = 12000
+max_tool_calls = 8
+timeout_seconds = 180
+"#,
+        )
+        .unwrap();
+        config.budget.validate().unwrap();
+        let analyst = config.budget.resolve("research.analyst").unwrap();
+        assert_eq!(
+            analyst,
+            akzio_domain::TaskBudget {
+                max_input_tokens: 1_000_000,
+                max_output_tokens: 12000,
+                max_tool_calls: akzio_domain::budget::ToolCallLimit::Limited(8),
+                max_wall_time_secs: 180,
+            }
+        );
+        let critic = config.budget.resolve("research.critic").unwrap();
+        assert_eq!(critic.max_input_tokens, 1_000_000);
+        assert_eq!(critic.max_output_tokens, 7000);
+        assert_eq!(
+            critic.max_tool_calls,
+            akzio_domain::budget::ToolCallLimit::Unlimited
+        );
+        assert_eq!(critic.max_wall_time_secs, 120);
+    }
+
+    #[test]
+    fn role_can_select_unlimited_or_a_finite_tool_limit() {
+        use akzio_domain::budget::ToolCallLimit;
+        let settings: akzio_domain::AgentSettings = toml::from_str(
+            r#"
+[budget.default]
+max_tool_calls = 4
+[budget.analyst]
+max_tool_calls = "unlimited"
+[budget.synthesizer]
+max_tool_calls = 0
+"#,
+        )
+        .unwrap();
+        settings.budget.validate().unwrap();
+        assert_eq!(
+            settings
+                .budget
+                .resolve("research.analyst")
+                .unwrap()
+                .max_tool_calls,
+            ToolCallLimit::Unlimited
+        );
+        assert_eq!(
+            settings
+                .budget
+                .resolve("research.critic")
+                .unwrap()
+                .max_tool_calls,
+            ToolCallLimit::Limited(4)
+        );
+        assert_eq!(
+            settings
+                .budget
+                .resolve("research.synthesizer")
+                .unwrap()
+                .max_tool_calls,
+            ToolCallLimit::Limited(0)
+        );
+        let defaults: akzio_domain::AgentSettings = toml::from_str(
+            r#"[budget.default]
+max_input_tokens = 1000000
+max_tool_calls = "unlimited"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            defaults.budget.resolved(),
+            akzio_domain::AgentBudgetConfig::default().resolved()
+        );
+    }
+
+    #[test]
+    fn invalid_agent_budgets_fail_before_startup() {
+        for entry in [
+            "max_input_tokens = -1",
+            "max_input_tokens = 4294967296",
+            "max_tool_calls = 65536",
+            "max_tool_calls = -1",
+            "max_tool_calls = 'infinite'",
+            "timeout_seconds = -1",
+            "max_output_tokens = 1.5",
+            "max_input_tokens = 'many'",
+            "unknown_limit = 12",
+        ] {
+            assert!(
+                toml::from_str::<akzio_domain::AgentSettings>(&format!(
+                    "[budget.analyst]\n{entry}"
+                ))
+                .is_err(),
+                "{entry}"
+            );
+        }
+        for entry in [
+            "max_input_tokens = 0",
+            "max_output_tokens = 0",
+            "timeout_seconds = 0",
+        ] {
+            let settings: akzio_domain::AgentSettings =
+                toml::from_str(&format!("[budget.default]\n{entry}")).unwrap();
+            assert!(settings.budget.validate().is_err(), "{entry}");
+        }
+        assert!(toml::from_str::<akzio_domain::AgentSettings>(
+            "[budget.gpt_model]\nmax_input_tokens=1000"
+        )
+        .is_err());
+    }
 }

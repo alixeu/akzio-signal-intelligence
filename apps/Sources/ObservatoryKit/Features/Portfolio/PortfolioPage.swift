@@ -26,7 +26,7 @@ struct PortfolioPage: View {
                         HStack(alignment: .top, spacing: AkzioLayout.s4) {
                             curveCard
                             VStack(alignment: .leading, spacing: AkzioLayout.s4) {
-                                AllocationBars(rows: portfolio.allocations)
+                                AllocationBars(rows: portfolio.allocations, subtitle: portfolio.allocationSubtitle)
                                 RiskPanel(risk: portfolio.risk)
                             }
                             .frame(width: AkzioLayout.rightRailWidth)

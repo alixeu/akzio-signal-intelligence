@@ -6,9 +6,9 @@ impl Daemon {
         request: PaperApprovalRequest,
     ) -> Result<PaperApprovalResponse> {
         request.identity.validate()?;
-        if !self.paper.auto_paper {
+        if !self.paper.auto_paper && !self.debug_enabled() {
             return Err(DaemonError::InvalidInput(
-                "Paper approval requires auto_paper=true".to_owned(),
+                "Paper approval requires Paper scheduling or an isolated Debug Core".to_owned(),
             ));
         }
         let expected_identity_hash =
@@ -181,10 +181,62 @@ impl Daemon {
             .await?
     }
 
+    pub(crate) fn prepare_position_plan(
+        &self,
+        session_key: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(akzio_store::WorkflowCommit, Vec<Artifact>)> {
+        let run_id = RunId::new();
+        let setup = self
+            .paper
+            .scheduler
+            .paper_snapshot_artifacts(&run_id, session_key, now)?
+            .into_iter()
+            .map(|a| {
+                let need: EvidenceNeed = serde_json::from_slice(&self.store.read_blob(&a.blob)?)?;
+                Ok((a, need))
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|(_, need)| {
+                need.criticality() != akzio_domain::EvidenceCriticality::ExecutionSafety
+            })
+            .map(|(a, _)| a)
+            .collect::<Vec<_>>();
+        let dataset = setup
+            .iter()
+            .map(|a| ArtifactRef {
+                artifact_id: a.artifact_id.clone(),
+                kind: a.kind,
+            })
+            .collect::<Vec<_>>();
+        let mut proposal = self
+            .workflow
+            .approved_research_proposal("paper.approved.v1")?;
+        for task in proposal
+            .tasks
+            .values_mut()
+            .filter(|t| t.recipe_id.as_str() == akzio_domain::RESEARCH_ANALYST_RECIPE_ID)
+        {
+            task.evidence_needs = dataset.clone();
+        }
+        let graph = self.workflow.lower(RunPurpose::PositionPlan, &proposal)?;
+        Ok((
+            self.workflow
+                .prepare_workflow_commit(run_id, RunPurpose::PositionPlan, graph, now)?,
+            setup,
+        ))
+    }
+
     /// Paper sessions are scheduler-owned and require a frozen session slot.
     /// The R5 daemon does not construct one directly, so this public submit
     /// surface rejects Paper before any workflow or broker side effect.
     pub fn submit_default(&self, purpose: RunPurpose) -> Result<RunId> {
+        if self.debug_enabled() {
+            return Err(DaemonError::InvalidInput(
+                "use debug prepare on an isolated Debug Core".into(),
+            ));
+        }
         match purpose {
             RunPurpose::Debug | RunPurpose::PositionPlan | RunPurpose::PaperDryRun => {}
             RunPurpose::Paper => {
@@ -200,6 +252,16 @@ impl Daemon {
             }
         }
 
+        if purpose == RunPurpose::PositionPlan {
+            let now = Utc::now();
+            let session_key = now
+                .with_timezone(&chrono_tz::America::New_York)
+                .date_naive()
+                .to_string();
+            let (workflow, setup) = self.prepare_position_plan(&session_key, now)?;
+            self.store.commit_position_plan(&workflow, &setup)?;
+            return Ok(workflow.run.run_id);
+        }
         let run_id = RunId::new();
         let graph = self.workflow.bootstrap(purpose, "active")?;
         self.workflow

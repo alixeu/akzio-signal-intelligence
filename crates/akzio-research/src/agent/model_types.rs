@@ -43,6 +43,8 @@ pub struct AgentModelRequest {
     pub tool_outputs: Vec<ModelToolOutput>,
     pub continuation_instruction: Option<String>,
     pub max_output_tokens: u32,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     pub tools: Vec<AgentToolDefinition>,
     pub terminal: Option<AgentTerminalDefinition>,
 }
@@ -57,6 +59,14 @@ pub struct AgentToolDefinition {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentTurnTelemetry {
+    #[serde(default)]
+    pub provider_request_id: Option<String>,
+    #[serde(default)]
+    pub response_id: Option<String>,
+    #[serde(default)]
+    pub requested_model: Option<String>,
+    #[serde(default)]
+    pub actual_model: Option<String>,
     pub latency_millis: u64,
     pub input_tokens: Option<u64>,
     #[serde(default)]
@@ -68,6 +78,8 @@ pub struct AgentTurnTelemetry {
 
 #[derive(Debug, Clone)]
 struct AgentTurnRuntimeSnapshot {
+    resolved_budget: TaskBudget,
+    budget_usage: Value,
     capability: ModelCapabilitySnapshot,
     capability_hash: akzio_domain::ContentHash,
     budget_policy: ModelBudgetPolicy,
@@ -296,6 +308,7 @@ impl AgentModel for ModelClientAdapter {
                 instructions: request.prompt,
                 input,
                 max_output_tokens: request.max_output_tokens,
+                reasoning_effort: request.reasoning_effort,
                 tools,
                 tool_choice,
                 fixture_key: Some(request.purpose),
@@ -314,6 +327,10 @@ impl AgentModel for ModelClientAdapter {
                     model_client_error(error, trace)
                 })?;
         let telemetry = AgentTurnTelemetry {
+            provider_request_id: response.provider_request_id.clone(),
+            response_id: response.raw.get("id").and_then(Value::as_str).map(str::to_owned),
+            requested_model: response.request_body.get("model").and_then(Value::as_str).map(str::to_owned),
+            actual_model: response.raw.get("model").and_then(Value::as_str).map(str::to_owned),
             latency_millis: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             input_tokens: response.usage.input_tokens,
             cached_input_tokens: response.usage.cached_input_tokens,

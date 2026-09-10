@@ -296,6 +296,9 @@ pub struct WorkflowNode {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowGraph {
+    /// Frozen at Run creation; empty on legacy graphs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agent_budgets: BTreeMap<String, TaskBudget>,
     pub schema_version: u32,
     pub topology_id: String,
     pub nodes: Vec<WorkflowNode>,
@@ -303,6 +306,14 @@ pub struct WorkflowGraph {
 
 impl WorkflowGraph {
     pub fn validate(&self) -> Result<(), DomainError> {
+        for (purpose, budget) in &self.agent_budgets {
+            if crate::budget::default_agent_budget(purpose).is_none() {
+                return Err(DomainError::EmptyField {
+                    field: "workflow_graph.agent_budgets.role",
+                });
+            }
+            budget.validate()?;
+        }
         if self.schema_version != SCHEMA_VERSION || self.topology_id.trim().is_empty() {
             return Err(DomainError::EmptyField {
                 field: "workflow_graph.identity",
