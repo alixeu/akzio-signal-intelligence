@@ -478,6 +478,9 @@ fn paper_need_source_family(resource: &str) -> &'static str {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceAcquisitionMode {
+    /// Hosted search plus an independent model source review. Provider
+    /// attribution and semantic review remain distinct from HTTP snapshots.
+    ModelReviewed,
     /// One provider search, no independent fetch. The result may carry provider
     /// attribution only and can never present itself as a source document.
     DiscoveryOnly,
@@ -489,6 +492,7 @@ pub enum EvidenceAcquisitionMode {
 impl EvidenceAcquisitionMode {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::ModelReviewed => "model_reviewed",
             Self::DiscoveryOnly => "discovery_only",
             Self::VerifiedSource => "verified_source",
         }
@@ -502,27 +506,31 @@ impl EvidenceAcquisitionMode {
 /// Identity of the acquisition mapping below. It is persisted next to acquired
 /// evidence so a later canonical consumer can detect that the policy changed
 /// instead of silently re-deriving a mode with newer code.
-pub const EVIDENCE_ACQUISITION_POLICY_VERSION: u32 = 2;
+pub const EVIDENCE_ACQUISITION_POLICY_VERSION: u32 = 4;
 
 /// Rust-owned acquisition policy. Neither model output, citation JSON, nor tool
 /// arguments participate: the mode is a function of the run purpose and the
 /// committed `EvidenceNeed` alone, so a model cannot promote `DiscoveryOnly`
 /// into `VerifiedSource`.
 pub fn evidence_acquisition_mode(
-    purpose: RunPurpose,
+    _purpose: RunPurpose,
     need: &EvidenceNeed,
 ) -> EvidenceAcquisitionMode {
     if need.source_family != "news_web" {
         return EvidenceAcquisitionMode::VerifiedSource;
     }
-    match purpose {
-        RunPurpose::Paper => EvidenceAcquisitionMode::VerifiedSource,
-        RunPurpose::Debug
-        | RunPurpose::PositionPlan
-        | RunPurpose::PaperDryRun
-        | RunPurpose::Replay
-        | RunPurpose::Shadow => EvidenceAcquisitionMode::DiscoveryOnly,
+    // The `research:*` namespace is issuer-owned direct material even though
+    // its historical source_family remains `news_web`. Keep it independent of
+    // provider-mediated recent-news discovery and bind it to a verified
+    // source-document closure in the new run.
+    if need.resource.starts_with("research:")
+        && !need
+            .resource
+            .starts_with("research:earnings_event_calendar:")
+    {
+        return EvidenceAcquisitionMode::VerifiedSource;
     }
+    EvidenceAcquisitionMode::ModelReviewed
 }
 
 /// Hash the policy version together with the complete purpose-by-family
@@ -552,6 +560,18 @@ pub fn evidence_acquisition_policy_hash() -> ContentHash {
                 evidence_acquisition_mode(purpose, &need).as_str()
             ));
         }
+    }
+    let issuer_probe = EvidenceNeed {
+        schema_version: SCHEMA_VERSION,
+        source_family: "news_web".to_owned(),
+        resource: "research:etf_holdings:QQQ:2026-09-14".to_owned(),
+        max_age_secs: 1,
+    };
+    for purpose in PURPOSES {
+        identity.push_str(&format!(
+            "|news_web:issuer_direct:{purpose:?}={}",
+            evidence_acquisition_mode(purpose, &issuer_probe).as_str()
+        ));
     }
     ContentHash::of_bytes(identity.as_bytes())
 }

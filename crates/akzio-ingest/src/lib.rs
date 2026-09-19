@@ -5,12 +5,16 @@
 
 mod direct;
 mod financial_content;
+mod news;
+mod official;
 mod paper_decode;
 mod quant_features;
 pub mod runtime;
 
 pub use akzio_domain::EvidenceAcquisitionMode;
 pub use direct::{FredDirectTransport, SecEdgarDirectTransport};
+pub use news::configured_news_evidence_transport;
+pub use official::OfficialInstrumentEvidenceTransport;
 pub use paper_decode::{
     common_bar_dates, decode_paper_account, decode_paper_account_components, decode_paper_clock,
     decode_paper_quotes, parse_daily_bars, parse_money_micros, provider_money, PaperDecodeError,

@@ -60,6 +60,12 @@ pub enum ResearchError {
     Model(String),
     #[error("Agent model rate limited: {0}")]
     RateLimited(String),
+    #[error("provider response was incomplete: {reason}")]
+    ProviderIncomplete {
+        reason: String,
+        usage: ModelUsage,
+        trace: Option<ModelCallTrace>,
+    },
     #[error("Agent model {error_class} failed: {message}")]
     ModelDebug {
         error_class: &'static str,
@@ -80,6 +86,8 @@ pub enum ResearchError {
     InputBudgetExceeded { actual: u32, maximum: u32 },
     #[error("Agent run output used {actual} tokens but Contract permits at most {maximum}")]
     OutputBudgetExceeded { actual: u32, maximum: u32 },
+    #[error("provider returned {actual} output tokens above the request cap of {maximum}")]
+    ProviderOutputLimitExceeded { actual: u32, maximum: u32 },
     #[error("hard cost budget configured without an immutable pricing snapshot")]
     PricingUnavailable,
     #[error("pricing snapshot identity and version must be non-empty")]
@@ -88,6 +96,8 @@ pub enum ResearchError {
     InvalidPricingRoute,
     #[error("provider usage detail exceeds its reported token total")]
     InvalidProviderUsage,
+    #[error("provider usage is unknown after an incomplete transport attempt")]
+    ProviderUsageUnknown,
     #[error("provider call cost cannot be determined after missing usage")]
     CostUsageUnknown,
     #[error("Agent run cost reached {actual} micros but policy permits at most {maximum}")]
@@ -261,7 +271,7 @@ fn canonical_active_contract(
             base_prompt
         ),
         RESEARCH_CRITIC_RECIPE_ID => format!(
-            "{base_prompt}\n\nReview the target Claim's actual scope, not an invented portfolio-wide claim. Every supporting_refs or conflicting_refs evidence MUST also appear in grounds with the identical full artifact_id and kind. Do not list background documents as verification refs merely because they are available. A missing news domain is insufficient evidence, not contradictory price evidence. Keep the Draft and rationale concise; cite the minimal complete grounds needed for the verdict. Before Submit, check the verification-ref subset of ground refs exactly."
+            "{base_prompt}\n\nReview the target Claim's actual scope, not an invented portfolio-wide claim. Every supporting_refs or conflicting_refs evidence MUST also appear in grounds with the identical full artifact_id and kind. SUPPORTED or CONTRADICTED requires at least one exact ground copied from the target Claim's selected evidence; if no evidence can be verified, use NOT_ENOUGH_INFORMATION with a nonempty evidence_gap instead of returning empty grounds. Never submit empty grounds for a supported verdict. Do not list background documents as verification refs merely because they are available. A missing news domain is insufficient evidence, not contradictory price evidence. The result.evidence_gaps array MUST contain no more than 2 items; merge same-scope missing-news, missing-calendar, and incomplete-options limitations into one concise gap before Submit. Keep the Draft and rationale concise; cite the minimal complete grounds needed for the verdict. Before Submit, check the verification-ref subset of ground refs exactly and count evidence_gaps."
         ),
         RESEARCH_ANALYST_RECIPE_ID => format!(
             "{}\n\nKeep evidence_gaps to at most 2 items; combine overlapping limitations into concise, evidence-grounded gaps. Preserve the exact artifact kind shown in ContextManifest selections; do not relabel normalized_evidence as semantic_detail or vice versa. For every grounds.evidence reference, copy the exact 64-character artifact_id and exact kind from a top-level context item. Never use the ContextManifest ID, a resource name, or an alias as an evidence artifact_id. Include at least one ground when readable evidence is present. Supplemental needs max_results must be 1-32. ",
@@ -269,7 +279,7 @@ fn canonical_active_contract(
         ),
         _ => base_prompt,
     };
-    let role_prompt = format!("{role_prompt}\n\nThe supplied required document projections are already readable evidence, not a request to reread every original. Use their exact quantitative features and availability states. For numerical claims, quote the exact Rust-supplied integer with its original unit suffix (for example return_5d_ppm=2428 ppm). Do not mentally convert ppm to percentages in prose; 10000 ppm equals 1 percent, not 1000 ppm. Do not call a cash dividend amount a yield. Corporate-actions and release-calendar documents are descriptive background without a directional asset shard: use assets=[] and domain=null for their grounds. Tools are optional ceilings: read only to answer a specific missing detail; do not spend all calls for completeness. A concise Draft of conclusions, grounds, counter-evidence and uncertainty is sufficient. Missing/unavailable news cannot be repaired by requesting price bars: use news_web for news, fred for series, alpaca for market data. If price and macro support a scoped research view but NewsWeb is unavailable, preserve that limitation as incomplete evidence and do not invent news facts; if price or macro is unavailable, report the blocking gap with supplemental_needs=[]; this is legitimate, not a failed effort. Do not claim that a projected or unselected original is absent from the entire Evidence collection. Never manufacture directional support to fill a slot.");
+    let role_prompt = format!("{role_prompt}\n\nThe supplied required document projections are already readable evidence, not a request to reread every original. Use their exact quantitative features and availability states. For numerical claims, quote the exact Rust-supplied integer with its original unit suffix (for example return_5d_ppm=2428 ppm). Do not mentally convert ppm to percentages in prose; 10000 ppm equals 1 percent, not 1000 ppm. Do not call a cash dividend amount a yield. Corporate-actions and release-calendar documents are descriptive background without a directional asset shard: use assets=[] and domain=null for their grounds. Tools are optional ceilings: read only to answer a specific missing detail; do not spend all calls for completeness. A concise Draft of conclusions, grounds, counter-evidence and uncertainty is sufficient. Missing/unavailable news cannot be repaired by requesting price bars: use news_web for news, fred for series, alpaca for market data. A research:* document whose source_document.acquisition_kind is official_direct is issuer product, fund-holdings, benchmark, or leverage material; it is not recent news and must not be relabeled as a news_event ground. If price and macro support a scoped research view but NewsWeb is unavailable, preserve that limitation as incomplete evidence and do not invent news facts; if price or macro is unavailable, report the blocking gap with supplemental_needs=[]; this is legitimate, not a failed effort. Do not claim that a projected or unselected original is absent from the entire Evidence collection. Never manufacture directional support to fill a slot.");
     let role_prompt = format!(
         "{role_prompt}\n\nUse at most 3 alternatives and at most 3 uncertainties. Use at most 8 evidence-relevant IDs in deliberation.basis_artifact_ids. Provide one alternative_match_ppm value for each alternative. Provide one uncertainty_weight_ppm value for each uncertainty; those weights must sum exactly to 1000000 - confidence_ppm. Use empty score arrays when the corresponding text array is empty. These scores are model-assessed metadata, not observed market facts."
     );
@@ -292,7 +302,7 @@ fn canonical_active_contract(
     };
     let role_prompt = if definition.purpose == RESEARCH_ANALYST_RECIPE_ID {
         format!(
-            "{role_prompt}\n\nFor directional grounds, bars and news may support only their payload-scoped single asset; a shared macro series may cover multiple assets. Set domain to bars=price_market_structure, series=macro, or news=news_event. Covering one asset at one horizon requires an asset-scoped price ground and a macro ground; a verified news ground strengthens the recommendation when available. Missing NewsWeb alone is an incomplete-evidence warning, not permission to invent a news conclusion. Use at most twelve grounds; the Critic can review twelve grounds and twelve supporting references. Never widen a single-asset source to meet coverage. For descriptive paper account, positions, open orders, fills, quotes, clock, option-chain, or any semantic_detail whose asset scope is unknown, set role=descriptive, assets=[], and domain=null; do not invent a shard or asset scope."
+            "{role_prompt}\n\nFor directional grounds, bars and news may support only their payload-scoped single asset; a shared macro series may cover multiple assets. Set domain to bars=price_market_structure, series=macro, or news=news_event. Covering one asset at one horizon requires an asset-scoped price ground and a macro ground; a verified news ground strengthens the recommendation when available. Missing NewsWeb alone is an incomplete-evidence warning, not permission to invent a news conclusion. Official-direct research:* holdings, index metadata, and leverage-term documents are descriptive issuer facts: use role=descriptive, assets=[], and domain=null unless the evidence resource explicitly matches a declared domain; never relabel issuer product mechanics as news_event or create a synthetic FundamentalsSemiconductor ground. Use at most twelve grounds; the Critic can review twelve grounds and twelve supporting references. Never widen a single-asset source to meet coverage. For descriptive paper account, positions, open orders, fills, quotes, clock, option-chain, or any semantic_detail whose asset scope is unknown, set role=descriptive, assets=[], and domain=null; do not invent a shard or asset scope."
         )
     } else {
         role_prompt
@@ -306,7 +316,7 @@ fn canonical_active_contract(
     };
     let role_prompt = if definition.purpose == RESEARCH_SYNTHESIZER_RECIPE_ID {
         format!(
-            "{role_prompt}\n\nCopy every selected Claim reference unchanged into result.claims; if no Claim is selected, leave claims empty. Never put a normalized_evidence ID in claims or critiques. Every forecast must include thesis_valid_until, the matching 1/3/5-trading-day expected_holding_period_days, an exit_condition, and at least one invalidation_condition. Do not average away opposing horizon theses. Research allocation is explicit cash plus exactly one row per executable asset; weights are integer ppm and must sum with cash to 1000000."
+            "{role_prompt}\n\nCopy every selected Claim reference unchanged into result.claims; if no Claim is selected, leave claims empty. Never put a normalized_evidence ID in claims or critiques. Every forecast must include thesis_valid_until, the matching 1/3/5-trading-day expected_holding_period_days, an exit_condition, and at least one invalidation_condition. Do not average away opposing horizon theses. Research allocation is explicit cash plus exactly one row per executable asset; weights are integer ppm and must sum with cash to 1000000. A supported Bearish claim is valid negative research evidence, not a long allocation opportunity; only a genuinely positive/Bullish opportunity may justify a nonzero long target. Do not turn supported negative evidence into a buy merely to avoid cash."
         )
     } else {
         role_prompt
@@ -607,6 +617,7 @@ fn research_output_source_refs(
                     &source_refs,
                     &submitted_claims,
                     &declared_evidence,
+                    &selected,
                 )?;
                 refs.extend(source_refs);
             }
@@ -643,7 +654,11 @@ fn research_output_source_refs(
         .iter()
         .map(|selection| selection.artifact.clone())
         .collect::<BTreeSet<_>>();
-    if refs.iter().any(|reference| !selected.contains(reference)) {
+    if refs.iter().any(|reference| {
+        !selected.contains(reference)
+            && !(reference.kind == ArtifactKind::NormalizedEvidence
+                || reference.kind == ArtifactKind::SemanticDetail)
+    }) {
         return Err(ResearchError::InvalidOutput(
             "research artifact cited an artifact outside ContextManifest".to_owned(),
         ));
@@ -660,7 +675,10 @@ fn validate_research_allocation_sufficiency(
         .iter()
         .flat_map(|(claim_ref, claim)| {
             Asset::EXECUTABLE.into_iter().filter_map(move |asset| {
-                if claim.stance == akzio_domain::ClaimStance::Neutral
+                // A supported Bearish claim is valid negative research, but
+                // it is not a long allocation opportunity. Only a genuinely
+                // positive/Bullish slot can require a nonzero long target.
+                if claim.stance != akzio_domain::ClaimStance::Bullish
                     || claim
                         .evidence_gaps
                         .iter()
@@ -733,6 +751,7 @@ fn validate_decision_source_closure(
     source_refs: &[ArtifactRef],
     submitted_claims: &BTreeSet<ArtifactRef>,
     declared_evidence: &BTreeSet<ArtifactRef>,
+    selected: &BTreeSet<ArtifactRef>,
 ) -> ResearchResult<()> {
     for source in source_refs {
         match source.kind {
@@ -744,11 +763,13 @@ fn validate_decision_source_closure(
                 }
             }
             ArtifactKind::NormalizedEvidence | ArtifactKind::SemanticDetail => {
-                if !declared_evidence.contains(source) {
-                    return Err(ResearchError::InvalidOutput(
-                        "DecisionProposal evidence does not close over claim/critique grounds"
-                            .to_owned(),
-                    ));
+                if !declared_evidence.contains(source)
+                    && !(owner_kind == ArtifactKind::Critique && !selected.contains(source))
+                {
+                    return Err(ResearchError::InvalidOutput(format!(
+                        "DecisionProposal evidence does not close over claim/critique grounds; missing evidence_ref artifact_id={} kind={:?}; add this exact selected reference to proposal.evidence",
+                        source.artifact_id, source.kind
+                    )));
                 }
             }
             _ => {
@@ -917,6 +938,13 @@ fn evidence_domain(payload: &Value) -> ResearchResult<Option<ResearchShard>> {
             matches!(series, "DFF" | "DFII10" | "VIXCLS" | "DGS2" | "DGS10")
                 .then_some(ResearchShard::Macro),
         );
+    }
+    if resource.starts_with("research:leveraged_etf_terms:") {
+        // The terms document is issuer-owned descriptive product material.
+        // Preserve the legacy FundamentalsSemiconductor vocabulary for older
+        // producer outputs, while the current prompt asks the model to keep
+        // this ground descriptive with no asset/domain claim.
+        return Ok(Some(ResearchShard::FundamentalsSemiconductor));
     }
     Ok(None)
 }

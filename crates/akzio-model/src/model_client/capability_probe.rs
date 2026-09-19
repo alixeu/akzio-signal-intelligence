@@ -157,9 +157,9 @@ async fn probe_native_web_tool(
     let request = ModelRequest {
         instructions: "Use the Rust-approved native web search once and return the source URLs.".to_owned(),
         input: ModelInput::Fresh {
-            text: "Search for one recent Reuters article about QQQ.".to_owned(),
+            text: "Find the official FRED VIXCLS series page at fred.stlouisfed.org and cite its URL.".to_owned(),
         },
-        max_output_tokens: 256,
+        max_output_tokens: 1000,
         reasoning_effort: None,
         tools: vec![policy.tool_definition()],
         // A capability probe must test the hosted tool itself. `auto` is
@@ -329,7 +329,7 @@ fn safe_model_error(error: &ModelError) -> Value {
         }
         ModelError::CapabilityProbe(_) => json!({"kind": "capability_probe"}),
         ModelError::Refused(_) => json!({"kind": "refused"}),
-        ModelError::Incomplete(_) => json!({"kind": "incomplete"}),
+        ModelError::Incomplete { .. } => json!({"kind": "incomplete"}),
         ModelError::MissingOutput => json!({"kind": "missing_output"}),
         ModelError::FixtureExhausted => json!({"kind": "fixture_exhausted"}),
         ModelError::EmptyBaseUrl
@@ -417,6 +417,14 @@ mod capability_audit_tests {
         let body = openai_responses_request_body("gpt-test", "low", &request);
         assert_eq!(body["tool_choice"], "required");
         assert_eq!(body["tools"][0]["type"], NATIVE_WEB_SEARCH_TOOL);
+        assert!(body["include"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| {
+                item == "web_search_call.action.sources"
+            })));
+        assert!(body["tools"][0]["filters"]["allowed_domains"]
+            .as_array()
+            .is_some_and(|domains| domains.iter().any(|domain| domain == "reuters.com")));
     }
 
     #[test]

@@ -265,6 +265,26 @@ fn recipe_evidence_sources(contract: &akzio_domain::AgentContract) -> BTreeSet<S
         .collect()
 }
 
+#[cfg(test)]
+mod news_acquisition_budget_tests {
+    use super::*;
+
+    #[test]
+    fn evidence_recipe_can_complete_two_hosted_model_calls_with_a_finite_deadline() {
+        let (recipes, terminals) = rust_terminal_recipes().unwrap();
+        let evidence = recipes
+            .iter()
+            .find(|recipe| recipe.recipe_id == terminals.evidence_gate)
+            .unwrap();
+        assert_eq!(evidence.budget.max_wall_time_secs, 180);
+        let execution = recipes
+            .iter()
+            .find(|recipe| recipe.recipe_id == terminals.execution_gate)
+            .unwrap();
+        assert_eq!(execution.budget.max_wall_time_secs, 90);
+    }
+}
+
 pub fn rust_terminal_recipes() -> RuntimeResult<(Vec<TaskRecipe>, TerminalRecipeSet)> {
     let evidence = rust_gate_recipe(EVIDENCE_GATE_RECIPE_ID, RuntimeTaskClass::Evidence)?;
     let decision = rust_gate_recipe(DECISION_GATE_RECIPE_ID, RuntimeTaskClass::DecisionGate)?;
@@ -304,7 +324,13 @@ fn rust_gate_recipe(recipe_id: &str, task_class: RuntimeTaskClass) -> RuntimeRes
         },
         _ => RetryPolicy::none(),
     };
-    let max_wall_time_secs = if task_class == RuntimeTaskClass::ExecutionGate {
+    let max_wall_time_secs = if task_class == RuntimeTaskClass::Evidence {
+        // News acquisition contains hosted discovery followed by a separate
+        // source review. The old 30s system-task deadline cancelled this path
+        // before reviewed evidence could be materialized. Keep a finite outer
+        // bound; existing workflow graphs retain their frozen budgets.
+        180
+    } else if task_class == RuntimeTaskClass::ExecutionGate {
         90
     } else {
         30

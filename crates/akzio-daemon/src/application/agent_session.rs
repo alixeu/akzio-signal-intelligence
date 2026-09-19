@@ -190,7 +190,10 @@ fn research_output_source_refs(
 }
 
 fn should_expand_research_sources(recipe_id: &str) -> bool {
-    recipe_id == akzio_domain::RESEARCH_SYNTHESIZER_RECIPE_ID
+    matches!(
+        recipe_id,
+        akzio_domain::RESEARCH_CRITIC_RECIPE_ID | akzio_domain::RESEARCH_SYNTHESIZER_RECIPE_ID
+    )
 }
 
 #[cfg(test)]
@@ -216,12 +219,12 @@ mod tests {
     }
 
     #[test]
-    fn only_synthesizer_expands_research_output_sources() {
+    fn critics_and_synthesizers_expand_research_output_sources() {
+        assert!(should_expand_research_sources(
+            akzio_domain::RESEARCH_CRITIC_RECIPE_ID
+        ));
         assert!(should_expand_research_sources(
             akzio_domain::RESEARCH_SYNTHESIZER_RECIPE_ID
-        ));
-        assert!(!should_expand_research_sources(
-            akzio_domain::RESEARCH_CRITIC_RECIPE_ID
         ));
     }
 }

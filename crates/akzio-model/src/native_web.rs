@@ -157,7 +157,7 @@ impl NativeWebPolicy {
             return Err(ModelError::NativeWebUnavailable);
         }
 
-        let mut saw_search = false;
+        let mut saw_action = false;
         let mut sources = std::collections::BTreeSet::new();
         for call in calls {
             if call.get("status").and_then(Value::as_str) != Some("completed") {
@@ -169,7 +169,7 @@ impl NativeWebPolicy {
                 .ok_or(ModelError::NativeWebArgumentsInvalid)?;
             match action.get("type").and_then(Value::as_str) {
                 Some("search") => {
-                    saw_search = true;
+                    saw_action = true;
                     let mut queries = Vec::new();
                     if let Some(query) = action.get("query").and_then(Value::as_str) {
                         queries.push(query);
@@ -177,18 +177,13 @@ impl NativeWebPolicy {
                     if let Some(values) = action.get("queries").and_then(Value::as_array) {
                         queries.extend(values.iter().filter_map(Value::as_str));
                     }
-                    if queries.is_empty()
-                        || queries.iter().any(|query| {
-                            query.trim().is_empty() || query.chars().count() > self.max_query_chars
-                        })
-                    {
+                    if queries.iter().any(|query| {
+                        query.trim().is_empty() || query.chars().count() > self.max_query_chars
+                    }) {
                         return Err(ModelError::NativeWebLimitExceeded);
                     }
-                    let action_sources = action
-                        .get("sources")
-                        .and_then(Value::as_array)
-                        .ok_or(ModelError::NativeWebArgumentsInvalid)?;
-                    for source in action_sources {
+                    let action_sources = action.get("sources").and_then(Value::as_array);
+                    for source in action_sources.into_iter().flatten() {
                         let uri = source
                             .get("url")
                             .or_else(|| source.get("uri"))
@@ -198,14 +193,26 @@ impl NativeWebPolicy {
                         sources.insert(uri.to_owned());
                     }
                 }
-                Some("open_page" | "find_in_page") => {}
+                Some("open_page" | "find_in_page") => {
+                    saw_action = true;
+                    let uri = action
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .ok_or(ModelError::NativeWebArgumentsInvalid)?;
+                    self.validate_uri(uri)?;
+                    sources.insert(uri.to_owned());
+                }
                 _ => return Err(ModelError::NativeWebArgumentsInvalid),
             }
         }
-        if !saw_search || sources.is_empty() {
-            return Err(ModelError::NativeWebArgumentsInvalid);
+        // Query and action.sources are optional in hosted responses. Native
+        // annotations also carry provenance; a model-written URL alone cannot
+        // get here without a completed hosted action.
+        if !saw_action {
+            return Err(ModelError::NativeWebUnavailable);
         }
-        if sources.len() > self.max_results {
+        sources.extend(self.extract_citations(raw)?.into_iter().map(|c| c.uri));
+        if sources.len() > self.max_citations {
             return Err(ModelError::NativeWebLimitExceeded);
         }
         Ok(())
@@ -243,10 +250,11 @@ impl NativeWebPolicy {
             || !parsed.username().is_empty()
             || parsed.password().is_some()
             || parsed.port().is_some()
-            || !self
-                .allowed_hosts
-                .iter()
-                .any(|host| parsed.host_str() == Some(host.as_str()))
+            || !self.allowed_hosts.iter().any(|allowed| {
+                parsed
+                    .host_str()
+                    .is_some_and(|host| host == allowed || host.ends_with(&format!(".{allowed}")))
+            })
         {
             return Err(ModelError::NativeWebUnsafeCitation {
                 uri: uri.to_owned(),
@@ -322,5 +330,47 @@ fn collect_citations(value: &Value, output: &mut Vec<NativeWebCitation>) {
                 .for_each(|value| collect_citations(value, output));
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod hosted_response_tests {
+    use super::*;
+    #[test]
+    fn approved_subdomain_does_not_allow_a_spoofed_suffix() {
+        let policy = NativeWebPolicy::default();
+        assert!(policy
+            .validate_uri("https://www.reuters.com/article")
+            .is_ok());
+        assert!(policy
+            .validate_uri("https://reuters.com.attacker.example/article")
+            .is_err());
+        assert!(policy
+            .validate_uri("https://attackerreuters.com/article")
+            .is_err());
+    }
+    #[test]
+    fn hosted_search_with_annotations_does_not_require_optional_query_or_sources() {
+        let raw = json!({"output":[
+            {"type":"web_search_call","status":"completed","action":{"type":"search"}},
+            {"type":"message","content":[{"type":"output_text","text":"Source-backed observation","annotations":[{"type":"url_citation","url":"https://www.reuters.com/markets/example","title":"Example","start_index":0,"end_index":10}]}]}
+        ]});
+        let policy = NativeWebPolicy::default();
+        assert!(policy.validate_provider_response(&raw).is_ok());
+        assert_eq!(policy.extract_citations(&raw).unwrap().len(), 1);
+    }
+    #[test]
+    fn hosted_open_page_can_verify_a_known_source_without_searching_again() {
+        let raw = json!({"output":[{"type":"web_search_call","status":"completed","action":{"type":"open_page","url":"https://reuters.com/markets/example"}}]});
+        assert!(NativeWebPolicy::default()
+            .validate_provider_response(&raw)
+            .is_ok());
+    }
+    #[test]
+    fn plain_model_text_never_proves_hosted_search() {
+        let raw = json!({"output":[{"type":"message","content":[{"type":"output_text","text":"I searched Reuters","annotations":[{"type":"url_citation","url":"https://reuters.com/markets/example"}]}]}]});
+        assert!(NativeWebPolicy::default()
+            .validate_provider_response(&raw)
+            .is_err());
     }
 }

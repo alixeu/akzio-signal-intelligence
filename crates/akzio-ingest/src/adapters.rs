@@ -24,6 +24,8 @@ pub enum EvidenceAdapterError {
     DataQuality(String),
     #[error("provider data pending: {0}")]
     Pending(String),
+    #[error("evidence adapter is not configured: {0}")]
+    NotConfigured(String),
     #[error("permanent provider request error (HTTP {0})")]
     Permanent(u16),
     #[error("native web evidence {kind:?}: {reason}")]
@@ -1402,6 +1404,42 @@ impl ModelNativeWebEvidenceTransport {
             }
         })? {
             GovernedResource::NewsWeb { query } => query,
+            GovernedResource::RecentNews {
+                asset,
+                window_start,
+                window_end,
+                topic,
+            } => format!(
+                "{} recent {} news and events from {} through {}. Search the ETF, its underlying index, major constituents and sector or monetary-policy events. Distinguish reported facts from inferred ETF effects. Use at most three relevant articles from the allowed domains; report publication dates. Product mechanics are not recent news.",
+                asset.symbol(),
+                topic,
+                window_start,
+                window_end
+            ),
+            GovernedResource::OfficialFundHoldings { asset, as_of } => {
+                format!(
+                    "official complete {} ETF holdings as of {}",
+                    asset.symbol(),
+                    as_of
+                )
+            }
+            GovernedResource::OfficialIndexMetadata { asset, as_of } => {
+                format!(
+                    "official {} benchmark index metadata as of {}",
+                    asset.symbol(),
+                    as_of
+                )
+            }
+            GovernedResource::OfficialLeveragedEtfTerms { asset, as_of } => format!(
+                "official {} daily-reset leverage terms and risks as of {}",
+                asset.symbol(),
+                as_of
+            ),
+            GovernedResource::OfficialEarningsEventCalendar { asset, as_of } => format!(
+                "official {} component-company earnings calendar as of {}",
+                asset.symbol(),
+                as_of
+            ),
             _ => resource.to_owned(),
         };
         let request = ModelRequest {
@@ -1770,5 +1808,63 @@ mod native_web_error_tests {
             ),
             NativeWebFailureKind::NoVerifiableSources
         );
+    }
+}
+
+#[cfg(test)]
+mod alpaca_news_tests {
+    use super::*;
+
+    #[test]
+    fn alpaca_resource_surface_does_not_claim_to_support_news() {
+        let resource = "news:QQQ:2026-09-01:2026-09-15:market";
+        assert!(GovernedResource::parse(EvidenceSource::Alpaca, resource).is_err());
+
+        let error = AlpacaPaperEvidenceTransport::path_for(resource)
+            .expect_err("Alpaca adapter must not silently route an unsupported news resource");
+        assert!(error.to_string().contains("not allowlisted"));
+    }
+
+    /// Provider contract check for Alpaca's documented Market Data news
+    /// endpoint. This intentionally tests the provider separately from the
+    /// current application adapter, which has no Alpaca-news resource route.
+    #[tokio::test]
+    #[ignore = "requires ALPACA_API_KEY/ALPACA_API_SECRET and live network access"]
+    async fn live_alpaca_news_endpoint_returns_a_news_array() {
+        let key = std::env::var("ALPACA_API_KEY").expect("ALPACA_API_KEY is configured");
+        let secret =
+            std::env::var("ALPACA_API_SECRET").expect("ALPACA_API_SECRET is configured");
+        let response = Client::new()
+            .get("https://data.alpaca.markets/v1beta1/news")
+            .query(&[
+                ("symbols", "QQQ"),
+                ("limit", "1"),
+                ("include_content", "false"),
+            ])
+            .header("APCA-API-KEY-ID", key)
+            .header("APCA-API-SECRET-KEY", secret)
+            .send()
+            .await
+            .expect("Alpaca news request should reach the provider");
+
+        assert!(
+            response.status().is_success(),
+            "Alpaca news endpoint returned HTTP {}",
+            response.status().as_u16()
+        );
+        let payload: Value = response
+            .json()
+            .await
+            .expect("Alpaca news response should be JSON");
+        let articles = payload
+            .get("news")
+            .and_then(Value::as_array)
+            .expect("Alpaca news response should contain a news array");
+        for article in articles {
+            assert!(article.get("id").and_then(Value::as_u64).is_some());
+            assert!(article.get("headline").and_then(Value::as_str).is_some());
+            assert!(article.get("created_at").and_then(Value::as_str).is_some());
+            assert!(article.get("updated_at").and_then(Value::as_str).is_some());
+        }
     }
 }

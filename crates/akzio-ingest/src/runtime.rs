@@ -126,6 +126,28 @@ pub enum GovernedResource {
         window_end: NaiveDate,
         vintage: NaiveDate,
     },
+    OfficialFundHoldings {
+        asset: Asset,
+        as_of: NaiveDate,
+    },
+    OfficialIndexMetadata {
+        asset: Asset,
+        as_of: NaiveDate,
+    },
+    OfficialLeveragedEtfTerms {
+        asset: Asset,
+        as_of: NaiveDate,
+    },
+    OfficialEarningsEventCalendar {
+        asset: Asset,
+        as_of: NaiveDate,
+    },
+    RecentNews {
+        asset: Asset,
+        window_start: NaiveDate,
+        window_end: NaiveDate,
+        topic: String,
+    },
     NewsWeb {
         query: String,
     },
@@ -145,14 +167,62 @@ impl GovernedResource {
             EvidenceSource::Alpaca => Self::parse_alpaca(resource),
             EvidenceSource::SecEdgar => Self::parse_sec(resource),
             EvidenceSource::Fred => Self::parse_fred(resource),
-            EvidenceSource::NewsWeb => {
-                let query = governed_news_query(resource)?;
-                if query.is_empty() || query.chars().count() > 2_000 {
-                    return Err(EvidenceRuntimeError::InvalidRequest);
-                }
-                Ok(Self::NewsWeb { query })
-            }
+            EvidenceSource::NewsWeb => Self::parse_news(resource),
         }
+    }
+
+    fn parse_news(resource: &str) -> Result<Self, EvidenceRuntimeError> {
+        let parts = resource.split(':').collect::<Vec<_>>();
+        if let ["research", category, symbol, as_of] = parts.as_slice() {
+            let asset =
+                Asset::try_from(*symbol).map_err(|_| EvidenceRuntimeError::InvalidRequest)?;
+            let as_of = NaiveDate::parse_from_str(as_of, "%Y-%m-%d")
+                .map_err(|_| EvidenceRuntimeError::InvalidRequest)?;
+            return match *category {
+                "etf_holdings" => Ok(Self::OfficialFundHoldings { asset, as_of }),
+                "index_metadata" => Ok(Self::OfficialIndexMetadata { asset, as_of }),
+                "leveraged_etf_terms" if matches!(asset, Asset::Tqqq | Asset::Soxl) => {
+                    Ok(Self::OfficialLeveragedEtfTerms { asset, as_of })
+                }
+                "earnings_event_calendar" => {
+                    Ok(Self::OfficialEarningsEventCalendar { asset, as_of })
+                }
+                _ => Err(EvidenceRuntimeError::InvalidRequest),
+            };
+        }
+        if let ["news", symbol, start, end, topic] = parts.as_slice() {
+            let asset =
+                Asset::try_from(*symbol).map_err(|_| EvidenceRuntimeError::InvalidRequest)?;
+            let window_start = NaiveDate::parse_from_str(start, "%Y-%m-%d")
+                .map_err(|_| EvidenceRuntimeError::InvalidRequest)?;
+            let window_end = NaiveDate::parse_from_str(end, "%Y-%m-%d")
+                .map_err(|_| EvidenceRuntimeError::InvalidRequest)?;
+            if window_end < window_start
+                || window_end.signed_duration_since(window_start) > Duration::days(31)
+                || !matches!(
+                    *topic,
+                    "market"
+                        | "rates"
+                        | "semiconductor"
+                        | "regulation"
+                        | "earnings"
+                        | "geopolitics"
+                )
+            {
+                return Err(EvidenceRuntimeError::InvalidRequest);
+            }
+            return Ok(Self::RecentNews {
+                asset,
+                window_start,
+                window_end,
+                topic: (*topic).to_owned(),
+            });
+        }
+        let query = governed_news_query(resource)?;
+        if query.is_empty() || query.chars().count() > 2_000 {
+            return Err(EvidenceRuntimeError::InvalidRequest);
+        }
+        Ok(Self::NewsWeb { query })
     }
 
     fn parse_alpaca(resource: &str) -> Result<Self, EvidenceRuntimeError> {

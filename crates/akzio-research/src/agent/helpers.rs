@@ -48,6 +48,13 @@ fn research_error_detail(error: &ResearchError) -> Value {
             "kind": model_error_class(error),
             "message": sanitize_provider_text(message),
         }),
+        ResearchError::ProviderIncomplete {
+            reason, usage, ..
+        } => json!({
+            "kind": "provider_incomplete",
+            "message": sanitize_provider_text(reason),
+            "usage": usage,
+        }),
         ResearchError::ModelDebug {
             error_class,
             message,
@@ -90,7 +97,11 @@ fn model_error_result(error: &ModelError) -> Value {
         }),
         ModelError::InvalidStream(_) => json!({"error": "invalid_stream"}),
         ModelError::Refused(message) => json!({"error": "refused", "message": message}),
-        ModelError::Incomplete(reason) => json!({"error": "incomplete", "reason": reason}),
+        ModelError::Incomplete { reason, usage } => json!({
+            "error": "incomplete",
+            "reason": reason,
+            "usage": usage,
+        }),
         ModelError::MissingOutput => json!({"error": "missing_output"}),
         ModelError::CapabilityProbe(message) => {
             json!({"error": "capability_probe", "message": sanitize_provider_text(message)})
@@ -110,6 +121,16 @@ fn model_error_result(error: &ModelError) -> Value {
 }
 
 fn model_client_error(error: ModelError, trace: Option<ModelCallTrace>) -> ResearchError {
+    let error = match error {
+        ModelError::Incomplete { reason, usage } => {
+            return ResearchError::ProviderIncomplete {
+                reason: format!("incomplete: {reason}"),
+                usage,
+                trace,
+            };
+        }
+        error => error,
+    };
     let (error_class, message) = match error {
         ModelError::Transport(error) => ("transport", sanitize_provider_text(&error.to_string())),
         ModelError::StreamIdleTimeout { idle_timeout } => (
@@ -139,7 +160,7 @@ fn model_client_error(error: ModelError, trace: Option<ModelCallTrace>) -> Resea
         }
         ModelError::InvalidStream(_) => ("invalid_output", "invalid response stream".to_owned()),
         ModelError::Refused(message) => return ResearchError::ModelRefused(message),
-        ModelError::Incomplete(reason) => ("invalid_output", format!("incomplete: {reason}")),
+        ModelError::Incomplete { .. } => unreachable!("handled before error classification"),
         ModelError::NativeWebUnavailable
         | ModelError::NativeWebToolNotAllowed
         | ModelError::NativeWebArgumentsInvalid
@@ -169,6 +190,7 @@ fn model_client_error(error: ModelError, trace: Option<ModelCallTrace>) -> Resea
 fn model_debug_trace(error: &ResearchError) -> Option<&ModelCallTrace> {
     match error {
         ResearchError::ModelDebug { trace, .. } => Some(trace),
+        ResearchError::ProviderIncomplete { trace, .. } => trace.as_ref(),
         _ => None,
     }
 }
@@ -201,6 +223,7 @@ fn model_error_class(error: &ResearchError) -> &'static str {
     match error {
         ResearchError::Model(_) => "transport",
         ResearchError::RateLimited(_) => "rate_limited",
+        ResearchError::ProviderIncomplete { .. } => "provider_incomplete",
         ResearchError::ModelDebug { error_class, .. } => error_class,
         _ => "other",
     }
@@ -245,6 +268,22 @@ fn resolve_reference_kinds(value: &mut Value, refs: &[Value]) -> ResearchResult<
                 }
             }
             for value in object.values_mut() {resolve_reference_kinds(value,refs)?;}
+            // Wire references are a set with no ordering requirement. Canonical
+            // allocations require sorted ArtifactRefs after kind resolution.
+            // Preserve duplicates so the original domain validator rejects them;
+            // never add, drop or substitute evidence. The raw turn stays intact.
+            if let Some(allocations) = object.get_mut("research_allocation")
+                .and_then(|plan| plan.get_mut("allocations"))
+                .and_then(Value::as_array_mut)
+            {
+                for allocation in allocations {
+                    if let Some(value) = allocation.get_mut("evidence_refs") {
+                        let mut references: Vec<ArtifactRef> = serde_json::from_value(value.clone())?;
+                        references.sort();
+                        *value = serde_json::to_value(references)?;
+                    }
+                }
+            }
         }
         Value::Array(values) => for value in values {resolve_reference_kinds(value,refs)?;},
         _ => {}
@@ -255,6 +294,41 @@ fn resolve_reference_kinds(value: &mut Value, refs: &[Value]) -> ResearchResult<
 #[cfg(test)]
 mod reference_binding_tests {
     use super::*;
+    #[test]
+    fn allocation_wire_references_validate_regardless_of_provider_order() {
+        let refs = vec![json!({"artifact_id":"c".repeat(64),"kind":"normalized_evidence"}),
+            json!({"artifact_id":"f".repeat(64),"kind":"normalized_evidence"}),
+            json!({"artifact_id":"a".repeat(64),"kind":"normalized_evidence"})];
+        let mut submission = json!({"result":{"research_allocation":{"allocations":[{
+            "asset":"QQQ", "target_weight_ppm":100000, "supporting_horizons":["t5"],
+            "evidence_refs": refs.iter().map(|r|json!({"artifact_id":r["artifact_id"]})).collect::<Vec<_>>(),
+            "rationale":"bounded t5 research", "abstention_reason":null
+        }]}}});
+        resolve_reference_kinds(&mut submission, &refs).unwrap();
+        let row = &submission["result"]["research_allocation"]["allocations"][0];
+        let allocation: akzio_domain::ResearchAssetAllocation = serde_json::from_value(row.clone()).unwrap();
+        allocation.validate().expect("wire ordering is not evidence loss");
+        assert_eq!(allocation.evidence_refs.len(), 3);
+        assert_eq!(allocation.evidence_refs[0].artifact_id.to_string(), "a".repeat(64));
+        assert_eq!(allocation.target_weight_ppm.0, 100000);
+        let mut duplicate = submission.clone();
+        let duplicate_refs = duplicate["result"]["research_allocation"]["allocations"][0]["evidence_refs"].as_array_mut().unwrap();
+        duplicate_refs.push(duplicate_refs[0].clone());
+        resolve_reference_kinds(&mut duplicate, &refs).unwrap();
+        let duplicate: akzio_domain::ResearchAssetAllocation = serde_json::from_value(
+            duplicate["result"]["research_allocation"]["allocations"][0].clone()).unwrap();
+        assert_eq!(duplicate.evidence_refs.len(), 4);
+        assert!(duplicate.validate().is_err());
+        let mut unknown = submission.clone();
+        unknown["result"]["research_allocation"]["allocations"][0]["evidence_refs"][0] = json!({"artifact_id":"b".repeat(64)});
+        assert!(resolve_reference_kinds(&mut unknown, &refs).is_err());
+        let mut zero = allocation;
+        zero.target_weight_ppm = akzio_domain::WeightPpm::ZERO;
+        zero.evidence_refs.clear();
+        zero.supporting_horizons.clear();
+        zero.abstention_reason = Some("unsupported research slot".into());
+        zero.validate().expect("zero allocation may explicitly abstain");
+    }
     #[test]
     fn thesis_expiry_requires_timezone_timestamp_not_calendar_date() {
         let schema = decision_proposal_output_schema();
@@ -278,6 +352,35 @@ mod reference_binding_tests {
 #[cfg(test)]
 mod cumulative_budget_tests {
     use super::*;
+
+    #[test]
+    fn provider_incomplete_is_not_retried_as_schema_repair_and_keeps_usage() {
+        let error = model_client_error(
+            ModelError::Incomplete {
+                reason: "max_output_tokens".to_owned(),
+                usage: ModelUsage {
+                    input_tokens: Some(12),
+                    cached_input_tokens: None,
+                    output_tokens: Some(4_287),
+                    reasoning_tokens: Some(900),
+                },
+            },
+            None,
+        );
+        assert!(matches!(
+            error,
+            ResearchError::ProviderIncomplete {
+                usage: ModelUsage {
+                    output_tokens: Some(4_287),
+                    reasoning_tokens: Some(900),
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(!retryable_model_error(&error, &RetryPolicy::none()));
+    }
+
     #[test]
     fn over_budget_request_never_authorizes_a_provider_turn() {
         let policy = TaskBudget { max_input_tokens: 48000, max_output_tokens: 5000, max_wall_time_secs: 120, max_tool_calls: akzio_domain::budget::ToolCallLimit::Limited(2) };

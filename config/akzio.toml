@@ -31,6 +31,9 @@ debug = false
 # Agent resource defaults; role overrides use the same fields.
 # Input is cumulative across LLM requests in one Attempt, not a context window.
 # Output and timeout retain their per-role defaults when omitted.
+# New Critic Attempts default to 16000 cumulative output tokens so one Draft,
+# one Submit, and one bounded semantic repair share a finite budget. Historical
+# Contracts retain their immutable 4000-token value.
 [agent.budget.default]
 max_input_tokens = 1000000
 max_tool_calls = "unlimited"

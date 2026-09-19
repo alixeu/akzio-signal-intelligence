@@ -46,8 +46,8 @@ pub enum ModelError {
     InvalidStream(String),
     #[error("model refused the request: {0}")]
     Refused(String),
-    #[error("model response is incomplete: {0}")]
-    Incomplete(String),
+    #[error("model response is incomplete: {reason}")]
+    Incomplete { reason: String, usage: ModelUsage },
     #[error("model response has neither output text nor a tool call")]
     MissingOutput,
     #[error("model capability probe failed: {0}")]

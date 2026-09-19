@@ -193,6 +193,37 @@ impl ContextMaterialization {
                 .iter()
                 .filter(|d| d.metadata.kind == ArtifactKind::Critique)
                 .collect::<Vec<_>>();
+            // Expose the exact closure already required by Submit validation.
+            // Descriptive and neutral grounds still require provenance; this
+            // index grants no additional documents or directional support.
+            let selected = self
+                .ledger
+                .iter()
+                .map(|d| ArtifactRef {
+                    artifact_id: d.document_id.clone(),
+                    kind: d.kind,
+                })
+                .collect::<BTreeSet<_>>();
+            let required_proposal_evidence = claims
+                .iter()
+                .chain(critiques.iter())
+                .flat_map(|d| {
+                    let grounds = d.value["grounds"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|g| g.get("evidence"));
+                    let verification = ["supporting_refs", "conflicting_refs"]
+                        .into_iter()
+                        .flat_map(|key| d.value[key].as_array().into_iter().flatten());
+                    grounds.chain(verification)
+                })
+                .filter_map(|value| serde_json::from_value::<ArtifactRef>(value.clone()).ok())
+                .filter(|reference| {
+                    matches!(reference.kind, ArtifactKind::NormalizedEvidence | ArtifactKind::SemanticDetail)
+                        && selected.contains(reference)
+                })
+                .collect::<BTreeSet<_>>();
             let mut horizons = Vec::new();
             for horizon in ["t1", "t3", "t5"] {
                     let matching = claims
@@ -236,6 +267,8 @@ impl ContextMaterialization {
             context.push(
                 serde_json::json!({"type":"must_read","class":"coverage_verification_matrix",
                 "version":2,"manifest_artifact_id":self.manifest_artifact_id,"horizons":horizons,
+                "required_proposal_evidence":required_proposal_evidence,
+                "evidence_closure_policy":"When submitting these Claims and Critiques, copy every exact reference in required_proposal_evidence into result.evidence, including descriptive grounds and neutral forecasts. This is a selected-reference index, not directional support or permission to read unselected sources. Rust still validates the complete closure.",
                 "missing_support_action":"neutralize_each_asset_horizon_without_complete_support"}),
             );
         }
@@ -698,6 +731,58 @@ fn abbreviate_narrative(value: &mut Value) {
 #[cfg(test)]
 mod compact_context_tests {
     use super::*;
+    #[test]
+    fn synthesizer_matrix_lists_exact_selected_evidence_closure() {
+        let metadata = |name: &str, kind| ContextDocumentMetadata {
+            document_id: ArtifactId(content_hash_json(&serde_json::json!(name)).unwrap()),
+            kind,
+            source: "test".into(),
+            observed_at: None,
+            published_at: None,
+            estimated_tokens: 1,
+            relevance: 1,
+            reason: "required".into(),
+            must_read: true,
+            read_grant_identity: content_hash_json(&serde_json::json!("grant")).unwrap(),
+        };
+        let price = metadata("price", ArtifactKind::NormalizedEvidence);
+        let descriptive = metadata("descriptive", ArtifactKind::SemanticDetail);
+        let private = metadata("unselected", ArtifactKind::NormalizedEvidence);
+        let unrelated = metadata("unrelated", ArtifactKind::NormalizedEvidence);
+        let reference = |m: &ContextDocumentMetadata| serde_json::json!({
+            "artifact_id": m.document_id, "kind": m.kind
+        });
+        let claim = ContextMustReadDocument {
+            class: "claim".into(),
+            metadata: metadata("claim", ArtifactKind::Claim),
+            value: serde_json::json!({"horizon":"t5", "grounds":[
+                {"evidence":reference(&price),"role":"directional"},
+                {"evidence":reference(&descriptive),"role":"descriptive"},
+                {"evidence":reference(&private),"role":"descriptive"}
+            ]}),
+        };
+        let critique = ContextMustReadDocument {
+            class: "critique".into(),
+            metadata: metadata("critique", ArtifactKind::Critique),
+            value: serde_json::json!({"grounds":[{"evidence":reference(&price)}],
+                "supporting_refs":[reference(&descriptive)],"conflicting_refs":[reference(&price)]}),
+        };
+        let hash = content_hash_json(&serde_json::json!("manifest")).unwrap();
+        let materialization = ContextMaterialization {
+            manifest_artifact_id: ArtifactId(hash.clone()),
+            read_grant_identity: hash.clone(),
+            materialization_identity: hash,
+            task_contract: serde_json::json!({"purpose":RESEARCH_SYNTHESIZER_RECIPE_ID}),
+            ledger: vec![price.clone(), descriptive.clone(), unrelated],
+            must_read: vec![claim, critique],
+        };
+        let view = materialization.model_context();
+        let refs = view.last().unwrap()["required_proposal_evidence"].as_array().unwrap();
+        assert_eq!(refs.len(), 2);
+        assert!(refs.contains(&reference(&price)));
+        assert!(refs.contains(&reference(&descriptive)));
+        assert!(!refs.contains(&reference(&private)));
+    }
     #[test]
     fn compact_coverage_preserves_all_asset_horizons_and_exact_claim_verification() {
         let hash = content_hash_json(&serde_json::json!("claim")).unwrap();

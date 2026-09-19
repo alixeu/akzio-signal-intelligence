@@ -67,6 +67,11 @@ pub const AGENT_ROLES: [(&str, &str); 5] = [
     ("outcome_worker", "learning.outcome_worker"),
 ];
 
+/// New Attempts need enough cumulative output for a Critic Draft, one Submit,
+/// and one bounded semantic repair.  Historical Agent Contracts keep their
+/// original numeric budget and hash through `legacy_contract_budget`.
+pub const NEW_CRITIC_OUTPUT_TOKENS: u32 = 16_000;
+
 /// Immutable legacy Contract defaults; preserve existing hashes and ContextPolicy.
 pub fn legacy_contract_budget(purpose: &str) -> Option<TaskBudget> {
     let (input, output, tools, timeout) = match purpose {
@@ -90,6 +95,9 @@ pub fn default_agent_budget(purpose: &str) -> Option<TaskBudget> {
     let mut budget = legacy_contract_budget(purpose)?;
     budget.max_input_tokens = 1_000_000;
     budget.max_tool_calls = ToolCallLimit::Unlimited;
+    if purpose == "research.critic" {
+        budget.max_output_tokens = NEW_CRITIC_OUTPUT_TOKENS;
+    }
     Some(budget)
 }
 
@@ -187,6 +195,33 @@ impl<'de> Deserialize<'de> for ToolCallLimit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_critic_budget_is_distinct_from_legacy_contract_budget() {
+        assert_eq!(
+            legacy_contract_budget("research.critic")
+                .expect("registered Critic role")
+                .max_output_tokens,
+            4_000
+        );
+        assert_eq!(
+            default_agent_budget("research.critic")
+                .expect("registered Critic role")
+                .max_output_tokens,
+            16_000
+        );
+
+        let mut settings = AgentBudgetConfig::default();
+        settings.critic.max_output_tokens = Some(16_000);
+        assert_eq!(
+            settings
+                .resolve("research.critic")
+                .expect("registered Critic role")
+                .max_output_tokens,
+            16_000
+        );
+    }
+
     #[test]
     fn legacy_budget_wire_format_is_unchanged() {
         let raw = r#"{"max_input_tokens":48000,"max_output_tokens":6000,"max_wall_time_secs":120,"max_tool_calls":4}"#;

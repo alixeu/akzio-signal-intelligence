@@ -37,10 +37,52 @@ impl AgentRecoveryUsage {
         request: &AgentModelRequest,
         policy: &ModelBudgetPolicy,
     ) -> Option<()> {
+        self.usage_valid = false;
         self.input_tokens = self
             .input_tokens
             .saturating_add(u64::from(estimate_tokens(request).ok()?));
         if policy.pricing.is_some() {
+            self.cost_complete = false;
+        }
+        Some(())
+    }
+
+    fn record_failed_usage(
+        &mut self,
+        request: &AgentModelRequest,
+        usage: &ModelUsage,
+        policy: &ModelBudgetPolicy,
+    ) -> Option<()> {
+        if usage.input_tokens.is_none() || usage.output_tokens.is_none() {
+            self.usage_valid = false;
+        }
+        let resolved = resolve_model_usage(estimate_tokens(request).ok()?, 0, None);
+        self.input_tokens = self
+            .input_tokens
+            .saturating_add(usage.input_tokens.unwrap_or(resolved.input_tokens));
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(usage.cached_input_tokens.unwrap_or_default());
+        self.output_tokens = self
+            .output_tokens
+            .saturating_add(usage.output_tokens.unwrap_or_default());
+        self.reasoning_tokens = self
+            .reasoning_tokens
+            .saturating_add(usage.reasoning_tokens.unwrap_or_default());
+        if let Some(pricing) = &policy.pricing {
+            let input_tokens = u32::try_from(
+                usage.input_tokens.unwrap_or(resolved.input_tokens),
+            )
+            .unwrap_or(u32::MAX);
+            let output_tokens =
+                u32::try_from(usage.output_tokens.unwrap_or_default()).unwrap_or(u32::MAX);
+            match usage_cost_micros(
+                resolve_model_usage(input_tokens, output_tokens, None),
+                pricing,
+            ) {
+                Ok(cost) => self.cost_micros = self.cost_micros.saturating_add(cost),
+                Err(_) => self.usage_valid = false,
+            }
             self.cost_complete = false;
         }
         Some(())
@@ -89,6 +131,8 @@ struct AgentRecoveryCheckpoint {
     continuation: Option<ModelContinuation>,
     pending_tool_outputs: Vec<ModelToolOutput>,
     trace_refs: Vec<ArtifactRef>,
+    submit_call_id: Option<String>,
+    submission_attempts: u8,
     provider_calls: u32,
     tool_calls: u32,
     usage: AgentRecoveryUsage,
@@ -103,6 +147,8 @@ impl AgentRecoveryCheckpoint {
             continuation: None,
             pending_tool_outputs: vec![],
             trace_refs: vec![],
+            submit_call_id: None,
+            submission_attempts: 0,
             provider_calls: 0,
             tool_calls: 0,
             usage: AgentRecoveryUsage::default(),
@@ -147,6 +193,8 @@ struct StoredAgentTurnPayload {
     request: AgentModelRequest,
     #[serde(default)]
     response: Option<AgentModelTurn>,
+    #[serde(default)]
+    error_detail: Option<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -182,6 +230,7 @@ enum AgentRecoveryEvent {
         source_refs: Vec<ArtifactRef>,
         payload: StoredToolResultPayload,
     },
+    StageAcceptance(akzio_domain::StageAcceptance),
 }
 
 #[derive(Debug, Clone)]
@@ -251,6 +300,29 @@ impl<'a> AgentRecoveryReducer<'a> {
                 self.checkpoint.trace_refs.push(reference);
                 self.finish_tool_batch();
             }
+            AgentRecoveryEvent::StageAcceptance(acceptance) => {
+                if acceptance.business_result == "SubmitRejected"
+                    && self.checkpoint.phase == AgentTurnPhase::Submit
+                    && self.checkpoint.pending_tool_outputs.is_empty()
+                {
+                    let call_id = self.checkpoint.submit_call_id.clone()?;
+                    let message = acceptance
+                        .checks
+                        .iter()
+                        .find(|check| check.check_id == "agent.submit_validation")
+                        .map(|check| check.actual.clone())
+                        .unwrap_or_else(|| "previous submit_result was rejected".to_owned());
+                    self.checkpoint.pending_tool_outputs.push(ModelToolOutput {
+                        call_id,
+                        output: serde_json::json!({
+                            "ok": false,
+                            "error": "invalid_submission",
+                            "message": message,
+                            "repair_policy": "reuse_previous_submission_and_change_only_rejected_fields",
+                        }),
+                    });
+                }
+            }
         }
         Some(self)
     }
@@ -294,6 +366,18 @@ impl<'a> AgentRecoveryReducer<'a> {
         self.checkpoint.trace_refs.push(reference);
         let Some(response) = payload.response else {
             (!completed).then_some(())?;
+            if let Some(usage) = payload
+                .error_detail
+                .as_ref()
+                .and_then(|detail| detail.get("usage"))
+                .and_then(|usage| serde_json::from_value::<ModelUsage>(usage.clone()).ok())
+            {
+                return self.checkpoint.usage.record_failed_usage(
+                    &payload.request,
+                    &usage,
+                    &payload.budget_policy,
+                );
+            }
             return self
                 .checkpoint
                 .usage
@@ -335,7 +419,14 @@ impl<'a> AgentRecoveryReducer<'a> {
                         .collect::<Option<_>>()?;
                 }
             }
-            AgentTurnPhase::Draft | AgentTurnPhase::Submit => return None,
+            AgentTurnPhase::Submit => {
+                let submission = response.terminal_submission?;
+                self.checkpoint.submit_call_id = Some(submission.call_id);
+                self.checkpoint.submission_attempts = self.checkpoint.submission_attempts.saturating_add(1);
+                self.checkpoint.next_model_turn = payload.turn.saturating_add(1);
+                self.checkpoint.phase = AgentTurnPhase::Submit;
+            }
+            AgentTurnPhase::Draft => return None,
         }
         Some(())
     }
@@ -431,6 +522,7 @@ fn load_recovery_events(
                 LifecycleEventType::ToolCompleted | LifecycleEventType::ToolFailed => {
                     ArtifactKind::ToolResult
                 }
+                LifecycleEventType::StageAcceptanceRecorded => ArtifactKind::DebugRecord,
                 _ => continue,
             };
             let Some(artifact_id) = event.artifact_id else {
@@ -441,7 +533,8 @@ fn load_recovery_events(
                 origin.run_id.as_ref() == Some(&permit.run_id)
                     && origin.task_id.as_ref() == Some(&permit.task_id)
                     && origin.attempt_id.as_ref() == Some(attempt_id)
-                    && origin.contract_hash.as_ref() == permit.contract_hash.as_ref()
+                    && (expected_kind == ArtifactKind::DebugRecord
+                        || origin.contract_hash.as_ref() == permit.contract_hash.as_ref())
             });
             if artifact.kind != expected_kind || !expected_origin || artifact.validate().is_err() {
                 return Ok(None);
@@ -490,6 +583,12 @@ fn load_recovery_events(
                         payload,
                     }
                 }
+                LifecycleEventType::StageAcceptanceRecorded => {
+                    let Ok(payload) = serde_json::from_slice(&bytes) else {
+                        return Ok(None);
+                    };
+                    AgentRecoveryEvent::StageAcceptance(payload)
+                }
                 LifecycleEventType::ToolFailed => return Ok(None),
                 _ => unreachable!("event type filtered above"),
             };
@@ -497,4 +596,69 @@ fn load_recovery_events(
         }
     }
     Ok(Some(loaded))
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    fn guard() -> AgentRecoveryGuard {
+        let hash = akzio_domain::ContentHash::of_bytes(b"recovery-test");
+        AgentRecoveryGuard {
+            contract_hash: hash.clone(),
+            context_manifest: akzio_domain::ContextManifestPayload {
+                schema_version: akzio_domain::DOMAIN_SCHEMA_VERSION,
+                contract_hash: hash.clone(),
+                selections: vec![],
+                quarantined: vec![],
+                total_bytes: 0,
+                projected_bytes: Some(0),
+                estimated_tokens: 0,
+                input_hash: hash.clone(),
+            },
+            read_grant_identity: hash.clone(),
+            context_materialization_identity: hash.clone(),
+            capability_snapshot_hash: hash.clone(),
+            budget_policy_hash: hash.clone(),
+            draft_tool_set_hash: hash.clone(),
+            submit_tool_set_hash: hash,
+        }
+    }
+
+    #[test]
+    fn rejected_submit_recovery_reuses_call_and_sends_compact_feedback() {
+        let guard = guard();
+        let mut reducer = AgentRecoveryReducer::new(&guard);
+        reducer.checkpoint.phase = AgentTurnPhase::Submit;
+        reducer.checkpoint.submit_call_id = Some("submit-1".to_owned());
+        let acceptance = akzio_domain::StageAcceptance {
+            version: 1,
+            run_id: RunId("run-1".to_owned()),
+            task_id: TaskId("task-1".to_owned()),
+            attempt_id: AttemptId("attempt-1".to_owned()),
+            stage: "research.critic".to_owned(),
+            business_result: "SubmitRejected".to_owned(),
+            test_result: akzio_domain::AcceptanceResult::Fail,
+            checks: vec![akzio_domain::AcceptanceCheck {
+                check_id: "agent.submit_validation".to_owned(),
+                category: akzio_domain::AcceptanceCategory::Schema,
+                expected: "valid Critique".to_owned(),
+                actual: "research.grounds must be empty".to_owned(),
+                result: akzio_domain::AcceptanceResult::Fail,
+                evidence_refs: vec![],
+                message: "reuse valid fields".to_owned(),
+            }],
+            created_at: Utc::now(),
+        };
+
+        let reducer = reducer
+            .fold(AgentRecoveryEvent::StageAcceptance(acceptance))
+            .expect("recovery reducer accepts persisted rejection");
+        assert_eq!(reducer.checkpoint.pending_tool_outputs.len(), 1);
+        assert_eq!(reducer.checkpoint.pending_tool_outputs[0].call_id, "submit-1");
+        assert_eq!(
+            reducer.checkpoint.pending_tool_outputs[0].output["repair_policy"],
+            "reuse_previous_submission_and_change_only_rejected_fields"
+        );
+    }
 }

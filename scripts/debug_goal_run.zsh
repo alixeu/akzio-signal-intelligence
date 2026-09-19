@@ -7,6 +7,11 @@ script_dir="${0:A:h}"
 repo_root="${script_dir:h}"
 cd "${repo_root}"
 
+# PositionPlan uses the controlled research entrypoint, not legacy Debug submit.
+if [[ "${2:-}" == "real-position-plan" ]]; then
+  exec python3 "${script_dir}/position_plan_run.py" "${1:-config/akzio.debug-goal.local.toml}"
+fi
+
 goal_config_input="${1:-config/akzio.debug-goal.local.toml}"
 goal_stage="${2:-real-debug}"
 goal_stamp="$(date -u +%Y%m%dT%H%M%SZ)"

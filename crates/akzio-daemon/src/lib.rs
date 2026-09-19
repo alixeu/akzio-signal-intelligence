@@ -58,11 +58,11 @@ use akzio_execution::{
 pub use akzio_ingest::AlpacaMarketDataFeed;
 use akzio_ingest::{
     common_bar_dates, decode_paper_account, decode_paper_clock, decode_paper_quotes,
-    model_native_web_evidence_transport, parse_daily_bars, parse_money_micros, provider_money,
-    AcquiredEvidence, AlpacaPaperEvidenceTransport, AsyncEvidenceAdapter, EvidenceBundle,
-    EvidenceProvenance, EvidenceQuality, EvidenceRequest, EvidenceRuntime, EvidenceRuntimeError,
-    EvidenceSource, FixtureEvidenceAdapter, FredDirectTransport, NormalizedEvidencePayload,
-    PaperDecodeError, SecEdgarDirectTransport,
+    parse_daily_bars, parse_money_micros, provider_money, AcquiredEvidence,
+    AlpacaPaperEvidenceTransport, AsyncEvidenceAdapter, EvidenceBundle, EvidenceProvenance,
+    EvidenceQuality, EvidenceRequest, EvidenceRuntime, EvidenceRuntimeError, EvidenceSource,
+    FixtureEvidenceAdapter, FredDirectTransport, NormalizedEvidencePayload, PaperDecodeError,
+    SecEdgarDirectTransport,
 };
 use akzio_learning::{
     apply_risk_ground_truth_assessments, daily_observations, evaluate_canary_cohort,

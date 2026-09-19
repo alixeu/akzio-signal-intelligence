@@ -414,51 +414,7 @@ fn apply_config_environment(config: &Config) {
 fn load_config(path: &Path) -> Result<Config> {
     let mut config = read_config_file(path)?;
     config.agent.budget.validate().context("invalid agent.budget configuration")?;
-    if let Some(model) = config.model.as_mut() {
-        model.base_url = resolve_env_placeholder(&model.base_url, "model.base_url")?;
-        model.api_key = resolve_env_placeholder(&model.api_key, "model.api_key")?;
-        if let Ok(value) = std::env::var("AKZIO_MODEL") {
-            model.model = value;
-        }
-        if let Ok(value) = std::env::var("AKZIO_REASONING_EFFORT") {
-            model.reasoning_effort = value;
-        }
-        if let Ok(value) = std::env::var("AKZIO_RESPONSE_LANGUAGE") {
-            model.response_language = value;
-        }
-        if let Ok(value) = std::env::var("AKZIO_MODEL_ROUTES_JSON") {
-            model.routes = serde_json::from_str(&value).context("parse AKZIO_MODEL_ROUTES_JSON")?;
-        }
-        if model.model.trim().is_empty()
-            || model.reasoning_effort.trim().is_empty()
-            || model.response_language.trim().is_empty()
-        {
-            bail!("model, reasoning_effort, and response_language must be non-empty");
-        }
-        for (purpose, route) in &model.routes {
-            if !matches!(
-                purpose.as_str(),
-                "research.planner"
-                    | "research.analyst"
-                    | "research.critic"
-                    | "research.synthesizer"
-                    | "learning.outcome_worker"
-                    | "evidence.news_web"
-            ) {
-                bail!("unsupported model route {purpose}");
-            }
-            if route.model.trim().is_empty() || route.reasoning_effort.trim().is_empty() {
-                bail!("model route {purpose} contains an empty value");
-            }
-            if route
-                .response_language
-                .as_deref()
-                .is_some_and(|value| value.trim().is_empty())
-            {
-                bail!("model route {purpose} contains an empty response_language");
-            }
-        }
-    }
+    resolve_model_configuration(&mut config)?;
     if let Some(store_root) = std::env::var_os("AKZIO_STORE_ROOT") {
         config.daemon.store_root = PathBuf::from(store_root);
     }
@@ -586,7 +542,7 @@ mod agent_budget_config_tests {
         for (purpose, output, timeout) in [
             ("research.planner", 2000, 120),
             ("research.analyst", 6000, 120),
-            ("research.critic", 4000, 120),
+            ("research.critic", 16000, 120),
             ("research.synthesizer", 5000, 120),
             ("learning.outcome_worker", 4000, 180),
         ] {
@@ -741,4 +697,55 @@ max_tool_calls = "unlimited"
         )
         .is_err());
     }
+}
+
+// Shared by daemon loading and real provider tests; execution configuration
+// validation remains in load_config and is never weakened by model-only tests.
+fn resolve_model_configuration(config: &mut Config) -> Result<()> {
+    if let Some(model) = config.model.as_mut() {
+        model.base_url = resolve_env_placeholder(&model.base_url, "model.base_url")?;
+        model.api_key = resolve_env_placeholder(&model.api_key, "model.api_key")?;
+        if let Ok(value) = std::env::var("AKZIO_MODEL") {
+            model.model = value;
+        }
+        if let Ok(value) = std::env::var("AKZIO_REASONING_EFFORT") {
+            model.reasoning_effort = value;
+        }
+        if let Ok(value) = std::env::var("AKZIO_RESPONSE_LANGUAGE") {
+            model.response_language = value;
+        }
+        if let Ok(value) = std::env::var("AKZIO_MODEL_ROUTES_JSON") {
+            model.routes = serde_json::from_str(&value).context("parse AKZIO_MODEL_ROUTES_JSON")?;
+        }
+        if model.model.trim().is_empty()
+            || model.reasoning_effort.trim().is_empty()
+            || model.response_language.trim().is_empty()
+        {
+            bail!("model, reasoning_effort, and response_language must be non-empty");
+        }
+        for (purpose, route) in &model.routes {
+            if !matches!(
+                purpose.as_str(),
+                "research.planner"
+                    | "research.analyst"
+                    | "research.critic"
+                    | "research.synthesizer"
+                    | "learning.outcome_worker"
+                    | "evidence.news_web"
+            ) {
+                bail!("unsupported model route {purpose}");
+            }
+            if route.model.trim().is_empty() || route.reasoning_effort.trim().is_empty() {
+                bail!("model route {purpose} contains an empty value");
+            }
+            if route
+                .response_language
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                bail!("model route {purpose} contains an empty response_language");
+            }
+        }
+    }
+    Ok(())
 }

@@ -7,7 +7,6 @@ use akzio_domain::{
     MoneyMicros, Outcome, OutcomeHorizon, OutcomeSchedule,
 };
 use akzio_ingest::{parse_daily_bars, EvidenceAdapterError, NormalizedEvidencePayload};
-use akzio_model::ModelClient;
 use chrono::{DateTime, Duration as ChronoDuration};
 
 fn handle_calibration(command: &CalibrationCommand, config_path: &Path) -> Result<()> {
@@ -796,26 +795,17 @@ async fn run_evidence_command(command: &EvidenceCommand, config: &Config) -> Res
                 .model
                 .as_ref()
                 .context("NewsWeb preflight requires [model] configuration")?;
-            let (client, route) = if let Some(route) = model_config.routes.get("evidence.news_web") {
-                (
-                    ModelClient::from_config(&model_config.for_route(route))
-                        .context("construct configured NewsWeb model route")?,
-                    Some("evidence.news_web"),
-                )
-            } else {
-                (
-                    ModelClient::from_config(model_config)
-                        .context("construct configured model client")?,
-                    None,
-                )
-            };
-            let adapter = model_native_web_evidence_transport(client, EvidenceSource::NewsWeb)
-                .context("construct governed NewsWeb adapter")?;
+            let route = if model_config.routes.contains_key("evidence.news_web") { "evidence.news_web" } else { "default" };
+            let adapter = akzio_ingest::configured_news_evidence_transport(model_config)
+                .context("construct governed NewsWeb router")?;
             let request = EvidenceRequest {
                 source: EvidenceSource::NewsWeb,
                 resource: resource.clone(),
                 max_age: ChronoDuration::days(7),
-                acquisition_mode: EvidenceAcquisitionMode::VerifiedSource,
+                acquisition_mode: akzio_domain::evidence_acquisition_mode(RunPurpose::PositionPlan, &akzio_domain::EvidenceNeed {
+                    schema_version: akzio_domain::DOMAIN_SCHEMA_VERSION,
+                    source_family: "news_web".into(), resource: resource.clone(), max_age_secs: 604800,
+                }),
             };
             let acquired = match adapter.acquire(&request).await {
                 Ok(acquired) => acquired,
@@ -851,7 +841,10 @@ async fn run_evidence_command(command: &EvidenceCommand, config: &Config) -> Res
                 "resource": resource,
                 "asset": asset,
                 "route": route,
-                "evidence_domain": "news_event",
+                "evidence_domain": if resource.starts_with("news:") { Some("news_event") } else { None },
+                "source_review": acquired.normalized.get("source_review"),
+                "reviewed_facts": acquired.normalized.get("reviewed_facts"),
+                "execution_authorization": "not_granted",
                 "published_at": acquired.provenance.published_at,
                 "retrieved_at": acquired.observed_at,
                 "usable_at": usable_at,
@@ -874,6 +867,10 @@ fn evidence_preflight_error(error: &EvidenceAdapterError) -> (&'static str, &'st
         EvidenceAdapterError::Unauthorized(_) => ("authorization", "provider authorization or entitlement denied"),
         EvidenceAdapterError::RateLimited { .. } => ("rate_limited", "provider rate limited the request"),
         EvidenceAdapterError::Pending(_) => ("pending", "provider data is pending"),
+        EvidenceAdapterError::NotConfigured(_) => (
+            "adapter_unavailable",
+            "no authorized provider is configured",
+        ),
         EvidenceAdapterError::Permanent(_) => ("permanent_provider_error", "provider rejected the request"),
         EvidenceAdapterError::Transport(_) => ("transport", "provider route or network transport failed"),
         EvidenceAdapterError::Policy { .. } => ("policy_rejected", "Rust evidence policy rejected the response"),

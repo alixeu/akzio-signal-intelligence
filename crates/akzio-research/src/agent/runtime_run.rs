@@ -4,6 +4,102 @@
 // Attempt. The previous 55/45 split killed legitimate high-reasoning Drafts at
 // 66s even when the Contract still had 54s left.
 const DRAFT_WALL_TIME_FRACTION: f32 = 0.70;
+const CRITIC_DRAFT_OUTPUT_CAP: u32 = 4_000;
+const CRITIC_SUBMIT_RECOVERY_RESERVE_DIVISOR: u32 = 4;
+// The 12-forecast Submit is larger than its memo. Keep the frozen 5k total,
+// but spend less of it restating the six upstream research documents.
+const SYNTHESIZER_DRAFT_OUTPUT_CAP: u32 = 900;
+
+fn synthesis_length_guidance(phase: AgentTurnPhase, cap: u32) -> String {
+    let target = cap.saturating_mul(3) / 4;
+    let phase_rule = match phase {
+        AgentTurnPhase::Draft => {
+            "Write a short synthesis memo, not the final JSON or a full report. Summarize the asset/horizon conclusions, material conflicts and uncertainty; do not recopy upstream documents or the evidence-ID ledger."
+        }
+        AgentTurnPhase::Submit => {
+            "Format the completed Draft only; do not restart research. Preserve all 12 forecasts with their required thesis fields, four allocations plus cash, exact evidence/claim/critique references, material conflicts and uncertainties. Shorten prose only: use concise summary, rationale, exit/invalidation conditions and deliberation; do not repeat the memo or evidence text. Never drop required fields, references or change numeric conclusions to fit."
+        }
+    };
+    format!(
+        "Synthesis phase allowance: {cap} output tokens INCLUDING reasoning and tool arguments. Aim below {target} total tokens to leave headroom. The actual request ceiling may be lower after input/cost checks; always obey that lower ceiling. This writing target never expands the budget. {phase_rule}"
+    )
+}
+
+fn synthesis_compression_feedback(
+    request: &AgentModelRequest,
+    turn: &AgentModelTurn,
+    budget: &AgentRunBudget,
+    submission_attempts: u8,
+    max_attempts: u8,
+    error: &ResearchError,
+) -> Option<ModelToolOutput> {
+    if request.purpose != RESEARCH_SYNTHESIZER_RECIPE_ID
+        || request.phase != AgentTurnPhase::Submit
+        || submission_attempts != 0
+        || max_attempts < 2
+        || !matches!(error, ResearchError::ProviderOutputLimitExceeded { .. })
+        || turn.assistant_text.is_some()
+        || !turn.tool_calls.is_empty()
+        || budget.output_usage_unknown
+        || budget.check_wall().is_err()
+        || budget.remaining_output_tokens().is_err()
+    {
+        return None;
+    }
+    Some(ModelToolOutput {
+        call_id: turn.terminal_submission.as_ref()?.call_id.clone(),
+        output: json!({
+            "ok": false,
+            "error": "provider_output_limit_exceeded",
+            "message": error.to_string(),
+            "repair_policy": "compress_prose_only_preserve_all_required_fields_references_and_numeric_conclusions",
+            "remaining_output_tokens": budget.remaining_output_tokens().ok()?,
+        }),
+    })
+}
+
+fn phase_output_cap(
+    budget: &AgentRunBudget,
+    phase: AgentTurnPhase,
+    purpose: &str,
+    submission_attempts: u8,
+) -> ResearchResult<u32> {
+    let submit_reserve = if phase == AgentTurnPhase::Draft {
+        (budget.max_output_tokens / 2).max(1)
+    } else if purpose == akzio_domain::RESEARCH_CRITIC_RECIPE_ID && submission_attempts == 0 {
+        (budget.max_output_tokens / CRITIC_SUBMIT_RECOVERY_RESERVE_DIVISOR).max(1)
+    } else {
+        0
+    };
+    if phase == AgentTurnPhase::Draft
+        && (budget.remaining_output_tokens()? <= submit_reserve
+            || budget.started.elapsed() >= budget.wall_time.mul_f32(DRAFT_WALL_TIME_FRACTION))
+    {
+        return Err(ResearchError::InvalidOutput(
+            "draft_incomplete: reserved Submit budget reached before a memo was completed"
+                .to_owned(),
+        ));
+    }
+    let max_output_tokens = if phase == AgentTurnPhase::Draft || submit_reserve > 0 {
+        budget
+            .remaining_output_tokens()?
+            .saturating_sub(submit_reserve)
+            .max(1)
+    } else {
+        budget.remaining_output_tokens()?
+    };
+    Ok(
+        if phase == AgentTurnPhase::Draft && purpose == akzio_domain::RESEARCH_CRITIC_RECIPE_ID {
+            max_output_tokens.min(CRITIC_DRAFT_OUTPUT_CAP)
+        } else if phase == AgentTurnPhase::Draft
+            && purpose == akzio_domain::RESEARCH_SYNTHESIZER_RECIPE_ID
+        {
+            max_output_tokens.min(SYNTHESIZER_DRAFT_OUTPUT_CAP)
+        } else {
+            max_output_tokens
+        },
+    )
+}
 
 impl AgentRuntime {
     pub async fn run(
@@ -223,47 +319,25 @@ impl AgentRuntime {
         let mut phase = recovery.phase;
         // Recovery only enters Submit after replaying a persisted, nonempty memo.
         let mut draft_completed = phase == AgentTurnPhase::Submit;
-        let mut submission_attempts = 0_u8;
+        let mut submission_attempts = recovery.submission_attempts;
         let started = budget.started;
         let wall_time = budget.wall_time;
         loop {
             budget.check_wall()?;
-            // Reserve half the total output for submission and schema repair.
-            // The cap is cumulative across draft tools and recovered turns.
-            let submit_reserve = (budget.max_output_tokens / 2).max(1);
-            if phase == AgentTurnPhase::Draft
-                && (budget.remaining_output_tokens()? <= submit_reserve
-                    || budget.started.elapsed()
-                        >= budget.wall_time.mul_f32(DRAFT_WALL_TIME_FRACTION))
-            {
-                return Err(ResearchError::InvalidOutput(
-                    "draft_incomplete: reserved Submit budget reached before a memo was completed"
-                        .to_owned(),
-                ));
-            }
+            // Reserve output before every request. The Critic keeps one quarter
+            // of its finite Attempt budget for one semantic Submit repair; the
+            // first Submit can use the other half after its Draft reservation.
+            // All reservations are released before actual provider usage is
+            // charged, so a response is counted exactly once.
             if phase == AgentTurnPhase::Submit && !draft_completed {
                 return Err(ResearchError::MissingFinalOutput);
             }
-            let max_output_tokens = if phase == AgentTurnPhase::Draft {
-                budget
-                    .remaining_output_tokens()?
-                    .saturating_sub(submit_reserve)
-                    .max(1)
-            } else {
-                budget.remaining_output_tokens()?
-            };
-            let max_output_tokens = if phase == AgentTurnPhase::Draft
-                && installed.contract.purpose.as_str() == akzio_domain::RESEARCH_CRITIC_RECIPE_ID
-            {
-                max_output_tokens.min(700)
-            } else if phase == AgentTurnPhase::Draft
-                && installed.contract.purpose.as_str()
-                    == akzio_domain::RESEARCH_SYNTHESIZER_RECIPE_ID
-            {
-                max_output_tokens.min(1_800)
-            } else {
-                max_output_tokens
-            };
+            let max_output_tokens = phase_output_cap(
+                budget,
+                phase,
+                installed.contract.purpose.as_str(),
+                submission_attempts,
+            )?;
 
             let mut request = AgentModelRequest {
                 contract_hash: installed.contract.contract_hash.clone(),
@@ -285,11 +359,14 @@ impl AgentRuntime {
                 },
                 continuation: continuation.clone(),
                 tool_outputs: pending_tool_outputs.clone(),
-                continuation_instruction: (phase == AgentTurnPhase::Submit
-                    && pending_tool_outputs.is_empty())
-                .then(|| {
-                    "Draft memo is complete. Call submit_result exactly once. Before submitting: use exact IDs from the schema and their original kinds, exact task horizon, scoped evidence gaps, and matching source/resource pairs. Unavailable evidence may be reported with supplemental_needs=[]; do not invent replacement requests. Preserve uncertainty and missing support. No other tools or assistant text."
-                        .to_owned()
+                continuation_instruction: (phase == AgentTurnPhase::Submit).then(|| {
+                    if pending_tool_outputs.is_empty() {
+                        "Draft memo is complete. Call submit_result exactly once. Before submitting: use exact IDs from the schema and their original kinds, exact task horizon, scoped evidence gaps, and matching source/resource pairs. Unavailable evidence may be reported with supplemental_needs=[]; do not invent replacement requests. Preserve uncertainty and missing support. No other tools or assistant text."
+                            .to_owned()
+                    } else {
+                        "The previous submit_result was rejected by Rust validation. This is one bounded repair turn: call submit_result exactly once, reuse every valid field and exact source reference from the previous submission, and change only what the structured rejection requires. Do not restate the Critique memo, grounds, evidence text, or full context; do not call read tools or add new evidence. No assistant text or other tools."
+                            .to_owned()
+                    }
                 }),
                 max_output_tokens,
                 // Draft and Submit have separate, audited phase costs. Analyst
@@ -320,6 +397,13 @@ impl AgentRuntime {
         };
             if let Some(projection) = self.historical_projection {
                 projection.project_request(&mut request);
+            }
+            if request.purpose == RESEARCH_SYNTHESIZER_RECIPE_ID {
+                // Add before estimating input so this instruction is also charged.
+                request.prompt.push_str("\n\n");
+                request
+                    .prompt
+                    .push_str(&synthesis_length_guidance(phase, request.max_output_tokens));
             }
             let provisional_input_tokens = estimate_tokens(&request)?;
             // A memo and a Submit must both fit. Optional schema repair is bounded
@@ -393,6 +477,8 @@ impl AgentRuntime {
                 budget.authorize_model_call(input_tokens)?;
                 let request_hash = model_request_hash(&request)?;
                 self.validate_authority_permit(permit).await?;
+                let reserved_output_tokens = request.max_output_tokens;
+                budget.reserve_output_tokens(reserved_output_tokens)?;
                 let event_permit = permit.clone();
                 let event_now = logical_now(now, started.elapsed());
                 self.store_executor
@@ -458,6 +544,7 @@ impl AgentRuntime {
                         maximum_secs: node.budget.max_wall_time_secs,
                     })
                 });
+                budget.release_output_tokens(reserved_output_tokens);
                 match call {
                     Ok(turn) => {
                         break (turn, runtime_snapshot, request_hash);
@@ -492,7 +579,19 @@ impl AgentRuntime {
                             artifact_id: failed_turn.artifact_id,
                             kind: ArtifactKind::AgentTurn,
                         });
-                        budget.record_failed_turn(input_tokens)?;
+                        let provider_incomplete =
+                            matches!(&error, ResearchError::ProviderIncomplete { .. });
+                        let accounting = match &error {
+                            ResearchError::ProviderIncomplete { usage, .. } => {
+                                budget.record_failed_provider_usage(input_tokens, usage)
+                            }
+                            _ => budget.record_failed_turn(input_tokens),
+                        };
+                        if let Err(accounting_error) = accounting {
+                            if !provider_incomplete {
+                                return Err(accounting_error);
+                            }
+                        }
                         self.observe_debug_budget(permit, budget, "FailedTurnAccounted")
                             .await?;
                         if draft_deadline {
@@ -571,14 +670,53 @@ impl AgentRuntime {
                 artifact_id: turn_artifact.artifact_id,
                 kind: ArtifactKind::AgentTurn,
             });
-            budget.record_turn(
+            let provider_output_limit = turn
+                .telemetry
+                .as_ref()
+                .and_then(|telemetry| telemetry.output_tokens)
+                .and_then(|actual| u32::try_from(actual).ok())
+                .filter(|actual| *actual > request.max_output_tokens)
+                .map(|actual| ResearchError::ProviderOutputLimitExceeded {
+                    actual,
+                    maximum: request.max_output_tokens,
+                });
+            let account_result = budget.record_turn(
                 input_tokens,
                 estimate_turn_output_tokens(&turn)?,
                 turn.telemetry.as_ref(),
-            )?;
+            );
             continuation = Some(turn.continuation.clone());
             self.observe_debug_budget(permit, budget, "TurnAccounted")
                 .await?;
+            if let Err(error) = account_result {
+                return Err(provider_output_limit.unwrap_or(error));
+            }
+            if let Some(error) = provider_output_limit {
+                // This is a rejection, never an acceptance tolerance. Actual
+                // usage was charged above; exhausted budgets have already exited.
+                if let Some(feedback) = synthesis_compression_feedback(
+                    &request,
+                    &turn,
+                    budget,
+                    submission_attempts,
+                    installed.contract.retry.max_attempts,
+                    &error,
+                ) {
+                    self.record_submit_rejection(
+                        permit,
+                        installed.contract.purpose.as_str(),
+                        error.to_string(),
+                        trace_refs.last().cloned().into_iter().collect(),
+                        turn_now,
+                    )
+                    .await?;
+                    submission_attempts = submission_attempts.saturating_add(1);
+                    pending_tool_outputs = vec![feedback];
+                    model_turn = model_turn.saturating_add(1);
+                    continue;
+                }
+                return Err(error);
+            }
             pending_tool_outputs.clear();
             if phase == AgentTurnPhase::Draft && turn.terminal_submission.is_some() {
                 return Err(ResearchError::AmbiguousSubmission);
@@ -718,26 +856,14 @@ impl AgentRuntime {
                 .await?;
 
             if let Err(ResearchError::InvalidOutput(message)) = &validated {
-                let permit = permit.clone();
-                let message = message.clone();
-                let stage = installed.contract.purpose.as_str().to_owned();
-                let evidence_refs = trace_refs.last().cloned().into_iter().collect();
-                self.store_executor.execute(move |store| {
-                    if store.debug_session(&permit.run_id)?.is_some() {
-                        store.record_stage_acceptance(&akzio_domain::StageAcceptance {
-                            version: 1, run_id: permit.run_id.clone(), task_id: permit.task_id.clone(),
-                            attempt_id: permit.attempt_id.clone(), stage,
-                            business_result: "SubmitRejected".into(), test_result: akzio_domain::AcceptanceResult::Fail,
-                            checks: vec![akzio_domain::AcceptanceCheck {
-                                check_id: "agent.submit_validation".into(), category: akzio_domain::AcceptanceCategory::Schema,
-                                expected: "Canonical schema, scope and evidence validation".into(), actual: message.clone(),
-                                result: akzio_domain::AcceptanceResult::Fail, evidence_refs,
-                                message: "Original rejected submission; preserved before any repair request".into(),
-                            }], created_at: turn_now,
-                        })?;
-                    }
-                    Ok::<_, akzio_store::StoreError>(())
-                }).await??;
+                self.record_submit_rejection(
+                    permit,
+                    installed.contract.purpose.as_str(),
+                    message.clone(),
+                    trace_refs.last().cloned().into_iter().collect(),
+                    turn_now,
+                )
+                .await?;
             }
 
             let (output, deliberation_note, research_sources) = match validated {
@@ -809,11 +935,171 @@ impl AgentRuntime {
             return Ok(output_artifact);
         }
     }
+
+    async fn record_submit_rejection(
+        &self,
+        permit: &TaskWritePermit,
+        stage: &str,
+        message: String,
+        evidence_refs: Vec<ArtifactRef>,
+        now: DateTime<Utc>,
+    ) -> ResearchResult<()> {
+        let permit = permit.clone();
+        let stage = stage.to_owned();
+        self.store_executor
+            .execute(move |store| {
+                if store.debug_session(&permit.run_id)?.is_some() {
+                    store.record_stage_acceptance(&akzio_domain::StageAcceptance {
+                        version: 1,
+                        run_id: permit.run_id.clone(),
+                        task_id: permit.task_id.clone(),
+                        attempt_id: permit.attempt_id.clone(),
+                        stage,
+                        business_result: "SubmitRejected".into(),
+                        test_result: akzio_domain::AcceptanceResult::Fail,
+                        checks: vec![akzio_domain::AcceptanceCheck {
+                            check_id: "agent.submit_validation".into(),
+                            category: akzio_domain::AcceptanceCategory::Schema,
+                            expected: "Budget, canonical schema, scope and evidence validation"
+                                .into(),
+                            actual: message,
+                            result: akzio_domain::AcceptanceResult::Fail,
+                            evidence_refs,
+                            message:
+                                "Original rejected submission; preserved before any repair request"
+                                    .into(),
+                        }],
+                        created_at: now,
+                    })?;
+                }
+                Ok::<_, akzio_store::StoreError>(())
+            })
+            .await??;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod wall_time_split_tests {
     use super::*;
+
+    fn captured_submit() -> (AgentModelRequest, AgentModelTurn) {
+        let request = AgentModelRequest {
+            contract_hash: akzio_domain::ContentHash::of_bytes(b"test"),
+            purpose: RESEARCH_SYNTHESIZER_RECIPE_ID.into(),
+            phase: AgentTurnPhase::Submit,
+            prompt: String::new(),
+            objective: String::new(),
+            manifest_artifact_id: ArtifactId(akzio_domain::ContentHash::of_bytes(b"manifest")),
+            read_grant_identity: None,
+            context_materialization_identity: None,
+            context: vec![],
+            continuation: None,
+            tool_outputs: vec![],
+            continuation_instruction: None,
+            max_output_tokens: 3_240,
+            reasoning_effort: Some("low".into()),
+            tools: vec![],
+            terminal: None,
+        };
+        let turn = AgentModelTurn {
+            assistant_text: None,
+            tool_calls: vec![],
+            terminal_submission: Some(AgentTerminalSubmission {
+                call_id: "captured-submit".into(),
+                arguments: json!({"unchanged": true}),
+            }),
+            continuation: ModelContinuation::from_items(vec![]),
+            telemetry: Some(AgentTurnTelemetry {
+                provider_request_id: None,
+                response_id: None,
+                requested_model: None,
+                actual_model: None,
+                latency_millis: 61_394,
+                input_tokens: Some(1),
+                cached_input_tokens: None,
+                output_tokens: Some(3_270),
+                reasoning_tokens: Some(125),
+            }),
+            model_debug: None,
+        };
+        (request, turn)
+    }
+
+    #[test]
+    fn captured_overrun_is_charged_once_and_cannot_repair_exhausted_budget() {
+        let policy =
+            akzio_domain::budget::default_agent_budget(RESEARCH_SYNTHESIZER_RECIPE_ID).unwrap();
+        let mut budget = AgentRunBudget::new(&policy, &RetryPolicy::none());
+        let (request, turn) = captured_submit();
+        budget.record_turn(1, 1_760, None).unwrap();
+        assert!(matches!(
+            budget.record_turn(1, 1, turn.telemetry.as_ref()),
+            Err(ResearchError::OutputBudgetExceeded {
+                actual: 5_030,
+                maximum: 5_000
+            })
+        ));
+        assert_eq!(budget.output_tokens, 5_030);
+        assert_eq!(budget.reasoning_tokens, 125);
+        let error = ResearchError::ProviderOutputLimitExceeded {
+            actual: 3_270,
+            maximum: 3_240,
+        };
+        assert!(synthesis_compression_feedback(&request, &turn, &budget, 0, 2, &error).is_none());
+    }
+
+    #[test]
+    fn compression_reuses_submit_call_only_once_without_changing_payload_or_budget() {
+        let policy =
+            akzio_domain::budget::default_agent_budget(RESEARCH_SYNTHESIZER_RECIPE_ID).unwrap();
+        let mut budget = AgentRunBudget::new(&policy, &RetryPolicy::none());
+        let (mut request, turn) = captured_submit();
+        let original = turn.clone();
+        budget.record_turn(1, 900, None).unwrap();
+        budget.record_turn(1, 1, turn.telemetry.as_ref()).unwrap();
+        let error = ResearchError::ProviderOutputLimitExceeded {
+            actual: 3_270,
+            maximum: 3_240,
+        };
+        let feedback =
+            synthesis_compression_feedback(&request, &turn, &budget, 0, 2, &error).unwrap();
+        assert_eq!(feedback.call_id, "captured-submit");
+        assert_eq!(feedback.output["remaining_output_tokens"], 830);
+        assert_eq!(turn, original);
+        assert_eq!(budget.output_tokens, 4_170);
+        assert!(synthesis_compression_feedback(&request, &turn, &budget, 1, 2, &error).is_none());
+        assert!(synthesis_compression_feedback(&request, &turn, &budget, 0, 1, &error).is_none());
+        request.phase = AgentTurnPhase::Draft;
+        assert!(synthesis_compression_feedback(&request, &turn, &budget, 0, 2, &error).is_none());
+    }
+
+    #[test]
+    fn synthesizer_draft_leaves_room_for_captured_3270_token_submit() {
+        let policy = akzio_domain::budget::default_agent_budget("research.synthesizer").unwrap();
+        assert_eq!(policy.max_output_tokens, 5_000);
+        let mut budget = AgentRunBudget::new(&policy, &RetryPolicy::none());
+        let draft_cap = phase_output_cap(
+            &budget,
+            AgentTurnPhase::Draft,
+            RESEARCH_SYNTHESIZER_RECIPE_ID,
+            0,
+        )
+        .unwrap();
+        assert_eq!(draft_cap, 900);
+        budget.record_turn(1, draft_cap, None).unwrap();
+        let submit_cap = phase_output_cap(
+            &budget,
+            AgentTurnPhase::Submit,
+            RESEARCH_SYNTHESIZER_RECIPE_ID,
+            0,
+        )
+        .unwrap();
+        assert!(submit_cap >= 3_270);
+        budget.record_turn(1, 3_270, None).unwrap();
+        assert_eq!(budget.output_tokens, 4_170);
+        assert_eq!(budget.max_output_tokens, 5_000);
+    }
 
     #[test]
     fn draft_phase_keeps_more_than_the_old_fifty_five_percent_cut() {
@@ -822,5 +1108,59 @@ mod wall_time_split_tests {
         assert_eq!(draft.as_secs(), 84);
         assert!(draft > total.mul_f32(0.55));
         assert!(draft < total);
+    }
+
+    #[test]
+    fn critic_phase_caps_leave_one_repair_reservation() {
+        let policy = akzio_domain::budget::default_agent_budget("research.critic").unwrap();
+        let mut budget = AgentRunBudget::new(&policy, &RetryPolicy::none());
+        assert_eq!(
+            phase_output_cap(
+                &budget,
+                AgentTurnPhase::Draft,
+                akzio_domain::RESEARCH_CRITIC_RECIPE_ID,
+                0
+            )
+            .unwrap(),
+            4_000
+        );
+        budget.record_turn(1, 4_000, None).unwrap();
+        assert_eq!(
+            phase_output_cap(
+                &budget,
+                AgentTurnPhase::Submit,
+                akzio_domain::RESEARCH_CRITIC_RECIPE_ID,
+                0
+            )
+            .unwrap(),
+            8_000
+        );
+        budget.record_turn(1, 4_000, None).unwrap();
+        assert_eq!(
+            phase_output_cap(
+                &budget,
+                AgentTurnPhase::Submit,
+                akzio_domain::RESEARCH_CRITIC_RECIPE_ID,
+                1
+            )
+            .unwrap(),
+            8_000
+        );
+    }
+
+    #[test]
+    fn legacy_critic_budget_still_has_its_historical_boundary() {
+        let policy = akzio_domain::budget::legacy_contract_budget("research.critic").unwrap();
+        let budget = AgentRunBudget::new(&policy, &RetryPolicy::none());
+        assert_eq!(
+            phase_output_cap(
+                &budget,
+                AgentTurnPhase::Draft,
+                akzio_domain::RESEARCH_CRITIC_RECIPE_ID,
+                0
+            )
+            .unwrap(),
+            2_000
+        );
     }
 }

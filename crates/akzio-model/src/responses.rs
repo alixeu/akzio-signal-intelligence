@@ -347,7 +347,10 @@ pub(super) fn openai_response_from_raw(raw: Value, request_body: Value) -> Resul
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_owned();
-        return Err(ModelError::Incomplete(reason));
+        return Err(ModelError::Incomplete {
+            reason,
+            usage: normalize_usage(&raw),
+        });
     }
     if let Some(refusal) = extract_refusal(&raw) {
         return Err(ModelError::Refused(refusal));
@@ -525,5 +528,30 @@ mod transcript_regression {
         );
         assert_eq!(second.continuation.items()[2]["output"], "evidence A");
         assert_eq!(second.continuation.items().len(), 4);
+    }
+
+    #[test]
+    fn incomplete_response_retains_provider_usage_for_runtime_accounting() {
+        let raw = json!({
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "usage": {
+                "input_tokens": 123,
+                "output_tokens": 4287,
+                "output_tokens_details": {"reasoning_tokens": 900}
+            }
+        });
+
+        let error = openai_response_from_raw(raw, json!({"input": "context"}))
+            .expect_err("incomplete response must not be accepted as a complete turn");
+        match error {
+            ModelError::Incomplete { reason, usage } => {
+                assert_eq!(reason, "max_output_tokens");
+                assert_eq!(usage.input_tokens, Some(123));
+                assert_eq!(usage.output_tokens, Some(4287));
+                assert_eq!(usage.reasoning_tokens, Some(900));
+            }
+            other => panic!("expected incomplete response, got {other:?}"),
+        }
     }
 }

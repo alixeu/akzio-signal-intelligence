@@ -84,7 +84,14 @@ impl ContextBroker {
                             reference.artifact_id
                         )));
                     }
-                    required.insert(reference.artifact_id);
+                    // Claim grounds are needed to validate the claim itself.
+                    // Critique grounds remain durable source closure, but
+                    // their compact evidence projections are optional model
+                    // inputs so Synthesizer context cannot be exhausted by
+                    // repeating every nested semantic detail.
+                    if artifact.kind == ArtifactKind::Claim {
+                        required.insert(reference.artifact_id);
+                    }
                 }
             }
         }

@@ -496,3 +496,134 @@ fn validate_fred_vintage(
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use akzio_domain::EvidenceAcquisitionMode;
+    use chrono::NaiveDate;
+
+    #[test]
+    fn fred_observation_request_preserves_window_and_vintage() {
+        let (request, public, kind) = FredDirectTransport::request_for(
+            "series:DFII10:2026-09-01:2026-09-15:2026-08-31",
+        )
+        .expect("valid FRED series resource");
+
+        assert_eq!(kind, FredPayloadKind::Observations);
+        assert_eq!(public.scheme(), "https");
+        assert_eq!(public.host_str(), Some("api.stlouisfed.org"));
+        assert_eq!(public.path(), "/fred/series/observations");
+        assert!(!public.query().unwrap_or_default().contains("api_key"));
+        assert_eq!(request, public);
+
+        let query = public.query_pairs().collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(query.get("series_id").map(|value| value.as_ref()), Some("DFII10"));
+        assert_eq!(
+            query.get("observation_start").map(|value| value.as_ref()),
+            Some("2026-09-01")
+        );
+        assert_eq!(
+            query.get("observation_end").map(|value| value.as_ref()),
+            Some("2026-09-15")
+        );
+        assert_eq!(query.get("file_type").map(|value| value.as_ref()), Some("json"));
+        assert_eq!(
+            query.get("realtime_start").map(|value| value.as_ref()),
+            Some("2026-08-31")
+        );
+        assert_eq!(
+            query.get("realtime_end").map(|value| value.as_ref()),
+            Some("2026-08-31")
+        );
+    }
+
+    #[test]
+    fn fred_release_calendar_request_uses_bounded_dates_endpoint() {
+        let (request, public, kind) = FredDirectTransport::request_for(
+            "release_calendar:2026-09-16:2026-10-30:2026-09-15",
+        )
+        .expect("valid FRED release-calendar resource");
+
+        assert_eq!(kind, FredPayloadKind::ReleaseCalendar);
+        assert_eq!(request, public);
+        assert_eq!(public.path(), "/fred/releases/dates");
+        let query = public.query_pairs().collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(query.get("file_type").map(|value| value.as_ref()), Some("json"));
+        assert_eq!(
+            query
+                .get("include_release_dates_with_no_data")
+                .map(|value| value.as_ref()),
+            Some("true")
+        );
+        assert_eq!(query.get("limit").map(|value| value.as_ref()), Some("1000"));
+        assert_eq!(
+            query.get("order_by").map(|value| value.as_ref()),
+            Some("release_date")
+        );
+        assert_eq!(query.get("sort_order").map(|value| value.as_ref()), Some("desc"));
+        assert_eq!(
+            query.get("realtime_start").map(|value| value.as_ref()),
+            Some("2026-09-15")
+        );
+        assert_eq!(
+            query.get("realtime_end").map(|value| value.as_ref()),
+            Some("2026-09-15")
+        );
+    }
+
+    #[test]
+    fn fred_payload_and_vintage_validation_reject_wrong_shapes() {
+        let observations = serde_json::json!({
+            "realtime_start": "2026-08-31",
+            "realtime_end": "2026-08-31",
+            "observations": [{"date": "2026-09-02", "value": "2.43"}]
+        });
+        assert!(validate_fred_payload(FredPayloadKind::Observations, &observations).is_ok());
+        assert!(validate_fred_vintage(
+            NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
+            &observations
+        )
+        .is_ok());
+
+        let wrong_vintage = serde_json::json!({
+            "realtime_start": "2026-09-01",
+            "realtime_end": "2026-09-01",
+            "observations": []
+        });
+        assert!(validate_fred_vintage(
+            NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
+            &wrong_vintage
+        )
+        .is_err());
+        assert!(validate_fred_payload(
+            FredPayloadKind::Observations,
+            &serde_json::json!({"observations": {}})
+        )
+        .is_err());
+    }
+
+    /// Opt-in provider contract check. It is intentionally ignored in normal
+    /// CI because it requires a live key and an external service.
+    #[tokio::test]
+    #[ignore = "requires FRED_API_KEY and live network access"]
+    async fn live_fred_observations_are_acquired_and_vintage_checked() {
+        let transport = FredDirectTransport::from_env().expect("FRED_API_KEY is configured");
+        let resource = "series:DFII10:2026-09-01:2026-09-15:2026-08-31";
+        let value = transport
+            .acquire(&EvidenceRequest {
+                source: EvidenceSource::Fred,
+                resource: resource.to_owned(),
+                max_age: chrono::Duration::days(7),
+                acquisition_mode: EvidenceAcquisitionMode::VerifiedSource,
+            })
+            .await
+            .expect("FRED observations request should succeed");
+
+        assert_eq!(value.media_type, "application/json");
+        assert!(!value.raw.is_empty());
+        assert!(value.normalized["observations"].is_array());
+        assert_eq!(value.provenance.document_id.as_deref(), Some(resource));
+        assert!(!value.provenance.source_uri.contains("api_key"));
+    }
+}

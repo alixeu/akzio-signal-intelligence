@@ -20,6 +20,8 @@ pub struct AgentRunBudget {
     cached_input_tokens: u64,
     max_output_tokens: u32,
     output_tokens: u32,
+    output_tokens_reserved: u32,
+    output_usage_unknown: bool,
     reasoning_tokens: u64,
     max_tool_calls: akzio_domain::budget::ToolCallLimit,
     tool_calls: u32,
@@ -42,7 +44,10 @@ impl AgentRunBudget {
     fn debug_observation(&self, boundary: &str) -> serde_json::Value {
         serde_json::json!({"resolved":self.resolved_policy(),"boundary":boundary,"scope":"current_agent_budget_including_recovery",
             "input_tokens_used":self.input_tokens,"input_tokens_remaining":self.max_input_tokens.saturating_sub(self.input_tokens),
-            "output_tokens_used":self.output_tokens,"output_tokens_remaining":self.max_output_tokens.saturating_sub(self.output_tokens),
+            "output_tokens_used":self.output_tokens,"output_tokens_reserved":self.output_tokens_reserved,
+            "output_tokens_remaining":self.max_output_tokens.saturating_sub(self.output_tokens).saturating_sub(self.output_tokens_reserved),
+            "output_tokens_charged_remaining":self.max_output_tokens.saturating_sub(self.output_tokens),
+            "output_usage_unknown":self.output_usage_unknown,
             "tool_calls_used":self.tool_calls,"tool_calls_remaining":self.max_tool_calls.remaining(u64::from(self.tool_calls)),
             "model_calls_used":self.model_calls,"model_calls_remaining":self.max_model_calls.map(|limit| limit.saturating_sub(self.model_calls)),
             "elapsed_millis":self.started.elapsed().as_millis(),"wall_time_remaining_millis":self.wall_time.saturating_sub(self.started.elapsed()).as_millis(),
@@ -62,6 +67,8 @@ impl AgentRunBudget {
             cached_input_tokens: 0,
             max_output_tokens: policy.max_output_tokens,
             output_tokens: 0,
+            output_tokens_reserved: 0,
+            output_usage_unknown: false,
             reasoning_tokens: 0,
             max_tool_calls: policy.max_tool_calls,
             tool_calls: 0,
@@ -101,6 +108,9 @@ impl AgentRunBudget {
     }
 
     fn authorize_model_call(&mut self, input_tokens: u32) -> ResearchResult<()> {
+        if self.output_usage_unknown {
+            return Err(ResearchError::ProviderUsageUnknown);
+        }
         self.check_input(input_tokens)?;
         self.record_model_call()
     }
@@ -142,31 +152,39 @@ impl AgentRunBudget {
         Ok(())
     }
 
-    fn checked_output_total(&self, tokens: u32) -> ResearchResult<u32> {
-        let actual =
-            self.output_tokens
-                .checked_add(tokens)
-                .ok_or(ResearchError::OutputBudgetExceeded {
-                    actual: u32::MAX,
-                    maximum: self.max_output_tokens,
-                })?;
-        if actual > self.max_output_tokens {
-            return Err(ResearchError::OutputBudgetExceeded {
-                actual,
-                maximum: self.max_output_tokens,
-            });
-        }
-        Ok(actual)
-    }
-
     fn remaining_output_tokens(&self) -> ResearchResult<u32> {
-        let remaining = self.max_output_tokens.saturating_sub(self.output_tokens);
+        let remaining = self
+            .max_output_tokens
+            .saturating_sub(self.output_tokens)
+            .saturating_sub(self.output_tokens_reserved);
         (remaining > 0)
             .then_some(remaining)
             .ok_or(ResearchError::OutputBudgetExceeded {
-                actual: self.output_tokens.saturating_add(1),
+                actual: self
+                    .output_tokens
+                    .saturating_add(self.output_tokens_reserved)
+                    .saturating_add(1),
                 maximum: self.max_output_tokens,
             })
+    }
+
+    fn reserve_output_tokens(&mut self, tokens: u32) -> ResearchResult<()> {
+        let remaining = self.remaining_output_tokens()?;
+        if tokens > remaining {
+            return Err(ResearchError::OutputBudgetExceeded {
+                actual: self
+                    .output_tokens
+                    .saturating_add(self.output_tokens_reserved)
+                    .saturating_add(tokens),
+                maximum: self.max_output_tokens,
+            });
+        }
+        self.output_tokens_reserved = self.output_tokens_reserved.saturating_add(tokens);
+        Ok(())
+    }
+
+    fn release_output_tokens(&mut self, tokens: u32) {
+        self.output_tokens_reserved = self.output_tokens_reserved.saturating_sub(tokens);
     }
 
     /// Per-call output ceiling constrained by both the remaining whole-task
@@ -215,10 +233,36 @@ impl AgentRunBudget {
         telemetry: Option<&AgentTurnTelemetry>,
     ) -> ResearchResult<()> {
         let usage = resolve_model_usage(estimated_input, estimated_output, telemetry);
+        self.record_resolved_usage(usage)
+    }
+
+    fn record_failed_provider_usage(
+        &mut self,
+        estimated_input: u32,
+        usage: &ModelUsage,
+    ) -> ResearchResult<()> {
+        if usage.output_tokens.is_none() {
+            self.output_usage_unknown = true;
+        }
+        self.record_resolved_usage(ResolvedModelUsage {
+            input_tokens: usage.input_tokens.unwrap_or(u64::from(estimated_input)),
+            cached_input_tokens: usage.cached_input_tokens,
+            output_tokens: usage.output_tokens.unwrap_or_default(),
+            reasoning_tokens: usage.reasoning_tokens,
+        })
+    }
+
+    fn record_resolved_usage(&mut self, usage: ResolvedModelUsage) -> ResearchResult<()> {
         let input = u32::try_from(usage.input_tokens).unwrap_or(u32::MAX);
         let output = u32::try_from(usage.output_tokens).unwrap_or(u32::MAX);
-        let input_total = self.checked_input_total(input)?;
-        let output_total = self.checked_output_total(output)?;
+        let input_total = self.input_tokens.saturating_add(input);
+        let output_total = self.output_tokens.saturating_add(output);
+        let invalid_provider_usage = usage
+            .cached_input_tokens
+            .is_some_and(|cached| cached > usage.input_tokens)
+            || usage
+                .reasoning_tokens
+                .is_some_and(|reasoning| reasoning > usage.output_tokens);
         let cached_input_tokens = self
             .cached_input_tokens
             .checked_add(usage.cached_input_tokens.unwrap_or_default())
@@ -227,17 +271,42 @@ impl AgentRunBudget {
             .reasoning_tokens
             .checked_add(usage.reasoning_tokens.unwrap_or_default())
             .ok_or(ResearchError::CostOverflow)?;
-        let turn_cost = self
-            .budget_policy
-            .as_ref()
-            .and_then(|policy| policy.pricing.as_ref())
-            .map(|pricing| usage_cost_micros(usage, pricing))
-            .transpose()?;
+        let turn_cost = (!invalid_provider_usage)
+            .then(|| {
+                self.budget_policy
+                    .as_ref()
+                    .and_then(|policy| policy.pricing.as_ref())
+                    .map(|pricing| usage_cost_micros(usage, pricing))
+                    .transpose()
+            })
+            .transpose()?
+            .flatten();
         let cost_micros = turn_cost.map_or(Ok(self.cost_micros), |cost| {
             self.cost_micros
                 .checked_add(cost)
                 .ok_or(ResearchError::CostOverflow)
         })?;
+        self.input_tokens = input_total;
+        self.cached_input_tokens = cached_input_tokens;
+        self.output_tokens = output_total;
+        self.reasoning_tokens = reasoning_tokens;
+        self.cost_micros = cost_micros;
+
+        if invalid_provider_usage {
+            return Err(ResearchError::InvalidProviderUsage);
+        }
+        if input_total > self.max_input_tokens {
+            return Err(ResearchError::InputBudgetExceeded {
+                actual: input_total,
+                maximum: self.max_input_tokens,
+            });
+        }
+        if output_total > self.max_output_tokens {
+            return Err(ResearchError::OutputBudgetExceeded {
+                actual: output_total,
+                maximum: self.max_output_tokens,
+            });
+        }
         if let Some(maximum) = self
             .budget_policy
             .as_ref()
@@ -250,15 +319,11 @@ impl AgentRunBudget {
                 });
             }
         }
-        self.input_tokens = input_total;
-        self.cached_input_tokens = cached_input_tokens;
-        self.output_tokens = output_total;
-        self.reasoning_tokens = reasoning_tokens;
-        self.cost_micros = cost_micros;
         Ok(())
     }
 
     fn record_failed_turn(&mut self, estimated_input: u32) -> ResearchResult<()> {
+        self.output_usage_unknown = true;
         self.record_input(estimated_input)?;
         if self
             .budget_policy
@@ -353,6 +418,8 @@ impl AgentRunBudget {
         self.input_tokens = input_tokens;
         self.cached_input_tokens = checkpoint.usage.cached_input_tokens;
         self.output_tokens = output_tokens;
+        self.output_tokens_reserved = 0;
+        self.output_usage_unknown = false;
         self.reasoning_tokens = checkpoint.usage.reasoning_tokens;
         self.cost_micros = checkpoint.usage.cost_micros;
         self.cost_complete = checkpoint.usage.cost_complete
@@ -436,8 +503,88 @@ mod configured_budget_tests {
         budget.record_input(u32::MAX).unwrap();
         assert!(budget.authorize_model_call(1).is_err());
         budget.output_tokens = u32::MAX;
-        assert!(budget.checked_output_total(1).is_err());
         budget.record_tool_calls(u32::from(u16::MAX)).unwrap();
         assert!(budget.record_tool_calls(1).is_err());
+    }
+
+    #[test]
+    fn provider_output_total_charges_once_and_keeps_reasoning_as_detail() {
+        let policy = akzio_domain::budget::default_agent_budget("research.critic").unwrap();
+        let mut budget = AgentRunBudget::new(&policy, &RetryPolicy::none());
+        let telemetry = AgentTurnTelemetry {
+            provider_request_id: Some("req-1".to_owned()),
+            response_id: Some("resp-1".to_owned()),
+            requested_model: Some("gpt-5.6-sol".to_owned()),
+            actual_model: Some("gpt-5.6-sol".to_owned()),
+            latency_millis: 10,
+            input_tokens: Some(2_000),
+            cached_input_tokens: Some(100),
+            output_tokens: Some(4_287),
+            reasoning_tokens: Some(1_200),
+        };
+
+        budget.record_turn(1, 1, Some(&telemetry)).unwrap();
+
+        assert_eq!(budget.input_tokens, 2_000);
+        assert_eq!(budget.cached_input_tokens, 100);
+        assert_eq!(budget.output_tokens, 4_287);
+        assert_eq!(budget.reasoning_tokens, 1_200);
+    }
+
+    #[test]
+    fn over_limit_provider_usage_is_retained_before_budget_failure() {
+        let mut policy = akzio_domain::budget::default_agent_budget("research.critic").unwrap();
+        policy.max_output_tokens = 4_000;
+        let mut budget = AgentRunBudget::new(&policy, &RetryPolicy::none());
+        let telemetry = AgentTurnTelemetry {
+            provider_request_id: None,
+            response_id: None,
+            requested_model: None,
+            actual_model: None,
+            latency_millis: 0,
+            input_tokens: Some(100),
+            cached_input_tokens: None,
+            output_tokens: Some(4_287),
+            reasoning_tokens: Some(900),
+        };
+
+        assert!(matches!(
+            budget.record_turn(1, 1, Some(&telemetry)),
+            Err(ResearchError::OutputBudgetExceeded {
+                actual: 4_287,
+                maximum: 4_000
+            })
+        ));
+        assert_eq!(budget.output_tokens, 4_287);
+        assert_eq!(budget.reasoning_tokens, 900);
+        assert_eq!(budget.debug_observation("over-limit")["output_tokens_used"], 4_287);
+    }
+
+    #[test]
+    fn output_reservation_reduces_request_headroom_and_is_released() {
+        let mut policy = akzio_domain::budget::default_agent_budget("research.critic").unwrap();
+        policy.max_output_tokens = 16_000;
+        let mut budget = AgentRunBudget::new(&policy, &RetryPolicy::none());
+        budget.record_turn(1, 2_000, None).unwrap();
+        budget.reserve_output_tokens(4_000).unwrap();
+        assert_eq!(budget.remaining_output_tokens().unwrap(), 10_000);
+        assert!(budget.reserve_output_tokens(10_001).is_err());
+        budget.release_output_tokens(4_000);
+        assert_eq!(budget.remaining_output_tokens().unwrap(), 14_000);
+    }
+
+    #[test]
+    fn unknown_failed_output_blocks_an_unaccounted_retry() {
+        let policy = akzio_domain::budget::default_agent_budget("research.critic").unwrap();
+        let mut budget = AgentRunBudget::new(&policy, &RetryPolicy::none());
+        budget.record_failed_turn(100).unwrap();
+        assert!(matches!(
+            budget.authorize_model_call(1),
+            Err(ResearchError::ProviderUsageUnknown)
+        ));
+        assert_eq!(
+            budget.debug_observation("unknown")["output_usage_unknown"],
+            true
+        );
     }
 }

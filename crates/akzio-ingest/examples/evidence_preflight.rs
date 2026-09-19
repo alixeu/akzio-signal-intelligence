@@ -1,9 +1,11 @@
 //! Read-only adapter capability probe. Never creates Runs, permits or artifacts.
 //! Success means acquisition/adapter validation only, not EvidenceGate acceptance.
-use akzio_domain::{paper_session_evidence_needs, ContentHash};
+use akzio_domain::{
+    evidence_acquisition_mode, paper_session_evidence_needs, ContentHash, RunPurpose,
+};
 use akzio_ingest::{
-    AlpacaMarketDataFeed, AlpacaPaperEvidenceTransport, AsyncEvidenceAdapter,
-    EvidenceAcquisitionMode, EvidenceRequest, EvidenceSource, FredDirectTransport,
+    AlpacaMarketDataFeed, AlpacaPaperEvidenceTransport, AsyncEvidenceAdapter, EvidenceRequest,
+    EvidenceSource, FredDirectTransport, OfficialInstrumentEvidenceTransport,
 };
 use chrono::{Duration, Utc};
 use serde_json::json;
@@ -16,6 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     chrono::NaiveDate::parse_from_str(&session, "%Y-%m-%d")?;
     let alpaca = AlpacaPaperEvidenceTransport::from_env(Some(AlpacaMarketDataFeed::Iex))?;
     let fred = FredDirectTransport::from_env()?;
+    let official = OfficialInstrumentEvidenceTransport::new()?;
     let prefix = std::env::args().nth(2).unwrap_or_default();
     for need in paper_session_evidence_needs(&session)
         .into_iter()
@@ -25,24 +28,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (source, adapter): (_, &dyn AsyncEvidenceAdapter) = match need.source_family.as_str() {
             "alpaca" => (EvidenceSource::Alpaca, &alpaca),
             "fred" => (EvidenceSource::Fred, &fred),
+            "news_web" => (EvidenceSource::NewsWeb, &official),
             _ => {
                 println!(
                     "{}",
                     json!({"resource":need.resource,"provider":need.source_family,
                     "criticality":criticality,"state":"NOT_PROBED",
-                    "reason":"production registry requires verified native-web capability; this probe does not grant it"})
+                    "reason":"no direct preflight adapter is registered for this source family"})
                 );
                 continue;
             }
         };
         let started = Utc::now();
+        let acquisition_mode = evidence_acquisition_mode(RunPurpose::PositionPlan, &need);
         let result = adapter
             .acquire_at(
                 &EvidenceRequest {
                     source,
                     resource: need.resource.clone(),
                     max_age: Duration::seconds(i64::try_from(need.max_age_secs)?),
-                    acquisition_mode: EvidenceAcquisitionMode::VerifiedSource,
+                    acquisition_mode,
                 },
                 started,
             )
@@ -67,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         source,
                         resource: need.resource.clone(),
                         max_age: Duration::seconds(i64::try_from(need.max_age_secs)?),
-                        acquisition_mode: EvidenceAcquisitionMode::VerifiedSource,
+                        acquisition_mode,
                     },
                     &value,
                     Utc::now(),
@@ -78,6 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "contracts":value.normalized.get("snapshots").and_then(serde_json::Value::as_object).map(|v|v.len()),
                 "next_page_token_present":value.normalized.get("next_page_token").and_then(serde_json::Value::as_str).is_some_and(|s|!s.is_empty()),
                 "provider_timestamp":value.normalized.get("timestamp"),
+                "source_document":value.normalized.get("source_document"),
                 "quote_validation":quote_validation,
                 "quotes":if need.resource == "paper.quotes" { value.normalized.get("quotes") } else { None },
                 "validation": validation, "materialization":"NOT_RUN: no Store writes"})
@@ -122,6 +128,12 @@ fn error_observation(error: &akzio_ingest::EvidenceAdapterError) -> serde_json::
             "transport failed; raw URL and credentials withheld",
         ),
         Pending(_) => ("pending", None, true, "provider data pending"),
+        NotConfigured(_) => (
+            "adapter_unavailable",
+            None,
+            false,
+            "no authorized provider is configured",
+        ),
         NativeWeb { kind, .. } => (
             kind.as_str(),
             None,

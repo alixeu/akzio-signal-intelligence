@@ -68,39 +68,20 @@ impl Daemon {
         if let Ok(fred) = FredDirectTransport::from_env() {
             production_evidence.insert(EvidenceSource::Fred, Arc::new(fred));
         }
-        let (news_model, news_capability) =
-            if let Some(route) = model_config.routes.get("evidence.news_web") {
-                let capability = model_capabilities
-                    .routes
-                    .get("evidence.news_web")
-                    .cloned()
-                    .ok_or_else(|| {
-                        ModelError::CapabilityProbe(
-                            "missing capability snapshot for route evidence.news_web".to_owned(),
-                        )
-                    })?;
-                (
-                    ModelClient::from_config(&model_config.for_route(route))?,
-                    capability,
-                )
-            } else {
-                (model.clone(), model_capabilities.default.clone())
-            };
-        daemon.news_web_status = news_capability.native_web_status.as_str().to_owned();
-        daemon.news_web_route = if model_config.routes.contains_key("evidence.news_web") {
-            "evidence.news_web".to_owned()
-        } else {
-            "default".to_owned()
-        };
-        if news_capability.native_web_tool_verified
-            && news_capability.native_web_tool
-            && news_capability.native_web_status == akzio_model::NativeWebCapabilityStatus::Verified
-        {
-            production_evidence.insert(
-                EvidenceSource::NewsWeb,
-                model_native_web_evidence_transport(news_model, EvidenceSource::NewsWeb)?,
-            );
-        }
+        // Capability probes are diagnostics, not a permanent veto based on one
+        // search result. Actual acquisitions validate hosted search responses.
+        let capability = model_capabilities
+            .routes
+            .get("evidence.news_web")
+            .unwrap_or(&model_capabilities.default);
+        daemon.news_web_status = capability.native_web_status.as_str().to_owned();
+        production_evidence.insert(
+            EvidenceSource::NewsWeb,
+            akzio_ingest::configured_news_evidence_transport(&model_config)
+                .map_err(akzio_ingest::EvidenceRuntimeError::from)?,
+        );
+        daemon.news_web_route =
+            "resource_router:official_direct+native_web_model_review".to_owned();
         let outcome_worker_enabled =
             daemon.outcome_processing && production_evidence.contains_key(&EvidenceSource::Alpaca);
         if auto_paper && !production_evidence.contains_key(&EvidenceSource::Alpaca) {

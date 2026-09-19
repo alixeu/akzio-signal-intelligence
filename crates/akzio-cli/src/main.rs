@@ -22,9 +22,7 @@ use akzio_domain::{
     RunPurpose, RuntimeIdentity, WorkflowStatus,
 };
 use akzio_execution::{paper::AlpacaPaper, DecisionPolicy};
-use akzio_ingest::{
-    model_native_web_evidence_transport, EvidenceAcquisitionMode, EvidenceRequest, EvidenceSource,
-};
+use akzio_ingest::{EvidenceRequest, EvidenceSource};
 use akzio_model::{
     probe_configured_model_capabilities, ModelCapabilityProbeSet, OpenAIResponsesConfig,
     OPENAI_RESPONSES_PROVIDER_ID,
@@ -420,3 +418,7 @@ include!("cli/run_commands.rs");
 include!("cli/debug_commands.rs");
 include!("cli/model_qualification.rs");
 include!("cli/calibration.rs");
+
+#[cfg(test)]
+#[path = "cli/real_news_tests.rs"]
+mod real_news_tests;

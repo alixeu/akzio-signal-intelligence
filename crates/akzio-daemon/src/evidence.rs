@@ -16,6 +16,19 @@ struct ExecutionAcquisitionMaterialization {
     quote_error: Option<String>,
 }
 
+async fn bounded_research_acquisition<T>(
+    acquisition: impl std::future::Future<Output = Result<T>>,
+    allowance: std::time::Duration,
+) -> Result<T> {
+    tokio::time::timeout(allowance, acquisition)
+        .await
+        .unwrap_or_else(|_| {
+            Err(DaemonError::Unavailable(
+                "evidence_acquisition_timeout".into(),
+            ))
+        })
+}
+
 impl Daemon {
     pub(super) async fn acquire_evidence(
         &self,
@@ -60,11 +73,21 @@ impl Daemon {
                     now,
                 )
             } else {
-                let acquired = futures::future::join_all(
-                    research_inputs
-                        .iter()
-                        .map(|reference| self.acquire_live_paper_evidence(task, reference, now)),
-                )
+                // Keep room inside the frozen gate budget to validate and
+                // persist completed sources and explicit coverage gaps.
+                let allowance = std::time::Duration::from_secs(u64::from(
+                    task.node
+                        .budget
+                        .max_wall_time_secs
+                        .saturating_sub(15)
+                        .max(1),
+                ));
+                let acquired = futures::future::join_all(research_inputs.iter().map(|reference| {
+                    bounded_research_acquisition(
+                        self.acquire_live_paper_evidence(task, reference, now),
+                        allowance,
+                    )
+                }))
                 .await;
                 let cutoff = Utc::now();
                 let results = research_inputs
@@ -1368,11 +1391,15 @@ fn evidence_failure_category(error: &DaemonError) -> &'static str {
         DaemonError::Evidence(R::Adapter(A::Unauthorized(_))) => "authorization",
         DaemonError::Evidence(R::Adapter(A::RateLimited { .. })) => "rate_limited",
         DaemonError::Evidence(R::Adapter(A::Pending(_))) => "pending",
+        DaemonError::Evidence(R::Adapter(A::NotConfigured(_))) => "adapter_unavailable",
         DaemonError::Evidence(R::Adapter(A::Transport(_))) => "transport",
         DaemonError::Evidence(R::Adapter(A::Permanent(_))) => "permanent_provider_error",
         DaemonError::Evidence(R::Adapter(A::NativeWeb { kind, .. })) => kind.as_str(),
         DaemonError::Evidence(R::StaleEvidence) => "stale_content",
         DaemonError::Evidence(_) => "data_quality",
+        DaemonError::Unavailable(reason) if reason == "evidence_acquisition_timeout" => {
+            "acquisition_timeout"
+        }
         DaemonError::Unavailable(_) => "adapter_unavailable",
         _ => "validation_failure",
     }
@@ -1393,4 +1420,41 @@ fn validated_paper_quotes(
         }
     }
     Ok(snapshot)
+}
+
+#[cfg(test)]
+mod acquisition_deadline_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn slow_source_does_not_discard_completed_sources_or_hide_temporal_errors() {
+        let allowance = std::time::Duration::from_millis(10);
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            tokio::join!(
+                bounded_research_acquisition(async { Ok(7_u8) }, allowance),
+                bounded_research_acquisition(std::future::pending::<Result<u8>>(), allowance),
+                bounded_research_acquisition(
+                    async {
+                        Err::<u8, _>(DaemonError::Evidence(
+                            akzio_ingest::EvidenceRuntimeError::TemporalContamination,
+                        ))
+                    },
+                    allowance,
+                ),
+            )
+        })
+        .await
+        .expect("one slow source must not consume the entire gate deadline");
+        assert_eq!(result.0.unwrap(), 7);
+        assert_eq!(
+            evidence_failure_category(&result.1.unwrap_err()),
+            "acquisition_timeout"
+        );
+        assert!(matches!(
+            result.2,
+            Err(DaemonError::Evidence(
+                akzio_ingest::EvidenceRuntimeError::TemporalContamination
+            ))
+        ));
+    }
 }
