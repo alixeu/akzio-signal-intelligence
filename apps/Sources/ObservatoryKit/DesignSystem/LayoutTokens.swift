@@ -16,7 +16,7 @@ public enum AkzioLayout {
     public static let pageMargin: CGFloat = 20
     public static let statusBarHeight: CGFloat = 48
     /// Minimum fixed width that fits the longest English navigation label
-    /// ("Scenario Gallery") with the icon, row padding and sidebar breathing room.
+    /// ("Intelligence") with the icon, row padding and sidebar breathing room.
     public static let sidebarWidth: CGFloat = 224
     public static let sidebarHorizontalPadding: CGFloat = 16
     /// The compact sidebar control sits to the right of the native traffic lights,
@@ -31,7 +31,7 @@ public enum AkzioLayout {
         max(0, (statusBarHeight - collapsedSidebarToggleSize) / 2)
     }
     public static let inspectorWidth: CGFloat = 300
-    public static let workflowInspectorWidth: CGFloat = 520
+    public static let workflowInspectorWidth: CGFloat = 360
     public static let inspectorOverlayMaxHeight: CGFloat = 560
     /// Wide enough for "Analyst 1 · gemini-3.1-pro · 83%" on one line without
     /// truncating the role name, which is the row's primary identifier.
@@ -50,6 +50,7 @@ public enum AkzioLayout {
     /// Keeps an in-page inspector inside its owning content region at every
     /// window size. The outer `s3` padding consumes `s6` across both edges.
     public static func inspectorOverlaySize(in available: CGSize) -> CGSize {
+        // 宽高都至少保留 1pt；同时受固定 rail 宽度和最大高度限制，避免小窗口出现负尺寸。
         CGSize(
             width: min(inspectorWidth, max(1, available.width - s6)),
             height: min(inspectorOverlayMaxHeight, max(1, available.height - s6))
@@ -85,6 +86,7 @@ public enum AkzioShadow {
 
 extension View {
     public func akzioShadow(_ level: AkzioShadow) -> some View {
+        // 阴影参数只由 token 决定，View 不在调用点自行组合半径和偏移。
         shadow(color: level.color, radius: level.radius, x: 0, y: level.y)
     }
 
@@ -104,18 +106,6 @@ extension View {
             )
     }
 
-    /// Hairline separator that fades at both ends instead of a hard 1px rule.
-    public func akzioTopEdgeFade() -> some View {
-        overlay(alignment: .top) {
-            LinearGradient(
-                colors: [AkzioColor.hairline, .clear],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-            .frame(height: 8)
-            .allowsHitTesting(false)
-        }
-    }
 }
 
 public struct HairlineDivider: View {
@@ -128,6 +118,7 @@ public struct HairlineDivider: View {
     }
 
     public var body: some View {
+        // Divider 只改变对应轴的尺寸，另一轴保持由父布局决定。
         Rectangle()
             .fill(color)
             .frame(

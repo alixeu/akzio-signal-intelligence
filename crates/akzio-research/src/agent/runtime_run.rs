@@ -4,101 +4,73 @@
 // Attempt. The previous 55/45 split killed legitimate high-reasoning Drafts at
 // 66s even when the Contract still had 54s left.
 const DRAFT_WALL_TIME_FRACTION: f32 = 0.70;
-const CRITIC_DRAFT_OUTPUT_CAP: u32 = 4_000;
-const CRITIC_SUBMIT_RECOVERY_RESERVE_DIVISOR: u32 = 4;
-// The 12-forecast Submit is larger than its memo. Keep the frozen 5k total,
-// but spend less of it restating the six upstream research documents.
-const SYNTHESIZER_DRAFT_OUTPUT_CAP: u32 = 900;
-
-fn synthesis_length_guidance(phase: AgentTurnPhase, cap: u32) -> String {
-    let target = cap.saturating_mul(3) / 4;
-    let phase_rule = match phase {
-        AgentTurnPhase::Draft => {
-            "Write a short synthesis memo, not the final JSON or a full report. Summarize the asset/horizon conclusions, material conflicts and uncertainty; do not recopy upstream documents or the evidence-ID ledger."
-        }
-        AgentTurnPhase::Submit => {
-            "Format the completed Draft only; do not restart research. Preserve all 12 forecasts with their required thesis fields, four allocations plus cash, exact evidence/claim/critique references, material conflicts and uncertainties. Shorten prose only: use concise summary, rationale, exit/invalidation conditions and deliberation; do not repeat the memo or evidence text. Never drop required fields, references or change numeric conclusions to fit."
-        }
-    };
-    format!(
-        "Synthesis phase allowance: {cap} output tokens INCLUDING reasoning and tool arguments. Aim below {target} total tokens to leave headroom. The actual request ceiling may be lower after input/cost checks; always obey that lower ceiling. This writing target never expands the budget. {phase_rule}"
-    )
-}
-
-fn synthesis_compression_feedback(
-    request: &AgentModelRequest,
-    turn: &AgentModelTurn,
-    budget: &AgentRunBudget,
-    submission_attempts: u8,
-    max_attempts: u8,
-    error: &ResearchError,
-) -> Option<ModelToolOutput> {
-    if request.purpose != RESEARCH_SYNTHESIZER_RECIPE_ID
-        || request.phase != AgentTurnPhase::Submit
-        || submission_attempts != 0
-        || max_attempts < 2
-        || !matches!(error, ResearchError::ProviderOutputLimitExceeded { .. })
-        || turn.assistant_text.is_some()
-        || !turn.tool_calls.is_empty()
-        || budget.output_usage_unknown
-        || budget.check_wall().is_err()
-        || budget.remaining_output_tokens().is_err()
-    {
-        return None;
+fn outcome_phase_output_cap(budget: &AgentRunBudget, phase: AgentTurnPhase) -> ResearchResult<u32> {
+    let reserve = if phase == AgentTurnPhase::Draft { (budget.max_output_tokens / 2).max(1) } else { 0 };
+    if phase == AgentTurnPhase::Draft && (budget.remaining_output_tokens()? <= reserve
+        || budget.started.elapsed() >= budget.wall_time.mul_f32(DRAFT_WALL_TIME_FRACTION)) {
+        return Err(ResearchError::InvalidOutput("draft_incomplete: reserved Submit budget reached before a memo was completed".into()));
     }
-    Some(ModelToolOutput {
-        call_id: turn.terminal_submission.as_ref()?.call_id.clone(),
-        output: json!({
-            "ok": false,
-            "error": "provider_output_limit_exceeded",
-            "message": error.to_string(),
-            "repair_policy": "compress_prose_only_preserve_all_required_fields_references_and_numeric_conclusions",
-            "remaining_output_tokens": budget.remaining_output_tokens().ok()?,
-        }),
-    })
+    Ok(budget.remaining_output_tokens()?.saturating_sub(reserve).max(1))
 }
 
 fn phase_output_cap(
     budget: &AgentRunBudget,
     phase: AgentTurnPhase,
     purpose: &str,
-    submission_attempts: u8,
+    _submission_attempts: u8,
+    _contract_version: u32,
+    provider_cap: Option<u32>,
 ) -> ResearchResult<u32> {
-    let submit_reserve = if phase == AgentTurnPhase::Draft {
-        (budget.max_output_tokens / 2).max(1)
-    } else if purpose == akzio_domain::RESEARCH_CRITIC_RECIPE_ID && submission_attempts == 0 {
-        (budget.max_output_tokens / CRITIC_SUBMIT_RECOVERY_RESERVE_DIVISOR).max(1)
-    } else {
-        0
-    };
-    if phase == AgentTurnPhase::Draft
-        && (budget.remaining_output_tokens()? <= submit_reserve
-            || budget.started.elapsed() >= budget.wall_time.mul_f32(DRAFT_WALL_TIME_FRACTION))
-    {
-        return Err(ResearchError::InvalidOutput(
-            "draft_incomplete: reserved Submit budget reached before a memo was completed"
-                .to_owned(),
-        ));
+    if purpose == LEARNING_OUTCOME_WORKER_RECIPE_ID {
+        return outcome_phase_output_cap(budget, phase);
     }
-    let max_output_tokens = if phase == AgentTurnPhase::Draft || submit_reserve > 0 {
-        budget
-            .remaining_output_tokens()?
-            .saturating_sub(submit_reserve)
-            .max(1)
+    // max_output_tokens is the frozen Task lifetime allowance. The request
+    // receives only the unspent part, bounded independently by the application
+    // ceiling and any explicitly declared Provider output capability.
+    let remaining = budget.remaining_output_tokens()?;
+    let cap = remaining
+        .min(akzio_domain::budget::MAX_AGENT_OUTPUT_TOKENS)
+        .min(provider_cap.unwrap_or(u32::MAX));
+    if cap == 0 {
+        return Err(ResearchError::OutputBudgetExceeded { actual: 1, maximum: 0 });
+    }
+    Ok(cap)
+}
+
+/// Minimum share of a task's wall-time allowance that must remain before a
+/// bounded repair round is worth requesting. A repair is a second full provider
+/// turn; entering one with almost no time left cannot succeed and replaces the
+/// real validation rejection with a misleading `wall_time` failure. Observed
+/// structured submissions take roughly half the 120s allowance, so a repair
+/// needs at least that much again.
+const REPAIR_ROUND_WALL_TIME_FRACTION: f32 = 0.5;
+
+/// True when enough of the phase deadline remains to attempt a repair round.
+/// The rejection itself is still recorded either way; this only decides whether
+/// asking the model to fix it can plausibly finish inside the same allowance.
+fn repair_round_fits(phase_deadline: StdDuration, elapsed: StdDuration) -> bool {
+    phase_deadline.saturating_sub(elapsed)
+        >= phase_deadline.mul_f32(REPAIR_ROUND_WALL_TIME_FRACTION)
+}
+
+fn model_phase_deadline(
+    wall_time: StdDuration,
+    phase: AgentTurnPhase,
+    contract_version: u32,
+) -> StdDuration {
+    let phase_deadline = if phase == AgentTurnPhase::Draft {
+        wall_time.mul_f32(DRAFT_WALL_TIME_FRACTION)
     } else {
-        budget.remaining_output_tokens()?
+        wall_time
     };
-    Ok(
-        if phase == AgentTurnPhase::Draft && purpose == akzio_domain::RESEARCH_CRITIC_RECIPE_ID {
-            max_output_tokens.min(CRITIC_DRAFT_OUTPUT_CAP)
-        } else if phase == AgentTurnPhase::Draft
-            && purpose == akzio_domain::RESEARCH_SYNTHESIZER_RECIPE_ID
-        {
-            max_output_tokens.min(SYNTHESIZER_DRAFT_OUTPUT_CAP)
-        } else {
-            max_output_tokens
-        },
-    )
+    if contract_version < akzio_domain::budget::OUTPUT_BUDGET_RESEARCH_CONTRACT_VERSION {
+        return phase_deadline;
+    }
+    // Accounting and a fenced failure commit must have time inside the same
+    // task allowance. This does not guarantee a blocked Store can finish;
+    // that case still leaves a durable Started with unknown usage.
+    let audit_reserve = StdDuration::from_secs(1).min(wall_time / 10);
+    phase_deadline.min(wall_time.saturating_sub(audit_reserve))
 }
 
 impl AgentRuntime {
@@ -159,17 +131,48 @@ impl AgentRuntime {
                         .tasks
                         .into_iter()
                         .find(|task| task.node.task_id == task_id)
-                        .map(|task| task.node.budget)
+                        .map(|task| (task.node, task.active_attempt))
                 })
             })
             .await??;
-        if frozen.as_ref() != Some(&node.budget)
+        // Candidate evidence is authorized by Context below and may be enriched
+        // after claim. The immutable execution scope and policy must still match.
+        let frozen_execution_matches = frozen.as_ref().is_some_and(|(stored, _)| {
+            let mut execution = node.clone();
+            execution.input_artifacts = stored.input_artifacts.clone();
+            execution.dependencies.sort();
+            execution == *stored
+        });
+        if !frozen_execution_matches
             || budget.resolved_policy() != node.budget
             || node.retry != installed.contract.retry
             || node.on_failure != installed.contract.on_failure
         {
             return Err(ResearchError::NodePolicyMismatch);
         }
+        // Use the durable Attempt start, not a later handler-local start. The
+        // controller's deadline otherwise wins before the Agent can audit a
+        // timed-out call. Never extend either clock or reset cumulative usage.
+        let event_time_origin = if installed.contract.version
+            >= akzio_domain::budget::OUTPUT_BUDGET_RESEARCH_CONTRACT_VERSION
+        {
+            let active = frozen.and_then(|(_, active)| active)
+                .filter(|active| active.permit == *permit)
+                .ok_or(ResearchError::GrantPermitMismatch)?;
+            let elapsed = Utc::now().signed_duration_since(active.started_at)
+                .to_std().map_err(|_| ResearchError::InvalidOutput(
+                    "Attempt start is in the future; cannot establish its deadline".into()
+                ))?;
+            let started = Instant::now().checked_sub(elapsed).ok_or_else(|| {
+                ResearchError::InvalidOutput("Attempt elapsed time cannot be represented".into())
+            })?;
+            budget.started = budget.started.min(started);
+            budget.check_wall()?;
+            active.started_at
+        } else {
+            now
+        };
+        let query_scope = akzio_domain::ContextQueryScope::for_node(node);
         let candidates = candidates.into_iter().collect::<Vec<_>>();
         let manifest = if let Some(parent_task_id) = &node.parent_task_id {
             if !node.dependencies.contains(parent_task_id) {
@@ -206,7 +209,7 @@ impl AgentRuntime {
             let permit = permit.clone();
             let grant_ttl = self.grant_ttl;
             self.store_executor
-                .execute(move |_| context.assemble(&permit, &contract, candidates, now, grant_ttl))
+                .execute(move |_| context.assemble(&permit, &contract, &query_scope, candidates, now, grant_ttl))
                 .await??
         };
         if !manifest.grant.matches_permit(permit) {
@@ -242,20 +245,32 @@ impl AgentRuntime {
             })
             .collect::<Vec<_>>();
         let reference_ledger = serde_json::to_string(&reference_ledger)?;
-        let prompt = format!(
-            "{governance}\n\n{role}\n\nDuring Draft, use granted read tools as needed, then return a concise, auditable research memo in {response_language}. State conclusions, evidence, counter-evidence, and uncertainty without exposing hidden chain-of-thought. During Submit, call submit_result exactly once; keep JSON property names, enum literals, identifiers, symbols, and cited source text unchanged.\n\nTop-level ContextManifest references (copy exact artifact_id and kind into result references; a blocked decision still preserves selected claims and their grounds):\n{reference_ledger}\n\nWire Submit references contain only artifact_id, not kind. Rust resolves kind from this immutable ledger. Select only IDs allowed by the specific field schema; a Claim is not an evidence ground."
-        );
-        let prompt = if installed.contract.output.artifact_kind == ArtifactKind::DecisionProposal {
-            format!(
-                "{prompt}\n\nSubmission invariant: result.claims and result.hard_blockers must not both be empty; copy at least one selected claim reference when claims are available. result.research_allocation is mandatory: include all four executable assets exactly once, explicit integer-ppm cash, and make the four asset weights plus cash sum to 1000000."
-            )
-        } else {
-            prompt
+        let direct_structured = match installed.contract.purpose.as_str() {
+            RESEARCH_ANALYST_RECIPE_ID | RESEARCH_CRITIC_RECIPE_ID | RESEARCH_SYNTHESIZER_RECIPE_ID | akzio_domain::RESEARCH_PROPOSAL_REVIEWER_RECIPE_ID
+                if installed.contract.version >= 65 => true,
+            LEARNING_OUTCOME_WORKER_RECIPE_ID => false,
+            _ => return Err(ResearchError::InvalidOutput("legacy_workflow_retired".into())),
         };
-        let prompt = format!(
-            "{prompt}\n\nResolved Attempt resource budget: {}. max_input_tokens is the cumulative input across all LLM requests in this Attempt, not the provider context window. Draft and Submit share this budget.",
-            serde_json::to_string(&node.budget)?
-        );
+        // Choose the research or Outcome protocol explicitly.
+        let prompt = if direct_structured {
+            prompts::structured_request_prompt(
+                &governance,
+                &role,
+                response_language,
+                &reference_ledger,
+                installed.contract.output.artifact_kind,
+                &node.budget,
+                installed.contract.version,
+            )?
+        } else {
+            prompts::outcome_request_prompt(
+                &governance,
+                &role,
+                response_language,
+                &reference_ledger,
+                &node.budget,
+            )?
+        };
         let mut output_schema: Value = serde_json::from_slice(
             &self
                 .read_authority_document(&installed.contract, &installed.contract.output.schema)
@@ -270,24 +285,42 @@ impl AgentRuntime {
                 .map(|s| json!(s.artifact))
                 .collect::<Vec<_>>(),
         );
-        let run_purpose = self.run_purpose_for(&permit.run_id).await?;
-        let tools = if !should_advertise_read_tools(run_purpose) {
+        if direct_structured {
+            if installed.contract.version >= 61 {
+                let contract_version = installed.contract.version;
+                let manifest_for_schema = manifest.clone();
+                output_schema = self.store_executor.execute(move |store| {
+                    bind_ground_scope_schema(&store, &manifest_for_schema, &mut output_schema, contract_version)?;
+                    Ok::<_, ResearchError>(output_schema)
+                }).await??;
+            }
+            output_schema["properties"]["deliberation"]["properties"]["basis_artifact_ids"]["minItems"] = json!(1);
+            if installed.contract.output.artifact_kind == ArtifactKind::DecisionProposal {
+                remove_model_timing_fields(&mut output_schema);
+                bind_synthesis_submission_schema(&mut output_schema);
+            }
+        }
+        if installed.contract.output.artifact_kind == ArtifactKind::ProposalReview { remove_review_identity(&mut output_schema); }
+        let tools = if direct_structured {
             Vec::new()
         } else {
             model_tool_definitions(&self.context, &installed.contract)?
         };
         let terminal = AgentTerminalDefinition {
-            description: format!(
-                "Submit the final {} contract output for Rust validation. Reference objects use only artifact_id: Rust resolves kind from the immutable Manifest before canonical validation. This has no side effects.",
-                installed.contract.purpose.as_str()
-            ),
+            description: submit_tool_description(&installed.contract.purpose),
             input_schema: output_schema.clone(),
+        };
+        let deliberation_terminal = AgentTerminalDefinition {
+            description: "Repair only the rejected deliberation. The original result is immutable and owned by Rust.".into(),
+            input_schema: json!({"type":"object","properties":{"deliberation":terminal.input_schema["properties"]["deliberation"]},"required":["deliberation"],"additionalProperties":false}),
         };
         let prefetched_capabilities = model.capability_snapshot();
         let budget_policy = model.budget_policy();
         budget.attach_budget_policy(&budget_policy)?;
         let budget_policy_hash = budget_policy_hash(&budget_policy)?;
         let recovery_guard = AgentRecoveryGuard {
+            initial_phase: if direct_structured { AgentTurnPhase::Submit } else { AgentTurnPhase::Draft },
+            deliberation_repair_tool_set_hash: if direct_structured { Some(advertised_tool_set_hash(&[], Some(&deliberation_terminal))?) } else { None },
             contract_hash: installed.contract.contract_hash.clone(),
             context_manifest: manifest.payload.clone(),
             read_grant_identity: context_materialization.read_grant_identity.clone(),
@@ -306,6 +339,7 @@ impl AgentRuntime {
                 agent_recovery_checkpoint(&store, &recovery_permit, &recovery_guard)
             })
             .await??;
+        let provider_output_cap = prefetched_capabilities.declared_max_output_tokens;
         let mut prefetched_capabilities = Some(prefetched_capabilities);
         if matches!(&recovery.source, AgentRecoverySource::Recovered(_)) {
             budget.restore(&recovery)?;
@@ -317,18 +351,22 @@ impl AgentRuntime {
         let mut trace_refs = recovery.trace_refs;
         let mut model_turn = recovery.next_model_turn;
         let mut phase = recovery.phase;
-        // Recovery only enters Submit after replaying a persisted, nonempty memo.
+        // Research starts at Submit; Outcome recovery still requires a persisted Draft memo.
         let mut draft_completed = phase == AgentTurnPhase::Submit;
         let mut submission_attempts = recovery.submission_attempts;
         let started = budget.started;
         let wall_time = budget.wall_time;
         loop {
             budget.check_wall()?;
-            // Reserve output before every request. The Critic keeps one quarter
-            // of its finite Attempt budget for one semantic Submit repair; the
-            // first Submit can use the other half after its Draft reservation.
-            // All reservations are released before actual provider usage is
-            // charged, so a response is counted exactly once.
+            if installed.contract.version >= akzio_domain::budget::OUTPUT_BUDGET_RESEARCH_CONTRACT_VERSION
+                && started.elapsed() >= model_phase_deadline(wall_time, phase, installed.contract.version) {
+                return Err(ResearchError::WallTimeExceeded {
+                    maximum_secs: node.budget.max_wall_time_secs,
+                });
+            }
+            // Reserve the effective request cap against the shared task ledger.
+            // Only Outcome uses the phase-specific allocation below.
+            // Release reservations before charging actual Provider usage, once.
             if phase == AgentTurnPhase::Submit && !draft_completed {
                 return Err(ResearchError::MissingFinalOutput);
             }
@@ -337,6 +375,8 @@ impl AgentRuntime {
                 phase,
                 installed.contract.purpose.as_str(),
                 submission_attempts,
+                installed.contract.version,
+                provider_output_cap,
             )?;
 
             let mut request = AgentModelRequest {
@@ -344,9 +384,9 @@ impl AgentRuntime {
                 purpose: installed.contract.purpose.as_str().to_owned(),
                 phase,
                 prompt: if phase == AgentTurnPhase::Draft && !budget.max_tool_calls.allows(u64::from(budget.tool_calls) + 1) {
-                    format!("{prompt}\nRead tool budget exhausted. Complete the concise Draft memo using available facts; explicitly preserve insufficient evidence. Rust will then request Submit.")
+                    prompts::reads_exhausted_prompt(&prompt)
                 } else { prompt.clone() },
-                objective: node.objective.clone(),
+                objective: node.model_objective(),
                 manifest_artifact_id: manifest.artifact.artifact_id.clone(),
                 read_grant_identity: Some(context_materialization.read_grant_identity.clone()),
                 context_materialization_identity: Some(
@@ -359,35 +399,14 @@ impl AgentRuntime {
                 },
                 continuation: continuation.clone(),
                 tool_outputs: pending_tool_outputs.clone(),
-                continuation_instruction: (phase == AgentTurnPhase::Submit).then(|| {
-                    if pending_tool_outputs.is_empty() {
-                        "Draft memo is complete. Call submit_result exactly once. Before submitting: use exact IDs from the schema and their original kinds, exact task horizon, scoped evidence gaps, and matching source/resource pairs. Unavailable evidence may be reported with supplemental_needs=[]; do not invent replacement requests. Preserve uncertainty and missing support. No other tools or assistant text."
-                            .to_owned()
-                    } else {
-                        "The previous submit_result was rejected by Rust validation. This is one bounded repair turn: call submit_result exactly once, reuse every valid field and exact source reference from the previous submission, and change only what the structured rejection requires. Do not restate the Critique memo, grounds, evidence text, or full context; do not call read tools or add new evidence. No assistant text or other tools."
-                            .to_owned()
-                    }
-                }),
+                continuation_instruction: if direct_structured && pending_tool_outputs.is_empty() { None } else { prompts::continuation_instruction(
+                    phase, installed.contract.version, !pending_tool_outputs.is_empty(),
+                ) },
                 max_output_tokens,
-                // Draft and Submit have separate, audited phase costs. Analyst
-                // Drafts use medium reasoning so the fixed 120s Attempt can
-                // still reach Submit; the model, evidence, output contract,
-                // and target semantics are unchanged. Submit is deterministic
-                // schema formatting and uses low reasoning.
-                reasoning_effort: if phase == AgentTurnPhase::Submit
-                    || installed.contract.purpose.as_str()
-                        == akzio_domain::RESEARCH_CRITIC_RECIPE_ID
-                {
+                // Outcome retains its Submit formatting override; research uses its configured route.
+                reasoning_effort: if !direct_structured && phase == AgentTurnPhase::Submit {
                     Some("low".to_owned())
-                } else if matches!(
-                    installed.contract.purpose.as_str(),
-                    RESEARCH_ANALYST_RECIPE_ID
-                        | akzio_domain::RESEARCH_SYNTHESIZER_RECIPE_ID
-                ) {
-                    Some("medium".to_owned())
-                } else {
-                    None
-                },
+                } else { None },
                 tools: if phase == AgentTurnPhase::Draft && budget.max_tool_calls.allows(u64::from(budget.tool_calls) + 1) {
                     tools.clone()
                 } else {
@@ -395,16 +414,30 @@ impl AgentRuntime {
             },
             terminal: (phase == AgentTurnPhase::Submit).then(|| terminal.clone()),
         };
+            if !direct_structured && installed.contract.version >= catalogue::COMPACT_SUBMISSION_CONTRACT_VERSION
+                && phase == AgentTurnPhase::Submit {
+                let instruction = request.continuation_instruction.get_or_insert_with(String::new);
+                instruction.push_str(prompts::COMPACT_JSON_GUIDANCE);
+            }
             if let Some(projection) = self.historical_projection {
                 projection.project_request(&mut request);
             }
-            if request.purpose == RESEARCH_SYNTHESIZER_RECIPE_ID {
-                // Add before estimating input so this instruction is also charged.
-                request.prompt.push_str("\n\n");
-                request
-                    .prompt
-                    .push_str(&synthesis_length_guidance(phase, request.max_output_tokens));
+            if request.purpose == RESEARCH_ANALYST_RECIPE_ID {
+                request.prompt.push_str(prompts::ANALYST_GROUNDS_GUIDANCE);
             }
+            if request.purpose == akzio_domain::RESEARCH_CRITIC_RECIPE_ID {
+                request.prompt.push_str(prompts::CRITIC_VERDICT_GUIDANCE);
+            }
+            let frozen_result = if direct_structured && is_deliberation_repair(&pending_tool_outputs) {
+                let original = self.last_structured_submission(&trace_refs).await?;
+                request.context = vec![json!({"type":"deliberation_repair","previous_deliberation":original["deliberation"],"validation_feedback":pending_tool_outputs,"frozen_result_hash":akzio_domain::ContentHash::of_bytes(&serde_json::to_vec(&original["result"])?)})];
+                request.continuation = None;
+                request.tool_outputs.clear();
+                request.continuation_instruction = None;
+                request.prompt = format!("{governance}\n本次仅修复此前被 Rust 拒绝的 deliberation。正式 result 已冻结，不得提交、重写或推断 result。保留原有依据和叙事，仅修复指出的错误；uncertainty_weight_ppm 的总和必须严格等于 1000000-confidence_ppm。恰好调用一次 submit_result，只包含 deliberation。引用 ID 必须来自此不可变 ledger：{reference_ledger}");
+                request.terminal = Some(deliberation_terminal.clone());
+                Some(original["result"].clone())
+            } else { None };
             let provisional_input_tokens = estimate_tokens(&request)?;
             // A memo and a Submit must both fit. Optional schema repair is bounded
             // by remaining budget; insufficient input never fabricates a memo.
@@ -434,6 +467,15 @@ impl AgentRuntime {
                 let capability_snapshot = prefetched_capabilities
                     .take()
                     .unwrap_or_else(|| model.capability_snapshot());
+                if capability_snapshot.declared_max_output_tokens
+                    .is_some_and(|cap| request.max_output_tokens > cap)
+                {
+                    return Err(ResearchError::CapabilityMismatch {
+                        capability: "max_output_tokens",
+                        provider_id: capability_snapshot.provider_id.clone(),
+                        model_id: capability_snapshot.model_id.clone(),
+                    });
+                }
                 let capability_snapshot_hash = capability_snapshot_hash(&capability_snapshot)?;
                 let runtime_snapshot = AgentTurnRuntimeSnapshot {
                     resolved_budget: node.budget.clone(),
@@ -447,7 +489,7 @@ impl AgentRuntime {
                 if let Err(capability) =
                     validate_model_capabilities(&runtime_snapshot.capability, &request)
                 {
-                    let turn_now = logical_now(now, started.elapsed());
+                    let turn_now = logical_now(event_time_origin, started.elapsed());
                     let failed_turn = self
                         .record_failed_turn(
                             TurnRecord {
@@ -474,13 +516,19 @@ impl AgentRuntime {
                 }
                 // Reject locally before opening a durable Provider turn.
                 // A budget rejection must not leave AgentTurnStarted unmatched.
+                if installed.contract.version >= akzio_domain::budget::OUTPUT_BUDGET_RESEARCH_CONTRACT_VERSION
+                && started.elapsed() >= model_phase_deadline(wall_time, phase, installed.contract.version) {
+                    return Err(ResearchError::WallTimeExceeded {
+                        maximum_secs: node.budget.max_wall_time_secs,
+                    });
+                }
                 budget.authorize_model_call(input_tokens)?;
                 let request_hash = model_request_hash(&request)?;
                 self.validate_authority_permit(permit).await?;
                 let reserved_output_tokens = request.max_output_tokens;
                 budget.reserve_output_tokens(reserved_output_tokens)?;
                 let event_permit = permit.clone();
-                let event_now = logical_now(now, started.elapsed());
+                let event_now = logical_now(event_time_origin, started.elapsed());
                 self.store_executor
                     .execute(move |store| {
                         store.append_task_event(
@@ -529,21 +577,28 @@ impl AgentRuntime {
                 });
                 self.observe_debug_budget(permit, budget, "BeforeLLM")
                     .await?;
-                let phase_deadline = if phase == AgentTurnPhase::Draft {
-                    wall_time.mul_f32(DRAFT_WALL_TIME_FRACTION)
-                } else {
-                    wall_time
-                };
-                let call = tokio::time::timeout(
-                    phase_deadline.saturating_sub(started.elapsed()),
-                    model.turn_with_events(request.clone(), on_event),
-                )
-                .await
-                .unwrap_or_else(|_| {
+                let phase_deadline = model_phase_deadline(
+                    wall_time, phase, installed.contract.version,
+                );
+                let remaining = phase_deadline.saturating_sub(started.elapsed());
+                let provider_started = Instant::now();
+                let call = if remaining.is_zero() {
                     Err(ResearchError::WallTimeExceeded {
                         maximum_secs: node.budget.max_wall_time_secs,
                     })
-                });
+                } else {
+                    tokio::time::timeout(
+                        remaining,
+                        model.turn_with_events(request.clone(), on_event),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(ResearchError::WallTimeExceeded {
+                            maximum_secs: node.budget.max_wall_time_secs,
+                        })
+                    })
+                };
+                self.record_pipeline_latency(permit, if direct_structured { "structured" } else if phase == AgentTurnPhase::Draft { "draft" } else { "submit" }, "provider", provider_started.elapsed(), call.is_ok(), model_turn).await?;
                 budget.release_output_tokens(reserved_output_tokens);
                 match call {
                     Ok(turn) => {
@@ -556,7 +611,7 @@ impl AgentRuntime {
                         let will_retry = !draft_deadline
                             && retryable
                             && turn_attempt < installed.contract.retry.max_attempts;
-                        let turn_now = logical_now(now, started.elapsed());
+                        let turn_now = logical_now(event_time_origin, started.elapsed());
                         let failed_turn = self
                             .record_failed_turn(
                                 TurnRecord {
@@ -579,10 +634,14 @@ impl AgentRuntime {
                             artifact_id: failed_turn.artifact_id,
                             kind: ArtifactKind::AgentTurn,
                         });
-                        let provider_incomplete =
-                            matches!(&error, ResearchError::ProviderIncomplete { .. });
+                        let provider_incomplete = matches!(
+                            &error,
+                            ResearchError::ProviderIncomplete { .. }
+                                | ResearchError::ProviderUsageMissing { .. }
+                        );
                         let accounting = match &error {
-                            ResearchError::ProviderIncomplete { usage, .. } => {
+                            ResearchError::ProviderIncomplete { usage, .. }
+                            | ResearchError::ProviderUsageMissing { usage, .. } => {
                                 budget.record_failed_provider_usage(input_tokens, usage)
                             }
                             _ => budget.record_failed_turn(input_tokens),
@@ -623,7 +682,22 @@ impl AgentRuntime {
                 projection.restore_turn(&mut turn);
             }
             if started.elapsed() > wall_time {
-                let turn_now = logical_now(now, started.elapsed());
+                // The provider completed, but the phase did not. Account known
+                // usage and keep this as a failed turn so recovery cannot treat
+                // the late memo as accepted Draft output.
+                let resolved = resolve_model_usage(
+                    input_tokens,
+                    estimate_turn_output_tokens(&turn)?,
+                    turn.telemetry.as_ref(),
+                );
+                let accounting = budget.record_resolved_usage(resolved);
+                let usage = ModelUsage {
+                    input_tokens: Some(resolved.input_tokens),
+                    cached_input_tokens: resolved.cached_input_tokens,
+                    output_tokens: Some(resolved.output_tokens),
+                    reasoning_tokens: resolved.reasoning_tokens,
+                };
+                let turn_now = logical_now(event_time_origin, started.elapsed());
                 let failed_turn = self
                     .record_failed_turn(
                         TurnRecord {
@@ -636,8 +710,8 @@ impl AgentRuntime {
                         },
                         &request,
                         "wall_time",
-                        None,
-                        None,
+                        Some(json!({"kind": "wall_time", "usage": usage, "response": turn})),
+                        turn.model_debug.as_ref(),
                         false,
                         &runtime_snapshot,
                     )
@@ -646,11 +720,14 @@ impl AgentRuntime {
                     artifact_id: failed_turn.artifact_id,
                     kind: ArtifactKind::AgentTurn,
                 });
+                self.observe_debug_budget(permit, budget, "LateTurnAccounted")
+                    .await?;
+                accounting?;
                 return Err(ResearchError::WallTimeExceeded {
                     maximum_secs: node.budget.max_wall_time_secs,
                 });
             }
-            let turn_now = logical_now(now, started.elapsed());
+            let turn_now = logical_now(event_time_origin, started.elapsed());
             let turn_artifact = self
                 .record_turn(
                     TurnRecord {
@@ -692,31 +769,10 @@ impl AgentRuntime {
                 return Err(provider_output_limit.unwrap_or(error));
             }
             if let Some(error) = provider_output_limit {
-                // This is a rejection, never an acceptance tolerance. Actual
-                // usage was charged above; exhausted budgets have already exited.
-                if let Some(feedback) = synthesis_compression_feedback(
-                    &request,
-                    &turn,
-                    budget,
-                    submission_attempts,
-                    installed.contract.retry.max_attempts,
-                    &error,
-                ) {
-                    self.record_submit_rejection(
-                        permit,
-                        installed.contract.purpose.as_str(),
-                        error.to_string(),
-                        trace_refs.last().cloned().into_iter().collect(),
-                        turn_now,
-                    )
-                    .await?;
-                    submission_attempts = submission_attempts.saturating_add(1);
-                    pending_tool_outputs = vec![feedback];
-                    model_turn = model_turn.saturating_add(1);
-                    continue;
-                }
+                // Actual usage is already charged. Do not reformat or resubmit the result.
                 return Err(error);
             }
+            let validation_feedback = pending_tool_outputs.clone();
             pending_tool_outputs.clear();
             if phase == AgentTurnPhase::Draft && turn.terminal_submission.is_some() {
                 return Err(ResearchError::AmbiguousSubmission);
@@ -783,15 +839,29 @@ impl AgentRuntime {
                 .terminal_submission
                 .ok_or(ResearchError::MissingFinalOutput)?;
 
+            if direct_structured && submission_attempts > 0 {
+                self.record_structured_revision(permit, &trace_refs, model_turn, &validation_feedback).await?;
+            }
+
             let validation_runtime = self.clone();
             let validation_permit = permit.clone();
             let validation_contract = installed.contract.clone();
             let validation_manifest = manifest.clone();
             let mut validation_arguments = submission.arguments.clone();
-            let validation_objective = node.objective.clone();
+            if let Some(result) = frozen_result {
+                bind_frozen_result(&mut validation_arguments, result)?;
+            }
+            let validation_spec = node.execution_spec();
+            let bound_wire_schema = (direct_structured && installed.contract.version >= 61)
+                .then(|| output_schema.clone());
+            let parse_started = Instant::now();
             let validated = self
                 .store_executor
                 .execute(move |_| {
+                    if let Some(schema) = &bound_wire_schema {
+                        validate_schema_value(&validation_arguments, schema, "$")
+                            .map_err(ResearchError::InvalidOutput)?;
+                    }
                     resolve_reference_kinds(
                         &mut validation_arguments,
                         &validation_manifest
@@ -801,6 +871,12 @@ impl AgentRuntime {
                             .map(|s| json!(s.artifact))
                             .collect::<Vec<_>>(),
                     )?;
+                    if direct_structured && validation_contract.output.artifact_kind == ArtifactKind::DecisionProposal {
+                        bind_rust_forecast_times(&validation_runtime.store, &validation_manifest, &mut validation_arguments, turn_now)?;
+                    }
+                    if validation_contract.output.artifact_kind == ArtifactKind::ProposalReview {
+                        bind_review_identity(&validation_runtime.store, &validation_manifest, &validation_contract, &mut validation_arguments)?;
+                    }
                     validate_submission_schema(
                         &validation_runtime.store,
                         &validation_contract,
@@ -819,9 +895,7 @@ impl AgentRuntime {
                         &output,
                     )?;
                     if validation_contract.output.artifact_kind == ArtifactKind::Claim {
-                        if let Some(horizon) = validation_objective
-                            .strip_prefix("[research_horizon=")
-                            .and_then(|s| s.split_once(']').map(|p| p.0))
+                        if let Some(horizon) = validation_spec.horizon_name()
                         {
                             if output.get("horizon").and_then(Value::as_str) != Some(horizon) {
                                 return Err(ResearchError::InvalidOutput(
@@ -833,9 +907,7 @@ impl AgentRuntime {
                     }
                     if validation_contract.output.artifact_kind == ArtifactKind::RetrospectiveDraft
                     {
-                        if let Some(horizon) = validation_objective
-                            .strip_prefix("[outcome_horizon=")
-                            .and_then(|s| s.split_once(']').map(|p| p.0))
+                        if let Some(horizon) = validation_spec.horizon_name()
                         {
                             if output.get("horizon").and_then(Value::as_str) != Some(horizon) {
                                 return Err(ResearchError::InvalidOutput(
@@ -850,11 +922,14 @@ impl AgentRuntime {
                         validation_contract.output.artifact_kind,
                         &output,
                         &validation_manifest,
+                        turn_now,
+                        validation_contract.version,
                     )?;
                     Ok::<_, ResearchError>((output, deliberation_note, research_sources))
                 })
                 .await?;
 
+            self.record_pipeline_latency(permit, if direct_structured { "structured" } else { "submit" }, "parse_validate", parse_started.elapsed(), validated.is_ok(), model_turn).await?;
             if let Err(ResearchError::InvalidOutput(message)) = &validated {
                 self.record_submit_rejection(
                     permit,
@@ -868,19 +943,20 @@ impl AgentRuntime {
 
             let (output, deliberation_note, research_sources) = match validated {
                 Ok(validated) => validated,
-                Err(error @ ResearchError::InvalidOutput(_))
+                Err(ResearchError::InvalidOutput(message))
                     if submission_attempts.saturating_add(1)
-                        < installed.contract.retry.max_attempts =>
+                        < installed.contract.retry.max_attempts
+                        && repair_round_fits(
+                            model_phase_deadline(
+                                wall_time,
+                                phase,
+                                installed.contract.version,
+                            ),
+                            started.elapsed(),
+                        ) =>
                 {
                     submission_attempts = submission_attempts.saturating_add(1);
-                    pending_tool_outputs.push(ModelToolOutput {
-                        call_id: submission.call_id,
-                        output: json!({
-                            "ok": false,
-                            "error": "invalid_submission",
-                            "message": error.to_string(),
-                        }),
-                    });
+                    pending_tool_outputs.push(submission_rejection_feedback(submission.call_id, message));
                     model_turn = model_turn.saturating_add(1);
                     continue;
                 }
@@ -901,6 +977,7 @@ impl AgentRuntime {
             .collect();
             let output_permit = permit.clone();
             let output_contract = installed.contract.clone();
+            let persist_started = Instant::now();
             let output_artifact = self
                 .store_executor
                 .execute(move |store| {
@@ -932,8 +1009,33 @@ impl AgentRuntime {
                     )?)
                 })
                 .await??;
+            self.record_pipeline_latency(permit, if direct_structured { "structured" } else { "submit" }, "persist_stage", persist_started.elapsed(), true, model_turn).await?;
             return Ok(output_artifact);
         }
+    }
+
+    async fn record_pipeline_latency(&self, permit: &TaskWritePermit, phase: &str, stage: &str,
+        elapsed: StdDuration, succeeded: bool, revision: u16) -> ResearchResult<()> {
+        let permit = permit.clone();
+        let phase = phase.to_owned();
+        let stage = stage.to_owned();
+        self.store_executor.execute(move |store| {
+            if store.debug_session(&permit.run_id)?.is_some() {
+                store.record_stage_acceptance(&akzio_domain::StageAcceptance {
+                    version: 1, run_id: permit.run_id.clone(), task_id: permit.task_id.clone(), attempt_id: permit.attempt_id.clone(),
+                    stage: format!("agent.{phase}.{stage}"), business_result: "PipelineLatency".into(),
+                    test_result: akzio_domain::AcceptanceResult::Pass,
+                    checks: vec![akzio_domain::AcceptanceCheck {
+                        check_id: "agent.pipeline_latency".into(), category: akzio_domain::AcceptanceCategory::Schema,
+                        expected: "Measured elapsed time; revision identifies the immutable AgentTurn".into(),
+                        actual: json!({"phase":phase,"stage":stage,"latency_micros":elapsed.as_micros(),"succeeded":succeeded,"revision":revision}).to_string(),
+                        result: akzio_domain::AcceptanceResult::Pass, evidence_refs: vec![], message: "Observation only; does not grant business acceptance".into(),
+                    }], created_at: Utc::now(),
+                })?;
+            }
+            Ok::<_, StoreError>(())
+        }).await??;
+        Ok(())
     }
 
     async fn record_submit_rejection(
@@ -948,30 +1050,30 @@ impl AgentRuntime {
         let stage = stage.to_owned();
         self.store_executor
             .execute(move |store| {
-                if store.debug_session(&permit.run_id)?.is_some() {
-                    store.record_stage_acceptance(&akzio_domain::StageAcceptance {
-                        version: 1,
-                        run_id: permit.run_id.clone(),
-                        task_id: permit.task_id.clone(),
-                        attempt_id: permit.attempt_id.clone(),
-                        stage,
-                        business_result: "SubmitRejected".into(),
-                        test_result: akzio_domain::AcceptanceResult::Fail,
-                        checks: vec![akzio_domain::AcceptanceCheck {
-                            check_id: "agent.submit_validation".into(),
-                            category: akzio_domain::AcceptanceCategory::Schema,
-                            expected: "Budget, canonical schema, scope and evidence validation"
+                // Retry recovery needs this tool result for every run, including
+                // canonical runs without a DebugSession.
+                store.record_stage_acceptance(&akzio_domain::StageAcceptance {
+                    version: 1,
+                    run_id: permit.run_id.clone(),
+                    task_id: permit.task_id.clone(),
+                    attempt_id: permit.attempt_id.clone(),
+                    stage,
+                    business_result: "SubmitRejected".into(),
+                    test_result: akzio_domain::AcceptanceResult::Fail,
+                    checks: vec![akzio_domain::AcceptanceCheck {
+                        check_id: "agent.submit_validation".into(),
+                        category: akzio_domain::AcceptanceCategory::Schema,
+                        expected: "Budget, canonical schema, scope and evidence validation"
+                            .into(),
+                        actual: message,
+                        result: akzio_domain::AcceptanceResult::Fail,
+                        evidence_refs,
+                        message:
+                            "Original rejected submission; preserved before any repair request"
                                 .into(),
-                            actual: message,
-                            result: akzio_domain::AcceptanceResult::Fail,
-                            evidence_refs,
-                            message:
-                                "Original rejected submission; preserved before any repair request"
-                                    .into(),
-                        }],
-                        created_at: now,
-                    })?;
-                }
+                    }],
+                    created_at: now,
+                })?;
                 Ok::<_, akzio_store::StoreError>(())
             })
             .await??;
@@ -983,124 +1085,6 @@ impl AgentRuntime {
 mod wall_time_split_tests {
     use super::*;
 
-    fn captured_submit() -> (AgentModelRequest, AgentModelTurn) {
-        let request = AgentModelRequest {
-            contract_hash: akzio_domain::ContentHash::of_bytes(b"test"),
-            purpose: RESEARCH_SYNTHESIZER_RECIPE_ID.into(),
-            phase: AgentTurnPhase::Submit,
-            prompt: String::new(),
-            objective: String::new(),
-            manifest_artifact_id: ArtifactId(akzio_domain::ContentHash::of_bytes(b"manifest")),
-            read_grant_identity: None,
-            context_materialization_identity: None,
-            context: vec![],
-            continuation: None,
-            tool_outputs: vec![],
-            continuation_instruction: None,
-            max_output_tokens: 3_240,
-            reasoning_effort: Some("low".into()),
-            tools: vec![],
-            terminal: None,
-        };
-        let turn = AgentModelTurn {
-            assistant_text: None,
-            tool_calls: vec![],
-            terminal_submission: Some(AgentTerminalSubmission {
-                call_id: "captured-submit".into(),
-                arguments: json!({"unchanged": true}),
-            }),
-            continuation: ModelContinuation::from_items(vec![]),
-            telemetry: Some(AgentTurnTelemetry {
-                provider_request_id: None,
-                response_id: None,
-                requested_model: None,
-                actual_model: None,
-                latency_millis: 61_394,
-                input_tokens: Some(1),
-                cached_input_tokens: None,
-                output_tokens: Some(3_270),
-                reasoning_tokens: Some(125),
-            }),
-            model_debug: None,
-        };
-        (request, turn)
-    }
-
-    #[test]
-    fn captured_overrun_is_charged_once_and_cannot_repair_exhausted_budget() {
-        let policy =
-            akzio_domain::budget::default_agent_budget(RESEARCH_SYNTHESIZER_RECIPE_ID).unwrap();
-        let mut budget = AgentRunBudget::new(&policy, &RetryPolicy::none());
-        let (request, turn) = captured_submit();
-        budget.record_turn(1, 1_760, None).unwrap();
-        assert!(matches!(
-            budget.record_turn(1, 1, turn.telemetry.as_ref()),
-            Err(ResearchError::OutputBudgetExceeded {
-                actual: 5_030,
-                maximum: 5_000
-            })
-        ));
-        assert_eq!(budget.output_tokens, 5_030);
-        assert_eq!(budget.reasoning_tokens, 125);
-        let error = ResearchError::ProviderOutputLimitExceeded {
-            actual: 3_270,
-            maximum: 3_240,
-        };
-        assert!(synthesis_compression_feedback(&request, &turn, &budget, 0, 2, &error).is_none());
-    }
-
-    #[test]
-    fn compression_reuses_submit_call_only_once_without_changing_payload_or_budget() {
-        let policy =
-            akzio_domain::budget::default_agent_budget(RESEARCH_SYNTHESIZER_RECIPE_ID).unwrap();
-        let mut budget = AgentRunBudget::new(&policy, &RetryPolicy::none());
-        let (mut request, turn) = captured_submit();
-        let original = turn.clone();
-        budget.record_turn(1, 900, None).unwrap();
-        budget.record_turn(1, 1, turn.telemetry.as_ref()).unwrap();
-        let error = ResearchError::ProviderOutputLimitExceeded {
-            actual: 3_270,
-            maximum: 3_240,
-        };
-        let feedback =
-            synthesis_compression_feedback(&request, &turn, &budget, 0, 2, &error).unwrap();
-        assert_eq!(feedback.call_id, "captured-submit");
-        assert_eq!(feedback.output["remaining_output_tokens"], 830);
-        assert_eq!(turn, original);
-        assert_eq!(budget.output_tokens, 4_170);
-        assert!(synthesis_compression_feedback(&request, &turn, &budget, 1, 2, &error).is_none());
-        assert!(synthesis_compression_feedback(&request, &turn, &budget, 0, 1, &error).is_none());
-        request.phase = AgentTurnPhase::Draft;
-        assert!(synthesis_compression_feedback(&request, &turn, &budget, 0, 2, &error).is_none());
-    }
-
-    #[test]
-    fn synthesizer_draft_leaves_room_for_captured_3270_token_submit() {
-        let policy = akzio_domain::budget::default_agent_budget("research.synthesizer").unwrap();
-        assert_eq!(policy.max_output_tokens, 5_000);
-        let mut budget = AgentRunBudget::new(&policy, &RetryPolicy::none());
-        let draft_cap = phase_output_cap(
-            &budget,
-            AgentTurnPhase::Draft,
-            RESEARCH_SYNTHESIZER_RECIPE_ID,
-            0,
-        )
-        .unwrap();
-        assert_eq!(draft_cap, 900);
-        budget.record_turn(1, draft_cap, None).unwrap();
-        let submit_cap = phase_output_cap(
-            &budget,
-            AgentTurnPhase::Submit,
-            RESEARCH_SYNTHESIZER_RECIPE_ID,
-            0,
-        )
-        .unwrap();
-        assert!(submit_cap >= 3_270);
-        budget.record_turn(1, 3_270, None).unwrap();
-        assert_eq!(budget.output_tokens, 4_170);
-        assert_eq!(budget.max_output_tokens, 5_000);
-    }
-
     #[test]
     fn draft_phase_keeps_more_than_the_old_fifty_five_percent_cut() {
         let total = std::time::Duration::from_secs(120);
@@ -1110,57 +1094,59 @@ mod wall_time_split_tests {
         assert!(draft < total);
     }
 
+    /// Real failure in run 27a69f3ccfad464b (2026-09-21): a Critic submission
+    /// was rejected for empty `ground_closure` after 85.4s of a 120s allowance.
+    /// The repair round was requested anyway and died on wall_time at 111.6s,
+    /// reporting `wall_time` instead of the validation rejection that caused it.
     #[test]
-    fn critic_phase_caps_leave_one_repair_reservation() {
-        let policy = akzio_domain::budget::default_agent_budget("research.critic").unwrap();
-        let mut budget = AgentRunBudget::new(&policy, &RetryPolicy::none());
-        assert_eq!(
-            phase_output_cap(
-                &budget,
-                AgentTurnPhase::Draft,
-                akzio_domain::RESEARCH_CRITIC_RECIPE_ID,
-                0
-            )
-            .unwrap(),
-            4_000
+    fn repair_round_is_skipped_when_it_cannot_finish_in_the_allowance() {
+        let deadline = std::time::Duration::from_secs(120);
+        let elapsed = std::time::Duration::from_millis(85_400);
+        assert!(
+            !repair_round_fits(deadline, elapsed),
+            "a repair with 34.6s left must not be attempted"
         );
-        budget.record_turn(1, 4_000, None).unwrap();
-        assert_eq!(
-            phase_output_cap(
-                &budget,
-                AgentTurnPhase::Submit,
-                akzio_domain::RESEARCH_CRITIC_RECIPE_ID,
-                0
-            )
-            .unwrap(),
-            8_000
-        );
-        budget.record_turn(1, 4_000, None).unwrap();
-        assert_eq!(
-            phase_output_cap(
-                &budget,
-                AgentTurnPhase::Submit,
-                akzio_domain::RESEARCH_CRITIC_RECIPE_ID,
-                1
-            )
-            .unwrap(),
-            8_000
-        );
+        // A rejection arriving early still gets its bounded repair.
+        assert!(repair_round_fits(
+            deadline,
+            std::time::Duration::from_secs(30)
+        ));
+        // Exactly half the allowance remaining is still enough.
+        assert!(repair_round_fits(
+            deadline,
+            std::time::Duration::from_secs(60)
+        ));
+        // Past the deadline there is nothing left to spend.
+        assert!(!repair_round_fits(deadline, deadline));
+        assert!(!repair_round_fits(
+            deadline,
+            deadline + std::time::Duration::from_secs(5)
+        ));
     }
 
     #[test]
-    fn legacy_critic_budget_still_has_its_historical_boundary() {
-        let policy = akzio_domain::budget::legacy_contract_budget("research.critic").unwrap();
-        let budget = AgentRunBudget::new(&policy, &RetryPolicy::none());
-        assert_eq!(
-            phase_output_cap(
-                &budget,
-                AgentTurnPhase::Draft,
-                akzio_domain::RESEARCH_CRITIC_RECIPE_ID,
-                0
-            )
-            .unwrap(),
-            2_000
-        );
+    fn configured_million_output_reaches_research_submit_without_role_caps() {
+        for purpose in [RESEARCH_ANALYST_RECIPE_ID, akzio_domain::RESEARCH_CRITIC_RECIPE_ID, RESEARCH_SYNTHESIZER_RECIPE_ID] {
+            let mut policy = akzio_domain::budget::default_agent_budget(purpose).unwrap();
+            policy.max_output_tokens = 1_000_000;
+            let mut budget = AgentRunBudget::new(&policy, &RetryPolicy::none());
+            assert_eq!(phase_output_cap(&budget, AgentTurnPhase::Submit, purpose, 0, 65, None).unwrap(), 1_000_000);
+            budget.record_turn(10, 2_525, None).unwrap();
+            assert_eq!(phase_output_cap(&budget, AgentTurnPhase::Submit, purpose, 0, 65, None).unwrap(), 997_475);
+            assert_eq!(phase_output_cap(&budget, AgentTurnPhase::Submit, purpose, 0, 65, Some(128_000)).unwrap(), 128_000);
+            assert_eq!(budget.max_input_tokens, policy.max_input_tokens);
+            assert_eq!(budget.wall_time.as_secs(), 180);
+        }
     }
+
+    #[test]
+    fn shared_deadline_reserves_audit_time_without_extending_task() {
+        let total = StdDuration::from_secs(120);
+        assert_eq!(model_phase_deadline(total, AgentTurnPhase::Submit, 49), StdDuration::from_secs(119));
+        assert_eq!(model_phase_deadline(total, AgentTurnPhase::Draft, 49), StdDuration::from_secs(84));
+        assert_eq!(model_phase_deadline(total, AgentTurnPhase::Submit, 47), total);
+        let short = StdDuration::from_secs(2);
+        assert_eq!(model_phase_deadline(short, AgentTurnPhase::Submit, 49), StdDuration::from_millis(1800));
+    }
+
 }

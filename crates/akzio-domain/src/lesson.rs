@@ -35,53 +35,6 @@ pub enum LessonTrustClass {
     Contested,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LessonGovernanceSignalKind {
-    Contradiction,
-    PostUseFailure,
-}
-
-impl LessonGovernanceSignalKind {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Contradiction => "contradiction",
-            Self::PostUseFailure => "post_use_failure",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LessonGovernanceSignal {
-    pub kind: LessonGovernanceSignalKind,
-    pub evidence: ArtifactRef,
-    pub actor: String,
-    pub reason: String,
-    pub observed_at: DateTime<Utc>,
-}
-
-impl LessonGovernanceSignal {
-    pub fn validate(&self) -> Result<(), DomainError> {
-        if self.actor.trim().is_empty()
-            || self.reason.trim().is_empty()
-            || !matches!(
-                self.evidence.kind,
-                ArtifactKind::Claim
-                    | ArtifactKind::Critique
-                    | ArtifactKind::Outcome
-                    | ArtifactKind::Retrospective
-                    | ArtifactKind::Evaluation
-                    | ArtifactKind::SemanticDetail
-            )
-        {
-            return Err(DomainError::EmptyField {
-                field: "lesson.governance_signal",
-            });
-        }
-        Ok(())
-    }
-}
-
 /// Mutable-by-revision governance metadata for a Lesson. The Store usage
 /// ledger remains the source of truth for actual recalls; the budget here
 /// controls when a new verifier revision is required.
@@ -512,61 +465,5 @@ impl LessonEvidence {
             && self.attribution == other.attribution
             && self.utility_ppm_by_horizon == other.utility_ppm_by_horizon
             && self.calibration_ppm_by_horizon == other.calibration_ppm_by_horizon
-    }
-
-    /// True when at least one horizon closed with positive utility. Descriptive
-    /// only; see the type-level note on causality.
-    pub fn any_horizon_positive_utility(&self) -> bool {
-        self.utility_ppm_by_horizon.iter().any(|value| *value > 0)
-    }
-}
-
-/// Observational rollup over a Lesson's evidence ledger.
-///
-/// Every field is a co-occurrence count, not an effect estimate.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LessonEvidenceSummary {
-    pub applied_count: u64,
-    pub rejected_count: u64,
-    /// Of `applied_count`, how many closed with positive utility on any horizon.
-    pub applied_with_positive_utility: u64,
-    /// Of `rejected_count`, how many closed with positive utility on any horizon.
-    /// Not a counterfactual for the applied arm.
-    pub rejected_with_positive_utility: u64,
-    /// Mean calibration quality across every scored horizon of every record.
-    pub mean_calibration_ppm: Option<u32>,
-    /// Always true. Present so callers cannot silently treat this as causal.
-    pub observational: bool,
-}
-
-impl LessonEvidenceSummary {
-    pub fn from_records(records: &[LessonEvidence]) -> Self {
-        let mut summary = Self {
-            observational: true,
-            ..Self::default()
-        };
-        let mut calibration_total = 0_u64;
-        let mut calibration_count = 0_u64;
-        for record in records {
-            let positive = record.any_horizon_positive_utility();
-            match record.attribution {
-                LessonAttribution::Applied => {
-                    summary.applied_count += 1;
-                    summary.applied_with_positive_utility += u64::from(positive);
-                }
-                LessonAttribution::Rejected => {
-                    summary.rejected_count += 1;
-                    summary.rejected_with_positive_utility += u64::from(positive);
-                }
-            }
-            for value in record.calibration_ppm_by_horizon.iter().flatten() {
-                calibration_total += u64::from(*value);
-                calibration_count += 1;
-            }
-        }
-        summary.mean_calibration_ppm = calibration_total
-            .checked_div(calibration_count)
-            .and_then(|mean| u32::try_from(mean).ok());
-        summary
     }
 }

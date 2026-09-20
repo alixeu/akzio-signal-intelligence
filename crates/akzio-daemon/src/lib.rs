@@ -9,6 +9,8 @@ mod debug;
 mod dispatch;
 pub use debug::{DebugForkRequest, DebugPrepareRequest};
 mod evidence;
+mod market_audit;
+pub use market_audit::persist_market_audit_capture;
 mod http;
 mod observer;
 mod observer_analytics;
@@ -18,7 +20,7 @@ mod worker;
 
 pub use scheduler::{
     AlpacaPaperSessionClock, BrokerSessionClock, PaperScheduler, PaperWorkflowSource,
-    SchedulerError, StaticPaperWorkflowSource, StorePaperWorkflowSource, SCHEDULER_LEASE_NAME,
+    SchedulerError, StorePaperWorkflowSource, SCHEDULER_LEASE_NAME,
 };
 
 pub use worker::{TaskHandler, WorkerPool, WorkerPoolConfig};
@@ -359,6 +361,7 @@ pub fn runtime_governance_identity(
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
     pub agent_budget: akzio_domain::AgentBudgetConfig,
+    pub research_settings: akzio_domain::ResearchSettings,
     pub debug_control: Option<DebugCoreConfig>,
     pub outcome_processing: bool,
     pub store_root: PathBuf,
@@ -421,10 +424,16 @@ pub struct DebugCoreConfig {
     pub runtime_identity: ContentHash,
     pub decision_policy_status: String,
     pub decision_policy_input_hash: Option<ContentHash>,
+    pub decision_policy_artifact: Option<ArtifactRef>,
 }
 
 impl Daemon {
     fn model_for(&self, purpose: &str) -> &ModelClientAdapter {
+        let purpose = if purpose == akzio_domain::RESEARCH_PROPOSAL_REVIEWER_RECIPE_ID {
+            akzio_domain::RESEARCH_CRITIC_RECIPE_ID
+        } else {
+            purpose
+        };
         self.stage_models.get(purpose).unwrap_or(&self.model)
     }
 }
@@ -541,11 +550,6 @@ struct EventQuery {
 }
 
 #[derive(Debug, Deserialize)]
-struct SubmitRequest {
-    purpose: RunPurpose,
-}
-
-#[derive(Debug, Deserialize)]
 struct FreezeRequest {
     reason: String,
 }
@@ -624,16 +628,38 @@ fn debug_fixture_evidence(
             "is_open": true,
             "timestamp": now.to_rfc3339(),
         }),
-        value if value.starts_with("bars:") => serde_json::json!({
-            "bars": [{
-                "t": completed_bar_time.to_rfc3339(),
-                "o": 100.0,
-                "h": 101.0,
-                "l": 99.0,
-                "c": 100.5,
-                "v": 1.0,
-            }]
-        }),
+        value if value.starts_with("bars:") => {
+            // Explicit offline calendar, shared by all four fixture assets.
+            // This is not an exchange calendar and is never used by real adapters.
+            let closes = (1..=15)
+                .map(|offset| now.date_naive() + Duration::days(offset))
+                .filter(|date| {
+                    !matches!(
+                        chrono::Datelike::weekday(date),
+                        chrono::Weekday::Sat | chrono::Weekday::Sun
+                    )
+                })
+                .map(|date| {
+                    (
+                        date.to_string(),
+                        date.and_hms_opt(20, 0, 0).unwrap().and_utc(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            serde_json::json!({
+                "fixture": true,
+                "forecast_calendar_source": "synthetic_weekdays_fixture_only",
+                "forecast_session_closes": closes,
+                "bars": [{
+                    "t": completed_bar_time.to_rfc3339(),
+                    "o": 100.0,
+                    "h": 101.0,
+                    "l": 99.0,
+                    "c": 100.5,
+                    "v": 1.0,
+                }]
+            })
+        }
         value if value.starts_with("news:") => serde_json::json!({
             "answer": "fixture market news",
             "citations": [{ "uri": "https://www.reuters.com/", "published_at": now.to_rfc3339() }],
@@ -692,4 +718,16 @@ impl From<StoredEvent> for EventView {
             created_at: event.created_at.to_rfc3339(),
         }
     }
+}
+
+/// Resolve the canonical installed Synthesizer identity in an isolated scratch Store.
+pub fn canonical_synthesizer_contract_hash(store: &Store) -> Result<ContentHash> {
+    let catalogue = akzio_research::ActiveResearchCatalogue::install(store, Utc::now())?;
+    let hash = catalogue
+        .contracts
+        .contracts()
+        .find(|c| c.contract.purpose.as_str() == "research.synthesizer")
+        .map(|c| c.contract.contract_hash.clone())
+        .ok_or_else(|| DaemonError::InvalidInput("Synthesizer contract missing".into()));
+    hash
 }

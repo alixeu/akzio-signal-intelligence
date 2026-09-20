@@ -16,7 +16,7 @@ extension LiveProjection {
                 )
             ]
         }
-        return events.suffix(12).map { event in
+        return events.sorted { $0.cursor > $1.cursor }.prefix(50).map { event in
             EventPresentation(
                 id: "event-\(event.cursor)",
                 title: event.eventType
@@ -153,7 +153,8 @@ extension LiveProjection {
                         reasoningMode: entry.model?.reasoningEffort,
                         latencyMillis: entry.latencyMillis.map(Int.init),
                         inputTokens: entry.inputTokens.map(Int.init),
-                        outputTokens: entry.outputTokens.map(Int.init)
+                        outputTokens: entry.outputTokens.map(Int.init),
+                        taskID: entry.taskID
                     )
                 )
             }
@@ -171,7 +172,8 @@ extension LiveProjection {
                     actor: actor,
                     title: tool.name ?? MissingValue.unavailable.rawValue,
                     body: detail,
-                    createdAt: eventDatesByCursor[entry.cursor]
+                    createdAt: eventDatesByCursor[entry.cursor],
+                    taskID: entry.taskID
                 )
                 )
             }
@@ -197,12 +199,18 @@ extension LiveProjection {
                         reasoningMode: entry.model?.reasoningEffort,
                         latencyMillis: entry.latencyMillis.map(Int.init),
                         inputTokens: entry.inputTokens.map(Int.init),
-                        outputTokens: entry.outputTokens.map(Int.init)
+                        outputTokens: entry.outputTokens.map(Int.init),
+                        taskID: entry.taskID
                     )
                 )
             }
         }
         analysisRecords.append(contentsOf: reasoningRecords.map(\.presentation))
+        analysisRecords = analysisRecords.map { record in
+            var value = record
+            value.horizon = tasks.first { $0.node.taskID == record.taskID }.flatMap { $0.node.horizon }
+            return value
+        }
         return CouncilPresentation(
             roles: roles,
             selectedRole: selected,

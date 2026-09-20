@@ -64,6 +64,7 @@ struct ActiveAgentsList: View {
                         .truncationMode(.tail)
                 }
                 Text(L10n.text(agent.activityLabel, language: language)).akzioText(.caption)
+                    .lineLimit(2).help(agent.activityLabel)
             }
             Spacer(minLength: AkzioLayout.s2)
             if agent.status == .notTriggered {

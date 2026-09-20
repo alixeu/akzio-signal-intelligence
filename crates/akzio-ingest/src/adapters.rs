@@ -228,6 +228,32 @@ impl AlpacaMarketDataFeed {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlpacaOptionDataFeed {
+    Opra,
+    #[default]
+    Indicative,
+}
+impl std::str::FromStr for AlpacaOptionDataFeed {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "opra" => Ok(Self::Opra),
+            "indicative" => Ok(Self::Indicative),
+            _ => Err("expected opra or indicative".into()),
+        }
+    }
+}
+impl AlpacaOptionDataFeed {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Opra => "opra",
+            Self::Indicative => "indicative",
+        }
+    }
+}
+
 /// Rust-owned Alpaca Paper market-data transport. The resource language is
 /// deliberately finite; callers cannot pass an arbitrary URL or endpoint.
 #[derive(Clone)]
@@ -238,6 +264,7 @@ pub struct AlpacaPaperEvidenceTransport {
     key_id: String,
     secret_key: String,
     market_data_feed: Option<AlpacaMarketDataFeed>,
+    option_data_feed: AlpacaOptionDataFeed,
 }
 
 impl std::fmt::Debug for AlpacaPaperEvidenceTransport {
@@ -290,6 +317,7 @@ impl AlpacaPaperEvidenceTransport {
             ));
         }
         let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .http1_only()
             .local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
             .connect_timeout(std::time::Duration::from_secs(15))
@@ -303,7 +331,13 @@ impl AlpacaPaperEvidenceTransport {
             key_id,
             secret_key,
             market_data_feed,
+            option_data_feed: AlpacaOptionDataFeed::Indicative,
         })
+    }
+
+    pub fn with_option_feed(mut self, feed: AlpacaOptionDataFeed) -> Self {
+        self.option_data_feed = feed;
+        self
     }
 
     pub(super) fn path_for(resource: &str) -> Result<String, EvidenceAdapterError> {
@@ -480,8 +514,14 @@ impl AlpacaPaperEvidenceTransport {
         if source != EvidenceSource::Alpaca {
             return Err(EvidenceAdapterError::SourceMismatch);
         }
+        if matches!(resource, "paper.clock" | "paper.quotes") {
+            return self.acquire_execution_market(resource).await;
+        }
         if resource.starts_with("bars:") {
             return self.acquire_session_bars(resource, Utc::now()).await;
+        }
+        if resource.starts_with("option_chain:") {
+            return self.acquire_option_capture(resource, Utc::now()).await;
         }
         let path = self.configured_path_for(resource)?;
         let url = format!("{}{}", self.base_url_for(resource), path);
@@ -509,7 +549,7 @@ impl AlpacaPaperEvidenceTransport {
         };
         classify_evidence_response(&response)?;
         let status = response.status();
-        let mut body = response
+        let body = response
             .bytes()
             .await
             .map_err(|error| EvidenceAdapterError::Transport(error.to_string()))?
@@ -520,67 +560,19 @@ impl AlpacaPaperEvidenceTransport {
                 status.as_u16()
             )));
         }
-        let mut normalized: Value = serde_json::from_slice(&body)
+        let normalized: Value = serde_json::from_slice(&body)
             .map_err(|error| EvidenceAdapterError::DataQuality(error.to_string()))?;
         if resource.starts_with("bars:") {
             validate_daily_bar_payload(&normalized)
                 .map_err(|error| EvidenceAdapterError::Transport(error.to_string()))?;
-        } else if resource.starts_with("corporate_actions:") {
-            if !normalized
+        } else if resource.starts_with("corporate_actions:")
+            && !normalized
                 .get("corporate_actions")
                 .is_some_and(serde_json::Value::is_object)
-            {
-                return Err(EvidenceAdapterError::Transport(
-                    "Alpaca corporate-actions payload is incomplete".to_owned(),
-                ));
-            }
-        } else if resource.starts_with("option_chain:") {
-            // Same bounded-page policy as daily bars. Never publish a partial chain.
-            let mut pages = vec![String::from_utf8(body.clone()).map_err(|_| {
-                EvidenceAdapterError::DataQuality("option page is not UTF-8".into())
-            })?];
-            let mut tokens = std::collections::BTreeSet::new();
-            while let Some(token) = normalized
-                .get("next_page_token")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-            {
-                if pages.len() >= 16 || !tokens.insert(token.clone()) {
-                    return Err(EvidenceAdapterError::DataQuality(
-                        "option pagination limit or repeated cursor".into(),
-                    ));
-                }
-                let mut next = Url::parse(&url).map_err(|_| {
-                    EvidenceAdapterError::DataQuality("invalid option endpoint".into())
-                })?;
-                next.query_pairs_mut().append_pair("page_token", &token);
-                let response = self
-                    .client
-                    .get(next)
-                    .header("APCA-API-KEY-ID", &self.key_id)
-                    .header("APCA-API-SECRET-KEY", &self.secret_key)
-                    .send()
-                    .await
-                    .map_err(|_| {
-                        EvidenceAdapterError::Transport("option page request failed".into())
-                    })?;
-                classify_evidence_response(&response)?;
-                let raw = response.text().await.map_err(|_| {
-                    EvidenceAdapterError::Transport("option page body read failed".into())
-                })?;
-                let page: Value = serde_json::from_str(&raw).map_err(|_| {
-                    EvidenceAdapterError::DataQuality("option page JSON invalid".into())
-                })?;
-                merge_option_chain_page(&mut normalized, &page)?;
-                pages.push(raw);
-            }
-            if pages.len() > 1 {
-                body = serde_json::to_vec(&serde_json::json!({"pages":pages})).map_err(|_| {
-                    EvidenceAdapterError::DataQuality("option page bundle invalid".into())
-                })?;
-            }
-            validate_option_chain_payload(&normalized)?;
+        {
+            return Err(EvidenceAdapterError::Transport(
+                "Alpaca corporate-actions payload is incomplete".to_owned(),
+            ));
         }
         let observed_at = Utc::now();
         let source_uri = url;
@@ -620,6 +612,8 @@ impl AsyncEvidenceAdapter for AlpacaPaperEvidenceTransport {
             }
             if request.resource.starts_with("bars:") {
                 self.acquire_session_bars(&request.resource, cutoff).await
+            } else if request.resource.starts_with("option_chain:") {
+                self.acquire_option_capture(&request.resource, cutoff).await
             } else {
                 self.acquire(request).await
             }
@@ -637,52 +631,6 @@ impl AsyncEvidenceAdapter for AlpacaPaperEvidenceTransport {
             self.acquire_inner(request.source, &request.resource).await
         })
     }
-}
-
-fn validate_option_chain_payload(value: &Value) -> Result<(), EvidenceAdapterError> {
-    if value
-        .get("next_page_token")
-        .and_then(Value::as_str)
-        .is_some_and(|token| !token.trim().is_empty())
-    {
-        return Err(EvidenceAdapterError::Transport(
-            "Alpaca option chain is paginated; canonical snapshot would be incomplete".to_owned(),
-        ));
-    }
-    let snapshots = value
-        .get("snapshots")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            EvidenceAdapterError::Transport("Alpaca option-chain payload is incomplete".to_owned())
-        })?;
-    let expirations = snapshots
-        .iter()
-        .filter(|(_, snapshot)| {
-            snapshot
-                .get("impliedVolatility")
-                .or_else(|| snapshot.get("implied_volatility"))
-                .and_then(Value::as_f64)
-                .is_some_and(|iv| iv.is_finite() && iv > 0.0)
-        })
-        .filter_map(|(contract, _)| option_contract_expiration(contract))
-        .collect::<std::collections::BTreeSet<_>>();
-    if expirations.len() < 2 {
-        return Err(EvidenceAdapterError::Transport(
-            format!("Alpaca option chain lacks two IV buckets; contracts={}; first_contracts={:?}; fields={:?}", snapshots.len(), snapshots.keys().take(2).collect::<Vec<_>>(), snapshots.values().next().and_then(Value::as_object).map(|v|v.keys().collect::<Vec<_>>())),
-        ));
-    }
-    Ok(())
-}
-
-fn option_contract_expiration(contract: &str) -> Option<chrono::NaiveDate> {
-    contract
-        .as_bytes()
-        .windows(6)
-        .filter(|window| window.iter().all(u8::is_ascii_digit))
-        .find_map(|window| {
-            let value = std::str::from_utf8(window).ok()?;
-            chrono::NaiveDate::parse_from_str(value, "%y%m%d").ok()
-        })
 }
 
 const MAX_SOURCE_DOCUMENT_BYTES: usize = 2 * 1024 * 1024;
@@ -1247,6 +1195,8 @@ impl SourceMaterialization {
             "source_count": source_count,
             "successful_source_count": successful_sources,
             "verified_source_count": verified_sources,
+            "source_verified": citations_complete,
+            "news_evidence_status": if citations_complete { "source_verified" } else if successful_sources == 0 { "fetch_failed" } else { "source_unverified" },
             "acquisition_mode": EvidenceAcquisitionMode::VerifiedSource.as_str(),
             "acquisition_policy_version": akzio_domain::EVIDENCE_ACQUISITION_POLICY_VERSION,
             "acquisition_policy_hash": akzio_domain::evidence_acquisition_policy_hash().to_string(),
@@ -1396,54 +1346,9 @@ impl ModelNativeWebEvidenceTransport {
         if source == EvidenceSource::Alpaca {
             return Err(EvidenceAdapterError::SourceMismatch);
         }
-        let research_intent = match GovernedResource::parse(source, resource).map_err(|error| {
-            EvidenceAdapterError::Policy {
-                evidence_source: source,
-                resource: resource.to_owned(),
-                reason: error.to_string(),
-            }
-        })? {
-            GovernedResource::NewsWeb { query } => query,
-            GovernedResource::RecentNews {
-                asset,
-                window_start,
-                window_end,
-                topic,
-            } => format!(
-                "{} recent {} news and events from {} through {}. Search the ETF, its underlying index, major constituents and sector or monetary-policy events. Distinguish reported facts from inferred ETF effects. Use at most three relevant articles from the allowed domains; report publication dates. Product mechanics are not recent news.",
-                asset.symbol(),
-                topic,
-                window_start,
-                window_end
-            ),
-            GovernedResource::OfficialFundHoldings { asset, as_of } => {
-                format!(
-                    "official complete {} ETF holdings as of {}",
-                    asset.symbol(),
-                    as_of
-                )
-            }
-            GovernedResource::OfficialIndexMetadata { asset, as_of } => {
-                format!(
-                    "official {} benchmark index metadata as of {}",
-                    asset.symbol(),
-                    as_of
-                )
-            }
-            GovernedResource::OfficialLeveragedEtfTerms { asset, as_of } => format!(
-                "official {} daily-reset leverage terms and risks as of {}",
-                asset.symbol(),
-                as_of
-            ),
-            GovernedResource::OfficialEarningsEventCalendar { asset, as_of } => format!(
-                "official {} component-company earnings calendar as of {}",
-                asset.symbol(),
-                as_of
-            ),
-            _ => resource.to_owned(),
-        };
+        let research_intent = crate::prompts::research_intent(source, resource)?;
         let request = ModelRequest {
-            instructions: "Use only the Rust-approved native web tool. Return verifiable citations for every material fact.".to_owned(),
+            instructions: crate::prompts::WEB_GOVERNANCE.to_owned(),
             input: ModelInput::Fresh {
                 text: serde_json::json!({
                     "source_family": source.as_str(),
@@ -1703,55 +1608,66 @@ impl AsyncEvidenceAdapter for FixtureEvidenceAdapter {
     }
 }
 
+#[path = "market_capture.rs"]
+mod market_capture;
+#[path = "paper_session.rs"]
+mod paper_session;
+
 #[path = "session_bars.rs"]
 mod session_bars;
 pub(crate) use session_bars::classify_evidence_response;
 pub use session_bars::validate_outcome_price_window;
 
-fn merge_option_chain_page(target: &mut Value, page: &Value) -> Result<(), EvidenceAdapterError> {
-    let incoming = page
-        .get("snapshots")
-        .and_then(Value::as_object)
-        .ok_or_else(|| EvidenceAdapterError::DataQuality("option page snapshots missing".into()))?;
-    let current = target
-        .get_mut("snapshots")
-        .and_then(Value::as_object_mut)
-        .ok_or_else(|| EvidenceAdapterError::DataQuality("option snapshots missing".into()))?;
-    for (symbol, snapshot) in incoming {
-        if current.insert(symbol.clone(), snapshot.clone()).is_some() {
-            return Err(EvidenceAdapterError::DataQuality(
-                "duplicate option contract across pages".into(),
-            ));
-        }
-    }
-    target["next_page_token"] = page.get("next_page_token").cloned().unwrap_or(Value::Null);
-    Ok(())
-}
-
 #[cfg(test)]
-mod option_pagination_tests {
+mod alpaca_redirect_tests {
     use super::*;
-    #[test]
-    fn provider_camel_case_iv_passes_without_weakening_bucket_requirement() {
-        let complete = serde_json::json!({"snapshots": {
-            "SOXL260918C00050000": {"impliedVolatility":0.5},
-            "SOXL261016C00050000": {"impliedVolatility":0.6}
-        }});
-        assert!(validate_option_chain_payload(&complete).is_ok());
-        let missing =
-            serde_json::json!({"snapshots":{"SOXL260918C00050000":{"impliedVolatility":0.5}}});
-        assert!(validate_option_chain_payload(&missing).is_err());
-    }
-    #[test]
-    fn merges_complete_chain_and_rejects_duplicate_contracts() {
-        let mut first =
-            serde_json::json!({"snapshots":{"contract-a":{}},"next_page_token":"cursor"});
-        let second = serde_json::json!({"snapshots":{"contract-b":{}},"next_page_token":null});
-        merge_option_chain_page(&mut first, &second).unwrap();
-        assert_eq!(first["snapshots"].as_object().unwrap().len(), 2);
-        assert!(first["next_page_token"].is_null());
-        assert!(merge_option_chain_page(&mut first, &second).is_err());
-        assert!(merge_option_chain_page(&mut first, &serde_json::json!({})).is_err());
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn production_evidence_client_rejects_redirect_before_second_request() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = requests.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                assert!(
+                    stream.read(&mut request).await.unwrap() > 0,
+                    "request closed before headers"
+                );
+                let index = observed.fetch_add(1, Ordering::SeqCst);
+                let response = if index == 0 {
+                    format!(
+                        "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{address}/forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_owned()
+                };
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let mut transport = AlpacaPaperEvidenceTransport::new(
+            "https://paper-api.alpaca.markets",
+            "test",
+            "test",
+            None,
+        )
+        .unwrap();
+        // Override only the test URL; retain the exact production client policy.
+        transport.base_url = format!("http://{address}");
+        let result = transport
+            .acquire_inner(EvidenceSource::Alpaca, "paper.account")
+            .await;
+        server.abort();
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "redirect target received broker credentials"
+        );
+        assert!(result.is_err(), "redirect must not materialize evidence");
     }
 }
 
@@ -1832,8 +1748,7 @@ mod alpaca_news_tests {
     #[ignore = "requires ALPACA_API_KEY/ALPACA_API_SECRET and live network access"]
     async fn live_alpaca_news_endpoint_returns_a_news_array() {
         let key = std::env::var("ALPACA_API_KEY").expect("ALPACA_API_KEY is configured");
-        let secret =
-            std::env::var("ALPACA_API_SECRET").expect("ALPACA_API_SECRET is configured");
+        let secret = std::env::var("ALPACA_API_SECRET").expect("ALPACA_API_SECRET is configured");
         let response = Client::new()
             .get("https://data.alpaca.markets/v1beta1/news")
             .query(&[

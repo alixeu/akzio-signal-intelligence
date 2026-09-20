@@ -30,14 +30,14 @@ impl Store {
             if origin.run_id.as_ref() != Some(run_id) {
                 continue;
             }
-            let payload: Retrospective = self.read_artifact_payload(&artifact)?;
+            let payload: Retrospective = self.read_artifact_payload_with_connection(&connection, &artifact)?;
             if payload.outcome_id == *outcome_id && payload.horizon == horizon {
                 matching.push(artifact);
             }
         }
         if matching.len() == 2 {
-            let a: Retrospective = self.read_artifact_payload(&matching[0])?;
-            let b: Retrospective = self.read_artifact_payload(&matching[1])?;
+            let a: Retrospective = self.read_artifact_payload_with_connection(&connection, &matching[0])?;
+            let b: Retrospective = self.read_artifact_payload_with_connection(&connection, &matching[1])?;
             if valid_retrospective_repair(&matching[0], &a, &matching[1], &b) {
                 return Ok(Some(matching.remove(1)));
             }
@@ -239,7 +239,7 @@ impl Store {
             if origin.run_id.as_ref() != Some(run_id) {
                 continue;
             }
-            let payload: Outcome = self.read_artifact_payload(&artifact)?;
+            let payload: Outcome = self.read_artifact_payload_with_connection(&connection, &artifact)?;
             if artifact.lifecycle == ArtifactLifecycle::Canonical
                 && payload.is_sealed()
                 && payload.outcome_id == *outcome_id
@@ -273,7 +273,7 @@ impl Store {
                 })
                 .collect::<Vec<_>>();
         for artifact in &matching {
-            let schedule: OutcomeSchedule = self.read_artifact_payload(artifact)?;
+            let schedule: OutcomeSchedule = self.read_artifact_payload_with_connection(&connection, artifact)?;
             schedule.validate()?;
         }
         matching.sort_by_key(|artifact| artifact.created_at);
@@ -298,7 +298,7 @@ impl Store {
             {
                 continue;
             }
-            let outcome: Outcome = self.read_artifact_payload(&artifact)?;
+            let outcome: Outcome = self.read_artifact_payload_with_connection(&connection, &artifact)?;
             if outcome.is_sealed()
                 && matches!(
                     artifact.lifecycle,

@@ -94,7 +94,8 @@ impl BrokerSessionClock for AlpacaPaperSessionClock {
                 .market_clock()
                 .await
                 .map_err(|error| SchedulerError::Clock(error.to_string()))?;
-            Ok(clock.is_open.then(|| clock.session_date.to_string()))
+            Ok((clock.session.kind != akzio_domain::TradingSession::Closed)
+                .then(|| clock.session_date.to_string()))
         })
     }
 
@@ -124,11 +125,6 @@ pub trait PaperWorkflowSource: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = SchedulerResult<WorkflowProposal>> + Send + 'a>>;
 }
 
-#[derive(Clone)]
-pub struct StaticPaperWorkflowSource {
-    proposal: WorkflowProposal,
-}
-
 /// Prefers a durable Paper `WorkflowProposal` from `Store`. A bounded,
 /// Rust-compiled bootstrap may be supplied for the first scheduler session;
 /// reservation persists that proposal atomically with the Paper run.
@@ -137,12 +133,6 @@ pub struct StorePaperWorkflowSource {
     store: Store,
     store_executor: StoreExecutor,
     bootstrap: Option<(WorkflowRuntime, String)>,
-}
-
-impl StaticPaperWorkflowSource {
-    pub fn new(proposal: WorkflowProposal) -> Self {
-        Self { proposal }
-    }
 }
 
 impl StorePaperWorkflowSource {
@@ -168,7 +158,7 @@ impl StorePaperWorkflowSource {
         self
     }
 
-    /// A stored proposal that still references another Run's planner-lowered
+    /// A stored proposal that still references another Run's compiled
     /// `EvidenceNeed` can never be reserved, because reservation rejects
     /// cross-run RunScoped evidence fail-closed. Such a proposal must be
     /// skipped during selection; otherwise it stays the newest durable Paper
@@ -267,15 +257,6 @@ impl PaperWorkflowSource for StorePaperWorkflowSource {
                 .execute(move |_| source.proposal_sync())
                 .await?
         })
-    }
-}
-
-impl PaperWorkflowSource for StaticPaperWorkflowSource {
-    fn proposal<'a>(
-        &'a self,
-        _session_key: &'a str,
-    ) -> Pin<Box<dyn Future<Output = SchedulerResult<WorkflowProposal>> + Send + 'a>> {
-        Box::pin(async move { Ok(self.proposal.clone()) })
     }
 }
 

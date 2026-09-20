@@ -5,6 +5,8 @@
 
 mod agent;
 mod fixture;
+mod prompt_registry;
+pub mod quality;
 
 pub use crate::agent::{
     ActiveResearchCatalogue, AgentModel, AgentModelRequest, AgentModelTurn, AgentReasoningEvent,
@@ -28,7 +30,7 @@ fn component_hash(components: &[(&str, &[u8])]) -> ContentHash {
 }
 
 pub fn prompt_component_hash() -> ContentHash {
-    component_hash(&[
+    let mut components: Vec<(&str, &[u8])> = vec![
         (
             "crates/akzio-research/src/agent.rs",
             include_bytes!("agent.rs"),
@@ -86,11 +88,25 @@ pub fn prompt_component_hash() -> ContentHash {
             include_bytes!("agent/helpers.rs"),
         ),
         ("crates/akzio-research/src/lib.rs", include_bytes!("lib.rs")),
-    ])
+    ];
+    components.push((
+        "crates/akzio-research/src/prompt_registry.rs",
+        include_bytes!("prompt_registry.rs"),
+    ));
+    components.extend(prompt_registry::components(false));
+    component_hash(&components)
 }
 
 pub fn contract_component_hash() -> ContentHash {
-    component_hash(&[
+    let mut components: Vec<(&str, &[u8])> = vec![
+        (
+            "crates/akzio-domain/src/research_review.rs",
+            include_bytes!("../../akzio-domain/src/research_review.rs"),
+        ),
+        (
+            "crates/akzio-research/src/agent/proposal_review.rs",
+            include_bytes!("agent/proposal_review.rs"),
+        ),
         (
             "crates/akzio-domain/src/contract.rs",
             include_bytes!("../../akzio-domain/src/contract.rs"),
@@ -144,5 +160,7 @@ pub fn contract_component_hash() -> ContentHash {
             include_bytes!("agent/helpers.rs"),
         ),
         ("crates/akzio-research/src/lib.rs", include_bytes!("lib.rs")),
-    ])
+    ];
+    components.extend(prompt_registry::components(true));
+    component_hash(&components)
 }

@@ -81,7 +81,10 @@ extension LiveProjection {
                 "Last \($0.rangeDays) days vs previous 30"
             } ?? (section.reason ?? "No canonical learning available"),
             availabilityStatus: liveObserverSectionStatus(section.status),
-            availabilityReason: section.reason
+            availabilityReason: section.reason,
+            researchAudit: payload.currentRun?.researchAudit?.records.filter {
+                $0.producer == "learning.retrieval.audit" || $0.producer == "learning.revalidation.suggestion"
+            }.flatMap(\.rows) ?? []
         )
     }
 
@@ -129,7 +132,7 @@ extension LiveProjection {
             },
             windows: [],
             selected: .t1,
-            observedTradingDays: 0,
+            observedTradingDays: nil,
             totalTradingDays: 5,
             outcomeID: MissingValue.unavailable.rawValue,
             availabilityStatus: .unavailable,
@@ -147,11 +150,12 @@ extension LiveProjection {
             market: "US Equities",
             startedAt: Date(timeIntervalSince1970: 0),
             elapsedSeconds: 0,
-            systemHealthPpm: 0,
+            systemHealthPpm: nil,
             marketOpen: false,
+            marketStatusKnown: false,
             dataLive: false,
             dataStale: true,
-            latencyMillis: 0,
+            latencyMillis: nil,
             brokerSession: MissingValue.unavailable.rawValue
         )
     }
@@ -160,7 +164,7 @@ extension LiveProjection {
         ArchivePresentation(
             rows: [],
             totalRuns: 0,
-            successRatePpm: 0,
+            successRatePpm: nil,
             page: 1,
             pageSize: 1,
             selectedRowID: nil,

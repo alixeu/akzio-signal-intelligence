@@ -1,9 +1,12 @@
 fn handle_observatory_config(config_path: &Path, command: &ObservatoryConfigCommand) -> Result<()> {
+    // 配置入口只负责本地 TOML 的创建、读取和更新；它不启动 daemon、不创建 Run，
+    // 也不把编辑后的模型字段视为已经通过 Paper/Decision Gate。
     match command {
         ObservatoryConfigCommand::Init {
             template,
             store_root,
         } => {
+            // Init 只在目标不存在时从模板生成新配置；已存在的文件保持不变并返回 created=false。
             if config_path.exists() {
                 return print_json(&serde_json::json!({ "created": false }));
             }
@@ -29,6 +32,7 @@ fn handle_observatory_config(config_path: &Path, command: &ObservatoryConfigComm
                 );
             }
             let credentials = toml_section_mut(&mut document, "credentials")?;
+            // 凭据来源是当前进程环境，写入前仍受配置文件权限保护；未提供的可选凭据保持缺省。
             credentials.insert(
                 "alpaca_api_key".to_owned(),
                 toml::Value::String(std::env::var("ALPACA_API_KEY").unwrap_or_default()),
@@ -51,10 +55,13 @@ fn handle_observatory_config(config_path: &Path, command: &ObservatoryConfigComm
             print_json(&serde_json::json!({ "created": true }))
         }
         ObservatoryConfigCommand::Get => {
+            // Get 返回当前可编辑投影，其中包含模型路由和连接配置；读取本身不做运行时探测。
             let config = read_config_file(config_path)?;
             print_json(&editable_observatory_configuration(&config)?)
         }
         ObservatoryConfigCommand::Set => {
+            // Set 从 stdin 接收完整编辑对象，更新前由 update_observatory_configuration 做
+            // provider/模型字段校验，解析或校验失败都不会写回文件。
             let mut payload = String::new();
             io::stdin()
                 .read_to_string(&mut payload)
@@ -68,6 +75,8 @@ fn handle_observatory_config(config_path: &Path, command: &ObservatoryConfigComm
 }
 
 fn editable_observatory_configuration(config: &Config) -> Result<ObservatoryEditableConfiguration> {
+    // 将 Config 映射为 UI 可编辑的扁平投影；release/cutoff 等当前模型身份字段不在该
+    // 结构中修改，后续 Set 会从现有配置保留它们。
     let model = config
         .model
         .as_ref()
@@ -91,6 +100,8 @@ fn update_observatory_configuration(
     config_path: &Path,
     configuration: ObservatoryEditableConfiguration,
 ) -> Result<()> {
+    // 只允许当前支持的 OpenAI Responses provider；新模型/路由替换后先做基础设置校验，
+    // 再把模型、凭据和 SEC user-agent 一并写回，不能通过此入口激活 Policy 或批准 Paper。
     let provider = configuration.provider.trim();
     if provider != OPENAI_RESPONSES_PROVIDER_ID {
         bail!(
@@ -104,6 +115,8 @@ fn update_observatory_configuration(
         .as_ref()
         .context("Observatory configuration requires [model]")?;
     let model = OpenAIResponsesConfig {
+        // 身份相关 release_date/knowledge_cutoff/debug 从现有配置继承，避免编辑界面
+        // 意外清空历史校准所依赖的时间字段。
         base_url: configuration.llm_base_url.trim().to_owned(),
         model: configuration.global_model.trim().to_owned(),
         release_date: current_model.release_date.clone(),
@@ -177,6 +190,8 @@ async fn approve_paper(
     valid_hours: i64,
     qualification_report: &Path,
 ) -> Result<()> {
+    // 先校验交易 Session、operator、理由、金额和有效期，再探测当前模型能力并生成
+    // RuntimeIdentity；最终请求只是在 daemon Store 中受理 approval，绝不直接下单。
     let _session = chrono::NaiveDate::parse_from_str(session_key, "%Y-%m-%d")
         .context("session_key must be YYYY-MM-DD")?;
     if operator.trim().is_empty()
@@ -209,6 +224,8 @@ async fn approve_paper(
             qualification_report.display()
         )
     })?;
+    // Qualification 报告必须是独立生成且结构完整的输入；读取成功或 API 受理都不等于
+    // DecisionGate/ExecutionGate 已通过，后续 Paper scheduler 仍需执行全部检查。
     qualification.validate().context("validate model qualification report")?;
     print_json(
         &ControlApiClient::from_config(config)?

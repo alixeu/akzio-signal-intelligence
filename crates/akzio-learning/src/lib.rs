@@ -4,12 +4,9 @@
 
 mod campaign;
 mod evaluation;
-mod experiment;
-mod historical;
 mod lesson_evidence;
 mod outcome_schedule;
 mod qualification;
-mod qualification_campaign;
 
 use akzio_domain::{ArtifactProvenance, TaskWritePermit};
 use chrono::{DateTime, Utc};
@@ -28,10 +25,7 @@ pub(crate) fn trusted_learning_provenance(
     }
 }
 
-pub use campaign::{
-    evaluate_canary_cohort, CanaryBundleComparison, CanaryCampaignRuntime, CanaryError,
-    CanaryHorizonMetrics, CanarySubjectComparison,
-};
+pub use campaign::{evaluate_canary_cohort, CanaryCampaignRuntime, CanaryError};
 pub use evaluation::{
     apply_risk_ground_truth_assessments, daily_observations, horizon_observations,
     materialize_outcome, materialize_partial_outcome, realized_execution,
@@ -42,27 +36,12 @@ pub use evaluation::{
     SealedEvaluationInput, ShadowObservation, AKZIO_MIN_CALIBRATION_SAMPLES,
     AKZIO_MIN_FRESH_PAIRS_PER_HORIZON,
 };
-pub use experiment::{
-    build_search_bias_certificate, build_search_bias_certificate_with_policy,
-    default_metric_identities, moving_block_bootstrap_lower_bound_ppm,
-    stationary_bootstrap_lower_bound_ppm, SearchBiasEvaluationError, SearchBiasEvaluationResult,
-};
-pub use historical::{
-    purged_walk_forward_splits, run_point_in_time_backtest, ExchangeSession, FrozenHoldout,
-    FrozenHoldoutView, HistoricalBacktestResult, HistoricalEvaluationError, HistoricalNavPoint,
-    HistoricalSessionInput, VersionedExchangeCalendar, WalkForwardConfig, WalkForwardSplit,
-    HISTORICAL_EVALUATION_SCHEMA_VERSION,
-};
 pub use outcome_schedule::{
     OutcomeScheduleError, OutcomeScheduleInput, OutcomeScheduleOutput, OutcomeScheduleResult,
     OutcomeSchedulingRuntime,
 };
 pub use qualification::{
-    run_model_qualification_from_receipts, run_offline_model_qualification,
-    OfflineModelQualificationInput, OfflineModelQualificationResult, QualificationRunError,
-    QualificationScenarioObservation, QualificationStage, ReceiptBasedQualificationInput,
-};
-pub use qualification_campaign::{
-    run_model_qualification_campaign, QualificationCampaignError, QualificationCampaignPlan,
-    QualificationStageExecutor, QualificationStageRequest, QualificationStageResult,
+    run_offline_model_qualification, OfflineModelQualificationInput,
+    OfflineModelQualificationResult, QualificationRunError, QualificationScenarioObservation,
+    QualificationStage,
 };

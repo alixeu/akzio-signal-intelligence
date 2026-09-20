@@ -1,6 +1,8 @@
 use akzio_execution::DecisionPolicyArtifact;
 
 fn configured_synthesizer_identity(model: &OpenAIResponsesConfig) -> Result<(String, ContentHash)> {
+    // 解析 research.synthesizer 的有效路由，并把 provider、端点、模型及版本语义字段
+    // 固化成哈希；这是身份比较输入，不会调用模型或改变 Store。
     let route = model.routes.get("research.synthesizer");
     let model_id = route
         .map(|route| route.model.clone())
@@ -22,36 +24,77 @@ struct LoadedDecisionPolicy {
     policy: DecisionPolicy,
     status: String,
     input_hash: Option<ContentHash>,
+    contract_hash: Option<ContentHash>,
+    artifact_id: Option<ArtifactId>,
+    source: &'static str,
 }
 
 fn load_decision_policy_from_config(
     config: &Config,
-    config_path: &Path,
 ) -> Result<LoadedDecisionPolicy> {
-    let Some(policy_path) = config.execution.decision_policy_path.as_ref() else {
+    // 配置只提供 Store Root；Policy 正文和 active head 仍由统一 Store 读取，
+    // 不再从外部 JSON 或旧 decision_policy_path 导入。
+    let store = Store::open(&config.daemon.store_root)?;
+    load_decision_policy_from_store(config, &store)
+}
+
+fn load_decision_policy_from_store(
+    config: &Config,
+    store: &Store,
+) -> Result<LoadedDecisionPolicy> {
+    // 只读取 SQL active head 指向的不可变 CAS Artifact，并用 descriptor 与正文交叉校验；
+    // 缺少 active head 时返回显式的默认/未配置投影，而不是把默认 Policy 当成已校准。
+    if let Some(stored) = store.active_decision_policy()? {
+        let bytes = store.read_blob(&stored.artifact.blob)?;
+        let loaded = decode_loaded_decision_policy(config, &bytes, Some(&stored.descriptor))?;
         return Ok(LoadedDecisionPolicy {
-            policy: DecisionPolicy::default(),
-            status: "unconfigured".to_owned(),
-            input_hash: None,
+            artifact_id: Some(stored.artifact.artifact_id),
+            source: "store_active_head",
+            ..loaded
         });
-    };
-    let resolved = if policy_path.is_absolute() {
-        policy_path.clone()
-    } else {
-        config_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(policy_path)
-    };
-    let bytes = fs::read(&resolved)
-        .with_context(|| format!("read frozen decision policy {}", resolved.display()))?;
-    let input_hash = ContentHash::of_bytes(&bytes);
-    let artifact = DecisionPolicyArtifact::decode_strict(&bytes)
-        .with_context(|| format!("decode frozen decision policy {}", resolved.display()))?;
+    }
+    Ok(LoadedDecisionPolicy {
+        policy: DecisionPolicy::default(),
+        status: "store_active_head_missing".to_owned(),
+        input_hash: None,
+        contract_hash: None,
+        artifact_id: None,
+        source: "store_active_head_missing",
+    })
+}
+
+fn decode_loaded_decision_policy(
+    config: &Config,
+    bytes: &[u8],
+    descriptor: Option<&akzio_store::DecisionPolicyDescriptor>,
+) -> Result<LoadedDecisionPolicy> {
+    // 解码边界同时检查 CAS envelope、Policy provenance、provider/route 和当前配置模型；
+    // 成功只返回内存中的 LoadedDecisionPolicy，激活仍必须走独立的 activate 路径。
+    let artifact = DecisionPolicyArtifact::decode_strict(bytes)
+        .context("decode frozen decision policy")?;
+    if let Some(descriptor) = descriptor {
+        if descriptor.envelope_hash != ContentHash::of_bytes(bytes)
+            || descriptor.policy_hash != artifact.provenance.output_hash
+            || artifact.provenance.provider_id.as_deref() != Some(&descriptor.provider_id)
+            || artifact.provenance.model_route.as_deref() != Some(&descriptor.model_route)
+            || artifact.provenance.contract_hash.as_ref() != Some(&descriptor.contract_hash)
+        {
+            bail!("active Store policy identity does not match its CAS envelope");
+        }
+    }
+    let input_hash = ContentHash::of_bytes(bytes);
     let policy = artifact.policy;
+    // Policy 自身的结构校验先于任何能力判断，避免用部分有效的校准字段进入运行时。
     policy
         .validate()
-        .with_context(|| format!("validate frozen decision policy {}", resolved.display()))?;
+        .context("validate frozen decision policy")?;
+    if let (Some(descriptor), Some(scope)) = (descriptor, &policy.active_forecast_calibration) {
+        if descriptor.model_id != scope.model_id
+            || descriptor.model_version_hash != scope.model_version_hash
+        {
+            bail!("active Store policy model identity does not match its CAS envelope");
+        }
+    }
 
     let provider_id = artifact
         .provenance
@@ -71,6 +114,8 @@ fn load_decision_policy_from_config(
     }
 
     if let Some(scope) = &policy.active_forecast_calibration {
+        // 带 forecast calibration 的 Policy 必须绑定当前配置的 Synthesizer 身份，
+        // 否则历史模型的风险参数不能被当前模型复用。
         let model = config
             .model
             .as_ref()
@@ -87,10 +132,45 @@ fn load_decision_policy_from_config(
         policy,
         status: status.to_owned(),
         input_hash: Some(input_hash),
+        contract_hash: artifact.provenance.contract_hash,
+        artifact_id: None,
+        source: "decoded",
     })
 }
 
+fn activate_decision_policy_artifact(
+    store: &Store,
+    artifact: &Artifact,
+    now: DateTime<Utc>,
+) -> Result<akzio_store::StoredDecisionPolicy> {
+    // 将严格解码后的 Policy provenance 映射为 Store descriptor，再由 Store 原子地更新
+    // active head；此处不会替 Policy 绕过 Contract 检查，调用方需先完成 Contract 比对。
+    let bytes = store.read_blob(&artifact.blob)?;
+    let envelope = DecisionPolicyArtifact::decode_strict(&bytes)
+        .context("strictly decode DecisionPolicyArtifact before Store activation")?;
+    if !envelope.policy.decision_capable() {
+        bail!("refusing to activate a policy that is not decision-capable");
+    }
+    let scope = envelope.policy.active_forecast_calibration.as_ref()
+        .context("decision-capable policy has no active forecast calibration")?;
+    let provider_id = envelope.provenance.provider_id.clone()
+        .context("decision policy provider identity missing")?;
+    let model_route = envelope.provenance.model_route.clone()
+        .context("decision policy model route missing")?;
+    let contract_hash = envelope.provenance.contract_hash.clone()
+        .context("decision policy Contract identity missing")?;
+    let descriptor = akzio_store::DecisionPolicyDescriptor {
+        policy_hash: envelope.provenance.output_hash.clone(),
+        envelope_hash: artifact.blob.hash.clone(), provider_id,
+        model_id: scope.model_id.clone(), model_version_hash: scope.model_version_hash.clone(),
+        model_route, contract_hash,
+    };
+    Ok(store.activate_decision_policy(artifact, &descriptor, now)?)
+}
+
 fn decision_policy_audit(loaded: &LoadedDecisionPolicy) -> (String, Option<ContentHash>) {
+    // 启动器使用该轻量投影记录 Policy 状态和输入哈希；它不改变 loaded Policy，也不做
+    // active head 写入。
     (loaded.status.clone(), loaded.input_hash.clone())
 }
 
@@ -99,8 +179,14 @@ fn runtime_identity_from_config(
     config_path: &Path,
     model_capabilities: &ModelCapabilityProbeSet,
 ) -> Result<RuntimeIdentity> {
-    let loaded = load_decision_policy_from_config(config, config_path)?;
-    runtime_identity_from_config_with_policy(config, config_path, model_capabilities, &loaded.policy)
+    // 默认从 Store active head 加载 Policy，再把统一身份计算委托给带显式 Policy 的版本。
+    let loaded = load_decision_policy_from_config(config)?;
+    runtime_identity_from_config_with_policy(
+        config,
+        config_path,
+        model_capabilities,
+        &loaded.policy,
+    )
 }
 
 fn runtime_identity_from_config_with_policy(
@@ -109,6 +195,8 @@ fn runtime_identity_from_config_with_policy(
     model_capabilities: &ModelCapabilityProbeSet,
     decision_policy: &DecisionPolicy,
 ) -> Result<RuntimeIdentity> {
+    // RuntimeIdentity 汇总源码、锁文件、配置、模型能力、Contract/Prompt/拓扑和治理哈希，
+    // 供 Paper approval/Debug 启动绑定；它描述启动输入，不等于审批、Decision 或订单。
     let model = config
         .model
         .as_ref()
@@ -119,6 +207,7 @@ fn runtime_identity_from_config_with_policy(
         .context("Paper runtime requires execution.market_data_feed")?;
     let provider_id = model.provider_identity().as_str().to_owned();
     let policy_identity = runtime_policy_identity(decision_policy)?;
+    // 每个角色的能力快照分别入 hash，再生成 bundle hash，避免只记录默认路由而遗漏覆盖。
     model_capabilities.validate_for_config(model)?;
     let mut model_capability_hashes = BTreeMap::from([(
         "default".to_owned(),
@@ -146,6 +235,7 @@ fn runtime_identity_from_config_with_policy(
                 "http_addr": config.daemon.http_addr.to_string(),
                 "worker_count": config.daemon.worker_count,
                 "auto_paper": config.daemon.auto_paper,
+                "manual_paper": config.daemon.manual_paper,
             },
             "execution": {
                 "experiment_profile": config.execution.experiment_profile,
@@ -213,6 +303,8 @@ fn runtime_identity_from_config_with_policy(
 }
 
 fn redacted_config_hash(config_path: &Path) -> Result<ContentHash> {
+    // 配置身份保留行为字段，但先删除 credentials 和 model.api_key；哈希用于身份绑定，
+    // 不把敏感值写入 RuntimeIdentity。
     let mut document = read_config_document(config_path)?;
     if let Some(root) = document.as_table_mut() {
         root.remove("credentials");
@@ -228,22 +320,27 @@ fn redacted_config_hash(config_path: &Path) -> Result<ContentHash> {
 }
 
 fn source_revision() -> Result<String> {
+    // 读取 build.rs 写入的编译期源码身份；缺少该环境变量时由编译阶段直接失败。
     Ok(env!("AKZIO_SOURCE_REVISION").to_owned())
 }
 
 fn read_config_file(path: &Path) -> Result<Config> {
+    // 读取并反序列化完整配置；环境变量替换和运行时约束由调用方按入口需要执行。
     fs::read_to_string(path)
         .with_context(|| format!("read config {}", path.display()))
         .and_then(|text| toml::from_str::<Config>(&text).context("parse config TOML"))
 }
 
 fn read_config_document(path: &Path) -> Result<toml::Value> {
+    // 保留 TOML 通用树以支持 Observatory 的局部编辑；这里不执行 Config 级业务校验。
     fs::read_to_string(path)
         .with_context(|| format!("read config {}", path.display()))
         .and_then(|text| toml::from_str::<toml::Value>(&text).context("parse config TOML"))
 }
 
 fn write_config_file(path: &Path, document: &toml::Value) -> Result<()> {
+    // 将配置先写入同目录临时文件并设置最小权限，再 rename 到目标；这条路径只更新
+    // 本地配置，不触碰 Store、Run 或 Paper 状态。
     let parent = path
         .parent()
         .context("Akzio configuration path has no parent directory")?;
@@ -276,6 +373,7 @@ fn toml_section_mut<'a>(
     document: &'a mut toml::Value,
     name: &str,
 ) -> Result<&'a mut toml::map::Map<String, toml::Value>> {
+    // 获取或创建指定顶层 TOML table；若现有值不是 table，立即报错而不覆盖用户配置。
     let root = document
         .as_table_mut()
         .context("Akzio configuration root must be a TOML table")?;
@@ -290,6 +388,7 @@ fn set_optional_toml_string(
     key: &str,
     value: Option<String>,
 ) {
+    // 空白或空字符串按“未设置”处理并删除旧键；非空值才写回 TOML。
     if let Some(value) = value
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
@@ -301,6 +400,8 @@ fn set_optional_toml_string(
 }
 
 fn validate_model_settings(model: &OpenAIResponsesConfig) -> Result<()> {
+    // Observatory 编辑入口只校验模型基础字段、日期格式和受支持路由；执行 profile、
+    // Paper 成本和资产约束仍由 load_config 负责，不能把此校验当作可运行性证明。
     if model.base_url.trim().is_empty()
         || model.model.trim().is_empty()
         || model.reasoning_effort.trim().is_empty()
@@ -320,8 +421,7 @@ fn validate_model_settings(model: &OpenAIResponsesConfig) -> Result<()> {
     for (purpose, route) in &model.routes {
         if !matches!(
             purpose.as_str(),
-            "research.planner"
-                | "research.analyst"
+            "research.analyst"
                 | "research.critic"
                 | "research.synthesizer"
                 | "learning.outcome_worker"
@@ -353,14 +453,15 @@ fn validate_model_settings(model: &OpenAIResponsesConfig) -> Result<()> {
     Ok(())
 }
 
-const CANONICAL_RESEARCH_ROUTES: [&str; 4] = [
-    "research.planner",
+const CANONICAL_RESEARCH_ROUTES: [&str; 3] = [
     "research.analyst",
     "research.critic",
     "research.synthesizer",
 ];
 
 fn validate_canonical_model_identity(model: &OpenAIResponsesConfig) -> Result<()> {
+    // PaperResearch/HistoricalEval 需要模型发布日期和知识截止日，以便构造可审计身份和
+    // 历史时间语义；这里只检查字段存在，具体日期格式由 validate_model_settings 负责。
     if model.release_date.is_none() || model.knowledge_cutoff.is_none() {
         bail!("canonical research profiles require model.release_date and model.knowledge_cutoff");
     }
@@ -368,6 +469,8 @@ fn validate_canonical_model_identity(model: &OpenAIResponsesConfig) -> Result<()
 }
 
 fn validate_canonical_research_routes(profile: &str, model: &OpenAIResponsesConfig) -> Result<()> {
+    // 正式研究拓扑要求 Analyst/Critic/Synthesizer 都有显式路由，并且每条路由能继承或
+    // 覆盖 release_date/knowledge_cutoff；缺任一角色都在启动前失败。
     for purpose in CANONICAL_RESEARCH_ROUTES {
         let route = model
             .routes
@@ -391,6 +494,8 @@ fn validate_canonical_research_routes(profile: &str, model: &OpenAIResponsesConf
 }
 
 fn initial_config_value(value: &str) -> String {
+    // 初始化模板只展开形如 $ENV 的整值占位符；未设置的环境变量变为空字符串，
+    // 其他普通字符串原样保留，不做任意模板求值。
     value
         .strip_prefix('$')
         .and_then(|name| std::env::var(name).ok())
@@ -404,6 +509,7 @@ fn initial_config_value(value: &str) -> String {
 }
 
 fn apply_config_environment(config: &Config) {
+    // 仅在进程环境尚未提供时注入 SEC user agent，避免配置文件覆盖调用方显式环境值。
     if let Some(value) = config.observatory.sec_user_agent.as_deref() {
         if std::env::var_os("SEC_USER_AGENT").is_none() && !value.is_empty() {
             std::env::set_var("SEC_USER_AGENT", value);
@@ -412,10 +518,27 @@ fn apply_config_environment(config: &Config) {
 }
 
 fn load_config(path: &Path) -> Result<Config> {
+    // 这是常规 daemon/远端命令的完整入口：读取预算、模型和凭据，应用环境覆盖，
+    // 再校验 loopback、四资产、成本、市场数据和 experiment profile；成功只返回可启动
+    // 配置，不代表 daemon 已启动或 Paper 订单已获准。
     let mut config = read_config_file(path)?;
-    config.agent.budget.validate().context("invalid agent.budget configuration")?;
+    config
+        .agent
+        .budget
+        .validate()
+        .context("invalid agent.budget configuration")?;
+    config.agent.research.validate().context("invalid agent.research configuration")?;
     resolve_model_configuration(&mut config)?;
+    for (name, value) in [("ALPACA_API_KEY", &config.credentials.alpaca_api_key),
+        ("ALPACA_API_SECRET", &config.credentials.alpaca_api_secret)] {
+        if !value.is_empty() { std::env::set_var(name, resolve_env_placeholder(value, name)?); }
+    }
+    if let Some(value) = &config.credentials.fred_api_key {
+        if !value.is_empty() { std::env::set_var("FRED_API_KEY", resolve_env_placeholder(value, "FRED_API_KEY")?); }
+    }
     if let Some(store_root) = std::env::var_os("AKZIO_STORE_ROOT") {
+        // AKZIO_STORE_ROOT 是显式运行时覆盖，优先于文件中的路径，但仍受后续 Store
+        // 生命周期和 Debug 隔离规则约束。
         config.daemon.store_root = PathBuf::from(store_root);
     }
     apply_config_environment(&config);
@@ -442,7 +565,7 @@ fn load_config(path: &Path) -> Result<Config> {
     }
     .validate()
     .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let auto_paper = config.daemon.auto_paper.unwrap_or(false);
+    let auto_paper = config.daemon.auto_paper.unwrap_or(false) || config.daemon.manual_paper;
     let zero_cost =
         config.execution.transaction_cost_ppm == 0 && config.execution.slippage_ppm == 0;
 
@@ -450,6 +573,7 @@ fn load_config(path: &Path) -> Result<Config> {
         && config.execution.transaction_cost_ppm == 0
         && config.execution.slippage_ppm == 0
     {
+        // Scheduler 必须有非零成本假设；零成本只允许显式 fixture 等不启动 Paper 的配置。
         bail!("Paper scheduler requires explicit transaction_cost_ppm or slippage_ppm");
     }
     if auto_paper && config.execution.market_data_feed.is_none() {
@@ -537,13 +661,25 @@ fn load_config(path: &Path) -> Result<Config> {
 mod agent_budget_config_tests {
 
     #[test]
+    fn proposal_revision_toml_default_zero_and_invalid_values() {
+        let absent: akzio_domain::AgentSettings = toml::from_str("").unwrap();
+        assert_eq!(absent.research.max_proposal_revisions, 2);
+        for limit in [0, 2, 5, 6] {
+            let settings: akzio_domain::AgentSettings = toml::from_str(&format!("[research]\nmax_proposal_revisions = {limit}\n")).unwrap();
+            assert_eq!(settings.research.validate().is_ok(), limit <= 5);
+        }
+        for value in ["-1", "1.5", "true", "256"] {
+            assert!(toml::from_str::<akzio_domain::AgentSettings>(&format!("[research]\nmax_proposal_revisions = {value}\n")).is_err());
+        }
+    }
+
+    #[test]
     fn budget_toml_defaults_role_override_and_million_input() {
         let absent: akzio_domain::AgentSettings = toml::from_str("").unwrap();
         for (purpose, output, timeout) in [
-            ("research.planner", 2000, 120),
-            ("research.analyst", 6000, 120),
-            ("research.critic", 16000, 120),
-            ("research.synthesizer", 5000, 120),
+            ("research.analyst", 1_000_000, 180),
+            ("research.critic", 1_000_000, 180),
+            ("research.synthesizer", 1_000_000, 180),
             ("learning.outcome_worker", 4000, 180),
         ] {
             assert_eq!(
@@ -565,6 +701,7 @@ http_addr = "127.0.0.1:17342"
 assets = ["TQQQ", "QQQ", "SOXX", "SOXL"]
 [agent.budget.analyst]
 max_input_tokens = 1000000
+max_output_tokens = 1000000
 "#,
         )
         .unwrap();
@@ -575,6 +712,14 @@ max_input_tokens = 1000000
                 .resolve("research.analyst")
                 .unwrap()
                 .max_input_tokens,
+            1_000_000
+        );
+        assert_eq!(
+            root.agent
+                .budget
+                .resolve("research.analyst")
+                .unwrap()
+                .max_output_tokens,
             1_000_000
         );
         let config: akzio_domain::AgentSettings = toml::from_str(
@@ -607,7 +752,7 @@ timeout_seconds = 180
             critic.max_tool_calls,
             akzio_domain::budget::ToolCallLimit::Unlimited
         );
-        assert_eq!(critic.max_wall_time_secs, 120);
+        assert_eq!(critic.max_wall_time_secs, 180);
     }
 
     #[test]
@@ -686,6 +831,7 @@ max_tool_calls = "unlimited"
         for entry in [
             "max_input_tokens = 0",
             "max_output_tokens = 0",
+            "max_output_tokens = 1000001",
             "timeout_seconds = 0",
         ] {
             let settings: akzio_domain::AgentSettings =
@@ -702,6 +848,8 @@ max_tool_calls = "unlimited"
 // Shared by daemon loading and real provider tests; execution configuration
 // validation remains in load_config and is never weakened by model-only tests.
 fn resolve_model_configuration(config: &mut Config) -> Result<()> {
+    // 只解析模型相关的环境占位符和 AKZIO_* 覆盖，并检查路由字段非空/名称合法；
+    // 该轻量入口供 preflight、校准身份和真实测试使用，完整执行配置仍须经过 load_config。
     if let Some(model) = config.model.as_mut() {
         model.base_url = resolve_env_placeholder(&model.base_url, "model.base_url")?;
         model.api_key = resolve_env_placeholder(&model.api_key, "model.api_key")?;
@@ -726,8 +874,7 @@ fn resolve_model_configuration(config: &mut Config) -> Result<()> {
         for (purpose, route) in &model.routes {
             if !matches!(
                 purpose.as_str(),
-                "research.planner"
-                    | "research.analyst"
+                "research.analyst"
                     | "research.critic"
                     | "research.synthesizer"
                     | "learning.outcome_worker"

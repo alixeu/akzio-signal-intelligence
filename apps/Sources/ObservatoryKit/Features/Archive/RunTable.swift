@@ -31,12 +31,19 @@ struct RunTable: View {
     @Environment(\.appLanguage) private var language
 
     var body: some View {
+        ViewThatFits(in: .horizontal) {
+            table(compact: false).frame(minWidth: 1070)
+            table(compact: true)
+        }
+    }
+
+    private func table(compact: Bool) -> some View {
         VStack(alignment: .leading, spacing: 0) {
-            header
+            header(compact: compact)
             HairlineDivider()
             VStack(spacing: 0) {
                 ForEach(rows) { row in
-                    rowView(row).id(row.id)
+                    rowView(row, compact: compact).id(row.id)
                 }
             }
             Spacer(minLength: 0)
@@ -46,17 +53,21 @@ struct RunTable: View {
 
     // MARK: Header
 
-    private var header: some View {
+    private func header(compact: Bool) -> some View {
         HStack(spacing: AkzioLayout.s2) {
             label("Run ID", width: 78)
-            label("Purpose", width: 74)
-            label("Topology", width: 120)
+            if !compact {
+                label("Purpose", width: 74)
+                label("Topology", width: 120)
+            }
             sortable(.status, width: 104)
-            sortable(.duration, width: 66)
+            if !compact { sortable(.duration, width: 66) }
             label("Current Stage", width: 112)
-            label("Model", width: 100)
-            sortable(.result, width: 62)
-            sortable(.started, width: 56)
+            if !compact {
+                label("Model", width: 100)
+                sortable(.result, width: 74)
+            }
+            sortable(.started, width: 148)
         }
         .padding(.horizontal, AkzioLayout.s2)
         .frame(height: 26)
@@ -94,31 +105,38 @@ struct RunTable: View {
 
     // MARK: Rows
 
-    private func rowView(_ row: ArchiveRowPresentation) -> some View {
+    private func rowView(_ row: ArchiveRowPresentation, compact: Bool) -> some View {
         let isSelected = row.id == selectedID
         return Button { onSelect(row.id) } label: {
             HStack(spacing: AkzioLayout.s2) {
                 Text(String(row.runID.prefix(8)))
                     .akzioMono(11, color: AkzioColor.primaryText)
                     .frame(width: 78, alignment: .leading)
+                if !compact {
                 PillTag(row.purposeLabel, tone: row.purpose.tone)
-                    .frame(width: 62, alignment: .leading)
-                Text(row.topology).akzioMono(10, color: AkzioColor.secondaryText)
+                    .frame(width: 74, alignment: .leading)
+                Text(row.topology).akzioMono(11, color: AkzioColor.secondaryText)
                     .frame(width: 120, alignment: .leading).lineLimit(1)
+                }
                 StatusBadge(row.status.status, size: .compact)
                     .frame(width: 104, alignment: .leading)
+                if !compact {
                 Text(L10n.text(PpmFormatter.duration(seconds: row.durationSeconds), language: language))
-                    .akzioMono(10, color: AkzioColor.secondaryText)
+                    .akzioMono(11, color: AkzioColor.secondaryText)
                     .lineLimit(1)
                     .frame(width: 66, alignment: .leading)
+                }
                 Text(L10n.text(row.currentStage, language: language)).akzioText(.bodySmall).frame(width: 112, alignment: .leading).lineLimit(1)
-                Text(row.model).akzioMono(10, color: AkzioColor.mutedText)
-                    .frame(width: 100, alignment: .leading).lineLimit(1)
+                if !compact {
+                Text(row.model).akzioMono(11, color: AkzioColor.secondaryText)
+                    .frame(width: 100, alignment: .leading).lineLimit(1).help(row.model)
                 Text(L10n.text(PpmFormatter.percent(ppm: row.resultPpm), language: language))
                     .akzioMono(10, color: resultColor(row))
                     .frame(width: 74, alignment: .leading)
-                Text(L10n.text(row.startedAtLabel, language: language)).akzioMono(10, color: AkzioColor.mutedText)
-                    .frame(width: 56, alignment: .leading)
+                }
+                Text(L10n.text(row.startedAtLabel, language: language)).akzioMono(11, color: AkzioColor.secondaryText)
+                    .lineLimit(1)
+                    .frame(width: 148, alignment: .leading)
                 Spacer(minLength: 0)
             }
             .padding(.horizontal, AkzioLayout.s2)
@@ -126,6 +144,11 @@ struct RunTable: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .help(row.runID)
+        .contextMenu {
+            Button("复制运行 ID") { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(row.runID, forType: .string) }
+            Button("复制模型名") { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(row.model, forType: .string) }
+        }
         .rowHoverHighlight(isSelected: isSelected)
         .overlay {
             if isSelected {

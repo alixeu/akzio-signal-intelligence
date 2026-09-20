@@ -55,6 +55,8 @@ impl OpenAIResponsesClient {
         connect_timeout: Duration,
         stream_idle_timeout: Duration,
     ) -> Result<Self> {
+        // 在构造 HTTP client 前先规范化并拒绝空配置；这些错误属于本地配置错误，
+        // 不会发起 provider I/O。
         let base_url = base_url.into().trim().trim_end_matches('/').to_owned();
         if base_url.is_empty() {
             return Err(ModelError::EmptyBaseUrl);
@@ -71,6 +73,8 @@ impl OpenAIResponsesClient {
         if reasoning_effort.trim().is_empty() {
             return Err(ModelError::EmptyReasoningEffort);
         }
+        // read_timeout 只限制单次流式空闲间隔；调用方的 Agent Contract/phase
+        // deadline 仍负责整轮墙钟预算。
         Ok(Self {
             http: Client::builder()
                 .connect_timeout(connect_timeout)
@@ -88,19 +92,6 @@ impl OpenAIResponsesClient {
         openai_responses_request_body(&self.model, &self.reasoning_effort, request)
     }
 
-    pub fn declared_capabilities(&self) -> OpenAIResponsesCapabilities {
-        OpenAIResponsesCapabilities {
-            supports_tool_calls: false,
-            supports_stateless_continuation: false,
-            reasoning_items: false,
-            encrypted_continuation: false,
-            native_web_tool: false,
-            streaming: false,
-            basis: ModelCapabilityBasis::Unknown,
-            verified: false,
-        }
-    }
-
     pub async fn respond(&self, request: ModelRequest) -> Result<ModelResponse> {
         self.respond_with_events(request, |_| {}).await
     }
@@ -110,6 +101,8 @@ impl OpenAIResponsesClient {
         request: ModelRequest,
         mut on_event: impl FnMut(ModelStreamEvent),
     ) -> Result<ModelResponse> {
+        // 一次请求使用无状态 store=false 的 Responses 调用；函数只返回协议层
+        // ModelResponse，持久化、Attempt 状态和业务 Gate 由上层负责。
         let body = self.request_body(&request);
         let mut response = self
             .http
@@ -125,6 +118,7 @@ impl OpenAIResponsesClient {
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
         if !status.is_success() {
+            // 非 2xx 在读取完整错误 body 后结束本轮，不进入 SSE 解析或业务重试判断。
             return Err(ModelError::Http {
                 status,
                 body: response.text().await?,
@@ -134,7 +128,9 @@ impl OpenAIResponsesClient {
         let mut pending = Vec::new();
         let mut data = Vec::new();
         let mut stream = ReasoningStream::default();
-        loop {
+        // pending 保存尚未遇到换行的字节，data 聚合同一 SSE event 的连续 data 行；
+        // provider 的 response.completed/incomplete 终态一旦校验并保存，就可停止等 EOF。
+        'response_stream: loop {
             let chunk = match response.chunk().await {
                 Ok(Some(chunk)) => chunk,
                 Ok(None) => break,
@@ -157,11 +153,19 @@ impl OpenAIResponsesClient {
                     line.pop();
                 }
                 if line.is_empty() {
+                    // 空行提交一个完整 SSE event；[DONE] 只会被 handle_sse_data 忽略，
+                    // 真正的 Responses 终态仍必须由 response.completed/incomplete 提供。
                     if let Err(error) = handle_sse_data(&data, &mut stream, &mut on_event) {
                         end_reasoning(&mut stream, &mut on_event);
                         return Err(error);
                     }
                     data.clear();
+                    // A validated Responses terminal owns the result and its
+                    // usage. HTTP EOF is not part of that protocol boundary:
+                    // a gateway may keep the connection open or fail later.
+                    if stream.response.is_some() {
+                        break 'response_stream;
+                    }
                 } else if let Some(value) = line.strip_prefix(b"data:") {
                     if !data.is_empty() {
                         data.push(b'\n');
@@ -170,22 +174,28 @@ impl OpenAIResponsesClient {
                 }
             }
         }
-        if pending.last() == Some(&b'\r') {
-            pending.pop();
-        }
-        if let Some(value) = pending.strip_prefix(b"data:") {
-            if !data.is_empty() {
-                data.push(b'\n');
+        if stream.response.is_none() {
+            // EOF 前的残余字节也尝试作为最后一个 data event；若没有终态，最终统一
+            // 报 missing response.completed，而不是把连接结束当作成功。
+            if pending.last() == Some(&b'\r') {
+                pending.pop();
             }
-            data.extend_from_slice(value.strip_prefix(b" ").unwrap_or(value));
-        }
-        if let Err(error) = handle_sse_data(&data, &mut stream, &mut on_event) {
-            end_reasoning(&mut stream, &mut on_event);
-            return Err(error);
+            if let Some(value) = pending.strip_prefix(b"data:") {
+                if !data.is_empty() {
+                    data.push(b'\n');
+                }
+                data.extend_from_slice(value.strip_prefix(b" ").unwrap_or(value));
+            }
+            if let Err(error) = handle_sse_data(&data, &mut stream, &mut on_event) {
+                end_reasoning(&mut stream, &mut on_event);
+                return Err(error);
+            }
         }
         let raw = stream.response.ok_or_else(|| {
             ModelError::InvalidStream("missing response.completed event".to_owned())
         })?;
+        // raw 已由 SSE 终态校验，下面再做 incomplete/refusal/output/usage 的统一协议
+        // 解析，并把 provider request id 作为非敏感响应元数据附上。
         openai_response_from_raw(raw, body).map(|mut result| {
             result.provider_request_id = provider_request_id;
             result
@@ -205,6 +215,8 @@ fn handle_sse_data(
     stream: &mut ReasoningStream,
     on_event: &mut impl FnMut(ModelStreamEvent),
 ) -> Result<()> {
+    // 解析一个已经按空行分隔的 SSE data；空 data/[DONE] 不是终态，未知事件
+    // 暂时忽略，以便兼容 provider 增加非业务事件。
     if data.is_empty() || data == b"[DONE]" {
         return Ok(());
     }
@@ -213,6 +225,7 @@ fn handle_sse_data(
     match event.get("type").and_then(Value::as_str) {
         Some("response.reasoning_summary_part.added") => start_reasoning(stream, on_event),
         Some("response.reasoning_summary_text.delta") => {
+            // delta 可能在 start 事件前到达，因此这里先确保只发出一次 ReasoningStart。
             start_reasoning(stream, on_event);
             if let Some(delta) = event.get("delta").and_then(Value::as_str) {
                 if !delta.is_empty() {
@@ -222,10 +235,26 @@ fn handle_sse_data(
         }
         Some("response.reasoning_summary_text.done") => end_reasoning(stream, on_event),
         Some("response.completed") | Some("response.incomplete") => {
+            // 终态事件的类型必须与 response.status 一致；只看事件名会把失败/进行中的
+            // body 错当成完整结果。
+            let expected = if event["type"] == "response.completed" {
+                "completed"
+            } else {
+                "incomplete"
+            };
+            let response = event
+                .get("response")
+                .filter(|response| response.get("status").and_then(Value::as_str) == Some(expected))
+                .ok_or_else(|| {
+                    ModelError::InvalidStream(format!(
+                        "response.{expected} event has missing or mismatched response status"
+                    ))
+                })?;
             end_reasoning(stream, on_event);
-            stream.response = event.get("response").cloned();
+            stream.response = Some(response.clone());
         }
         Some("response.failed") | Some("error") => {
+            // provider 明确失败时不保存 response，调用方只能看到 InvalidStream。
             end_reasoning(stream, on_event);
             return Err(ModelError::InvalidStream(event.to_string()));
         }
@@ -235,6 +264,7 @@ fn handle_sse_data(
 }
 
 fn start_reasoning(stream: &mut ReasoningStream, on_event: &mut impl FnMut(ModelStreamEvent)) {
+    // 多个 reasoning 事件共享一段生命周期，只向上层发出一个开始事件。
     if !stream.started {
         stream.started = true;
         on_event(ModelStreamEvent::ReasoningStart);
@@ -242,6 +272,7 @@ fn start_reasoning(stream: &mut ReasoningStream, on_event: &mut impl FnMut(Model
 }
 
 fn end_reasoning(stream: &mut ReasoningStream, on_event: &mut impl FnMut(ModelStreamEvent)) {
+    // 仅结束已经开始且尚未结束的 reasoning 段，避免错误路径重复发送结束事件。
     if stream.started && !stream.ended {
         stream.ended = true;
         on_event(ModelStreamEvent::ReasoningEnd);
@@ -253,6 +284,8 @@ pub(super) fn openai_responses_request_body(
     reasoning_effort: &str,
     request: &ModelRequest,
 ) -> Value {
+    // 将 ModelRequest 编译为单轮 Responses wire payload；这里仅序列化请求，不做
+    // provider I/O，也不改变 Rust 持有的工具授权和预算。
     let input = match &request.input {
         ModelInput::Fresh { text } => Value::String(text.clone()),
         ModelInput::Continue {
@@ -260,6 +293,8 @@ pub(super) fn openai_responses_request_body(
             tool_outputs,
             instruction,
         } => {
+            // 无状态续传沿用上一轮 transcript，随后追加 Rust 生成的 function_call_output
+            // 和可选 instruction，避免 provider 端隐藏会话状态。
             let mut items = continuation.items.clone();
             items.extend(tool_outputs.iter().map(|output| {
                 json!({
@@ -293,6 +328,8 @@ pub(super) fn openai_responses_request_body(
         .iter()
         .any(|tool| tool.name == NATIVE_WEB_SEARCH_TOOL)
     {
+        // hosted web 的来源字段需要显式 include；普通 function tool 不走这个 provider
+        // 专用分支。
         body["include"]
             .as_array_mut()
             .expect("Responses include is an array")
@@ -305,6 +342,8 @@ pub(super) fn openai_responses_request_body(
                 .iter()
                 .map(|tool| {
                     if tool.name == NATIVE_WEB_SEARCH_TOOL {
+                        // native web 使用 provider 原生 tool 类型；allowlist 从 Rust
+                        // 生成的 Schema enum 映射到 filters，避免把任意域名交给 provider。
                         let mut native_web = json!({"type": NATIVE_WEB_SEARCH_TOOL});
                         if let Some(domains) = tool
                             .input_schema
@@ -317,6 +356,8 @@ pub(super) fn openai_responses_request_body(
                         }
                         native_web
                     } else {
+                        // 其他工具作为严格 function 定义发送，参数 Schema 先经过
+                        // provider_schema 清理本地约束字段。
                         json!({
                             "type": "function",
                             "name": tool.name,
@@ -334,6 +375,8 @@ pub(super) fn openai_responses_request_body(
         ModelToolChoice::Auto => body["tool_choice"] = json!("auto"),
         ModelToolChoice::Required => body["tool_choice"] = json!("required"),
         ModelToolChoice::RequiredFunction(name) => {
+            // RequiredFunction 按调用方给出的函数名序列化；provider 返回后仍需由上层
+            // 校验调用参数和业务提交边界。
             body["tool_choice"] = json!({"type": "function", "name": name});
         }
     }
@@ -341,6 +384,8 @@ pub(super) fn openai_responses_request_body(
 }
 
 pub(super) fn openai_response_from_raw(raw: Value, request_body: Value) -> Result<ModelResponse> {
+    // 把 provider raw 规范化为 ModelResponse，并在协议边界拒绝 incomplete、refusal
+    // 和空输出；这里不持久化，也不决定研究提交、Decision 或 Execution 状态。
     if raw.get("status").and_then(Value::as_str) == Some("incomplete") {
         let reason = raw
             .pointer("/incomplete_details/reason")
@@ -358,6 +403,7 @@ pub(super) fn openai_response_from_raw(raw: Value, request_body: Value) -> Resul
     let output_text = extract_output_text(&raw).unwrap_or_default();
     let tool_calls = extract_tool_calls(&raw);
     if output_text.is_empty() && tool_calls.is_empty() {
+        // 只有可见文本或工具调用至少有一个时，才可交给上层的 Schema/业务校验继续处理。
         return Err(ModelError::MissingOutput);
     }
     let usage = normalize_usage(&raw);
@@ -387,6 +433,8 @@ pub(super) fn openai_response_from_raw(raw: Value, request_body: Value) -> Resul
 }
 
 fn usage_value(raw: &Value, pointers: &[&str]) -> Option<u64> {
+    // 按优先顺序读取 provider usage 别名；没有字段保持 None，交由上层按未知用量
+    // 的预算规则处理，不能用零值冒充已计量。
     pointers
         .iter()
         .find_map(|pointer| raw.pointer(pointer).and_then(Value::as_u64))
@@ -395,6 +443,8 @@ fn usage_value(raw: &Value, pointers: &[&str]) -> Option<u64> {
 /// Normalize field names emitted by Responses-compatible providers without
 /// claiming their broader transport or continuation semantics are identical.
 fn normalize_usage(raw: &Value) -> ModelUsage {
+    // 兼容 Responses 及相近 provider 的字段命名，只归一化已报告的数字，不估算
+    // 隐藏 reasoning 或缺失的输入/输出 token。
     ModelUsage {
         input_tokens: usage_value(raw, &["/usage/input_tokens", "/usage/prompt_tokens"]),
         cached_input_tokens: usage_value(
@@ -419,6 +469,8 @@ fn normalize_usage(raw: &Value) -> ModelUsage {
 }
 
 fn extract_refusal(response: &Value) -> Option<String> {
+    // refusal 位于 output message 的 content 中；一旦找到就由协议层拒绝整轮，不能
+    // 同时把其他文本或工具调用当作成功提交。
     response
         .get("output")
         .and_then(Value::as_array)?
@@ -431,6 +483,8 @@ fn extract_refusal(response: &Value) -> Option<String> {
 }
 
 pub fn extract_output_text(response: &Value) -> Option<String> {
+    // 优先读取顶层 output_text；缺失时回退到 output/content 中首个 text/output_text
+    // 部分，保持 provider 表示差异对上层不可见。
     response
         .get("output_text")
         .and_then(Value::as_str)
@@ -457,6 +511,8 @@ pub fn extract_output_text(response: &Value) -> Option<String> {
 }
 
 pub fn extract_tool_calls(response: &Value) -> Vec<ModelToolCall> {
+    // 同时读取兼容 payload 的顶层 tool_calls 和 Responses output；parse_tool_call
+    // 会过滤非 function/tool call 项并保留原出现顺序。
     let direct = response
         .get("tool_calls")
         .and_then(Value::as_array)
@@ -471,6 +527,8 @@ pub fn extract_tool_calls(response: &Value) -> Vec<ModelToolCall> {
 }
 
 pub(super) fn parse_tool_call(value: &Value) -> Option<ModelToolCall> {
+    // 将 function_call/tool_call 的 name、call_id 和 arguments 统一为内部类型；字符串
+    // arguments 若不是 JSON 则保留为 raw 字段，真正 Schema 合法性留给上层判断。
     let kind = value.get("type").and_then(Value::as_str);
     if kind.is_some_and(|kind| kind != "function_call" && kind != "tool_call") {
         return None;
@@ -555,3 +613,7 @@ mod transcript_regression {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "responses_stream_tests.rs"]
+mod stream_terminal_tests;

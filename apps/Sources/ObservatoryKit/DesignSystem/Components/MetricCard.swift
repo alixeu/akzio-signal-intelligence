@@ -26,6 +26,7 @@ public struct SectionCard<Content: View, Accessory: View>: View {
     }
 
     public var body: some View {
+        // SectionCard 只在有标题/副标题时占用 header 行；正文和 accessory 保持调用方传入的 View 类型。
         VStack(alignment: .leading, spacing: AkzioLayout.s3) {
             if title != nil || subtitle != nil {
                 HStack(alignment: .firstTextBaseline, spacing: AkzioLayout.s2) {
@@ -84,6 +85,7 @@ public struct MetricCard: View {
     }
 
     public var body: some View {
+        // 数值显示、delta 和 secondary 都是只读投影；numericValue 只供动效使用，不改变展示字符串。
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 5) {
                 if let symbol {

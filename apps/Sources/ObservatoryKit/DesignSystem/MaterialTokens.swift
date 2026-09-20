@@ -93,6 +93,7 @@ struct GlassSurfaceModifier: ViewModifier {
     @Environment(\.akzioRendersOffscreen) private var rendersOffscreen
 
     private var liquidGlass: Glass {
+        // 透明度只决定基础 material；elevated/modal 固定 regular，避免检查器因透明度过高失去边界。
         let variant: Glass
         switch level {
         case .base:
@@ -111,6 +112,7 @@ struct GlassSurfaceModifier: ViewModifier {
     }
 
     private var specularOpacity: Double {
+        // 高光强度随层级和 blur boost 变化，但不参与语义状态判断。
         switch level {
         case .base: 0.025 + 0.01 * intensity.blurBoost
         case .elevated: 0.08
@@ -128,6 +130,7 @@ struct GlassSurfaceModifier: ViewModifier {
             || highContrast
             || rendersOffscreen
             || insideGlass
+        // 任一无障碍/离屏/嵌套条件都会降级为不透明表面；这条分支不触碰 content 的数据。
         if opaque {
             #if DEBUG
             if insideGlass && !reduceTransparency {
@@ -210,6 +213,7 @@ private struct GlassBackdropModifier: ViewModifier {
     func body(content: Content) -> some View {
         let shape = RoundedRectangle(cornerRadius: radius, style: .continuous)
 
+        // Backdrop 与完整 glass 不同：只包背景；嵌套或无障碍条件下不再叠加 material。
         content.background {
             if transparency <= 0.001
                 || reduceTransparency
@@ -257,6 +261,7 @@ private struct WindowBackdropModifier: ViewModifier {
     }
 
     func body(content: Content) -> some View {
+        // 窗口背板只调节桌面 tint；真实模糊由 AppKit NSVisualEffectView 提供。
         content.background {
             if reduceTransparency || reduceTransparencyOverride || highContrast || rendersOffscreen {
                 surfaceTint
@@ -272,6 +277,7 @@ enum GlassAudit {
 
     static func warnNesting(level: GlassLevel) {
         let key = "\(level)"
+        // reported 按层级去重，调试日志只提醒第一次降级，不改变渲染结果。
         guard !reported.contains(key) else { return }
         reported.insert(key)
         print("[Akzio] glass-in-glass blocked for \(key); degraded to opaque elevated surface.")

@@ -70,8 +70,9 @@ impl Store {
                     &transaction,
                     &ArtifactId(ContentHash::new(existing_commitment)?),
                 )?;
-                let existing_payload: PaperCommitment =
-                    serde_json::from_slice(&self.read_blob(&existing_artifact.blob)?)?;
+                let existing_payload: PaperCommitment = serde_json::from_slice(
+                    &blob::read_blob_with(&transaction, &existing_artifact.blob)?,
+                )?;
                 self.validate_execution_commitment_lineage(
                     &transaction,
                     &existing_artifact,
@@ -120,8 +121,9 @@ impl Store {
             let existing_artifact_id = ArtifactId(ContentHash::new(existing_commitment)?);
             let existing_artifact = read_artifact(&transaction, &existing_artifact_id)?;
             if existing_artifact.kind == ArtifactKind::ExecutionCommitment {
-                let existing_payload: PaperCommitment =
-                    serde_json::from_slice(&self.read_blob(&existing_artifact.blob)?)?;
+                let existing_payload: PaperCommitment = serde_json::from_slice(
+                    &blob::read_blob_with(&transaction, &existing_artifact.blob)?,
+                )?;
                 self.validate_execution_commitment_lineage(
                     &transaction,
                     &existing_artifact,
@@ -466,10 +468,12 @@ impl Store {
                 prior_receipt.artifact_id.clone(),
             ));
         }
-        let commitment_payload: PaperCommitment =
-            serde_json::from_slice(&self.read_blob(&commitment_artifact.blob)?)?;
+        let commitment_payload: PaperCommitment = serde_json::from_slice(&blob::read_blob_with(
+            connection,
+            &commitment_artifact.blob,
+        )?)?;
         let receipt: OrderReceipt =
-            serde_json::from_slice(&self.read_blob(&receipt_artifact.blob)?)?;
+            serde_json::from_slice(&blob::read_blob_with(connection, &receipt_artifact.blob)?)?;
         commitment_payload.validate()?;
         receipt.validate()?;
         if receipt.plan_hash != commitment_payload.plan_hash

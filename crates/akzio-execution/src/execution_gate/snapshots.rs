@@ -93,7 +93,7 @@ impl ExecutionRuntime {
             }
         }
         if let Some(clock) = clock {
-            if !clock.is_open
+            if !clock.tradable()
                 || outside_freshness_window(
                     clock.observed_at,
                     now,
@@ -142,12 +142,12 @@ impl ExecutionRuntime {
                 ExecutionError::GrossExposureExceeded(_) => {
                     blockers.insert(HardBlocker::FactorLimit);
                 }
-            ExecutionError::MissingQuote(_) => {
-                blockers.insert(HardBlocker::MissingQuote);
-            }
-            ExecutionError::InvalidQuote(_) => {
-                blockers.insert(HardBlocker::InvalidQuote);
-            }
+                ExecutionError::MissingQuote(_) => {
+                    blockers.insert(HardBlocker::MissingQuote);
+                }
+                ExecutionError::InvalidQuote(_) => {
+                    blockers.insert(HardBlocker::InvalidQuote);
+                }
                 ExecutionError::StaleQuote(_) => {
                     blockers.insert(HardBlocker::StaleQuote);
                 }

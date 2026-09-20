@@ -78,10 +78,10 @@ impl TaskRuntime {
 
     async fn heartbeat(&self, permit: &TaskWritePermit) -> RuntimeResult<()> {
         let permit = permit.clone();
-        let lease_until = Utc::now() + self.lease_duration;
+        let lease_duration = self.lease_duration;
         Ok(self
             .store_executor
-            .execute(move |store| store.heartbeat_task(&permit, lease_until))
+            .execute(move |store| store.heartbeat_task(&permit, Utc::now() + lease_duration))
             .await??)
     }
 
@@ -114,7 +114,6 @@ impl TaskRuntime {
         } else {
             akzio_store::TaskWorkload::Session
         };
-        let now = Utc::now();
         let worker_id = worker_id.to_owned();
         let lease_duration = self.lease_duration;
         let identity = self.debug_identity.clone();
@@ -123,7 +122,7 @@ impl TaskRuntime {
             .execute(move |store| {
                 store.claim_next_task_for_workload_with_identity(
                     &worker_id,
-                    now,
+                    Utc::now(),
                     lease_duration,
                     workload,
                     identity.as_ref(),

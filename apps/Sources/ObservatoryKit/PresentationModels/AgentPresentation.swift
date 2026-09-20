@@ -71,9 +71,13 @@ public enum AnalysisRecordKind: String, Sendable, Hashable {
 
     public var displayName: String {
         switch self {
-        case .reasoningSummary, .researchMemo, .analysis, .llmOutput, .conclusion: "LLM"
+        case .reasoningSummary: "Model summary"
+        case .researchMemo: "Research memo"
+        case .analysis: "Research analysis"
+        case .llmOutput: "Model output"
+        case .conclusion: "Conclusion"
         case .tool: "Tool"
-        case .rustOutput: "Rust"
+        case .rustOutput: "Validated output"
         }
     }
 
@@ -103,6 +107,8 @@ public struct AnalysisRecordPresentation: Sendable, Hashable, Identifiable {
     public let inputTokens: Int?
     public let outputTokens: Int?
     public let isStreaming: Bool
+    public var taskID: String?
+    public var horizon: String?
 
     public init(
         id: String,
@@ -117,7 +123,9 @@ public struct AnalysisRecordPresentation: Sendable, Hashable, Identifiable {
         latencyMillis: Int? = nil,
         inputTokens: Int? = nil,
         outputTokens: Int? = nil,
-        isStreaming: Bool = false
+        isStreaming: Bool = false,
+        taskID: String? = nil,
+        horizon: String? = nil
     ) {
         self.id = id
         self.sequence = sequence
@@ -132,6 +140,8 @@ public struct AnalysisRecordPresentation: Sendable, Hashable, Identifiable {
         self.inputTokens = inputTokens
         self.outputTokens = outputTokens
         self.isStreaming = isStreaming
+        self.taskID = taskID
+        self.horizon = horizon
     }
 
     public var metadata: String? {
@@ -166,7 +176,8 @@ struct LiveReasoningRecord: Sendable, Hashable, Identifiable {
             title: "Reasoning Summary",
             body: body.isEmpty ? "Generating reasoning summary…" : body,
             createdAt: createdAt,
-            isStreaming: !isComplete
+            isStreaming: !isComplete,
+            taskID: taskID
         )
     }
 }
@@ -239,8 +250,6 @@ public struct RoleCardPresentation: Sendable, Hashable, Identifiable {
         self.intensity = intensity
     }
 
-    /// A Critic that never fired shows `Not Triggered`, not an idle success card.
-    public var isNotTriggered: Bool { status == .notTriggered }
 }
 
 // MARK: - Selected model detail
@@ -294,5 +303,4 @@ public struct CouncilPresentation: Sendable, Hashable {
         roles.first { $0.role == role }
     }
 
-    public var selectedCard: RoleCardPresentation? { role(selectedRole) }
 }

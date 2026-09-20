@@ -274,9 +274,10 @@ pub fn decode_paper_quotes(
             })?;
             let quote_observed_at = quote
                 .get("t")
-                .map(|timestamp| provider_timestamp(timestamp, "quote.t"))
-                .transpose()?
-                .unwrap_or(observed_at);
+                .ok_or_else(|| {
+                    PaperDecodeError::InvalidInput("Paper quote timestamp missing".to_owned())
+                })
+                .and_then(|timestamp| provider_timestamp(timestamp, "quote.t"))?;
             Ok((
                 asset,
                 Quote {
@@ -293,6 +294,7 @@ pub fn decode_paper_quotes(
         ));
     }
     Ok(QuoteSnapshot {
+        feed: value.get("feed").and_then(Value::as_str).map(str::to_owned),
         schema_version: DOMAIN_SCHEMA_VERSION,
         broker_session,
         observed_at,
@@ -303,12 +305,17 @@ pub fn decode_paper_quotes(
 pub fn decode_paper_clock(
     value: &Value,
     broker_session: String,
-    observed_at: DateTime<Utc>,
+    _observed_at: DateTime<Utc>,
 ) -> PaperDecodeResult<MarketClockSnapshot> {
     if value.get("schema_version").is_some() {
         return Ok(serde_json::from_value(value.clone())?);
     }
     Ok(MarketClockSnapshot {
+        session: value
+            .get("session")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?,
         schema_version: DOMAIN_SCHEMA_VERSION,
         broker_session,
         is_open: value
@@ -319,9 +326,10 @@ pub fn decode_paper_clock(
             })?,
         observed_at: value
             .get("timestamp")
-            .map(|timestamp| provider_timestamp(timestamp, "clock.timestamp"))
-            .transpose()?
-            .unwrap_or(observed_at),
+            .ok_or_else(|| {
+                PaperDecodeError::InvalidInput("Paper clock timestamp missing".to_owned())
+            })
+            .and_then(|timestamp| provider_timestamp(timestamp, "clock.timestamp"))?,
     })
 }
 
@@ -343,4 +351,70 @@ fn provider_timestamp(value: &Value, field: &str) -> PaperDecodeResult<DateTime<
         .map_err(|error| {
             PaperDecodeError::InvalidInput(format!("Paper provider field {field}: {error}"))
         })
+}
+
+#[cfg(test)]
+mod freshness_tests {
+    use super::*;
+
+    #[test]
+    fn missing_provider_timestamps_cannot_become_fresh_snapshots() {
+        let received_at = DateTime::parse_from_rfc3339("2026-09-09T14:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(
+            decode_paper_quotes(
+                &serde_json::json!({"quotes":{"QQQ":{"bp":100,"ap":101}}}),
+                "2026-09-09".into(),
+                received_at,
+            )
+            .is_err(),
+            "missing quote timestamp must not inherit download time"
+        );
+        assert!(
+            decode_paper_clock(
+                &serde_json::json!({"is_open":true}),
+                "2026-09-09".into(),
+                received_at,
+            )
+            .is_err(),
+            "missing market clock timestamp must not inherit download time"
+        );
+    }
+
+    #[test]
+    fn provider_timestamps_are_preserved_for_freshness_gate() {
+        let received_at = DateTime::parse_from_rfc3339("2026-09-09T14:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let source_at = received_at - chrono::Duration::minutes(10);
+        let quote = decode_paper_quotes(
+            &serde_json::json!({"quotes":{"QQQ":{"bp":100,"ap":101,"t":source_at.to_rfc3339()}}}),
+            "2026-09-09".into(),
+            received_at,
+        )
+        .unwrap();
+        assert_eq!(quote.quotes[&Asset::Qqq].observed_at, source_at);
+        let clock = decode_paper_clock(
+            &serde_json::json!({"is_open":true,"timestamp":source_at.to_rfc3339()}),
+            "2026-09-09".into(),
+            received_at,
+        )
+        .unwrap();
+        assert_eq!(clock.observed_at, source_at);
+        for timestamp in [Value::Null, serde_json::json!(42), serde_json::json!("bad")] {
+            assert!(decode_paper_quotes(
+                &serde_json::json!({"quotes":{"QQQ":{"bp":100,"ap":101,"t":timestamp}}}),
+                "2026-09-09".into(),
+                received_at,
+            )
+            .is_err());
+            assert!(decode_paper_clock(
+                &serde_json::json!({"is_open":true,"timestamp":timestamp}),
+                "2026-09-09".into(),
+                received_at,
+            )
+            .is_err());
+        }
+    }
 }

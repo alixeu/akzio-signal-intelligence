@@ -9,6 +9,8 @@ worker_count = 4
 # Constructs Alpaca Paper from environment credentials and fails closed before
 # scheduler startup when credentials, endpoint, or Paper prerequisites are invalid.
 auto_paper = false
+# Allow explicit App requests through the existing Paper scheduler and Gates.
+manual_paper = true
 
 [execution]
 experiment_profile = "paper-engineering"

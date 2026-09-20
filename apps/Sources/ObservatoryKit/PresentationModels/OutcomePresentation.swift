@@ -30,10 +30,6 @@ public struct HorizonPresentation: Sendable, Hashable, Identifiable {
         self.note = note
     }
 
-    /// Guard rail from the domain: only a sealed outcome may read as Completed.
-    public var isConsistent: Bool {
-        status == .completed ? isSealed : true
-    }
 }
 
 /// Mirrors `OutcomeWindow` (evaluation.rs:130). `calibrationPpm` and `riskRecallPpm`
@@ -102,7 +98,7 @@ public struct OutcomePresentation: Sendable, Hashable {
     public let horizons: [HorizonPresentation]
     public let windows: [OutcomeWindowPresentation]
     public let selected: OutcomeHorizonKind
-    public let observedTradingDays: Int
+    public let observedTradingDays: Int?
     public let totalTradingDays: Int
     public let outcomeID: String
     public let availabilityStatus: AkzioStatus
@@ -112,7 +108,7 @@ public struct OutcomePresentation: Sendable, Hashable {
         horizons: [HorizonPresentation],
         windows: [OutcomeWindowPresentation],
         selected: OutcomeHorizonKind,
-        observedTradingDays: Int,
+        observedTradingDays: Int?,
         totalTradingDays: Int,
         outcomeID: String,
         availabilityStatus: AkzioStatus = .completed,
@@ -136,8 +132,4 @@ public struct OutcomePresentation: Sendable, Hashable {
         windows.first { $0.horizon == kind }
     }
 
-    public var selectedWindow: OutcomeWindowPresentation? { window(selected) }
-
-    /// At most one ring may breathe at a time.
-    public var observingCount: Int { horizons.filter { $0.status == .observing }.count }
 }

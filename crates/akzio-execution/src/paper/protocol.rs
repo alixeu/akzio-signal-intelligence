@@ -110,7 +110,7 @@ fn broker_status_is_final_without_successor(status: &str) -> bool {
     )
 }
 
-fn market_clock_from_value(clock: &Value) -> Result<MarketClock> {
+fn market_clock_with_calendar(clock: &Value, calendar: &Value) -> Result<MarketClock> {
     let is_open = clock
         .get("is_open")
         .and_then(Value::as_bool)
@@ -121,9 +121,15 @@ fn market_clock_from_value(clock: &Value) -> Result<MarketClock> {
         .ok_or(PaperError::MissingField("clock.timestamp"))?;
     let observed_at = DateTime::parse_from_rfc3339(timestamp)
         .map_err(|error| PaperError::InvalidClock(error.to_string()))?;
+    let session = akzio_domain::TradingSessionSnapshot::from_calendar(
+        observed_at.with_timezone(&Utc),
+        is_open,
+        &akzio_domain::ExchangeSession::from_alpaca(calendar)?,
+    )?;
     Ok(MarketClock {
         is_open,
-        session_date: observed_at.date_naive(),
+        session_date: session.trade_date,
+        session,
     })
 }
 
@@ -134,12 +140,20 @@ fn side_name(side: OrderSide) -> &'static str {
     }
 }
 
+fn order_request(order: &OrderIntent, client_order_id: &str) -> Result<Value> {
+    Ok(serde_json::json!({
+        "symbol": order.asset.symbol(), "qty": quantity_string(order)?,
+        "side": side_name(order.side), "type": "limit", "time_in_force": "day",
+        "limit_price": money_string(order.limit_price), "extended_hours": order.extended_hours,
+        "client_order_id": client_order_id,
+    }))
+}
+
 fn money_string(value: MoneyMicros) -> String {
     let whole = value.0 / 1_000_000;
     let fraction = value.0.unsigned_abs() % 1_000_000;
     format!("{whole}.{fraction:06}")
 }
-
 
 fn quantity_string(order: &OrderIntent) -> Result<String> {
     let quantity_millionths = order

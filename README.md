@@ -70,7 +70,7 @@ flowchart TD
         API["Loopback HTTP + SSE (7342)"]
         Sch["Scheduler (30s Tick, Lease Fenced)"]
         WR["WorkflowRuntime"]
-        AR["AgentRuntime (两阶段调用治理)"]
+        AR["AgentRuntime (研究提交 / Outcome 两阶段)"]
         XR["ExecutionRuntime (Paper Commitment)"]
         LR["LearningRuntime (Outcome Worker)"]
     end
@@ -113,8 +113,8 @@ flowchart TD
 |---|---|---|---|
 | **1. Tick 探测** | `Scheduler` | Rust | 每 30s 探测 Alpaca 市场钟；校验交易日 Session 槽位排他性与 Paper 审批令牌 |
 | **2. 固化证据** | `EvidenceGate` | Rust | 保留 **40 项 Session EvidenceNeed**；前置只采集 34 项研究资料，6 项执行安全需求延迟到 ExecutionGate |
-| **3. 拓扑装配** | `WorkflowRuntime` | Rust | **首轮不调用 Planner**，采用预编译的确定性拓扑；后续优先复用历史 Proposal |
-| **4. 证据研判** | `Analyst Agent` | LLM | 基于至多 24 个授权 Artifact，生成单一 Horizon 的研究 Memo 与结构化 `Claim` |
+| **3. 拓扑装配** | `WorkflowRuntime` | Rust | Rust 编译固定研究拓扑；后续复用经过当前 Contract 校验的 Proposal |
+| **4. 证据研判** | `Analyst Agent` | LLM | 基于至多 24 个授权 Artifact，提交单一 Horizon 的结构化 `Claim` 与 deliberation |
 | **5. 交叉审查** | `Structured Critic` | LLM | 独立审查 Claim；若缺乏跨域支撑或存在矛盾，标记 `blocker: true`，生成 `Critique` |
 | **6. 预测综合** | `Synthesizer Agent`| LLM | 强制综合 **4 资产 × 3 期限 = 12 个 Forecast**；缺证据项强制设为中性，生成 `DecisionProposal` |
 | **7. 组合决策** | `DecisionGate` | Rust | 依据置信度、风险预算与校准模型计算目标组合；未配置校准时默认目标头寸为 0 |
@@ -132,25 +132,22 @@ flowchart TD
 
 | 智能体角色 | 模型 Route | Reasoning Effort | 预算约束 (Input / Output / 超时 / 工具数) | 产出物 |
 |---|---|---|---|---|
-| **Analyst** | `research.analyst` | `high` | 48,000 / 6,000 / 120s / 4 tools | `ArtifactKind::Claim` |
-| **Critic** | `research.critic` | `high` | 48,000 / 4,000 / 120s / 4 tools | `ArtifactKind::Critique` |
-| **Synthesizer** | `research.synthesizer`| `high` | 48,000 / 5,000 / 120s / 2 tools | `ArtifactKind::DecisionProposal` |
-| **Outcome Worker** | `learning.outcome_worker`| `medium` | 12,000 / 4,000 / 180s / 2 tools | `RetrospectiveDraft` |
+| **Analyst** | `research.analyst` | `high` | 1M / 1M / 180s / Submit | `ArtifactKind::Claim` |
+| **Critic** | `research.critic` | `high` | 1M / 1M / 180s / Submit | `ArtifactKind::Critique` |
+| **Synthesizer** | `research.synthesizer`| `high` | 1M / 1M / 180s / Submit | `ArtifactKind::DecisionProposal` |
+| **Outcome Worker** | `learning.outcome_worker`| `medium` | 1M / 4,000 / 180s / 受控读取 | `RetrospectiveDraft` |
 
-正式 Paper 默认由 Rust 编译三个 Analyst/Critic 对，分别负责 T1、T3、T5；每个 Analyst 仍只提交一个 Claim，允许对四资产声明有界 grounds。Synthesizer 直接依赖三份 Claim 和三条 Critic 路径，即使 Critic 返回 NoOutput，Claim 仍保留。非中性预测逐资产、逐 horizon 检查已验证的 price/macro/news 支撑。缺口只阻断其声明范围；无法支撑的 slot 必须中性。上表是不可变 Contract 的输出、时限和工具边界；实际 Attempt 输入预算由 Run 快照解析，当前默认配置为 1,000,000 cumulative input tokens 与 unlimited tools，二者不能混写。
+正式 Paper 默认由 Rust 编译三个 Analyst/Critic 对，分别负责 T1、T3、T5；每个 Analyst 仍只提交一个 Claim，允许对四资产声明有界 grounds。Synthesizer 直接依赖三份 Claim 和三条 Critic 路径，即使 Critic 返回 NoOutput，Claim 仍保留。非中性研究预测逐资产、逐 horizon 检查已验证且方向一致的 price/macro 支撑；新闻保留为 coverage 与执行风险资料。缺口只阻断其声明范围；无法支撑的 slot 必须中性。显式现金研究配置始终可以表达；非零配置必须引用对应资产、期限的看多支持与正预期收益。上表为新 Run 默认冻结预算；覆盖配置、工具授权与累计用量边界见 [预算配置](docs/agent-budget-configuration.md)。
 
-### 4.2 两阶段模型调用协议 (Two-Phase Invocation)
+### 4.2 研究提交与 Outcome 两阶段协议
 
-所有 Agent 必须遵守统一治理约束：
-1. **Draft 阶段（草稿研究）**：模型使用只读工具阅读材料，在上下文编写可审计的简体中文研究 Memo（`tool_choice = auto`）。
-2. **Submit 阶段（确定性提交）**：Memo 完成后，Rust **彻底撤除所有只读工具**，强制限缩只能调用一次 `submit_result` 工具（`tool_choice = required`），提交符合强类型 Schema 的 JSON。
-3. **调用全量审计落库**：工具调用遵循“**持久化 ToolCall → 执行只读读取 → 持久化 ToolResult**”事务顺序，确保中断具有完整确定性审计依据。
+Paper、PositionPlan、Shadow 的 Analyst、Critic、Synthesizer、ProposalReviewer 使用 Contract 67 / PromptBundle 37：模型直接调用 `submit_result` 提交 `result + deliberation`，输入只含授权 projections，不提供独立 Draft、读取或搜索工具。Rust 校验引用闭包、方向资格和补采范围，并绑定交易日历。Outcome 保持 Contract 63 / PromptBundle 35 与冻结哈希，继续 Draft → 受控读取 → Submit。
 
-Rust 为 Submit 保留一半输出预算和约 45% 调用时限，并根据累计输入估算提前结束 Draft，为提交及修正留空间。阶段转换不清零累计预算。Context 除授权清单外还注入有界正文、coverage matrix 或 Outcome stage packet；内部 source/kind/producer、Run、生命周期和学习资格检查同样适用于 ToolGrant。
+Outcome Draft 使用最多一半输出预算与 70% 墙钟时限，必须先保存 Memo 才能提交。读取遵循“持久化 ToolCall → 执行读取 → 持久化 ToolResult”。所有协议共享原有任务预算、调用审计和恢复机制，阶段转换不清零用量。退休范围和历史边界见 [研究协议迁移清单](docs/research-protocol-retirement.md)。
 
-### 4.3 绝缘的 5 大只读 Context 工具
+### 4.3 Outcome 的受控 Context 读取
 
-Agent **完全被剥夺网络、Shell、本地文件系统、数据库和下单权限**，仅拥有 5 个沙箱只读工具：
+运行时 Agent 不具备网络、Shell、本地文件系统、数据库和下单权限。研究角色只提交结果；Outcome 可按其冻结 Contract 使用以下沙箱工具：
 - `read_document(artifact_id)`：读取授权文档全文。
 - `read_range(artifact_id, start_byte, end_byte)`：切片读取，单次上限 32 KiB。
 - `search_context(query, max_results)`：**转小写后的子串包含匹配，而非向量搜索**（`text.to_lowercase().contains(&needle)`），需使用精确标的代码或专有名词。
@@ -163,7 +160,7 @@ Agent **完全被剥夺网络、Shell、本地文件系统、数据库和下单�
 
 ### 5.1 DecisionGate (投研到决策)
 - **12 个 Forecast 完整性**：Synthesizer 必须产出全部 12 个 Forecast（4 资产 × 3 期限）。任何缺少跨域直接支撑项，必须填充中性（`positive_return_probability_ppm = 500000`, `expected_return = 0`）。
-- **默认 Fail-Closed 策略**：系统未配置预校准的 `decision_policy_path` 时，默认可用样本数为 0，**目标仓位强制为 0**（空仓则不操作；已有仓位则触发平仓订单）。
+- **默认 Fail-Closed 策略**：Store 没有已激活的预校准 `DecisionPolicy` 时，默认可用样本数为 0，**执行目标仓位强制为 0**。零目标不直接授权平仓；只有原审批及全部 ExecutionGate 检查通过后才能生成订单，缺审批的冷启动保留 `NoOrder`，不进入 Allocator。canonical Store 数据库不存在时由 Rust 自动初始化 schema，但不会自动生成 policy；运行时仅接受 SQL Store 的 active head。候选 Policy 由 SQL 校准流程生成，操作员显式按 Artifact ID 执行 `calibration activate`；PositionPlan 不从文件导入 Policy。
 
 ### 5.2 ExecutionGate (决策到执行)
 - **原子幂等 Commitment**：在实际向 Alpaca 发起请求前，Rust 先向 SQLite 写入确定性 `client_order_id` 与 `ExecutionCommitment`。即便进程崩溃重启，也能保证不发生重复下单。
@@ -171,22 +168,17 @@ Agent **完全被剥夺网络、Shell、本地文件系统、数据库和下单�
 
 ### 5.3 校准数据准备与政策状态
 
-默认 `DecisionPolicy` 是 fail-closed 的未配置状态；研究流程完成不等于校准或决策可用。可以从只读 canonical Paper Store 准备真实历史样本：
+默认 `DecisionPolicy` 是 fail-closed 的未配置状态；研究完成不等于校准或执行资格就绪。先读取已有 canonical Store 的缺口：
 
 ```bash
-cargo run -p akzio-cli -- --config config/akzio.paper-research.local.toml \
-  calibration export \
-  --store /path/to/canonical-paper-store \
-  --risk-limits approved-risk-limits.json \
-  --output historical-calibration.json \
-  --min-samples 30
-cargo run -p akzio-cli -- calibration build \
-  --input historical-calibration.json \
-  --output frozen-decision-policy.json
-cargo run -p akzio-cli -- calibration inspect --input frozen-decision-policy.json
+target/debug/akzio calibration readiness --store ~/.akzio/store --min-samples 30
 ```
 
-`calibration export` 只读取已封存的 Decision、Outcome 和四资产共同日线，按实际 T+1/T+3/T+5 交易 Session 形成标签，并同时生成 `*.report.json` 质量报告。未成熟 Outcome、缺少 point-in-time 身份或价格冲突会保持 `BLOCKED`，不会用目标仓位、事后总结或合成样本填充。冻结政策加载后还要同时满足当前 `research.synthesizer` 的模型/版本/路由/Contract 身份；`decision_capable=false` 会继续保持零仓位 fail-closed。
+风险限制、校准数据集和候选 Policy 均为 SQL Store/CAS Artifact。通过 `set-risk-limits` 写入操作员明确给定的风险限制，再依次使用 `collect → build → inspect → validate → activate`；参数引用 Store Artifact ID。`collect` / `build` 不激活 Policy，旧 JSON 导入、`calibration export` 和 `export-active` 入口已删除。完整命令和必填条件见 [开发 Workflow](docs/development-workflow.md)。
+
+`collect` 只接受 canonical Store 的真实 Decision、密封 Outcome 和四资产共同交易 Session 标签，同时检查模型身份、Contract、训练窗口及价格序列。有效 Synthesizer 路由必须有可核实的 `release_date` 与 `knowledge_cutoff`。缺少样本或条件时保持阻断，不用目标仓位、事后总结或合成样本填充。`activate` 校验模型与当前 Synthesizer Contract 后，原子更新同一 Policy Artifact 的激活历史和 active head。
+
+隔离 Debug 和原生 Alpaca Paper 入口 `python3 scripts/position_plan_run.py --paper` 可以验证正式图，但其运行不能计入正式校准；readiness 明确报告 `isolated_debug_store`，等待 Outcome 不会改变资格。旧 `-fakerOnline` 已删除。Paper 入口按真实交易时段、原审批和全部 Gate 执行；`NoOrder` 可表示流程已完成，不能据此宣称 Policy 已校准或发生 Paper 下单、成交。扩展时段、待成交恢复和归档边界见 [开发 Workflow](docs/development-workflow.md)。
 
 ---
 
@@ -219,7 +211,7 @@ cargo run -p akzio-cli -- calibration inspect --input frozen-decision-policy.jso
 2. **默认策略下不会建立多头头寸**：
    - 缺省决策策略时，校准样本不足，Rust 决策闸门遵循 Fail-Closed 原则将目标头寸设定为 0。若账户为空仓，系统产出 `NoOrder`；若账户原有多头，系统会自动触发卖出平仓至 0 敞口。
 3. **初次运行会产出大量中性预测**：
-   - 系统首次运行为固定预编译拓扑（单个 Analyst）。单个 Analyst 只能覆盖一个 Horizon，无法满足 12 个资产/期限的完整三维交叉证据（行情、宏观、新闻），因此大量 Forecast 被 Synthesizer 设为中性是正常且合规的。
+   - 正式 Paper 与 PositionPlan 共享固定三组 Analyst/Critic，分别覆盖 T1/T3/T5。资料获取成功不等于方向命题获得支持；没有对应资产、期限和方向的充分依据时，Forecast 必须保持中性。不能把中性输出解释为只有单个 Analyst，也不能强迫模型产生非零仓位。
 
 ---
 
@@ -234,54 +226,26 @@ cargo run -p akzio-cli -- calibration inspect --input frozen-decision-policy.jso
 
 ### 8.2 配置文件设置
 
-复制模板文件至用户根目录：
+App 首次启动时使用 [Observatory 模板](config/akzio.observatory.toml) 初始化 `~/.akzio/config.toml`，之后在 App Settings 中配置模型端点、模型和凭据。已有用户配置不会被初始化流程覆盖。
+
+仅使用 CLI 时，可调用同一个初始化入口：
 
 ```bash
-mkdir -p ~/.akzio
-cp config/akzio.paper-research.example.toml ~/.akzio/config.toml
-chmod 0600 ~/.akzio/config.toml
+cargo run --locked -p akzio-cli -- observatory-config \
+  --config "$HOME/.akzio/config.toml" init \
+  --template config/akzio.observatory.toml \
+  --store-root "$HOME/.akzio/store"
 ```
 
-关键配置字段说明：
+初始化使用 `paper-engineering` profile，默认 `auto_paper=false`。模板中的模型端点与密钥占位符从 `LLM_GATEWAY_BASE_URL`、`LLM_GATEWAY_API_KEY` 解析；Alpaca 与 FRED 凭据分别从 `ALPACA_API_KEY`、`ALPACA_API_SECRET`、`FRED_API_KEY` 读取，也可在初始化后通过 Settings 配置。
 
-```toml
-[daemon]
-store_root = "~/.akzio/store"
-worker_count = 4
-auto_paper = true           # 开启自动 Paper 交易日调度
-
-[execution]
-experiment_profile = "paper-research"
-assets = ["TQQQ", "QQQ", "SOXX", "SOXL"]
-market_data_feed = "sip"
-
-[model]
-provider = "openai_responses"
-base_url = "https://api.openai.com/v1"
-model = "gpt-5.6-luna"
-release_date = "2026-02-15"      # 必填：模型发布日期
-knowledge_cutoff = "2025-12-31"  # 必填：知识截止时间
-response_language = "简体中文"
-
-[credentials]
-alpaca_api_key = "YOUR_ALPACA_PAPER_KEY"
-alpaca_api_secret = "YOUR_ALPACA_PAPER_SECRET"
-fred_api_key = "YOUR_FRED_API_KEY"
-```
-
-也可以通过环境变量导出凭据：
-```bash
-export OPENAI_API_KEY="sk-..."
-export ALPACA_API_KEY="PK..."
-export ALPACA_API_SECRET="..."
-export FRED_API_KEY="..."
-```
+`paper-research` 与 `historical-eval` 是独立研究 profile，切换时仍须满足 Rust 对精确模型身份、发布日期、知识截止时间及评估条件的校验；不能使用示例日期代替实际模型元数据。启用正式 Paper 调度仍需既有审批与全部 Gate。运行及验证入口见 [开发 Workflow](docs/development-workflow.md)。
 
 ---
 
 ## 九、CLI 操作与运维指令大全
 
-常驻服务的控制与查询通过认证的回环 HTTP API 完成；fixture 命令自行启动临时服务，通信令牌自动存放于 Store Root 的 `.daemon-token`（权限 0600）：
+常驻服务的控制与查询通过认证的回环 HTTP API 完成，通信令牌存放于 Store Root 的 `.daemon-token`（权限 0600）。离线 `debug verify-fixture` 在新隔离 Store 内直接验证正式拓扑：
 
 ```bash
 # 1. 启动本地守护进程（监听 127.0.0.1:7342）
@@ -290,11 +254,11 @@ cargo run -p akzio-cli -- daemon serve
 # 2. 检查守护进程健康状态与租约
 cargo run -p akzio-cli -- daemon health
 
-# 3. 离线 PaperDryRun fixture；显式隔离 Store，不调用外部模型或券商
-AKZIO_STORE_ROOT="$PWD/target/task2-fixture-store" cargo run -p akzio-cli -- --config config/task2-fixture.toml run fixture-debug
+# 3. 正式 PositionPlan 九节点离线验证，自动创建 .akzio 下的新 Store
+cargo run --locked -p akzio-cli -- debug verify-fixture
 
-# 4. 提交旧的整轮调试工作流（不具备逐节点控制；新入口见下文）
-cargo run -p akzio-cli -- run submit debug
+# 4. 控制接口测试服务；通过 debug prepare 创建正式 Paper / PositionPlan 图
+cargo run --locked -p akzio-cli -- --config config/debug-controller-fixture.toml debug serve-fixture
 
 # 5. 从耐久事件重放并验证指定 Run（只读诊断）
 cargo run -p akzio-cli -- run replay <run-id>
@@ -312,9 +276,9 @@ cargo run -p akzio-cli -- store doctor
 
 ---
 
-### 分流程 Debug（第一阶段）
+### 分流程 Debug
 
-完整设计、命令与验证边界见 [分流程 Debug 基础设施](docs/debug-infrastructure-phase1.md)。新入口使用隔离 Core，正式业务 DAG 不变，控制状态持久化在 V2Store。
+完整设计、命令与验证边界见 [分流程 Debug 基础设施](docs/debug-control.md)。新入口使用隔离 Core，正式业务 DAG 不变，控制状态持久化在 V2Store。
 
 ```bash
 # 仅离线验证控制器，不调用外部模型或券商。保持此 Core 运行。
@@ -333,7 +297,7 @@ App 可通过 `AKZIO_DEBUG_ENDPOINT` 与 `AKZIO_DEBUG_STORE_ROOT` 连接显式�
 
 项目包含配套的原生 macOS 管理应用（基于 SwiftUI 构建）：
 
-- **打包构建**：运行 `scripts/update_app_and_submit_debug.sh` 即可生成已签名的分发包 `apps/dist/akzio.app`。
+- **打包构建**：运行 `scripts/update_app_and_submit_debug.sh` 生成已签名的分发包 `apps/dist/akzio.app`，并保留构建产物。已有 Bundle 不会被覆盖；再次构建须通过 `AKZIO_APP_BUNDLE` 指定新路径，示例见 [开发 Workflow](docs/development-workflow.md)。
 - **Core 嵌入机制**：App 启动时会通过 `RustCoreSupervisor` 自动将内嵌的 `akzio-core` 启动为 `daemon serve`，无缝读取 `~/.akzio/config.toml`。
 - **状态监控**：若界面显示 `Paper scheduler waiting: broker market is closed`，表明系统正在正常等待下一个美股开盘窗口。
 
@@ -354,22 +318,22 @@ cargo clippy --workspace --all-targets -- -D warnings
 # 单元测试与集成测试
 cargo test --workspace
 
-# 离线 Fixture 自带临时 HTTP/Worker 与 Store doctor；不依赖真实模型配置
-AKZIO_STORE_ROOT="$PWD/target/task2-fixture-store" cargo run -p akzio-cli -- --config config/task2-fixture.toml run fixture-debug
+# 正式九节点离线验证，包含 Store Doctor 和证据导出；不依赖真实模型配置
+cargo run --locked -p akzio-cli -- debug verify-fixture
 # 独立 store doctor 命令要求对应配置的认证 daemon 正在运行
 cargo run -p akzio-cli -- store doctor
 ```
 
 ### 交付报告分级标准
 - **implemented**：功能代码完成并通过本地语法检查。
-- **offline-verified**：通过全套离线测试与 `fixture-debug` 验证。
+- **offline-verified**：通过全套离线测试与 `debug verify-fixture` 验证。
 - **real-Paper-verified**：在真实 Alpaca Paper 环境下完成至少 1 个完整开市周期的报单与对账。
 - **outcome/learning-verified**：完成 T+5 交易日封存并成功生成完整的 Evaluated Experience。
 
 
 ## 十二、当前修复语义与版本
 
-下面描述代码实现，不能代替运行验收。34 项修复、兼容边界见 [任务一交接](docs/task1-repair-handoff.md)，入口和断言见 [任务二说明](docs/task2-debug.md)，已执行的限定组合场景见 [任务二离线 Debug 记录](docs/task2-offline-debug.md)。
+下面描述代码实现，不能代替运行验收。当前约束见 [运行时契约](docs/agent-runtime-contract.md)，验证入口与证据等级见 [开发 Workflow](docs/development-workflow.md)。
 
 - **双时间轴**：Run 的终态描述 T0；Outcome 是同一 Run 的后续任务。Worker 数不少于 2 时分别为 Session、Outcome 保留服务能力；单 Worker 交错处理。每个 Outcome 独立租约，普通争用和未到期均为 Deferred，不消耗失败预算。
 - **交易时间与数据**：Rust 用交易所 calendar 的美东收盘时间（含 DST、提前收盘）加 20 分钟可用性余量判断已完成日线。T+N 是 baseline 之后四资产共同 Session 的第 1/3/5 个。T0 日线按倒序分页选最近 252 根，再升序计算特征；Outcome 读取有界 raw 日线。刚下载不代表内容新鲜。40 项需求分别记录研究成功、缺口和执行 Deferred；执行安全只在 ExecutionGate 即时刷新后 fail closed，研究缺口仍进入原有有界降级。
@@ -379,8 +343,8 @@ cargo run -p akzio-cli -- store doctor
 - **收益口径**：从初始股数、现金、去重成交和费用重建执行后敞口，再按冻结敞口计算 Outcome。具有原基线报价与成交记录的新观察执行路径标注 `frozen_post_execution_exposure_v3`，分列价格效应、实施差额、初始估值差额和估算费用；旧 V2 与未观察执行的估计路径保留各自语义。实际账户 NAV 为 unavailable，因为没有后续订单与外部现金流完整账本。计价窗口内发现公司行动或无法确认一致价格口径时数值不可用；窗口外行动保留证据并允许早期阶段继续，不用 adjusted bar 猜测收益。
 - **成本与身份**：Decision production cost 从其依赖任务闭包重建，包含该路径失败/重试；Outcome/叙事成本单独累计，生命周期总成本为另一读数。Experience 分开记录原研究 Contract 集、Workflow revision 与 evaluator Contract，原 DecisionContext 保留模型、policy 与 execution lineage。
 - **学习资格**：市场窗口完整、12-slot 研究充分、复盘有效、风险真值已测量是独立条件。Rust-only T5 可以封存数值和 ModelUnavailable 复盘，不能据此晋升。`run repair-narrative <run-id>` 在原 Run 上有界补写叙事 revision，保留原数值 Outcome；重新进入原资格检查和 Evaluation 事务，条件不足保持当前状态。LessonProposal 必须带资产、horizon、排除条件和来源，只生成 Draft/quarantine。
-- **查询与兼容**：`run replay` 返回 execution、各阶段叙事、数值封存、学习状态和成本分项。Store v15 新增按 Run/kind 的 Artifact 索引；v16 增加隔离 Debug 调度 head 和 RunScoped DebugRecord，不改变既有 CAS 或 Commitment。Domain schema 保持 10；正式 Contract 40、Prompt bundle 24；freshness candidate 41；Outcome metric V3（V2 仍可读取）、evaluation context v1，benchmark definition 仍为 1。旧缺失字段保留 unknown 语义，旧任务不自动换 Contract。升级与旧任务阻断规则见交接文档。
+- **查询与兼容**：`run replay` 返回 execution、各阶段叙事、数值封存、学习状态和成本分项。Store v15 新增按 Run/kind 的 Artifact 索引；v16 增加隔离 Debug 调度 head 和 RunScoped DebugRecord；v17 增加 DecisionPolicy 的不可变安装记录、激活链和 active head，不改变既有 CAS 或 Commitment。Domain schema 保持 10；研究 Contract 67、Prompt bundle 37、freshness candidate 68；Outcome Contract 63、Prompt bundle 35；Outcome metric V3（V2 仍可读取）、evaluation context v1，benchmark definition 仍为 1。旧缺失字段保留 unknown 语义，旧任务不自动换 Contract。升级与旧任务阻断规则见运行时契约。
 
-当前交付级别为 `implemented`，并对任务二报告中列出的场景达到 `offline-verified`。模型、行情、Broker 与 Session 推进均使用明确标注的 fixture；真实 LLM/Paper、真实跨交易日学习及完整生产压力验收尚未完成。
+验证结果按每次任务的实际执行范围报告；fixture 检查不构成真实 LLM/Paper、跨交易日学习或生产压力验收。
 
 研究与执行边界：现有 `RunPurpose::PositionPlan` 表示 research + Decision / target position plan，无 ExecutionGate、PaperCommit、Reconcile 或 Evaluate；`RunPurpose::Paper` 使用同一 `approved_research_proposal` 三组 T1/T3/T5 Analyst/Critic 和 Synthesizer，再进入原执行链。没有新增 RunMode。Paper 的 account / positions / open_orders / fills / quotes / clock Need 保留 scheduler identity 与 provenance，前置只记录 Deferred，执行时才刷新。PositionPlan 执行显示 N/A，Debug manual/continuous、Broker policy、learning scope 仍是独立控制维度。补充研究保留冻结 Session 日期及原 future-data/cutoff 校验，不再要求市场当前开放。NewsWeb acquisition purpose mapping 和 policy hash 未改，缺失或未验证的方向证据不得变成有效 grounds。

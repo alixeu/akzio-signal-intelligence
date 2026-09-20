@@ -109,7 +109,7 @@ pub enum ResolutionDisposition {
     Unresolved,
 }
 
-/// Rust-owned Planner research lanes. A Planner may select a bounded subset
+/// Historical proposal research lanes. Archived proposals may select a bounded subset
 /// of these lanes, but it cannot invent a new source family or lane at run
 /// time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -186,8 +186,12 @@ impl ResearchIntent {
         }
         if let (Some(start), Some(end)) = (self.window_start, self.window_end) {
             if end < start || end.signed_duration_since(start) > Duration::days(366) {
-                return Err(DomainError::InvalidBudget {
+                // Report the rejected window. "budget ... must be positive" named
+                // neither the dates nor the 366-day bound that actually failed.
+                return Err(DomainError::InvalidEvidenceWindow {
                     field: "research.intent.window",
+                    start: start.to_string(),
+                    end: end.to_string(),
                 });
             }
         }
@@ -238,6 +242,8 @@ impl EvidenceGround {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceGap {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supplemental_requests: Vec<crate::SupplementalIntent>,
     pub topic: String,
     pub rationale: String,
     #[serde(default)]
@@ -249,6 +255,9 @@ pub struct EvidenceGap {
     pub horizons: BTreeSet<DecisionHorizon>,
     #[serde(default)]
     pub supplemental_needs: Vec<ResearchIntent>,
+    /// Missing on historical payloads; new Contracts require an explicit classification.
+    #[serde(default)]
+    pub retriable: bool,
 }
 
 impl EvidenceGap {
@@ -272,10 +281,22 @@ impl EvidenceGap {
                 field: "research.evidence_gap",
             });
         }
-        if self.supplemental_needs.len() > 8 {
+        if self.retriable
+            && self.impact == EvidenceGapImpact::BlocksDirectionalForecast
+            && self.supplemental_needs.is_empty()
+            && self.supplemental_requests.is_empty()
+        {
+            return Err(DomainError::EmptyField {
+                field: "research.evidence_gap.retriable_requires_supplemental_needs",
+            });
+        }
+        if self.supplemental_needs.len() + self.supplemental_requests.len() > 8 {
             return Err(DomainError::InvalidBudget {
                 field: "research.evidence_gap.supplemental_needs",
             });
+        }
+        for request in &self.supplemental_requests {
+            request.validate()?;
         }
         for need in &self.supplemental_needs {
             need.validate()?;
@@ -383,14 +404,21 @@ impl ResearchCritique {
             .iter()
             .map(|ground| &ground.evidence)
             .collect::<BTreeSet<_>>();
-        if self
+        // Name the offending reference. "ground_closure must not be empty" sent
+        // repair rounds looking for a missing field while grounds were present
+        // and the real defect was a verification ref citing evidence outside them.
+        if let Some(reference) = self
             .supporting_refs
             .iter()
             .chain(self.conflicting_refs.iter())
-            .any(|reference| !ground_refs.contains(&reference.evidence))
+            .find(|reference| !ground_refs.contains(&reference.evidence))
         {
-            return Err(DomainError::EmptyField {
+            return Err(DomainError::VerificationRefOutsideGrounds {
                 field: "research.claim_verification.ground_closure",
+                evidence: format!(
+                    "{} (kind {:?})",
+                    reference.evidence.artifact_id.0, reference.evidence.kind
+                ),
             });
         }
         if !self.blocker
@@ -563,15 +591,42 @@ mod acquisition_semantics_tests {
             max_results: 1,
         };
         assert!(intent.validate().is_err());
+
+        let start = "2025-09-21T00:00:00Z".parse().unwrap();
+        let end = "2026-09-22T07:02:34Z".parse().unwrap();
+        let invalid_window = ResearchIntent {
+            source_family: "fred".into(),
+            resource: "series:VIXCLS".into(),
+            query: "refresh VIX".into(),
+            window_start: Some(start),
+            window_end: Some(end),
+            ..intent.clone()
+        };
+        assert!(matches!(
+            invalid_window.validate(),
+            Err(DomainError::InvalidEvidenceWindow {
+                field: "research.intent.window",
+                start: actual_start,
+                end: actual_end,
+            }) if actual_start == start.to_string() && actual_end == end.to_string()
+        ));
+
         let gap = EvidenceGap {
+            supplemental_requests: Vec::new(),
             topic: "news unavailable".into(),
             rationale: "No news adapter available; directional support remains insufficient".into(),
             impact: EvidenceGapImpact::BlocksDirectionalForecast,
             assets: BTreeSet::new(),
             horizons: BTreeSet::new(),
             supplemental_needs: vec![],
+            retriable: false,
         };
         assert!(gap.validate().is_ok());
+        let mut retriable = gap;
+        retriable.retriable = true;
+        assert!(retriable.validate().is_err());
+        retriable.impact = EvidenceGapImpact::Warning;
+        assert!(retriable.validate().is_ok());
     }
 }
 
@@ -598,5 +653,27 @@ mod critique_blocking_gap_tests {
         ));
         critique.blocker = true;
         assert!(critique.validate().is_ok());
+    }
+
+    #[test]
+    fn verification_ref_outside_grounds_names_the_offending_artifact() {
+        let ground_id = "b".repeat(64);
+        let outside_id = "c".repeat(64);
+        let critique: ResearchCritique = serde_json::from_value(serde_json::json!({
+            "schema_version": DOMAIN_SCHEMA_VERSION,
+            "target": {"artifact_id":"a".repeat(64),"kind":"claim"},
+            "topic":"QQQ t1 review", "severity":"low", "rationale":"supported",
+            "verification_status":"supported", "blocker":false,
+            "grounds":[{"evidence":{"artifact_id":ground_id,"kind":"normalized_evidence"},"role":"directional","assets":["QQQ"],"domain":"price_market_structure","support":"Price support"}],
+            "supporting_refs":[{"evidence":{"artifact_id":outside_id,"kind":"normalized_evidence"},"authority":"official","temporal_validity":"valid_at_decision_cutoff"}],
+            "conflicting_refs":[], "evidence_gaps":[]
+        })).unwrap();
+        assert!(matches!(
+            critique.validate(),
+            Err(DomainError::VerificationRefOutsideGrounds {
+                field: "research.claim_verification.ground_closure",
+                evidence,
+            }) if evidence.contains(&"c".repeat(64)) && evidence.contains("NormalizedEvidence")
+        ));
     }
 }

@@ -137,6 +137,8 @@ pub(super) fn selection_reason(kind: ArtifactKind) -> &'static str {
     match kind {
         ArtifactKind::NormalizedEvidence => "normalized_evidence",
         ArtifactKind::SemanticDetail => "semantic_detail",
+        ArtifactKind::DecisionProposal => "final_proposal",
+        ArtifactKind::ProposalReview => "proposal_review",
         ArtifactKind::Claim => "claim",
         ArtifactKind::Critique => "critique",
         ArtifactKind::Experience => "experience",

@@ -90,6 +90,8 @@ impl Daemon {
         let telemetry = observer_run_telemetry(&trajectory);
 
         Ok(ObserverRunDetail {
+            inspection: self.runtime_inspection(run_id)?,
+            research_audit: self.store.research_audit(run_id)?,
             workflow,
             events,
             trajectory,

@@ -45,6 +45,23 @@ pub enum DomainError {
     InvalidDecisionForecastProbability,
     #[error("evidence ground scope is invalid")]
     InvalidEvidenceGroundScope,
+    #[error(
+        "verification reference {evidence} in {field} is not one of the submitted grounds; \
+         every supporting_refs/conflicting_refs evidence must also appear in grounds with the same artifact_id and kind"
+    )]
+    VerificationRefOutsideGrounds {
+        field: &'static str,
+        evidence: String,
+    },
+    #[error(
+        "{field} window {start} .. {end} is invalid: window_end must not precede window_start \
+         and the window must span at most 366 days"
+    )]
+    InvalidEvidenceWindow {
+        field: &'static str,
+        start: String,
+        end: String,
+    },
     #[error("decision evidence is insufficient for the submitted forecasts")]
     InsufficientDecisionEvidence,
     #[error("a document attempt origin requires a task origin")]
@@ -399,19 +416,4 @@ impl TaskBudget {
         }
         Ok(())
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct ActorRef {
-    pub actor_id: String,
-    pub actor_role: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub signature_or_key_hash: Option<ContentHash>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct VerifierIdentity {
-    pub verifier_id: String,
-    pub verifier_version: String,
-    pub implementation_hash: ContentHash,
 }

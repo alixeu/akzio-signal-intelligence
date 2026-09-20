@@ -28,7 +28,7 @@ struct OutcomeSummaryCard: View {
                 }
                 .animation(policy.resolve(.smooth(duration: 0.48)), value: horizon)
             } else {
-                StatusExplanation(.waiting, detail: "This horizon has not sealed yet")
+                StatusExplanation(.waiting, detail: "Sealing has not been confirmed for this horizon")
                     .frame(height: 200)
             }
         } accessory: {

@@ -130,12 +130,18 @@ public struct StageLLMOutputPresentation: Sendable, Hashable, Identifiable {
         self.body = body
     }
 
-    public var displayKind: String {
-        kind.replacingOccurrences(of: "_", with: " ").capitalized
-    }
+}
+
+public struct ResearchAuditRowPresentation: Sendable, Hashable, Identifiable {
+    public let id: String
+    public let title: String
+    public let detail: String
+    public let references: [String]
+    public let isFailure: Bool
 }
 
 public struct StageInspectorPresentation: Sendable, Hashable {
+    public let researchAudit: [ResearchAuditRowPresentation]
     public let stageTitle: String
     public let status: AkzioStatus
     public let model: String
@@ -157,6 +163,8 @@ public struct StageInspectorPresentation: Sendable, Hashable {
     public let blockers: [HardBlocker]
     public let warnings: [SoftWarning]
     public let transientAnalysisRecords: [AnalysisRecordPresentation]
+    public let taskID: String?
+    public let horizon: String?
 
     /// Chronological, Observer-safe rows for the inspector and Overview popover.
     /// This is a projection of already-redacted telemetry and validated artifacts,
@@ -228,7 +236,12 @@ public struct StageInspectorPresentation: Sendable, Hashable {
                 )
             )
         }
-        return rows.sorted {
+        return rows.map { row in
+            var value = row
+            value.taskID = taskID ?? row.taskID
+            value.horizon = horizon ?? row.horizon
+            return value
+        }.sorted {
             $0.sequence == $1.sequence ? $0.kind.rawValue < $1.kind.rawValue : $0.sequence < $1.sequence
         }
     }
@@ -254,7 +267,10 @@ public struct StageInspectorPresentation: Sendable, Hashable {
         llmOutputs: [StageLLMOutputPresentation] = [],
         blockers: [HardBlocker] = [],
         warnings: [SoftWarning] = [],
-        transientAnalysisRecords: [AnalysisRecordPresentation] = []
+        transientAnalysisRecords: [AnalysisRecordPresentation] = [],
+        taskID: String? = nil,
+        horizon: String? = nil,
+        researchAudit: [ResearchAuditRowPresentation] = []
     ) {
         self.stageTitle = stageTitle
         self.status = status
@@ -277,6 +293,9 @@ public struct StageInspectorPresentation: Sendable, Hashable {
         self.blockers = blockers
         self.warnings = warnings
         self.transientAnalysisRecords = transientAnalysisRecords
+        self.taskID = taskID
+        self.horizon = horizon
+        self.researchAudit = researchAudit
     }
 }
 

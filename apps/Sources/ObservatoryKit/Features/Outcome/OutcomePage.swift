@@ -31,7 +31,7 @@ struct OutcomePage: View {
             }
         } toolbar: {
             HStack(spacing: AkzioLayout.s2) {
-                Text("\(outcome.observedTradingDays)/\(outcome.totalTradingDays) \(L10n.text("Trading Sessions", language: language))")
+                Text(outcome.observedTradingDays.map { "\($0)/\(outcome.totalTradingDays) \(L10n.text("Trading Sessions", language: language))" } ?? "已观测交易会话：暂无数据")
                     .akzioMono(11, color: AkzioColor.secondaryText)
                 Button {
                     store.navigate(to: .learning)

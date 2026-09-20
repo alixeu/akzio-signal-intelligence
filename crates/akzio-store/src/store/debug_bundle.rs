@@ -13,7 +13,7 @@ use serde_json::json;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 
-const EXPORTER_VERSION: &str = "debug-bundle-v1";
+const EXPORTER_VERSION: &str = "debug-bundle-v2";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DebugBundleManifest {
@@ -212,7 +212,8 @@ impl Store {
                     .map(|reference| reference.artifact_id.clone()),
             );
 
-            let raw_model = is_trajectory_redacted_kind(artifact.kind);
+            let raw_model = is_trajectory_redacted_kind(artifact.kind)
+                || artifact.kind == ArtifactKind::RawEvidence;
             let cross_run_allowed = cross_run_payload_allowed(&artifact, run_id, &debug_session);
             let should_capture = cross_run_allowed && (!raw_model || raw_access.allowed);
             let (payload, omitted_reason) = if !should_capture {
@@ -227,16 +228,19 @@ impl Store {
                 )
             } else {
                 match read_blob_bytes(&transaction, &artifact.blob.hash, artifact.blob.bytes) {
-                    Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
-                        Ok(value) => (Some(value), None),
-                        Err(_) => {
+                    Ok(bytes) => match decode_bundle_payload(&artifact.blob.media_type, &bytes) {
+                        Some(value) => (Some(value), None),
+                        None => {
                             problems.missing.push(json!({
                                 "artifact_id": artifact.artifact_id,
-                                "reason": "non_json_payload_not_exported",
+                                "reason": "unsupported_or_invalid_payload_encoding",
                                 "source_bytes": artifact.blob.bytes
                             }));
                             problems.uncaptured_payloads += 1;
-                            (None, Some("non_json_payload_not_exported".to_owned()))
+                            (
+                                None,
+                                Some("unsupported_or_invalid_payload_encoding".to_owned()),
+                            )
                         }
                     },
                     Err(error) => {
@@ -274,18 +278,58 @@ impl Store {
         let rust_records = build_rust_decisions(&bundle_events, &artifacts, &task_index);
         let decision_matrix = build_decision_matrix(&artifacts, &task_index);
         let policies = build_policies_and_risk(&artifacts, &debug_session, &run_json);
-        let failures = build_failures_and_missing(
+        let acquisition_calls = observed_acquisition_calls(&artifacts);
+        let mut failures = build_failures_and_missing(
             &bundle_events,
             &call_records,
             &tool_records,
             &problems,
             &raw_access,
         );
-        let model_routes = build_model_routes(&call_records);
+        failures["source_review_failures"] = source_review_failures(&artifacts);
+        failures["scope"] = json!("model_failures covers research AgentTurn only; source_review_failures covers acquisition validation; missing raw access means unknown");
+        let mut route_calls = call_records.clone();
+        route_calls.extend(acquisition_calls.clone());
+        let model_routes = build_model_routes(&route_calls);
         let evidence_status = build_evidence_status(&artifacts, &bundle_events);
         let context_coverage = build_context_coverage(&artifacts);
+        let research_progress = super::research_review::research_progress(
+            workflow_json["tasks"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+            &artifacts
+                .iter()
+                .filter_map(|a| a.payload.as_ref().map(|v| (&a.artifact, v)))
+                .collect::<Vec<_>>(),
+            &attempt_output_ids(&transaction, run_id)?
+                .into_iter()
+                .collect(),
+            debug_session
+                .as_ref()
+                .and_then(|s| s.get("identity"))
+                .is_some_and(|i| {
+                    i["run_purpose"] == "position_plan"
+                        && i["llm_mode"] != "fixture"
+                        && i["decision_policy_artifact"].is_null()
+                }),
+        );
+        let research_audit = super::research_review::build_research_audit(
+            &workflow_json,
+            research_progress,
+            &artifacts
+                .iter()
+                .filter_map(|a| a.payload.as_ref().map(|v| (&a.artifact, v)))
+                .collect::<Vec<_>>(),
+        );
         let draft_submit_coverage = build_draft_submit_coverage(&call_records);
-        let stage_acceptance = build_stage_acceptance(&artifacts);
+        let stage_acceptance = build_stage_acceptance(
+            &artifacts,
+            workflow_json["tasks"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        );
         let timeline = bundle_events
             .iter()
             .map(|event| {
@@ -327,6 +371,10 @@ impl Store {
         let safe_rust_records = redact_records(&rust_records, &mut problems.redactions);
         let safe_timeline = redact_records(&timeline, &mut problems.redactions);
         let safe_evidence_status = redact_value(&evidence_status, &mut problems.redactions);
+        let safe_research_audit = redact_value(
+            &serde_json::to_value(&research_audit)?,
+            &mut problems.redactions,
+        );
         let safe_context_coverage = redact_value(&context_coverage, &mut problems.redactions);
         let safe_draft_submit_coverage =
             redact_value(&draft_submit_coverage, &mut problems.redactions);
@@ -400,6 +448,12 @@ impl Store {
             &target,
             "evidence_status.json",
             &safe_evidence_status,
+            &mut file_hashes,
+        )?;
+        write_json_file(
+            &target,
+            "research_review.json",
+            &safe_research_audit,
             &mut file_hashes,
         )?;
         write_json_file(
@@ -532,6 +586,8 @@ impl Store {
                 "events": timeline.len(),
                 "artifacts": artifact_index.len(),
                 "agent_calls": call_records.len(),
+                "acquisition_model_calls": acquisition_calls.len(),
+                "call_count_scope": "research AgentTurn and acquisition provider responses are separate",
                 "tool_records": tool_records.len(),
                 "rust_decisions": rust_records.len()
             }),
@@ -741,12 +797,13 @@ fn raw_workflow_fallback(
     run_id: &RunId,
 ) -> StoreResult<serde_json::Value> {
     let tasks = connection
-        .prepare("SELECT task_id, recipe_id, objective, status, budget_json, input_artifacts_json FROM rebuild_tasks WHERE run_id=?1 ORDER BY task_id")?
+        .prepare("SELECT task_id, recipe_id, objective, status, budget_json, input_artifacts_json, node_spec_json FROM rebuild_tasks WHERE run_id=?1 ORDER BY task_id")?
         .query_map(params![run_id.0], |row| {
             Ok(json!({
                 "task_id": row.get::<_, String>(0)?,
                 "recipe_id": row.get::<_, String>(1)?,
                 "objective": row.get::<_, String>(2)?,
+                "spec": row.get::<_, Option<String>>(6)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
                 "status": row.get::<_, String>(3)?,
                 "budget_json": serde_json::from_str::<serde_json::Value>(&row.get::<_, String>(4)?).unwrap_or(serde_json::Value::Null),
                 "input_artifacts": serde_json::from_str::<serde_json::Value>(&row.get::<_, String>(5)?).unwrap_or(serde_json::Value::Null)
@@ -773,11 +830,11 @@ fn task_index(
         return Ok(json!({"tasks": tasks}));
     }
     let tasks = connection
-        .prepare("SELECT task_id, recipe_id, objective, status, budget_json, input_artifacts_json FROM rebuild_tasks WHERE run_id=?1 ORDER BY task_id")?
+        .prepare("SELECT task_id, recipe_id, objective, status, budget_json, input_artifacts_json, node_spec_json FROM rebuild_tasks WHERE run_id=?1 ORDER BY task_id")?
         .query_map(params![run_id.0], |row| {
             let budget = serde_json::from_str::<serde_json::Value>(&row.get::<_, String>(4)?).unwrap_or(serde_json::Value::Null);
             let inputs = serde_json::from_str::<serde_json::Value>(&row.get::<_, String>(5)?).unwrap_or(serde_json::Value::Array(Vec::new()));
-            Ok(json!({"task_id":row.get::<_,String>(0)?,"recipe_id":row.get::<_,String>(1)?,"objective":row.get::<_,String>(2)?,"status":row.get::<_,String>(3)?,"budget":budget,"input_artifacts":inputs}))
+            Ok(json!({"task_id":row.get::<_,String>(0)?,"recipe_id":row.get::<_,String>(1)?,"objective":row.get::<_,String>(2)?,"spec":row.get::<_,Option<String>>(6)?.and_then(|s|serde_json::from_str::<serde_json::Value>(&s).ok()),"status":row.get::<_,String>(3)?,"budget":budget,"input_artifacts":inputs}))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(json!({"tasks": tasks}))
@@ -838,8 +895,8 @@ fn enrich_event(
         .and_then(|value| task_field(value, "recipe_id").and_then(serde_json::Value::as_str))
         .map(role_name);
     let horizon = task
-        .and_then(|value| task_field(value, "objective").and_then(serde_json::Value::as_str))
-        .and_then(parse_horizon);
+        .and_then(|value| akzio_domain::projected_node_spec(value.get("node").unwrap_or(value)))
+        .and_then(|spec| spec.horizon_name().map(str::to_owned));
     let payload = event
         .artifact_id
         .as_ref()
@@ -886,11 +943,9 @@ fn build_llm_calls(
     problems: &mut BundleProblems,
 ) -> Vec<serde_json::Value> {
     let mut terminal_events = BTreeMap::<ArtifactId, &BundleEvent>::new();
-    let mut starts = Vec::<&BundleEvent>::new();
+    let mut pairing = super::trajectory::AgentTurnPairing::default();
     for event in events {
-        if event.event.event_type == "agent.turn_started" {
-            starts.push(event);
-        }
+        pairing.observe(&event.event);
         if matches!(
             event.event.event_type.as_str(),
             "agent.turn"
@@ -995,16 +1050,13 @@ fn build_llm_calls(
         );
         calls.push(record);
     }
-    for start in starts {
-        let key = (start.event.task_id.clone(), start.event.attempt_id.clone());
-        let terminal_exists = calls.iter().any(|call| {
-            call.get("task_id").and_then(|v| v.as_str()) == key.0.as_ref().map(|v| v.0.as_str())
-                && call.get("attempt_id").and_then(|v| v.as_str())
-                    == key.1.as_ref().map(|v| v.0.as_str())
-        });
-        if terminal_exists {
+    for unmatched in pairing.unmatched_starts() {
+        let Some(start) = events
+            .iter()
+            .find(|event| event.event.cursor == unmatched.cursor)
+        else {
             continue;
-        }
+        };
         problems.unknown_after_crash_calls += 1;
         problems.uncaptured_payloads += 1;
         calls.push(json!({
@@ -1018,11 +1070,13 @@ fn build_llm_calls(
             "horizon": start.horizon,
             "turn_id": null,
             "call_id": null,
+            "phase": null,
             "status": "unknown_after_crash",
             "lifecycle": "dispatch_started_without_terminal",
             "domain_request": {"not_returned":true,"reason":"no_preflight_artifact_before_process_boundary"},
             "provider_request": {"not_returned":true},
             "provider_result": {"not_returned":true},
+            "telemetry": {"input_tokens":null,"output_tokens":null,"reasoning_tokens":null,"unknown_reason":"terminal_not_recorded"},
             "parent_call_id": null,
             "source_location": "AgentTurnStarted event without terminal artifact; do not infer failure"
         }));
@@ -1229,6 +1283,157 @@ fn build_policies_and_risk(
     json!({"schema_version":DOMAIN_SCHEMA_VERSION,"run":run,"debug_session":debug_session,"policy_and_risk_artifacts":values,"unknown_fields_are_null":true})
 }
 
+// Keep content structured so the same recursive redactor covers JSON and
+// NDJSON provider envelopes. Text is an explicit derived representation, not
+// an assertion that exported bytes have the original CAS hash.
+fn decode_bundle_payload(media_type: &str, bytes: &[u8]) -> Option<serde_json::Value> {
+    if let Ok(value) = serde_json::from_slice(bytes) {
+        return Some(value);
+    }
+    let media_type = media_type.split(';').next()?.trim();
+    let text = std::str::from_utf8(bytes).ok()?;
+    if matches!(media_type, "application/x-ndjson" | "application/ndjson") {
+        let records = text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        return (!records.is_empty())
+            .then(|| json!({"export_encoding":"ndjson", "records":records}));
+    }
+    (media_type.starts_with("text/")
+        || matches!(media_type, "application/xml" | "application/xhtml+xml"))
+    .then(|| json!({"export_encoding":"utf8", "media_type":media_type, "text":text}))
+}
+
+fn observed_acquisition_calls(artifacts: &[BundleArtifact]) -> Vec<serde_json::Value> {
+    let mut seen = BTreeSet::new();
+    let mut calls = Vec::new();
+    for artifact in artifacts {
+        if !matches!(
+            artifact.artifact.kind,
+            ArtifactKind::RawEvidence | ArtifactKind::NormalizedEvidence
+        ) {
+            continue;
+        }
+        let Some(payload) = &artifact.payload else {
+            continue;
+        };
+        let records = if payload["export_encoding"] == "ndjson" {
+            payload["records"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+        } else {
+            std::slice::from_ref(payload)
+        };
+        for record in records {
+            for (response_path, request_path, role) in [
+                (
+                    "/provider_result",
+                    "/provider_request",
+                    "evidence.discovery",
+                ),
+                (
+                    "/value/provider_result",
+                    "/value/provider_request",
+                    "evidence.discovery",
+                ),
+                (
+                    "/audit/response",
+                    "/audit/request",
+                    "evidence.source_review",
+                ),
+            ] {
+                let Some(response) = record.pointer(response_path) else {
+                    continue;
+                };
+                let Some(id) = response["id"].as_str() else {
+                    continue;
+                };
+                if !seen.insert(id.to_owned()) {
+                    continue;
+                }
+                calls.push(json!({"role":role,"scope":"acquisition","source_artifact_id":artifact.artifact.artifact_id,
+                    "response_id":id,"provider_request":record.pointer(request_path),
+                    "telemetry":{"actual_model":response["model"],"input_tokens":response.pointer("/usage/input_tokens"),
+                    "output_tokens":response.pointer("/usage/output_tokens"),"cached_input_tokens":response.pointer("/usage/input_tokens_details/cached_tokens")},
+                    "status":response["status"]}));
+            }
+        }
+    }
+    calls
+}
+
+fn source_review_failures(artifacts: &[BundleArtifact]) -> serde_json::Value {
+    let rows = artifacts.iter().filter(|a| a.artifact.kind == ArtifactKind::NormalizedEvidence)
+        .filter_map(|artifact| {
+            let review = artifact.payload.as_ref()?.pointer("/value/source_review")?;
+            let has_error = review.get("error").is_some_and(|v| !v.is_null());
+            let has_failures = review["validation_failures"].as_array().is_some_and(|v| !v.is_empty());
+            (has_error || has_failures).then(|| json!({"artifact_id":artifact.artifact.artifact_id,
+                "error":review["error"],"validation_failures":review["validation_failures"],"status":review["status"]}))
+        }).collect::<Vec<_>>();
+    json!(rows)
+}
+
+fn observed_web_calls(artifacts: &[BundleArtifact]) -> Vec<serde_json::Value> {
+    let mut seen = BTreeSet::new();
+    let mut calls = Vec::new();
+    for artifact in artifacts {
+        if !matches!(
+            artifact.artifact.kind,
+            ArtifactKind::RawEvidence | ArtifactKind::NormalizedEvidence
+        ) {
+            continue;
+        }
+        let Some(payload) = &artifact.payload else {
+            continue;
+        };
+        let records = if payload["export_encoding"] == "ndjson" {
+            payload["records"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+        } else {
+            std::slice::from_ref(payload)
+        };
+        for record in records {
+            // Only pipeline-owned provider envelopes, never arbitrary nested
+            // article text or model assertions, establish search execution.
+            for response in [
+                record.get("provider_result"),
+                record.pointer("/value/provider_result"),
+                record.pointer("/audit/response"),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                for item in response
+                    .get("output")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if item["type"] != "web_search_call" {
+                        continue;
+                    }
+                    let identity = json!({"response_id":response["id"],"call":item});
+                    let hash = ContentHash::of_bytes(identity.to_string().as_bytes());
+                    if seen.insert(hash) {
+                        calls.push(json!({"source_artifact_id":artifact.artifact.artifact_id,
+                            "provider_response_id":response["id"],"call_id":item["id"],
+                            "status":item["status"],"action":item["action"],
+                            "has_action_sources":item.pointer("/action/sources").and_then(serde_json::Value::as_array).is_some_and(|sources| !sources.is_empty())}));
+                    }
+                }
+            }
+        }
+    }
+    calls
+}
+
 fn build_evidence_status(
     artifacts: &[BundleArtifact],
     _events: &[BundleEvent],
@@ -1245,22 +1450,32 @@ fn build_evidence_status(
             rows.push(json!({"artifact_id":artifact.artifact.artifact_id,"kind":artifact.artifact.kind,"producer":artifact.artifact.producer,"payload":artifact.payload,"payload_status":if artifact.payload.is_some(){"captured"}else{"missing_or_omitted"},"source_refs":artifact.artifact.source_refs}));
         }
     }
-    let web_search_calls = artifacts
+    let calls = observed_web_calls(artifacts);
+    let evidenced_calls = calls
         .iter()
-        .filter(|artifact| artifact.artifact.kind == ArtifactKind::NormalizedEvidence)
-        .filter_map(|artifact| artifact.payload.as_ref())
-        .filter_map(|payload| payload.pointer("/value/provider_result/output"))
-        .filter_map(serde_json::Value::as_array)
-        .flatten()
-        .filter(|item| {
-            item.get("type").and_then(serde_json::Value::as_str) == Some("web_search_call")
-                && item
-                    .pointer("/action/sources")
-                    .and_then(serde_json::Value::as_array)
-                    .is_some_and(|sources| !sources.is_empty())
-        })
+        .filter(|call| call["has_action_sources"] == true)
         .count();
-    json!({"schema_version":DOMAIN_SCHEMA_VERSION,"records":rows,"web_search_calls":web_search_calls,"hosted_web_search_evidence_is_only_claimed_when_provider_payload_contains_web_search_call_action_sources":true})
+    let mut action_counts = BTreeMap::<String, usize>::new();
+    for call in &calls {
+        let action = call
+            .pointer("/action/type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        *action_counts.entry(action.to_owned()).or_default() += 1;
+    }
+    let acquisition_calls = observed_acquisition_calls(artifacts);
+    json!({"schema_version":DOMAIN_SCHEMA_VERSION,"records":rows,
+        "web_search_calls": if calls.is_empty() { serde_json::Value::Null } else { json!(calls.len()) },
+        "web_search_calls_scope":"all observed hosted web actions, including search/open/find; not source verification",
+        "acquisition_model_call_count":acquisition_calls.len(),
+        "acquisition_model_calls":acquisition_calls,
+        "acquisition_scope":"deduplicated persisted discovery and source-review responses; separate from research llm_calls.jsonl",
+        "source_review_failures":source_review_failures(artifacts),
+        "web_search_audit":{"status":if calls.is_empty(){"not_observed_in_export"}else{"observed"},
+            "observed_call_count":calls.len(),"action_counts":action_counts,
+            "calls_with_source_metadata":evidenced_calls,"calls":calls,
+            "scope":"persisted provider calls only; missing audit is not proof of no search; search is not source verification"},
+        "hosted_web_search_evidence_is_only_claimed_when_provider_payload_contains_web_search_call_action_sources":true})
 }
 
 fn build_context_coverage(artifacts: &[BundleArtifact]) -> serde_json::Value {
@@ -1273,8 +1488,18 @@ fn build_context_coverage(artifacts: &[BundleArtifact]) -> serde_json::Value {
                 .get("selections")
                 .cloned()
                 .unwrap_or_else(|| json!([]));
+            let selected_ids = selections.as_array().into_iter().flatten()
+                .filter_map(|s| s.pointer("/artifact/artifact_id").and_then(serde_json::Value::as_str)).collect::<BTreeSet<_>>();
+            let unselected = artifacts.iter().filter(|a| matches!(a.artifact.kind, ArtifactKind::NormalizedEvidence | ArtifactKind::SemanticDetail))
+                .filter(|a| !selected_ids.contains(a.artifact.artifact_id.0.as_str()))
+                .map(|a| json!({"artifact_id":a.artifact.artifact_id,"kind":a.artifact.kind,
+                    "resource":a.payload.as_ref().and_then(|p| p.get("resource")),
+                    "status":"exported_presence_only; availability_at_manifest_unknown"})).collect::<Vec<_>>();
             Some(json!({
                 "manifest_artifact_id": artifact.artifact.artifact_id,
+                "assembly_coverage": artifacts.iter().find(|a| a.artifact.producer == "context.coverage"
+                    && a.payload.as_ref().is_some_and(|p| p["manifest"] == serde_json::json!(artifact.artifact.artifact_id))).and_then(|a| a.payload.as_ref()),
+                "unselected_exported_evidence": unselected,
                 "input_hash": payload.get("input_hash"),
                 "source_bytes": payload.get("total_bytes"),
                 "projected_bytes": payload.get("projected_bytes"),
@@ -1329,7 +1554,10 @@ fn build_draft_submit_coverage(calls: &[serde_json::Value]) -> serde_json::Value
     json!({"schema_version": DOMAIN_SCHEMA_VERSION, "records": records})
 }
 
-fn build_stage_acceptance(artifacts: &[BundleArtifact]) -> serde_json::Value {
+fn build_stage_acceptance(
+    artifacts: &[BundleArtifact],
+    tasks: &[serde_json::Value],
+) -> serde_json::Value {
     let records = artifacts
         .iter()
         .filter(|artifact| artifact.artifact.producer == "debug.stage_acceptance")
@@ -1341,7 +1569,21 @@ fn build_stage_acceptance(artifacts: &[BundleArtifact]) -> serde_json::Value {
             })
         })
         .collect::<Vec<_>>();
-    json!({"schema_version": DOMAIN_SCHEMA_VERSION, "records": records, "not_run_is_not_pass": true})
+    let mut counts = BTreeMap::<String, usize>::new();
+    let mut workflow_status_counts = BTreeMap::<String, usize>::new();
+    let tasks = tasks.iter().map(|task| {
+        *workflow_status_counts.entry(task["status"].as_str().unwrap_or("unknown").to_owned()).or_default() += 1;
+        let task_id = &task["node"]["task_id"];
+        let acceptance = records.iter().rev().find(|record| record["payload"]["task_id"] == *task_id);
+        let status = if matches!(task["status"].as_str(),Some("queued" | "ready" | "pending" | "skipped" | "cancelled")) {
+            "NOT_REACHED"
+        } else {
+            acceptance.and_then(|record| record["payload"]["test_result"].as_str()).unwrap_or("NOT_RUN")
+        };
+        *counts.entry(status.to_owned()).or_default() += 1;
+        json!({"task_id":task_id,"role":task["node"]["recipe_id"],"workflow_status":task["status"],"acceptance_status":status})
+    }).collect::<Vec<_>>();
+    json!({"schema_version": DOMAIN_SCHEMA_VERSION, "records": records, "tasks":tasks,"counts":counts,"workflow_status_counts":workflow_status_counts,"not_run_is_not_pass": true})
 }
 
 fn build_failures_and_missing(
@@ -1394,6 +1636,12 @@ fn build_model_routes(calls: &[serde_json::Value]) -> serde_json::Value {
         ] {
             if let Some(value) = call
                 .pointer(&format!("/telemetry/{field}"))
+                .filter(|v| v.is_string())
+                .or_else(|| match field {
+                    "reasoning_effort" => call.pointer("/provider_request/reasoning/effort"),
+                    "requested_model" => call.pointer("/provider_request/model"),
+                    _ => None,
+                })
                 .and_then(|v| v.as_str())
             {
                 let values = entry[list].as_array_mut().expect("route list");
@@ -1405,8 +1653,14 @@ fn build_model_routes(calls: &[serde_json::Value]) -> serde_json::Value {
                 }
             }
         }
-        if call.pointer("/telemetry/input_tokens").is_none()
-            || call.pointer("/telemetry/output_tokens").is_none()
+        if call
+            .pointer("/telemetry/input_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .is_none()
+            || call
+                .pointer("/telemetry/output_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .is_none()
         {
             entry["unknown_usage"] = json!(entry["unknown_usage"]
                 .as_u64()
@@ -1591,13 +1845,55 @@ fn render_summary(
                 .count()
         })
         .unwrap_or(0);
-    format!("# SUMMARY\n\n- Run: `{}`; purpose: `{}`; persisted workflow status: `{}`.\n- Snapshot cursor: `{}`; this bundle is a read-only projection and does not choose a latest Run implicitly.\n- Agent calls recorded: `{}`; Rust decision records: `{}`; failure/unknown records: `{}`.\n- Decision matrix slots with an observed zero expected return: `{}/12`; this is a recorded forecast/decision value, not an inference that zero means safe or that a nonzero position was required.\n- Evidence and web-search status must be read from `evidence_status.json`; a citation without the persisted hosted `web_search_call.action.sources` shape is not upgraded to verified evidence.\n- Missing fields are explicitly `not_returned`, `not_recorded`, `not_authorized`, or `unknown_after_crash`; no model was called and no decision was rerun during export.\n\n## How to continue\n\nUse `timeline.jsonl` cursor order, then join `llm_calls.jsonl` by `call_id`/artifact refs, `tools.jsonl` by `call_id`, and `rust_decisions.jsonl` by event/artifact refs. `failures_and_missing.json` is the authoritative boundary list for this package.\n\n## Direct references\n\n- Run record: `{}`\n- First persisted call: `{}`\n- First Rust record: `{}`\n- Failure summary: `failures_and_missing.json`\n", run.get("run_id").and_then(|v| v.as_str()).unwrap_or("unknown"), run.get("purpose").and_then(|v| v.as_str()).unwrap_or("unknown"), status, cursor, calls.len(), decisions.len(), failures.get("counts").and_then(|v| v.get("agent_failure_count")).and_then(|v| v.as_u64()).unwrap_or_default().saturating_add(failures.get("counts").and_then(|v| v.get("unknown_call_count")).and_then(|v| v.as_u64()).unwrap_or_default()), zero_targets, run.get("run_id").and_then(|v| v.as_str()).unwrap_or("unknown"), calls.first().and_then(|v| v.get("call_id")).and_then(|v| v.as_str()).unwrap_or("not_returned"), decisions.first().and_then(|v| v.get("artifact_id")).and_then(|v| v.as_str()).unwrap_or("not_returned"))
+    format!(
+        "# SUMMARY\n\n- Run: `{}`; purpose: `{}`; persisted workflow status: `{}`.\n- Snapshot cursor: `{}`; this bundle is a read-only projection and does not choose a latest Run implicitly.\n- Agent calls recorded: `{}`; Rust decision records: `{}`; failure/unknown records: `{}`.\n- Decision matrix slots with an observed zero expected return: `{}/12`; this is a recorded forecast/decision value, not an inference that zero means safe or that a nonzero position was required.\n- Evidence and web-search status must be read from `evidence_status.json`; a citation without the persisted hosted `web_search_call.action.sources` shape is not upgraded to verified evidence.\n- Missing fields are explicitly `not_returned`, `not_recorded`, `not_authorized`, or `unknown_after_crash`; no model was called and no decision was rerun during export.\n\n## How to continue\n\nUse `timeline.jsonl` cursor order, then join `llm_calls.jsonl` by `call_id`/artifact refs, `tools.jsonl` by `call_id`, and `rust_decisions.jsonl` by event/artifact refs. `failures_and_missing.json` is the authoritative boundary list for this package.\n\n## Direct references\n\n- Run record: `{}`\n- First persisted call: `{}`\n- First Rust record: `{}`\n- Failure summary: `failures_and_missing.json`\n",
+        run.get("run_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown"),
+        run.get("purpose")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown"),
+        status,
+        cursor,
+        calls.len(),
+        decisions.len(),
+        failures
+            .get("counts")
+            .and_then(|v| v.get("agent_failure_count"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or_default()
+            .saturating_add(
+                failures
+                    .get("counts")
+                    .and_then(|v| v.get("unknown_call_count"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or_default()
+            ),
+        zero_targets,
+        run.get("run_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown"),
+        calls
+            .first()
+            .and_then(|v| v.get("call_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("not_returned"),
+        decisions
+            .first()
+            .and_then(|v| v.get("artifact_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("not_returned")
+    )
 }
 
 fn render_readme(access: &DebugBundleRawAccess) -> String {
     format!(
         "# Akzio Debug Bundle\n\nThis directory is a share-safe, read-only projection of one persisted Run. It was generated without calling a model, fetching evidence, placing an order, repairing Store data, or rerunning a decision.\n\n- Exporter: `{EXPORTER_VERSION}`\n- Provider request/result detail: `{}` (`{}`)\n- `source_artifact_hash` identifies the CAS object; `export_payload_hash` identifies the redacted exported payload. They are intentionally different when redaction occurred.\n- `not_returned`, `not_recorded`, `not_authorized`, and `unknown_after_crash` are evidence boundaries, not inferred values.\n- `checksums.sha256` covers every regular file except itself. No symlinks are permitted.\n\nJoin order: `timeline.jsonl` cursor → `llm_calls.jsonl` call/artifact refs → `tools.jsonl` call_id → `rust_decisions.jsonl` artifact/event refs. `SUMMARY.md` is the short human-readable orientation; the JSONL files are the machine-readable facts.\n",
-        if access.allowed { "captured_and_redacted" } else { "not_returned" },
+        if access.allowed {
+            "captured_and_redacted"
+        } else {
+            "not_returned"
+        },
         access.reason
     )
 }
@@ -1618,18 +1914,6 @@ fn parent_call_id_for_event(event: &BundleEvent, calls: &[serde_json::Value]) ->
 
 fn role_name(recipe: &str) -> String {
     recipe.to_owned()
-}
-
-fn parse_horizon(objective: &str) -> Option<String> {
-    for horizon in ["t1", "t3", "t5"] {
-        if objective.contains(&format!("research_horizon={horizon}"))
-            || objective.contains(&format!(" {horizon} Claim"))
-            || objective.contains(&format!(" {horizon} Critique"))
-        {
-            return Some(horizon.to_owned());
-        }
-    }
-    None
 }
 
 fn redact_records(
@@ -1835,6 +2119,102 @@ fn collect_files(root: &Path) -> StoreResult<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn succeeded_workflow_without_acceptance_is_not_test_pass() {
+        let tasks = vec![
+            json!({"node":{"task_id":"a","recipe_id":"research.analyst"},"status":"succeeded"}),
+            json!({"node":{"task_id":"b","recipe_id":"research.critic"},"status":"queued"}),
+            json!({"node":{"task_id":"c","recipe_id":"research.synthesizer"},"status":"skipped"}),
+            json!({"node":{"task_id":"d","recipe_id":"research.proposal_reviewer"},"status":"failed"}),
+        ];
+        let summary = build_stage_acceptance(&[], &tasks);
+        assert_eq!(summary["counts"], json!({"NOT_RUN":2,"NOT_REACHED":2}));
+        assert_eq!(summary["workflow_status_counts"]["failed"], 1);
+        assert!(summary["counts"].get("PASS").is_none());
+    }
+
+    #[test]
+    fn acquisition_audit_separates_calls_metadata_and_review_errors() {
+        let now = Utc::now();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/review-audit-tests")
+            .join(RunId::new().0);
+        let store = Store::open(root).unwrap();
+        let raw = json!({"export_encoding":"ndjson","records":[
+            {"provider_request":{"model":"news","reasoning":{"effort":"low"}},
+             "provider_result":{"id":"discovery","model":"news","usage":{"input_tokens":10,"output_tokens":2},
+                "output":[{"id":"web1","type":"web_search_call","action":{"type":"search","sources":[]}}]}},
+            {"audit":{"request":{"model":"review","reasoning":{"effort":"high"}},
+                "response":{"id":"review","model":"review","usage":{"input_tokens":20,"output_tokens":3},
+                "output":[{"id":"web2","type":"web_search_call","action":{"type":"open_page","sources":[{"url":"https://example.com"}]}}]}}}
+        ]});
+        let make = |kind, payload: serde_json::Value| BundleArtifact {
+            artifact: Artifact::new(
+                kind,
+                store.stage_json(&payload).unwrap(),
+                "evidence.normalize",
+                ArtifactLifecycle::RunScoped,
+                ArtifactProvenance {
+                    source_family: "news_web".into(),
+                    observed_at: Some(now),
+                    retrieved_at: now,
+                    source_uri: None,
+                    confidence_ppm: 1_000_000,
+                    producer_contract_hash: None,
+                },
+                None,
+                vec![],
+                now,
+            )
+            .unwrap(),
+            payload: Some(payload),
+            omitted_reason: None,
+        };
+        let artifacts = vec![
+            make(ArtifactKind::RawEvidence, raw.clone()),
+            make(ArtifactKind::RawEvidence, raw),
+            make(
+                ArtifactKind::NormalizedEvidence,
+                json!({"value":{"source_review":{"status":"model_reviewed", "error":"facts_outside_window",
+                "validation_failures":[{"reason":"facts_outside_window"}]}}}),
+            ),
+        ];
+        let status = build_evidence_status(&artifacts, &[]);
+        assert_eq!(status["web_search_calls"], 2);
+        assert_eq!(
+            status["web_search_audit"]["action_counts"],
+            json!({"search":1,"open_page":1})
+        );
+        assert_eq!(status["web_search_audit"]["calls_with_source_metadata"], 1);
+        assert_eq!(status["acquisition_model_call_count"], 2);
+        assert_eq!(
+            status["source_review_failures"].as_array().unwrap().len(),
+            1
+        );
+        let routes = build_model_routes(&observed_acquisition_calls(&artifacts));
+        assert_eq!(routes["routes"][0]["reasoning_efforts"], json!(["low"]));
+        assert_eq!(routes["routes"][1]["reasoning_efforts"], json!(["high"]));
+        assert_eq!(routes["routes"][0]["unknown_usage"], 0);
+    }
+
+    #[test]
+    fn text_and_ndjson_export_preserve_content_without_accepting_partial_json() {
+        let payload = decode_bundle_payload("text/html; charset=utf-8", b"<p>source</p>").unwrap();
+        assert_eq!(payload["text"], "<p>source</p>");
+        let records =
+            decode_bundle_payload("application/x-ndjson", b"{\"a\":1}\n{\"b\":2}\n").unwrap();
+        assert_eq!(records["records"].as_array().unwrap().len(), 2);
+        assert!(decode_bundle_payload("application/x-ndjson", b"{\"a\":1}\n{broken}").is_none());
+        assert!(decode_bundle_payload("application/json", b"{\"a\":1}\n{broken}").is_none());
+        assert!(decode_bundle_payload("application/octet-stream", &[0xff, 0]).is_none());
+        let status = build_evidence_status(&[], &[]);
+        assert!(status["web_search_calls"].is_null());
+        assert_eq!(
+            status["web_search_audit"]["status"],
+            "not_observed_in_export"
+        );
+    }
 
     #[test]
     fn share_safe_redaction_keeps_length_and_fingerprint_without_secret() {

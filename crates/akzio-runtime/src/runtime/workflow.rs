@@ -1,58 +1,6 @@
 use super::*;
 
 impl WorkflowRuntime {
-    /// Creates the non-Paper bootstrap graph whose sole model task is the
-    /// installed Planner. The Planner may extend this graph only while its
-    /// active attempt still owns a valid write permit.
-    pub fn bootstrap(
-        &self,
-        purpose: RunPurpose,
-        topology_id: impl Into<String>,
-    ) -> RuntimeResult<WorkflowGraph> {
-        if purpose == RunPurpose::Paper {
-            return Err(RuntimeError::PaperWorkflowRequiresPrecompiledProposal);
-        }
-        let topology_id = topology_id.into();
-        if topology_id.trim().is_empty() {
-            return Err(RuntimeError::Domain(DomainError::EmptyField {
-                field: "workflow.topology_id",
-            }));
-        }
-        if purpose == RunPurpose::PositionPlan {
-            return self.lower(purpose, &self.approved_research_proposal(topology_id)?);
-        }
-        let recipe = self.catalogue.recipe(&self.catalogue.planner)?;
-        let objective = match purpose {
-            RunPurpose::Debug if self.fixture_mode => {
-                "Run a bounded real-LLM debug workflow against governed TQQQ fixture evidence."
-            }
-            RunPurpose::Debug => {
-                "Run a bounded real-LLM debug workflow against production governed evidence."
-            }
-            RunPurpose::PositionPlan => {
-                "Produce a bounded real-LLM target position plan against production governed evidence, then stop before execution."
-            }
-            RunPurpose::PaperDryRun => {
-                "Run a bounded real-LLM debug workflow against governed TQQQ fixture evidence."
-            }
-            _ => "Produce bounded workflow proposal",
-        };
-        let planner = WorkflowNode {
-            task_id: akzio_domain::TaskId::new(),
-            recipe_id: recipe.recipe_id.clone(),
-            contract_hash: recipe.contract_hash.clone(),
-            objective: objective.to_owned(),
-            dependencies: vec![],
-            input_artifacts: vec![],
-            priority: recipe.priority_ceiling,
-            budget: self.resolved_budget(recipe),
-            retry: recipe.retry.clone(),
-            on_failure: recipe.on_failure,
-            parent_task_id: None,
-        };
-        self.with_terminal_gates(purpose, topology_id, vec![planner])
-    }
-
     pub fn submit(
         &self,
         run_id: RunId,
@@ -259,6 +207,13 @@ impl WorkflowRuntime {
         &self,
         topology_id: impl Into<String>,
     ) -> RuntimeResult<WorkflowProposal> {
+        Ok(self.research_definition(topology_id)?.proposal)
+    }
+
+    pub fn research_definition(
+        &self,
+        topology_id: impl Into<String>,
+    ) -> RuntimeResult<akzio_domain::WorkflowDefinition> {
         let topology_id = topology_id.into();
         let analyst = self
             .catalogue
@@ -269,28 +224,102 @@ impl WorkflowRuntime {
         let synthesizer = self
             .catalogue
             .recipe(&TaskRecipeId::new(SYNTHESIZER_RECIPE_ID)?)?;
+        self.research_settings.validate()?;
+        let reviewer = self.catalogue.recipe(&TaskRecipeId::new(
+            akzio_domain::RESEARCH_PROPOSAL_REVIEWER_RECIPE_ID,
+        )?)?;
+        let supplement = self.catalogue.recipe(&TaskRecipeId::new(
+            akzio_domain::RESEARCH_SUPPLEMENT_RECIPE_ID,
+        )?)?;
         let mut tasks = BTreeMap::new();
-        let mut synthesis_inputs = Vec::new();
-        for horizon in ["t1", "t3", "t5"] {
-            let analyst_alias = format!("analyst_{horizon}");
-            let critic_alias = format!("critic_{horizon}");
-            tasks.insert(analyst_alias.clone(), akzio_domain::WorkflowProposalTask {
-                recipe_id: analyst.recipe_id.clone(),
-                objective: format!("[research_horizon={horizon}] Assess TQQQ, QQQ, SOXX and SOXL for this horizon. Declare supported asset scopes and scoped evidence gaps. Do not fabricate coverage."),
-                depends_on: Vec::new(), priority: analyst.priority_ceiling, evidence_needs: Vec::new(),
-            });
-            tasks.insert(critic_alias.clone(), akzio_domain::WorkflowProposalTask {
-                recipe_id: critic.recipe_id.clone(),
-                objective: format!("Independently verify the supplied {horizon} Claim for all declared assets and evidence domains."),
-                depends_on: vec![analyst_alias.clone()], priority: critic.priority_ceiling, evidence_needs: Vec::new(),
-            });
-            synthesis_inputs.extend([analyst_alias, critic_alias]);
+        let mut initial = Vec::new();
+        let mut effective = Vec::new();
+        let mut insert = |alias: String,
+                          recipe: &TaskRecipe,
+                          objective: String,
+                          depends_on: Vec<String>,
+                          horizon,
+                          research_round,
+                          proposal_revision| {
+            tasks.insert(
+                alias.clone(),
+                akzio_domain::WorkflowProposalTask {
+                    spec: Some(akzio_domain::NodeSpec {
+                        key: alias,
+                        horizon,
+                        research_round,
+                        proposal_revision,
+                    }),
+                    recipe_id: recipe.recipe_id.clone(),
+                    objective,
+                    depends_on,
+                    priority: recipe.priority_ceiling,
+                    evidence_needs: vec![],
+                },
+            );
+        };
+        for (horizon, scope) in [
+            ("t1", akzio_domain::DecisionHorizon::T1),
+            ("t3", akzio_domain::DecisionHorizon::T3),
+            ("t5", akzio_domain::DecisionHorizon::T5),
+        ] {
+            let a = format!("analyst_{horizon}");
+            let c = format!("critic_{horizon}");
+            insert(
+                a.clone(),
+                analyst,
+                "Assess the four assets using governed evidence. Preserve scoped gaps.".into(),
+                vec![],
+                Some(scope),
+                Some(0),
+                None,
+            );
+            insert(c.clone(), critic, "Independently review the Claim and request governed supplementation for retriable material blockers.".into(), vec![a.clone()], Some(scope), Some(0), None);
+            initial.extend([a, c]);
         }
-        tasks.insert("synthesizer".to_owned(), akzio_domain::WorkflowProposalTask {
-            recipe_id: synthesizer.recipe_id.clone(),
-            objective: "Synthesize exactly 12 asset/horizon forecasts and a research-only four-asset plus cash composition using the supplied coverage and verification matrix. Neutralize unsupported slots, preserve independently supported slots, and cite the evidence behind every nonzero research target. Rust validates the research composition and remains the sole authority for execution permission.".to_owned(),
-            depends_on: synthesis_inputs, priority: synthesizer.priority_ceiling, evidence_needs: Vec::new(),
-        });
+        insert(
+            "supplement".into(),
+            supplement,
+            "Rust-owned single shared supplemental round; at most eight deduplicated resources"
+                .into(),
+            initial.clone(),
+            None,
+            None,
+            None,
+        );
+        effective.extend(initial);
+        for (horizon, scope) in [
+            ("t1", akzio_domain::DecisionHorizon::T1),
+            ("t3", akzio_domain::DecisionHorizon::T3),
+            ("t5", akzio_domain::DecisionHorizon::T5),
+        ] {
+            let a = format!("analyst_{horizon}_refined");
+            let c = format!("critic_{horizon}_refined");
+            insert(a.clone(), analyst, "Revise only if Rust reports new admissible evidence. Read the supplemental dispositions; keep unresolved gaps.".into(), vec!["supplement".into()], Some(scope), Some(1), None);
+            insert(
+                c.clone(),
+                critic,
+                "Review the revised Claim. The shared supplemental budget has been consumed."
+                    .into(),
+                vec![a.clone(), "supplement".into()],
+                Some(scope),
+                Some(1),
+                None,
+            );
+            effective.extend([a, c]);
+        }
+        let mut previous = None;
+        for revision in 0..=self.research_settings.max_proposal_revisions {
+            let synth = format!("synthesizer_{revision}");
+            let review = format!("proposal_review_{revision}");
+            let mut dependencies = effective.clone();
+            if let Some(prior) = previous {
+                dependencies.push(prior);
+            }
+            insert(synth.clone(), synthesizer, "Synthesize exactly twelve forecasts and four assets plus cash with numeric_basis for each scope. Address previous review findings if provided. Rust selects the effective horizon versions.".into(), dependencies, None, None, Some(revision));
+            insert(review.clone(), reviewer, "Review every forecast and allocation in the exact supplied proposal. Assess evidence, numeric basis, uncertainty, overlap and cash rationale; do not claim empirical calibration.".into(), vec![synth], None, None, Some(revision));
+            previous = Some(review);
+        }
         let proposal = WorkflowProposal {
             schema_version: DOMAIN_SCHEMA_VERSION,
             topology_id,
@@ -301,49 +330,10 @@ impl WorkflowRuntime {
         };
         proposal.validate(&self.catalogue.recipes)?;
         self.validate_proposal_limits(&proposal)?;
-        Ok(proposal)
-    }
-
-    pub fn reserve_approved_paper_session(
-        &self,
-        lease: &DaemonLease,
-        run_id: RunId,
-        session_key: impl Into<String>,
-        topology_id: impl Into<String>,
-        setup_artifacts: &[Artifact],
-        now: DateTime<Utc>,
-    ) -> RuntimeResult<SessionSlotReservation> {
-        let mut proposal = self.approved_paper_proposal(topology_id)?;
-        let snapshot_refs = setup_artifacts
-            .iter()
-            .map(|artifact| ArtifactRef {
-                artifact_id: artifact.artifact_id.clone(),
-                kind: artifact.kind,
-            })
-            .collect::<Vec<_>>();
-        for task in proposal
-            .tasks
-            .values_mut()
-            .filter(|task| task.recipe_id.as_str() == ANALYST_RECIPE_ID)
-        {
-            task.evidence_needs = snapshot_refs.clone();
-        }
-        proposal.validate(&self.catalogue.recipes)?;
-        self.validate_proposal_limits(&proposal)?;
-        let proposal_artifact = self.paper_proposal_artifact(&run_id, &proposal, now)?;
-        let session_key = session_key.into();
-        let workflow =
-            self.prepare_paper_workflow_commit(run_id, &proposal, Some(&proposal_artifact), now)?;
-        Ok(self.store.reserve_paper_session_with_proposal(
-            lease,
-            &SessionReservation {
-                session_key,
-                workflow,
-                setup_artifacts: setup_artifacts.to_vec(),
-                reserved_at: now,
-            },
-            &proposal_artifact,
-        )?)
+        Ok(akzio_domain::WorkflowDefinition {
+            version: akzio_domain::WORKFLOW_DEFINITION_VERSION,
+            proposal,
+        })
     }
 
     fn paper_proposal_artifact(

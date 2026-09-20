@@ -53,7 +53,7 @@ public enum ScenarioLibrary {
             runId: runID(&generator),
             purpose: scenario.purpose,
             status: scenario.workflowStatus,
-            topology: scenario.purpose == .debug ? "fixture-debug" : "three-analyst-fanout",
+            topology: "three-horizon-research",
             model: ModelCatalog.primary,
             market: "US Equities",
             startedAt: ObservatorySnapshot.anchor.addingTimeInterval(-Double(elapsed)),

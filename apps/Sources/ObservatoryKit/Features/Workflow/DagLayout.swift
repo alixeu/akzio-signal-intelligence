@@ -12,10 +12,6 @@ struct DagLayout: Sendable {
     static let columnSpacing: CGFloat = 126
     static let rowSpacing: CGFloat = 112
     static let margin: CGFloat = 56
-    /// Never shrink past this: below it the stage labels stop being readable, and a
-    /// pannable graph is better than an illegible one.
-    static let minimumFitScale: CGFloat = 0.68
-
     func point(_ id: String) -> CGPoint? { positions[id] }
 
     /// Scale that fits the whole graph into `size`, capped at 1 so a small graph is
@@ -26,7 +22,7 @@ struct DagLayout: Sendable {
             max(1, size.width - 24) / contentSize.width,
             max(1, size.height - 24) / contentSize.height
         )
-        return min(1, max(Self.minimumFitScale, fit))
+        return min(1, fit)
     }
 
     static func layout(for nodes: [WorkflowNodePresentation]) -> DagLayout {

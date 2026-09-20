@@ -87,55 +87,37 @@ impl ContextBroker {
         Ok((allowed, quarantined))
     }
 
-    fn infer_learning_scope(&self, references: &[ArtifactRef]) -> ContextResult<LessonScope> {
-        let mut scope = LessonScope::default();
+    fn learning_query_scope(
+        &self,
+        permit: &TaskWritePermit,
+        policy: &ContextPolicy,
+        query: &ContextQueryScope,
+        references: &[ArtifactRef],
+    ) -> ContextResult<ContextQueryScope> {
+        let mut scope = query.clone();
+        // Regime labels are derived only from authorized typed snapshots. No
+        // evidence text, arbitrary tag, or caller-supplied label is authoritative.
+        scope.regimes.clear();
         for reference in references {
+            if reference.kind != ArtifactKind::RegimeSnapshot
+                || !policy.permitted_kinds.contains(&ArtifactKind::RegimeSnapshot)
+            {
+                continue;
+            }
             let artifact = self.store.artifact(&reference.artifact_id)?;
-            if artifact.kind == ArtifactKind::RegimeSnapshot {
-                let bytes = self.store.read_blob(&artifact.blob)?;
-                if let Ok(snapshot) = serde_json::from_slice::<RegimeSnapshot>(&bytes) {
-                    if snapshot.classification_kind == RegimeClassificationKind::DecisionTime {
-                        for label in snapshot.canonical_regime_labels() {
-                            scope.regimes.insert(label);
-                        }
-                    }
-                }
+            if artifact.kind != ArtifactKind::RegimeSnapshot
+                || !governed_internal_source(&artifact)
+                || (!policy.permitted_source_families.is_empty()
+                    && !policy.permitted_source_families.contains(&artifact.provenance.source_family))
+            {
                 continue;
             }
-            if !matches!(
-                artifact.kind,
-                ArtifactKind::NormalizedEvidence | ArtifactKind::SemanticDetail
-            ) {
-                continue;
-            }
-            let bytes = self.store.read_blob(&artifact.blob)?;
-            let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-                continue;
-            };
-            let mut strings = Vec::new();
-            collect_strings(&value, &mut strings);
-            for value in strings {
-                if let Ok(asset) = Asset::try_from(value.as_str()) {
-                    scope.assets.insert(asset);
-                }
-                match value.to_ascii_lowercase().as_str() {
-                    "t1" => {
-                        scope.horizons.insert(DecisionHorizon::T1);
-                    }
-                    "t3" => {
-                        scope.horizons.insert(DecisionHorizon::T3);
-                    }
-                    "t5" => {
-                        scope.horizons.insert(DecisionHorizon::T5);
-                    }
-                    value if value.starts_with("regime:") => {
-                        scope.regimes.insert(value[7..].to_owned());
-                    }
-                    value if value.starts_with("stage:") => {
-                        scope.decision_stages.insert(value[6..].to_owned());
-                    }
-                    _ => {}
-                }
+            self.assert_context_permitted(policy, &artifact)?;
+            self.assert_context_run(permit, &artifact)?;
+            let snapshot: RegimeSnapshot = self.read_payload(&artifact)?;
+            snapshot.validate()?;
+            if snapshot.classification_kind == RegimeClassificationKind::DecisionTime {
+                scope.regimes.extend(snapshot.canonical_regime_labels());
             }
         }
         Ok(scope)
@@ -516,10 +498,12 @@ impl ContextBroker {
             let domain = parts.next().unwrap_or_default();
             let scope = parts.next().unwrap_or_default();
             let key = match domain {
-                "bars" | "news" | "option_chain" if Asset::try_from(scope).is_ok() => {
+                "bars" | "news" if Asset::try_from(scope).is_ok() => {
                     format!("1:{scope}:{domain}")
                 }
                 "series" if matches!(scope, "DFF" | "DFII10" | "VIXCLS") => format!("2:{scope}"),
+                "research" if scope == "earnings_event_calendar" => format!("3:{}", parts.next().unwrap_or_default()),
+                "option_chain" if Asset::try_from(scope).is_ok() => format!("4:{scope}"),
                 _ => continue,
             };
             by_key.entry(key).or_default().push(artifact.clone());
@@ -551,5 +535,35 @@ impl ContextBroker {
             }
         }
         Ok((!selected.is_empty()).then_some(selected))
+    }
+}
+
+#[cfg(test)]
+mod event_selection_tests {
+    use super::*;
+    #[test]
+    fn tight_budget_reserves_events_before_options_after_price_and_macro() {
+        let root=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/event-selection-tests").join(akzio_domain::RunId::new().0);
+        let store=Store::open(root).unwrap();
+        let now=Utc::now();
+        let resources=["option_chain:QQQ:2026-09-22:2026-10-22",
+            "research:earnings_event_calendar:QQQ:2026-09-22","series:DFF",
+            "bars:QQQ:2026-01-01:2026-09-22:1Day"];
+        let artifacts=resources.iter().map(|resource| {
+            let option=resource.starts_with("option_chain:");
+            Artifact::new(if option {ArtifactKind::SemanticDetail} else {ArtifactKind::NormalizedEvidence},
+                store.stage_json(&serde_json::json!({"resource":resource,"value":{}})).unwrap(),
+                if option {"evidence.option_projection"} else {"evidence.normalize"},
+                akzio_domain::ArtifactLifecycle::RunScoped,
+                akzio_domain::ArtifactProvenance {source_family:"test".into(), observed_at:Some(now),retrieved_at:now,
+                    source_uri:None,confidence_ppm:1_000_000,producer_contract_hash:None},None,vec![],now).unwrap()
+        }).collect::<Vec<_>>();
+        let broker=ContextBroker::new(store);
+        let policy=ContextPolicy {permitted_kinds:Default::default(),permitted_source_families:Default::default(),
+            min_artifacts:0,max_artifacts:3,max_bytes:131072,max_source_bytes:None,max_tokens:32000,allow_raw_reread:false};
+        let selected=broker.select_analyst_bundle(&artifacts,&policy).unwrap().unwrap();
+        assert_eq!(selected.len(),3);
+        assert!(!selected.iter().any(|a|a.artifact_id==artifacts[0].artifact_id));
+        assert!(selected.iter().any(|a|a.artifact_id==artifacts[1].artifact_id));
     }
 }

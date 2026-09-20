@@ -4,7 +4,14 @@ use super::*;
 
 impl Daemon {
     pub(crate) async fn execute_task(&self, task: ClaimedAttempt) -> TaskCompletion {
-        self.execute_task_at(task, Utc::now()).await
+        akzio_runtime::NodeExecutor::execute(
+            self,
+            akzio_runtime::NodeContext {
+                task,
+                started_at: Utc::now(),
+            },
+        )
+        .await
     }
 
     pub(crate) async fn execute_task_at(
@@ -83,11 +90,12 @@ impl Daemon {
         now: DateTime<Utc>,
     ) -> Result<TaskCompletion> {
         if task.node.recipe_id.as_str() == akzio_domain::LEARNING_OUTCOME_WORKER_RECIPE_ID {
-            return self.learning_evaluation().execute(task, now).await;
+            return self.execute_outcome_worker(task, now).await;
         }
         let recipe = self.workflow.recipe(&task.node.recipe_id)?;
         match recipe.task_class {
             RuntimeTaskClass::Agent => self.research_run().execute(task, now).await,
+            RuntimeTaskClass::ResearchControl => self.shared_research_supplement(task, now).await,
             RuntimeTaskClass::Evidence => self.evidence_acquisition().execute(task, now).await,
             RuntimeTaskClass::DecisionGate => self.paper_execution().decision_gate(task, now),
             RuntimeTaskClass::ExecutionGate => {
@@ -210,11 +218,18 @@ impl Daemon {
                     task.node.task_id
                 ))
             })?;
-            if dependency.status != TaskStatus::Succeeded {
+            if !matches!(
+                dependency.status,
+                TaskStatus::Succeeded | TaskStatus::Skipped
+            ) {
                 return Err(DaemonError::UnfinishedDependency {
                     task_id: task.node.task_id.clone(),
                     dependency: task_id,
                 });
+            }
+            if dependency.status == TaskStatus::Skipped {
+                pending.extend(dependency.node.dependencies.iter().cloned());
+                continue;
             }
             for artifact in self
                 .store
@@ -241,5 +256,15 @@ impl Daemon {
         Ok(serde_json::from_slice(
             &self.store.read_blob(&artifact.blob)?,
         )?)
+    }
+}
+
+impl akzio_runtime::NodeExecutor for Daemon {
+    fn execute(
+        &self,
+        context: akzio_runtime::NodeContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = akzio_runtime::NodeOutcome> + Send + '_>>
+    {
+        Box::pin(async move { self.execute_task_at(context.task, context.started_at).await })
     }
 }

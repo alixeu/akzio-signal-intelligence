@@ -6,6 +6,8 @@ use serde_json::Value;
 #[tokio::test]
 #[ignore = "requires AKZIO_REAL_LLM_CONFIG and AKZIO_REAL_LLM_OUTPUT; calls deployment LLM routes"]
 async fn real_news_uses_deployment_routes_and_verifies_sources() -> Result<()> {
+    // 该 ignored 测试只在显式提供部署配置和新输出目录时运行；它验证真实 NewsWeb
+    // adapter 的路由、模型审查和证据质量，不创建 Store Run，也不进入 Decision/Execution。
     let config_path = PathBuf::from(
         std::env::var("AKZIO_REAL_LLM_CONFIG").context("set the deployment config path")?,
     );
@@ -18,6 +20,8 @@ async fn real_news_uses_deployment_routes_and_verifies_sources() -> Result<()> {
     // endpoint/key fields. Never changes that file or silently falls back.
     let swapped = std::env::var("AKZIO_REAL_LLM_SWAP_ENDPOINT_FIELDS").as_deref() == Ok("1");
     if swapped {
+        // 仅在内存中修正专门测试开关指定的字段顺序；部署文件本身不被改写，
+        // 未启用开关时不会静默猜测或回退 endpoint/key。
         let model = config
             .model
             .as_mut()
@@ -39,6 +43,8 @@ async fn real_news_uses_deployment_routes_and_verifies_sources() -> Result<()> {
         .get("research.critic")
         .map(|r| model.for_route(r))
         .unwrap_or_else(|| model.clone());
+    // identity.json 记录实际选择的 discovery/reviewer 路由和配置文件哈希，便于把
+    // 真实模型证据与本次测试边界绑定；broker_calls=0 不是 Paper 订单证明，而是作用域声明。
     fs::write(
         output.join("identity.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
@@ -66,6 +72,7 @@ async fn real_news_uses_deployment_routes_and_verifies_sources() -> Result<()> {
     };
     let result = adapter.acquire(&request).await;
     if let Err(error) = &result {
+        // Provider 失败先落 failure.json，再由 ? 传播错误；失败现场保留但不伪造可用证据。
         fs::write(
             output.join("failure.json"),
             serde_json::to_vec_pretty(
@@ -74,6 +81,8 @@ async fn real_news_uses_deployment_routes_and_verifies_sources() -> Result<()> {
         )?;
     }
     let acquired = result?;
+    // 原始响应、规范化 payload 和质量报告分别保存，后续断言同时覆盖来源审查状态、
+    // 引用完整性、时间基准和“未做人审”的事实，HTTP 成功本身不足以通过测试。
     fs::write(output.join("raw.ndjson"), &acquired.raw)?;
     fs::write(
         output.join("normalized.json"),
@@ -117,6 +126,8 @@ async fn real_news_uses_deployment_routes_and_verifies_sources() -> Result<()> {
         &acquired,
         chrono::Utc::now(),
     )?;
+    // time_basis 只证明这次 Evidence payload 满足获取时效/来源校验；它仍不是授权的
+    // DecisionProposal、Decision 或 ExecutionVerdict。
     fs::write(
         output.join("validated-time-basis.json"),
         serde_json::to_vec_pretty(&time_basis)?,

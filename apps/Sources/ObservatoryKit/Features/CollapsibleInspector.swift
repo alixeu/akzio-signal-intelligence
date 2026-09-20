@@ -45,34 +45,16 @@ struct CollapsibleInspector<Content: View>: View {
         Button {
             withAnimation(policy.resolve(Motion.panel)) { presented.toggle() }
         } label: {
-            VStack(spacing: 5) {
-                Image(systemName: symbol)
-                    .font(.system(size: 12, weight: .medium))
-                // Rotated label: the frame height is the text's length, so it has to
-                // be long enough for the whole title or it clips mid-word.
-                Text(title)
-                    .akzioText(.caption)
-                    .fixedSize()
-                    .rotationEffect(.degrees(90))
-                    .frame(height: 116)
-            }
-            .foregroundStyle(presented ? AkzioColor.primaryGold : AkzioColor.secondaryText)
-            .frame(width: 34)
-            .padding(.vertical, AkzioLayout.s3)
-            .akzioGlassBackdrop(AkzioColor.raisedSurface, radius: AkzioLayout.cardRadius)
-            .overlay(
-                RoundedRectangle(cornerRadius: AkzioLayout.cardRadius, style: .continuous)
-                    .strokeBorder(
-                        presented ? AkzioColor.goldHairline : AkzioColor.hairline,
-                        lineWidth: AkzioLayout.hairlineWidth
-                    )
-            )
-            .contentShape(Rectangle())
+            Label(L10n.text(title, language: language), systemImage: symbol)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(AkzioColor.primaryText)
+                .fixedSize()
         }
-        .buttonStyle(PressableButtonStyle())
-        .help("\(title) — opens as a popover at this window size")
-                .accessibilityLabel("\(L10n.text("Show", language: language)) \(L10n.text(title, language: language))")
-        .popover(isPresented: $presented, arrowEdge: .trailing) {
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        .help(L10n.text(title, language: language))
+        .accessibilityLabel("\(L10n.text("Show", language: language)) \(L10n.text(title, language: language))")
+        .popover(isPresented: $presented, arrowEdge: .leading) {
             PageScroll {
                 content
                     .padding(AkzioLayout.s2)

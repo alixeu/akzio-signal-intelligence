@@ -15,10 +15,13 @@ impl AgentRuntime {
                 ResearchError::InvalidOutput(format!("deliberation envelope: {error}"))
             })?;
         envelope.deliberation.assessment_source = Some("model_assessed".to_owned());
-        envelope
-            .deliberation
-            .validate_model_assessment()
-            .map_err(|error| ResearchError::InvalidOutput(error.to_string()))?;
+        if contract.version >= 65 && matches!(contract.output.artifact_kind,
+            ArtifactKind::Claim | ArtifactKind::Critique | ArtifactKind::DecisionProposal) {
+            validate_research_deliberation(&envelope.deliberation)?;
+        } else {
+            envelope.deliberation.validate_model_assessment()
+                .map_err(|error| ResearchError::InvalidOutput(error.to_string()))?;
+        }
 
         let selected = manifest
             .payload

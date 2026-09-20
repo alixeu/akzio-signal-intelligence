@@ -83,11 +83,5 @@ impl AgentRuntime {
             .await??)
     }
 
-    async fn run_purpose_for(&self, run_id: &RunId) -> ResearchResult<RunPurpose> {
-        let run_id = run_id.clone();
-        Ok(self
-            .store_executor
-            .execute(move |store| store.run_purpose(&run_id))
-            .await??)
-    }
+
 }

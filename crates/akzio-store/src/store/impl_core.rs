@@ -1,46 +1,74 @@
+thread_local! {
+    /// Whether this thread currently holds the Store connection. Tracking it
+    /// turns a nested acquisition into a diagnosable error instead of a silent,
+    /// permanent hang; genuine contention between threads still blocks and
+    /// proceeds normally.
+    static CONNECTION_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn connection_held_by_current_thread() -> bool {
+    CONNECTION_HELD.with(std::cell::Cell::get)
+}
+
+/// The Store connection guard. Dereferences to [`Connection`] so every existing
+/// call site is unchanged, and clears this thread's ownership flag on drop.
+pub(super) struct ConnectionGuard<'store> {
+    guard: std::sync::MutexGuard<'store, Connection>,
+}
+
+impl<'store> ConnectionGuard<'store> {
+    fn new(guard: std::sync::MutexGuard<'store, Connection>) -> Self {
+        CONNECTION_HELD.with(|held| held.set(true));
+        Self { guard }
+    }
+}
+
+impl Drop for ConnectionGuard<'_> {
+    fn drop(&mut self) {
+        CONNECTION_HELD.with(|held| held.set(false));
+    }
+}
+
+impl std::ops::Deref for ConnectionGuard<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for ConnectionGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
 impl Store {
     pub fn root(&self) -> &Path {
         self.root.as_ref()
     }
 
-    fn connection(&self) -> StoreResult<std::sync::MutexGuard<'_, Connection>> {
-        self.connection
+    /// Acquire the single Store connection.
+    ///
+    /// The guard is a non-reentrant `std::sync::Mutex`, so acquiring it twice on
+    /// one thread would block that thread forever, holding both this lock and
+    /// any open SQLite write transaction. Because a silent hang is far worse to
+    /// diagnose than an error, a nested acquisition is reported instead of
+    /// deadlocking: the fix is always for the inner call to take the caller's
+    /// `&Connection`/`&Transaction` rather than reach for the mutex again.
+    fn connection(&self) -> StoreResult<ConnectionGuard<'_>> {
+        if connection_held_by_current_thread() {
+            return Err(StoreError::Integrity(
+                "store connection acquired twice on one thread; pass the caller's \
+                 connection or transaction to the inner call instead"
+                    .to_owned(),
+            ));
+        }
+        let guard = self
+            .connection
             .lock()
-            .map_err(|_| StoreError::Integrity("store connection poisoned".to_owned()))
-    }
-
-    pub fn observatory_configuration<T: DeserializeOwned>(&self) -> StoreResult<Option<T>> {
-        let payload = self
-            .connection()?
-            .query_row(
-                "SELECT configuration_json FROM rebuild_observatory_configuration WHERE singleton = 1",
-                [],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .optional()?;
-        payload
-            .map(|payload| serde_json::from_slice(&payload))
-            .transpose()
-            .map_err(StoreError::from)
-    }
-
-    pub fn set_observatory_configuration<T: Serialize>(
-        &self,
-        configuration: &T,
-    ) -> StoreResult<()> {
-        let payload = serde_json::to_vec(configuration)?;
-        self.connection()?.execute(
-            "INSERT INTO rebuild_observatory_configuration (singleton, configuration_json) VALUES (1, ?1) ON CONFLICT(singleton) DO UPDATE SET configuration_json = excluded.configuration_json",
-            params![payload],
-        )?;
-        Ok(())
-    }
-
-    pub fn clear_observatory_configuration(&self) -> StoreResult<bool> {
-        Ok(self.connection()?.execute(
-            "DELETE FROM rebuild_observatory_configuration WHERE singleton = 1",
-            [],
-        )? > 0)
+            .map_err(|_| StoreError::Integrity("store connection poisoned".to_owned()))?;
+        Ok(ConnectionGuard::new(guard))
     }
 
     fn read_all_events(&self, run_id: &RunId) -> StoreResult<Vec<StoredEvent>> {
@@ -180,6 +208,16 @@ impl Store {
     }
 
     pub(super) fn validate_workflow_commit(&self, commit: &WorkflowCommit) -> StoreResult<()> {
+        if commit.run.purpose == RunPurpose::PaperDryRun || commit.nodes.iter().any(|n| n.recipe_id.as_str() == "research.planner" || commit.run.purpose == RunPurpose::Debug && n.recipe_id.as_str().starts_with("research.")) {
+            return Err(StoreError::DebugControl("legacy_workflow_retired".into()));
+        }
+        for node in &commit.nodes {
+            if let Some(hash) = &node.contract_hash {
+                if self.contract_installation(hash)?.is_some_and(|c| matches!(c.contract.purpose.as_str(), "research.analyst" | "research.critic" | "research.synthesizer") && c.contract.version < 65) {
+                    return Err(StoreError::DebugControl("legacy_workflow_retired".into()));
+                }
+            }
+        }
         if commit.graph.kind != ArtifactKind::WorkflowGraph
             || commit.graph.artifact_id != commit.run.graph_artifact_id
         {

@@ -1,6 +1,10 @@
 impl Store {
+    // 判断 child Artifact 是否可以跨 Run 引用 parent：证据只允许登记 Shadow 复用父 EvidenceGate，
+    // Outcome 侧则只允许学习节点引用父 Run 的冻结 OutcomeSchedule/执行 lineage。
+    // 该函数只返回授权判断，不创建引用，也不把 Shadow 结果提升为 canonical 结果。
     pub(crate) fn canary_cross_run_reference_allowed(&self, connection: &Connection, child: &Artifact, parent: &Artifact) -> StoreResult<bool> {
         let Some(run_id) = child.origin.as_ref().and_then(|o|o.run_id.as_ref()) else { return Ok(false); };
+        // Shadow evidence 只接受父 EvidenceGate 成功 Attempt 的 NormalizedEvidence 或 collection status。
         if parent.kind == ArtifactKind::NormalizedEvidence
             || (child.kind == ArtifactKind::SemanticDetail
                 && child.producer == "canary.evidence_snapshot"
@@ -16,6 +20,8 @@ impl Store {
                 (ArtifactKind::EvidenceNeed, "learning.outcome_worker.need")
                 | (ArtifactKind::OutcomeSchedule, "learning.shadow_outcome_schedule"))
         { return Ok(false); }
+        // Outcome Shadow 只能从已登记 session 找到父 Run 的 canonical OutcomeSchedule，
+        // 再按 child kind 限定可引用的 schedule 或冻结执行 Artifact。
         let Some(session) = self.canary_session_for_run_with_connection(connection, run_id)? else { return Ok(false); };
         let Some(schedule_artifact) = super::read_run_kind_artifacts(connection, &session.reservation.parent_run_id, ArtifactKind::OutcomeSchedule)?.into_iter().find(|artifact|artifact.lifecycle == ArtifactLifecycle::Canonical) else { return Ok(false); };
         if child.kind == ArtifactKind::EvidenceNeed {
@@ -31,6 +37,7 @@ impl Store {
         Ok(frozen_refs.iter().any(|r|r.artifact_id == parent.artifact_id && r.kind == parent.kind))
     }
 
+    // 通过 Store 连接包装一次 parent evidence 判断；调用方不持有连接时使用此入口。
     /// Check one grant without reloading the entire parent workflow/evidence
     /// set for every Context validation and tool read.
     pub fn is_canary_parent_evidence(&self, shadow_run: &RunId, artifact_id: &akzio_domain::ArtifactId) -> StoreResult<bool> {
@@ -38,6 +45,8 @@ impl Store {
         self.is_canary_parent_evidence_with_connection(&connection, shadow_run, artifact_id)
     }
 
+    // 在已持有连接时执行 parent evidence 判断，避免 Context/Doctor 路径重复获取 Store Mutex。
+    // 非 Shadow、未登记或非三类 Shadow Run 直接返回 false；最后只查询父 gate 最近的成功输出。
     fn is_canary_parent_evidence_with_connection(&self, connection: &Connection, shadow_run: &RunId, artifact_id: &akzio_domain::ArtifactId) -> StoreResult<bool> {
         if run_purpose_from_connection(connection, shadow_run)? != RunPurpose::Shadow { return Ok(false); }
         let Some(session)=self.canary_session_for_run_with_connection(connection, shadow_run)? else { return Ok(false); };
@@ -47,6 +56,8 @@ impl Store {
             "SELECT EXISTS(SELECT 1 FROM rebuild_attempt_outputs o JOIN rebuild_artifacts r ON r.artifact_id=o.artifact_id WHERE o.artifact_id=?1 AND ((r.kind=?2 AND r.producer GLOB 'akzio.ingest.*.normalized') OR (r.kind=?4 AND r.producer='evidence.collection_status')) AND o.attempt_id=(SELECT a.attempt_id FROM rebuild_tasks t JOIN rebuild_attempts a ON a.task_id=t.task_id WHERE t.run_id=?3 AND t.recipe_id='gate.evidence' AND t.status='succeeded' AND a.status='succeeded' ORDER BY a.finished_at DESC,a.attempt_id DESC LIMIT 1))",
             params![artifact_id.0.as_str(),super::enum_name(ArtifactKind::NormalizedEvidence),reservation.parent_run_id.0,super::enum_name(ArtifactKind::SemanticDetail)],|row|row.get(0))?)
     }
+    // 严格读取登记 Shadow 可复用的父 EvidenceGate 输出：gate 未结束时返回 None，
+    // gate 失败、Shadow 未登记或运行绑定错误则返回冲突；返回集合只含规范化证据和 collection status。
     /// The three registered shadows compare the exact committed T0 evidence.
     /// This is the sole cross-Run evidence grant: later refreshes, arbitrary
     /// parent artifacts and unregistered Shadow runs are not included.
@@ -70,6 +81,9 @@ impl Store {
             || (artifact.kind==ArtifactKind::SemanticDetail && artifact.producer=="evidence.collection_status")
         ).collect()))
     }
+    // 校验 Canary 历史的单 active campaign、状态/active 一致性、session lineage，以及
+    // observation/evaluation 对 campaign、cohort、session 和 promotion policy 的不可变绑定。
+    // 这是完整性读取检查，不推进 campaign，也不重新计算 evaluation verdict。
     pub(crate) fn verify_canary_campaign_history(
         &self,
         connection: &Connection,
@@ -90,6 +104,7 @@ impl Store {
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         for campaign_id in campaign_ids {
+            // active 标志必须由 Staged/Validation/Active 状态推导，Completed/Frozen 不可继续 active。
             let campaign_id = ContentHash::new(campaign_id)?;
             let head = read_campaign(connection, &campaign_id)?.ok_or_else(|| {
                 StoreError::Integrity(format!("canary campaign {campaign_id} disappeared"))
@@ -156,6 +171,7 @@ impl Store {
                 scheduler_epoch,
                 reserved_at: parse_time(&reserved_at)?,
             };
+            // legacy session 仍需验证来源 Run 的 Paper/Shadow purpose 和自身 schema。
             reservation.validate()?;
             read_campaign(connection, &campaign_id)?.ok_or_else(|| {
                 StoreError::Integrity(format!(
@@ -184,6 +200,7 @@ impl Store {
         .query_map([], cohort_session_columns)?
         .collect::<Result<Vec<_>, _>>()?;
     for columns in cohort_sessions {
+        // paired cohort session 使用更完整的字段转换，再复核 campaign/cohort 与四条 Run lineage。
         let reservation = stored_cohort_session_from_columns(columns)?.reservation;
             let campaign = read_campaign(connection, &reservation.campaign_id)?.ok_or_else(|| {
                 StoreError::Integrity("canary cohort session campaign is missing".to_owned())
@@ -217,6 +234,7 @@ impl Store {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         for (campaign_id, stage_json, observation_json) in observations {
+            // observation 必须落在对应阶段的 cohort，且 session_key 必须已经预约。
             let campaign_id = ContentHash::new(campaign_id)?;
             let stage: CanaryCampaignStatus = serde_json::from_str(&stage_json)?;
             let observation: CanaryPairedObservation = serde_json::from_str(&observation_json)?;
@@ -254,6 +272,7 @@ impl Store {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         for (campaign_id, stage_json, evaluation_json) in evaluations {
+            // evaluation 只接受已存在 campaign/cohort 的 promotion policy 绑定，不校准其业务数值。
             let campaign_id = ContentHash::new(campaign_id)?;
             let stage: CanaryCampaignStatus = serde_json::from_str(&stage_json)?;
             let evaluation: CanaryCohortEvaluation = serde_json::from_str(&evaluation_json)?;

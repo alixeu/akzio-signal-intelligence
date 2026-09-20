@@ -8,7 +8,7 @@ use akzio_domain::{
     content_hash_json, CanaryCalibrationReport, CanaryCampaignStatus, CanaryCohortEvaluation,
     CanaryCohortManifest, CanaryPairedObservation, CanaryPairedSubjectMetrics,
     CanaryPromotionPolicy, CanarySubjectKind, CanaryVerdict, CandidatePolicyState, ContentHash,
-    ForecastScore, Outcome, OutcomeHorizon, PolicyState, PolicySubject, DOMAIN_SCHEMA_VERSION,
+    ForecastScore, OutcomeHorizon, PolicyState, PolicySubject, DOMAIN_SCHEMA_VERSION,
 };
 use akzio_store::{CanaryCampaignHead, DaemonLease, Store, StoreError};
 use chrono::{DateTime, Utc};
@@ -17,141 +17,12 @@ use crate::evaluation::{aggregate_calibration_report, AKZIO_MIN_CALIBRATION_SAMP
 
 const PPM_ONE: u32 = 1_000_000;
 
-/// One horizon of a canary comparison.
-///
-/// `risk_recall_ppm` stays `Option` so an unmeasured window never masquerades
-/// as measured-zero. See `CanaryPairedOutcomeMetrics` for the same invariant on
-/// the persisted side.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CanaryHorizonMetrics {
-    pub evidence_completeness_ppm: Option<u32>,
-    pub risk_recall_ppm: Option<u32>,
-    pub utility_ppm: i64,
-}
-
-impl CanaryHorizonMetrics {
-    pub fn from_outcome_window(window: &akzio_domain::OutcomeWindow) -> Self {
-        Self {
-            evidence_completeness_ppm: window.evidence_completeness_ppm,
-            risk_recall_ppm: window.risk_recall_ppm,
-            utility_ppm: window.utility_ppm,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CanarySubjectComparison {
-    pub parent: [CanaryHorizonMetrics; 3],
-    pub candidate: [CanaryHorizonMetrics; 3],
-}
-
-impl CanarySubjectComparison {
-    pub fn from_outcomes(parent: &Outcome, candidate: &Outcome) -> Result<Self, CanaryError> {
-        parent.validate()?;
-        candidate.validate()?;
-        let parent = metrics_by_horizon(parent)?;
-        let candidate = metrics_by_horizon(candidate)?;
-        Ok(Self { parent, candidate })
-    }
-
-    /// Rollback requires *observed* degradation. A horizon whose risk recall was
-    /// never measured yields `Defer`: absent evidence is not evidence of harm,
-    /// but it also must not buy a promotion.
-    pub fn verdict(&self, minimum_ppm: u32) -> CanaryVerdict {
-        if self
-            .candidate
-            .iter()
-            .zip(self.parent.iter())
-            .any(|(candidate, parent)| {
-                candidate
-                    .evidence_completeness_ppm
-                    .is_some_and(|value| value < minimum_ppm)
-                    || match (
-                        candidate.evidence_completeness_ppm,
-                        parent.evidence_completeness_ppm,
-                    ) {
-                        (Some(candidate), Some(parent)) => candidate < parent,
-                        _ => false,
-                    }
-                    || candidate.utility_ppm < parent.utility_ppm
-                    || candidate
-                        .risk_recall_ppm
-                        .is_some_and(|value| value < minimum_ppm)
-                    || match (candidate.risk_recall_ppm, parent.risk_recall_ppm) {
-                        (Some(candidate), Some(parent)) => candidate < parent,
-                        _ => false,
-                    }
-            })
-        {
-            return CanaryVerdict::Rollback;
-        }
-
-        if self
-            .candidate
-            .iter()
-            .chain(self.parent.iter())
-            .any(|metrics| {
-                metrics.risk_recall_ppm.is_none() || metrics.evidence_completeness_ppm.is_none()
-            })
-        {
-            return CanaryVerdict::Defer;
-        }
-
-        let parent_utility = self
-            .parent
-            .iter()
-            .map(|metrics| i128::from(metrics.utility_ppm))
-            .sum::<i128>();
-        let candidate_utility = self
-            .candidate
-            .iter()
-            .map(|metrics| i128::from(metrics.utility_ppm))
-            .sum::<i128>();
-        if candidate_utility > parent_utility {
-            CanaryVerdict::Advance
-        } else {
-            CanaryVerdict::Hold
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CanaryBundleComparison {
-    pub contract: CanarySubjectComparison,
-    pub topology: CanarySubjectComparison,
-    pub bundle: CanarySubjectComparison,
-}
-
-impl CanaryBundleComparison {
-    pub fn verdict(&self, minimum_ppm: u32) -> CanaryVerdict {
-        let verdicts = [
-            self.contract.verdict(minimum_ppm),
-            self.topology.verdict(minimum_ppm),
-            self.bundle.verdict(minimum_ppm),
-        ];
-        if verdicts.contains(&CanaryVerdict::Rollback) {
-            CanaryVerdict::Rollback
-        } else if verdicts.contains(&CanaryVerdict::Defer) {
-            CanaryVerdict::Defer
-        } else if verdicts
-            .iter()
-            .all(|verdict| *verdict == CanaryVerdict::Advance)
-        {
-            CanaryVerdict::Advance
-        } else {
-            CanaryVerdict::Hold
-        }
-    }
-}
-
 #[derive(Debug, Error)]
 pub enum CanaryError {
     #[error(transparent)]
     Domain(#[from] akzio_domain::DomainError),
     #[error(transparent)]
     Store(#[from] StoreError),
-    #[error("outcome is missing one of T+1/T+3/T+5 windows")]
-    MissingHorizon,
     #[error("canary cohort policy differs from the immutable manifest")]
     PolicyDrift,
     #[error("canary cohort observation does not match {0}")]
@@ -433,7 +304,6 @@ const fn horizon_index(horizon: OutcomeHorizon) -> usize {
 #[derive(Debug, Clone)]
 pub struct CanaryCampaignRuntime {
     store: Store,
-    minimum_ppm: u32,
 }
 
 impl CanaryCampaignRuntime {
@@ -445,15 +315,7 @@ impl CanaryCampaignRuntime {
                 },
             ));
         }
-        Ok(Self { store, minimum_ppm })
-    }
-
-    pub fn minimum_ppm(&self) -> u32 {
-        self.minimum_ppm
-    }
-
-    pub fn compare(&self, comparison: &CanaryBundleComparison) -> CanaryVerdict {
-        comparison.verdict(self.minimum_ppm)
+        Ok(Self { store })
     }
 
     pub fn target_policy_state(
@@ -485,20 +347,6 @@ impl CanaryCampaignRuntime {
         }
     }
 
-    pub fn apply_verdict(
-        &self,
-        lease: &DaemonLease,
-        campaign_id: &akzio_domain::ContentHash,
-        status: CanaryCampaignStatus,
-        comparison: &CanaryBundleComparison,
-        now: DateTime<Utc>,
-    ) -> Result<CanaryCampaignHead, CanaryError> {
-        let verdict = self.compare(comparison);
-        Ok(self
-            .store
-            .transition_canary_campaign(lease, campaign_id, status, verdict, now)?)
-    }
-
     pub fn apply_cohort_evaluation(
         &self,
         lease: &DaemonLease,
@@ -515,20 +363,4 @@ impl CanaryCampaignRuntime {
             now,
         )?)
     }
-}
-
-fn metrics_by_horizon(outcome: &Outcome) -> Result<[CanaryHorizonMetrics; 3], CanaryError> {
-    OutcomeHorizon::ALL
-        .map(|horizon| {
-            outcome
-                .windows
-                .iter()
-                .find(|window| window.horizon == horizon)
-                .map(CanaryHorizonMetrics::from_outcome_window)
-                .ok_or(CanaryError::MissingHorizon)
-        })
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?
-        .try_into()
-        .map_err(|_| CanaryError::MissingHorizon)
 }

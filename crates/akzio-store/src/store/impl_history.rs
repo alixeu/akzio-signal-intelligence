@@ -242,7 +242,7 @@ impl Store {
             }
 
             let outcome: Outcome =
-                serde_json::from_slice(&self.read_blob(&outcome_artifact.blob)?)?;
+                serde_json::from_slice(&blob::read_blob_with(connection, &outcome_artifact.blob)?)?;
             outcome.validate_sealed()?;
             let schedule = self.read_outcome_schedule_with_connection(
                 connection,
@@ -250,10 +250,10 @@ impl Store {
                 &[RunPurpose::Paper],
             )?;
             let experience: Experience =
-                serde_json::from_slice(&self.read_blob(&experience_artifact.blob)?)?;
+                serde_json::from_slice(&blob::read_blob_with(connection, &experience_artifact.blob)?)?;
             experience.validate()?;
             let evaluation: Evaluation =
-                serde_json::from_slice(&self.read_blob(&evaluation_artifact.blob)?)?;
+                serde_json::from_slice(&blob::read_blob_with(connection, &evaluation_artifact.blob)?)?;
             evaluation.validate()?;
 
             let outcome_ref = ArtifactRef {

@@ -29,11 +29,13 @@ response_language = "简体中文"
 debug = false
 
 # Agent resource defaults; role overrides use the same fields.
-# Input is cumulative across LLM requests in one Attempt, not a context window.
-# Output and timeout retain their per-role defaults when omitted.
-# New Critic Attempts default to 16000 cumulative output tokens so one Draft,
-# one Submit, and one bounded semantic repair share a finite budget. Historical
-# Contracts retain their immutable 4000-token value.
+# Input/output accumulate per Task across Draft, Submit, Retry and Recovery.
+# These are not a Provider context window or a whole-Run token allowance.
+# Research roles default to 1000000 Task output tokens (application max).
+# Wall time is separate: 120 seconds per research Attempt, 180 for Outcome.
+# Outcome Worker keeps 4000; explicit role overrides retain precedence. Output
+# does not change input, context, tools, wall time or retries. Historical frozen
+# Contracts and Runs keep their original budgets.
 [agent.budget.default]
 max_input_tokens = 1000000
 max_tool_calls = "unlimited"
@@ -43,5 +45,9 @@ max_tool_calls = "unlimited"
 # max_tool_calls = 8
 # max_output_tokens = 12000
 # timeout_seconds = 180
-# Also supported: planner, critic, synthesizer, outcome_worker.
+# Also supported: critic, synthesizer, outcome_worker.
 # See docs/agent-budget-configuration.md.
+
+# Additional proposal revisions after the initial synthesis and review.
+[agent.research]
+max_proposal_revisions = 2

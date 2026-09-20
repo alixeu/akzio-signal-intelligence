@@ -153,6 +153,7 @@ public enum ArchiveFixtures {
                 stageStatus = .queued
             }
             return ArchiveStageProgress(
+                id: "fixture-stage-\(index)",
                 label: label,
                 status: stageStatus,
                 timeLabel: stageStatus == .succeeded

@@ -1,0 +1,53 @@
+{
+  "features" : [
+    "refractivity"
+  ],
+  "fill" : "system-dark",
+  "groups" : [
+    {
+      "layers" : [
+        {
+          "glass" : false,
+          "image-name" : "02-signal-accent.svg",
+          "name" : "02 Signal Accent"
+        }
+      ],
+      "name" : "02 Signal Accent",
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.5
+      },
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.3
+      }
+    },
+    {
+      "layers" : [
+        {
+          "image-name" : "01-primary-mark.svg",
+          "name" : "01 Primary Mark"
+        }
+      ],
+      "name" : "01 Primary Glass",
+      "refractivity" : {
+        "depth" : 0,
+        "enabled" : true,
+        "strength" : 0.5
+      },
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.5
+      },
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.3
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "squares" : [
+      "macOS"
+    ]
+  }
+}

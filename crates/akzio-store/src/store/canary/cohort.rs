@@ -1,4 +1,6 @@
 impl Store {
+    // 在 daemon lease 保护的 Immediate 事务中记录当前阶段的 paired observations。
+    // 每条 observation 必须绑定已预约 cohort session；相同 identity 可幂等重放，不同内容一律冲突。
     pub fn record_canary_observations(
         &self,
         lease: &DaemonLease,
@@ -21,6 +23,7 @@ impl Store {
             StoreError::CanaryCampaignConflict("canary cohort manifest missing".to_owned())
         })?;
         for observation in observations {
+            // 先校验领域负载和 session 的 cohort/campaign/stage/交易日/regime 绑定，再允许写入。
             observation.validate()?;
             if observation.cohort_id != cohort.cohort_id {
                 return Err(StoreError::CanaryCampaignConflict(
@@ -60,6 +63,7 @@ impl Store {
                 .optional()?;
             if let Some(existing) = existing {
                 let existing: CanaryPairedObservation = serde_json::from_str(&existing)?;
+                // 已存在的同 session+horizon 只能接受完全相同的不可变 observation。
                 if existing != *observation {
                     return Err(StoreError::CanaryCampaignConflict(
                         "canary observation is immutable".to_owned(),
@@ -67,6 +71,7 @@ impl Store {
                 }
                 continue;
             }
+            // 新 observation 的 id 由完整内容 hash 决定；写入仍受同一 lease/事务保护。
             transaction.execute(
                 "INSERT INTO rebuild_canary_observations (observation_id, cohort_id, campaign_id, stage_json, session_key, horizon_json, observation_json, recorded_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
@@ -83,9 +88,11 @@ impl Store {
         }
         transaction.commit()?;
         drop(connection);
+        // 释放 Store 连接后再重新读取，避免在非可重入 Mutex 上嵌套获取连接。
         self.canary_observations(&cohort.cohort_id)
     }
 
+    // 按 session_key/horizon 顺序读取 cohort 的不可变 observation，并反序列化为领域值。
     pub fn canary_observations(
         &self,
         cohort_id: &ContentHash,
@@ -102,6 +109,8 @@ impl Store {
             .collect()
     }
 
+    // 校验 learning 已计算的 cohort evaluation 与 Store 中的 observation 摘要一致，
+    // 再在 lease 事务内幂等写入 evaluation 并推进预期阶段。Store 只持久化决定，不计算 verdict。
     pub fn transition_canary_campaign_with_evaluation(
         &self,
         lease: &DaemonLease,
@@ -138,6 +147,7 @@ impl Store {
                 "canary evaluation does not summarize persisted observations".to_owned(),
             ));
         }
+        // evaluation_id 重复时只接受同一 cohort/verdict 的历史内容；不允许覆盖已提交评价。
         let existing: Option<String> = transaction
             .query_row(
                 "SELECT evaluation_json FROM rebuild_canary_evaluations WHERE evaluation_id = ?1",
@@ -161,6 +171,7 @@ impl Store {
         };
         if let Some(idempotent) = idempotent_transition(&current, expected_status, evaluation.verdict)
         {
+            // 状态已经处于幂等终点时，原 evaluation 也必须已存在，避免只凭状态伪造历史。
             if !evaluation_exists {
                 return Err(StoreError::CanaryCampaignConflict(
                     "idempotent canary transition requires the original evaluation".to_owned(),
@@ -176,6 +187,7 @@ impl Store {
             )));
         }
         if !evaluation_exists {
+            // 评价先与阶段一起落库；后续 transition 失败时整个事务回滚。
             transaction.execute(
                 "INSERT INTO rebuild_canary_evaluations (evaluation_id, cohort_id, campaign_id, stage_json, evaluation_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
@@ -200,6 +212,8 @@ impl Store {
     }
 }
 
+// 从持久 observation 计算确定性的集合 hash、各 horizon 数量、交易日集合和 regime 集合，
+// 供 transition 校验提交的 evaluation 是否覆盖同一批事实。
 fn cohort_observation_summary(
     connection: &Connection,
     cohort_id: &ContentHash,

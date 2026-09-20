@@ -93,15 +93,6 @@ enum EventFixtures {
 
         var rows: [AgentRailItem] = [
             AgentRailItem(
-                id: "planner",
-                name: "Planner",
-                role: .planner,
-                model: ModelCatalog.primary,
-                status: .succeeded,
-                activityLabel: "Plan compiled",
-                progressPpm: 1_000_000
-            ),
-            AgentRailItem(
                 id: "analyst-1",
                 name: "Analyst-1",
                 role: .analyst,

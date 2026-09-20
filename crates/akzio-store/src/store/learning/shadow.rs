@@ -126,7 +126,7 @@ impl Store {
             if origin.run_id.as_ref() != Some(&permit.run_id) {
                 continue;
             }
-            let existing_payload: Retrospective = self.read_artifact_payload(&existing)?;
+            let existing_payload: Retrospective = self.read_artifact_payload_with_connection(&transaction, &existing)?;
             if existing_payload.outcome_id == retrospective.outcome_id
                 && existing_payload.horizon == retrospective.horizon
             {

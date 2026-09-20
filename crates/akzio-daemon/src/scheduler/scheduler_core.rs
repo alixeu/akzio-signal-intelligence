@@ -163,24 +163,4 @@ impl PaperScheduler {
             now,
         )?)
     }
-
-    pub fn reserve_approved_session(
-        &self,
-        run_id: RunId,
-        session_key: &str,
-        now: DateTime<Utc>,
-    ) -> SchedulerResult<SessionSlotReservation> {
-        NaiveDate::parse_from_str(session_key, "%Y-%m-%d")
-            .map_err(|_| SchedulerError::InvalidSessionKey(session_key.to_owned()))?;
-        let lease = self.acquire_or_renew(now)?;
-        let setup_artifacts = self.paper_snapshot_artifacts(&run_id, session_key, now)?;
-        Ok(self.workflow.reserve_approved_paper_session(
-            &lease,
-            run_id,
-            session_key,
-            "paper.approved.v1",
-            &setup_artifacts,
-            now,
-        )?)
-    }
 }

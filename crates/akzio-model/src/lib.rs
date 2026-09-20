@@ -75,6 +75,7 @@ pub const FIXTURE_CONTEXT_EVIDENCE_ID: &str = "$fixture.context.first_evidence_i
 /// Test-fixture placeholder resolved from the current model request's governed context.
 pub const FIXTURE_CONTEXT_CLAIM_ID: &str = "$fixture.context.first_claim_id";
 
+// 保持配置缺省值集中在反序列化层；调用方不需要用空字符串猜测 provider 行为。
 fn default_reasoning_effort() -> String {
     "medium".to_owned()
 }
@@ -134,7 +135,6 @@ pub struct OpenAIResponsesConfig {
 /// Compatibility aliases for callers while configuration and documentation
 /// migrate to provider-specific names.
 pub type ModelConfig = OpenAIResponsesConfig;
-pub type ModelRouteConfig = OpenAIResponsesRouteConfig;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -164,12 +164,16 @@ impl<'de> Deserialize<'de> for OpenAIResponsesConfig {
         D: Deserializer<'de>,
     {
         let wire = OpenAIResponsesConfigWire::deserialize(deserializer)?;
+        // 旧配置只有在官方地址下才可无歧义地沿用当前协议；自定义地址必须
+        // 明确声明 provider，避免把兼容端点误当成 OpenAI Responses 语义。
         if wire.provider.is_none() && !is_official_openai_base_url(&wire.base_url) {
             return Err(D::Error::custom(format!(
                 "legacy model config with custom base_url {} is ambiguous; add provider = \"{}\" to explicitly select OpenAI Responses semantics",
                 wire.base_url, OPENAI_RESPONSES_PROVIDER_ID
             )));
         }
+        // 当前 crate 只实现 OpenAI Responses；provider 字段用于显式选择/校验，
+        // 不会把未知协议静默保存进配置对象。
         Ok(Self {
             base_url: wire.base_url,
             model: wire.model,
@@ -208,6 +212,8 @@ impl OpenAIResponsesConfig {
     }
 
     pub fn for_route(&self, route: &OpenAIResponsesRouteConfig) -> Self {
+        // route 级字段覆盖同名全局字段；未提供或为空的 response_language
+        // 回退到全局值。选出的配置不再携带 routes，避免再次递归选择。
         Self {
             base_url: self.base_url.clone(),
             model: route.model.clone(),
@@ -307,6 +313,8 @@ pub struct ModelContinuation {
 
 impl ModelContinuation {
     pub fn from_items(items: Vec<Value>) -> Self {
+        // continuation 保存 provider transcript；普通 provider 响应不附带 fixture
+        // 输入，只有 fixture 分支会在响应返回后显式绑定它。
         Self {
             items,
             fixture_input: None,
@@ -314,6 +322,7 @@ impl ModelContinuation {
     }
 
     fn with_fixture_input(mut self, fixture_input: Option<String>) -> Self {
+        // 这个关联值只服务于下一轮离线 fixture 的占位符解析，不是新的模型上下文。
         self.fixture_input = fixture_input;
         self
     }
@@ -376,18 +385,6 @@ pub enum ModelCapabilityBasis {
     Unknown,
     StaticDeclared,
     RuntimeNegotiated,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OpenAIResponsesCapabilities {
-    pub supports_tool_calls: bool,
-    pub supports_stateless_continuation: bool,
-    pub reasoning_items: bool,
-    pub encrypted_continuation: bool,
-    pub native_web_tool: bool,
-    pub streaming: bool,
-    pub basis: ModelCapabilityBasis,
-    pub verified: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -461,6 +458,7 @@ impl NativeWebCapabilityStatus {
 
 impl ModelCapabilitySnapshot {
     pub fn unknown() -> Self {
+        // 未探测快照明确表示未知能力；它不能被上层当作拒绝或已支持来解释。
         Self {
             provider_id: "unknown".to_owned(),
             model_id: "unknown".to_owned(),
@@ -489,11 +487,9 @@ pub struct ModelCapabilityProbeSet {
 }
 
 impl ModelCapabilityProbeSet {
-    pub fn snapshot_for(&self, purpose: &str) -> &ModelCapabilitySnapshot {
-        self.routes.get(purpose).unwrap_or(&self.default)
-    }
-
     pub fn validate_for_config(&self, config: &OpenAIResponsesConfig) -> Result<()> {
+        // capability 必须逐项对应当前默认 route 和每个命名 route；数量或身份
+        // 不一致时 fail closed，不能用另一 route 的探测结果代替。
         validate_probed_snapshot(
             &self.default,
             &config.model,
@@ -523,6 +519,8 @@ fn validate_probed_snapshot(
     reasoning_effort: &str,
     route: &str,
 ) -> Result<()> {
+    // 只有 runtime-negotiated、已验证且具备工具、无状态续传和 SSE 的快照才能
+    // 作为当前配置的 provider 能力证明；native web 若声明支持还必须有可验证来源。
     if snapshot.provider_id != OPENAI_RESPONSES_PROVIDER_ID
         || snapshot.model_id != model
         || snapshot.reasoning_effort != reasoning_effort
@@ -576,8 +574,13 @@ pub enum ModelClient {
     OpenAIResponses(OpenAIResponsesClient),
     Fixture(Value),
     FixtureByPurpose(Arc<Mutex<BTreeMap<String, VecDeque<Value>>>>),
+    /// Immutable Draft/Submit templates, isolated by each request's context.
+    /// Sequence fixtures remain separate for intentional exhaustion/failure tests.
+    FixtureByPurposePhase(Arc<BTreeMap<String, [Value; 2]>>),
     FixtureSequence(Arc<Mutex<VecDeque<Value>>>),
 }
 include!("model_client/client_setup.rs");
 include!("model_client/client_response.rs");
+#[path = "model_client/probe_prompts.rs"]
+mod probe_prompts;
 include!("model_client/capability_probe.rs");

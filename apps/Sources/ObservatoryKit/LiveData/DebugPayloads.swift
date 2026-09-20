@@ -27,6 +27,8 @@ struct DebugNodePayload: Decodable, Identifiable, Sendable {
 }
 
 struct DebugRunPayload: Decodable, Sendable {
+    let inspection: RuntimeInspectionPayload?
+    let research: JSONValue?
     let session: DebugSessionPayload
     let workflow_status: String
     let execution_evidence: String?
@@ -64,8 +66,8 @@ extension ObserverClient {
         return try await debugRequest(path: "v1/debug/runs/\(run)/control", body: body)
     }
 
-    func debugPrepare(session: String, fixture: Bool, purpose: String) async throws -> DebugSessionPayload {
-        try await debugRequest(path: "v1/debug/runs", body: ["session_key": session, "purpose": purpose, "paper_allowed": false, "fixture_controller": fixture])
+    func debugPrepare(session: String, purpose: String) async throws -> DebugSessionPayload {
+        try await debugRequest(path: "v1/debug/runs", body: ["session_key": session, "purpose": purpose, "paper_allowed": false])
     }
 
     func debugFork(run: String, task: String?, reason: String, experimentID: String) async throws -> DebugSessionPayload {
@@ -83,7 +85,7 @@ extension ObserverClient {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
         }
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await ObserverTransportPolicy.session.data(for: request)
         guard let response = response as? HTTPURLResponse else { throw ObserverClientError.invalidResponse }
         guard response.statusCode == 200 else {
             // Debug errors are Core-generated, credential-free diagnostics.

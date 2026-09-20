@@ -443,3 +443,7 @@ pub(super) fn model_tool_definitions(
         })
         .collect()
 }
+
+pub(super) fn submit_tool_description(purpose: &ContractPurpose) -> String {
+    format!("提交最终的 {} Contract 输出供 Rust 校验。Reference objects 只能使用 artifact_id：Rust 会在 canonical validation 前从不可变 Manifest 解析 kind。此操作没有副作用。\n", purpose.as_str())
+}

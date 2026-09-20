@@ -14,45 +14,6 @@ fn push_alert(
     }
 }
 
-/// Explicit TTLs for disposable, non-Paper run purposes.
-///
-/// `None` means retain that purpose indefinitely. Shadow therefore remains
-/// retained by default; Paper is intentionally absent and can never be opted
-/// into deletion.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct RetentionPolicy {
-    pub debug: Option<Duration>,
-    pub position_plan: Option<Duration>,
-    pub paper_dry_run: Option<Duration>,
-    pub replay: Option<Duration>,
-    /// Shadow runs are retained indefinitely unless explicitly configured.
-    pub shadow: Option<Duration>,
-}
-
-/// Deterministic, read-only retention decision that must be revalidated before
-/// it can be applied.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RetentionPlan {
-    pub policy: RetentionPolicy,
-    pub planned_at: DateTime<Utc>,
-    pub event_cursor: i64,
-    pub run_ids: Vec<RunId>,
-    pub artifact_ids: Vec<ArtifactId>,
-    pub blob_hashes: Vec<ContentHash>,
-    pub logical_blob_bytes: u64,
-    pub plan_hash: ContentHash,
-}
-
-/// Rows physically removed by one atomic retention transaction.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RetentionReport {
-    pub plan_hash: ContentHash,
-    pub deleted_runs: u64,
-    pub deleted_artifacts: u64,
-    pub deleted_blobs: u64,
-    pub reclaimed_logical_blob_bytes: u64,
-}
-
 /// Fenced singleton lease for daemon-owned scheduling work. Task attempts use
 /// their own permits; this lease exclusively authorizes session slots and
 /// broker-visible commitment transitions.

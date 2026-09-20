@@ -40,13 +40,16 @@ extension EnvironmentValues {
 
 public enum L10n {
     public static func text(_ source: String, language: AppLanguage) -> String {
+        // 先查稳定字典，再尝试时间/日期等动态格式；未知文案原样返回，避免把缺翻译显示成空字符串。
         guard language.resolved == .simplifiedChinese else { return source }
         return zhHans[source] ?? dynamicZhHans(source) ?? source
     }
 
     private static func dynamicZhHans(_ source: String) -> String? {
+        // 动态规则只处理已知后缀、英文月份和 vs；其它字符串返回 nil 交给原文回退。
         let lower = source.lowercased()
         for (suffix, unit) in [("m ago", "分钟前"), ("h ago", "小时前"), ("d ago", "天前")] {
+            // 只有数值前缀才转换，避免把任意以单位结尾的业务文本误当时间。
             guard lower.hasSuffix(suffix) else { continue }
             let value = lower.dropLast(suffix.count).trimmingCharacters(in: .whitespaces)
             if Int(value) != nil { return "\(value) \(unit)" }
@@ -74,9 +77,19 @@ public enum L10n {
     }
 
     private static let zhHans: [String: String] = [
+        "Sealing has not been confirmed for this horizon": "该期限尚未确认封存",
+        "Run Details": "运行详情", "Claim": "研究主张", "Pending": "等待完成",
+        "Workflow completion rate": "流程完成率", "No data": "暂无数据",
+        "No active run": "暂无运行", "Market unknown": "市场状态未知",
+        "Research analysis": "研究分析", "Research memo": "研究文本",
+        "Model output": "模型输出", "Validated output": "校验反馈",
+        "Model summary": "模型摘要",
+        "Debug Control Changed": "调度控制已更新", "Debug Acceptance Recorded": "验收记录已保存",
+        "Outcome Worker Enqueued": "已安排后续评估", "Sealed outcome evidence available": "已有该期限的封存证据",
+
         "Overview": "总览", "Workflow": "工作流", "Intelligence": "智能议会",
         "Portfolio": "投资组合", "Outcome": "结果观测", "Learning": "学习",
-        "Run Archive": "运行归档", "Scenario Gallery": "场景库", "Settings": "设置",
+        "Run Archive": "运行归档", "Settings": "设置",
         "Live Overview": "运行总览", "Workflow Journey": "工作流旅程",
         "Intelligence Council": "智能议会", "Portfolio Performance": "组合表现",
         "Outcome Horizons": "结果期限", "Learning & Experience": "学习与经验",

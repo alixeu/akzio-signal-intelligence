@@ -49,6 +49,7 @@ pub mod artifact;
 pub mod behavior;
 pub mod canary;
 pub mod context;
+pub mod context_scope;
 pub mod contract;
 pub mod debug;
 pub mod decision;
@@ -67,11 +68,13 @@ pub mod release;
 pub mod research;
 pub mod runtime_manifest;
 pub mod workflow;
+pub mod workflow_definition;
 
 pub use artifact::*;
 pub use behavior::*;
 pub use canary::*;
 pub use context::*;
+pub use context_scope::*;
 pub use contract::*;
 pub use core::*;
 pub use debug::*;
@@ -95,6 +98,7 @@ pub use research::*;
 pub use runtime_manifest::*;
 pub use schema::FactorLimits;
 pub use workflow::*;
+pub use workflow_definition::*;
 
 /// Formal schema identity for the source-incompatible domain graph.
 pub const DOMAIN_SCHEMA_VERSION: u32 = schema::SCHEMA_VERSION;
@@ -115,3 +119,6 @@ pub fn estimate_json_tokens<T: serde::Serialize>(value: &T) -> Result<u32, serde
     let bytes = serde_json::to_vec(value)?.len() as u64;
     Ok(estimate_tokens_from_bytes(bytes))
 }
+
+pub mod research_review;
+pub use research_review::*;

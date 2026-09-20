@@ -298,20 +298,13 @@ impl OfficialInstrumentEvidenceTransport {
                 )
             }
             Asset::Tqqq => {
-                let document = self.fetch(PROSHARES_PAGE).await?;
-                let text = String::from_utf8_lossy(&document.body);
+                let mut document = self.fetch(PROSHARES_PAGE).await?;
+                let (text, effective) = proshares_product_version(&mut document, cutoff)?;
                 if !text.contains("TQQQ") || !text.contains("Nasdaq-100 Index") {
                     return Err(EvidenceAdapterError::DataQuality(
                         "ProShares page does not prove TQQQ benchmark".into(),
                     ));
                 }
-                let effective = latest_as_of_date(&text, cutoff.date_naive())
-                    .or_else(|| document.available_at.map(|value| value.date_naive()))
-                    .ok_or_else(|| {
-                        EvidenceAdapterError::DataQuality(
-                            "ProShares index metadata has no as-of date".into(),
-                        )
-                    })?;
                 (
                     document,
                     effective,
@@ -378,8 +371,8 @@ impl OfficialInstrumentEvidenceTransport {
     ) -> Result<AcquiredEvidence, EvidenceAdapterError> {
         let (document, effective_as_of, benchmark_index, multiple, text) = match asset {
             Asset::Tqqq => {
-                let document = self.fetch(PROSHARES_PAGE).await?;
-                let text = String::from_utf8_lossy(&document.body).into_owned();
+                let mut document = self.fetch(PROSHARES_PAGE).await?;
+                let (text, effective) = proshares_product_version(&mut document, cutoff)?;
                 if !text.contains("TQQQ")
                     || !text.contains("daily investment results")
                     || !text.contains("3x")
@@ -389,13 +382,6 @@ impl OfficialInstrumentEvidenceTransport {
                         "ProShares leverage terms are incomplete".into(),
                     ));
                 }
-                let effective = latest_as_of_date(&text, cutoff.date_naive())
-                    .or_else(|| document.available_at.map(|value| value.date_naive()))
-                    .ok_or_else(|| {
-                        EvidenceAdapterError::DataQuality(
-                            "ProShares leverage terms have no as-of date".into(),
-                        )
-                    })?;
                 (document, effective, "Nasdaq-100 Index", 3_u8, text)
             }
             Asset::Soxl => {
@@ -547,6 +533,47 @@ fn validate_effective_date(
         )));
     }
     Ok(())
+}
+
+fn proshares_product_version(
+    document: &mut HttpDocument,
+    cutoff: DateTime<Utc>,
+) -> Result<(String, NaiveDate), EvidenceAdapterError> {
+    let invalid = |message: &str| EvidenceAdapterError::DataQuality(message.into());
+    if let Ok(value) = serde_json::from_slice::<Value>(&document.body) {
+        if value.get("fundSymbol").and_then(Value::as_str) != Some("TQQQ")
+            || value.get("status").and_then(Value::as_str) != Some("Published")
+        {
+            return Err(invalid(
+                "ProShares product identity or publication status mismatch",
+            ));
+        }
+        let saved = value
+            .get("saved")
+            .and_then(Value::as_str)
+            .and_then(|v| DateTime::parse_from_rfc3339(v).ok())
+            .map(|v| v.with_timezone(&Utc))
+            .ok_or_else(|| invalid("ProShares product JSON has no saved revision timestamp"))?;
+        if saved > cutoff {
+            return Err(invalid(
+                "ProShares product revision is after research cutoff",
+            ));
+        }
+        let description = value
+            .get("description")
+            .and_then(Value::as_str)
+            .filter(|v| !v.trim().is_empty())
+            .ok_or_else(|| invalid("ProShares product JSON has no description"))?;
+        // The issuer's content revision dates this product description. The
+        // HTTP response Date is retrieval time, not the product version.
+        document.available_at = Some(saved);
+        return Ok((format!("TQQQ: {description}"), saved.date_naive()));
+    }
+    let text = String::from_utf8_lossy(&document.body).into_owned();
+    let effective = latest_as_of_date(&text, cutoff.date_naive())
+        .or_else(|| document.available_at.map(|v| v.date_naive()))
+        .ok_or_else(|| invalid("ProShares product page has no as-of date"))?;
+    Ok((text, effective))
 }
 
 fn parse_invesco_holdings(
@@ -716,7 +743,7 @@ fn parse_direxion_holdings(
         .first()
         .and_then(|row| row.get("TradeDate"))
         .and_then(Value::as_str)
-        .and_then(|value| parse_mdy_date(value))
+        .and_then(parse_mdy_date)
         .ok_or_else(|| {
             EvidenceAdapterError::DataQuality("Direxion holdings missing TradeDate".into())
         })?;
@@ -822,7 +849,7 @@ fn latest_as_of_date(text: &str, cutoff: NaiveDate) -> Option<NaiveDate> {
         while let Some(index) = text[start..].find(marker) {
             let begin = start + index + marker.len();
             let candidate = text[begin..]
-                .split(|character: char| matches!(character, '<' | '>' | '\n' | '\r' | '"' | '.'))
+                .split(['<', '>', '\n', '\r', '"', '.'])
                 .next()
                 .unwrap_or_default()
                 .trim();
@@ -854,6 +881,43 @@ fn latest_as_of_date(text: &str, cutoff: NaiveDate) -> Option<NaiveDate> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn proshares_json_uses_content_revision_not_next_day_response_date() {
+        use super::*;
+        let cutoff = DateTime::parse_from_rfc3339("2026-09-23T03:55:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let payload = json!({"fundSymbol":"TQQQ","status":"Published","saved":"2026-08-14T17:25:41Z",
+            "description":"daily investment results: three times (3x) the Nasdaq-100 Index"});
+        let mut doc = HttpDocument {
+            url: PROSHARES_PAGE.into(),
+            body: serde_json::to_vec(&payload).unwrap(),
+            media_type: "application/json".into(),
+            revision: Some("etag".into()),
+            available_at: Some(cutoff),
+        };
+        let (text, effective) = proshares_product_version(&mut doc, cutoff).unwrap();
+        assert!(text.contains("TQQQ"));
+        assert_eq!(effective.to_string(), "2026-08-14");
+        assert_eq!(
+            doc.available_at.unwrap().to_rfc3339(),
+            "2026-08-14T17:25:41+00:00"
+        );
+        validate_effective_date(
+            effective,
+            NaiveDate::from_ymd_opt(2026, 9, 22).unwrap(),
+            cutoff,
+        )
+        .unwrap();
+        let mut changed = payload.clone();
+        changed["saved"] = json!("2026-09-23T04:00:00Z");
+        doc.body = serde_json::to_vec(&changed).unwrap();
+        assert!(proshares_product_version(&mut doc, cutoff).is_err());
+        changed = payload;
+        changed["fundSymbol"] = json!("OTHER");
+        doc.body = serde_json::to_vec(&changed).unwrap();
+        assert!(proshares_product_version(&mut doc, cutoff).is_err());
+    }
     use super::*;
 
     #[test]

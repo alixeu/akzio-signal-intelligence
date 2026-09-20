@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AgentSettings {
+    pub research: crate::ResearchSettings,
     pub budget: AgentBudgetConfig,
 }
 
@@ -13,7 +14,6 @@ pub struct AgentSettings {
 #[serde(default, deny_unknown_fields)]
 pub struct AgentBudgetConfig {
     pub default: BudgetOverride,
-    pub planner: BudgetOverride,
     pub analyst: BudgetOverride,
     pub critic: BudgetOverride,
     pub synthesizer: BudgetOverride,
@@ -40,6 +40,14 @@ impl BudgetOverride {
                 return Err(DomainError::InvalidBudget { field });
             }
         }
+        if self
+            .max_output_tokens
+            .is_some_and(|value| value > MAX_AGENT_OUTPUT_TOKENS)
+        {
+            return Err(DomainError::InvalidBudget {
+                field: "agent.budget.max_output_tokens",
+            });
+        }
         // Zero read tools is a valid governance policy; submit_result is separate.
         Ok(())
     }
@@ -59,18 +67,17 @@ impl BudgetOverride {
     }
 }
 
-pub const AGENT_ROLES: [(&str, &str); 5] = [
-    ("planner", "research.planner"),
+pub const AGENT_ROLES: [(&str, &str); 4] = [
     ("analyst", "research.analyst"),
     ("critic", "research.critic"),
     ("synthesizer", "research.synthesizer"),
     ("outcome_worker", "learning.outcome_worker"),
 ];
 
-/// New Attempts need enough cumulative output for a Critic Draft, one Submit,
-/// and one bounded semantic repair.  Historical Agent Contracts keep their
-/// original numeric budget and hash through `legacy_contract_budget`.
-pub const NEW_CRITIC_OUTPUT_TOKENS: u32 = 16_000;
+/// Application output ceiling for newly configured tasks. This is neither an
+/// input-token budget nor a provider context-window declaration.
+pub const MAX_AGENT_OUTPUT_TOKENS: u32 = 1_000_000;
+pub const OUTPUT_BUDGET_RESEARCH_CONTRACT_VERSION: u32 = 49;
 
 /// Immutable legacy Contract defaults; preserve existing hashes and ContextPolicy.
 pub fn legacy_contract_budget(purpose: &str) -> Option<TaskBudget> {
@@ -90,13 +97,41 @@ pub fn legacy_contract_budget(purpose: &str) -> Option<TaskBudget> {
     })
 }
 
+/// Contract 49 changes only the research output dimension. Historical Contract
+/// objects keep their original serialized budgets; ContextPolicy is separate.
+pub fn versioned_contract_budget(purpose: &str) -> Option<TaskBudget> {
+    let purpose = if purpose == "research.proposal_reviewer" {
+        "research.critic"
+    } else {
+        purpose
+    };
+    let (input, output, tools, timeout) = match purpose {
+        "research.analyst" | "research.critic" => (48_000, MAX_AGENT_OUTPUT_TOKENS, 4, 120),
+        "research.synthesizer" => (48_000, MAX_AGENT_OUTPUT_TOKENS, 2, 120),
+        "learning.outcome_worker" => (12_000, 4_000, 2, 180),
+        _ => return None,
+    };
+    Some(TaskBudget {
+        max_input_tokens: input,
+        max_output_tokens: output,
+        max_tool_calls: ToolCallLimit::Limited(tools),
+        max_wall_time_secs: timeout,
+    })
+}
+
 /// Defaults for newly created Runs, independent of immutable Contract defaults.
 pub fn default_agent_budget(purpose: &str) -> Option<TaskBudget> {
-    let mut budget = legacy_contract_budget(purpose)?;
+    let mut budget = versioned_contract_budget(purpose)?;
     budget.max_input_tokens = 1_000_000;
     budget.max_tool_calls = ToolCallLimit::Unlimited;
-    if purpose == "research.critic" {
-        budget.max_output_tokens = NEW_CRITIC_OUTPUT_TOKENS;
+    // Real structured research exhausted 120s both while waiting for Critic
+    // and while repairing an Analyst submission. Give new research Runs one
+    // bounded 180s Attempt; existing serialized budgets remain unchanged.
+    if matches!(
+        purpose,
+        "research.analyst" | "research.critic" | "research.synthesizer"
+    ) {
+        budget.max_wall_time_secs = 180;
     }
     Some(budget)
 }
@@ -105,7 +140,6 @@ impl AgentBudgetConfig {
     pub fn validate(&self) -> Result<(), DomainError> {
         for value in [
             &self.default,
-            &self.planner,
             &self.analyst,
             &self.critic,
             &self.synthesizer,
@@ -117,14 +151,17 @@ impl AgentBudgetConfig {
     }
     pub fn resolve(&self, purpose: &str) -> Option<TaskBudget> {
         let role = match purpose {
-            "research.planner" => &self.planner,
             "research.analyst" => &self.analyst,
-            "research.critic" => &self.critic,
+            "research.critic" | "research.proposal_reviewer" => &self.critic,
             "research.synthesizer" => &self.synthesizer,
             "learning.outcome_worker" => &self.outcome_worker,
             _ => return None,
         };
-        let mut budget = default_agent_budget(purpose)?;
+        let mut budget = default_agent_budget(if purpose == "research.proposal_reviewer" {
+            "research.critic"
+        } else {
+            purpose
+        })?;
         self.default.apply(&mut budget);
         role.apply(&mut budget);
         Some(budget)
@@ -132,6 +169,7 @@ impl AgentBudgetConfig {
     pub fn resolved(&self) -> BTreeMap<String, TaskBudget> {
         AGENT_ROLES
             .into_iter()
+            .chain([("proposal_reviewer", "research.proposal_reviewer")])
             .map(|(_, purpose)| {
                 (
                     purpose.to_owned(),
@@ -197,6 +235,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn research_output_defaults_allow_a_million_with_role_appropriate_timeouts() {
+        for (_, purpose) in AGENT_ROLES {
+            let legacy = legacy_contract_budget(purpose).unwrap();
+            let budget = default_agent_budget(purpose).unwrap();
+            assert_eq!(budget.max_input_tokens, 1_000_000);
+            assert_eq!(budget.max_tool_calls, ToolCallLimit::Unlimited);
+            assert_eq!(
+                budget.max_wall_time_secs,
+                if matches!(
+                    purpose,
+                    "research.analyst" | "research.critic" | "research.synthesizer"
+                ) {
+                    180
+                } else {
+                    legacy.max_wall_time_secs
+                }
+            );
+            assert_eq!(
+                budget.max_output_tokens,
+                if purpose.starts_with("research.") {
+                    1_000_000
+                } else {
+                    4_000
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn output_override_rejects_more_than_the_application_ceiling() {
+        for limit in [1, 1_000_000] {
+            let mut settings = AgentBudgetConfig::default();
+            settings.default.max_output_tokens = Some(limit);
+            assert!(settings.validate().is_ok());
+        }
+        for limit in [0, 1_000_001, u32::MAX] {
+            let mut settings = AgentBudgetConfig::default();
+            settings.critic.max_output_tokens = Some(limit);
+            assert!(settings.validate().is_err(), "output {limit}");
+        }
+    }
+
+    #[test]
+    fn versioned_contract_changes_only_research_output() {
+        for (_, purpose) in AGENT_ROLES {
+            let mut expected = legacy_contract_budget(purpose).unwrap();
+            if purpose.starts_with("research.") {
+                expected.max_output_tokens = 1_000_000;
+            }
+            assert_eq!(versioned_contract_budget(purpose).unwrap(), expected);
+        }
+    }
+
+    #[test]
     fn new_critic_budget_is_distinct_from_legacy_contract_budget() {
         assert_eq!(
             legacy_contract_budget("research.critic")
@@ -208,11 +300,15 @@ mod tests {
             default_agent_budget("research.critic")
                 .expect("registered Critic role")
                 .max_output_tokens,
-            16_000
+            1_000_000
         );
 
         let mut settings = AgentBudgetConfig::default();
         settings.critic.max_output_tokens = Some(16_000);
+        assert_eq!(
+            settings.resolve("research.proposal_reviewer"),
+            settings.resolve("research.critic")
+        );
         assert_eq!(
             settings
                 .resolve("research.critic")

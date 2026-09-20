@@ -6,9 +6,13 @@ impl Daemon {
         request: PaperApprovalRequest,
     ) -> Result<PaperApprovalResponse> {
         request.identity.validate()?;
-        if !self.paper.auto_paper && !self.debug_enabled() {
+        if !(self.paper.auto_paper
+            || self.debug_enabled()
+            || (self.paper.paper_broker.is_some() && self.paper.runtime_identity_hash.is_some()))
+        {
             return Err(DaemonError::InvalidInput(
-                "Paper approval requires Paper scheduling or an isolated Debug Core".to_owned(),
+                "Paper approval requires a configured Paper runtime or an isolated Debug Core"
+                    .to_owned(),
             ));
         }
         let expected_identity_hash =
@@ -228,67 +232,10 @@ impl Daemon {
         ))
     }
 
-    /// Paper sessions are scheduler-owned and require a frozen session slot.
-    /// The R5 daemon does not construct one directly, so this public submit
-    /// surface rejects Paper before any workflow or broker side effect.
-    pub fn submit_default(&self, purpose: RunPurpose) -> Result<RunId> {
-        if self.debug_enabled() {
-            return Err(DaemonError::InvalidInput(
-                "use debug prepare on an isolated Debug Core".into(),
-            ));
-        }
-        match purpose {
-            RunPurpose::Debug | RunPurpose::PositionPlan | RunPurpose::PaperDryRun => {}
-            RunPurpose::Paper => {
-                return Err(DaemonError::InvalidInput(
-                    "Paper runs are scheduler-owned and unavailable until the fenced scheduler is wired"
-                        .to_owned(),
-                ));
-            }
-            RunPurpose::Replay | RunPurpose::Shadow => {
-                return Err(DaemonError::InvalidInput(
-                    "Replay and Shadow runs must be created by their owning runtimes".to_owned(),
-                ));
-            }
-        }
-
-        if purpose == RunPurpose::PositionPlan {
-            let now = Utc::now();
-            let session_key = now
-                .with_timezone(&chrono_tz::America::New_York)
-                .date_naive()
-                .to_string();
-            let (workflow, setup) = self.prepare_position_plan(&session_key, now)?;
-            self.store.commit_position_plan(&workflow, &setup)?;
-            return Ok(workflow.run.run_id);
-        }
-        let run_id = RunId::new();
-        let graph = self.workflow.bootstrap(purpose, "active")?;
-        self.workflow
-            .submit(run_id.clone(), purpose, graph, Utc::now())?;
-        Ok(run_id)
-    }
-
     pub async fn run_one(&self, worker_id: &str) -> Result<bool> {
-        self.run_one_with_task_clock(worker_id, |_| Utc::now())
-            .await
-    }
-
-    pub(crate) async fn run_one_with_task_clock<F>(
-        &self,
-        worker_id: &str,
-        now_for_task: F,
-    ) -> Result<bool>
-    where
-        F: FnOnce(&ClaimedAttempt) -> DateTime<Utc>,
-    {
-        let daemon = self.clone();
         Ok(self
             .task_runtime
-            .run_one(worker_id, move |task| async move {
-                let now = now_for_task(&task);
-                daemon.execute_task_at(task, now).await
-            })
+            .execute_ready_node(worker_id, akzio_store::TaskWorkload::Any, self)
             .await?)
     }
 }

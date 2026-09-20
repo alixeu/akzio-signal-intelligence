@@ -32,11 +32,6 @@ public enum ChartAnimation {
         policy.resolve(.smooth(duration: 0.35))
     }
 
-    /// Latest point highlight: one soft diffusion, then it stops.
-    public static func latestPointBloom(_ policy: MotionPolicy) -> Animation {
-        policy.resolve(.easeOut(duration: 0.55))
-    }
-
     /// Bars/ratios slide from their old value instead of snapping.
     public static func barShift(_ policy: MotionPolicy) -> Animation {
         policy.resolve(.smooth(duration: 0.42))

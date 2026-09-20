@@ -151,10 +151,6 @@ pub enum GovernedResource {
     NewsWeb {
         query: String,
     },
-    LegacyFixture {
-        source: EvidenceSource,
-        resource: String,
-    },
 }
 
 impl GovernedResource {
@@ -239,12 +235,6 @@ impl GovernedResource {
                         "%Y-%m-%d",
                     )
                     .map_err(|_| EvidenceRuntimeError::InvalidRequest)?,
-                });
-            }
-            "quote" | "bars" => {
-                return Ok(Self::LegacyFixture {
-                    source: EvidenceSource::Alpaca,
-                    resource: resource.to_owned(),
                 });
             }
             _ => {}
@@ -773,8 +763,8 @@ mod adapters;
 pub(crate) use adapters::classify_evidence_response;
 pub use adapters::validate_outcome_price_window;
 pub use adapters::{
-    AlpacaMarketDataFeed, AlpacaPaperEvidenceTransport, AsyncEvidenceAdapter, EvidenceAdapter,
-    EvidenceAdapterError, FixtureEvidenceAdapter, NativeWebFailureKind,
+    AlpacaMarketDataFeed, AlpacaOptionDataFeed, AlpacaPaperEvidenceTransport, AsyncEvidenceAdapter,
+    EvidenceAdapter, EvidenceAdapterError, FixtureEvidenceAdapter, NativeWebFailureKind,
 };
 
 pub fn model_native_web_evidence_transport(
@@ -831,3 +821,20 @@ pub struct EvidenceRuntime {
 }
 include!("materialization/materialize_raw.rs");
 include!("materialization/materialize_normalized.rs");
+
+#[cfg(test)]
+mod retired_resource_tests {
+    use super::*;
+    #[test]
+    fn bare_fixture_resources_are_rejected() {
+        for resource in ["quote", "bars"] {
+            assert!(GovernedResource::parse(EvidenceSource::Alpaca, resource).is_err());
+        }
+        assert!(GovernedResource::parse(EvidenceSource::Alpaca, "quote:QQQ").is_ok());
+        assert!(GovernedResource::parse(
+            EvidenceSource::Alpaca,
+            "bars:QQQ:1d:2026-09-01:20:raw:2026-09-22"
+        )
+        .is_ok());
+    }
+}

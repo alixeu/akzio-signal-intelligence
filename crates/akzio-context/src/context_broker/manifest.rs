@@ -1,4 +1,6 @@
 impl ContextBroker {
+    // 按角色从已经取到的候选 Artifact 中计算不可缺少的输入闭包。这个函数只做
+    // Context 完整性校验：它不会抓取新数据，也不会把提案或 Review 视为 Decision。
     fn required_role_inputs(
         &self,
         contract: &AgentContract,
@@ -11,6 +13,8 @@ impl ContextBroker {
         };
         let mut required = BTreeSet::new();
         if purpose == akzio_domain::LEARNING_OUTCOME_WORKER_RECIPE_ID {
+            // Outcome Worker 需要 Decision/Execution 上下文、OutcomeSchedule 及阶段包，
+            // 并额外追踪 DecisionContext 中声明的 Claim/Critique 引用。
             for kind in [
                 ArtifactKind::Decision,
                 ArtifactKind::DecisionContext,
@@ -33,6 +37,8 @@ impl ContextBroker {
                 .find(|a| a.kind == ArtifactKind::DecisionContext)
                 .expect("required above");
             let value: Value = self.read_payload(context)?;
+            // DecisionContext 的引用必须同时存在于当前候选集合，避免只凭 JSON 中的
+            // ArtifactRef 把未进入本次 Context 的材料变成隐含输入。
             for key in ["claims", "critiques"] {
                 let refs: Vec<ArtifactRef> = serde_json::from_value(
                     value
@@ -61,8 +67,10 @@ impl ContextBroker {
             );
         } else if matches!(
             purpose,
-            RESEARCH_CRITIC_RECIPE_ID | RESEARCH_SYNTHESIZER_RECIPE_ID
+            RESEARCH_CRITIC_RECIPE_ID | RESEARCH_SYNTHESIZER_RECIPE_ID | akzio_domain::RESEARCH_PROPOSAL_REVIEWER_RECIPE_ID
         ) {
+            // 研究角色先纳入 Claim/Critique，再验证它们的 source_refs；Claim 的依据
+            // 必须直接进入必需集合，Critique 的嵌套依据在新 Contract 下也必须闭合。
             for artifact in artifacts
                 .iter()
                 .filter(|a| matches!(a.kind, ArtifactKind::Claim | ArtifactKind::Critique))
@@ -89,10 +97,29 @@ impl ContextBroker {
                     // their compact evidence projections are optional model
                     // inputs so Synthesizer context cannot be exhausted by
                     // repeating every nested semantic detail.
-                    if artifact.kind == ArtifactKind::Claim {
+                    if artifact.kind == ArtifactKind::Claim || contract.version >= akzio_domain::REVIEWED_RESEARCH_CONTRACT_VERSION {
                         required.insert(reference.artifact_id);
                     }
                 }
+            }
+        }
+        if contract.version >= akzio_domain::REVIEWED_RESEARCH_CONTRACT_VERSION {
+            // Reviewed research 还必须携带最终提案、ProposalReview、补采结果及提案
+            // 的 numeric/evidence basis；ProposalReviewer 只能面对一个 final proposal。
+            required.extend(artifacts.iter().filter(|a| matches!(a.kind, ArtifactKind::DecisionProposal | ArtifactKind::ProposalReview) || a.producer == "research.supplement.result").map(|a| a.artifact_id.clone()));
+            for artifact in artifacts.iter().filter(|a| a.kind == ArtifactKind::DecisionProposal) {
+                let proposal: akzio_domain::DecisionDraft = self.read_payload(artifact)?;
+                for reference in proposal.claims.iter().chain(&proposal.critiques)
+                    .chain(proposal.numeric_basis.iter().flat_map(|b| &b.inputs))
+                    .chain(proposal.research_allocation.iter().flat_map(|p| &p.allocations).flat_map(|a| &a.evidence_refs)) {
+                    if !artifacts.iter().any(|a| a.artifact_id == reference.artifact_id && a.kind == reference.kind) {
+                        return Err(missing(format!("proposal basis {}", reference.artifact_id)));
+                    }
+                    required.insert(reference.artifact_id.clone());
+                }
+            }
+            if purpose == akzio_domain::RESEARCH_PROPOSAL_REVIEWER_RECIPE_ID && artifacts.iter().filter(|a| a.kind == ArtifactKind::DecisionProposal).count() != 1 {
+                return Err(missing("exactly one final proposal".into()));
             }
         }
         Ok(required)
@@ -102,6 +129,9 @@ impl ContextBroker {
         permit: &TaskWritePermit,
         candidates: &mut Vec<ArtifactRef>,
     ) -> ContextResult<()> {
+        // Synthesizer 的候选中若有来自 ContextManifest 的 Critique，则把其被审查的
+        // Claim 一并加入候选；加入前验证同 Run、同 Contract 和源 Manifest 的选择闭包，
+        // 不允许借 Critique 引用扩大到未授权材料。
         let critiques = candidates
             .iter()
             .filter(|reference| reference.kind == ArtifactKind::Critique)
@@ -181,6 +211,8 @@ impl ContextBroker {
         Ok(())
     }
 
+    // ContextBroker 只持有 Store 句柄；构造本身不打开数据库、不创建 Manifest，也不
+    // 产生任何研究或执行状态。
     pub fn new(store: Store) -> Self {
         Self { store }
     }
@@ -194,6 +226,8 @@ impl ContextBroker {
         manifest: &ContextManifest,
         now: DateTime<Utc>,
     ) -> ContextResult<Vec<ArtifactRef>> {
+        // 返回 Manifest 闭包中实际影响当前 Context 的 Experience/CandidatePolicy 引用；
+        // 当前 Policy head 会在使用时重验，返回该列表不等于激活或修改 Policy。
         self.policy_influences_internal(permit, contract, manifest, now, true)
     }
 
@@ -205,6 +239,9 @@ impl ContextBroker {
         now: DateTime<Utc>,
         require_live_grant: bool,
     ) -> ContextResult<Vec<ArtifactRef>> {
+        // 重新核对内存 Manifest 与 Store 中的 Artifact/payload、Contract、来源、预算和
+        // grant 闭包。require_live_grant=false 仅供成功父 Attempt 的历史证明路径，仍不
+        // 放宽 persisted Manifest 的身份与内容校验。
         contract.validate()?;
         if !manifest.grant.matches_permit(permit)
             || manifest.grant.contract_hash != contract.contract_hash
@@ -212,6 +249,12 @@ impl ContextBroker {
             || (require_live_grant && manifest.grant.expires_at <= now)
         {
             return Err(ContextError::InvalidManifestClosure);
+        }
+
+        if require_live_grant {
+            // A grant's TTL does not outlive the attempt authority which minted
+            // it. Historical succeeded-parent proofs use the separate path.
+            self.store.validate_task_permit(permit)?;
         }
 
         let persisted = self.store.artifact(&manifest.grant.manifest_artifact_id)?;
@@ -247,6 +290,8 @@ impl ContextBroker {
         let mut projected_bytes = 0_u64;
         let mut estimated_tokens = 0_u32;
         for selection in &persisted_payload.selections {
+            // 每个选择都重新读取并计算 projection budget，防止 payload 中篡改 token/byte
+            // 计数；selected/readable 也必须是一一对应且不重复的 ArtifactId。
             if !readable.insert(selection.artifact.artifact_id.clone()) {
                 return Err(ContextError::InvalidManifestClosure);
             }
@@ -310,6 +355,8 @@ impl ContextBroker {
             return Err(ContextError::InvalidManifestClosure);
         }
 
+        // 返回排序后的精确引用供 policy_influences 或子任务闭包继续使用；这里没有
+        // Store 写入，也没有对 DecisionGate/ExecutionGate 作任何结论。
         Ok(selected)
     }
 
@@ -321,6 +368,8 @@ impl ContextBroker {
         now: DateTime<Utc>,
         require_live_grant: bool,
     ) -> ContextResult<Vec<ArtifactRef>> {
+        // 先完整验证 Manifest，再只筛出已验证且当前 overlay head 允许的学习影响；
+        // 该读取路径不会创建 CandidatePolicy，也不会改变 active head。
         let selected =
             self.validate_manifest_closure(permit, contract, manifest, now, require_live_grant)?;
         let mut influences = Vec::new();
@@ -345,30 +394,45 @@ impl ContextBroker {
     /// Build context from an explicit candidate set only. There is intentionally no
     /// `documents_for_run` fallback: a task's data surface is reproducible from the
     /// manifest and source closure alone.
+    #[allow(clippy::too_many_arguments)]
     pub fn assemble(
         &self,
         permit: &TaskWritePermit,
         contract: &AgentContract,
+        query_scope: &ContextQueryScope,
         candidates: impl IntoIterator<Item = ArtifactRef>,
         now: DateTime<Utc>,
         grant_ttl: Duration,
     ) -> ContextResult<ContextManifest> {
+        // 输入候选必须由调用方显式提供；其余材料只来自同一 Store 中受 Contract、Run
+        // 和 overlay 规则约束的 Lesson/Experience。assemble 的成功结果只是 Context
+        // Manifest + ReadGrant，不代表研究提案已通过、更不代表 Decision/Execution。
         contract.validate()?;
         let policy = &contract.context;
         let mut seen = BTreeSet::new();
         let mut candidate_refs = candidates.into_iter().collect::<Vec<_>>();
         if contract.purpose.as_str() == RESEARCH_SYNTHESIZER_RECIPE_ID {
+            // Synthesizer 需要闭合 Critique 所审查的 Claim，但闭合仍受父 Manifest
+            // provenance 校验，不是对任意 source_ref 的递归放权。
             self.extend_synthesizer_critique_targets(permit, &mut candidate_refs)?;
         }
-        let learning_scope = self.infer_learning_scope(&candidate_refs)?;
-        candidate_refs.extend(self.learning_candidates(policy, &learning_scope, now)?);
+        let learning_scope = self.learning_query_scope(permit, policy, query_scope, &candidate_refs)?;
+        let learning = self.learning_candidates(permit, policy, &learning_scope, now)?;
+        // Lesson/Experience 是从 Store 召回的辅助上下文；召回审计与重验建议都是
+        // RunScoped 观察，不能把学习材料写成已激活的 CandidatePolicy。
+        self.suggest_lesson_revalidation(permit, &learning, &candidate_refs, now)?;
+        candidate_refs.extend(learning);
         let artifacts = candidate_refs
             .into_iter()
             .filter(|reference| seen.insert(reference.artifact_id.clone()))
             .map(|reference| self.store.artifact(&reference.artifact_id))
             .collect::<Result<Vec<_>, _>>()?;
+        let observed_candidates = artifacts.clone();
+        let mut exclusion_reasons = std::collections::BTreeMap::new();
         let mut eligible = Vec::with_capacity(artifacts.len());
         for artifact in artifacts {
+            // 先做 producer/kind、RawEvidence、Contract allowlist 和 source family 过滤；
+            // 通过后再检查 overlay 与 Run 归属，所有排除原因仅用于后续 coverage 审计。
             if !governed_internal_source(&artifact)
                 || artifact.kind == ArtifactKind::RawEvidence
                 || !policy.permitted_kinds.contains(&artifact.kind)
@@ -377,6 +441,7 @@ impl ContextBroker {
                         .permitted_source_families
                         .contains(&artifact.provenance.source_family))
             {
+                exclusion_reasons.insert(artifact.artifact_id.clone(), "contract_or_source_excluded");
                 continue;
             }
             if self.overlay_is_eligible(&artifact)? {
@@ -399,10 +464,22 @@ impl ContextBroker {
                 };
                 self.assert_context_run(permit, &artifact)?;
                 eligible.push(artifact);
+            } else {
+                // overlay 资格来自可变 Policy head，当前候选不满足时只排除本次读取，
+                // 不修改该 head，也不把失败解释成研究或执行失败。
+                exclusion_reasons.insert(artifact.artifact_id.clone(), "overlay_ineligible");
             }
         }
         let (mut artifacts, quarantined) = self.partition_untrusted_context(eligible)?;
-        let analyst_bundle = if contract.purpose.as_str() == RESEARCH_ANALYST_RECIPE_ID {
+        // 不可信证据仍可作为候选，但含指令样/金融风险指标的材料进入 quarantine，
+        // 不会进入模型选择；quarantined 记录随 Manifest 保留，便于审计而非当作输入。
+        let eligible_ids = artifacts.iter().map(|a| a.artifact_id.clone()).collect::<BTreeSet<_>>();
+        for candidate in &observed_candidates {
+            if !eligible_ids.contains(&candidate.artifact_id) {
+                exclusion_reasons.entry(candidate.artifact_id.clone()).or_insert("quarantined_or_replaced_by_projection");
+            }
+        }
+        let analyst_bundle = if matches!(contract.purpose.as_str(), RESEARCH_ANALYST_RECIPE_ID | RESEARCH_SYNTHESIZER_RECIPE_ID) {
             self.select_analyst_bundle(&artifacts, policy)?
         } else {
             None
@@ -410,7 +487,7 @@ impl ContextBroker {
         let mut directly_referenced = BTreeSet::new();
         if matches!(
             contract.purpose.as_str(),
-            RESEARCH_CRITIC_RECIPE_ID | RESEARCH_SYNTHESIZER_RECIPE_ID
+            RESEARCH_CRITIC_RECIPE_ID | RESEARCH_SYNTHESIZER_RECIPE_ID | akzio_domain::RESEARCH_PROPOSAL_REVIEWER_RECIPE_ID
         ) {
             for artifact in &artifacts {
                 match artifact.kind {
@@ -457,6 +534,8 @@ impl ContextBroker {
         });
 
         if let Some(bundle) = analyst_bundle {
+            // Balanced bundle 只改变排序优先级，后续仍统一经过必需集合和预算循环；
+            // 它不绕过 max_artifacts/max_bytes/max_tokens。
             let bundle_ids = bundle
                 .iter()
                 .map(|artifact| artifact.artifact_id.clone())
@@ -477,6 +556,8 @@ impl ContextBroker {
         let mut estimated_tokens = 0_u32;
         let mut selections = Vec::new();
         for artifact in artifacts {
+            // 必需输入优先但仍受三类预算和 Artifact 数量上限约束；可选材料超限时跳过，
+            // 必需材料超限则返回 MissingRequiredInput，避免形成看似成功但闭包不完整的上下文。
             let (projected, tokens) = self.projection_budget(&artifact)?;
             let next_source_bytes = total_bytes.saturating_add(artifact.blob.bytes);
             let next_projected_bytes = projected_bytes.saturating_add(projected);
@@ -486,6 +567,9 @@ impl ContextBroker {
                 || next_projected_bytes > policy.max_bytes
                 || next_tokens > policy.max_tokens
             {
+                exclusion_reasons.insert(artifact.artifact_id.clone(), if selections.len() >= usize::from(policy.max_artifacts) {
+                    "artifact_budget" } else if next_source_bytes > Self::source_budget(policy) { "source_byte_budget" }
+                    else if next_projected_bytes > policy.max_bytes { "projection_byte_budget" } else { "token_budget" });
                 if required.contains(&artifact.artifact_id) {
                     return Err(ContextError::MissingRequiredInput {
                         purpose: contract.purpose.as_str().to_owned(),
@@ -528,6 +612,8 @@ impl ContextBroker {
         }
         // Artifact bytes are immutable, but overlay eligibility reads the mutable
         // policy head. Re-check selected artifacts immediately before minting the grant.
+        // 这次复核只会缩小 selections；若缩小后低于最小数量，整个 assemble 失败，
+        // 不会提交一个缺少关键材料的 Manifest。
         let mut revalidated = Vec::with_capacity(selections.len());
         total_bytes = 0;
         estimated_tokens = 0;
@@ -535,6 +621,7 @@ impl ContextBroker {
             let artifact = self.store.artifact(&selection.artifact.artifact_id)?;
             self.assert_context_permitted(policy, &artifact)?;
             if !self.overlay_is_eligible(&artifact)? {
+                exclusion_reasons.insert(artifact.artifact_id.clone(), "overlay_changed_before_grant");
                 continue;
             }
             let (projected, tokens) = self.projection_budget(&artifact)?;
@@ -549,27 +636,26 @@ impl ContextBroker {
             return Err(ContextError::BudgetExceeded);
         }
 
-        self.mint_manifest(
+        let manifest = self.mint_manifest(
             permit,
             contract,
             selections,
             total_bytes,
             estimated_tokens,
             quarantined,
-            Vec::new(),
             now,
             grant_ttl,
-        )
+        )?;
+        if contract.version >= akzio_domain::REVIEWED_RESEARCH_CONTRACT_VERSION {
+            // coverage 绑定刚刚铸造的 Manifest，记录组装时观察到的候选和排除原因；它是
+            // 可追溯审计 Artifact，不是 Directional qualification 或 ProposalReview。
+            self.record_context_coverage(permit, &manifest, &observed_candidates, &exclusion_reasons, now)?;
+        }
+        Ok(manifest)
     }
 
     /// Persist a manifest over an already-budgeted selection list and mint its
     /// grant.
-    ///
-    /// `extra_source_refs` records lineage that is not itself a selection — the
-    /// baseline manifest an ablation arm was derived from. Only
-    /// `ArtifactKind::ContextManifest` refs belong there, because
-    /// `validate_manifest_closure` reconstructs the expected `source_refs` as the
-    /// selections plus exactly those.
     #[allow(clippy::too_many_arguments)]
     fn mint_manifest(
         &self,
@@ -579,10 +665,12 @@ impl ContextBroker {
         total_bytes: u64,
         estimated_tokens: u32,
         quarantined: Vec<ContextQuarantine>,
-        extra_source_refs: Vec<ArtifactRef>,
         now: DateTime<Utc>,
         grant_ttl: Duration,
     ) -> ContextResult<ContextManifest> {
+        // selections 已在 assemble 中完成筛选和预算计算，这里再次读取其 Artifact 来
+        // 生成 input_hash、payload 与 source_refs；payload 校验失败或 Store 提交失败时
+        // 不返回内存中的 grant。
         let policy = &contract.context;
         let role_inputs = selections
             .iter()
@@ -628,7 +716,6 @@ impl ContextBroker {
                         .iter()
                         .map(|quarantine| quarantine.artifact.clone()),
                 )
-                .chain(extra_source_refs)
                 .collect(),
             now,
         )?;
@@ -638,6 +725,8 @@ impl ContextBroker {
             LifecycleEventType::ContextManifestCreated,
             now,
         )?;
+        // Manifest Artifact 已持久化后才构造当前 Attempt 的 ReadGrant。Grant 只是读取
+        // 授权，既不确认 Agent 提交，也不触发 Decision/Execution/Paper 副作用。
         let grant = ReadGrant {
             manifest_artifact_id: artifact.artifact_id.clone(),
             run_id: permit.run_id.clone(),
@@ -660,97 +749,25 @@ impl ContextBroker {
         })
     }
 
-    /// Derive the Lesson-off arm of a paired experiment from the Lesson-on
-    /// manifest.
-    ///
-    /// Deliberately **not** a re-run of `assemble` with Lessons suppressed. The
-    /// budget filler there skips an oversized candidate and keeps going, so
-    /// removing the Lessons frees artifact, byte and token capacity that the next
-    /// candidates immediately refill — and the two arms would then differ by
-    /// whatever moved in rather than by the Lessons. Copying the baseline's
-    /// non-Lesson selections verbatim makes that refill structurally impossible:
-    /// the filler never runs.
-    ///
-    /// The result names the baseline manifest in its `source_refs`, which is what
-    /// pairs the two arms durably and content-addressably.
-    pub fn assemble_lesson_ablation(
-        &self,
-        permit: &TaskWritePermit,
-        contract: &AgentContract,
-        baseline: &ContextManifest,
-        now: DateTime<Utc>,
-        grant_ttl: Duration,
-    ) -> ContextResult<ContextManifest> {
-        // The ablation copies the selection list only and mints its own grant, so
-        // an expired baseline grant is not a read-authority leak. The baseline's
-        // closure must still be intact, or the arm would be derived from an
-        // unverified selection list.
-        self.validate_manifest_closure(permit, contract, baseline, now, false)?;
-        let policy = &contract.context;
-        let mut total_bytes = 0_u64;
-        let mut estimated_tokens = 0_u32;
-        let mut selections = Vec::with_capacity(baseline.payload.selections.len());
-        let mut ablated = 0_usize;
-        for selection in &baseline.payload.selections {
-            if selection.artifact.kind == ArtifactKind::Lesson {
-                ablated += 1;
-                continue;
-            }
-            // Overlay eligibility reads the mutable policy head. If a kept
-            // artifact has since become ineligible the arms are no longer
-            // comparable, so fail instead of silently dropping it and
-            // reintroducing the very asymmetry this method exists to prevent.
-            let artifact = self.store.artifact(&selection.artifact.artifact_id)?;
-            self.assert_context_permitted(policy, &artifact)?;
-            if !self.overlay_is_eligible(&artifact)? {
-                return Err(ContextError::ForbiddenArtifact {
-                    artifact_id: selection.artifact.artifact_id.clone(),
-                });
-            }
-            total_bytes = total_bytes.saturating_add(artifact.blob.bytes);
-            estimated_tokens = estimated_tokens.saturating_add(selection.estimated_tokens);
-            selections.push(selection.clone());
-        }
-        if ablated == 0 {
-            return Err(ContextError::NoLessonToAblate);
-        }
-        if selections.len() < usize::from(policy.min_artifacts) {
-            return Err(ContextError::BudgetExceeded);
-        }
-
-        self.mint_manifest(
-            permit,
-            contract,
-            selections,
-            total_bytes,
-            estimated_tokens,
-            baseline.payload.quarantined.clone(),
-            vec![ArtifactRef {
-                artifact_id: baseline.artifact.artifact_id.clone(),
-                kind: ArtifactKind::ContextManifest,
-            }],
-            now,
-            grant_ttl,
-        )
-    }
-
     fn learning_candidates(
         &self,
+        permit: &TaskWritePermit,
         policy: &ContextPolicy,
-        scope: &LessonScope,
+        scope: &ContextQueryScope,
         now: DateTime<Utc>,
     ) -> ContextResult<Vec<ArtifactRef>> {
+        // 从 Store 的 Active 快照中筛选学习覆盖；scope、usage、治理、来源和 overlay
+        // 逐层收窄候选，最终只返回最多四个完整冲突组及有限 Experience 引用。
         let mut candidates = Vec::new();
         if policy.permitted_kinds.contains(&ArtifactKind::Lesson) {
-            let mut lesson_count = 0;
-            for stored in self.store.lessons(Some(LessonLifecycle::Active), 50)? {
+            let mut ranked = Vec::new();
+            let mut audit = Vec::new();
+            for stored in self.store.active_lessons_snapshot()? {
                 let artifact = stored.artifact;
-                if !stored.lesson.scope.matches(
-                    &scope.assets,
-                    &scope.horizons,
-                    &scope.regimes,
-                    &scope.decision_stages,
-                ) {
+                let mut record = serde_json::json!({"artifact_id":artifact.artifact_id,"lesson_id":stored.lesson.lesson_id,
+                    "status":"scope_mismatch","scope":stored.lesson.scope});
+                if !scope.matches(&stored.lesson.scope) {
+                    audit.push(record);
                     continue;
                 }
                 let usage = self.store.lesson_usage(&stored.lesson.lesson_id)?;
@@ -761,6 +778,8 @@ impl ContextBroker {
                     .lesson
                     .is_retrievable(now, usage_count, &scope.regimes)
                 {
+                    record["status"] = serde_json::json!("governance_ineligible");
+                    audit.push(record);
                     continue;
                 }
                 if policy.permitted_source_families.is_empty()
@@ -770,17 +789,44 @@ impl ContextBroker {
                 {
                     self.assert_context_permitted(policy, &artifact)?;
                     if self.overlay_is_eligible(&artifact)? {
-                        candidates.push(ArtifactRef {
-                            artifact_id: artifact.artifact_id,
-                            kind: artifact.kind,
-                        });
-                        lesson_count += 1;
-                        if lesson_count >= 4 {
-                            break;
-                        }
+                        record["status"] = serde_json::json!("eligible");
+                        ranked.push((artifact, stored.lesson));
+                    } else {
+                        record["status"] = serde_json::json!("overlay_ineligible");
                     }
+                } else {
+                    record["status"] = serde_json::json!("source_family_excluded");
+                }
+                audit.push(record);
+            }
+            ranked.sort_by(|(_,a),(_,b)| lesson_relevance(b,scope).cmp(&lesson_relevance(a,scope))
+                .then_with(|| b.updated_at.cmp(&a.updated_at)).then_with(|| a.lesson_id.cmp(&b.lesson_id)));
+            let mut fingerprints = BTreeSet::new();
+            let mut selected_lessons = Vec::new();
+            for (artifact,lesson) in &ranked {
+                let fingerprint = lesson_retrieval_fingerprint(lesson)?;
+                // Explicit conflicts are distinct evidence, even with identical prose.
+                if !lesson.conflicts_with.is_empty() || ranked.iter().any(|(_,other)| other.conflicts_with.iter().any(|r| r.artifact_id==artifact.artifact_id)) || fingerprints.insert(fingerprint) {
+                    selected_lessons.push((artifact,lesson));
+                } else if let Some(record) = audit.iter_mut().find(|r| r["artifact_id"] == serde_json::json!(artifact.artifact_id)) {
+                    record["status"] = serde_json::json!("exact_duplicate");
                 }
             }
+            // When a selected lesson has an eligible explicit conflict, reserve
+            // a slot for its counterpart instead of presenting one side alone.
+            let chosen = select_lesson_groups(&selected_lessons.iter().map(|(artifact,lesson)|
+                (artifact.artifact_id.clone(),lesson.conflicts_with.clone())).collect::<Vec<_>>(),4);
+            for record in &mut audit {
+                if record["status"] == "eligible" {
+                    record["status"] = serde_json::json!(if chosen.iter().any(|id| record["artifact_id"] == serde_json::json!(id)) {"selected"} else {"rank_or_conflict_capacity"});
+                }
+            }
+            let selected_refs = chosen.into_iter().map(|artifact_id| ArtifactRef {artifact_id,kind:ArtifactKind::Lesson}).collect::<Vec<_>>();
+            // 审计记录与所选 Lesson 一起通过 TaskWritePermit 写入 RunScoped Artifact；
+            // 这保留筛选过程，但不把“selected”解释为 Lesson 已被批准或激活。
+            self.record_learning_observation(permit,"learning.retrieval.audit",&serde_json::json!({"scope":scope,
+                "selection_limit":4,"ranking":"regime,stage,asset,horizon,updated_at,lesson_id","records":audit}),selected_refs.clone(),now)?;
+            candidates.extend(selected_refs);
         }
         if policy.permitted_kinds.contains(&ArtifactKind::Experience) {
             let mut experience_count = 0;
@@ -788,6 +834,9 @@ impl ContextBroker {
                 .store
                 .recent_artifacts_by_kind(ArtifactKind::Experience, 100)?
             {
+                // Experience 只能在当前 Contract 允许的 source family、overlay head 和
+                // canonical learning 资格下进入 Context；Retrospective 仅按其 source_ref
+                // 作为附带材料，不在这里重新计算 Outcome。
                 if policy.permitted_source_families.is_empty()
                     || policy
                         .permitted_source_families
@@ -816,4 +865,55 @@ impl ContextBroker {
         }
         Ok(candidates)
     }
+}
+
+// 按当前查询 scope 计算 Lesson 的重合维度；返回值只用于确定性排序，不是 Lesson
+// 的有效性或交易方向评分。
+fn lesson_relevance(lesson: &Lesson, scope: &ContextQueryScope) -> (usize, usize, usize, usize) {
+    (lesson.scope.regimes.intersection(&scope.regimes).count(),
+        lesson.scope.decision_stages.intersection(&scope.decision_stages).count(),
+        lesson.scope.assets.intersection(&scope.assets).count(),
+        lesson.scope.horizons.intersection(&scope.horizons).count())
+}
+
+// 规范化空白后生成稳定指纹，用于折叠完全重复的 Lesson；scope、排除条件和关键文本
+// 都纳入指纹，因此不能把不同适用范围误合并。
+fn lesson_retrieval_fingerprint(lesson: &Lesson) -> ContextResult<String> {
+    let normalize = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut exclusions = lesson.exclusions.iter().map(|s| normalize(s)).collect::<Vec<_>>();
+    exclusions.sort();
+    Ok(serde_json::to_string(&serde_json::json!({"title":normalize(&lesson.title),"rationale":normalize(&lesson.rationale),"statement":normalize(&lesson.statement),
+        "recommended_behavior":normalize(&lesson.recommended_behavior),"scope":lesson.scope,"exclusions":exclusions}))?)
+}
+
+// 把显式 conflicts_with 构造成无向连通分量，只有完整分量能放入 limit 时才选择；
+// 这样冲突观点不会因容量限制被裁成只剩一侧。
+fn select_lesson_groups(entries: &[(ArtifactId,Vec<ArtifactRef>)], limit: usize) -> Vec<ArtifactId> {
+    let mut adjacency = entries.iter().map(|(id,_)|(id.clone(),BTreeSet::new())).collect::<std::collections::BTreeMap<_,_>>();
+    for (id,refs) in entries {
+        for reference in refs {
+            if adjacency.contains_key(&reference.artifact_id) {
+                adjacency.get_mut(id).expect("known lesson").insert(reference.artifact_id.clone());
+                adjacency.get_mut(&reference.artifact_id).expect("known conflict").insert(id.clone());
+            }
+        }
+    }
+    let mut visited = BTreeSet::new();
+    let mut chosen = Vec::new();
+    for (id,_) in entries {
+        if chosen.len()==limit {break;}
+        if visited.contains(id) {continue;}
+        let mut component = BTreeSet::new();
+        let mut queue = VecDeque::from([id.clone()]);
+        while let Some(next) = queue.pop_front() {
+            if visited.insert(next.clone()) {
+                component.insert(next.clone());
+                queue.extend(adjacency[&next].iter().cloned());
+            }
+        }
+        if chosen.len()+component.len()<=limit {
+            chosen.extend(entries.iter().filter(|(id,_)|component.contains(id)).map(|(id,_)|id.clone()));
+        }
+    }
+    chosen
 }

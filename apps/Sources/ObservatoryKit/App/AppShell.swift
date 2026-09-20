@@ -46,6 +46,7 @@ public struct AppShell: View {
             .modifier(WindowTitlebarInsetModifier(enabled: !rendersOffscreen))
             .background(windowActivityObservers)
             .background(WindowChromeConfigurator(desktopBlurEnabled: desktopBlurEnabled))
+            // `task` 只负责启动异步 Core 连接；视图本身先按当前 Store 状态渲染，连接结果由 Store 回写。
             .task { await store.bootstrapCore() }
     }
 
@@ -65,6 +66,24 @@ public struct AppShell: View {
 
     private var mainContent: some View {
                     VStack(spacing: 0) {
+                        if !store.isLive {
+                            HStack(spacing: 8) {
+                                Label("演示场景 · Mock", systemImage: "rectangle.dashed")
+                                    .fontWeight(.semibold)
+                                Text("\(store.displayScenarioTitle) · 数值与运行状态均为界面样例")
+                                Spacer(minLength: 0)
+                                Button("返回真实数据") {
+                                    Task { await store.reconnectCore() }
+                                }
+                            }
+                            .font(.caption)
+                            .foregroundStyle(AkzioColor.primaryGold)
+                            .padding(.horizontal, AkzioLayout.s4)
+                            .padding(.vertical, 8)
+                            .background(AkzioColor.deepBackground)
+                            .accessibilityIdentifier("mock-scenario-banner")
+                        }
+                        // Debug Core 只显示调试环境提示；正式 Core 才显示可发起 Run 的状态栏。
                         if store.debugEnabled {
                             DebugEnvironmentBanner(store: store)
                         } else {
@@ -73,7 +92,9 @@ public struct AppShell: View {
                             health: store.displayHealth,
                             observerState: store.observerState,
                             namespace: shared,
-                            canRun: store.isLive && !store.debugEnabled,
+                            canRun: store.isLive && !store.debugEnabled
+                                && store.coreSupervisor.state != .starting
+                                && store.coreSupervisor.state != .waitingReady,
                             selectedRunPurpose: store.selectedRunPurpose,
                             runInFlight: store.runInFlight,
                             runMessage: store.runMessage,
@@ -87,6 +108,28 @@ public struct AppShell: View {
                             onRevealRun: { store.revealRunInArchive(store.displayRun.runId) }
                         )
                         }
+                        if store.coreSupervisor.state == .starting || store.coreSupervisor.state == .waitingReady {
+                            HStack(spacing: 8) {
+                                ProgressView().controlSize(.small)
+                                Text("正在验证模型与启动 Core，请稍候…").font(.callout)
+                                Spacer()
+                            }
+                            .padding(.horizontal, AkzioLayout.s4)
+                            .padding(.vertical, 8)
+                        }
+                        // `detail` 优先于本地操作消息；没有任何错误/状态文本时不占用页面高度。
+                        if let message = store.observerState.detail ?? (store.runMessage.isEmpty ? nil : store.runMessage) {
+                            HStack(alignment: .top, spacing: 8) {
+                                Image(systemName: "exclamationmark.circle")
+                                Text(message).font(.callout).textSelection(.enabled)
+                                Spacer(minLength: 0)
+                            }
+                            .foregroundStyle(AkzioColor.actionCoral)
+                            .padding(12)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(AkzioColor.deepBackground)
+                            .accessibilityIdentifier("observer-status-message")
+                        }
                         RouteHost(store: store)
                     }
     }
@@ -94,6 +137,7 @@ public struct AppShell: View {
     private var shell: some View {
         GeometryReader { proxy in
             ZStack(alignment: .topLeading) {
+                // AppKit backdrop 负责模糊，这层只降低亮度；离屏截图或无障碍设置会跳过它。
                 if desktopBlurEnabled {
                     Color.black
                         .opacity(desktopShadeOpacity)
@@ -101,11 +145,13 @@ public struct AppShell: View {
                         .allowsHitTesting(false)
                 }
 
+                // Settings 展开时仍保留底层页面，但禁用并隐藏其无障碍树，避免误操作或重复读屏。
                 shellContent
                     .frame(width: proxy.size.width, height: proxy.size.height, alignment: .top)
                     .disabled(store.settingsPresented)
                     .accessibilityHidden(store.settingsPresented)
 
+            // 侧栏收起后只留下一个独立切换按钮，按钮仍复用同一 Store 路由状态。
             if !sidebarVisible {
                 Button(action: toggleSidebar) {
                     Image(systemName: "sidebar.left")
@@ -130,6 +176,7 @@ public struct AppShell: View {
                 .accessibilityLabel("Show Sidebar")
             }
 
+            // 设置层覆盖在页面之上；Store 只维护是否展示，具体布局由 SettingsLayer 决定。
             if store.settingsPresented {
                 SettingsLayer(store: store)
             }
@@ -162,6 +209,7 @@ public struct AppShell: View {
         .onChange(of: colorSchemeContrast) { _, _ in syncAccessibility() }
         .onChange(of: scenePhase) { _, phase in
             // `.background` covers minimise and hide; `.inactive` covers losing key.
+            // 这是场景级信号，窗口遮挡则由下面的 AppKit 通知补充。
             store.windowActive = phase == .active
         }
         .preferredColorScheme(.dark)
@@ -189,6 +237,7 @@ public struct AppShell: View {
     /// store so every page reads the same answer.
     private var widthProbe: some View {
         GeometryReader { proxy in
+            // GeometryReader 只测量，不参与命中测试；每次尺寸变化都把同一个布局结论写回 Store。
             Color.clear
                 .onAppear { store.compactLayout = proxy.size.width < AkzioLayout.compactWidthThreshold }
                 .onChange(of: proxy.size.width) { _, width in
@@ -201,6 +250,7 @@ public struct AppShell: View {
     /// AppKit is the only source of truth for occlusion; `scenePhase` alone does not
     /// report a window that is fully covered by another app's window.
     private var windowActivityObservers: some View {
+        // AppKit 的 occlusion 状态比 scenePhase 更细：窗口仍可 active 但可能完全被其他窗口遮挡。
         Color.clear
             .onNotification(NSApplication.didBecomeActiveNotification) { store.windowActive = true }
             .onNotification(NSApplication.willResignActiveNotification) { store.windowActive = false }
@@ -213,26 +263,30 @@ public struct AppShell: View {
     }
 
     private func syncAccessibility() {
+        // 系统无障碍值只在主线程同步到 Store，后续各页面读取同一份策略。
         store.systemReduceMotion = reduceMotion
         store.systemReduceTransparency = reduceTransparency
         store.systemHighContrast = colorSchemeContrast == .increased
     }
 
     private func toggleSidebar() {
+        // 动画只包住本地可逆的可见性翻转，不触发 Core 或路由副作用。
         withAnimation(.spring(response: 0.28, dampingFraction: 1.0)) {
             sidebarVisible.toggle()
         }
     }
 
     private func copyRunID() {
+        // 粘贴板写入是一次性 UI 副作用；ID 来源于当前展示投影，未发起新的查询。
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(store.displayRun.runId, forType: .string)
     }
 
-    /// ⌘1–⌘7 content routes, ⌘8 Settings, ⌘0 Scenario Gallery. Zero-opacity buttons
+    /// ⌘1–⌘7 content routes, ⌘8 Settings. Zero-opacity buttons
     /// keep every navigation path inside the same `store.navigate` pipeline.
     private var keyboardRoutes: some View {
         ZStack {
+            // 隐形按钮把快捷键统一送进 Store 的导航入口，避免键盘路径绕过转场协调器。
             ForEach(AppRoute.allCases) { route in
                 if let shortcut = route.shortcut {
                     Button("") { store.navigate(to: route, fromKeyboard: true) }
@@ -253,6 +307,7 @@ private struct WindowTitlebarInsetModifier: ViewModifier {
 
     @ViewBuilder
     func body(content: Content) -> some View {
+        // 离屏渲染不需要避让原生标题栏；真实窗口才忽略顶部安全区。
         if enabled {
             content.ignoresSafeArea(.container, edges: .top)
         } else {
@@ -285,6 +340,7 @@ struct RouteHost: View {
 
     @ViewBuilder
     private var page: some View {
+        // 每次只构造当前 route 的页面；数据不可用时由页面级占位明确表达“无数据”，不伪装成完成。
         switch store.route {
         case .overview: OverviewPage(store: store)
         case .workflow: WorkflowPage(store: store)
@@ -308,7 +364,6 @@ struct RouteHost: View {
                 LiveUnavailablePage(route: .learning)
             }
         case .runArchive: RunArchivePage(store: store)
-        case .scenarioGallery: ScenarioGalleryPage(store: store)
         }
     }
 }
@@ -321,6 +376,7 @@ extension View {
         _ name: Notification.Name,
         perform action: @escaping () -> Void
     ) -> some View {
+        // Publisher 的回调在主 actor 上更新 Store，View 层只负责把通知转换成无参闭包。
         onReceive(NotificationCenter.default.publisher(for: name)) { _ in action() }
     }
 }

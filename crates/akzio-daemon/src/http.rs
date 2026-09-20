@@ -2,6 +2,8 @@
 
 use super::*;
 include!("http_debug.rs");
+include!("http_runtime.rs");
+include!("http_launch.rs");
 use crate::observer::{
     ObserverPortfolioHistory, ObserverPortfolioRange, ObserverRunDetail, ObserverSection,
     ObserverSnapshot,
@@ -74,10 +76,17 @@ impl Daemon {
                 "/v1/debug/runs/{run_id}/acceptance",
                 post(http_debug_acceptance),
             )
+            .route("/runs", post(http_launch_run))
             .route("/health", get(http_health))
             .route("/ready", get(http_ready))
             .route("/v1/observer/snapshot", get(http_observer_snapshot))
             .route("/v1/observer/runs/{run_id}", get(http_observer_run))
+            .route("/v1/workflows/blueprint", get(http_workflow_blueprint))
+            .route(
+                "/v1/observer/runs/{run_id}/inspection",
+                get(http_run_inspection),
+            )
+            .route("/v1/observer/runs/{run_id}/journal", get(http_run_journal))
             .route(
                 "/v1/observer/portfolio/history",
                 get(http_observer_portfolio_history),
@@ -87,7 +96,6 @@ impl Daemon {
             .route("/runs/{run_id}/trajectory", get(http_trajectory))
             .route("/runs/{run_id}/retrospectives", get(http_retrospectives))
             .route("/runs/{run_id}/replay", get(http_replay))
-            .route("/runs", post(http_submit))
             .route("/runs/{run_id}/cancel", post(http_cancel))
             .route("/runs/{run_id}/retry", post(http_retry))
             .route(
@@ -437,21 +445,6 @@ async fn http_retrospectives(
     .await
     .map(Json)
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-}
-
-async fn http_submit(
-    State(daemon): State<Arc<Daemon>>,
-    headers: HeaderMap,
-    Json(request): Json<SubmitRequest>,
-) -> std::result::Result<Json<RunSubmissionResponse>, StatusCode> {
-    authorize(&daemon, &headers)?;
-    let operation = daemon.clone();
-    run_daemon_store_operation(daemon.store_executor.clone(), move || {
-        operation.submit_default(request.purpose)
-    })
-    .await
-    .map(|run_id| Json(RunSubmissionResponse { run_id }))
-    .map_err(invalid_input_or_internal)
 }
 
 async fn http_cancel(

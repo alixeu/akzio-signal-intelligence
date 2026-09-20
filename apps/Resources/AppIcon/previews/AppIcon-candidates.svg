@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="3072" height="1180" viewBox="0 0 3072 1180">
+  <rect width="3072" height="1180" fill="#101010"/>
+  <g transform="translate(48 48) scale(.96)">
+    <rect width="1024" height="1024" rx="220" fill="#181818"/>
+    <path fill="#D4A15E" d="M174 244h206l250 204-92 106-214-174H174V244Z"/>
+    <path fill="#D4A15E" d="M174 436h250l154 76-154 76H174V436Z"/>
+    <path fill="#D4A15E" d="M174 780h206l250-204-92-106-214 174H174v136Z"/>
+    <path fill="#FF6B4A" d="m630 512 58-58 58 58-58 58-58-58Z"/>
+  </g>
+  <g transform="translate(1048 48) scale(.96)">
+    <rect width="1024" height="1024" rx="220" fill="#181818"/>
+    <path fill="#D4A15E" d="M176 514c114-218 316-328 562-274-96 210-270 336-508 350l-54-76Z"/>
+    <path fill="#D4A15E" d="M848 510C734 728 532 838 286 784c96-210 270-336 508-350l54 76Z"/>
+    <path fill="#FF6B4A" d="m458 512 54-54 54 54-54 54-54-54Z"/>
+  </g>
+  <g transform="translate(2048 48) scale(.96)">
+    <rect width="1024" height="1024" rx="220" fill="#181818"/>
+    <path fill="#D4A15E" d="M494 181q18-19 36 0l141 146q19 19-1 36L532 481q-20 17-40 0L354 363q-20-17-1-37l141-145Z"/>
+    <path fill="#D4A15E" d="m199 633 160-160q17-17 32 5l91 132q14 20 0 39L355 827q-17 17-34 0L199 669q-17-19 0-36Z"/>
+    <path fill="#D4A15E" d="m825 633-160-160q-17-17-32 5l-91 132q-14 20 0 39l127 178q17 17 34 0l122-158q17-19 0-36Z"/>
+    <path fill="#FF6B4A" d="m505 507q7-7 14 0l34 34q7 7 0 14l-34 34q-7 7-14 0l-34-34q-7-7 0-14l34-34Z"/>
+  </g>
+  <g fill="#F3EFE9" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="42" font-weight="600">
+    <text x="512" y="1142" text-anchor="middle">01  Convergent Facets</text>
+    <text x="1536" y="1142" text-anchor="middle">02  Signal Lens</text>
+    <text x="2560" y="1142" text-anchor="middle">03  Clarity Prism · selected</text>
+  </g>
+</svg>

@@ -50,6 +50,40 @@ fn secure_file(path: &Path) -> StoreResult<()> {
     Ok(())
 }
 
+/// Refuse to upgrade a Store Root that an older binary may still be working on.
+///
+/// A table that does not exist yet cannot hold active work, so its absence is
+/// "nothing active" rather than an error: the tables are created by the schema
+/// batch further down, and a raw `no such table` here would mask the real
+/// upgrade decision.
+///
+/// The claimable states match `workflow::contract_upgrade_blockers`: a task that
+/// is queued or leased is owned by the old worker just as much as a running one,
+/// and letting it through would strand it after the version changes.
+fn assert_no_active_work_before_upgrade(connection: &Connection) -> StoreResult<()> {
+    let mut blocked = false;
+    if migration::table_exists(connection, "rebuild_tasks")? {
+        blocked = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM rebuild_tasks WHERE status IN ('queued', 'leased', 'running'))",
+            [],
+            |row| row.get(0),
+        )?;
+    }
+    if !blocked && migration::table_exists(connection, "rebuild_daemon_leases")? {
+        blocked = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM rebuild_daemon_leases WHERE expires_at > ?1)",
+            params![Utc::now().to_rfc3339()],
+            |row| row.get(0),
+        )?;
+    }
+    if blocked {
+        return Err(StoreError::DebugControl(
+            "stop old workers and drain active leases before Store 18 migration".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn initialize(connection: &mut Connection, root: &Path) -> StoreResult<()> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS rebuild_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
@@ -70,8 +104,15 @@ fn initialize(connection: &mut Connection, root: &Path) -> StoreResult<()> {
     {
         return Err(StoreError::IncompatibleStoreRoot(root.to_path_buf()));
     }
+    // The upgrade block runs before any migration touches the schema.
+    // `migrate_v13_to_v14` drops and rebuilds five tables with foreign keys
+    // disabled, so checking afterwards could only report a conflict the
+    // migration had already acted on.
+    if version.as_deref().is_some_and(|v| v != "18") {
+        assert_no_active_work_before_upgrade(connection)?;
+    }
     match version.as_deref() {
-        None | Some("14") | Some("15") | Some("16") => {}
+        None | Some("14") | Some("15") | Some("16") | Some("17") | Some("18") => {}
         Some("13") => migration::migrate_v13_to_v14(connection, root)?,
         Some(_) => {
             return Err(StoreError::IncompatibleStoreRoot(PathBuf::from(
@@ -79,15 +120,18 @@ fn initialize(connection: &mut Connection, root: &Path) -> StoreResult<()> {
             )));
         }
     }
-    if version.as_deref().is_some_and(|v| v != "16") {
-        let active: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM rebuild_tasks WHERE status='running') OR EXISTS(SELECT 1 FROM rebuild_daemon_leases WHERE expires_at > ?1)",
-            params![Utc::now().to_rfc3339()], |row| row.get(0))?;
-        if active {return Err(StoreError::DebugControl("stop old workers and drain active leases before Store 16 migration".into()));}
+    // Runs before the schema batch below, because that batch commits
+    // `schema_version = 18` and this step still requires the v14 label. Its own
+    // Contract-upgrade blockers keep a v14 root readable by the prior binary.
+    if matches!(version.as_deref(), Some("13" | "14")) {
+        migration::migrate_v14_to_v15(connection)?;
     }
-    connection.execute_batch(
-        "BEGIN;
-CREATE TABLE IF NOT EXISTS rebuild_blobs (
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if migration::table_exists(&transaction, "rebuild_tasks")? && !table_has_column(&transaction, "rebuild_tasks", "node_spec_json")? {
+        transaction.execute_batch("ALTER TABLE rebuild_tasks ADD COLUMN node_spec_json TEXT;")?;
+    }
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS rebuild_blobs (
     blob_hash TEXT PRIMARY KEY,
     logical_bytes INTEGER NOT NULL,
     stored_bytes INTEGER NOT NULL,
@@ -165,6 +209,7 @@ CREATE TABLE IF NOT EXISTS rebuild_workflow_revisions (
  on_failure TEXT NOT NULL,
  parent_task_id TEXT,
  input_artifacts_json TEXT NOT NULL,
+ node_spec_json TEXT,
  status TEXT NOT NULL,
            ready_at TEXT NOT NULL,
            lease_id TEXT,
@@ -311,6 +356,28 @@ CREATE TABLE IF NOT EXISTS rebuild_policy_heads (
     transition_event_cursor INTEGER NOT NULL UNIQUE REFERENCES rebuild_events(event_id),
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS rebuild_decision_policy_installations (
+    policy_hash TEXT PRIMARY KEY,
+    artifact_id TEXT NOT NULL UNIQUE REFERENCES rebuild_artifacts(artifact_id),
+    envelope_hash TEXT NOT NULL,
+    provider_id TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    model_version_hash TEXT NOT NULL,
+    model_route TEXT NOT NULL,
+    contract_hash TEXT NOT NULL,
+    installed_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS rebuild_decision_policy_activations (
+    activation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    previous_policy_hash TEXT REFERENCES rebuild_decision_policy_installations(policy_hash),
+    policy_hash TEXT NOT NULL REFERENCES rebuild_decision_policy_installations(policy_hash),
+    activated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS rebuild_decision_policy_head (
+    singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
+    policy_hash TEXT NOT NULL REFERENCES rebuild_decision_policy_installations(policy_hash),
+    activation_id INTEGER NOT NULL UNIQUE REFERENCES rebuild_decision_policy_activations(activation_id)
+);
 CREATE TABLE IF NOT EXISTS rebuild_shadow_pairs (
     pair_key TEXT PRIMARY KEY,
     subject_id TEXT NOT NULL,
@@ -387,10 +454,10 @@ CREATE TABLE IF NOT EXISTS rebuild_observatory_configuration (
     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
     configuration_json BLOB NOT NULL
 );
-CREATE TABLE IF NOT EXISTS rebuild_debug_sessions (
+CREATE TABLE IF NOT EXISTS rebuild_run_controls (
     run_id TEXT PRIMARY KEY REFERENCES rebuild_runs(run_id) ON DELETE CASCADE,
-    identity_artifact_id TEXT NOT NULL REFERENCES rebuild_artifacts(artifact_id),
-    runtime_identity TEXT NOT NULL,
+    identity_artifact_id TEXT REFERENCES rebuild_artifacts(artifact_id),
+    runtime_identity TEXT,
     revision INTEGER NOT NULL,
     status TEXT NOT NULL CHECK(status IN ('running','pause_requested','paused','stepping','completed','aborted')),
     execution_mode TEXT NOT NULL CHECK(execution_mode IN ('manual','continuous')),
@@ -414,34 +481,47 @@ DROP INDEX IF EXISTS rebuild_policy_transitions_subject;
 DROP INDEX IF EXISTS rebuild_policy_evaluations_subject;
 DROP INDEX IF EXISTS rebuild_lesson_events_cursor;
 DROP INDEX IF EXISTS rebuild_lesson_evidence_by_lesson;
-COMMIT;",
+-- Rebuildable from Artifact metadata alone. Repaired for every version, not
+-- just a fresh root: an initializer interrupted at any version can leave it
+-- missing, and SQLite rebuilds it without touching CAS payloads.
+CREATE INDEX IF NOT EXISTS rebuild_artifacts_run_kind
+    ON rebuild_artifacts (json_extract(origin_json, '$.run_id'), kind, created_at, artifact_id);",
     )?;
+    if migration::table_exists(&transaction, "rebuild_debug_sessions")? {
+        transaction.execute_batch("INSERT INTO rebuild_run_controls SELECT * FROM rebuild_debug_sessions; DROP TABLE rebuild_debug_sessions;")?;
+    }
+    run_control::backfill_history(&transaction)?;
     if !table_has_column(
-        connection,
+        &transaction,
         "rebuild_policy_evaluations",
         "candidate_policy_artifact_id",
     )? {
         return Err(StoreError::IncompatibleStoreRoot(root.to_path_buf()));
     }
-    if matches!(version.as_deref(), Some("13" | "14")) {
-        migration::migrate_v14_to_v15(connection)?;
+    // The version label is written in the same transaction as the schema it
+    // describes. Committing the tables first would let a crash leave a v18
+    // database still labelled v15/v16, which `Store::open_existing` rejects
+    // outright, stranding every read-only seam on a structurally valid Store.
+    //
+    // The shared control migration changes SQL heads only; no CAS,
+    // Commitment or hash is rewritten. Old workers reject v18 on reopen rather
+    // than silently ignoring the active policy head.
+    match version.as_deref() {
+        None => {
+            transaction.execute(
+                "INSERT INTO rebuild_metadata (key, value) VALUES ('schema_version', ?1)",
+                params![STORE_SCHEMA_VERSION.to_string()],
+            )?;
+        }
+        Some("18") => {}
+        Some(_) => {
+            transaction.execute(
+                "UPDATE rebuild_metadata SET value = ?1 WHERE key = 'schema_version'",
+                params![STORE_SCHEMA_VERSION.to_string()],
+            )?;
+        }
     }
-    if version.is_none() {
-        connection.execute_batch("CREATE INDEX IF NOT EXISTS rebuild_artifacts_run_kind ON rebuild_artifacts (json_extract(origin_json, '$.run_id'), kind, created_at, artifact_id);")?;
-        connection.execute(
-            "INSERT INTO rebuild_metadata (key, value) VALUES ('schema_version', ?1)",
-            params![STORE_SCHEMA_VERSION.to_string()],
-        )?;
-    }
-    // Also repair the rebuildable index for v15 roots produced by an interrupted
-    // older initializer. Never infer or rewrite CAS/commitment payloads here.
-    if version.as_deref() == Some("15") {
-        connection.execute_batch("CREATE INDEX IF NOT EXISTS rebuild_artifacts_run_kind ON rebuild_artifacts (json_extract(origin_json, '$.run_id'), kind, created_at, artifact_id);")?;
-    }
-    if version.is_some() && version.as_deref() != Some("16") {
-        // Additive scheduling metadata only. Old workers reject v16 on reopen.
-        connection.execute("UPDATE rebuild_metadata SET value = '16' WHERE key = 'schema_version'", [])?;
-    }
+    transaction.commit()?;
     Ok(())
 }
 

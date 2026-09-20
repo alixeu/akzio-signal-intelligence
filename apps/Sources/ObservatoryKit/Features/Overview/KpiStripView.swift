@@ -1,6 +1,6 @@
 import SwiftUI
 
-let overviewKpiCardMinHeight: CGFloat = 132
+let overviewKpiCardMinHeight: CGFloat = 44
 
 // MARK: - KPI strip
 //

@@ -6,6 +6,8 @@ const NATIVE_WEB_PROBE_SOURCE: &str = "native_web_required_search_probe_v2";
 pub async fn probe_configured_model_capabilities(
     config: &OpenAIResponsesConfig,
 ) -> Result<ModelCapabilityProbeSet> {
+    // 默认 route 与每个 purpose route 都独立建 client、独立探测；只有全部快照
+    // 与当前配置的模型和 reasoning_effort 对齐后，才返回可供上层使用的集合。
     let default = ModelClient::from_config(config)?
         .probe_capabilities()
         .await?;
@@ -26,11 +28,14 @@ pub async fn probe_configured_model_capabilities(
 
 impl ModelClient {
     pub async fn probe_capabilities(&self) -> Result<ModelCapabilitySnapshot> {
+        // 真实 Responses client 需要实际 provider 往返；fixture 只返回离线声明，
+        // 不把离线结果伪装成 runtime-negotiated handshake。
         match self {
             Self::OpenAIResponses(client) => probe_openai_responses_capabilities(client).await,
-            Self::Fixture(_) | Self::FixtureByPurpose(_) | Self::FixtureSequence(_) => {
-                Ok(self.capability_snapshot())
-            }
+            Self::Fixture(_)
+            | Self::FixtureByPurpose(_)
+            | Self::FixtureByPurposePhase(_)
+            | Self::FixtureSequence(_) => Ok(self.capability_snapshot()),
         }
     }
 }
@@ -38,6 +43,7 @@ impl ModelClient {
 async fn probe_openai_responses_capabilities(
     client: &OpenAIResponsesClient,
 ) -> Result<ModelCapabilitySnapshot> {
+    // 非审计入口复用同一探测流程，但丢弃仅供质量记录的调用摘要。
     probe_openai_responses_capabilities_audited(client)
         .await
         .map(|(snapshot, _)| snapshot)
@@ -48,6 +54,8 @@ impl ModelClient {
     pub async fn probe_capabilities_audited(
         &self,
     ) -> Result<(ModelCapabilitySnapshot, Vec<Value>)> {
+        // audited 结果包含 provider 请求/响应的脱敏摘要，因此只允许真实 provider
+        // 产生；fixture 没有可证明的外部请求，直接拒绝而不是补造审计记录。
         match self {
             Self::OpenAIResponses(client) => {
                 probe_openai_responses_capabilities_audited(client).await
@@ -62,12 +70,14 @@ impl ModelClient {
 async fn probe_openai_responses_capabilities_audited(
     client: &OpenAIResponsesClient,
 ) -> Result<(ModelCapabilitySnapshot, Vec<Value>)> {
+    // 两次 required function call 验证工具调用与无状态续传；随后另做一次 required
+    // native web probe。所有请求都经过同一个无状态 Responses adapter。
     let started = std::time::Instant::now();
     let first = client
         .respond(capability_probe_request(
             CAPABILITY_PROBE_TOOL,
             ModelInput::Fresh {
-                text: "Call the required capability probe function once.".to_owned(),
+                text: probe_prompts::CALL.to_owned(),
             },
         ))
         .await?;
@@ -80,6 +90,8 @@ async fn probe_openai_responses_capabilities_audited(
                 "initial response did not return the required function call".to_owned(),
             )
         })?;
+    // 第二次请求复用 first.continuation，并只取出 call_id 作为 tool output 的关联键；
+    // provider transcript 本身不会被借用状态带入别的请求。
     let first_audit = capability_response_audit(&first, started.elapsed());
     let (reasoning_items, encrypted_continuation) =
         continuation_observations(first.continuation.items());
@@ -101,6 +113,7 @@ async fn probe_openai_responses_capabilities_audited(
             },
         ))
         .await?;
+    // function call 已返回并不等于续传可用；完成函数仍必须在第二个终态中出现。
     if !second
         .tool_calls
         .iter()
@@ -116,12 +129,9 @@ async fn probe_openai_responses_capabilities_audited(
         first_audit,
         capability_response_audit(&second, started.elapsed()),
     ];
-    let (
-        native_web_tool,
-        native_web_tool_verified,
-        native_web_status,
-        native_web_audit,
-    ) =
+    // hosted web 能力是独立可失败项：失败原因进入状态和脱敏审计，但不抹掉已经
+    // 验证通过的 function/continuation 能力。
+    let (native_web_tool, native_web_tool_verified, native_web_status, native_web_audit) =
         probe_native_web_tool(client).await;
     let mut audit = audit;
     if let Some(native_web_audit) = native_web_audit {
@@ -153,11 +163,16 @@ async fn probe_openai_responses_capabilities_audited(
 async fn probe_native_web_tool(
     client: &OpenAIResponsesClient,
 ) -> (bool, bool, NativeWebCapabilityStatus, Option<Value>) {
+    // 使用 Required 而非 Auto，确保“未调用”与“模型选择不搜索”可区分；验证同时
+    // 要求 hosted action 和可提取、可 allowlist 校验的 citation。
     let policy = NativeWebPolicy::default();
     let request = ModelRequest {
-        instructions: "Use the Rust-approved native web search once and return the source URLs.".to_owned(),
+        instructions: probe_prompts::WEB_GOVERNANCE
+            .to_owned(),
         input: ModelInput::Fresh {
-            text: "Find the official FRED VIXCLS series page at fred.stlouisfed.org and cite its URL.".to_owned(),
+            text:
+                probe_prompts::WEB_QUERY
+                    .to_owned(),
         },
         max_output_tokens: 1000,
         reasoning_effort: None,
@@ -170,6 +185,8 @@ async fn probe_native_web_tool(
     };
     match client.respond(request).await {
         Ok(response) => {
+            // provider raw 只在这里做 hosted action/citation 验证；结果摘要不携带完整
+            // response，避免 capability 审计扩散模型输出或凭据相关内容。
             let validation = policy
                 .validate_provider_response(&response.raw)
                 .and_then(|_| policy.extract_citations(&response.raw).map(|_| ()));
@@ -201,17 +218,19 @@ async fn probe_native_web_tool(
                 false,
                 status,
                 Some(json!({
-                "capability": "native_web",
-                "verified": false,
-                "status": status,
-                "error": safe_model_error(&error),
-            })),
+                    "capability": "native_web",
+                    "verified": false,
+                    "status": status,
+                    "error": safe_model_error(&error),
+                })),
             )
         }
     }
 }
 
 fn native_web_failure_status(raw: Option<&Value>, error: &ModelError) -> NativeWebCapabilityStatus {
+    // 若已有 raw response，优先按实际 hosted web_call 轨迹区分未调用、无来源和
+    // 来源校验问题；没有 raw 时再按 HTTP/transport/adapter 错误分类。
     if let Some(raw) = raw {
         let calls = raw
             .get("output")
@@ -223,9 +242,9 @@ fn native_web_failure_status(raw: Option<&Value>, error: &ModelError) -> NativeW
         if calls.is_empty() {
             return NativeWebCapabilityStatus::NotCalled;
         }
-        let has_search_action = calls.iter().any(|call| {
-            call.pointer("/action/type").and_then(Value::as_str) == Some("search")
-        });
+        let has_search_action = calls
+            .iter()
+            .any(|call| call.pointer("/action/type").and_then(Value::as_str) == Some("search"));
         if !has_search_action {
             return NativeWebCapabilityStatus::NoVerifiableSources;
         }
@@ -270,6 +289,7 @@ fn native_web_failure_status(raw: Option<&Value>, error: &ModelError) -> NativeW
 }
 
 fn provider_declares_unsupported_tool(body: &str) -> bool {
+    // provider 错误正文只用于识别“工具不支持”；无法解析或未命中固定词组时不猜测。
     let Ok(value) = serde_json::from_str::<Value>(body) else {
         return false;
     };
@@ -290,6 +310,7 @@ fn provider_declares_unsupported_tool(body: &str) -> bool {
 }
 
 fn collect_error_text(value: &Value, output: &mut String) {
+    // 递归收集结构化错误里的字符串，供上层做有限、可审计的分类匹配。
     match value {
         Value::String(value) => {
             if !output.is_empty() {
@@ -308,6 +329,8 @@ fn collect_error_text(value: &Value, output: &mut String) {
 }
 
 fn safe_model_error(error: &ModelError) -> Value {
+    // capability 审计只保留稳定错误类别和必要状态码，不复制 HTTP body、URL 细节或
+    // 其他可能包含敏感内容的错误文本。
     match error {
         ModelError::Http { status, .. } => json!({
             "kind": "http",
@@ -341,8 +364,10 @@ fn safe_model_error(error: &ModelError) -> Value {
 }
 
 fn capability_probe_request(tool_name: &str, input: ModelInput) -> ModelRequest {
+    // 构造最小 required function probe；输入只描述探测意图，不授予研究 Context 或
+    // Decision/Execution 工具权限。
     ModelRequest {
-        instructions: "Perform only the required Akzio capability probe function call.".to_owned(),
+        instructions: probe_prompts::FUNCTION_GOVERNANCE.to_owned(),
         input,
         max_output_tokens: 96,
         reasoning_effort: None,
@@ -363,6 +388,8 @@ fn capability_probe_request(tool_name: &str, input: ModelInput) -> ModelRequest 
 }
 
 fn continuation_observations(items: &[Value]) -> (Option<bool>, Option<bool>) {
+    // 从 provider 返回的 transcript 中观察 reasoning item；没有该 item 时保持未知，
+    // 不把“未返回”误判成明确不支持。
     let reasoning = items
         .iter()
         .filter(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
@@ -381,6 +408,7 @@ fn continuation_observations(items: &[Value]) -> (Option<bool>, Option<bool>) {
 }
 
 fn capability_response_audit(response: &ModelResponse, elapsed: std::time::Duration) -> Value {
+    // 记录请求/响应身份、usage、延迟和工具声明，故意不放入完整 raw response。
     json!({
         "provider": OPENAI_RESPONSES_PROVIDER_ID,
         "requested_model": response.request_body.get("model"),
@@ -417,11 +445,9 @@ mod capability_audit_tests {
         let body = openai_responses_request_body("gpt-test", "low", &request);
         assert_eq!(body["tool_choice"], "required");
         assert_eq!(body["tools"][0]["type"], NATIVE_WEB_SEARCH_TOOL);
-        assert!(body["include"]
-            .as_array()
-            .is_some_and(|items| items.iter().any(|item| {
-                item == "web_search_call.action.sources"
-            })));
+        assert!(body["include"].as_array().is_some_and(|items| items
+            .iter()
+            .any(|item| { item == "web_search_call.action.sources" })));
         assert!(body["tools"][0]["filters"]["allowed_domains"]
             .as_array()
             .is_some_and(|domains| domains.iter().any(|domain| domain == "reuters.com")));
@@ -450,7 +476,8 @@ mod capability_audit_tests {
                 None,
                 &ModelError::Http {
                     status: reqwest::StatusCode::BAD_REQUEST,
-                    body: json!({"error":{"message":"web_search is not supported by this model"}}).to_string(),
+                    body: json!({"error":{"message":"web_search is not supported by this model"}})
+                        .to_string(),
                 },
             ),
             NativeWebCapabilityStatus::ToolUnsupported

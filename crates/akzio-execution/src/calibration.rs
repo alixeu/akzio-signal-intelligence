@@ -116,6 +116,43 @@ pub struct OfflineRiskLimits {
     pub daily_reset_decay_ppm: u32,
 }
 
+impl OfflineRiskLimits {
+    pub fn validate(&self) -> OfflineCalibrationResult<()> {
+        if self.max_capital_weight_ppm == 0
+            || self.max_capital_weight_ppm > 1_000_000
+            || self.liquidity_weight_cap_ppm == 0
+            || self.liquidity_weight_cap_ppm > self.max_capital_weight_ppm
+            || self.daily_reset_decay_ppm > 1_000_000
+            || !(1..=3_000_000).contains(&self.max_expected_shortfall_ppm)
+            || !(1..=3_000_000).contains(&self.max_gap_loss_ppm)
+            || !(1..=5).contains(&self.max_leveraged_holding_days)
+        {
+            return Err(OfflineCalibrationError::InvalidInput(
+                "invalid operator risk limits".into(),
+            ));
+        }
+        let policy = DecisionPolicy {
+            min_confidence_ppm: self.min_confidence_ppm,
+            max_gross_weight: WeightPpm(self.max_gross_weight_ppm),
+            maximum_execution_delay_ms: self.maximum_execution_delay_ms,
+            minimum_process_quality_ppm: self.minimum_process_quality_ppm,
+            min_probability_edge_ppm: self.min_probability_edge_ppm,
+            max_brier_score_ppm: self.max_brier_score_ppm,
+            target_annualized_volatility_ppm: self.target_annualized_volatility_ppm,
+            max_portfolio_beta_ppm: self.max_portfolio_beta_ppm,
+            portfolio_risk_model: PortfolioRiskModel {
+                max_expected_shortfall_ppm: self.max_expected_shortfall_ppm,
+                max_gap_loss_ppm: self.max_gap_loss_ppm,
+                max_leveraged_holding_days: self.max_leveraged_holding_days,
+                ..DecisionPolicy::default().portfolio_risk_model
+            },
+            ..DecisionPolicy::default()
+        };
+        policy.validate()?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OfflineCalibrationInput {
     pub schema_version: u32,
@@ -160,7 +197,8 @@ pub struct DecisionPolicyProvenance {
     pub contract_hash: Option<ContentHash>,
 }
 
-/// The file loaded by `execution.decision_policy_path`.
+/// Frozen policy envelope persisted as an immutable SQL CAS Artifact.
+/// Runtime identity reads only the canonical SQL Store active head.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecisionPolicyArtifact {
     pub schema_version: u32,
@@ -213,47 +251,7 @@ impl DecisionPolicyArtifact {
         Ok(())
     }
 
-    pub fn decode(bytes: &[u8]) -> OfflineCalibrationResult<Self> {
-        let value: serde_json::Value = serde_json::from_slice(bytes)?;
-        if value.get("policy").is_some() {
-            let artifact: Self = serde_json::from_value(value)?;
-            artifact.validate()?;
-            Ok(artifact)
-        } else {
-            let policy: DecisionPolicy = serde_json::from_value(value)?;
-            policy.validate()?;
-            let now = Utc::now();
-            let risk_model_hash =
-                content_hash_json(&serde_json::to_value(&policy.portfolio_risk_model)?)?;
-            let output_hash = content_hash_json(&serde_json::to_value(&policy)?)?;
-            Ok(Self {
-                schema_version: Self::SCHEMA_VERSION,
-                provenance: DecisionPolicyProvenance {
-                    policy_version: "legacy-unversioned".to_owned(),
-                    algorithm_version: "legacy-unversioned".to_owned(),
-                    created_at: now,
-                    training_start: now,
-                    training_end: now,
-                    assets: Asset::EXECUTABLE.to_vec(),
-                    horizons: DecisionHorizon::ALL.to_vec(),
-                    sample_count: 0,
-                    source_runs: vec!["legacy-policy".to_owned()],
-                    input_hash: ContentHash::of_bytes(b"legacy-policy"),
-                    output_hash,
-                    risk_model_hash,
-                    provider_id: None,
-                    model_route: None,
-                    contract_hash: None,
-                },
-                policy,
-            })
-        }
-    }
-
-    /// Strict loader used by current runtime configuration and calibration
-    /// inspection. Legacy bare `DecisionPolicy` JSON remains readable only
-    /// through the explicitly named compatibility `decode` path and is never
-    /// reported as a provenance-bearing frozen policy by new entry points.
+    /// Load the complete provenance-bearing envelope from SQL CAS bytes.
     pub fn decode_strict(bytes: &[u8]) -> OfflineCalibrationResult<Self> {
         let value: serde_json::Value = serde_json::from_slice(bytes)?;
         if value.get("policy").is_none() {
@@ -351,6 +349,7 @@ fn validate_input(
     input: &OfflineCalibrationInput,
     frozen_at: DateTime<Utc>,
 ) -> OfflineCalibrationResult<()> {
+    input.risk_limits.validate()?;
     if input.schema_version != 1
         || input.policy_version.trim().is_empty()
         || input.algorithm_version.trim().is_empty()
@@ -883,6 +882,5 @@ mod tests {
     fn strict_decode_rejects_bare_legacy_policy_without_provenance() {
         let bytes = serde_json::to_vec(&DecisionPolicy::default()).unwrap();
         assert!(DecisionPolicyArtifact::decode_strict(&bytes).is_err());
-        assert!(DecisionPolicyArtifact::decode(&bytes).is_ok());
     }
 }

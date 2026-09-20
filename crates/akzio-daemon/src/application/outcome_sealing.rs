@@ -6,10 +6,13 @@ pub(crate) struct OutcomeSealing<'a> {
 }
 
 impl<'a> OutcomeSealing<'a> {
+    // 保存 Daemon 借用；Outcome 的计算和学习资格仍由 outcome runtime/Store 负责。
     pub(crate) const fn new(daemon: &'a Daemon) -> Self {
         Self { daemon }
     }
 
+    // 为 Paper Run 组装 Decision、Execution 和 Outcome 的冻结血缘，并提交
+    // OutcomeSchedule；Committed 只表示调度已持久化，不表示 T+1/T+3/T+5 已完成或已学习。
     pub(crate) async fn execute(
         &self,
         task: &ClaimedAttempt,
@@ -17,12 +20,16 @@ impl<'a> OutcomeSealing<'a> {
     ) -> Result<TaskCompletion> {
         let purpose = self.daemon.store.run_purpose(&task.run_id)?;
         if purpose != RunPurpose::Paper {
+            // Shadow 走独立的评估入口，PositionPlan/其他 purpose 不创建 OutcomeSchedule；
+            // NoOutput 是该节点对当前 purpose 不适用，不是业务链路整体成功。
             return if purpose == RunPurpose::Shadow {
                 self.daemon.execute_shadow_evaluate(task, now).await
             } else {
                 Ok(TaskCompletion::NoOutput)
             };
         }
+        // 下面的 terminal_input 只读取本 Run 已成功节点的终态 Artifact；任何缺失或
+        // 类型不匹配都会在 Store/Daemon 边界返回错误，不用不完整输入推导 Outcome。
         let decision = self.daemon.terminal_input(task, ArtifactKind::Decision)?;
         let decision_context = self
             .daemon
@@ -37,6 +44,8 @@ impl<'a> OutcomeSealing<'a> {
         verdict_payload
             .validate()
             .map_err(|error| DaemonError::InvalidInput(error.to_string()))?;
+        // NoOrder 仍保留 Decision 到 ExecutionVerdict 的 lineage；只有 Accepted 才要求
+        // 已持久化的 Commitment 和 Reconciliation，不能把受理订单写成已成交。
         let execution = match verdict_payload {
             ExecutionVerdict::NoOrder { .. } => OutcomeExecutionLineage::NoOrder {
                 execution_verdict: verdict,
@@ -64,6 +73,8 @@ impl<'a> OutcomeSealing<'a> {
                 baseline_trading_day,
                 now,
             })?;
+        // commit 只建立后续交易日窗口的 OutcomeSchedule；后续 worker 才按真实共同
+        // 交易 Session 评估并可能进入封存/学习资格检查。
         self.daemon
             .outcome_scheduling_runtime
             .commit(&task.permit, &output, now)?;

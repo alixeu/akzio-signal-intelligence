@@ -128,7 +128,7 @@ impl PaperScheduler {
             return Err(SchedulerError::WorkflowUnavailable);
         }
 
-        let lease = self.acquire_or_renew_async(now).await?;
+        let lease = self.acquire_or_renew_async().await?;
         let parent_run_id = RunId::new();
         let scheduler = self.clone();
         let snapshot_run_id = parent_run_id.clone();

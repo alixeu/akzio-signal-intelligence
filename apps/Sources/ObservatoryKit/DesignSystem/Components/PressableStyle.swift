@@ -12,6 +12,7 @@ public struct PressableButtonStyle: ButtonStyle {
     }
 
     public func makeBody(configuration: Configuration) -> some View {
+        // ButtonStyle 只读取 SwiftUI 提供的 isPressed；释放时状态自动恢复，调用方不需要清理。
         configuration.label
             .scaleEffect(configuration.isPressed ? scale : 1)
             .animation(policy.resolve(Motion.control), value: configuration.isPressed)
@@ -31,6 +32,7 @@ public struct HoverLift: ViewModifier {
     @State private var isHovering = false
 
     public func body(content: Content) -> some View {
+        // hover 只影响装饰层、位移和阴影；减少动效时保留 hover 状态但不应用 3D 倾斜。
         content
             .overlay {
                 if isHovering && !policy.isReduced {
@@ -88,6 +90,7 @@ public struct RowHoverHighlight: ViewModifier {
     @State private var isHovering = false
 
     public func body(content: Content) -> some View {
+        // 行高不随 hover 改变；选中态优先于 hover，并用左侧色条提供非颜色之外的定位。
         content
             .background {
                 if isSelected {

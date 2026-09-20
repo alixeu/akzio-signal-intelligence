@@ -145,6 +145,7 @@ impl Store {
         worker_inputs.sort();
         worker_inputs.dedup();
         let worker = WorkflowNode {
+            spec: Some(akzio_domain::NodeSpec::stage("learning.outcome_worker")),
             task_id: TaskId::new(),
             recipe_id: TaskRecipeId::new("learning.outcome_worker")?,
             contract_hash: worker_contract_hash,
@@ -292,26 +293,6 @@ impl Store {
         Ok(())
     }
 
-    /// Atomically seals one Paper outcome and its final retrospective while
-    /// leaving no window where a worker can finish with only one of them.
-    pub fn commit_outcome_retrospective_fenced(
-        &self,
-        lease: &DaemonLease,
-        permit: &TaskWritePermit,
-        outcome_artifact: &Artifact,
-        retrospective_artifact: &Artifact,
-        now: DateTime<Utc>,
-    ) -> StoreResult<()> {
-        self.write_outcome_retrospective_fenced(
-            lease,
-            permit,
-            outcome_artifact,
-            retrospective_artifact,
-            now,
-            true,
-        )
-    }
-
     pub fn write_outcome_retrospective_fenced(
         &self,
         lease: &DaemonLease,
@@ -408,7 +389,7 @@ impl Store {
             if origin.run_id.as_ref() != Some(&permit.run_id) {
                 continue;
             }
-            let existing_payload: Retrospective = self.read_artifact_payload(&existing)?;
+            let existing_payload: Retrospective = self.read_artifact_payload_with_connection(&transaction, &existing)?;
             if existing_payload.outcome_id == retrospective.outcome_id
                 && existing_payload.horizon == retrospective.horizon
                 && existing != *retrospective_artifact

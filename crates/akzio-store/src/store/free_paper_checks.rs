@@ -318,3 +318,53 @@ fn trajectory_output_refs(artifact: &Artifact) -> Vec<ArtifactRef> {
     refs.dedup();
     refs
 }
+
+#[cfg(test)]
+mod connection_guard_tests {
+    use super::*;
+
+    fn test_store(label: &str) -> Store {
+        Store::open(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/connection-guard-tests")
+                .join(format!("{label}-{}", RunId::new().0)),
+        )
+        .unwrap()
+    }
+
+    /// Acquiring the connection twice on one thread is reported rather than
+    /// hanging. Before this, the nested acquisition blocked forever while still
+    /// holding the lock, taking the whole process down with no diagnostic.
+    #[test]
+    fn nested_acquisition_on_one_thread_is_reported() {
+        let store = test_store("nested-acquire");
+        let guard = store.connection().unwrap();
+        let error = match store.connection() {
+            Ok(_) => panic!("nested acquire must fail instead of deadlocking"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(&error, StoreError::Integrity(message) if message.contains("twice on one thread")),
+            "expected a nested-acquisition diagnostic, got {error:?}"
+        );
+        drop(guard);
+
+        // The flag is cleared on drop, so the next acquisition succeeds.
+        store.connection().unwrap();
+    }
+
+    /// The ownership flag is per thread: another thread still blocks and then
+    /// proceeds, because cross-thread contention is ordinary serialization.
+    #[test]
+    fn a_second_thread_still_serializes() {
+        let store = test_store("cross-thread-serialize");
+        let guard = store.connection().unwrap();
+        let other = {
+            let store = store.clone();
+            std::thread::spawn(move || store.connection().map(|_| ()).map_err(|e| e.to_string()))
+        };
+        // Release the guard so the waiting thread can make progress.
+        drop(guard);
+        other.join().unwrap().expect("other thread must acquire");
+    }
+}

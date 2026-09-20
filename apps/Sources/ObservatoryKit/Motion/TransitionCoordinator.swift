@@ -74,16 +74,6 @@ public final class TransitionCoordinator {
 
     public var isRunning: Bool { intent != nil }
 
-    /// Progress through the whole choreography, 0…1.
-    public var normalizedPhase: Double {
-        switch phase {
-        case .idle, .settle: 1
-        case .prepare: 0
-        case .transform: 0.25
-        case .reveal: 0.65
-        }
-    }
-
     public func animation(policy: MotionPolicy) -> Animation {
         var response = descriptor.response
         let keyboard = intent?.fromKeyboard == true
@@ -161,8 +151,4 @@ public final class TransitionCoordinator {
         driver = nil
     }
 
-    /// Phase gate used by pages to stagger their own content.
-    public func hasReached(_ target: TransitionPhase) -> Bool {
-        phase == .idle || phase >= target
-    }
 }

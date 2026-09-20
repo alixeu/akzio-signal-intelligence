@@ -1,4 +1,4 @@
-//! Deterministic model fixture used by Debug and Paper Dry Run.
+//! Deterministic model fixture used by the formal Paper and PositionPlan graphs.
 
 use std::collections::BTreeMap;
 
@@ -46,26 +46,20 @@ pub fn fixture_critique_output() -> Value {
             "topic": "fixture_depth",
             "rationale": "No additional governed detail was selected for the fixture critique.",
             "impact": "warning",
-            "supplemental_needs": [], "assets": [], "horizons": []
+            "retriable": false, "supplemental_requests": [], "assets": [], "horizons": []
         }]
     })
 }
 
 pub fn fixture_model_client() -> ModelClient {
-    let planner = serde_json::json!({
-        "schema_version": akzio_domain::DOMAIN_SCHEMA_VERSION,
-        "topology_id": "active",
-        "tasks": {
-            "analyst": {
-                "recipe_id": "research.analyst",
-                "objective": "Produce a fixture claim",
-                "depends_on": [],
-                "priority": 80,
-                "evidence_needs": []
-            }
-        },
-        "stop_reason": "fixture planner has no configured evidence adapter"
-    });
+    let mut claim = fixture_claim_output();
+    claim["horizon"] = serde_json::json!("$fixture.task.horizon");
+    claim["grounds"][0]["evidence"] = serde_json::json!(
+        "$fixture.schema.first_ref:/properties/result/properties/grounds/items/properties/evidence"
+    );
+    let mut critique = fixture_critique_output();
+    critique["target"] =
+        serde_json::json!("$fixture.schema.first_ref:/properties/result/properties/target");
     let forecasts = akzio_domain::Asset::EXECUTABLE
         .into_iter()
         .flat_map(|asset| {
@@ -116,13 +110,8 @@ pub fn fixture_model_client() -> ModelClient {
                 "confidence_ppm": 1000000
             }
         });
-        vec![
-            serde_json::json!({
-                "output": [{
-                    "type": "message",
-                    "content": [{"type": "output_text", "text": "fixture research memo"}]
-                }]
-            }),
+        [
+            serde_json::Value::Null, // Research has no Draft fixture response.
             serde_json::json!({
                 "output": [{
                     "type": "function_call",
@@ -133,19 +122,22 @@ pub fn fixture_model_client() -> ModelClient {
             }),
         ]
     };
-    ModelClient::fixture_by_purpose(BTreeMap::from([
-        ("research.planner".to_owned(), responses(planner)),
+    ModelClient::fixture_by_purpose_phase(BTreeMap::from([
         (
-            "research.analyst".to_owned(),
-            responses(fixture_claim_output()),
+            "research.proposal_reviewer".to_owned(),
+            responses(
+                serde_json::json!({"assessments":akzio_domain::proposal_review_keys().into_iter().map(|scope| serde_json::json!({"scope":scope,"accepted":true,"rationale":"The deterministic fixture explicitly abstains and makes no calibration claim.","evidence_refs":[],"issues":[]})).collect::<Vec<_>>()}),
+            ),
         ),
-        (
-            "research.critic".to_owned(),
-            responses(fixture_critique_output()),
-        ),
+        ("research.analyst".to_owned(), responses(claim)),
+        ("research.critic".to_owned(), responses(critique)),
         (
             "research.synthesizer".to_owned(),
             responses(serde_json::json!({
+                "numeric_basis": akzio_domain::proposal_review_keys().into_iter().map(|scope| serde_json::json!({
+                    "scope":scope,"inputs":["$fixture.schema.first_ref:/properties/result/properties/numeric_basis/items/properties/inputs/items"],
+                    "units":"ppm","method":"Neutral fixture: probability 500000, return and invested weights zero; cash 1000000.",
+                    "assumptions":"No directional support in the offline fixture.","uncertainty":"Not empirically calibrated; explicit abstention."})).collect::<Vec<_>>(),
                 "summary": "fixture decision draft",
                 "confidence_ppm": 500000,
                 "forecasts": forecasts,
@@ -153,19 +145,129 @@ pub fn fixture_model_client() -> ModelClient {
                     "cash_weight_ppm": 1000000,
                     "allocations": research_allocations
                 },
-                "claims": [{
-                    "artifact_id": akzio_model::FIXTURE_CONTEXT_CLAIM_ID,
-                    "kind": "claim"
-                }],
-                "critiques": [],
-                "evidence": [{
-                    "artifact_id": akzio_model::FIXTURE_CONTEXT_EVIDENCE_ID,
-                    "kind": "normalized_evidence"
-                }],
+                "claims": "$fixture.schema.all_refs:/properties/result/properties/claims/items",
+                "critiques": "$fixture.schema.all_refs:/properties/result/properties/critiques/items",
+                "evidence": "$fixture.schema.all_refs:/properties/result/properties/evidence/items",
                 "material_conflicts": [],
                 "hard_blockers": [],
                 "soft_warnings": []
             })),
         ),
     ]))
+}
+
+#[cfg(test)]
+mod phase_fixture_tests {
+    use super::*;
+    use akzio_model::{ModelInput, ModelRequest, ModelToolChoice, ModelToolDefinition};
+    use serde_json::json;
+
+    fn request(horizon: &str, evidence_id: &str) -> ModelRequest {
+        ModelRequest {
+            instructions: "offline fixture".into(),
+            input: ModelInput::Fresh {
+                text: json!({
+                    "objective": format!("[research_horizon={horizon}] Offline scoped research"),
+                    "context_manifest": format!("manifest-{horizon}"),
+                    "context": [{"kind": "normalized_evidence", "artifact_id": evidence_id}]
+                })
+                .to_string(),
+            },
+            max_output_tokens: 5000,
+            reasoning_effort: None,
+            tools: vec![],
+            tool_choice: ModelToolChoice::Auto,
+            fixture_key: Some("research.analyst".into()),
+        }
+    }
+
+    fn submit(mut request: ModelRequest, evidence_id: &str) -> ModelRequest {
+        request.tool_choice = ModelToolChoice::RequiredFunction("submit_result".into());
+        request.tools = vec![ModelToolDefinition {
+            name: "submit_result".into(),
+            description: "Submit scoped fixture".into(),
+            strict: true,
+            input_schema: json!({"properties":{"result":{"properties":{"grounds":{"items":{"properties":{"evidence":{"properties":{"artifact_id":{"enum":[evidence_id]}}}}}}}}}}),
+        }];
+        request
+    }
+
+    #[tokio::test]
+    async fn concurrent_formal_fixture_tasks_keep_phase_horizon_and_references_isolated() {
+        let client = fixture_model_client();
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+        let tasks = ["t1", "t3", "t5"].map(|horizon| {
+            let client = client.clone();
+            let barrier = barrier.clone();
+            async move {
+                let evidence = akzio_domain::ContentHash::of_bytes(horizon.as_bytes()).to_string();
+                let request = request(horizon, &evidence);
+                assert!(
+                    client.respond(request.clone()).await.is_err(),
+                    "research Draft is retired"
+                );
+                barrier.wait().await;
+                let submit = submit(request, &evidence);
+                let result = client.respond(submit.clone()).await.unwrap();
+                let repeat = client.respond(submit).await.unwrap();
+                assert_eq!(
+                    result.tool_calls, repeat.tool_calls,
+                    "replaying one request must not consume another task's response"
+                );
+                let value = &result.tool_calls[0].arguments;
+                assert_eq!(value["result"]["horizon"], horizon);
+                assert_eq!(value["result"]["stance"], "neutral");
+                assert_eq!(
+                    value["result"]["grounds"][0]["evidence"]["artifact_id"],
+                    evidence
+                );
+            }
+        });
+        futures::future::join_all(tasks).await;
+    }
+
+    #[tokio::test]
+    async fn fixture_templates_use_only_current_bound_schema_not_stale_context() {
+        let client = fixture_model_client();
+        let old = akzio_domain::ContentHash::of_bytes(b"old-context").to_string();
+        let current = akzio_domain::ContentHash::of_bytes(b"current-enum").to_string();
+        let request = request("t1", &old);
+        let mut submit = submit(request, &current);
+        let output = client.respond(submit.clone()).await.unwrap();
+        assert_eq!(
+            output.tool_calls[0].arguments["result"]["grounds"][0]["evidence"]["artifact_id"],
+            current
+        );
+        submit.tools[0].input_schema["properties"]["result"]["properties"]["grounds"]["items"]
+            ["properties"]["evidence"]["properties"]["artifact_id"]["enum"] = json!([]);
+        assert!(
+            client.respond(submit).await.is_err(),
+            "an empty allowed enum must not fall back to old context"
+        );
+    }
+
+    #[tokio::test]
+    async fn fault_injection_sequences_keep_consumption_and_invalid_output_semantics() {
+        let raw = json!({"output":[{"type":"function_call", "name":"submit_result", "call_id":"fault-injection", "arguments":"{\"horizon\":\"intentionally_invalid\"}"}]});
+        let request = request("t1", "unused");
+        let sequence = ModelClient::fixture_sequence([raw.clone()]);
+        let output = sequence.respond(request.clone()).await.unwrap();
+        assert_eq!(
+            output.tool_calls[0].arguments["horizon"],
+            "intentionally_invalid"
+        );
+        assert!(matches!(
+            sequence.respond(request.clone()).await,
+            Err(akzio_model::ModelError::FixtureExhausted)
+        ));
+        let by_purpose = ModelClient::fixture_by_purpose(BTreeMap::from([(
+            "research.analyst".into(),
+            vec![raw],
+        )]));
+        by_purpose.respond(request.clone()).await.unwrap();
+        assert!(matches!(
+            by_purpose.respond(request).await,
+            Err(akzio_model::ModelError::FixtureExhausted)
+        ));
+    }
 }

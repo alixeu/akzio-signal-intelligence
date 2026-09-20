@@ -32,7 +32,7 @@ struct CoreSettingsSection: View {
 
             SettingsSection(
                 "Required Credentials",
-            footnote: "Configuration is saved in ~/.akzio/config.toml with owner-only permissions."
+            footnote: "配置位置：\(store.coreConfigurationPath) · 仅当前用户可访问"
             ) {
                 credentialFields
             }
@@ -59,6 +59,8 @@ struct CoreSettingsSection: View {
             }
 
             HStack(spacing: AkzioLayout.s2) {
+                Button("连接真实数据") { Task { await store.reconnectCore() } }
+                    .buttonStyle(PressableButtonStyle())
                 Button(L10n.text("Save & Restart Core", language: language)) {
                     Task { await store.saveCoreConfigurationAndRestart() }
                 }

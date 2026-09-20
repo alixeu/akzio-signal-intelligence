@@ -98,6 +98,8 @@ pub(crate) struct ObserverApprovalStatus {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ObserverRunDetail {
+    pub inspection: akzio_store::RunInspection,
+    pub research_audit: akzio_store::ResearchAudit,
     pub workflow: WorkflowSnapshot,
     pub events: Vec<EventView>,
     pub trajectory: Vec<TrajectoryEntry>,

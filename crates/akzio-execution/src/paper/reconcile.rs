@@ -1,38 +1,55 @@
-impl AlpacaPaper {
-    fn validate_commitment(
-        &self,
-        commitment: &PaperCommitment,
-        plan: &ExecutionPlan,
-    ) -> Result<()> {
-        commitment
-            .validate()
-            .map_err(|error| PaperError::InvalidCommitment(error.to_string()))?;
-        plan.validate()?;
-        if commitment.plan_hash != plan.plan_hash {
-            return Err(PaperError::CommitmentPlanHashMismatch);
-        }
-        if commitment.broker_session != plan.broker_session {
-            return Err(PaperError::InvalidCommitment(
-                "broker session does not match execution plan".to_owned(),
-            ));
-        }
-        if commitment.client_order_ids.len() != plan.orders.len() {
-            return Err(PaperError::InvalidCommitment(
-                "client order count does not match allocation plan".to_owned(),
-            ));
-        }
-        for (index, order) in plan.orders.iter().enumerate() {
-            let expected = client_order_id(&commitment.broker_session, &plan.plan_hash, index, 0);
-            if commitment.client_order_ids.get(&order.asset) != Some(&expected) {
-                return Err(PaperError::CommitmentClientOrderMismatch(order.asset));
-            }
-        }
-        Ok(())
+fn validate_commitment(commitment: &PaperCommitment, plan: &ExecutionPlan) -> Result<()> {
+    commitment
+        .validate()
+        .map_err(|error| PaperError::InvalidCommitment(error.to_string()))?;
+    plan.validate()?;
+    if commitment.plan_hash != plan.plan_hash {
+        return Err(PaperError::CommitmentPlanHashMismatch);
     }
+    if commitment.broker_session != plan.broker_session {
+        return Err(PaperError::InvalidCommitment(
+            "broker session does not match execution plan".to_owned(),
+        ));
+    }
+    if commitment.client_order_ids.len() != plan.orders.len() {
+        return Err(PaperError::InvalidCommitment(
+            "client order count does not match allocation plan".to_owned(),
+        ));
+    }
+    for (index, order) in plan.orders.iter().enumerate() {
+        let expected = client_order_id(&commitment.broker_session, &plan.plan_hash, index, 0);
+        if commitment.client_order_ids.get(&order.asset) != Some(&expected) {
+            return Err(PaperError::CommitmentClientOrderMismatch(order.asset));
+        }
+    }
+    Ok(())
+}
 
-    async fn assert_market_open(&self) -> Result<()> {
-        if !self.market_clock().await?.is_open {
+impl AlpacaPaper {
+    async fn assert_market_session(
+        &self,
+        broker_session: &str,
+        order: &OrderIntent,
+        authorization: &PaperSubmissionAuthorization,
+    ) -> Result<()> {
+        let clock = self.market_clock().await?;
+        if clock.session.kind == akzio_domain::TradingSession::Closed {
             return Err(PaperError::MarketClosed);
+        }
+        if !authorization.matches_session(&clock.session, broker_session)
+            || order.extended_hours != clock.session.kind.extended_hours()
+        {
+            return Err(PaperError::InvalidCommitment(
+                "unsubmitted order belongs to a different trading session".to_owned(),
+            ));
+        }
+        if clock.session.kind == akzio_domain::TradingSession::Overnight {
+            let asset = self
+                .get_json(&format!("/v2/assets/{}", order.asset.symbol()))
+                .await?;
+            if !akzio_domain::alpaca_overnight_asset_available(&asset, order.asset) {
+                return Err(PaperError::MarketClosed);
+            }
         }
         Ok(())
     }
@@ -81,16 +98,7 @@ impl AlpacaPaper {
         reprice_count: u8,
     ) -> Result<PaperOrderReceipt> {
         let url = self.url("/v2/orders");
-        let body = serde_json::json!({
-            "symbol": order.asset.symbol(),
-            "qty": quantity_string(order)?,
-            "side": side_name(order.side),
-            "type": "limit",
-            "time_in_force": "day",
-            "limit_price": money_string(order.limit_price),
-            "extended_hours": false,
-            "client_order_id": client_order_id,
-        });
+        let body = order_request(order, client_order_id)?;
         let value = self.post_json(&url, body).await?;
         receipt_from_value(value, client_order_id, false, reprice_count)
     }
@@ -152,7 +160,11 @@ impl AlpacaPaper {
         .await
     }
 
-    async fn replace_committed_order(&self, intent: &PaperReprice) -> Result<PaperOrderReceipt> {
+    async fn replace_committed_order(
+        &self,
+        intent: &PaperReprice,
+        authorization: &PaperSubmissionAuthorization,
+    ) -> Result<PaperOrderReceipt> {
         intent.validate()?;
         if let Some(existing) = self.lookup(&intent.replacement_client_order_id).await? {
             return Ok(PaperOrderReceipt {
@@ -160,6 +172,7 @@ impl AlpacaPaper {
                 ..existing
             });
         }
+        authorization.assert_replacement_current(Utc::now())?;
         let prior = self
             .lookup(&intent.prior_client_order_id)
             .await?
@@ -187,6 +200,7 @@ impl AlpacaPaper {
                 "replacement is in flight but deterministic successor is not visible".to_owned(),
             ));
         }
+        authorization.assert_replacement_current(Utc::now())?;
         let url = self.url(&format!("/v2/orders/{}", intent.prior_broker_order_id));
         let value = self
             .patch_json(

@@ -78,7 +78,7 @@ impl AllocationRuntime {
         {
             return Err(AllocationError::SessionMismatch);
         }
-        if !input.clock.is_open {
+        if !input.clock.tradable() {
             return Err(AllocationError::MarketClosed);
         }
         Ok(build_execution_plan(
@@ -162,6 +162,7 @@ fn build_execution_plan(
             i64::try_from(delta.unsigned_abs()).map_err(|_| ExecutionError::NewNotionalExceeded)?,
         );
         orders.push(OrderIntent {
+            extended_hours: input.clock.trading_session().extended_hours(),
             asset,
             side,
             notional,

@@ -3,8 +3,9 @@
 set -eu
 
 usage() {
+    # usage 同时承担帮助和参数错误出口，调用者传入 0 才表示显式请求帮助。
     echo "usage: $0 --config CONFIG --run-id RUN_ID --out OUTPUT_DIR [--store STORE_ROOT]" >&2
-    exit 1
+    exit "${1:-1}"
 }
 
 config=
@@ -13,6 +14,7 @@ out=
 store=
 
 while [ "$#" -gt 0 ]; do
+    # 参数解析只消费成对的 option/value；未知参数立即失败，不选择隐式最新 Run。
     case "$1" in
         --config)
             [ "$#" -ge 2 ] || usage
@@ -35,7 +37,7 @@ while [ "$#" -gt 0 ]; do
             shift 2
             ;;
         --help|-h)
-            usage
+            usage 0
             ;;
         *)
             echo "unknown option: $1" >&2
@@ -57,7 +59,7 @@ done
     exit 1
 }
 case "$run_id" in
-    *[!A-Za-z0-9._-]*|'*')
+    *[!A-Za-z0-9._-]*)
         echo "--run-id contains unsupported path characters" >&2
         exit 1
         ;;
@@ -69,6 +71,7 @@ command -v mkdir >/dev/null 2>&1 || { echo "missing dependency: mkdir" >&2; exit
 command -v mv >/dev/null 2>&1 || { echo "missing dependency: mv" >&2; exit 1; }
 
 umask 077
+# 从脚本位置定位仓库，确保从任意当前目录调用时仍使用同一 Cargo manifest。
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
 
@@ -80,6 +83,7 @@ mkdir -p -- "$out"
 
 tmp_root=$(mktemp -d "${TMPDIR:-/tmp}/akzio-debug-export.XXXXXX")
 cleanup() {
+    # trap 覆盖正常退出和信号退出；临时目录只保存中间 bundle，不承担最终交付。
     if [ -n "${tmp_root:-}" ] && [ -d "$tmp_root" ]; then
         rm -rf -- "$tmp_root"
     fi
@@ -91,6 +95,7 @@ cli_output=$tmp_root/cli-output.json
 binary=${AKZIO_BIN:-$repo_dir/target/debug/akzio}
 
 if [ -x "$binary" ]; then
+    # 已有可执行文件时直接复用；否则只允许离线 Cargo fallback，不能拉取依赖或启动服务。
     set -- "$binary" --config "$config" debug export-bundle "$run_id" --out "$bundle_tmp"
 else
     command -v cargo >/dev/null 2>&1 || {
@@ -99,7 +104,7 @@ else
     }
     # Offline Cargo fallback only builds the already checked-out workspace; it
     # cannot fetch crates or start a daemon/model during export.
-    set -- cargo run --offline --quiet -p akzio-cli -- --config "$config" debug export-bundle "$run_id" --out "$bundle_tmp"
+    set -- cargo run --manifest-path "$repo_dir/Cargo.toml" --locked --offline --quiet -p akzio-cli -- --config "$config" debug export-bundle "$run_id" --out "$bundle_tmp"
 fi
 if [ -n "$store" ]; then
     set -- "$@" --store "$store"
@@ -128,6 +133,7 @@ if [ -e "$final_dir" ] || [ -e "$final_tar" ]; then
     exit 1
 fi
 mv -- "$bundle_tmp" "$final_dir"
+# 先搬到最终目录，再打 tar；tar 失败会删除不可用归档但保留 bundle 目录供诊断。
 if ! tar -czf "$final_tar" -C "$out" "$name"; then
     echo "tar creation failed; no archive is usable" >&2
     rm -f -- "$final_tar"
@@ -140,6 +146,7 @@ printf 'bundle_tar=%s\n' "$final_tar"
 printf 'status=%s\n' "$status"
 
 if [ "$status" = partial ]; then
+    # partial 是已生成但未完整导出的结果，用退出码 2 与真正失败区分。
     exit 2
 fi
 exit 0

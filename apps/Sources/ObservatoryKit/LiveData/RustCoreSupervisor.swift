@@ -175,11 +175,14 @@ public final class RustCoreSupervisor {
         request.setValue(controlToken, forHTTPHeaderField: "x-akzio-token")
         request.setValue("application/json", forHTTPHeaderField: "content-type")
         request.httpBody = try JSONEncoder().encode(RunSubmissionRequest(purpose: purpose))
-        request.timeoutInterval = 5
-        let (data, response) = try await URLSession.shared.data(for: request)
+        request.timeoutInterval = 60
+        let (data, response) = try await ObserverTransportPolicy.session.data(for: request)
         guard let response = response as? HTTPURLResponse,
               (200..<300).contains(response.statusCode)
-        else { throw CoreLaunchError.runRejected }
+        else {
+            let detail = (try? JSONDecoder().decode(RunRejection.self, from: data))?.error
+            throw CoreLaunchError.runFailure(detail ?? "Rust Core 拒绝运行请求")
+        }
         return try JSONDecoder().decode(RunSubmission.self, from: data).runID
     }
 
@@ -188,13 +191,13 @@ public final class RustCoreSupervisor {
         controlToken: String,
         process: Process
     ) async throws {
-        let deadline = ContinuousClock.now.advanced(by: .seconds(15))
+        let deadline = ContinuousClock.now.advanced(by: .seconds(300))
         while ContinuousClock.now < deadline {
             guard process.isRunning else { throw CoreLaunchError.exitedBeforeReady }
             var request = URLRequest(url: endpoint.appending(path: "ready"))
             request.setValue(controlToken, forHTTPHeaderField: "x-akzio-token")
             request.timeoutInterval = 1
-            if let (_, response) = try? await URLSession.shared.data(for: request),
+            if let (_, response) = try? await ObserverTransportPolicy.session.data(for: request),
                (response as? HTTPURLResponse)?.statusCode == 200
             {
                 return
@@ -207,7 +210,7 @@ public final class RustCoreSupervisor {
     private func endpointIsOccupied(_ endpoint: URL) async -> Bool {
         var request = URLRequest(url: endpoint.appending(path: "ready"))
         request.timeoutInterval = 0.5
-        return (try? await URLSession.shared.data(for: request)) != nil
+        return (try? await ObserverTransportPolicy.session.data(for: request)) != nil
     }
 
     private func childEnvironment(
@@ -330,6 +333,7 @@ enum CoreLaunchError: LocalizedError {
     case readyTimeout
     case notReady
     case runRejected
+    case runFailure(String)
 
     var errorDescription: String? {
         switch self {
@@ -338,9 +342,10 @@ enum CoreLaunchError: LocalizedError {
         case .missingConfig: "Bundled Rust core configuration was not found"
         case .portOccupied: "127.0.0.1:7342 is already occupied by another process"
         case .exitedBeforeReady: "Rust core exited before becoming ready"
-        case .readyTimeout: "Rust core did not become ready within 15 seconds"
+        case .readyTimeout: "Core 在 5 分钟内未就绪，请检查模型连接和 Core 日志"
         case .notReady: "Rust core is not ready"
         case .runRejected: "Rust core rejected the run"
+        case .runFailure(let message): message
         }
     }
 }
@@ -356,3 +361,5 @@ private struct RunSubmission: Decodable {
 private struct RunSubmissionRequest: Encodable {
     let purpose: RunPurpose
 }
+
+private struct RunRejection: Decodable { let error: String }

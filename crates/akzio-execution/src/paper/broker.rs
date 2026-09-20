@@ -3,10 +3,15 @@ impl CommittedPaperBroker for AlpacaPaper {
         &'a self,
         commitment: &'a PaperCommitment,
         plan: &'a ExecutionPlan,
+        authorization: &'a PaperSubmissionAuthorization,
     ) -> Pin<Box<dyn Future<Output = Result<PaperExecution>> + Send + 'a>> {
-        Box::pin(AlpacaPaper::execute_committed(self, commitment, plan))
+        Box::pin(AlpacaPaper::execute_committed(
+            self,
+            commitment,
+            plan,
+            authorization,
+        ))
     }
-
 
     fn reconcile_commitment<'a>(
         &'a self,
@@ -28,7 +33,12 @@ impl CommittedPaperBroker for AlpacaPaper {
     fn replace_order<'a>(
         &'a self,
         intent: &'a PaperReprice,
+        authorization: &'a PaperSubmissionAuthorization,
     ) -> Pin<Box<dyn Future<Output = Result<PaperOrderReceipt>> + Send + 'a>> {
-        Box::pin(AlpacaPaper::replace_committed_order(self, intent))
+        Box::pin(AlpacaPaper::replace_committed_order(
+            self,
+            intent,
+            authorization,
+        ))
     }
 }

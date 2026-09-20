@@ -335,23 +335,6 @@ pub struct CapacityScenario {
     pub within_capacity: bool,
 }
 
-/// One deterministic point in a capacity study.  The estimate deliberately
-/// reports execution pressure rather than pretending that a single-account
-/// backtest return survives unchanged at a larger deployment size.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CapacityStudyPoint {
-    pub scenario: CapacityScenario,
-    pub estimated_completion_minutes: u32,
-    pub capacity_adjusted_return_ppm: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CapacityStudy {
-    pub account_notionals: Vec<MoneyMicros>,
-    pub homogeneous_agent_counts: Vec<u32>,
-    pub points: Vec<CapacityStudyPoint>,
-}
-
 pub fn assess_capacity(
     policy: &CapacityPolicy,
     target: &TargetPortfolio,
@@ -413,79 +396,6 @@ pub fn assess_capacity(
         homogeneous_agent_count,
         assets,
         within_capacity,
-    })
-}
-
-/// Evaluate the same target across a deployment-size and homogeneous-agent
-/// grid.  Inputs must be strictly increasing so the output is stable and
-/// directly comparable across qualification runs.
-pub fn assess_capacity_study(
-    policy: &CapacityPolicy,
-    target: &TargetPortfolio,
-    account_notionals: &[MoneyMicros],
-    homogeneous_agent_counts: &[u32],
-    average_daily_dollar_volume: &BTreeMap<Asset, MoneyMicros>,
-    gross_expected_return_ppm: i64,
-) -> Result<CapacityStudy, DomainError> {
-    let valid_notionals = !account_notionals.is_empty()
-        && account_notionals.iter().all(|value| value.0 > 0)
-        && account_notionals
-            .windows(2)
-            .all(|pair| pair[0].0 < pair[1].0);
-    let valid_populations = !homogeneous_agent_counts.is_empty()
-        && homogeneous_agent_counts.iter().all(|value| *value > 0)
-        && homogeneous_agent_counts
-            .windows(2)
-            .all(|pair| pair[0] < pair[1]);
-    if !valid_notionals || !valid_populations {
-        return Err(DomainError::InvalidBudget {
-            field: "capacity_study.grid",
-        });
-    }
-
-    let mut points = Vec::with_capacity(
-        account_notionals
-            .len()
-            .saturating_mul(homogeneous_agent_counts.len()),
-    );
-    for account_notional in account_notionals.iter().copied() {
-        for homogeneous_agent_count in homogeneous_agent_counts.iter().copied() {
-            let scenario = assess_capacity(
-                policy,
-                target,
-                account_notional,
-                homogeneous_agent_count,
-                average_daily_dollar_volume,
-            )?;
-            let maximum_participation = scenario
-                .assets
-                .iter()
-                .map(|asset| asset.expected_market_participation_ppm)
-                .max()
-                .unwrap_or(WeightPpm::SCALE);
-            let estimated_completion_minutes = u64::from(maximum_participation)
-                .saturating_mul(390)
-                .saturating_add(u64::from(policy.maximum_market_participation_ppm) - 1)
-                / u64::from(policy.maximum_market_participation_ppm);
-            let maximum_slippage = scenario
-                .assets
-                .iter()
-                .map(|asset| asset.estimated_slippage_ppm)
-                .max()
-                .unwrap_or(WeightPpm::SCALE);
-            points.push(CapacityStudyPoint {
-                scenario,
-                estimated_completion_minutes: u32::try_from(estimated_completion_minutes)
-                    .unwrap_or(u32::MAX),
-                capacity_adjusted_return_ppm: gross_expected_return_ppm
-                    .saturating_sub(i64::from(maximum_slippage)),
-            });
-        }
-    }
-    Ok(CapacityStudy {
-        account_notionals: account_notionals.to_vec(),
-        homogeneous_agent_counts: homogeneous_agent_counts.to_vec(),
-        points,
     })
 }
 

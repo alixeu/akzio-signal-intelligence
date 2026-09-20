@@ -4,8 +4,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    content_hash_json, ArtifactId, ArtifactKind, ArtifactRef, Asset, ContentHash, DomainError,
-    TargetPortfolio, WeightPpm,
+    content_hash_json, ArtifactKind, ArtifactRef, Asset, ContentHash, DomainError, TargetPortfolio,
+    WeightPpm,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -485,49 +485,6 @@ pub struct ModelQualificationReport {
 }
 
 impl ModelQualificationReport {
-    pub fn all_checks_passed(
-        key: ModelQualificationKey,
-        behavior_fingerprint: ContentHash,
-        approved_by: String,
-        qualified_at: DateTime<Utc>,
-        expires_at: DateTime<Utc>,
-    ) -> Self {
-        let fingerprint_seed = behavior_fingerprint.as_str().to_owned();
-        let reference = |kind, stage: &str| ArtifactRef {
-            artifact_id: ArtifactId(ContentHash::of_bytes(
-                format!("fixture:{stage}:{fingerprint_seed}").as_bytes(),
-            )),
-            kind,
-        };
-        let mut report = Self {
-            key,
-            behavior_fingerprint,
-            evidence: ModelQualificationEvidence {
-                frozen_context_manifest: reference(ArtifactKind::ContextManifest, "context"),
-                replay_evaluation: reference(ArtifactKind::Evaluation, "replay"),
-                adversarial_evaluation: reference(ArtifactKind::Evaluation, "adversarial"),
-                execution_simulation_evaluation: reference(
-                    ArtifactKind::Evaluation,
-                    "execution-simulation",
-                ),
-                shadow_evaluation: reference(ArtifactKind::Evaluation, "shadow"),
-                canary_evaluation: reference(ArtifactKind::Evaluation, "canary"),
-            },
-            replay_passed: true,
-            adversarial_passed: true,
-            execution_simulation_passed: true,
-            shadow_passed: true,
-            canary_passed: true,
-            critical_regressions: 0,
-            approved_by,
-            qualified_at,
-            expires_at,
-            report_hash: ContentHash::of_bytes(b"pending"),
-        };
-        report.report_hash = report.unsigned_hash();
-        report
-    }
-
     pub fn validate(&self) -> Result<(), DomainError> {
         self.key.validate()?;
         self.evidence.validate()?;

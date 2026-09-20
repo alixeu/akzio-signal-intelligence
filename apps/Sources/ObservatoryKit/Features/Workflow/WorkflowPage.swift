@@ -27,7 +27,12 @@ struct WorkflowPage: View {
                         .frame(maxWidth: .infinity, alignment: .topLeading)
                 }
             } else {
+            PageScroll {
             VStack(alignment: .leading, spacing: AkzioLayout.s4) {
+                RuntimeInspectorPanel(store: store)
+                if let summary = store.workflowEvidenceSummary {
+                    Text(summary).akzioText(.body).textSelection(.enabled)
+                }
                 StagedSection(index: 0) {
                     WorkflowProgressStrip(workflow: workflow, namespace: namespace)
                 }
@@ -43,15 +48,18 @@ struct WorkflowPage: View {
                     symbol: "list.bullet.rectangle",
                     width: AkzioLayout.workflowInspectorWidth
                 ) {
+                    ScrollView {
                     StageInspectorPanel(
                         inspector: store.selectedStageInspector,
                         node: store.activeStage,
                         namespace: namespace,
                         width: AkzioLayout.workflowInspectorWidth
                     )
+                    }.frame(height: 520)
                         }
                     }
                 }
+            }
             }
             }
         } toolbar: {
@@ -86,7 +94,7 @@ struct WorkflowPage: View {
                 offset: $offset,
                 onSelect: { store.selectedStageID = $0 }
             )
-            .frame(minHeight: 430)
+            .frame(height: 430)
             .background {
                 if showsGrid {
                     GridBackdrop()

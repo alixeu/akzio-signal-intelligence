@@ -40,14 +40,14 @@ extension LiveProjection {
                 isSealed: window != nil,
                 note: window == nil
                     ? (section?.reason ?? "Awaiting sealed trading-session evidence")
-                    : "Sealed from canonical Paper evidence"
+                    : "Sealed outcome evidence available"
             )
         }
         return OutcomePresentation(
             horizons: horizons,
             windows: windows,
             selected: windows.last?.horizon ?? .t1,
-            observedTradingDays: Int(analytics?.completedTradingSessions ?? 0),
+            observedTradingDays: analytics.map { Int($0.completedTradingSessions) },
             totalTradingDays: OutcomeHorizonKind.t5.tradingDays,
             outcomeID: analytics?.outcomeID
                 ?? artifact?.payload["outcome_id"]?.string

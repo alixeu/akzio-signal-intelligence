@@ -187,7 +187,9 @@ fn append_event(
             created_at.to_rfc3339(),
         ],
     )?;
-    Ok(transaction.last_insert_rowid())
+    let cursor = transaction.last_insert_rowid();
+    run_control::checkpoint_boundary(transaction, run_id, cursor, event_type, task_id, attempt_id, artifact_id, created_at)?;
+    Ok(cursor)
 }
 
 fn append_task_event(
@@ -239,7 +241,7 @@ fn validate_event_shape(
     }
 
     let valid = match event_type {
-        LifecycleEventType::DebugControlChanged => !has_task_id && !has_attempt_id && has_artifact_id,
+        LifecycleEventType::RunCheckpointSaved | LifecycleEventType::DebugControlChanged => !has_task_id && !has_attempt_id && has_artifact_id,
         LifecycleEventType::StageAcceptanceRecorded => has_task_id && has_attempt_id && has_artifact_id,
         LifecycleEventType::DebugBudgetObserved => has_task_id && has_attempt_id && has_artifact_id,
         LifecycleEventType::WorkflowCreated => !has_task_id && !has_attempt_id && has_artifact_id,

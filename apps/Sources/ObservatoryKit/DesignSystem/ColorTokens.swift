@@ -15,8 +15,8 @@ public enum AkzioColor {
     public static let actionCoral = Color(hex: 0xFF6B4A)
 
     public static let primaryText = Color(hex: 0xF3EFE9)
-    public static let secondaryText = Color(hex: 0xB0A9A0)
-    public static let mutedText = Color(hex: 0x948D84)
+    public static let secondaryText = Color(hex: 0xC7C0B7)
+    public static let mutedText = Color(hex: 0xACA69E)
 
     public static let hairline = Color.white.opacity(0.08)
     public static let goldHairline = Color(hex: 0xD4A15E).opacity(0.18)
@@ -128,34 +128,4 @@ extension Color {
             opacity: 1
         )
     }
-}
-
-/// Hue/saturation probe used by `ColorTokenTests` to keep the palette honest.
-public struct ColorProbe: Sendable {
-    public let hue: Double
-    public let saturation: Double
-    public let brightness: Double
-
-    public init(hex: UInt32) {
-        let r = Double((hex >> 16) & 0xFF) / 255
-        let g = Double((hex >> 8) & 0xFF) / 255
-        let b = Double(hex & 0xFF) / 255
-        let maxV = max(r, g, b)
-        let minV = min(r, g, b)
-        let delta = maxV - minV
-        brightness = maxV
-        saturation = maxV == 0 ? 0 : delta / maxV
-        if delta == 0 {
-            hue = 0
-        } else if maxV == r {
-            hue = (60 * ((g - b) / delta)).truncatingRemainder(dividingBy: 360)
-        } else if maxV == g {
-            hue = 60 * ((b - r) / delta) + 120
-        } else {
-            hue = 60 * ((r - g) / delta) + 240
-        }
-    }
-
-    /// Purple / violet / blue band the spec bans outright.
-    public var isBannedHue: Bool { saturation > 0.15 && hue >= 200 && hue <= 330 }
 }

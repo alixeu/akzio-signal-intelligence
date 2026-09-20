@@ -13,8 +13,9 @@ public struct RunPresentation: Sendable, Equatable {
     public let market: String
     public let startedAt: Date
     public let elapsedSeconds: Int
-    public let systemHealthPpm: Int
+    public let systemHealthPpm: Int?
     public let marketOpen: Bool
+    public let marketStatusKnown: Bool
     public let dataLive: Bool
     public let dataStale: Bool
     public let latencyMillis: Int?
@@ -29,8 +30,9 @@ public struct RunPresentation: Sendable, Equatable {
         market: String,
         startedAt: Date,
         elapsedSeconds: Int,
-        systemHealthPpm: Int,
+        systemHealthPpm: Int?,
         marketOpen: Bool,
+        marketStatusKnown: Bool = true,
         dataLive: Bool,
         dataStale: Bool = false,
         latencyMillis: Int?,
@@ -46,6 +48,7 @@ public struct RunPresentation: Sendable, Equatable {
         self.elapsedSeconds = elapsedSeconds
         self.systemHealthPpm = systemHealthPpm
         self.marketOpen = marketOpen
+        self.marketStatusKnown = marketStatusKnown
         self.dataLive = dataLive
         self.dataStale = dataStale
         self.latencyMillis = latencyMillis
@@ -65,6 +68,10 @@ public struct RunPresentation: Sendable, Equatable {
 
     /// Paper Commit only applies to canonical Paper runs.
     public var submitsPaperOrders: Bool { purpose.submitsPaperOrders }
+
+    public var hasRun: Bool { runId.caseInsensitiveCompare(MissingValue.unavailable.rawValue) != .orderedSame }
+
+    public var displayStatus: String { hasRun ? status.displayName : "No active run" }
 
     public var dataStatus: AkzioStatus {
         if dataStale { return .stale }

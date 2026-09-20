@@ -122,12 +122,28 @@ impl Store {
         if expires_at <= now {
             return Err(StoreError::InvalidDaemonLease(lease.lease_name.clone()));
         }
-        let connection = self.connection()?;
-        let changed = connection.execute(
-            "UPDATE rebuild_daemon_leases SET expires_at = ?1, heartbeat_at = ?2 WHERE lease_name = ?3 AND owner_id = ?4 AND epoch = ?5 AND expires_at > ?2",
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<String> = transaction.query_row(
+            "SELECT expires_at FROM rebuild_daemon_leases WHERE lease_name = ?1 AND owner_id = ?2 AND epoch = ?3",
+            params![lease.lease_name, lease.owner_id, lease.epoch],
+            |row| row.get(0),
+        ).optional()?;
+        let Some(current) = current else {
+            return Ok(false);
+        };
+        let current = parse_time(&current)?;
+        if current <= now {
+            return Ok(false);
+        }
+        // A heartbeat cannot undo a maintenance window's lease extension.
+        let expires_at = expires_at.max(current);
+        transaction.execute(
+            "UPDATE rebuild_daemon_leases SET expires_at = ?1, heartbeat_at = ?2 WHERE lease_name = ?3 AND owner_id = ?4 AND epoch = ?5",
             params![expires_at.to_rfc3339(), now.to_rfc3339(), lease.lease_name, lease.owner_id, lease.epoch],
         )?;
-        Ok(changed == 1)
+        transaction.commit()?;
+        Ok(true)
     }
 
     pub fn daemon_lease(&self, lease_name: &str) -> StoreResult<Option<DaemonLease>> {
@@ -229,6 +245,11 @@ impl Store {
                 }
                 Self::commit_workflow_transaction(&transaction, &reservation.workflow)?;
                 Self::append_session_setup_events(&transaction, reservation, None)?;
+                assert_session_slot_run(
+                    &transaction,
+                    &reservation.session_key,
+                    &reservation.workflow.run.run_id,
+                )?;
                 transaction.execute(
                     "INSERT INTO rebuild_session_slots (session_key, run_id, topology_id, graph_artifact_id, run_created_at, scheduler_epoch, reserved_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![

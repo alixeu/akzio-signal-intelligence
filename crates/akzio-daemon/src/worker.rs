@@ -60,12 +60,6 @@ impl WorkerPool {
         self
     }
 
-    /// Recover work owned by a process that stopped without finishing its
-    /// leases.  It is safe to call before every pool start and is idempotent.
-    pub async fn recover_abandoned(&self) -> Result<u64, RuntimeError> {
-        self.runtime.recover_expired_tasks(Utc::now()).await
-    }
-
     /// Run the configured worker count until `shutdown` becomes true.
     ///
     /// A task is never run outside `TaskRuntime`: handler failures must be
@@ -126,12 +120,6 @@ impl WorkerPool {
             })??;
         }
         Ok(())
-    }
-
-    pub fn worker_ids(&self) -> Vec<String> {
-        (0..self.config.normalized_worker_count())
-            .map(|index| format!("{}-{index}", self.config.worker_prefix))
-            .collect()
     }
 }
 
@@ -206,10 +194,12 @@ async fn worker_loop(
             reserved
         };
         let result = runtime
-            .run_one_for_workload(&worker_id, preferred, |task| handler(task))
+            .execute_ready_node(&worker_id, preferred, handler.as_ref())
             .await;
         let result = if matches!(result, Ok(false)) && reserved == akzio_store::TaskWorkload::Any {
-            runtime.run_one(&worker_id, |task| handler(task)).await
+            runtime
+                .execute_ready_node(&worker_id, akzio_store::TaskWorkload::Any, handler.as_ref())
+                .await
         } else {
             result
         };

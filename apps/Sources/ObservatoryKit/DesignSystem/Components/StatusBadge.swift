@@ -30,6 +30,7 @@ public struct StatusBadge: View {
 
     public var body: some View {
         let style = status.style
+        // style 同时提供图标、颜色和默认文案；无障碍策略开启时即使 showsLabel=false 仍显示文字。
         HStack(spacing: size == .compact ? 4 : 5) {
             Image(systemName: style.symbol)
                 .font(.system(size: size == .compact ? 9 : 10, weight: .semibold))
@@ -80,6 +81,7 @@ public struct StatusDot: View {
 
     public var body: some View {
         let tone = status.style.tone
+        // 只有 live 状态且全局允许 ambient 时绘制呼吸环；终态圆点保持静止。
         Circle()
             .fill(tone == .gold && status == .succeeded ? AkzioColor.successDot : tone.color)
             .frame(width: diameter, height: diameter)
@@ -112,6 +114,7 @@ public struct PillTag: View {
     }
 
     public var body: some View {
+        // PillTag 是只读语义标签，不引入 Button 或 hover 状态。
         Text(L10n.text(text, language: language))
             .font(AkzioFont.caption)
             .tracking(AkzioFont.captionTracking)

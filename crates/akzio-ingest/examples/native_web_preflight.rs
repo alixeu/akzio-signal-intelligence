@@ -12,11 +12,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "low",
     )?);
     let policy = NativeWebPolicy::default();
-    let result = client.respond(ModelRequest {
-        instructions: "Use the supplied hosted web search once to locate the FRED VIXCLS series. Cite its official page. This is a capability probe, not investment research.".into(),
-        input: ModelInput::Fresh { text: "Find VIXCLS at fred.stlouisfed.org using web search.".into() },
-        max_output_tokens: 1000, reasoning_effort: None, tools: vec![policy.tool_definition()], tool_choice: ModelToolChoice::Required, fixture_key: None,
-    }).await;
+    let result = client
+        .respond(ModelRequest {
+            instructions: "使用提供的 hosted web search 一次，定位 FRED VIXCLS series。引用其官方页面。这是 capability probe，不是投资研究。\n"
+                .into(),
+            input: ModelInput::Fresh {
+                text: "使用 web search 在 fred.stlouisfed.org 查找 VIXCLS。\n"
+                    .into(),
+            },
+            max_output_tokens: 1000,
+            reasoning_effort: None,
+            tools: vec![policy.tool_definition()],
+            tool_choice: ModelToolChoice::Required,
+            fixture_key: None,
+        })
+        .await;
     match result {
         Ok(response) => println!(
             "{}",

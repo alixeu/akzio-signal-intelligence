@@ -33,6 +33,7 @@ public struct ProgressRing<Center: View>: View {
     }
 
     public var body: some View {
+        // nil progress 只显示虚线轨道；有值时才消费 progress 画 trim，完成阈值另行触发一次 bloom。
         ZStack {
             // Track
             Circle()
@@ -74,6 +75,7 @@ public struct ProgressRing<Center: View>: View {
         .frame(width: diameter, height: diameter)
         .completionBloom(trigger: completionTick, tone: tone)
         .onChange(of: progress) { _, new in
+            // 只有跨入 100% 才递增 completionTick，避免同一完成值重复播放。
             if let new, new >= 1 { completionTick += 1 }
         }
         .accessibilityElement(children: .combine)
@@ -110,6 +112,7 @@ public struct RiskGauge: View {
 
     private var normalized: Double {
         let span = bounds.upperBound - bounds.lowerBound
+        // 退化区间不参与除法；正常区间把 value 夹到 0...1，needle 与弧线使用同一比例。
         guard span > 0 else { return 0 }
         return min(max((value - bounds.lowerBound) / span, 0), 1)
     }
@@ -117,6 +120,7 @@ public struct RiskGauge: View {
     private var isRisky: Bool { value >= riskThreshold }
 
     public var body: some View {
+        // 风险颜色和指针位置同时反映阈值，避免仅靠颜色传递风险语义。
         VStack(spacing: 4) {
             ZStack {
                 Circle()

@@ -7,6 +7,8 @@ pub enum OrderSide {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrderIntent {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub extended_hours: bool,
     pub asset: Asset,
     pub side: OrderSide,
     pub notional: MoneyMicros,

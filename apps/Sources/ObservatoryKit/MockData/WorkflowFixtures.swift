@@ -7,7 +7,6 @@ import Foundation
 enum WorkflowFixtures {
     /// Execution order. The index in this array is the progress ruler.
     static let order: [WorkflowStageKind] = [
-        .planner,
         .evidenceGate,
         .analyst(1), .analyst(2), .analyst(3),
         .critic,
@@ -107,9 +106,7 @@ enum WorkflowFixtures {
     }
 
     static func edges(scenario: MockScenario) -> [WorkflowEdgePresentation] {
-        var edges: [WorkflowEdgePresentation] = [
-            .init(from: .planner, to: .evidenceGate, kind: .sequential)
-        ]
+        var edges: [WorkflowEdgePresentation] = []
         for index in 1...3 {
             edges.append(.init(from: .evidenceGate, to: .analyst(index), kind: .parallel))
             edges.append(.init(from: .analyst(index), to: .critic, kind: .optional))

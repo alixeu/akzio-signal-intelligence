@@ -37,7 +37,7 @@ impl Daemon {
     ) -> Result<Vec<akzio_domain::Artifact>> {
         if task.node.input_artifacts.is_empty() {
             return match self.store.run_purpose(&task.run_id)? {
-                RunPurpose::Debug | RunPurpose::PaperDryRun => Ok(Vec::new()),
+                RunPurpose::Debug => Ok(Vec::new()),
                 RunPurpose::Paper | RunPurpose::PositionPlan => Err(DaemonError::InvalidInput(
                     "Research evidence gate requires at least one EvidenceNeed".to_owned(),
                 )),
@@ -138,20 +138,12 @@ impl Daemon {
                         ("unavailable", "temporal_contamination")
                     }
                     Err(error) => {
-                        // Store and lineage failures are not provider coverage gaps.
-                        if matches!(
-                            error,
-                            DaemonError::Store(_)
-                                | DaemonError::Evidence(
-                                    akzio_ingest::EvidenceRuntimeError::Store(_)
-                                        | akzio_ingest::EvidenceRuntimeError::InvalidEvidenceNeed
-                                        | akzio_ingest::EvidenceRuntimeError::UnsafeSourceUri
-                                        | akzio_ingest::EvidenceRuntimeError::SourceNotAllowed(_)
-                                )
-                        ) {
+                        // Only known provider availability/content failures are
+                        // coverage gaps. Identity, policy, Store and internal
+                        // errors must retain their original failure semantics.
+                        let Some(category) = evidence_failure_category(&error) else {
                             return Err(error);
-                        }
-                        let category = evidence_failure_category(&error);
+                        };
                         // ExecutionSafety needs were deferred before acquisition.
                         // Provider coverage failures here are research gaps; the
                         // temporal and provenance failures above still fail closed.
@@ -224,7 +216,7 @@ impl Daemon {
                 max_age: Duration::seconds(max_age_secs),
                 acquisition_mode: evidence_acquisition_mode(purpose, &need),
             };
-            let use_fixture_adapter = self.fixture_mode || purpose == RunPurpose::PaperDryRun;
+            let use_fixture_adapter = self.fixture_mode;
             let production_adapter = (!use_fixture_adapter)
                 .then(|| self.production_evidence.get(&source))
                 .flatten();
@@ -252,8 +244,7 @@ impl Daemon {
                     .get(&source)
                     .cloned()
                     .unwrap_or_default();
-                let allow_fixture_evidence =
-                    purpose == RunPurpose::PaperDryRun || self.fixture_mode;
+                let allow_fixture_evidence = self.fixture_mode;
                 if allow_fixture_evidence {
                     responses
                         .entry(need.resource.clone())
@@ -431,23 +422,13 @@ impl Daemon {
         task: &ClaimedAttempt,
         claim: &ResearchClaim,
         claim_reference: &ArtifactRef,
-        candidates: &[ArtifactRef],
+        _candidates: &[ArtifactRef],
         now: DateTime<Utc>,
     ) -> Result<Vec<(ArtifactRef, Artifact, EvidenceNeed)>> {
         let session_key = self.research_session_key(&task.run_id)?;
         let session_date = NaiveDate::parse_from_str(&session_key, "%Y-%m-%d").map_err(|_| {
             DaemonError::InvalidInput("Paper run has invalid session slot".to_owned())
         })?;
-        let existing_resources = candidates
-            .iter()
-            .filter(|reference| reference.kind == ArtifactKind::NormalizedEvidence)
-            .filter_map(|reference| self.store.artifact(&reference.artifact_id).ok())
-            .filter_map(|artifact| self.store.read_blob(&artifact.blob).ok())
-            .filter_map(|payload| {
-                serde_json::from_slice::<NormalizedEvidencePayload>(&payload).ok()
-            })
-            .map(|payload| payload.resource)
-            .collect::<BTreeSet<_>>();
         let mut needs = BTreeMap::<EvidenceNeed, ()>::new();
 
         for intent in claim
@@ -459,8 +440,13 @@ impl Daemon {
             for expanded_intent in Self::expand_supplemental_intents(intent)? {
                 let need = expanded_intent.evidence_need()?;
                 Self::validate_supplemental_need(&expanded_intent, &need, &session_date)?;
-                if !existing_resources.contains(&need.resource) {
-                    needs.insert(need, ());
+                // A prior normalized payload can still lack the requested facts.
+                // The durable one-round limit bounds a deliberate re-query.
+                needs.insert(need, ());
+                if needs.len() > 8 {
+                    return Err(DaemonError::InvalidInput(
+                        "supplemental round exceeds 8 expanded requests".into(),
+                    ));
                 }
             }
         }
@@ -547,9 +533,8 @@ impl Daemon {
     ) -> Result<Vec<ArtifactRef>> {
         let purpose = self.store.run_purpose(&task.run_id)?;
         let bundles =
-            futures::future::try_join_all(needs.iter().map(|(reference, need_artifact, need)| {
+            futures::future::join_all(needs.iter().map(|(reference, _need_artifact, need)| {
                 let reference = reference.clone();
-                let need_artifact = need_artifact.clone();
                 let need = need.clone();
                 async move {
                     let source = evidence_source(&need.source_family)?;
@@ -595,23 +580,55 @@ impl Daemon {
                                         source.as_str()
                                     ))
                                 })?;
-                        runtime
-                            .acquire_and_normalize_async(
+                        let acquired = runtime
+                            .acquire_validated_async(
                                 &task.permit,
                                 &reference,
                                 &request,
                                 adapter.as_ref(),
                                 now,
                             )
-                            .await?
+                            .await?;
+                        // Freeze availability after real retrieval, as in the initial
+                        // collection; the refined Analyst gets this new evidence clock.
+                        runtime.materialize_validated(
+                            &task.permit,
+                            &reference,
+                            &request,
+                            acquired,
+                            if task.node.recipe_id.as_str()
+                                == akzio_domain::RESEARCH_SUPPLEMENT_RECIPE_ID
+                            {
+                                now
+                            } else {
+                                Utc::now()
+                            },
+                        )?
                     };
-                    Ok::<_, DaemonError>((need_artifact, bundle))
+                    if need.source_family == "news_web" {
+                        self.validate_paper_news_acquisition(task, &need, &bundle.normalized)?;
+                    }
+                    Ok::<_, DaemonError>(bundle)
                 }
             }))
-            .await?;
+            .await;
 
         let mut normalized = Vec::with_capacity(bundles.len());
-        for (_need_artifact, bundle) in bundles {
+        for result in bundles {
+            let bundle = match result {
+                Ok(bundle) => bundle,
+                Err(error) => {
+                    if task.node.recipe_id.as_str() == akzio_domain::RESEARCH_SUPPLEMENT_RECIPE_ID {
+                        return Err(error);
+                    }
+                    self.note_supplemental_round_abandoned(
+                        task,
+                        "supplemental source returned no valid facts",
+                        &error,
+                    )?;
+                    continue;
+                }
+            };
             self.store.write_task_artifact(
                 &task.permit,
                 &bundle.raw,
@@ -1318,10 +1335,13 @@ impl Daemon {
             self.validate_paper_normalized(task, need_artifact, &need, normalized, &payload)?;
             payloads.insert(resource.clone(), (normalized, payload));
         }
+        // This timestamp bounds freshness of the entire account view. The
+        // newest response cannot renew older positions, orders or fills; the
+        // materialization completion time remains the artifact's created_at.
         let observed_at = payloads
             .values()
             .map(|(_, payload)| payload.observed_at)
-            .max()
+            .min()
             .ok_or_else(|| {
                 DaemonError::InvalidInput("Paper account payloads are empty".to_owned())
             })?;
@@ -1385,9 +1405,12 @@ impl Daemon {
     }
 }
 
-fn evidence_failure_category(error: &DaemonError) -> &'static str {
+// This classifies errors only from governed acquisition/materialization. Adapter
+// payload failures have typed variants; InvalidInput here comes from the Rust
+// EvidenceNeed/acquisition-identity checks, never unparsed third-party content.
+fn evidence_failure_category(error: &DaemonError) -> Option<&'static str> {
     use akzio_ingest::{EvidenceAdapterError as A, EvidenceRuntimeError as R};
-    match error {
+    let category = match error {
         DaemonError::Evidence(R::Adapter(A::Unauthorized(_))) => "authorization",
         DaemonError::Evidence(R::Adapter(A::RateLimited { .. })) => "rate_limited",
         DaemonError::Evidence(R::Adapter(A::Pending(_))) => "pending",
@@ -1395,14 +1418,20 @@ fn evidence_failure_category(error: &DaemonError) -> &'static str {
         DaemonError::Evidence(R::Adapter(A::Transport(_))) => "transport",
         DaemonError::Evidence(R::Adapter(A::Permanent(_))) => "permanent_provider_error",
         DaemonError::Evidence(R::Adapter(A::NativeWeb { kind, .. })) => kind.as_str(),
+        DaemonError::Evidence(R::Adapter(A::DataQuality(_) | A::MissingFixture(_)))
+        | DaemonError::Evidence(
+            R::InvalidAcquisition | R::InvalidQuality | R::MissingAvailability,
+        ) => "data_quality",
         DaemonError::Evidence(R::StaleEvidence) => "stale_content",
-        DaemonError::Evidence(_) => "data_quality",
         DaemonError::Unavailable(reason) if reason == "evidence_acquisition_timeout" => {
             "acquisition_timeout"
         }
         DaemonError::Unavailable(_) => "adapter_unavailable",
-        _ => "validation_failure",
-    }
+        // Includes invalid provenance/citations, source/policy mismatches,
+        // invalid committed needs, serialization and Store failures.
+        _ => return None,
+    };
+    Some(category)
 }
 
 fn validated_paper_quotes(
@@ -1426,6 +1455,41 @@ fn validated_paper_quotes(
 mod acquisition_deadline_tests {
     use super::*;
 
+    #[test]
+    fn acquisition_classification_does_not_downgrade_internal_or_identity_errors() {
+        use akzio_ingest::{EvidenceAdapterError as A, EvidenceRuntimeError as R};
+        let malformed_json = serde_json::from_str::<Value>("{").unwrap_err();
+        let failures = [
+            DaemonError::InvalidInput("Rust acquisition identity mismatch".into()),
+            DaemonError::Json(malformed_json),
+            DaemonError::Store(StoreError::StalePermit(TaskId::new())),
+            DaemonError::Evidence(R::Store(StoreError::StalePermit(TaskId::new()))),
+            DaemonError::Evidence(R::InvalidProvenance),
+            DaemonError::Evidence(R::InvalidCitation),
+            DaemonError::Evidence(R::Adapter(A::SourceMismatch)),
+            DaemonError::Evidence(R::Adapter(A::Policy {
+                evidence_source: EvidenceSource::NewsWeb,
+                resource: "news:QQQ".into(),
+                reason: "request violates the frozen acquisition policy".into(),
+            })),
+        ];
+        for failure in failures {
+            assert!(evidence_failure_category(&failure).is_none(), "{failure}");
+        }
+        assert_eq!(
+            evidence_failure_category(&DaemonError::Evidence(R::Adapter(A::DataQuality(
+                "provider returned malformed content".into()
+            )))),
+            Some("data_quality")
+        );
+        assert_eq!(
+            evidence_failure_category(&DaemonError::Evidence(R::Adapter(A::Pending(
+                "source not published yet".into()
+            )))),
+            Some("pending")
+        );
+    }
+
     #[tokio::test]
     async fn slow_source_does_not_discard_completed_sources_or_hide_temporal_errors() {
         let allowance = std::time::Duration::from_millis(10);
@@ -1448,7 +1512,7 @@ mod acquisition_deadline_tests {
         assert_eq!(result.0.unwrap(), 7);
         assert_eq!(
             evidence_failure_category(&result.1.unwrap_err()),
-            "acquisition_timeout"
+            Some("acquisition_timeout")
         );
         assert!(matches!(
             result.2,

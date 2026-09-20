@@ -6,9 +6,9 @@ use akzio_domain::{
     content_hash_json, estimate_tokens_from_bytes, manifest_input_hash, AgentContract, Artifact,
     ArtifactId, ArtifactKind, ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef,
     Asset, BlobRef, CandidatePolicy, ContentHash, ContextManifestPayload, ContextPolicy,
-    ContextProjection, ContextQuarantine, ContextQuarantineReason, ContextSelection, ContextTrust,
-    DecisionHorizon, DomainError, Experience, FinancialContentAssessment, FinancialContentPolicy,
-    Lesson, LessonLifecycle, LessonScope, LifecycleEventType, PolicyState, ReadGrant,
+    ContextProjection, ContextQuarantine, ContextQuarantineReason, ContextQueryScope,
+    ContextSelection, ContextTrust, DomainError, Experience, FinancialContentAssessment,
+    FinancialContentPolicy, Lesson, LessonLifecycle, LifecycleEventType, PolicyState, ReadGrant,
     RegimeClassificationKind, RegimeSnapshot, ResearchClaim, ResearchCritique, TaskBudget,
     TaskWritePermit, DOMAIN_SCHEMA_VERSION, RESEARCH_ANALYST_RECIPE_ID, RESEARCH_CRITIC_RECIPE_ID,
     RESEARCH_SYNTHESIZER_RECIPE_ID,
@@ -18,6 +18,10 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+
+#[cfg(test)]
+#[path = "context_broker/lesson_quality_tests.rs"]
+mod lesson_quality_tests;
 
 #[derive(Debug, Error)]
 pub enum ContextError {
@@ -63,12 +67,6 @@ pub enum ContextError {
     InvalidComparison,
     #[error("claim evidence read requires a claim artifact")]
     ExpectedClaim,
-    /// The Lesson-off arm of a paired experiment was requested against a
-    /// baseline that carried no Lesson. The two arms would be byte-identical, so
-    /// the comparison would report a null effect from a treatment that never
-    /// varied.
-    #[error("lesson ablation requires a baseline manifest that selected a lesson")]
-    NoLessonToAblate,
 }
 
 pub type ContextResult<T> = Result<T, ContextError>;
@@ -131,6 +129,7 @@ struct ParentContextProof<'a> {
 }
 
 include!("context_broker/manifest.rs");
+include!("context_broker/coverage.rs");
 include!("context_broker/selection.rs");
 include!("context_broker/grants.rs");
 include!("context_broker/materialization.rs");
@@ -144,3 +143,6 @@ use selection::{
     context_trust, derive_child_projection, instruction_indicators, is_safe_deliberation_summary,
     is_trace_kind, overlay_state_is_eligible, purpose_rank, selection_reason,
 };
+
+#[path = "context_broker/guidance.rs"]
+mod guidance;

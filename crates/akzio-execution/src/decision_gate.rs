@@ -28,6 +28,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum DecisionGateError {
+    #[error("final proposal review missing, rejected or bound to different content")]
+    ProposalReviewRequired,
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
@@ -1192,7 +1194,19 @@ mod decision_trace_tests {
 
     #[test]
     fn default_policy_is_not_decision_capable() {
-        assert!(!DecisionPolicy::default().decision_capable());
+        let policy = DecisionPolicy::default();
+        assert!(!policy.decision_capable());
+        let now = Utc::now();
+        let (target, _, trace) = policy
+            .target_with_risk_traced(
+                now,
+                900_000,
+                &neutral_forecasts(now + chrono::Duration::days(1)),
+            )
+            .expect("uncalibrated policy must produce a legal zero target");
+        assert!(target.weights.values().all(|weight| weight.0 == 0));
+        assert!(trace.first_zeroing_branch.is_some());
+        assert!(!trace.rules.is_empty());
     }
 
     #[test]

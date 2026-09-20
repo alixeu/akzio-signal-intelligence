@@ -13,13 +13,12 @@ use akzio_daemon::{
     runtime_governance_identity, runtime_policy_identity, topology_component_hash,
     AlpacaMarketDataFeed, AlpacaPaperSessionClock, Daemon, DaemonConfig, DaemonHealth,
     PaperApprovalRequest, PaperApprovalResponse, PaperWorkflowSource, ReplayReport,
-    RetrospectiveView, RunCancellationResponse, RunRetryResponse, RunSubmissionResponse,
-    StoreEventView,
+    RetrospectiveView, RunCancellationResponse, RunRetryResponse,
 };
 use akzio_domain::{
     content_hash_json, Asset, CanaryCampaignSpec, ContentHash, ExperimentCondition,
     LessonLifecycle, ModelQualificationReport, OutcomeCostModel, ReleaseEvidenceBundle, RunId,
-    RunPurpose, RuntimeIdentity, WorkflowStatus,
+    RunPurpose, RuntimeIdentity,
 };
 use akzio_execution::{paper::AlpacaPaper, DecisionPolicy};
 use akzio_ingest::{EvidenceRequest, EvidenceSource};
@@ -30,7 +29,7 @@ use akzio_model::{
 use akzio_store::{CanaryCampaignHead, SessionSlot, Store, StoredRun, TrajectoryEntry};
 use anyhow::{bail, Context, Result};
 use chrono::{NaiveDate, Utc};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use futures::StreamExt;
 use reqwest::{Client, Method, RequestBuilder, Response, Url};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -47,6 +46,10 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    Workflow {
+        #[command(subcommand)]
+        command: WorkflowCommand,
+    },
     Debug {
         #[command(subcommand)]
         command: DebugCommand,
@@ -89,19 +92,30 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum CalibrationCommand {
-    Build {
+    /// Read-only report of canonical Paper outcome maturity and calibration gaps.
+    Readiness {
         #[arg(long)]
-        input: PathBuf,
-        #[arg(long)]
-        output: PathBuf,
+        store: PathBuf,
+        #[arg(long, default_value_t = 30)]
+        min_samples: u32,
     },
-    Export {
+    Preflight {
+        #[arg(long)]
+        scratch: PathBuf,
+    },
+    /// Store explicit operator risk limits as an immutable SQL Artifact.
+    SetRiskLimits {
+        #[arg(long)]
+        store: PathBuf,
+        #[command(flatten)]
+        limits: CalibrationRiskSettings,
+    },
+    /// Collect a calibration dataset from canonical Outcomes into SQL.
+    Collect {
         #[arg(long)]
         store: PathBuf,
         #[arg(long)]
-        risk_limits: PathBuf,
-        #[arg(long)]
-        output: PathBuf,
+        risk_limits: String,
         #[arg(long, default_value_t = 30)]
         min_samples: u32,
         #[arg(long)]
@@ -109,18 +123,102 @@ enum CalibrationCommand {
         #[arg(long)]
         training_end: Option<String>,
     },
+    /// Fit a stored dataset and persist a candidate policy without activating it.
+    Build {
+        #[arg(long)]
+        store: PathBuf,
+        #[arg(long)]
+        dataset: String,
+    },
+    /// Explicitly activate one stored, validated policy Artifact.
+    Activate {
+        #[arg(long)]
+        store: PathBuf,
+        #[arg(long)]
+        policy: String,
+    },
+    /// Copy the active immutable policy into a new or isolated Store.
+    Bootstrap {
+        #[arg(long)]
+        source_store: PathBuf,
+        #[arg(long)]
+        target_store: PathBuf,
+    },
     Inspect {
         #[arg(long)]
-        input: PathBuf,
+        store: PathBuf,
+        #[arg(long)]
+        artifact: String,
     },
     Validate {
         #[arg(long)]
-        input: PathBuf,
+        store: PathBuf,
+        #[arg(long)]
+        policy: String,
     },
+}
+
+#[derive(Debug, clap::Args)]
+struct CalibrationRiskSettings {
+    #[arg(long)]
+    min_confidence_ppm: u32,
+    #[arg(long)]
+    max_gross_weight_ppm: u32,
+    #[arg(long)]
+    maximum_execution_delay_ms: u64,
+    #[arg(long)]
+    minimum_process_quality_ppm: u32,
+    #[arg(long)]
+    min_probability_edge_ppm: u32,
+    #[arg(long)]
+    max_brier_score_ppm: u32,
+    #[arg(long)]
+    target_annualized_volatility_ppm: u32,
+    #[arg(long)]
+    max_portfolio_beta_ppm: u32,
+    #[arg(long)]
+    max_expected_shortfall_ppm: u32,
+    #[arg(long)]
+    max_gap_loss_ppm: u32,
+    #[arg(long)]
+    max_capital_weight_ppm: u32,
+    #[arg(long)]
+    liquidity_weight_cap_ppm: u32,
+    #[arg(long)]
+    max_leveraged_holding_days: u8,
+    #[arg(long)]
+    daily_reset_decay_ppm: u32,
+}
+
+impl From<&CalibrationRiskSettings> for OfflineRiskLimits {
+    fn from(value: &CalibrationRiskSettings) -> Self {
+        Self {
+            min_confidence_ppm: value.min_confidence_ppm,
+            max_gross_weight_ppm: value.max_gross_weight_ppm,
+            maximum_execution_delay_ms: value.maximum_execution_delay_ms,
+            minimum_process_quality_ppm: value.minimum_process_quality_ppm,
+            min_probability_edge_ppm: value.min_probability_edge_ppm,
+            max_brier_score_ppm: value.max_brier_score_ppm,
+            target_annualized_volatility_ppm: value.target_annualized_volatility_ppm,
+            max_portfolio_beta_ppm: value.max_portfolio_beta_ppm,
+            max_expected_shortfall_ppm: value.max_expected_shortfall_ppm,
+            max_gap_loss_ppm: value.max_gap_loss_ppm,
+            max_capital_weight_ppm: value.max_capital_weight_ppm,
+            liquidity_weight_cap_ppm: value.liquidity_weight_cap_ppm,
+            max_leveraged_holding_days: value.max_leveraged_holding_days,
+            daily_reset_decay_ppm: value.daily_reset_decay_ppm,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
 enum EvidenceCommand {
+    MarketAudit {
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long, default_value = "indicative")]
+        option_feed: akzio_ingest::AlpacaOptionDataFeed,
+    },
     Preflight {
         #[arg(long)]
         resource: String,
@@ -172,9 +270,22 @@ enum DaemonAction {
 
 #[derive(Debug, Subcommand)]
 enum RunCommand {
-    Submit {
-        #[arg(value_enum)]
-        purpose: PurposeArg,
+    Inspect {
+        run_id: String,
+    },
+    Checkpoint {
+        run_id: String,
+    },
+    Journal {
+        run_id: String,
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long)]
+        task_id: Option<String>,
+        #[arg(long)]
+        attempt_id: Option<String>,
     },
     Replay {
         run_id: String,
@@ -199,8 +310,16 @@ enum RunCommand {
     RepairNarrative {
         run_id: String,
     },
-    FixtureDebug,
-    PaperDryRun,
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkflowCommand {
+    Blueprint {
+        #[arg(long, default_value = "position_plan", value_parser = ["position_plan", "paper", "shadow"])]
+        purpose: String,
+        #[arg(long, default_value = "json", value_parser = ["json", "mermaid"])]
+        format: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -272,12 +391,6 @@ impl From<SessionSlot> for PaperSessionView {
     }
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum PurposeArg {
-    Debug,
-    PaperDryRun,
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
@@ -303,6 +416,8 @@ struct DaemonSettings {
     http_addr: SocketAddr,
     worker_count: Option<usize>,
     auto_paper: Option<bool>,
+    #[serde(default)]
+    manual_paper: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -318,8 +433,6 @@ struct ExecutionSettings {
     transaction_cost_ppm: u32,
     #[serde(default)]
     slippage_ppm: u32,
-    #[serde(default)]
-    decision_policy_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -394,11 +507,6 @@ struct ObservatoryEditableConfiguration {
     #[serde(rename = "fredAPIKey")]
     fred_api_key: Option<String>,
     sec_user_agent: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct SubmitRequest {
-    purpose: RunPurpose,
 }
 
 #[derive(Debug, Serialize)]

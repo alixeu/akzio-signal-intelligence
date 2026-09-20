@@ -9,6 +9,7 @@ mod blob;
 mod canary;
 mod debug;
 mod debug_bundle;
+mod decision_policy;
 mod doctor;
 mod execution;
 mod experiment;
@@ -18,15 +19,21 @@ mod lesson;
 mod maintenance;
 mod migration;
 mod release;
+mod research_quality;
+mod research_review;
+mod run_control;
 mod schema;
+pub use run_control::{RunCheckpoint, RunControlView, RunEventPage, RunEventView, RunInspection};
 mod trajectory;
 mod workflow;
 
 pub use canary::{CanaryCampaignHead, StoredCanarySession};
 pub use debug::{DebugArtifactView, DebugAttemptView, DebugNodeView, DebugRunView};
 pub use debug_bundle::{DebugBundleIntegrity, DebugBundleManifest, DebugBundleRawAccess};
+pub use decision_policy::{DecisionPolicyDescriptor, StoredDecisionPolicy};
 pub use lesson::{LessonRevalidationScan, LessonUsage, LessonWriteResult, StoredLesson};
 pub use maintenance::MaintenanceLeaseDeferral;
+pub use research_review::{ResearchAudit, ResearchAuditRecord};
 
 include!("store/prelude.rs");
 include!("store/public_types.rs");
@@ -46,3 +53,6 @@ include!("store/impl_attempt.rs");
 include!("store/free_reads.rs");
 include!("store/free_policy_reads.rs");
 include!("store/free_paper_checks.rs");
+
+#[cfg(test)]
+mod retirement_tests;

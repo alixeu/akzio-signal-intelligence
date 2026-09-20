@@ -51,6 +51,7 @@ struct CohortSessionColumns {
     reserved_at: String,
 }
 
+// 按 SQL 列顺序提取 cohort session 原始字段；类型/业务绑定在后续转换函数中统一校验。
 fn cohort_session_columns(row: &rusqlite::Row<'_>) -> rusqlite::Result<CohortSessionColumns> {
     Ok(CohortSessionColumns {
         cohort_id: row.get(0)?,
@@ -68,6 +69,8 @@ fn cohort_session_columns(row: &rusqlite::Row<'_>) -> rusqlite::Result<CohortSes
     })
 }
 
+// 将 SQL 字段恢复为带 schema、日期、阶段和四条 Run lineage 的 CanarySessionReservation。
+// 数值/时间解析失败或领域校验失败都阻断读取，不返回部分可信的 session。
 fn stored_cohort_session_from_columns(
     columns: CohortSessionColumns,
 ) -> StoreResult<StoredCanarySession> {

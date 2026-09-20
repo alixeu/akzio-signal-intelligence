@@ -1,37 +1,38 @@
 use super::*;
 
 impl WorkflowRuntime {
-    pub fn recover(&self, run_id: &RunId) -> RuntimeResult<WorkflowSnapshot> {
-        let snapshot = self.store.workflow_snapshot(run_id)?;
-        self.validate_compiled_graph(snapshot.run.purpose, &snapshot.revision.graph)?;
-        Ok(snapshot)
+    /// History is checked against its immutable installations, never today's active recipes.
+    fn validate_historical_graph(&self, graph: &WorkflowGraph) -> RuntimeResult<()> {
+        graph.validate()?;
+        for node in &graph.nodes {
+            if let Some(hash) = &node.contract_hash {
+                let stored = self
+                    .store
+                    .contract_installation(hash)?
+                    .ok_or_else(|| StoreError::MissingContractInstallation(hash.clone()))?;
+                let contract = stored.contract;
+                contract.validate()?;
+                if contract.purpose.as_str() != node.recipe_id.as_str()
+                    || node.retry != contract.retry
+                    || node.on_failure != contract.on_failure
+                    || node.budget
+                        != graph
+                            .agent_budgets
+                            .get(contract.purpose.as_str())
+                            .cloned()
+                            .unwrap_or(contract.budget)
+                {
+                    return Err(RuntimeError::NodeRecipeMismatch(node.task_id.clone()));
+                }
+            }
+        }
+        Ok(())
     }
 
-    /// Reconstruct a Run from its append-only event stream and durable task
-    /// history, rejecting a snapshot that cannot be derived from that history.
-    /// Create a fresh noncanonical rerun. Paper, Shadow and Replay workloads
-    /// have distinct owner flows and can never be retried through HTTP.
-    pub fn retry_run(&self, source_run_id: &RunId, now: DateTime<Utc>) -> RuntimeResult<RunId> {
-        let source = self.replay_run(source_run_id)?;
-        if !matches!(
-            source.status,
-            WorkflowStatus::Completed
-                | WorkflowStatus::CompletedWithExecutionRejection
-                | WorkflowStatus::Failed
-                | WorkflowStatus::Cancelled
-        ) {
-            return Err(RuntimeError::RetryRunNotTerminal(source_run_id.clone()));
-        }
-        if !matches!(
-            source.run.purpose,
-            RunPurpose::Debug | RunPurpose::PositionPlan | RunPurpose::PaperDryRun
-        ) {
-            return Err(RuntimeError::RetryPurpose(source.run.purpose));
-        }
-        let run_id = RunId::new();
-        let graph = self.bootstrap(source.run.purpose, source.run.topology_id.clone())?;
-        self.submit(run_id.clone(), source.run.purpose, graph, now)?;
-        Ok(run_id)
+    pub fn recover(&self, run_id: &RunId) -> RuntimeResult<WorkflowSnapshot> {
+        let snapshot = self.store.recovery_snapshot(run_id)?;
+        self.validate_historical_graph(&snapshot.revision.graph)?;
+        Ok(snapshot)
     }
 
     pub fn replay_run(&self, run_id: &RunId) -> RuntimeResult<WorkflowSnapshot> {
@@ -39,7 +40,7 @@ impl WorkflowRuntime {
         self.validate_replay_revisions(run_id, &replay)?;
         let snapshot = self.store.workflow_snapshot(run_id)?;
         self.validate_replay_snapshot(run_id, &replay, &snapshot)?;
-        self.validate_compiled_graph(snapshot.run.purpose, &snapshot.revision.graph)?;
+        self.validate_historical_graph(&snapshot.revision.graph)?;
         Ok(snapshot)
     }
 
@@ -229,7 +230,6 @@ impl WorkflowRuntime {
         run_id: &RunId,
         replay: &ReplayedWorkflow,
     ) -> RuntimeResult<()> {
-        let purpose = self.store.run_purpose(run_id)?;
         for (index, reduced) in replay.revisions.iter().enumerate() {
             let revision = u64::try_from(index).map_err(|_| {
                 Self::replay_error(run_id, "workflow revision index does not fit u64")
@@ -244,7 +244,7 @@ impl WorkflowRuntime {
                     format!("revision {revision} differs from event history"),
                 ));
             }
-            self.validate_compiled_graph(purpose, &reduced.graph)?;
+            self.validate_historical_graph(&reduced.graph)?;
         }
         Ok(())
     }

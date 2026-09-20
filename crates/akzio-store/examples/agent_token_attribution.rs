@@ -2,9 +2,14 @@
 use akzio_domain::{ArtifactId, ArtifactKind, ContentHash, RunId};
 use akzio_store::Store;
 use serde_json::{json, Value};
+
+// 统计一个已经解析的 JSON 值的紧凑序列化字节数，用于请求分项归因。
 fn bytes(v: &Value) -> usize {
     serde_json::to_vec(v).expect("JSON").len()
 }
+
+// 从既有 Store 读取 AgentTurn，并把请求、上下文、历史续接和工具负载拆成只读大小指标。
+// `--run` 只负责按 Run 找到 AgentTurn；本示例不改变任何 Artifact、BLOB 或运行状态。
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let root = args
@@ -13,6 +18,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = Store::open_existing(root)?;
     let mut rows = Vec::new();
     let mut ids = args.collect::<Vec<_>>();
+
+    // `--run` 要求唯一的 Run ID，并从 Store 的事件/Artifact 索引中取 AgentTurn。
+    // 这里得到的仍是历史 Artifact 列表，不代表 Run 已完成或 Decision 已获准。
     if ids.first().is_some_and(|id| id == "--run") {
         if ids.len() != 2 {
             return Err("usage: agent_token_attribution STORE --run RUN_ID".into());
@@ -24,6 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect();
     }
     for id in ids {
+        // 每个参数必须指向 AgentTurn；随后只读取其 CAS BLOB 和对应的 Contract 安装。
         let a = store.artifact(&ArtifactId(ContentHash::new(id)?))?;
         if a.kind != ArtifactKind::AgentTurn {
             return Err("expected AgentTurn".into());
@@ -36,6 +45,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut opaque = 0;
         if let Some(items) = r.pointer("/continuation/items").and_then(Value::as_array) {
             for item in items {
+                // function_call_output 是重放给后续请求的工具结果；带原始 context 的 user
+                // 项恢复首次上下文，其余项才计入对话历史。加密内容只能按字节计数，不能解密或输出。
                 if item["type"] == "function_call_output" {
                     replay += bytes(item);
                 } else if item["role"] == "user"
@@ -51,6 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 opaque += item["encrypted_content"].as_str().map_or(0, str::len);
             }
         }
+        // Contract 由 AgentTurn 的哈希绑定；缺失安装时停止，避免把治理源大小归因到未知版本。
         let hash: ContentHash = serde_json::from_value(v["contract_hash"].clone())?;
         let contract = store
             .contract_installation(&hash)?
@@ -59,6 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut facts = 0;
         let mut task_contract = 0;
         for d in context.as_array().into_iter().flatten() {
+            // Context 中的任务契约、元数据和事实分别计数；这里只计算 JSON 结构大小。
             if d["class"] == "task_contract" {
                 task_contract += bytes(d);
             } else if d["type"] == "context_metadata_ledger" {
@@ -68,6 +81,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 facts += bytes(&d["value"]);
             }
         }
+        // 输出的是可审计的大小/telemetry 指标，不包含 prompt、证据正文或不透明推理内容。
         rows.push(json!({"artifact_id":a.artifact_id,"origin":a.origin,"turn":v["turn"],
             "whole_request_json_bytes":bytes(r),"runtime_request_estimate_tokens":akzio_domain::estimate_json_tokens(r)?,
             "prompt_json_bytes":bytes(&r["prompt"]),
@@ -79,6 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "read_tools_json_bytes":bytes(&r["tools"]),"terminal_schema_json_bytes":bytes(&r["terminal"]),
             "provider_usage":v.pointer("/response/telemetry")}));
     }
+    // 所有输入处理完成后一次性打印指标；打印成功不表示任何研究、Decision 或执行阶段完成。
     println!("{}", serde_json::to_string_pretty(&rows)?);
     Ok(())
 }

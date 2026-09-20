@@ -244,6 +244,9 @@ impl AgentRunBudget {
         if usage.output_tokens.is_none() {
             self.output_usage_unknown = true;
         }
+        if usage.input_tokens.is_none() || usage.output_tokens.is_none() {
+            self.cost_complete = false;
+        }
         self.record_resolved_usage(ResolvedModelUsage {
             input_tokens: usage.input_tokens.unwrap_or(u64::from(estimated_input)),
             cached_input_tokens: usage.cached_input_tokens,
@@ -355,8 +358,8 @@ impl AgentRunBudget {
     }
 
     fn restore(&mut self, checkpoint: &AgentRecoveryCheckpoint) -> ResearchResult<()> {
-        if !checkpoint.usage.usage_valid {
-            return Err(ResearchError::InvalidProviderUsage);
+        if let Some(failure) = &checkpoint.usage.failure {
+            return Err(failure.error());
         }
         if self
             .max_model_calls
@@ -557,7 +560,10 @@ mod configured_budget_tests {
         ));
         assert_eq!(budget.output_tokens, 4_287);
         assert_eq!(budget.reasoning_tokens, 900);
-        assert_eq!(budget.debug_observation("over-limit")["output_tokens_used"], 4_287);
+        assert_eq!(
+            budget.debug_observation("over-limit")["output_tokens_used"],
+            4_287
+        );
     }
 
     #[test]
@@ -586,5 +592,36 @@ mod configured_budget_tests {
             budget.debug_observation("unknown")["output_usage_unknown"],
             true
         );
+    }
+
+    #[test]
+    fn partial_provider_usage_is_retained_and_cannot_resume_with_unknown_output() {
+        let policy = akzio_domain::budget::default_agent_budget("research.critic").unwrap();
+        let mut budget = AgentRunBudget::new(&policy, &RetryPolicy::none());
+        budget
+            .record_failed_provider_usage(
+                1,
+                &ModelUsage {
+                    input_tokens: Some(125),
+                    cached_input_tokens: Some(25),
+                    output_tokens: None,
+                    reasoning_tokens: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(budget.input_tokens, 125);
+        assert_eq!(budget.cached_input_tokens, 25);
+        assert!(!budget.cost_complete);
+        assert!(matches!(
+            budget.authorize_model_call(1),
+            Err(ResearchError::ProviderUsageUnknown)
+        ));
+        let mut checkpoint = AgentRecoveryCheckpoint::fresh();
+        checkpoint.usage.failure = Some(RecoveryUsageFailure::Unknown);
+        checkpoint.usage.input_tokens = 125;
+        assert!(matches!(
+            budget.restore(&checkpoint),
+            Err(ResearchError::ProviderUsageUnknown)
+        ));
     }
 }

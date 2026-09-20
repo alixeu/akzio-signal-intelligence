@@ -104,11 +104,18 @@ struct ObserverSectionPayload<T: Decodable & Sendable>: Decodable, Sendable {
 }
 
 struct ObserverRunDetailPayload: Decodable, Sendable {
+    let inspection: RuntimeInspectionPayload?
     let workflow: ObserverWorkflowPayload
     let events: [ObserverEventPayload]
     let trajectory: [ObserverTrajectoryPayload]
     let artifacts: [ObserverArtifactPayload]
     let telemetry: ObserverRunTelemetryPayload?
+    let researchAudit: ResearchAuditPayload?
+
+    enum CodingKeys: String, CodingKey {
+        case inspection, workflow, events, trajectory, artifacts, telemetry
+        case researchAudit = "research_audit"
+    }
 }
 
 struct ObserverRunTelemetryPayload: Decodable, Sendable {

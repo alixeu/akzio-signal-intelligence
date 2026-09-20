@@ -92,27 +92,27 @@ pub(super) fn evidence_read_tool_specs(store: &Store) -> ResearchResult<Vec<Tool
     [
         (
             "read_document",
-            "Read one complete document explicitly granted by ContextManifest.",
+            "读取一个由 ContextManifest 明确授权的完整文档。\n",
             artifact_id_tool_input_schema(),
         ),
         (
             "read_range",
-            "Read one bounded byte range from a granted document.",
+            "读取一个已授权文档中的有界字节范围。\n",
             read_range_tool_input_schema(),
         ),
         (
             "search_context",
-            "Search only documents selected by the active ContextManifest.",
+            "只搜索当前有效 ContextManifest 选中的文档。\n",
             search_context_tool_input_schema(),
         ),
         (
             "read_claim_evidence",
-            "Read one granted claim and its granted evidence grounds.",
+            "读取一个已授权 Claim 及其已授权的 evidence grounds。\n",
             artifact_id_tool_input_schema(),
         ),
         (
             "compare_sources",
-            "Read and compare two to four granted source documents.",
+            "读取并比较 2 到 4 个已授权的来源文档。\n",
             compare_sources_tool_input_schema(),
         ),
     ]
@@ -187,82 +187,6 @@ pub(super) fn retrospective_draft_output_schema() -> Value {
     })
 }
 
-pub(super) fn planner_draft_output_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "schema_version": {
-                "type": "integer",
-                "enum": [DOMAIN_SCHEMA_VERSION]
-            },
-            "topology_id": {"type": "string", "enum": ["active"]},
-            "tasks": {
-                "type": "object",
-                "properties": {},
-                "required": [],
-                "maxProperties": PLANNER_MAX_DRAFT_TASKS,
-                "additionalProperties": planner_draft_task_schema()
-            },
-            "stop_reason": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 1024
-            }
-        },
-        "required": ["schema_version", "topology_id", "tasks"],
-        "additionalProperties": false
-    })
-}
-
-pub(super) fn planner_draft_task_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "recipe_id": {
-                "type": "string",
-                "enum": PLANNER_CHILD_RECIPE_IDS
-            },
-            "objective": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 2048
-            },
-            "depends_on": {
-                "type": "array",
-                "items": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 128
-                },
-                "maxItems": PLANNER_MAX_DRAFT_TASKS
-            },
-            "priority": {
-                "type": "integer",
-                "minimum": 0,
-                "maximum": 100
-            },
-        "evidence_needs": {
-            "type": "array",
-            "items": evidence_need_output_schema(),
-            "maxItems": PLANNER_MAX_DRAFT_TASKS
-        },
-        "research_intents": {
-            "type": "array",
-            "items": research_intent_output_schema(),
-            "maxItems": PLANNER_MAX_DRAFT_TASKS
-        }
-        },
-        "required": [
-            "recipe_id",
-            "objective",
-            "depends_on",
-            "priority",
-            "evidence_needs"
-        ],
-        "additionalProperties": false
-    })
-}
-
 pub(super) fn research_intent_output_schema() -> Value {
     json!({
         "type": "object",
@@ -291,30 +215,6 @@ pub(super) fn research_intent_output_schema() -> Value {
             "schema_version", "source_family", "resource", "query", "assets",
             "window_start", "window_end", "max_age_secs", "max_results"
         ],
-        "additionalProperties": false
-    })
-}
-
-pub(super) fn evidence_need_output_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "schema_version": {
-                "type": "integer",
-                "enum": [DOMAIN_SCHEMA_VERSION]
-            },
-            "source_family": {
-                "type": "string",
-                "enum": GOVERNED_EVIDENCE_SOURCE_FAMILIES
-            },
-            "resource": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 512
-            },
-            "max_age_secs": {"type": "integer"}
-        },
-        "required": ["schema_version", "source_family", "resource", "max_age_secs"],
         "additionalProperties": false
     })
 }
@@ -478,13 +378,14 @@ pub(super) fn evidence_gap_schema() -> Value {
             "impact": { "type": "string", "enum": ["warning", "blocks_directional_forecast"] },
             "assets": { "type": "array", "maxItems": 4, "uniqueItems": true, "items": { "type": "string", "enum": ["TQQQ", "QQQ", "SOXX", "SOXL"] } },
             "horizons": { "type": "array", "maxItems": 3, "uniqueItems": true, "items": { "type": "string", "enum": ["t1", "t3", "t5"] } },
+            "retriable": { "type": "boolean" },
             "supplemental_needs": {
                 "type": "array",
                 "maxItems": 8,
                 "items": research_intent_output_schema()
             }
         },
-        "required": ["topic", "rationale", "impact", "assets", "horizons", "supplemental_needs"],
+        "required": ["topic", "rationale", "impact", "assets", "horizons", "supplemental_needs", "retriable"],
         "additionalProperties": false
     })
 }

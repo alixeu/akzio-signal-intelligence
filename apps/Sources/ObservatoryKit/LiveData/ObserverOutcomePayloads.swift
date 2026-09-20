@@ -269,12 +269,15 @@ struct ObserverTaskPayload: Decodable, Sendable {
 }
 
 struct ObserverNodePayload: Decodable, Sendable {
+    let spec: NodeSpecPayload?
+    var horizon: String? { spec != nil ? spec?.horizon : WorkflowDisplay.horizon(objective: objective) }
     let taskID: String
     let recipeID: String
     let objective: String
     let dependencies: [String]
 
     enum CodingKeys: String, CodingKey {
+        case spec
         case taskID = "task_id"
         case recipeID = "recipe_id"
         case objective

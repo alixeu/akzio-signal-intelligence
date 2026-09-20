@@ -5,6 +5,7 @@ impl AlpacaPaper {
             return Err(PaperError::NonPaperEndpoint(supplied));
         }
         let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .http1_only()
             .local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
             .connect_timeout(std::time::Duration::from_secs(15))
@@ -41,15 +42,29 @@ impl AlpacaPaper {
 
     pub async fn market_clock(&self) -> Result<MarketClock> {
         let clock = self.get_json("/v2/clock").await?;
-        market_clock_from_value(&clock)
+        let timestamp: DateTime<Utc> = required_string(&clock, "timestamp")?
+            .parse()
+            .map_err(|e: chrono::ParseError| PaperError::InvalidClock(e.to_string()))?;
+        let date = timestamp
+            .with_timezone(&chrono_tz::America::New_York)
+            .date_naive();
+        let calendar = self
+            .get_json(&format!(
+                "/v2/calendar?start={}&end={}",
+                date - chrono::Duration::days(1),
+                date + chrono::Duration::days(14)
+            ))
+            .await?;
+        market_clock_with_calendar(&clock, &calendar)
     }
 
     async fn execute_committed(
         &self,
         commitment: &PaperCommitment,
         plan: &ExecutionPlan,
+        authorization: &PaperSubmissionAuthorization,
     ) -> Result<PaperExecution> {
-        self.validate_commitment(commitment, plan)?;
+        validate_commitment(commitment, plan)?;
         let mut orders = Vec::with_capacity(plan.orders.len());
         for order in &plan.orders {
             let client_order_id = commitment
@@ -63,19 +78,16 @@ impl AlpacaPaper {
                     reprice_count: 1,
                     ..receipt
                 }),
-            None => self
-                .lookup(client_order_id)
-                .await?
-                .map(|receipt| PaperOrderReceipt {
-                    reused: true,
-                    reprice_count: 0,
-                    ..receipt
-                }),
+                None => self
+                    .lookup(client_order_id)
+                    .await?
+                    .map(|receipt| PaperOrderReceipt {
+                        reused: true,
+                        reprice_count: 0,
+                        ..receipt
+                    }),
             };
             orders.push(receipt);
-        }
-        if orders.iter().any(Option::is_none) {
-            self.assert_market_open().await?;
         }
         for (index, order) in plan.orders.iter().enumerate() {
             if orders[index].is_none() {
@@ -83,6 +95,28 @@ impl AlpacaPaper {
                     .client_order_ids
                     .get(&order.asset)
                     .ok_or(PaperError::CommitmentClientOrderMismatch(order.asset))?;
+                // Lookup remains available after expiry. A partial recovery is
+                // evidence of existing effects, not permission to fill gaps.
+                let permission = match authorization.assert_current(&plan.plan_hash, Utc::now()) {
+                    Ok(()) => {
+                        self.assert_market_session(&commitment.broker_session, order, authorization)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                }
+                .and_then(|()| authorization.assert_current(&plan.plan_hash, Utc::now()));
+                if let Err(error) = permission {
+                    if matches!(
+                        error,
+                        PaperError::SubmissionUnauthorized
+                            | PaperError::MarketClosed
+                            | PaperError::InvalidCommitment(_)
+                    ) && orders.iter().any(Option::is_some)
+                    {
+                        break;
+                    }
+                    return Err(error);
+                }
                 orders[index] = Some(self.submit_order(order, client_order_id, 0).await?);
             }
         }

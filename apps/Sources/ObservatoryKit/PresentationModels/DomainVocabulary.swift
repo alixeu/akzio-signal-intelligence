@@ -40,19 +40,19 @@ public enum RunPurpose: String, CaseIterable, Codable, Hashable, Sendable {
         }
     }
 
-    public static let userLaunchModes: [RunPurpose] = [.debug, .positionPlan]
+    public static let userLaunchModes: [RunPurpose] = [.positionPlan, .paper]
 
     public var launchModeName: String {
         switch self {
-        case .debug: "Full research"
-        case .positionPlan: "Position plan only"
+        case .paper: "完整模式 · Paper"
+        case .positionPlan: "仅生成仓位计划"
         default: displayName
         }
     }
 
     public var launchModeSummary: String {
         switch self {
-        case .debug: "Full research · Debug safety mode"
+        case .paper: "投研 → 决策 → 执行检查 → Paper → 对账 → 后续评估"
         case .positionPlan: "Position plan · No execution"
         default: displayName
         }
@@ -60,8 +60,8 @@ public enum RunPurpose: String, CaseIterable, Codable, Hashable, Sendable {
 
     public var launchModeDescription: String {
         switch self {
-        case .debug:
-            "Run a full real-model research workflow. Paper submission remains scheduler-owned."
+        case .paper:
+            "运行完整 Paper 流程；实际下单仍需有效审批和全部 Gate 通过。"
         case .positionPlan:
             "Generate target positions and stop before execution."
         default:

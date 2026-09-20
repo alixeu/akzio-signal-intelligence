@@ -72,6 +72,8 @@ impl Quote {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuoteSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feed: Option<String>,
     pub schema_version: u32,
     pub broker_session: String,
     pub observed_at: DateTime<Utc>,
@@ -91,6 +93,8 @@ impl QuoteSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MarketClockSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<TradingSessionSnapshot>,
     pub schema_version: u32,
     pub broker_session: String,
     pub is_open: bool,
@@ -98,6 +102,21 @@ pub struct MarketClockSnapshot {
 }
 
 impl MarketClockSnapshot {
+    pub fn trading_session(&self) -> TradingSession {
+        self.session.as_ref().map_or(
+            if self.is_open {
+                TradingSession::Regular
+            } else {
+                TradingSession::Closed
+            },
+            |session| session.kind,
+        )
+    }
+
+    pub fn tradable(&self) -> bool {
+        self.trading_session() != TradingSession::Closed
+    }
+
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION || self.broker_session.trim().is_empty() {
             return Err(DomainError::EmptyField {

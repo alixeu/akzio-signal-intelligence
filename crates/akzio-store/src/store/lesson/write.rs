@@ -116,27 +116,6 @@ impl Store {
         })
     }
 
-    /// Append observational evidence linking Lesson revisions to sealed outcomes.
-    ///
-    /// Idempotent on `(lesson_id, decision_context, outcome)`: reprocessing the
-    /// same triple is a no-op, and a *different* payload on an existing triple is
-    /// an integrity error because the ledger is immutable. Keyed on the stable
-    /// `lesson_id` rather than the Lesson artifact so that a later lifecycle
-    /// transition, which writes a new artifact, does not orphan prior evidence.
-    pub fn record_lesson_evidence(
-        &self,
-        records: &[LessonEvidence],
-        now: DateTime<Utc>,
-    ) -> StoreResult<u64> {
-        self.ensure_lesson_tables()?;
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let inserted =
-            self.record_lesson_evidence_with_transaction(&transaction, records, now)?;
-        transaction.commit()?;
-        Ok(inserted)
-    }
-
     pub(super) fn record_lesson_evidence_with_transaction(
         &self,
         transaction: &rusqlite::Transaction<'_>,
@@ -297,17 +276,6 @@ impl Store {
             .collect()
     }
 
-    /// Observational rollup only. See `LessonEvidence` for why these counts
-    /// cannot be read as the Lesson's causal effect.
-    pub fn lesson_evidence_summary(
-        &self,
-        lesson_id: &LessonId,
-    ) -> StoreResult<LessonEvidenceSummary> {
-        Ok(LessonEvidenceSummary::from_records(
-            &self.lesson_evidence(lesson_id)?,
-        ))
-    }
-
     pub fn lesson(&self, lesson_id: &LessonId) -> StoreResult<Option<StoredLesson>> {
         let mut connection = self.connection()?;
         if ensure_lesson_table_set(&connection)? == 0 {
@@ -345,6 +313,31 @@ impl Store {
                 lessons.push(lesson);
             }
         }
+        Ok(lessons)
+    }
+
+    /// Scan one SQL snapshot in bounded pages before context relevance ranking.
+    /// A relevant older lesson must not disappear behind 50 newer mismatches.
+    pub fn active_lessons_snapshot(&self) -> StoreResult<Vec<StoredLesson>> {
+        let mut connection = self.connection()?;
+        if ensure_lesson_table_set(&connection)? == 0 { return Ok(Vec::new()); }
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let mut cursor = String::new();
+        let mut lessons = Vec::new();
+        loop {
+            let ids = {
+                let mut statement = tx.prepare("SELECT lesson_id FROM rebuild_lesson_heads WHERE lifecycle='active' AND lesson_id>?1 ORDER BY lesson_id LIMIT 128")?;
+                let page = statement.query_map(params![cursor], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                page
+            };
+            if ids.is_empty() { break; }
+            for id in &ids {
+                if let Some(lesson) = self.read_lesson_from_transaction(&tx, &LessonId(id.clone()))? { lessons.push(lesson); }
+            }
+            cursor = ids.last().expect("nonempty page").clone();
+        }
+        tx.commit()?;
         Ok(lessons)
     }
 
@@ -446,36 +439,6 @@ impl Store {
             scanned_active,
             contested,
         })
-    }
-
-    /// Record an operator- or verifier-confirmed contradiction/failure signal.
-    /// The evidence target is resolved before a new contested Lesson revision
-    /// is written, and the immutable lifecycle event reason binds its ID.
-    pub fn record_lesson_governance_signal(
-        &self,
-        lesson_id: &LessonId,
-        signal: &LessonGovernanceSignal,
-    ) -> StoreResult<StoredLesson> {
-        signal.validate()?;
-        let evidence = self.artifact(&signal.evidence.artifact_id)?;
-        if evidence.kind != signal.evidence.kind {
-            return Err(StoreError::InvalidLearningCommit(
-                "lesson.governance_signal.evidence_kind",
-            ));
-        }
-        let reason = format!(
-            "[{}:{}] {}",
-            signal.kind.as_str(),
-            signal.evidence.artifact_id.0.as_str(),
-            signal.reason
-        );
-        self.transition_lesson(
-            lesson_id,
-            LessonLifecycle::Contested,
-            &signal.actor,
-            &reason,
-            signal.observed_at,
-        )
     }
 
     /// Lifecycle changes create a successor artifact; prior revisions remain

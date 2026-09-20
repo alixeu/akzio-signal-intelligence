@@ -11,8 +11,8 @@ use akzio_domain::{
     ArtifactProvenance, ArtifactRef, Asset, AttemptId, AttemptRelation, BlobRef, CandidatePolicy,
     CandidatePolicyState, ContentHash, ContractId, ContractPurpose, DOMAIN_SCHEMA_VERSION,
     DeliberationSummary, DomainError, Evaluation, ExecutionContext, ExecutionPlan,
-    ExecutionVerdict, Experience, ExperimentTrial, ExperimentTrialStatus, FailureDisposition,
-    FreezeState, LeaseId, Lesson, LessonEvidence, LessonGovernanceSignal, LessonId,
+    ExecutionVerdict, Experience, ExperimentTrial, FailureDisposition,
+    FreezeState, LeaseId, Lesson, LessonEvidence, LessonId,
     LessonLifecycle, LifecycleEventType, OrderReceipt, OrderSide, Outcome, OutcomeExecutionLineage,
     OutcomeHorizon, OutcomeId, OutcomeSchedule, PaperCancel, PaperCommitment, PaperLaunchApproval,
     PaperReprice, PolicyState, PolicySubject, PolicyTransition, PolicyTransitionId,
@@ -40,7 +40,7 @@ use thiserror::Error;
 const DATABASE_FILE: &str = "akzio.sqlite3";
 const EXPORT_DATABASE_FILE: &str = "akzio-export.sqlite3";
 const POST_TERMINAL_WORKER_RECIPE_ID: &str = akzio_domain::LEARNING_OUTCOME_WORKER_RECIPE_ID;
-const STORE_SCHEMA_VERSION: u32 = 16;
+const STORE_SCHEMA_VERSION: u32 = 18;
 const BLOB_ENCODING_IDENTITY: &str = "identity";
 const BLOB_ENCODING_ZSTD: &str = "zstd";
 const BLOB_ENCODING_SLICE_V1: &str = "slice-v1";
@@ -76,14 +76,10 @@ pub enum StoreError {
     InvalidArtifactClosure(ArtifactId),
     #[error("workflow graph artifact must have kind workflow_graph")]
     InvalidWorkflowGraphArtifact,
-    #[error("planner output artifact must have kind workflow_proposal")]
+    #[error("workflow proposal artifact must have kind workflow_proposal")]
     InvalidWorkflowProposalArtifact,
     #[error("workflow graph differs from persisted task graph")]
     WorkflowGraphMismatch,
-    #[error("workflow patch is based on a stale graph artifact")]
-    StaleWorkflowGraph,
-    #[error("Paper workflow {0} is immutable after submission")]
-    FrozenPaperWorkflow(RunId),
     #[error("task {0} already exists")]
     DuplicateTask(TaskId),
     #[error("run {0} already exists")]
@@ -169,6 +165,8 @@ pub enum StoreError {
     PolicyTransitionConflict(String),
     #[error("policy evaluation {0} conflicts with prior immutable evaluation")]
     PolicyEvaluationConflict(String),
+    #[error("decision policy {0} conflicts with its immutable installation")]
+    DecisionPolicyConflict(ContentHash),
     #[error("shadow pair {0} conflicts with a prior immutable completion")]
     ShadowPairConflict(String),
     #[error("canary campaign {0} conflicts with the current campaign")]
@@ -249,19 +247,6 @@ pub struct WorkflowCommit {
     pub run: StoredRun,
     pub graph: Artifact,
     pub nodes: Vec<WorkflowNode>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkflowPatchCommit {
-    pub permit: TaskWritePermit,
-    pub previous_graph_artifact_id: ArtifactId,
-    pub planner_output: Artifact,
-    pub evidence_needs: Vec<Artifact>,
-    pub proposal: Artifact,
-    pub next_graph: Artifact,
-    pub added_nodes: Vec<WorkflowNode>,
-    pub updated_nodes: Vec<WorkflowNode>,
-    pub completed_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -420,10 +405,10 @@ pub struct TrajectoryToolLifecycle {
 /// comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct RunModelUsage {
-    /// Distinct `AgentTurn` artifacts, i.e. provider calls, including failed
-    /// ones: a failed turn still consumed input tokens.
+    /// Distinct `AgentTurn` artifacts plus unmatched dispatch starts. Failed
+    /// calls may consume tokens; unmatched starts have unknown provider usage.
     pub turns: u64,
-    /// Turns whose persisted telemetry reported no token counts at all.
+    /// Turns without reported token counts, including unmatched dispatches.
     pub turns_missing_usage: u64,
     pub input_tokens: u64,
     pub cached_input_tokens: u64,

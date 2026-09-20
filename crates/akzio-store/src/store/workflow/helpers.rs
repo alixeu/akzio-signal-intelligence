@@ -1,3 +1,14 @@
+pub(super) fn legacy_workflow(connection: &Connection, run: &RunId) -> StoreResult<bool> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM rebuild_runs r WHERE r.run_id=?1 AND (r.purpose='paper_dry_run' OR EXISTS(SELECT 1 FROM rebuild_tasks t LEFT JOIN rebuild_contract_installations c ON c.contract_hash=t.contract_hash WHERE t.run_id=r.run_id AND (t.recipe_id='research.planner' OR (c.purpose IN ('research.analyst','research.critic','research.synthesizer') AND c.contract_version < 65)))))",
+        params![run.0], |row| row.get(0))?)
+}
+
+pub(super) fn assert_workflow_executable(connection: &Connection, run: &RunId) -> StoreResult<()> {
+    if legacy_workflow(connection, run)? { return Err(StoreError::DebugControl("legacy_workflow_retired".into())); }
+    Ok(())
+}
+
 pub(super) fn contract_upgrade_blockers(
     connection: &Connection,
     active_contract_hash: &ContentHash,

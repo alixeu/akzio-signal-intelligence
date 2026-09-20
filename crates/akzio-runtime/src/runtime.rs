@@ -1,4 +1,4 @@
-//! Dynamic workflow lowering for the runtime.
+//! Rust-owned fixed workflow compilation for the runtime.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -8,22 +8,20 @@ use std::{
 
 use akzio_domain::{
     Artifact, ArtifactKind, ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, ArtifactRef,
-    Asset, AttemptId, ClaimStance, ContentHash, ContractPurpose, DomainError, EvidenceNeed,
-    FailureDisposition, LifecycleEventType, ResearchClaim, RetryPolicy, RunId, RunPurpose,
-    RuntimeTaskClass, TaskBudget, TaskId, TaskRecipe, TaskRecipeId, TaskStatus, TaskWritePermit,
-    WorkflowGraph, WorkflowNode, WorkflowProposal, WorkflowProposalDraft, WorkflowProposalTask,
-    WorkflowStatus, DOMAIN_SCHEMA_VERSION, STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID,
+    AttemptId, ClaimStance, ContentHash, ContractPurpose, DomainError, FailureDisposition,
+    LifecycleEventType, ResearchClaim, RetryPolicy, RunId, RunPurpose, RuntimeTaskClass,
+    TaskBudget, TaskId, TaskRecipe, TaskRecipeId, TaskStatus, TaskWritePermit, WorkflowGraph,
+    WorkflowNode, WorkflowProposal, WorkflowStatus, DOMAIN_SCHEMA_VERSION,
 };
 use akzio_store::{
     ClaimedAttempt, DaemonLease, RetryTaskResult, SessionReservation, SessionSlotReservation,
-    Store, StoreError, StoredEvent, StoredRun, WorkflowCommit, WorkflowPatchCommit,
-    WorkflowSnapshot,
+    Store, StoreError, StoredEvent, StoredRun, WorkflowCommit, WorkflowSnapshot,
 };
 use chrono::{DateTime, Duration, Utc};
 use thiserror::Error;
 
 mod catalogue;
-mod planner;
+mod compilation;
 mod replay;
 mod store_executor;
 mod task;
@@ -36,7 +34,7 @@ pub use catalogue::{
     TerminalRecipeSet, DECISION_GATE_RECIPE_ID, EVALUATE_RECIPE_ID, EVIDENCE_GATE_RECIPE_ID,
     EXECUTION_GATE_RECIPE_ID, PAPER_COMMIT_RECIPE_ID, RECONCILE_RECIPE_ID,
 };
-pub use planner::should_run_structured_critique;
+pub use compilation::should_run_structured_critique;
 pub use store_executor::{
     StoreExecutor, StoreExecutorTelemetry, StoreMaintenanceKind, StoreMaintenanceOutcome,
     StoreMaintenanceState,
@@ -45,6 +43,8 @@ pub use task::TaskRuntime;
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
+    #[error("legacy_workflow_retired")]
+    LegacyWorkflowRetired,
     #[error(transparent)]
     Domain(#[from] DomainError),
     #[error(transparent)]
@@ -69,14 +69,8 @@ pub enum RuntimeError {
     },
     #[error("active contract {0} is not the canonical Store head")]
     NonCanonicalActiveContract(String),
-    #[error("Planner may not schedule Rust terminal recipe {0}")]
+    #[error("Proposal may not schedule Rust terminal recipe {0}")]
     TerminalRecipeInProposal(TaskRecipeId),
-    #[error(
-        "planner may not schedule research.critic; Rust inserts at most one conditional critic"
-    )]
-    PlannerSchedulesCritic,
-    #[error("planner may not schedule more than one research.synthesizer")]
-    PlannerSchedulesMultipleSynthesizers,
     #[error("terminal recipe {recipe} has class {actual:?}, expected {expected:?}")]
     InvalidTerminalRecipe {
         recipe: TaskRecipeId,
@@ -85,15 +79,11 @@ pub enum RuntimeError {
     },
     #[error("proposal would exceed the configured workflow node limit")]
     WorkflowNodeLimit,
-    #[error("Paper workflow {0} is frozen once submitted")]
-    FrozenPaperWorkflow(RunId),
     #[error("run {0} must be terminal before it can be retried")]
     RetryRunNotTerminal(RunId),
-    #[error("run purpose {0:?} cannot be retried through the operator surface")]
-    RetryPurpose(RunPurpose),
-    #[error("planner task {task} exceeds child limit for recipe {recipe}")]
+    #[error("proposal task {task} exceeds child limit for recipe {recipe}")]
     WorkflowFanoutLimit { task: String, recipe: TaskRecipeId },
-    #[error("planner task {task} exceeds depth limit for recipe {recipe}")]
+    #[error("proposal task {task} exceeds depth limit for recipe {recipe}")]
     WorkflowDepthLimit { task: String, recipe: TaskRecipeId },
     #[error("agent task {task} has multiple direct agent dependencies")]
     MultipleAgentParents { task: String },
@@ -119,12 +109,6 @@ pub enum RuntimeError {
     InvalidEvidenceNeed(akzio_domain::TaskId),
     #[error("Evidence Gate input plan does not match research EvidenceNeeds")]
     InvalidEvidencePlan,
-    #[error("workflow contains more than one planner task")]
-    DuplicatePlannerTask,
-    #[error("workflow patch must be authored by an active planner attempt")]
-    PlannerPermitRequired,
-    #[error("Paper workflows require a precompiled proposal")]
-    PaperWorkflowRequiresPrecompiledProposal,
     #[error("workflow replay for run {run_id} diverged: {reason}")]
     ReplayDiverged { run_id: RunId, reason: String },
 }
@@ -134,10 +118,6 @@ pub type RuntimeResult<T> = Result<T, RuntimeError>;
 const ANALYST_RECIPE_ID: &str = akzio_domain::RESEARCH_ANALYST_RECIPE_ID;
 const CRITIC_RECIPE_ID: &str = akzio_domain::RESEARCH_CRITIC_RECIPE_ID;
 const SYNTHESIZER_RECIPE_ID: &str = akzio_domain::RESEARCH_SYNTHESIZER_RECIPE_ID;
-const STRUCTURED_CRITIC_ALIAS_PREFIX: &str = "structured_critic";
-const DEBUG_FIXTURE_SOURCE: &str = "alpaca";
-const DEBUG_FIXTURE_RESOURCE: &str = "bars:TQQQ:1d";
-const DEBUG_FIXTURE_MAX_AGE_SECS: u64 = 86_400;
 pub const STRUCTURED_CRITIQUE_MATERIALITY_PPM: u32 = 500_000;
 pub const STRUCTURED_CRITIQUE_CONFIDENCE_PPM: u32 = 500_000;
 
@@ -169,10 +149,10 @@ struct ReplayedWorkflow {
 
 #[derive(Debug, Clone)]
 pub struct WorkflowRuntime {
+    research_settings: akzio_domain::ResearchSettings,
     agent_budgets: BTreeMap<String, TaskBudget>,
     store: Store,
     catalogue: RecipeCatalogue,
-    fixture_mode: bool,
 }
 
 impl WorkflowRuntime {
@@ -180,9 +160,18 @@ impl WorkflowRuntime {
         Self {
             store,
             catalogue,
-            fixture_mode: false,
+            research_settings: Default::default(),
             agent_budgets: akzio_domain::AgentBudgetConfig::default().resolved(),
         }
+    }
+
+    pub fn with_research_settings(
+        mut self,
+        settings: &akzio_domain::ResearchSettings,
+    ) -> RuntimeResult<Self> {
+        settings.validate()?;
+        self.research_settings = settings.clone();
+        Ok(self)
     }
 
     pub fn with_agent_budgets(
@@ -201,11 +190,6 @@ impl WorkflowRuntime {
             .unwrap_or_else(|| recipe.budget.clone())
     }
 
-    pub fn with_fixture_mode(mut self, enabled: bool) -> Self {
-        self.fixture_mode = enabled;
-        self
-    }
-
     pub fn recipe(&self, recipe_id: &TaskRecipeId) -> RuntimeResult<&TaskRecipe> {
         self.catalogue.recipe(recipe_id)
     }
@@ -221,7 +205,7 @@ pub enum RetryCause {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TaskCompletion {
+pub enum NodeOutcome {
     Succeeded(Vec<Artifact>),
     /// A Rust gate can succeed after forwarding already durable lineage without
     /// manufacturing a duplicate artifact. The task transition remains in the
@@ -235,6 +219,11 @@ pub enum TaskCompletion {
     Retry(RetryCause),
     RetryAfter(RetryCause, DateTime<Utc>),
 }
+
+/// Compatibility name for existing business handlers; there is one result protocol.
+pub type TaskCompletion = NodeOutcome;
+mod node;
+pub use node::{NodeContext, NodeExecutor};
 
 fn required_terminal<'a>(
     terminals: &BTreeMap<TaskRecipeId, &'a WorkflowNode>,

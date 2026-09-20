@@ -3,6 +3,35 @@ use akzio_store::*;
 use chrono::{Duration, Utc};
 use std::sync::{Arc, Barrier};
 
+#[test]
+fn research_quality_budget_is_durable_and_never_refunds_started_calls() {
+    let c = Case::new();
+    c.control(DebugAction::Step, Some(0));
+    let task = c.claim().unwrap();
+    for index in 0..40 {
+        assert_eq!(
+            c.store
+                .reserve_research_quality_call(
+                    &task.permit,
+                    &serde_json::json!({"synthetic":true,"index":index})
+                )
+                .unwrap(),
+            index + 1
+        );
+    }
+    let reopened = Store::open(c.store.root()).unwrap();
+    assert!(reopened
+        .reserve_research_quality_call(&task.permit, &serde_json::json!({"resumed":true}))
+        .is_err());
+    assert_eq!(
+        c.store
+            .research_quality_records("research.quality.call.started")
+            .unwrap()
+            .len(),
+        40
+    );
+}
+
 struct Case {
     store: Store,
     run: RunId,
@@ -30,6 +59,7 @@ impl Case {
             .iter()
             .enumerate()
             .map(|(i, id)| WorkflowNode {
+                spec: None,
                 task_id: id.clone(),
                 recipe_id: TaskRecipeId::new("test.stage").unwrap(),
                 contract_hash: None,
@@ -59,6 +89,7 @@ impl Case {
             })
             .collect::<Vec<_>>();
         let graph = WorkflowGraph {
+            definition_version: None,
             agent_budgets: Default::default(),
             schema_version: DOMAIN_SCHEMA_VERSION,
             topology_id: "controller-test".into(),
@@ -117,6 +148,7 @@ impl Case {
                         runtime_identity: identity.clone(),
                         decision_policy_status: "unconfigured".into(),
                         decision_policy_input_hash: None,
+                        decision_policy_artifact: None,
                         contract_hashes: vec![],
                         dataset: vec![],
                         parent_run_id: None,
@@ -191,6 +223,81 @@ fn t01_pause_prevents_new_claims_and_drains_without_cancelling() {
         .unwrap();
     assert_eq!(c.inspect().session.status, DebugStatus::Paused);
     assert!(c.claim().is_none());
+}
+
+#[test]
+fn expired_task_permit_cannot_write_or_heartbeat_before_recovery() {
+    let c = Case::new();
+    c.control(DebugAction::Resume, None);
+    let claim = c
+        .store
+        .claim_next_task_for_workload_with_identity(
+            "expiry-worker",
+            Utc::now(),
+            Duration::milliseconds(1),
+            TaskWorkload::Any,
+            Some(&c.identity),
+        )
+        .unwrap()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    assert!(matches!(
+        c.store.validate_task_permit(&claim.permit),
+        Err(StoreError::StalePermit(_))
+    ));
+    assert!(matches!(
+        c.store
+            .finish_task(&claim.permit, TaskStatus::Succeeded, Utc::now()),
+        Err(StoreError::StalePermit(_))
+    ));
+    assert!(matches!(
+        c.store
+            .heartbeat_task(&claim.permit, Utc::now() + Duration::seconds(30)),
+        Err(StoreError::StalePermit(_))
+    ));
+    assert_eq!(c.store.recover_expired_tasks(Utc::now()).unwrap(), 1);
+    let replacement = c.claim().unwrap();
+    c.store.validate_task_permit(&replacement.permit).unwrap();
+    c.store
+        .finish_task(&replacement.permit, TaskStatus::Succeeded, Utc::now())
+        .unwrap();
+}
+
+#[test]
+fn heartbeat_checks_complete_identity_and_cannot_shorten_existing_lease() {
+    let c = Case::new();
+    c.control(DebugAction::Resume, None);
+    let claim = c.claim().unwrap();
+    let mut wrong_run = claim.permit.clone();
+    wrong_run.run_id = RunId::new();
+    assert!(matches!(
+        c.store
+            .heartbeat_task(&wrong_run, Utc::now() + Duration::seconds(30)),
+        Err(StoreError::StalePermit(_))
+    ));
+    let mut wrong_contract = claim.permit.clone();
+    wrong_contract.contract_hash = Some(ContentHash::of_bytes(b"wrong contract"));
+    assert!(matches!(
+        c.store
+            .heartbeat_task(&wrong_contract, Utc::now() + Duration::seconds(30)),
+        Err(StoreError::StalePermit(_))
+    ));
+    let now = Utc::now();
+    c.store
+        .heartbeat_task(&claim.permit, now + Duration::seconds(60))
+        .unwrap();
+    c.store
+        .heartbeat_task(&claim.permit, now + Duration::seconds(20))
+        .unwrap();
+    assert_eq!(
+        c.store
+            .recover_expired_tasks(now + Duration::seconds(40))
+            .unwrap(),
+        0
+    );
+    c.store
+        .finish_task(&claim.permit, TaskStatus::Succeeded, Utc::now())
+        .unwrap();
 }
 
 #[test]
@@ -421,6 +528,9 @@ fn t08_retry_preserves_attempt_history_and_limits() {
     assert_eq!(node.attempts[1].status, "succeeded");
     assert!(!node.retry_eligible);
     assert_eq!(node.task.node.budget.max_input_tokens, 1000);
+    // Doctor must read AttemptRelation payloads through its already-held
+    // connection rather than attempting a nested Store connection acquisition.
+    c.store.verify_integrity().unwrap();
 }
 
 #[test]
@@ -719,6 +829,43 @@ fn t14_readonly_inspect_and_acceptance_keep_business_and_test_separate() {
 #[test]
 fn t15_debug_bundle_is_read_only_and_raw_access_follows_isolation() {
     let debug = Case::new();
+    debug.control(DebugAction::Resume, None);
+    let attempt = debug.claim().unwrap();
+    let raw = concat!(
+        "{\"provider_result\":{\"id\":\"discovery\",\"output\":[{\"type\":\"web_search_call\",\"id\":\"search-1\",\"status\":\"completed\",\"action\":{\"sources\":[{\"url\":\"https://example.com/news\"}]}}]}}\n",
+        "{\"audit\":{\"request\":{\"api_key\":\"private-fixture-value\"},\"response\":{\"id\":\"review\",\"output\":[{\"type\":\"web_search_call\",\"id\":\"review-1\",\"action\":{\"sources\":[{\"url\":\"https://example.com/news\"}]}}]}}}\n"
+    );
+    let now = Utc::now();
+    let evidence = Artifact::new(
+        ArtifactKind::RawEvidence,
+        debug
+            .store
+            .stage_bytes(raw.as_bytes(), "application/x-ndjson")
+            .unwrap(),
+        "evidence.raw",
+        ArtifactLifecycle::RunScoped,
+        ArtifactProvenance {
+            source_family: "news_web".into(),
+            observed_at: Some(now),
+            retrieved_at: now,
+            source_uri: None,
+            confidence_ppm: 1_000_000,
+            producer_contract_hash: None,
+        },
+        Some(attempt.permit.artifact_origin()),
+        vec![],
+        now,
+    )
+    .unwrap();
+    debug
+        .store
+        .write_task_artifact(
+            &attempt.permit,
+            &evidence,
+            LifecycleEventType::ArtifactCommitted,
+            now,
+        )
+        .unwrap();
     let target = debug
         .store
         .root()
@@ -735,6 +882,19 @@ fn t15_debug_bundle_is_read_only_and_raw_access_follows_isolation() {
     assert!(target.join("SUMMARY.md").is_file());
     assert!(target.join("checksums.sha256").is_file());
     assert_eq!(debug.store.event_cursor().unwrap(), before_cursor);
+    let exported =
+        std::fs::read_to_string(target.join(format!("artifacts/{}.json", evidence.artifact_id)))
+            .unwrap();
+    assert!(!exported.contains("private-fixture-value"));
+    let payload: serde_json::Value = serde_json::from_str(&exported).unwrap();
+    assert_eq!(payload["export_encoding"], "ndjson");
+    assert_eq!(payload["records"].as_array().unwrap().len(), 2);
+    let status: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(target.join("evidence_status.json")).unwrap())
+            .unwrap();
+    assert_eq!(status["web_search_calls"], 2);
+    assert_eq!(status["web_search_audit"]["observed_call_count"], 2);
+    assert_eq!(manifest.integrity.uncaptured_payloads, 0);
 
     let paper = Case::with_purpose(RunPurpose::Paper);
     let legacy_target = paper
@@ -752,3 +912,273 @@ fn t15_debug_bundle_is_read_only_and_raw_access_follows_isolation() {
         StoreError::RawModelExportNotAllowed(RunPurpose::Paper)
     ));
 }
+
+fn completed_draft_with_abandoned_submit() -> (Case, i64) {
+    let case = Case::new();
+    case.control(DebugAction::Resume, None);
+    let claimed = case.claim().unwrap();
+    let now = Utc::now();
+    case.store
+        .append_task_event(&claimed.permit, LifecycleEventType::AgentTurnStarted, now)
+        .unwrap();
+    let turn = Artifact::new(
+        ArtifactKind::AgentTurn,
+        case.store
+            .stage_json(&serde_json::json!({
+                "turn": 0,
+                "call_id": "draft-call",
+                "request": {"phase": "draft"},
+                "response": {"telemetry": {
+                    "input_tokens": 17,
+                    "output_tokens": 5,
+                    "latency_millis": 3
+                }}
+            }))
+            .unwrap(),
+        "research.agent.turn",
+        ArtifactLifecycle::RunScoped,
+        ArtifactProvenance {
+            source_family: "model".into(),
+            observed_at: Some(now),
+            retrieved_at: now,
+            source_uri: None,
+            confidence_ppm: 1_000_000,
+            producer_contract_hash: claimed.permit.contract_hash.clone(),
+        },
+        Some(claimed.permit.artifact_origin()),
+        vec![],
+        now,
+    )
+    .unwrap();
+    case.store
+        .write_task_artifact(
+            &claimed.permit,
+            &turn,
+            LifecycleEventType::AgentTurnCompleted,
+            now,
+        )
+        .unwrap();
+    case.store
+        .append_task_event(&claimed.permit, LifecycleEventType::AgentTurnStarted, now)
+        .unwrap();
+    let submit_cursor = case.store.event_cursor().unwrap();
+    // Older stores can contain the legacy alias for a completed artifact.
+    // It must neither double-charge Draft nor close the later Submit start.
+    case.store
+        .write_task_artifact(&claimed.permit, &turn, LifecycleEventType::AgentTurn, now)
+        .unwrap();
+    case.store
+        .retry_task(&claimed.permit, now + Duration::seconds(1), now)
+        .unwrap();
+    (case, submit_cursor)
+}
+
+#[test]
+fn bundle_does_not_pair_completed_draft_with_abandoned_submit() {
+    let (case, submit_cursor) = completed_draft_with_abandoned_submit();
+    let before = case.store.event_cursor().unwrap();
+    let target = case
+        .store
+        .root()
+        .parent()
+        .unwrap()
+        .join(format!("calls-{}", case.run));
+    let manifest = case.store.export_debug_bundle(&case.run, &target).unwrap();
+    assert_eq!(manifest.integrity.unknown_after_crash_calls, 1);
+    let calls = std::fs::read_to_string(target.join("llm_calls.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 2);
+    let unknown = calls
+        .iter()
+        .find(|call| call["status"] == "unknown_after_crash")
+        .unwrap();
+    assert_eq!(unknown["event_cursor"], submit_cursor);
+    assert!(
+        unknown["call_id"].is_null(),
+        "no durable call ID was recorded"
+    );
+    assert!(
+        unknown["turn_id"].is_null(),
+        "do not infer the missing Submit identity"
+    );
+    assert_eq!(case.store.event_cursor().unwrap(), before);
+}
+
+#[test]
+fn usage_counts_abandoned_submit_as_unknown_after_completed_draft() {
+    let (case, _) = completed_draft_with_abandoned_submit();
+    let before = case.store.event_cursor().unwrap();
+    let usage = case.store.run_model_usage(&case.run).unwrap();
+    assert_eq!(usage.turns, 2, "the second dispatch is a separate call");
+    assert_eq!(usage.turns_missing_usage, 1);
+    assert_eq!(
+        usage.input_tokens, 17,
+        "preserve known provider usage exactly once"
+    );
+    assert_eq!(usage.output_tokens, 5);
+    assert_eq!(case.store.event_cursor().unwrap(), before);
+}
+
+/// A broker-session slot is the single exclusive record of one Paper run.
+/// `rebuild_session_slots.run_id` carries no foreign key and no uniqueness
+/// constraint, so the Store asserts both inside the reserving transaction.
+mod session_slot_integrity {
+    use super::*;
+
+    fn paper_reservation(
+        store: &Store,
+        session_key: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> SessionReservation {
+        let run = RunId::new();
+        let task = TaskId::new();
+        let nodes = vec![WorkflowNode {
+            spec: None,
+            task_id: task,
+            recipe_id: TaskRecipeId::new("test.stage").unwrap(),
+            contract_hash: None,
+            objective: "stage 0 [research_horizon=t1]".into(),
+            dependencies: vec![],
+            input_artifacts: vec![],
+            priority: 50,
+            budget: TaskBudget {
+                max_input_tokens: 1000,
+                max_output_tokens: 100,
+                max_wall_time_secs: 30,
+                max_tool_calls: akzio_domain::budget::ToolCallLimit::Limited(2),
+            },
+            retry: RetryPolicy {
+                max_attempts: 1,
+                initial_backoff_ms: 1,
+                retry_transport: false,
+                retry_rate_limited: false,
+                retry_invalid_output: false,
+            },
+            on_failure: FailureDisposition::FailTask,
+            parent_task_id: None,
+        }];
+        let graph = WorkflowGraph {
+            definition_version: None,
+            agent_budgets: Default::default(),
+            schema_version: DOMAIN_SCHEMA_VERSION,
+            topology_id: "paper-slot-test".into(),
+            nodes: nodes.clone(),
+        };
+        let graph_artifact = Artifact::new(
+            ArtifactKind::WorkflowGraph,
+            store.stage_json(&graph).unwrap(),
+            "runtime.workflow",
+            ArtifactLifecycle::RunScoped,
+            ArtifactProvenance {
+                source_family: "akzio.runtime".into(),
+                observed_at: None,
+                retrieved_at: now,
+                source_uri: None,
+                confidence_ppm: 1_000_000,
+                producer_contract_hash: None,
+            },
+            Some(ArtifactOrigin {
+                run_id: Some(run.clone()),
+                task_id: None,
+                attempt_id: None,
+                contract_hash: None,
+            }),
+            vec![],
+            now,
+        )
+        .unwrap();
+        SessionReservation {
+            session_key: session_key.to_owned(),
+            workflow: WorkflowCommit {
+                run: StoredRun {
+                    run_id: run,
+                    purpose: RunPurpose::Paper,
+                    topology_id: graph.topology_id.clone(),
+                    graph_artifact_id: graph_artifact.artifact_id.clone(),
+                    created_at: now,
+                },
+                graph: graph_artifact,
+                nodes,
+            },
+            setup_artifacts: vec![],
+            reserved_at: now,
+        }
+    }
+
+    fn store_with_lease(label: &str) -> (Store, DaemonLease, chrono::DateTime<Utc>) {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/session-slot-tests")
+            .join(format!("{label}-{}", RunId::new().0));
+        let store = Store::open(root).unwrap();
+        let now = Utc::now();
+        let lease = store
+            .acquire_daemon_lease("scheduler", "owner", now, now + Duration::minutes(5))
+            .unwrap()
+            .unwrap();
+        (store, lease, now)
+    }
+
+    /// One run may never own two slots. `Store::session_slot_for_run` resolves at
+    /// most one row, so a second slot would make that lookup pick arbitrarily.
+    #[test]
+    fn a_run_cannot_own_a_second_session_slot() {
+        let (store, lease, now) = store_with_lease("one-slot-per-run");
+        let first = paper_reservation(&store, "2026-09-21", now);
+        store.reserve_session_slot(&lease, &first).unwrap();
+
+        // Same run, different trading session. `commit_workflow_transaction`
+        // rejects the duplicate Run row first, so the slot guard is the second
+        // line of defence; either way no second slot may reach the table.
+        let mut second = paper_reservation(&store, "2026-09-22", now);
+        second.workflow.run.run_id = first.workflow.run.run_id.clone();
+        assert!(store.reserve_session_slot(&lease, &second).is_err());
+
+        assert_eq!(
+            store
+                .session_slot_for_run(&first.workflow.run.run_id)
+                .unwrap()
+                .unwrap()
+                .session_key,
+            "2026-09-21"
+        );
+        store.verify_integrity().unwrap();
+    }
+
+    /// Re-reserving the identical session stays idempotent: the original graph
+    /// is returned and the caller's replacement is not recorded.
+    #[test]
+    fn reserving_the_same_session_twice_is_idempotent() {
+        let (store, lease, now) = store_with_lease("idempotent-slot");
+        let reservation = paper_reservation(&store, "2026-09-21", now);
+        let first = store.reserve_session_slot(&lease, &reservation).unwrap();
+        assert!(first.newly_reserved);
+
+        let again = store.reserve_session_slot(&lease, &reservation).unwrap();
+        assert!(!again.newly_reserved);
+        assert_eq!(
+            again.slot.workflow.run.run_id,
+            first.slot.workflow.run.run_id
+        );
+        store.verify_integrity().unwrap();
+    }
+
+    /// A reserved slot is discoverable by its run, and the Doctor accepts the
+    /// run/slot pairing it just wrote.
+    #[test]
+    fn reserved_slot_resolves_by_run_and_passes_doctor() {
+        let (store, lease, now) = store_with_lease("slot-by-run");
+        let reservation = paper_reservation(&store, "2026-09-21", now);
+        let run_id = reservation.workflow.run.run_id.clone();
+        store.reserve_session_slot(&lease, &reservation).unwrap();
+
+        let slot = store.session_slot_for_run(&run_id).unwrap().unwrap();
+        assert_eq!(slot.session_key, "2026-09-21");
+        store.verify_integrity().unwrap();
+    }
+}
+
+#[path = "support/runtime_control.rs"]
+mod runtime_control;

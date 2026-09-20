@@ -2,6 +2,8 @@
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 fn resolve_env_placeholder(value: &str, field: &str) -> Result<String> {
+    // 只解析以 '$' 开头的环境占位符，并把第一个 '/' 之后的内容作为字面后缀；
+    // 非占位符原样返回，缺失变量或空变量名直接阻断配置加载。
     let Some(name) = value.strip_prefix('$') else {
         return Ok(value.to_owned());
     };
@@ -15,14 +17,18 @@ fn resolve_env_placeholder(value: &str, field: &str) -> Result<String> {
 }
 
 fn daemon_token(settings: &DaemonSettings) -> Result<String> {
+    // 统一复用“读取或安全创建”逻辑，保证 HTTP client/server 使用同一个 Store Root 下
+    // 的 token；token 可用不代表 daemon 已通过 Paper 或执行授权。
     load_or_create_daemon_token(settings)
 }
 
 fn daemon_token_path(settings: &DaemonSettings) -> PathBuf {
+    // Token 与 Store Root 绑定，存放在该根目录的隐藏文件中，不进入 CAS Artifact。
     settings.store_root.join(".daemon-token")
 }
 
 fn validate_daemon_token(value: String, source: &str) -> Result<String> {
+    // HTTP 认证 token 必须非空且不能跨行，避免从文件或环境读取时引入额外 header 内容。
     if value.trim().is_empty() || value.contains(['\r', '\n']) {
         bail!("daemon token from {source} must be nonempty and contain no newlines");
     }
@@ -30,6 +36,8 @@ fn validate_daemon_token(value: String, source: &str) -> Result<String> {
 }
 
 fn load_or_create_daemon_token(settings: &DaemonSettings) -> Result<String> {
+    // 已有 token 只读并校验；首次创建使用独占临时文件、0600 权限、sync 和 hard-link
+    // 发布，遇到并发创建则删除自己的临时文件并读取已发布版本，不覆盖现有 token。
     let path = daemon_token_path(settings);
     if path.exists() {
         return read_daemon_token_file(&path);
@@ -98,6 +106,8 @@ fn load_or_create_daemon_token(settings: &DaemonSettings) -> Result<String> {
 }
 
 fn read_daemon_token_file(path: &std::path::Path) -> Result<String> {
+    // 读取前先收紧 Unix 权限，再校验文本内容；权限修复是认证文件的本地副作用，
+    // 不涉及 Store 业务状态。
     enforce_daemon_token_permissions(path)?;
     validate_daemon_token(
         fs::read_to_string(path)
@@ -108,6 +118,7 @@ fn read_daemon_token_file(path: &std::path::Path) -> Result<String> {
 
 #[cfg(unix)]
 fn enforce_daemon_token_permissions(path: &std::path::Path) -> Result<()> {
+    // 仅修正权限位，不改写 token 内容；非 0600 时尽力收紧并把失败向上传播。
     let mut permissions = fs::metadata(path)
         .with_context(|| format!("inspect daemon token file {}", path.display()))?
         .permissions();
@@ -121,24 +132,51 @@ fn enforce_daemon_token_permissions(path: &std::path::Path) -> Result<()> {
 
 #[cfg(not(unix))]
 fn enforce_daemon_token_permissions(_path: &std::path::Path) -> Result<()> {
+    // 非 Unix 平台没有本模块可用的权限位接口，内容校验仍由调用方执行。
     Ok(())
 }
 
 async fn serve(config: &Config, config_path: &Path) -> Result<()> {
+    // 组装并启动 daemon：先读取 SQL active Policy、校验 Debug/Paper 的启动前置，再探测
+    // 模型能力和构造 RuntimeIdentity，最后才创建 HTTP/worker/scheduler。启动成功不等于
+    // Run、Decision、ExecutionVerdict、PaperCommit 或成交已经完成。
     let auto_paper = config.daemon.auto_paper.unwrap_or(false);
-    let token = daemon_token(&config.daemon)?;
     let model = config
         .model
         .clone()
         .context("missing [model] configuration for daemon serve")?;
-    let loaded_policy = load_decision_policy_from_config(config, config_path)?;
+    let loaded_policy = load_decision_policy_from_config(config)?;
     let decision_policy = loaded_policy.policy.clone();
     let (decision_policy_status, decision_policy_input_hash) =
         decision_policy_audit(&loaded_policy);
+    let uncalibrated_research = !auto_paper
+        && decision_policy_status == "store_active_head_missing"
+        && decision_policy_input_hash.is_none()
+        && loaded_policy.artifact_id.is_none();
+    // 未校准且非 auto_paper 的研究模式允许启动以积累真实标签；真实 Debug Core 和 Paper
+    // 仍要求 decision-capable 的 Store Policy，不能用默认 Policy 绕过校验。
+    if config.daemon.debug_control && !uncalibrated_research && (!decision_policy.decision_capable()
+        || decision_policy_status != "ready_for_current_decision"
+        || decision_policy_input_hash.is_none()
+        || loaded_policy.artifact_id.is_none()) {
+        bail!("real Debug Core requires a decision-capable frozen policy before model capability probes");
+    }
+    if config.daemon.debug_control && !uncalibrated_research {
+        // 即使 Policy 能力足够，也必须与当前 Store 的 Synthesizer Contract 精确匹配。
+        let store = Store::open(&config.daemon.store_root)?;
+        let contract = akzio_daemon::canonical_synthesizer_contract_hash(&store)?;
+        if loaded_policy.contract_hash.as_ref() != Some(&contract) {
+            bail!("real Debug Core frozen policy does not match the Synthesizer Contract");
+        }
+    }
+    let token = daemon_token(&config.daemon)?;
+    // Provider capability probe 发生在 Daemon::open 之前；失败则不会启动 worker 或 scheduler。
     let model_capabilities = probe_configured_model_capabilities(&model)
         .await
         .context("probe configured model capabilities before daemon startup")?;
-    let runtime_identity_hash = if auto_paper || config.daemon.debug_control {
+    let runtime_identity_hash = if auto_paper || config.daemon.manual_paper || config.daemon.debug_control {
+        // 只有会影响 Paper/Debug 身份的模式才绑定完整 RuntimeIdentity；普通研究服务不
+        // 通过这个可选字段伪造审批或 Decision 身份。
         Some(
             runtime_identity_from_config_with_policy(
                 config,
@@ -172,11 +210,16 @@ async fn serve(config: &Config, config_path: &Path) -> Result<()> {
     let daemon = Daemon::open(
         DaemonConfig {
             agent_budget: config.agent.budget.clone(),
+            research_settings: config.agent.research.clone(),
             debug_control: if config.daemon.debug_control { Some(akzio_daemon::DebugCoreConfig {
                 code_revision: source_revision()?,
                 runtime_identity: runtime_identity_hash.clone().context("Debug runtime identity missing")?,
                 decision_policy_status,
                 decision_policy_input_hash,
+                decision_policy_artifact: loaded_policy.artifact_id.clone().map(|artifact_id| ArtifactRef {
+                    artifact_id,
+                    kind: ArtifactKind::DecisionPolicy,
+                }),
             }) } else { None },
             outcome_processing: config.daemon.outcome_processing,
             store_root: config.daemon.store_root.clone(),
@@ -196,6 +239,8 @@ async fn serve(config: &Config, config_path: &Path) -> Result<()> {
         model,
         model_capabilities,
     )?;
+    // shutdown channel 同时交给 HTTP 和 worker/scheduler；任一关闭信号只请求停止，不会
+    // 撤销已经持久化的 Run 或订单状态。
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
         if let Err(error) = wait_for_shutdown_signal().await {
@@ -203,7 +248,9 @@ async fn serve(config: &Config, config_path: &Path) -> Result<()> {
         }
         let _ = shutdown_tx.send(true);
     });
-    let paper = if auto_paper || config.daemon.debug_control {
+    let paper = if auto_paper || config.daemon.manual_paper || config.daemon.debug_control {
+        // Debug/Paper 模式需要 Paper client 供观察或正式链路使用；普通研究服务不构造
+        // Broker 连接，从而保持未授权路径没有外部交易 I/O。
         Some(AlpacaPaper::from_env().context("construct Alpaca Paper client")?)
     } else {
         None
@@ -212,6 +259,8 @@ async fn serve(config: &Config, config_path: &Path) -> Result<()> {
         .as_ref()
         .map(|paper| AlpacaPaperSessionClock::new(paper.clone()));
     let daemon = match paper {
+        // Arc 克隆只共享已构造的 daemon；with_paper_* 注册观察器和 Broker 边界，实际订单
+        // 仍须通过运行时 Gate、Commitment 和 Store effect intent。
         Some(paper) => Arc::new(
             daemon
                 .with_paper_observer(paper.clone())
@@ -221,6 +270,8 @@ async fn serve(config: &Config, config_path: &Path) -> Result<()> {
     };
     let http_daemon = daemon.clone();
     if auto_paper {
+        // Scheduler 启动前必须能加载 Paper workflow proposal；随后 HTTP 与 Paper scheduler
+        // 并行运行。proposal 被加载不代表某个 Run 已完成或订单已提交。
         let source = daemon.paper_workflow_source();
         source
             .proposal("preflight")
@@ -236,6 +287,7 @@ async fn serve(config: &Config, config_path: &Path) -> Result<()> {
                 .serve_with_paper_scheduler(clock, &source, Duration::from_secs(30), shutdown_rx,),
         )?;
     } else {
+        // 非 auto_paper 只提供 HTTP 和普通 worker，不启动交易 Session scheduler。
         tokio::try_join!(
             http_daemon.serve_http(config.daemon.http_addr, shutdown_rx.clone()),
             http_daemon.serve_workers(shutdown_rx),
@@ -245,6 +297,8 @@ async fn serve(config: &Config, config_path: &Path) -> Result<()> {
 }
 
 async fn wait_for_shutdown_signal() -> Result<()> {
+    // 统一等待 Ctrl-C、SIGTERM（Unix）或显式开启的父进程 stdin EOF；返回只表示收到
+    // 停止信号，调用方负责把 watch 值传播给服务组件。
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
@@ -267,6 +321,8 @@ async fn wait_for_shutdown_signal() -> Result<()> {
 }
 
 async fn wait_for_parent_stdin_eof() -> Result<()> {
+    // 默认永久等待且不读取 stdin；只有 AKZIO_EXIT_ON_STDIN_EOF=1 时才把父进程 EOF
+    // 作为关闭信号，避免普通管道状态意外终止 daemon。
     if std::env::var_os("AKZIO_EXIT_ON_STDIN_EOF").as_deref() != Some(std::ffi::OsStr::new("1")) {
         std::future::pending::<()>().await;
         unreachable!();
@@ -284,19 +340,18 @@ async fn wait_for_parent_stdin_eof() -> Result<()> {
 }
 
 fn fixture_daemon(config: &Config) -> Result<Daemon> {
-    if config.execution.decision_policy_path.is_some() {
-        bail!(
-            "fixture runtime does not consume execution.decision_policy_path; use daemon serve with an isolated Store"
-        );
-    }
+    // 构造供 debug serve-fixture 使用的确定性 daemon：关闭 auto_paper，使用默认 Policy
+    // 和 fixture model client；它只服务隔离 Debug 控制，不提供真实 Paper 订单能力。
     Ok(Daemon::with_model(
         DaemonConfig {
             agent_budget: config.agent.budget.clone(),
+            research_settings: config.agent.research.clone(),
             debug_control: if config.daemon.debug_control { Some(akzio_daemon::DebugCoreConfig {
                 code_revision: source_revision()?,
                 runtime_identity: ContentHash::of_bytes(source_revision()?.as_bytes()),
                 decision_policy_status: "fixture_default".into(),
                 decision_policy_input_hash: None,
+                decision_policy_artifact: None,
             }) } else {None},
             outcome_processing: config.daemon.outcome_processing,
             store_root: config.daemon.store_root.clone(),
@@ -318,144 +373,8 @@ fn fixture_daemon(config: &Config) -> Result<Daemon> {
 }
 
 fn print_json<T: Serialize>(response: &T) -> Result<()> {
+    // 所有 CLI 分支通过同一 pretty JSON 边界输出结构化结果；序列化失败向调用方传播，
+    // 不把半截响应当作成功。
     println!("{}", serde_json::to_string_pretty(response)?);
     Ok(())
-}
-
-async fn fixture_debug(config: Config) -> Result<()> {
-    let (report, _) = run_fixture_purpose(config, RunPurpose::PaperDryRun).await?;
-    if report.status != WorkflowStatus::Completed {
-        bail!(
-            "fixture Debug workflow did not complete: {:?}",
-            report.status
-        );
-    }
-    println!(
-        "{}",
-        serde_json::json!({
-            "run_id": report.run_id,
-            // `fixture-debug` drives the PaperDryRun fixture path. Report the
-            // Store-owned purpose so this is never read as Debug or as Paper
-            // acceptance evidence.
-            "purpose": report.purpose,
-            "status": report.status,
-            "fixture": true,
-            "evidence": "fixture/offline"
-        })
-    );
-    Ok(())
-}
-
-async fn paper_dry_run(config: Config) -> Result<()> {
-    let (report, canonical_learning_events) =
-        run_fixture_purpose(config, RunPurpose::PaperDryRun).await?;
-    if report.status != WorkflowStatus::Completed {
-        bail!(
-            "Paper Dry Run workflow did not complete: {:?}",
-            report.status
-        );
-    }
-    if canonical_learning_events != 0 {
-        bail!("Paper Dry Run produced canonical learning transition");
-    }
-    println!(
-        "{}",
-        serde_json::json!({
-            "run_id": report.run_id,
-            "purpose": "paper_dry_run",
-            "status": format!("{:?}", report.status),
-            "canonical_learning_events": canonical_learning_events,
-            "fixture": true,
-            "evidence": "fixture/offline"
-        })
-    );
-    Ok(())
-}
-
-async fn run_fixture_purpose(config: Config, purpose: RunPurpose) -> Result<(ReplayReport, usize)> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .context("bind ephemeral fixture control API")?;
-    let addr = listener.local_addr()?;
-    let token = "fixture-only".to_owned();
-    let daemon = fixture_daemon(&config)?;
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let serve_daemon = daemon.clone();
-    let server = tokio::spawn(async move {
-        tokio::try_join!(
-            serve_daemon.serve_http_listener(listener, shutdown_rx.clone()),
-            serve_daemon.serve_workers(shutdown_rx),
-        )
-    });
-    let client = ControlApiClient::new(addr, token)?;
-    let mut ready = false;
-    for _ in 0..100 {
-        if client.health().await.is_ok() {
-            ready = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    if !ready {
-        let _ = shutdown_tx.send(true);
-        let _ = server.await;
-        bail!("fixture daemon HTTP control API did not become ready");
-    }
-    let submitted = match client.submit(purpose).await {
-        Ok(submitted) => submitted,
-        Err(error) => {
-            let _ = shutdown_tx.send(true);
-            let _ = server.await;
-            return Err(error);
-        }
-    };
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-    let report = loop {
-        match client.replay(&submitted.run_id.0).await {
-            Ok(report)
-                if matches!(
-                    report.status,
-                    WorkflowStatus::Completed
-                        | WorkflowStatus::CompletedWithExecutionRejection
-                        | WorkflowStatus::Failed
-                        | WorkflowStatus::Cancelled
-                ) =>
-            {
-                break report;
-            }
-            Ok(_) if tokio::time::Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            Ok(report) => {
-                let _ = shutdown_tx.send(true);
-                let _ = server.await;
-                bail!(
-                    "fixture workflow did not reach a terminal status: {:?}",
-                    report.status
-                );
-            }
-            Err(error) if tokio::time::Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                let _ = error;
-            }
-            Err(error) => {
-                let _ = shutdown_tx.send(true);
-                let _ = server.await;
-                return Err(error);
-            }
-        }
-    };
-    let canonical_learning_events = client
-        .store_events(&submitted.run_id, 0, 10_000)
-        .await?
-        .iter()
-        .filter(|event| event.event_type == "policy.transitioned")
-        .count();
-    client.store_doctor().await?;
-    let _ = shutdown_tx.send(true);
-    match server.await {
-        Ok(Ok(_)) => Ok((report, canonical_learning_events)),
-        Ok(Err(error)) => Err(anyhow::anyhow!(error)),
-        Err(error) => Err(error.into()),
-    }
 }

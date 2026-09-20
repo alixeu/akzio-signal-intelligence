@@ -23,11 +23,13 @@ impl DecisionRuntime {
         let draft: DecisionDraft = serde_json::from_slice(&self.store.read_blob(&proposal.blob)?)?;
         draft.validate()?;
         self.validate_draft_closure(&draft, &selected)?;
-        let raw_research_plan = draft.research_allocation.as_ref().ok_or(
-            DomainError::EmptyField {
-                field: "decision_draft.research_allocation",
-            },
-        )?;
+        let raw_research_plan =
+            draft
+                .research_allocation
+                .as_ref()
+                .ok_or(DomainError::EmptyField {
+                    field: "decision_draft.research_allocation",
+                })?;
         // Semantic evidence sufficiency is unconditional. A producer contract
         // that is not installed, or that predates the rule, cannot vouch for
         // claim semantics, so the gate rejects the proposal rather than
@@ -36,8 +38,16 @@ impl DecisionRuntime {
             .store
             .contract_installation(&proposal_contract)?
             .ok_or(DecisionGateError::UnsupportedProposalContract)?;
-        if installed.contract.version < 16 {
+        if installed.contract.version < akzio_domain::DIRECTION_BOUND_RESEARCH_CONTRACT_VERSION {
             return Err(DecisionGateError::UnsupportedProposalContract);
+        }
+        if installed.contract.version >= akzio_domain::REVIEWED_RESEARCH_CONTRACT_VERSION {
+            akzio_domain::validate_numeric_bases(&draft.numeric_basis)?;
+            let (_, review) = self.store.final_proposal_review(&input.permit.run_id, &input.permit.task_id)?
+                .ok_or(DecisionGateError::ProposalReviewRequired)?;
+            if !review.authorizes(&input.proposal, &proposal.blob.hash) {
+                return Err(DecisionGateError::ProposalReviewRequired);
+            }
         }
         let claim_records = draft
             .claims
@@ -54,8 +64,10 @@ impl DecisionRuntime {
             .iter()
             .map(|(_, claim)| claim.clone())
             .collect::<Vec<_>>();
-        validate_decision_evidence_sufficiency(&draft, &claims)
-            .map_err(|_| DecisionGateError::InsufficientClaimEvidence)?;
+        if installed.contract.version < akzio_domain::STRUCTURED_RESEARCH_CONTRACT_VERSION {
+            validate_decision_evidence_sufficiency(&draft, &claims)
+                .map_err(|_| DecisionGateError::InsufficientClaimEvidence)?;
+        }
 
         let critique_records = draft
             .critiques
@@ -77,7 +89,10 @@ impl DecisionRuntime {
             .iter()
             .map(|(_, critique)| critique.clone())
             .collect::<Vec<_>>();
-        akzio_domain::validate_verified_forecast_slots(
+        let validate_slots = if installed.contract.version >= akzio_domain::STRUCTURED_RESEARCH_CONTRACT_VERSION {
+            akzio_domain::validate_verified_forecast_slots
+        } else { akzio_domain::validate_legacy_verified_forecast_slots };
+        validate_slots(
             &draft,
             &claim_records
                 .iter()
@@ -94,6 +109,11 @@ impl DecisionRuntime {
             &critiques,
         )
         .map_err(|_| DecisionGateError::InsufficientClaimEvidence)?;
+        if installed.contract.version >= akzio_domain::STRUCTURED_RESEARCH_CONTRACT_VERSION {
+            akzio_domain::validate_structured_allocation_eligibility(&draft, &claim_records.iter().map(|(artifact, claim)| (
+                ArtifactRef { artifact_id: artifact.artifact_id.clone(), kind: ArtifactKind::Claim }, claim.clone()
+            )).collect::<Vec<_>>(), &critiques).map_err(|_| DecisionGateError::InsufficientClaimEvidence)?;
+        }
         let research_plan = self.review_research_plan(
             raw_research_plan,
             &draft.forecasts,
@@ -491,10 +511,11 @@ impl DecisionRuntime {
                     forecasts.iter().any(|forecast| {
                         forecast.asset == allocation.asset
                             && forecast.horizon == *horizon
-                            && !forecast.is_neutral()
+                            && forecast.expected_return_ppm > 0
                             && research_slot_supported(
                                 allocation.asset,
                                 *horizon,
+                                &allocation.evidence_refs,
                                 claims,
                                 critiques,
                             )
@@ -602,30 +623,28 @@ impl DecisionRuntime {
             ResearchPlanStatus::ExplicitCash
         };
         let purpose = self.store.run_purpose(run_id)?;
-        let (execution_status, execution_blockers) = if matches!(
-            status,
-            ResearchPlanStatus::BlockedByResearch
-        ) {
-            (
-                ResearchExecutionStatus::Blocked,
-                vec!["research_plan_blocked".to_owned()],
-            )
-        } else if purpose == RunPurpose::PositionPlan {
-            (
-                ResearchExecutionStatus::NotApplicable,
-                vec!["position_plan_does_not_enter_execution".to_owned()],
-            )
-        } else if !self.policy.decision_capable() {
-            (
-                ResearchExecutionStatus::Blocked,
-                vec!["decision_policy_not_ready".to_owned()],
-            )
-        } else {
-            (
-                ResearchExecutionStatus::PendingExecutionGate,
-                vec!["execution_gate_not_run".to_owned()],
-            )
-        };
+        let (execution_status, execution_blockers) =
+            if matches!(status, ResearchPlanStatus::BlockedByResearch) {
+                (
+                    ResearchExecutionStatus::Blocked,
+                    vec!["research_plan_blocked".to_owned()],
+                )
+            } else if purpose == RunPurpose::PositionPlan {
+                (
+                    ResearchExecutionStatus::NotApplicable,
+                    vec!["position_plan_does_not_enter_execution".to_owned()],
+                )
+            } else if !self.policy.decision_capable() {
+                (
+                    ResearchExecutionStatus::Blocked,
+                    vec!["decision_policy_not_ready".to_owned()],
+                )
+            } else {
+                (
+                    ResearchExecutionStatus::PendingExecutionGate,
+                    vec!["execution_gate_not_run".to_owned()],
+                )
+            };
         let review = ResearchPlanReview {
             raw: raw.clone(),
             validated,
@@ -813,13 +832,17 @@ impl DecisionRuntime {
 fn research_slot_supported(
     asset: Asset,
     horizon: DecisionHorizon,
+    references: &[ArtifactRef],
     claims: &[(Artifact, ResearchClaim)],
     critiques: &[(Artifact, ResearchCritique)],
 ) -> bool {
     claims.iter().any(|(artifact, claim)| {
         if claim.horizon != horizon
-            || claim.stance == akzio_domain::ClaimStance::Neutral
-            || claim.evidence_gaps.iter().any(|gap| gap.blocks_slot(asset, horizon, claim.horizon))
+            || claim.stance != akzio_domain::ClaimStance::Bullish
+            || claim
+                .evidence_gaps
+                .iter()
+                .any(|gap| gap.blocks_slot(asset, horizon, claim.horizon))
         {
             return false;
         }
@@ -845,10 +868,20 @@ fn research_slot_supported(
             artifact_id: artifact.artifact_id.clone(),
             kind: ArtifactKind::Claim,
         };
-        critiques.iter().any(|(_, critique)| {
+        critiques.iter().any(|(critique_artifact, critique)| {
             critique.target == claim_ref
                 && critique.verification_status == ClaimVerificationStatus::Supported
                 && !critique.blocks_slot(asset, horizon, claim.horizon)
+                && references.iter().any(|reference| {
+                    *reference == claim_ref
+                        || (reference.kind == ArtifactKind::Critique
+                            && reference.artifact_id == critique_artifact.artifact_id)
+                        || claim.grounds.iter().any(|ground| {
+                            ground.role == akzio_domain::EvidenceGroundRole::Directional
+                                && ground.assets.contains(&asset)
+                                && ground.evidence == *reference
+                        })
+                })
         })
     })
 }
@@ -888,11 +921,7 @@ fn has_unverified_critical_claim(
                         })
                 })
                 .any(|forecast| {
-                    verification.blocks_slot(
-                        forecast.asset,
-                        forecast.horizon,
-                        claim.horizon,
-                    )
+                    verification.blocks_slot(forecast.asset, forecast.horizon, claim.horizon)
                 })
         })
 }
@@ -921,6 +950,7 @@ fn build_asset_eligibility(
                 && active_forecasts.iter().all(|forecast| {
                     claims.iter().any(|(artifact, claim)| {
                         claim.horizon == forecast.horizon
+                            && forecast.supported_by_stance(claim.stance)
                             && critiques.iter().any(|(_, critique)| {
                                 critique.target
                                     == ArtifactRef {
@@ -929,11 +959,7 @@ fn build_asset_eligibility(
                                     }
                                     && critique.verification_status
                                         == ClaimVerificationStatus::Supported
-                                    && !critique.blocks_slot(
-                                        asset,
-                                        forecast.horizon,
-                                        claim.horizon,
-                                    )
+                                    && !critique.blocks_slot(asset, forecast.horizon, claim.horizon)
                             })
                     })
                 });
@@ -943,6 +969,7 @@ fn build_asset_eligibility(
                         .iter()
                         .filter(|(artifact, claim)| {
                             claim.horizon == forecast.horizon
+                                && forecast.supported_by_stance(claim.stance)
                                 && !claim.evidence_gaps.iter().any(|gap| {
                                     gap.blocks_slot(asset, forecast.horizon, claim.horizon)
                                 })
@@ -978,8 +1005,9 @@ fn build_asset_eligibility(
                 });
 
             let risk_calibration = policy.asset_calibrations.get(&asset);
-            let insufficient_samples = risk_calibration
-                .is_some_and(|calibration| calibration.sample_count < policy.min_calibration_samples);
+            let insufficient_samples = risk_calibration.is_some_and(|calibration| {
+                calibration.sample_count < policy.min_calibration_samples
+            });
             let risk_calibration_ok = risk_calibration.is_some_and(|calibration| {
                 calibration.sample_count >= policy.min_calibration_samples
                     && calibration.brier_score_ppm <= policy.max_brier_score_ppm
@@ -1035,14 +1063,20 @@ fn build_asset_eligibility(
                 reasons.push(DecisionEligibilityReason::HorizonConflict);
             }
             if directional_forecast_present
-                && target.weights.get(&asset).is_none_or(|weight| weight.0 == 0)
+                && target
+                    .weights
+                    .get(&asset)
+                    .is_none_or(|weight| weight.0 == 0)
                 && reasons.is_empty()
             {
                 reasons.push(DecisionEligibilityReason::NoDirectionalSignal);
             }
             reasons.sort();
             reasons.dedup();
-            let eligible = target.weights.get(&asset).is_some_and(|weight| weight.0 > 0)
+            let eligible = target
+                .weights
+                .get(&asset)
+                .is_some_and(|weight| weight.0 > 0)
                 && reasons.is_empty();
             (
                 asset,

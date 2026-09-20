@@ -86,7 +86,6 @@ enum CouncilFixtures {
         }
 
         return [
-            card(.planner, model: ModelCatalog.primary, status: .succeeded),
             card(.analyst, model: ModelCatalog.primary, status: running ? .running : .succeeded),
             card(
                 .critic,

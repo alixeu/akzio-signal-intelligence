@@ -113,14 +113,3 @@ extension EnvironmentValues {
         set { self[MotionPolicyKey.self] = newValue }
     }
 }
-
-extension View {
-    /// Animate with a token, already filtered through the active policy.
-    public func akzioAnimation<V: Equatable>(
-        _ animation: Animation,
-        value: V,
-        policy: MotionPolicy
-    ) -> some View {
-        self.animation(policy.resolve(animation), value: value)
-    }
-}

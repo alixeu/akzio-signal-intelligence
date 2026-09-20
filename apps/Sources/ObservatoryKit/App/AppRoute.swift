@@ -13,8 +13,6 @@ public enum AppRoute: String, CaseIterable, Identifiable, Sendable {
     case outcome
     case learning
     case runArchive
-    /// Debug-only surface listing every mock scenario and component.
-    case scenarioGallery
 
     public var id: String { rawValue }
 
@@ -32,7 +30,6 @@ public enum AppRoute: String, CaseIterable, Identifiable, Sendable {
         case .outcome: "Outcome"
         case .learning: "Learning"
         case .runArchive: "Run Archive"
-        case .scenarioGallery: "Scenario Gallery"
         }
     }
 
@@ -46,7 +43,6 @@ public enum AppRoute: String, CaseIterable, Identifiable, Sendable {
         case .outcome: "Outcome Horizons"
         case .learning: "Learning & Experience"
         case .runArchive: "Run Archive"
-        case .scenarioGallery: "Scenario Gallery"
         }
     }
 
@@ -60,7 +56,6 @@ public enum AppRoute: String, CaseIterable, Identifiable, Sendable {
         case .outcome: "target"
         case .learning: "sparkles.rectangle.stack"
         case .runArchive: "archivebox"
-        case .scenarioGallery: "square.grid.3x3"
         }
     }
 
@@ -74,7 +69,6 @@ public enum AppRoute: String, CaseIterable, Identifiable, Sendable {
         case .outcome: "5"
         case .learning: "6"
         case .runArchive: "7"
-        case .scenarioGallery: "0"
         }
     }
 }

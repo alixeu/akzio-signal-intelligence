@@ -10,7 +10,7 @@ fn default_debug_policy_status() -> String {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum DebugStatus {
+pub enum RunControlStatus {
     Running,
     PauseRequested,
     Paused,
@@ -21,10 +21,14 @@ pub enum DebugStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum DebugExecutionMode {
+pub enum RunExecutionMode {
     Manual,
     Continuous,
 }
+
+/// Wire-compatible names retained for the existing Debug API.
+pub type DebugStatus = RunControlStatus;
+pub type DebugExecutionMode = RunExecutionMode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -38,6 +42,8 @@ pub enum DebugLlmMode {
 pub enum DebugBrokerPolicy {
     Forbidden,
     PaperAllowed,
+    /// Retired local simulation identity, retained for historical decoding only.
+    SimulatedOnly,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +73,9 @@ pub struct DebugSessionIdentity {
     pub decision_policy_status: String,
     #[serde(default)]
     pub decision_policy_input_hash: Option<ContentHash>,
+    /// Exact immutable Store artifact selected for this Run.
+    #[serde(default)]
+    pub decision_policy_artifact: Option<ArtifactRef>,
     pub contract_hashes: Vec<ContentHash>,
     pub dataset: Vec<ArtifactRef>,
     pub parent_run_id: Option<RunId>,
@@ -74,6 +83,16 @@ pub struct DebugSessionIdentity {
     pub parent_artifacts: Vec<ArtifactRef>,
     pub reason: Option<String>,
     pub created_at: DateTime<Utc>,
+}
+
+impl DebugSessionIdentity {
+    /// Frozen session authority shared by inspection and control. Fixture runs
+    /// do not pretend to have a real calibrated policy.
+    pub fn research_only_without_policy(&self) -> bool {
+        self.run_purpose == RunPurpose::PositionPlan
+            && self.llm_mode != DebugLlmMode::Fixture
+            && self.decision_policy_artifact.is_none()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

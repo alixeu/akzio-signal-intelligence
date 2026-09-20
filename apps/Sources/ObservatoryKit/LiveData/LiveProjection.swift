@@ -116,8 +116,9 @@ struct LiveProjection: Sendable {
                 market: "Unavailable",
                 startedAt: payload.generatedAt,
                 elapsedSeconds: 0,
-                systemHealthPpm: Int(payload.core.readinessPpm ?? 0),
+                systemHealthPpm: payload.core.readinessPpm.map(Int.init),
                 marketOpen: payload.portfolio.data?.marketOpen ?? false,
+            marketStatusKnown: payload.portfolio.data != nil,
                 dataLive: true,
                 latencyMillis: summary?.latencyMillis.map(Int.init),
                 brokerSession: "Unavailable"
@@ -134,8 +135,9 @@ struct LiveProjection: Sendable {
             market: "US Equities",
             startedAt: workflow.run.createdAt,
             elapsedSeconds: max(0, Int(end.timeIntervalSince(workflow.run.createdAt))),
-            systemHealthPpm: Int(payload.core.readinessPpm ?? 0),
+            systemHealthPpm: payload.core.readinessPpm.map(Int.init),
             marketOpen: payload.portfolio.data?.marketOpen ?? false,
+            marketStatusKnown: payload.portfolio.data != nil,
             dataLive: true,
             latencyMillis: summary?.latencyMillis.map(Int.init)
                 ?? payload.currentRun?.telemetry?.latencyMillis.map(Int.init),
@@ -156,7 +158,7 @@ struct LiveProjection: Sendable {
         var analystIndex = 0
         var taskStages: [String: WorkflowStageKind] = [:]
         var stageOccurrences: [String: Int] = [:]
-        let nodes = workflow.tasks.map { task -> WorkflowNodePresentation in
+        let nodes = WorkflowDisplay.orderedTasks(workflow.tasks).map { task -> WorkflowNodePresentation in
             let stage = stage(for: task.node.recipeID, analystIndex: &analystIndex)
             taskStages[task.node.taskID] = stage
             let position = WorkflowLayout.position(stage)
@@ -201,7 +203,8 @@ struct LiveProjection: Sendable {
                 stage: stage,
                 trajectory: trajectory,
                 artifactsByID: artifactsByID,
-                reasoningRecords: reasoningRecords.filter { $0.taskID == task.node.taskID }
+                reasoningRecords: reasoningRecords.filter { $0.taskID == task.node.taskID },
+                researchAudit: detail?.researchAudit?.records.filter { $0.taskID == task.node.taskID }.flatMap(\.rows) ?? []
                 )
             )
         }
@@ -237,7 +240,8 @@ struct LiveProjection: Sendable {
         stage: WorkflowStageKind,
         trajectory: [ObserverTrajectoryPayload],
         artifactsByID: [String: ObserverArtifactPayload],
-        reasoningRecords: [LiveReasoningRecord]
+        reasoningRecords: [LiveReasoningRecord],
+        researchAudit: [ResearchAuditRowPresentation] = []
     ) -> StageInspectorPresentation {
         let entries = trajectory.filter { $0.taskID == task.node.taskID }
         let deliberation = entries.compactMap(\.deliberation).last
@@ -318,7 +322,10 @@ struct LiveProjection: Sendable {
                     }?.cursor ?? 0
                 )
             },
-            transientAnalysisRecords: reasoningRecords.map(\.presentation) + memoRecords
+            transientAnalysisRecords: reasoningRecords.map(\.presentation) + memoRecords,
+            taskID: task.node.taskID,
+            horizon: task.node.horizon,
+            researchAudit: researchAudit
         )
     }
 
@@ -409,9 +416,11 @@ struct LiveProjection: Sendable {
             let end = workflow.finishedAt
             let active = workflow.tasks.first { taskStatus($0.taskStatus) == .running }
                 ?? workflow.tasks.first { taskStatus($0.taskStatus) == .leased }
-            let progress = workflow.tasks.map { task in
+            let progress = WorkflowDisplay.orderedTasks(workflow.tasks).map { task in
                 ArchiveStageProgress(
+                    id: task.node.taskID,
                     label: task.node.recipeID,
+                    horizon: task.node.horizon,
                     status: taskStatus(task.taskStatus).status(optional: false),
                     timeLabel: task.finishedAt.map(timeLabel) ?? MissingValue.pending.rawValue
                 )
@@ -435,8 +444,8 @@ struct LiveProjection: Sendable {
             )
         }
         let terminal = workflows.filter { workflowStatus($0.status).isTerminal }
-        let completed = terminal.filter { workflowStatus($0.status) == .completed }.count
-        let successRate = terminal.isEmpty ? 0 : completed * 1_000_000 / terminal.count
+        let completed = terminal.filter { [.completed, .completedWithExecutionRejection, .decisionCompleted].contains(workflowStatus($0.status)) }.count
+        let successRate: Int? = terminal.isEmpty ? nil : completed * 1_000_000 / terminal.count
         return ArchivePresentation(
             rows: rows,
             totalRuns: rows.count,

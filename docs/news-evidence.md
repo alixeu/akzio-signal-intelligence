@@ -41,3 +41,5 @@ cargo test --locked -p akzio-cli real_news_uses_deployment_routes \
 输出含脱敏配置身份、原始模型响应、精简事实、质量与时间校验产物。不得提交这些输出或配置凭据。`base_url` 必须是请求地址，`api_key` 必须是密钥。测试保留显式的 `AKZIO_REAL_LLM_SWAP_ENDPOINT_FIELDS=1` 诊断选项，只用于已确认填反字段的临时内存修正；正常部署不应设置它。
 
 协议依据：[OpenAI Web search](https://developers.openai.com/api/docs/guides/tools-web-search)。来源存在、事件陈述准确、投资方向正确、仓位合理及执行授权始终是不同的判断。
+
+2026-09-21 状态分离：`news_evidence_status` 明确记录 `fetch_failed`、`facts_empty`、`facts_outside_window`、`malformed_json` 或 `model_reviewed`，其他来源闭包不合法保留 `source_unverified`。真实来源快照路径只有完整验证时才记录 `source_verified`。ModelReviewed 路径显式保存 `verified_source_count=0`、`source_verified=false` 与独立的 `model_reviewed_source_count`；`citations_complete` 只表示模型审阅事实的引用闭合，不能解释为来源快照已验证。发现请求的网络错误保留 `fetch_failed`，未配置、权限等原有错误类别保留。

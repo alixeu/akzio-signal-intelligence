@@ -66,23 +66,6 @@ public struct ObservatorySnapshot: Sendable, Equatable {
         return formatter.string(from: anchor)
     }
 
-    /// Structural fingerprint proving two builds of the same scenario are identical.
-    /// Value-type reflection is deterministic here because every field is a value.
-    public var determinismFingerprint: String {
-        var parts: [String] = [scenarioID, String(anchor.timeIntervalSince1970)]
-        parts.append(String(describing: run))
-        parts.append(String(describing: workflow))
-        parts.append(String(describing: council))
-        parts.append(String(describing: portfolio))
-        parts.append(String(describing: outcome))
-        parts.append(String(describing: learning))
-        parts.append(String(describing: archive))
-        parts.append(String(describing: events))
-        parts.append(String(describing: agents))
-        parts.append(String(describing: health))
-        return parts.joined(separator: "|")
-    }
-
     /// Elapsed seconds are stored, never derived from the wall clock.
     public var elapsedLabel: String {
         PpmFormatter.elapsed(seconds: run.elapsedSeconds)

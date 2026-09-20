@@ -6,15 +6,6 @@ pub(crate) struct ControlApiClient {
     token: String,
 }
 
-impl From<PurposeArg> for RunPurpose {
-    fn from(value: PurposeArg) -> Self {
-        match value {
-            PurposeArg::Debug => Self::Debug,
-            PurposeArg::PaperDryRun => Self::PaperDryRun,
-        }
-    }
-}
-
 impl ControlApiClient {
     pub(crate) fn from_config(config: &Config) -> Result<Self> {
         // A read-only inspect must not create credentials or chmod a Store file.
@@ -155,14 +146,6 @@ impl ControlApiClient {
             .await
     }
 
-    pub(crate) async fn submit(&self, purpose: RunPurpose) -> Result<RunSubmissionResponse> {
-        self.json(
-            self.request(Method::POST, self.endpoint(&["runs"]))
-                .json(&SubmitRequest { purpose }),
-        )
-        .await
-    }
-
     pub(crate) async fn replay(&self, run_id: &str) -> Result<ReplayReport> {
         self.json(self.request(Method::GET, self.endpoint(&["runs", run_id, "replay"])))
             .await
@@ -260,18 +243,12 @@ impl ControlApiClient {
             .await
             .context("open loopback event stream")?;
         let mut stream = require_success(response).await?.bytes_stream();
-        let mut pending = String::new();
+        let mut pending = Vec::new();
         let mut event_data = Vec::new();
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context("read loopback event stream")?;
-            pending.push_str(
-                std::str::from_utf8(chunk.as_ref())
-                    .context("loopback control API emitted non-UTF-8 SSE")?,
-            );
-
-            while let Some(newline) = pending.find('\n') {
-                let line = pending.drain(..=newline).collect::<String>();
+            for line in sse_lines(&mut pending, chunk.as_ref())? {
                 let line = line.trim_end_matches(&['\r', '\n'][..]);
                 if line.is_empty() {
                     print_sse_data(&mut event_data);
@@ -283,6 +260,20 @@ impl ControlApiClient {
         print_sse_data(&mut event_data);
         Ok(())
     }
+}
+
+fn sse_lines(pending: &mut Vec<u8>, chunk: &[u8]) -> Result<Vec<String>> {
+    // HTTP chunks may end inside a UTF-8 code point. Decode only complete
+    // newline-delimited SSE lines, retaining the partial bytes for the next read.
+    pending.extend_from_slice(chunk);
+    let mut lines = Vec::new();
+    while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+        lines.push(
+            String::from_utf8(pending.drain(..=newline).collect())
+                .context("loopback control API emitted non-UTF-8 SSE")?,
+        );
+    }
+    Ok(lines)
 }
 
 async fn require_success(response: Response) -> Result<Response> {
@@ -404,19 +395,6 @@ impl ControlApiClient {
         .await
     }
 
-    pub(crate) async fn store_events(
-        &self,
-        run_id: &RunId,
-        after: i64,
-        limit: usize,
-    ) -> Result<Vec<StoreEventView>> {
-        let mut url = self.endpoint(&["control", "store", "events", run_id.0.as_str()]);
-        url.query_pairs_mut()
-            .append_pair("after", &after.to_string())
-            .append_pair("limit", &limit.to_string());
-        self.json(self.request(Method::GET, url)).await
-    }
-
     pub(crate) async fn lesson_add(&self, input: &serde_json::Value) -> Result<serde_json::Value> {
         self.json(
             self.request(
@@ -479,5 +457,27 @@ impl ControlApiClient {
             })),
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod sse_tests {
+    use super::*;
+
+    #[test]
+    fn utf8_event_survives_every_network_chunk_boundary() {
+        let event = "data: {\"message\":\"研究完成🦀\"}\r\n\r\n";
+        for split in 0..=event.len() {
+            let mut pending = Vec::new();
+            let mut lines = sse_lines(&mut pending, &event.as_bytes()[..split]).unwrap();
+            lines.extend(sse_lines(&mut pending, &event.as_bytes()[split..]).unwrap());
+            assert_eq!(lines.concat(), event);
+            assert!(pending.is_empty());
+        }
+    }
+
+    #[test]
+    fn malformed_complete_sse_line_is_rejected() {
+        assert!(sse_lines(&mut Vec::new(), b"data: \xff\n").is_err());
     }
 }

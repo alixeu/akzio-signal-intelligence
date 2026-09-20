@@ -73,6 +73,11 @@ impl Store {
         }
         Self::commit_workflow_transaction(transaction, &reservation.workflow)?;
         Self::append_session_setup_events(transaction, reservation, Some(proposal))?;
+        assert_session_slot_run(
+            transaction,
+            &reservation.session_key,
+            &reservation.workflow.run.run_id,
+        )?;
         transaction.execute(
             "INSERT INTO rebuild_session_slots (session_key, run_id, topology_id, graph_artifact_id, run_created_at, scheduler_epoch, reserved_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
@@ -156,6 +161,7 @@ impl Store {
         if inserted != 1 {
             return Err(StoreError::DuplicateRun(commit.run.run_id.clone()));
         }
+        run_control::initialize_control(transaction, &commit.run.run_id, commit.run.created_at)?;
         for node in &commit.nodes {
             insert_task_node(transaction, &commit.run.run_id, node, commit.run.created_at)?;
         }
@@ -241,7 +247,7 @@ impl Store {
             return Err(invalid());
         }
         let verdict: ExecutionVerdict =
-            serde_json::from_slice(&self.read_blob(&verdict_artifact.blob)?)?;
+            serde_json::from_slice(&blob::read_blob_with(connection, &verdict_artifact.blob)?)?;
         let ExecutionVerdict::Accepted { execution_context } = verdict else {
             return Err(invalid());
         };
@@ -260,7 +266,7 @@ impl Store {
             return Err(invalid());
         }
         let context: ExecutionContext =
-            serde_json::from_slice(&self.read_blob(&context_artifact.blob)?)?;
+            serde_json::from_slice(&blob::read_blob_with(connection, &context_artifact.blob)?)?;
         context.validate_complete_plan_closure()?;
         if context.run_id != *run_id
             || context.broker_session.as_deref() != Some(session_key)
@@ -304,7 +310,7 @@ impl Store {
         {
             return Err(invalid());
         }
-        let plan: ExecutionPlan = serde_json::from_slice(&self.read_blob(&plan_artifact.blob)?)?;
+        let plan: ExecutionPlan = serde_json::from_slice(&blob::read_blob_with(connection, &plan_artifact.blob)?)?;
         plan.validate()?;
         if !has_exact_source_refs(
             &plan_artifact,

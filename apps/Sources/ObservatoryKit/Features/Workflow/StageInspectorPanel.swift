@@ -20,6 +20,23 @@ struct StageInspectorPanel: View {
             header
             HairlineDivider()
             metrics.staggeredReveal(index: 1)
+            if !inspector.researchAudit.isEmpty {
+                section("研究审计", index: 2) {
+                    PageScroll {
+                        VStack(alignment: .leading, spacing: 8) {
+                            ForEach(inspector.researchAudit) { row in
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(row.title).akzioText(.bodySmall, color: row.isFailure ? AkzioColor.actionCoral : AkzioColor.primaryText)
+                                    Text(row.detail).akzioText(.bodySmall, color: AkzioColor.mutedText).textSelection(.enabled)
+                                    if !row.references.isEmpty {
+                                        Text(row.references.joined(separator: "\n")).akzioMono(9, color: AkzioColor.mutedText).textSelection(.enabled)
+                                    }
+                                }
+                            }
+                        }
+                    }.frame(maxHeight: 200)
+                }
+            }
             section("Analysis Record", index: 2) {
                 Text(L10n.text(
                     "Natural-language LLM research, tool lifecycle, and Rust-validated output. Hidden reasoning and secret-bearing arguments remain excluded.",
@@ -210,6 +227,7 @@ struct AnalysisRecordRow: View {
                     .akzioText(.caption, color: AkzioColor.mutedText)
                     .lineLimit(1)
                 }
+                if record.createdAt == nil { Text("时间未知").akzioText(.caption) }
                 Button(action: copyBody) {
                     Image(systemName: "doc.on.doc")
                         .font(.system(size: 11, weight: .medium))
@@ -221,7 +239,14 @@ struct AnalysisRecordRow: View {
                 .accessibilityLabel(L10n.text("Copy", language: language))
             }
 
-            Text(localizedBody)
+            if showsActor || record.taskID != nil {
+                Text("\(L10n.text(record.actor, language: language)) · \(record.horizon?.uppercased() ?? "期限未知") · \(record.taskID ?? "任务未知")")
+                    .akzioMono(11, color: AkzioColor.secondaryText)
+                    .textSelection(.enabled)
+            }
+            Text(L10n.text(record.title, language: language)).akzioText(.bodySmall, color: AkzioColor.secondaryText)
+            ObservedMarkdown(source: localizedBody)
+                .textSelection(.enabled)
                 .akzioText(.body, color: AkzioColor.primaryText)
                 .lineLimit(nil)
                 .multilineTextAlignment(.leading)
@@ -266,12 +291,12 @@ struct AnalysisRecordRow: View {
 
     private func copyBody() {
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(localizedBody, forType: .string)
+        NSPasteboard.general.setString(record.body, forType: .string)
     }
 
     private func timestamp(_ date: Date) -> String {
         let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_GB")
+        formatter.locale = language.locale
         formatter.dateFormat = "dd/MM/yyyy, h:mm:ss a"
         return formatter.string(from: date)
     }

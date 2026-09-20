@@ -1,57 +1,7 @@
 impl ContextBroker {
-    /// Record an explicitly source-linked Context repair. This is intentionally a
-    /// normal artifact write, so repair is observable and may itself be cited.
-    pub fn record_repair<T: Serialize>(
-        &self,
-        permit: &TaskWritePermit,
-        contract: &AgentContract,
-        grant: &ReadGrant,
-        source_refs: Vec<ArtifactRef>,
-        value: &T,
-        now: DateTime<Utc>,
-    ) -> ContextResult<Artifact> {
-        if !grant.matches_permit(permit) || grant.contract_hash != contract.contract_hash {
-            return Err(ContextError::InvalidManifestClosure);
-        }
-        self.validate_persisted_grant(permit, contract, grant, now)?;
-        for source in &source_refs {
-            if !grant.permits(
-                &source.artifact_id,
-                source.kind == ArtifactKind::RawEvidence,
-                now,
-            ) {
-                return Err(ContextError::GrantDenied {
-                    manifest_id: grant.manifest_artifact_id.clone(),
-                    artifact_id: source.artifact_id.clone(),
-                });
-            }
-        }
-        let artifact = Artifact::new(
-            ArtifactKind::ContextRepair,
-            self.store.stage_json(value)?,
-            format!("context.repair.{}", contract.purpose.as_str()),
-            ArtifactLifecycle::RunScoped,
-            ArtifactProvenance {
-                source_family: "akzio.context_repair".to_owned(),
-                observed_at: None,
-                retrieved_at: now,
-                source_uri: None,
-                confidence_ppm: 1_000_000,
-                producer_contract_hash: Some(contract.contract_hash.clone()),
-            },
-            Some(permit.artifact_origin()),
-            source_refs,
-            now,
-        )?;
-        self.store.write_task_artifact(
-            permit,
-            &artifact,
-            LifecycleEventType::ContextRepaired,
-            now,
-        )?;
-        Ok(artifact)
-    }
-
+    // 检查单个 Artifact 是否同时满足 ContextPolicy、内部 producer/kind allowlist 和
+    // 特殊类型规则；RawEvidence 永远不能直接进入 Manifest，ExPost regime 也不能作为
+    // Decision-time Context。该函数只拒绝输入，不修改 Policy 或 Artifact。
     fn assert_context_permitted(
         &self,
         policy: &ContextPolicy,
@@ -88,6 +38,8 @@ impl ContextBroker {
         permit: &TaskWritePermit,
         artifact: &Artifact,
     ) -> ContextResult<()> {
+        // 普通 RunScoped 材料必须属于当前 Run；Lesson/Experience/CandidatePolicy 通过
+        // 独立 overlay 资格，canary 父证据则只能命中 Store 登记的冻结复用关系。
         if artifact.kind == ArtifactKind::NormalizedEvidence
             && self.store.is_canary_parent_evidence(&permit.run_id,&artifact.artifact_id)?
         {
@@ -114,6 +66,8 @@ impl ContextBroker {
     }
 
     fn overlay_is_eligible(&self, artifact: &Artifact) -> ContextResult<bool> {
+        // Lesson 依据 payload/lifecycle 判断；Experience/CandidatePolicy 还要满足记录过的
+        // influence subject、canonical learning 来源和当前 Policy head。这里只读资格，不激活/更新 head。
         match artifact.kind {
             ArtifactKind::Lesson => {
                 let lesson: Lesson = self.read_payload(artifact)?;
@@ -200,6 +154,8 @@ impl ContextBroker {
     }
 
     fn is_canonical_paper_artifact(&self, artifact: &Artifact) -> ContextResult<bool> {
+        // CandidatePolicy/Experience 只能引用 Canonical 且属于 canonical learning Run 的
+        // Artifact；生命周期或 RunPurpose 不符合时直接退出，避免隔离/调试数据进入正式学习。
         if artifact.lifecycle != ArtifactLifecycle::Canonical {
             return Ok(false);
         }
@@ -214,6 +170,8 @@ impl ContextBroker {
     }
 
     fn read_payload<T: DeserializeOwned>(&self, artifact: &Artifact) -> ContextResult<T> {
+        // 所有 typed payload 都从 Artifact 的 CAS blob 解码；本 helper 不授予权限，调用方
+        // 负责先完成 Artifact/Grant 边界校验，serde 错误原样转成 ContextError。
         Ok(serde_json::from_slice(
             &self.store.read_blob(&artifact.blob)?,
         )?)
@@ -224,6 +182,8 @@ impl ContextBroker {
         policy: &ContextPolicy,
         selections: &[ContextSelection],
     ) -> ContextResult<BTreeSet<ArtifactId>> {
+        // 从已选 Artifact 沿 source_refs 做有界去重遍历，只收集符合 source family 的
+        // RawEvidence；allow_raw_reread=false 时返回空集合，普通 Manifest 仍不暴露原文。
         if !policy.allow_raw_reread {
             return Ok(BTreeSet::new());
         }
@@ -238,6 +198,8 @@ impl ContextBroker {
                 continue;
             }
             let artifact = self.store.artifact(&artifact_id)?;
+            // 非 RawEvidence 的来源继续入队，RawEvidence 只记录 ID，不会继续展开其内部
+            // 引用，因此闭包既不重复读取也不跨越原始证据边界。
             for source in artifact.source_refs {
                 let source_artifact = self.store.artifact(&source.artifact_id)?;
                 if source_artifact.kind == ArtifactKind::RawEvidence {
@@ -260,6 +222,8 @@ impl ContextBroker {
 /// Exact internal producer/kind pairs. External evidence retains the contract's
 /// source allowlist and untrusted-content policy; no namespace wildcard grants.
 fn governed_internal_source(artifact: &Artifact) -> bool {
+    // 这里是精确的内部 producer/kind 配对；未知 source family 只允许基础外部证据类型，
+    // 最终仍要经过 ContextPolicy 的 source allowlist 和不可信内容隔离，不能依赖命名空间通配。
     use ArtifactKind::*;
     match artifact.provenance.source_family.as_str() {
         "akzio.ingest" => {
@@ -268,7 +232,7 @@ fn governed_internal_source(artifact: &Artifact) -> bool {
                     artifact.producer.as_str(),
                     "evidence.collection_status"
                         | "canary.evidence_snapshot"
-                        | "evidence.option_projection"
+                        | "evidence.option_projection" | "research.supplement.result"
                 )
         }
         "akzio.agent" => {
@@ -277,6 +241,7 @@ fn governed_internal_source(artifact: &Artifact) -> bool {
                 (Claim, "agent.research.analyst")
                     | (Critique, "agent.research.critic")
                     | (DecisionProposal, "agent.research.synthesizer")
+                    | (ProposalReview, "agent.research.proposal_reviewer")
                     | (RetrospectiveDraft, "agent.learning.outcome_worker")
             ) || (artifact.kind == DeliberationNote
                 && artifact.provenance.producer_contract_hash.is_some()

@@ -411,9 +411,9 @@ impl Store {
         assert_candidate_decision_binding(connection, &candidate_decision, completion)?;
 
         let parent_outcome: Outcome =
-            serde_json::from_slice(&self.read_blob(&parent_outcome_artifact.blob)?)?;
+            serde_json::from_slice(&blob::read_blob_with(connection, &parent_outcome_artifact.blob)?)?;
         let candidate_outcome: Outcome =
-            serde_json::from_slice(&self.read_blob(&candidate_outcome_artifact.blob)?)?;
+            serde_json::from_slice(&blob::read_blob_with(connection, &candidate_outcome_artifact.blob)?)?;
         parent_outcome.validate_sealed()?;
         candidate_outcome.validate_sealed()?;
 
@@ -536,7 +536,7 @@ impl Store {
         }
         assert_artifact_from_allowed_purposes(connection, &verdict_artifact, allowed_purposes)?;
         let verdict: ExecutionVerdict =
-            serde_json::from_slice(&self.read_blob(&verdict_artifact.blob)?)?;
+            serde_json::from_slice(&blob::read_blob_with(connection, &verdict_artifact.blob)?)?;
         verdict.validate()?;
 
         match (&schedule.execution, verdict) {
@@ -578,7 +578,7 @@ impl Store {
                     allowed_purposes,
                 )?;
                 let commitment_payload: PaperCommitment =
-                    serde_json::from_slice(&self.read_blob(&commitment_artifact.blob)?)?;
+                    serde_json::from_slice(&blob::read_blob_with(connection, &commitment_artifact.blob)?)?;
                 commitment_payload.validate()?;
                 if commitment_payload.execution_context != schedule.execution_context
                     || !commitment_artifact
@@ -604,7 +604,7 @@ impl Store {
                     allowed_purposes,
                 )?;
                 let reconciliation_payload: Reconciliation =
-                    serde_json::from_slice(&self.read_blob(&reconciliation_artifact.blob)?)?;
+                    serde_json::from_slice(&blob::read_blob_with(connection, &reconciliation_artifact.blob)?)?;
                 reconciliation_payload.validate()?;
                 if reconciliation_payload.commitment != *commitment
                     || !reconciliation_artifact

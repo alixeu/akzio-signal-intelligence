@@ -41,6 +41,7 @@ impl Store {
                 .collect::<Result<Vec<_>, _>>()?;
             rows
         };
+        for (_, run_id, _, _, _, _) in &expired { assert_workflow_executable(&transaction, run_id)?; }
         for (task_id, run_id, attempt_id, lease_id, epoch, contract_hash) in &expired {
             let permit = TaskWritePermit {
                 run_id: run_id.clone(),

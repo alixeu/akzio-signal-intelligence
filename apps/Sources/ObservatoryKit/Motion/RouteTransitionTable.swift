@@ -18,7 +18,7 @@ public struct RouteTransitionDescriptor: Sendable {
     /// Base response of the route spring; the policy can soften it.
     public let response: Double
     /// Edge the incoming supporting content slides from.
-    /// Human-readable forward choreography, surfaced in the Scenario Gallery.
+    /// Human-readable forward choreography for transition diagnostics.
     public let forwardNote: String
     public let reverseNote: String
 
@@ -51,11 +51,6 @@ public enum RouteTransitionTable {
         table[key(from, to)] ?? crossfade
     }
 
-    /// True when the pair has a registered natural shared element.
-    public static func hasNaturalSharedElement(from: AppRoute, to: AppRoute) -> Bool {
-        table[key(from, to)]?.style == .sharedElement
-    }
-
     static let crossfade = RouteTransitionDescriptor(
         style: .crossfade,
         anchors: [],
@@ -71,7 +66,7 @@ public enum RouteTransitionTable {
             reverseNote: "DAG folds back along the same paths into the Signal Universe; Inspector retracts; the current node returns to centre."
         ),
         key(.overview, .intelligence): RouteTransitionDescriptor(
-            anchors: [.currentNode, .roleCard(.planner), .confidenceRing, .modelName],
+            anchors: [.currentNode, .roleCard(.analyst), .confidenceRing, .modelName],
             response: 0.60,
             forwardNote: "The active agent node leaves its orbit and morphs into a Role Card; other agents become council cards; the Confidence Ring moves into Selected Model Detail.",
             reverseNote: "Role Card contracts back into its orbital slot and the ring returns to the KPI strip."

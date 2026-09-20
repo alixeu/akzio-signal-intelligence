@@ -20,6 +20,9 @@ impl WorkflowRuntime {
             )
         })?;
         match event_type {
+            LifecycleEventType::RunCheckpointSaved => {
+                self.store.validate_checkpoint_event(event)?;
+            }
             LifecycleEventType::WorkflowCreated => {
                 self.reduce_graph_event(run_id, replay, event, true)?
             }
@@ -109,6 +112,7 @@ impl WorkflowRuntime {
                 replay.saw_task_start = true;
             }
             LifecycleEventType::AgentTurnStarted
+            | LifecycleEventType::SupplementalRoundAbandoned
             | LifecycleEventType::TaskRetryExhausted
             | LifecycleEventType::TaskRecoveryExhausted => {
                 let task = Self::replay_task_mut(run_id, replay, event)?;
@@ -173,6 +177,11 @@ impl WorkflowRuntime {
             | LifecycleEventType::SchedulerWorkflowProposalCreated => {
                 self.reduce_session_setup_event(run_id, event)?;
             }
+            LifecycleEventType::DebugControlChanged
+            | LifecycleEventType::DebugBudgetObserved
+            | LifecycleEventType::StageAcceptanceRecorded => {
+                self.reduce_debug_record_event(run_id, replay, event, event_type)?;
+            }
             _ if event.artifact_id.is_some() => {
                 self.reduce_artifact_trace_event(run_id, replay, event)?;
             }
@@ -184,6 +193,148 @@ impl WorkflowRuntime {
             }
         }
         replay.event_cursor = event.cursor;
+        Ok(())
+    }
+
+    /// Debug records describe Rust control and observations, not contract outputs.
+    /// Acceptance also records canonical submission rejections needed by retries;
+    /// unlike debug controls and budgets, it does not require a DebugSession.
+    /// Acceptance may follow a terminal attempt; only budget observations require
+    /// the attempt to still be active at this point in the event stream.
+    fn reduce_debug_record_event(
+        &self,
+        run_id: &RunId,
+        replay: &ReplayedWorkflow,
+        event: &StoredEvent,
+        event_type: LifecycleEventType,
+    ) -> RuntimeResult<()> {
+        use akzio_domain::{DebugSession, DebugSessionIdentity, StageAcceptance};
+
+        let invalid =
+            || Self::replay_error(run_id, format!("invalid {} DebugRecord", event.event_type));
+        let artifact = self
+            .store
+            .artifact(event.artifact_id.as_ref().ok_or_else(invalid)?)?;
+        Self::validate_debug_record_envelope(run_id, event, &artifact)?;
+        let session = self.store.debug_session(run_id)?;
+        let expected_refs: BTreeSet<ArtifactRef> = match (event_type, artifact.producer.as_str()) {
+            (LifecycleEventType::DebugControlChanged, "debug.session_identity") => {
+                let session = session.as_ref().ok_or_else(invalid)?;
+                if event.task_id.is_some() || event.attempt_id.is_some() {
+                    return Err(invalid());
+                }
+                let identity: DebugSessionIdentity =
+                    serde_json::from_slice(&self.store.read_blob(&artifact.blob)?)?;
+                if identity != session.identity || identity.created_at != event.created_at {
+                    return Err(invalid());
+                }
+                identity
+                    .dataset
+                    .into_iter()
+                    .chain(identity.parent_artifacts)
+                    .collect()
+            }
+            (LifecycleEventType::DebugControlChanged, "debug.control") => {
+                let session = session.as_ref().ok_or_else(invalid)?;
+                if event.task_id.is_some() || event.attempt_id.is_some() {
+                    return Err(invalid());
+                }
+                let control: DebugSession =
+                    serde_json::from_slice(&self.store.read_blob(&artifact.blob)?)?;
+                if control.identity != session.identity
+                    || control.revision == 0
+                    || control.revision > session.revision
+                    || control.updated_at != event.created_at
+                    || control
+                        .permitted_task_id
+                        .iter()
+                        .chain(control.paused_at_task_id.iter())
+                        .any(|task| !replay.tasks.contains_key(task))
+                {
+                    return Err(invalid());
+                }
+                BTreeSet::new()
+            }
+            (LifecycleEventType::DebugBudgetObserved, "debug.budget_snapshot") => {
+                session.as_ref().ok_or_else(invalid)?;
+                let task_id = event.task_id.as_ref().ok_or_else(invalid)?;
+                let task = replay.tasks.get(task_id).ok_or_else(invalid)?;
+                Self::assert_active_attempt(run_id, task, event)?;
+                let _: serde_json::Value =
+                    serde_json::from_slice(&self.store.read_blob(&artifact.blob)?)?;
+                BTreeSet::new()
+            }
+            (LifecycleEventType::StageAcceptanceRecorded, "debug.stage_acceptance") => {
+                let acceptance: StageAcceptance =
+                    serde_json::from_slice(&self.store.read_blob(&artifact.blob)?)?;
+                if acceptance.version != 1
+                    || acceptance.stage.is_empty()
+                    || acceptance
+                        .checks
+                        .iter()
+                        .any(|check| check.check_id.is_empty())
+                    || acceptance.run_id != *run_id
+                    || event.task_id.as_ref() != Some(&acceptance.task_id)
+                    || event.attempt_id.as_ref() != Some(&acceptance.attempt_id)
+                    || acceptance.created_at != event.created_at
+                    || !replay.tasks.contains_key(&acceptance.task_id)
+                    || !self
+                        .store
+                        .attempt_events(run_id, &acceptance.task_id, &acceptance.attempt_id)?
+                        .iter()
+                        .any(|prior| {
+                            prior.cursor < event.cursor
+                                && prior.event_type == LifecycleEventType::TaskStarted.as_str()
+                        })
+                {
+                    return Err(invalid());
+                }
+                acceptance
+                    .checks
+                    .into_iter()
+                    .flat_map(|check| check.evidence_refs)
+                    .collect()
+            }
+            _ => return Err(invalid()),
+        };
+        if artifact
+            .source_refs
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            != expected_refs
+        {
+            return Err(invalid());
+        }
+        for reference in &artifact.source_refs {
+            if self.store.artifact(&reference.artifact_id)?.kind != reference.kind {
+                return Err(invalid());
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_debug_record_envelope(
+        run_id: &RunId,
+        event: &StoredEvent,
+        artifact: &Artifact,
+    ) -> RuntimeResult<()> {
+        artifact.validate()?;
+        if artifact.kind != ArtifactKind::DebugRecord
+            || artifact.lifecycle != ArtifactLifecycle::RunScoped
+            || artifact.provenance.source_family != "akzio.debug"
+            || artifact.provenance.producer_contract_hash.is_some()
+            || artifact.created_at != event.created_at
+            || artifact.origin.as_ref()
+                != Some(&ArtifactOrigin {
+                    run_id: Some(run_id.clone()),
+                    task_id: event.task_id.clone(),
+                    attempt_id: event.attempt_id.clone(),
+                    contract_hash: None,
+                })
+        {
+            return Err(Self::replay_error(run_id, "invalid DebugRecord envelope"));
+        }
         Ok(())
     }
 
@@ -322,5 +473,70 @@ impl WorkflowRuntime {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_record_envelope_rejects_foreign_origin_and_source() {
+        let run_id = RunId::new();
+        let now = Utc::now();
+        let make = |origin_run: RunId, source: &str| {
+            Artifact::new(
+                ArtifactKind::DebugRecord,
+                akzio_domain::BlobRef {
+                    hash: ContentHash::of_bytes(b"{}"),
+                    media_type: "application/json".into(),
+                    bytes: 2,
+                },
+                "debug.control",
+                ArtifactLifecycle::RunScoped,
+                ArtifactProvenance {
+                    source_family: source.into(),
+                    observed_at: None,
+                    retrieved_at: now,
+                    source_uri: None,
+                    confidence_ppm: 1_000_000,
+                    producer_contract_hash: None,
+                },
+                Some(ArtifactOrigin {
+                    run_id: Some(origin_run),
+                    task_id: None,
+                    attempt_id: None,
+                    contract_hash: None,
+                }),
+                vec![],
+                now,
+            )
+            .unwrap()
+        };
+        let valid = make(run_id.clone(), "akzio.debug");
+        let event = StoredEvent {
+            cursor: 1,
+            run_id: run_id.clone(),
+            task_id: None,
+            attempt_id: None,
+            event_type: LifecycleEventType::DebugControlChanged.as_str().into(),
+            artifact_id: Some(valid.artifact_id.clone()),
+            created_at: now,
+        };
+        WorkflowRuntime::validate_debug_record_envelope(&run_id, &event, &valid).unwrap();
+        for invalid in [
+            make(RunId::new(), "akzio.debug"),
+            make(run_id.clone(), "model"),
+        ] {
+            assert!(matches!(
+                WorkflowRuntime::validate_debug_record_envelope(&run_id, &event, &invalid),
+                Err(RuntimeError::ReplayDiverged { .. })
+            ));
+        }
+        let mut wrong_event = event;
+        wrong_event.task_id = Some(TaskId::new());
+        assert!(
+            WorkflowRuntime::validate_debug_record_envelope(&run_id, &wrong_event, &valid).is_err()
+        );
     }
 }

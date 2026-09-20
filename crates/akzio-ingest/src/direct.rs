@@ -81,6 +81,7 @@ impl SecEdgarDirectTransport {
             ));
         }
         let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .http1_only()
             .timeout(Duration::from_secs(20))
             .build()
@@ -248,6 +249,7 @@ impl FredDirectTransport {
             ));
         }
         let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .http1_only()
             .timeout(Duration::from_secs(20))
             .build()
@@ -503,12 +505,66 @@ mod tests {
     use akzio_domain::EvidenceAcquisitionMode;
     use chrono::NaiveDate;
 
+    async fn assert_direct_client_rejects_redirect(client: Client) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = requests.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                assert!(
+                    stream.read(&mut request).await.unwrap() > 0,
+                    "request closed before headers"
+                );
+                let index = observed.fetch_add(1, Ordering::SeqCst);
+                let response = if index == 0 {
+                    format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{address}/untrusted-source\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_owned()
+                };
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        // The unchanged production client handles this loopback request; no
+        // real provider host, environment credentials, or replacement client.
+        let response = client
+            .get(format!("http://{address}/official-source"))
+            .send()
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "unverified redirect target was fetched"
+        );
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        assert!(crate::runtime::classify_evidence_response(&response).is_err());
+    }
+
+    #[tokio::test]
+    async fn production_sec_client_rejects_redirect() {
+        let transport =
+            SecEdgarDirectTransport::new("Akzio offline test test@example.invalid").unwrap();
+        assert_direct_client_rejects_redirect(transport.client).await;
+    }
+
+    #[tokio::test]
+    async fn production_fred_client_rejects_redirect() {
+        let transport = FredDirectTransport::new("offline-fixture-key").unwrap();
+        assert_direct_client_rejects_redirect(transport.client).await;
+    }
+
     #[test]
     fn fred_observation_request_preserves_window_and_vintage() {
-        let (request, public, kind) = FredDirectTransport::request_for(
-            "series:DFII10:2026-09-01:2026-09-15:2026-08-31",
-        )
-        .expect("valid FRED series resource");
+        let (request, public, kind) =
+            FredDirectTransport::request_for("series:DFII10:2026-09-01:2026-09-15:2026-08-31")
+                .expect("valid FRED series resource");
 
         assert_eq!(kind, FredPayloadKind::Observations);
         assert_eq!(public.scheme(), "https");
@@ -517,8 +573,13 @@ mod tests {
         assert!(!public.query().unwrap_or_default().contains("api_key"));
         assert_eq!(request, public);
 
-        let query = public.query_pairs().collect::<std::collections::BTreeMap<_, _>>();
-        assert_eq!(query.get("series_id").map(|value| value.as_ref()), Some("DFII10"));
+        let query = public
+            .query_pairs()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            query.get("series_id").map(|value| value.as_ref()),
+            Some("DFII10")
+        );
         assert_eq!(
             query.get("observation_start").map(|value| value.as_ref()),
             Some("2026-09-01")
@@ -527,7 +588,10 @@ mod tests {
             query.get("observation_end").map(|value| value.as_ref()),
             Some("2026-09-15")
         );
-        assert_eq!(query.get("file_type").map(|value| value.as_ref()), Some("json"));
+        assert_eq!(
+            query.get("file_type").map(|value| value.as_ref()),
+            Some("json")
+        );
         assert_eq!(
             query.get("realtime_start").map(|value| value.as_ref()),
             Some("2026-08-31")
@@ -540,16 +604,20 @@ mod tests {
 
     #[test]
     fn fred_release_calendar_request_uses_bounded_dates_endpoint() {
-        let (request, public, kind) = FredDirectTransport::request_for(
-            "release_calendar:2026-09-16:2026-10-30:2026-09-15",
-        )
-        .expect("valid FRED release-calendar resource");
+        let (request, public, kind) =
+            FredDirectTransport::request_for("release_calendar:2026-09-16:2026-10-30:2026-09-15")
+                .expect("valid FRED release-calendar resource");
 
         assert_eq!(kind, FredPayloadKind::ReleaseCalendar);
         assert_eq!(request, public);
         assert_eq!(public.path(), "/fred/releases/dates");
-        let query = public.query_pairs().collect::<std::collections::BTreeMap<_, _>>();
-        assert_eq!(query.get("file_type").map(|value| value.as_ref()), Some("json"));
+        let query = public
+            .query_pairs()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            query.get("file_type").map(|value| value.as_ref()),
+            Some("json")
+        );
         assert_eq!(
             query
                 .get("include_release_dates_with_no_data")
@@ -561,7 +629,10 @@ mod tests {
             query.get("order_by").map(|value| value.as_ref()),
             Some("release_date")
         );
-        assert_eq!(query.get("sort_order").map(|value| value.as_ref()), Some("desc"));
+        assert_eq!(
+            query.get("sort_order").map(|value| value.as_ref()),
+            Some("desc")
+        );
         assert_eq!(
             query.get("realtime_start").map(|value| value.as_ref()),
             Some("2026-09-15")

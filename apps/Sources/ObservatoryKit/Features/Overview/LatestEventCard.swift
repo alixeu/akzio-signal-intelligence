@@ -10,6 +10,7 @@ struct LatestEventCard: View {
     @Environment(\.motionPolicy) private var policy
     @Environment(\.appLanguage) private var language
     @State private var pulseTick = 0
+    @State private var expanded = false
 
     private var latest: EventPresentation? { events.first }
 
@@ -29,7 +30,7 @@ struct LatestEventCard: View {
                     if events.count > 1 {
                         HairlineDivider()
                         VStack(alignment: .leading, spacing: 5) {
-                            ForEach(Array(events.dropFirst().enumerated()), id: \.element.id) { index, event in
+                            ForEach(Array(events.dropFirst().prefix(4).enumerated()), id: \.element.id) { index, event in
                                 HStack(spacing: AkzioLayout.s2) {
                                     Circle()
                                         .fill(event.severity.tone.color.opacity(0.7))
@@ -42,6 +43,21 @@ struct LatestEventCard: View {
                             }
                         }
                     }
+                }
+                if events.count > 5 {
+                    DisclosureGroup("更多事件（\(events.count - 5)）", isExpanded: $expanded) {
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: 10) {
+                                ForEach(Array(events.dropFirst(5))) { event in
+                                    HStack(alignment: .top) {
+                                        Text(L10n.text(event.title, language: language)).akzioText(.bodySmall)
+                                        Spacer(minLength: 4)
+                                        Text(event.relativeLabel).akzioMono(11)
+                                    }
+                                }
+                            }.padding(.vertical, 8)
+                        }.frame(height: 160)
+                    }.font(.callout)
                 }
             } else {
                 StatusExplanation(.queued, detail: "No events recorded for this run yet")

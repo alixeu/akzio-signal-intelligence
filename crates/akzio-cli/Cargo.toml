@@ -18,6 +18,7 @@ akzio-execution = { path = "../akzio-execution" }
 akzio-ingest = { path = "../akzio-ingest" }
 akzio-learning = { path = "../akzio-learning" }
 akzio-model = { path = "../akzio-model" }
+akzio-research = { path = "../akzio-research" }
 akzio-store = { path = "../akzio-store" }
 anyhow.workspace = true
 chrono.workspace = true

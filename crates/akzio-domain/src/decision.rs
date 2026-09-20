@@ -672,6 +672,21 @@ impl Forecast {
     pub fn is_neutral(&self) -> bool {
         self.expected_return_ppm == 0 && self.positive_return_probability_ppm == 500_000
     }
+
+    /// Bind a directional forecast to a claim about the same direction.
+    /// Expected return determines direction; probability breaks only a zero-return
+    /// tie, since skewed distributions can have different mean and median signs.
+    pub fn supported_by_stance(&self, stance: crate::ClaimStance) -> bool {
+        let direction = self
+            .expected_return_ppm
+            .cmp(&0)
+            .then_with(|| self.positive_return_probability_ppm.cmp(&500_000));
+        matches!(
+            (direction, stance),
+            (std::cmp::Ordering::Greater, crate::ClaimStance::Bullish)
+                | (std::cmp::Ordering::Less, crate::ClaimStance::Bearish)
+        )
+    }
 }
 
 /// One asset-level research intention emitted by the synthesizer. This is a
@@ -897,6 +912,8 @@ impl ResearchPlanReview {
 /// grant, permit, endpoint, order, or free-form execution authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecisionDraft {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub numeric_basis: Vec<crate::NumericEstimateBasis>,
     pub summary: String,
     pub confidence_ppm: u32,
     pub forecasts: Vec<Forecast>,
@@ -996,6 +1013,10 @@ impl DecisionDraft {
         })
     }
 }
+
+/// First canonical contract with direction-bound forecasts and optional cash.
+/// Older proposals must not be reinterpreted under this validation contract.
+pub const DIRECTION_BOUND_RESEARCH_CONTRACT_VERSION: u32 = 47;
 
 pub fn validate_decision_evidence_sufficiency(
     draft: &DecisionDraft,
@@ -1157,7 +1178,7 @@ fn validate_forecasts(forecasts: &[Forecast]) -> Result<(), DomainError> {
 
 /// Research coverage policy v2: missing and unverified slots remain neutral.
 /// Portfolio-level blockers are evaluated separately by the execution policy.
-pub fn validate_verified_forecast_slots(
+pub fn validate_legacy_verified_forecast_slots(
     draft: &DecisionDraft,
     claims: &[(ArtifactRef, ResearchClaim)],
     critiques: &[crate::ResearchCritique],
@@ -1167,6 +1188,7 @@ pub fn validate_verified_forecast_slots(
             .iter()
             .filter(|(reference, claim)| {
                 claim.horizon == forecast.horizon
+                    && forecast.supported_by_stance(claim.stance)
                     && critiques.iter().any(|critique| {
                         critique.target == *reference
                             && !critique.blocks_slot(
@@ -1185,6 +1207,114 @@ pub fn validate_verified_forecast_slots(
             .forecasts
             .retain(|f| f.asset == forecast.asset && f.horizon == forecast.horizon);
         validate_decision_evidence_sufficiency(&scoped, &verified)?;
+    }
+    Ok(())
+}
+
+/// First contract binding each slot to one complete Claim and its own Critique.
+pub const STRUCTURED_RESEARCH_CONTRACT_VERSION: u32 = 57;
+
+/// The authoritative eligibility predicate shared by Context and both Rust gates.
+/// Deliberation and additional Critic evidence never supply a missing Claim ground.
+pub fn claim_slot_eligible(
+    reference: &ArtifactRef,
+    claim: &ResearchClaim,
+    critiques: &[crate::ResearchCritique],
+    asset: Asset,
+    horizon: DecisionHorizon,
+) -> bool {
+    if claim.horizon != horizon
+        || claim.validate().is_err()
+        || claim.stance == crate::ClaimStance::Neutral
+        || claim
+            .evidence_gaps
+            .iter()
+            .any(|g| g.blocks_slot(asset, horizon, claim.horizon))
+    {
+        return false;
+    }
+    critiques.iter().any(|critique| {
+        critique.target == *reference
+            && critique.validate().is_ok()
+            && critique.verification_status == crate::ClaimVerificationStatus::Supported
+            && !critique.blocks_slot(asset, horizon, claim.horizon)
+            && [ResearchShard::PriceMarketStructure, ResearchShard::Macro]
+                .into_iter()
+                .all(|domain| {
+                    claim.grounds.iter().any(|ground| {
+                        ground.role == EvidenceGroundRole::Directional
+                            && ground.domain == Some(domain)
+                            && ground.assets.contains(&asset)
+                            && critique.grounds.iter().any(|reviewed| {
+                                reviewed.evidence == ground.evidence
+                                    && reviewed.role == ground.role
+                                    && reviewed.domain == ground.domain
+                                    && reviewed.assets.contains(&asset)
+                            })
+                            && critique.supporting_refs.iter().any(|verified| {
+                                verified.evidence == ground.evidence
+                                    && verified.is_current_authoritative()
+                            })
+                    })
+                })
+    })
+}
+
+pub fn validate_verified_forecast_slots(
+    draft: &DecisionDraft,
+    claims: &[(ArtifactRef, ResearchClaim)],
+    critiques: &[crate::ResearchCritique],
+) -> Result<(), DomainError> {
+    for forecast in draft.forecasts.iter().filter(|f| !f.is_neutral()) {
+        if !claims.iter().any(|(reference, claim)| {
+            draft.claims.contains(reference)
+                && forecast.supported_by_stance(claim.stance)
+                && claim_slot_eligible(
+                    reference,
+                    claim,
+                    critiques,
+                    forecast.asset,
+                    forecast.horizon,
+                )
+        }) {
+            return Err(DomainError::InsufficientDecisionEvidence);
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_structured_allocation_eligibility(
+    proposal: &DecisionDraft,
+    claims: &[(ArtifactRef, ResearchClaim)],
+    critiques: &[crate::ResearchCritique],
+) -> Result<(), DomainError> {
+    for allocation in proposal
+        .research_allocation
+        .iter()
+        .flat_map(|plan| &plan.allocations)
+        .filter(|row| row.target_weight_ppm.0 > 0)
+    {
+        let eligible = allocation.supporting_horizons.iter().any(|horizon| {
+            proposal.forecasts.iter().any(|f| {
+                f.asset == allocation.asset && f.horizon == *horizon && f.expected_return_ppm > 0
+            }) && claims.iter().any(|(reference, claim)| {
+                claim.stance == crate::ClaimStance::Bullish
+                    && claim_slot_eligible(reference, claim, critiques, allocation.asset, *horizon)
+                    && allocation.evidence_refs.iter().any(|cited| {
+                        cited == reference
+                            || claim.grounds.iter().any(|g| {
+                                g.assets.contains(&allocation.asset) && g.evidence == *cited
+                            })
+                            || critiques.iter().enumerate().any(|(index, c)| {
+                                c.target == *reference
+                                    && proposal.critiques.get(index) == Some(cited)
+                            })
+                    })
+            })
+        });
+        if !eligible {
+            return Err(DomainError::InsufficientDecisionEvidence);
+        }
     }
     Ok(())
 }
@@ -1312,8 +1442,7 @@ mod scoped_blocker_tests {
         }
     }
 
-    #[test]
-    fn scoped_critique_blocker_does_not_block_another_asset_slot() {
+    fn scoped_fixture() -> (DecisionDraft, ResearchClaim, ResearchCritique) {
         let claim_ref = ArtifactRef {
             artifact_id: ArtifactId(ContentHash::of_bytes(b"claim")),
             kind: ArtifactKind::Claim,
@@ -1336,7 +1465,6 @@ mod scoped_blocker_tests {
                 ResearchShard::NewsEvent,
             ));
         }
-        let critique_ground = grounds[0].clone();
         let claim = ResearchClaim {
             schema_version: DOMAIN_SCHEMA_VERSION,
             topic: "T1 multi-asset claim".to_owned(),
@@ -1347,12 +1475,14 @@ mod scoped_blocker_tests {
             confidence_ppm: 800_000,
             grounds: grounds.clone(),
             evidence_gaps: vec![EvidenceGap {
+                supplemental_requests: Vec::new(),
                 topic: "TQQQ news unavailable".to_owned(),
                 rationale: "Only TQQQ lacks its T1 news domain".to_owned(),
                 impact: EvidenceGapImpact::BlocksDirectionalForecast,
                 assets: BTreeSet::from([Asset::Tqqq]),
                 horizons: BTreeSet::from([DecisionHorizon::T1]),
                 supplemental_needs: Vec::new(),
+                retriable: false,
             }],
         };
         let critique = ResearchCritique {
@@ -1362,14 +1492,17 @@ mod scoped_blocker_tests {
             severity: CritiqueSeverity::Low,
             blocker: true,
             rationale: "The blocker is scoped to TQQQ only".to_owned(),
-            grounds: vec![critique_ground.clone()],
+            grounds: grounds.clone(),
             evidence_gaps: claim.evidence_gaps.clone(),
             verification_status: ClaimVerificationStatus::Supported,
-            supporting_refs: vec![ClaimVerificationEvidence {
-                evidence: critique_ground.evidence.clone(),
-                authority: SourceAuthority::Official,
-                temporal_validity: TemporalValidity::ValidAtDecisionCutoff,
-            }],
+            supporting_refs: grounds
+                .iter()
+                .map(|ground| ClaimVerificationEvidence {
+                    evidence: ground.evidence.clone(),
+                    authority: SourceAuthority::Official,
+                    temporal_validity: TemporalValidity::ValidAtDecisionCutoff,
+                })
+                .collect(),
             conflicting_refs: Vec::new(),
         };
         let forecast = Forecast {
@@ -1385,6 +1518,7 @@ mod scoped_blocker_tests {
             }),
         };
         let draft = DecisionDraft {
+            numeric_basis: Vec::new(),
             summary: "scoped blocker regression".to_owned(),
             confidence_ppm: 800_000,
             forecasts: vec![forecast],
@@ -1401,6 +1535,228 @@ mod scoped_blocker_tests {
             applied_learning_refs: Vec::new(),
             rejected_learning_refs: Vec::new(),
         };
+        (draft, claim, critique)
+    }
+
+    #[test]
+    fn nonzero_allocation_must_cite_its_eligible_asset_claim() {
+        let (mut draft, claim, critique) = scoped_fixture();
+        draft.research_allocation = Some(ResearchAllocationPlan {
+            allocations: Asset::EXECUTABLE
+                .into_iter()
+                .map(|asset| ResearchAssetAllocation {
+                    asset,
+                    target_weight_ppm: WeightPpm(if asset == Asset::Qqq { 100_000 } else { 0 }),
+                    supporting_horizons: if asset == Asset::Qqq {
+                        vec![DecisionHorizon::T1]
+                    } else {
+                        vec![]
+                    },
+                    evidence_refs: if asset == Asset::Qqq {
+                        vec![draft.claims[0].clone()]
+                    } else {
+                        vec![]
+                    },
+                    rationale: "scoped allocation regression".into(),
+                    abstention_reason: (asset != Asset::Qqq).then(|| "no allocation".into()),
+                })
+                .collect(),
+            cash_weight_ppm: WeightPpm(900_000),
+        });
+        let claims = [(draft.claims[0].clone(), claim.clone())];
+        assert!(validate_structured_allocation_eligibility(
+            &draft,
+            &claims,
+            std::slice::from_ref(&critique)
+        )
+        .is_ok());
+        let unrelated = claim
+            .grounds
+            .iter()
+            .find(|g| g.assets.contains(&Asset::Tqqq))
+            .unwrap()
+            .evidence
+            .clone();
+        draft
+            .research_allocation
+            .as_mut()
+            .unwrap()
+            .allocations
+            .iter_mut()
+            .find(|a| a.asset == Asset::Qqq)
+            .unwrap()
+            .evidence_refs = vec![unrelated];
+        assert!(validate_structured_allocation_eligibility(&draft, &claims, &[critique]).is_err());
+    }
+
+    #[test]
+    fn unrelated_claim_gap_cannot_poison_a_verified_slot() {
+        let (draft, claim, critique) = scoped_fixture();
+        let mut unrelated = claim.clone();
+        unrelated
+            .grounds
+            .retain(|g| g.assets.contains(&Asset::Tqqq));
+        unrelated.evidence_gaps[0].assets.clear();
+        let unrelated_ref = ArtifactRef {
+            artifact_id: ArtifactId(ContentHash::of_bytes(b"unrelated")),
+            kind: ArtifactKind::Claim,
+        };
+        assert!(validate_verified_forecast_slots(
+            &draft,
+            &[(draft.claims[0].clone(), claim), (unrelated_ref, unrelated)],
+            &[critique]
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn unavailable_news_warning_preserves_verified_price_and_macro_direction() {
+        let (draft, mut claim, mut critique) = scoped_fixture();
+        claim
+            .grounds
+            .retain(|g| g.domain != Some(ResearchShard::NewsEvent));
+        claim.evidence_gaps[0].impact = EvidenceGapImpact::Warning;
+        claim.evidence_gaps[0].assets = BTreeSet::from(Asset::EXECUTABLE);
+        critique.grounds = claim.grounds.clone();
+        critique.evidence_gaps = claim.evidence_gaps.clone();
+        critique.blocker = false;
+        critique
+            .supporting_refs
+            .retain(|r| claim.grounds.iter().any(|g| g.evidence == r.evidence));
+        assert!(claim_slot_eligible(
+            &draft.claims[0],
+            &claim,
+            std::slice::from_ref(&critique),
+            Asset::Qqq,
+            DecisionHorizon::T1
+        ));
+        validate_verified_forecast_slots(&draft, &[(draft.claims[0].clone(), claim)], &[critique])
+            .unwrap();
+    }
+
+    #[test]
+    fn eligibility_uses_formal_grounds_and_matching_verified_scope_only() {
+        let (draft, mut claim, mut critique) = scoped_fixture();
+        let reference = &draft.claims[0];
+        assert!(claim_slot_eligible(
+            reference,
+            &claim,
+            &[critique.clone()],
+            Asset::Qqq,
+            DecisionHorizon::T1
+        ));
+        assert!(!claim_slot_eligible(
+            reference,
+            &claim,
+            &[critique.clone()],
+            Asset::Qqq,
+            DecisionHorizon::T3
+        ));
+        assert!(!claim_slot_eligible(
+            reference,
+            &claim,
+            &[critique.clone()],
+            Asset::Soxl,
+            DecisionHorizon::T1
+        ));
+        claim
+            .grounds
+            .retain(|g| g.domain != Some(ResearchShard::Macro));
+        assert!(
+            !claim_slot_eligible(
+                reference,
+                &claim,
+                &[critique.clone()],
+                Asset::Qqq,
+                DecisionHorizon::T1
+            ),
+            "Critic macro cannot repair missing formal Claim macro"
+        );
+        let (_, claim, _) = scoped_fixture();
+        critique.supporting_refs.retain(|r| {
+            !claim
+                .grounds
+                .iter()
+                .any(|g| g.evidence == r.evidence && g.domain == Some(ResearchShard::Macro))
+        });
+        assert!(
+            !claim_slot_eligible(
+                reference,
+                &claim,
+                &[critique],
+                Asset::Qqq,
+                DecisionHorizon::T1
+            ),
+            "price verification alone cannot verify macro"
+        );
+        let mut neutral = draft.clone();
+        neutral.forecasts[0].expected_return_ppm = 0;
+        neutral.forecasts[0].positive_return_probability_ppm = 500_000;
+        assert!(validate_verified_forecast_slots(&neutral, &[], &[]).is_ok());
+    }
+
+    #[test]
+    fn forecast_grid_rejects_duplicates_even_when_length_is_twelve() {
+        let (draft, _, _) = scoped_fixture();
+        let forecasts = Asset::EXECUTABLE
+            .into_iter()
+            .flat_map(|asset| {
+                let template = draft.forecasts[0].clone();
+                DecisionHorizon::ALL.into_iter().map(move |horizon| {
+                    let mut forecast = template.clone();
+                    forecast.asset = asset;
+                    forecast.horizon = horizon;
+                    forecast
+                        .thesis
+                        .as_mut()
+                        .unwrap()
+                        .expected_holding_period_days = horizon.trading_days();
+                    forecast
+                })
+            })
+            .collect::<Vec<_>>();
+        assert!(validate_forecasts(&forecasts).is_ok());
+        let mut duplicate = forecasts.clone();
+        duplicate[11] = forecasts[0].clone();
+        assert!(validate_forecasts(&duplicate).is_err());
+        assert!(validate_forecasts(&forecasts[..11]).is_err());
+    }
+
+    #[test]
+    fn forecast_must_not_join_price_and_macro_from_different_claims() {
+        let (draft, mut price, mut critique) = scoped_fixture();
+        price.evidence_gaps.clear();
+        price
+            .grounds
+            .retain(|g| g.domain == Some(ResearchShard::PriceMarketStructure));
+        critique.blocker = false;
+        critique.evidence_gaps.clear();
+        let mut macro_claim = price.clone();
+        macro_claim.grounds = vec![directional_ground(
+            "macro-only",
+            Asset::Qqq,
+            ResearchShard::Macro,
+        )];
+        let macro_ref = ArtifactRef {
+            artifact_id: ArtifactId(ContentHash::of_bytes(b"macro-claim")),
+            kind: ArtifactKind::Claim,
+        };
+        let mut macro_critique = critique.clone();
+        macro_critique.target = macro_ref.clone();
+        assert!(
+            validate_verified_forecast_slots(
+                &draft,
+                &[(draft.claims[0].clone(), price), (macro_ref, macro_claim)],
+                &[critique, macro_critique],
+            )
+            .is_err(),
+            "a forecast must have price and macro in the same verified Claim"
+        );
+    }
+
+    #[test]
+    fn scoped_critique_blocker_does_not_block_another_asset_slot() {
+        let (draft, claim, critique) = scoped_fixture();
         assert!(critique.blocks_slot(Asset::Tqqq, DecisionHorizon::T1, DecisionHorizon::T1));
         assert!(!critique.blocks_slot(Asset::Qqq, DecisionHorizon::T1, DecisionHorizon::T1));
         let mut global_critique = critique.clone();
@@ -1417,5 +1773,42 @@ mod scoped_blocker_tests {
             result.is_ok(),
             "a blocker scoped to TQQQ must not reject the fully grounded QQQ slot: {result:?}"
         );
+    }
+
+    #[test]
+    fn verified_forecast_rejects_opposite_or_neutral_claim_stance() {
+        let (draft, mut claim, critique) = scoped_fixture();
+        for stance in [ClaimStance::Bearish, ClaimStance::Neutral] {
+            claim.stance = stance;
+            assert!(
+                validate_verified_forecast_slots(
+                    &draft,
+                    &[(draft.claims[0].clone(), claim.clone())],
+                    std::slice::from_ref(&critique),
+                )
+                .is_err(),
+                "a {stance:?} claim cannot support the positive QQQ:T1 forecast"
+            );
+        }
+        let mut bearish_draft = draft.clone();
+        bearish_draft.forecasts[0].expected_return_ppm = -10_000;
+        bearish_draft.forecasts[0].positive_return_probability_ppm = 300_000;
+        claim.stance = ClaimStance::Bearish;
+        assert!(
+            validate_verified_forecast_slots(
+                &bearish_draft,
+                &[(draft.claims[0].clone(), claim.clone())],
+                std::slice::from_ref(&critique),
+            )
+            .is_ok(),
+            "matching bearish research remains expressible"
+        );
+        claim.stance = ClaimStance::Bullish;
+        assert!(validate_verified_forecast_slots(
+            &bearish_draft,
+            &[(draft.claims[0].clone(), claim)],
+            &[critique],
+        )
+        .is_err());
     }
 }

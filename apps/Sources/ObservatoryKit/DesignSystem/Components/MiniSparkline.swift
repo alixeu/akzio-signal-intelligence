@@ -26,6 +26,7 @@ public struct MiniSparkline: View {
     }
 
     public var body: some View {
+        // GeometryReader 给出当前卡片尺寸；所有点先归一化，再按同一组 points 生成填充、折线和最新点。
         GeometryReader { proxy in
             let points = normalizedPoints(in: proxy.size)
             ZStack {
@@ -55,6 +56,7 @@ public struct MiniSparkline: View {
     }
 
     private func normalizedPoints(in size: CGSize) -> [CGPoint] {
+        // 少于两个值无法形成线段；span 加最小值避免全相等数据除零，并保持点的原始顺序。
         guard values.count > 1 else { return [] }
         let minValue = values.min() ?? 0
         let maxValue = values.max() ?? 1
@@ -71,6 +73,7 @@ public struct MiniSparkline: View {
 
     private func linePath(_ points: [CGPoint]) -> Path {
         Path { path in
+            // Path 闭包内部只是消费已计算点，不修改源数组；空数组直接得到空路径。
             guard let first = points.first else { return }
             path.move(to: first)
             for point in points.dropFirst() {
@@ -81,6 +84,7 @@ public struct MiniSparkline: View {
 
     private func fillPath(_ points: [CGPoint], in size: CGSize) -> Path {
         Path { path in
+            // 填充路径从底边起步并在最后闭合，视觉上不会改变折线的上边界。
             guard let first = points.first, let last = points.last else { return }
             path.move(to: CGPoint(x: first.x, y: size.height))
             path.addLine(to: first)
@@ -110,6 +114,7 @@ public struct SegmentedProgressBar: View {
     }
 
     public var body: some View {
+        // total 为 0 时仍保留一个空段，避免 Range(0..<0) 让进度条从布局中消失；completed 只控制已完成段。
         HStack(spacing: 3) {
             ForEach(0..<max(total, 1), id: \.self) { index in
                 RoundedRectangle(cornerRadius: 2, style: .continuous)
@@ -137,6 +142,7 @@ public struct RatioBar: View {
     }
 
     public var body: some View {
+        // fraction 缺失表示未知而非 0%，因此只画空轨道；有值时先夹紧再计算填充宽度。
         GeometryReader { proxy in
             ZStack(alignment: .leading) {
                 Capsule().fill(Color.white.opacity(0.07))

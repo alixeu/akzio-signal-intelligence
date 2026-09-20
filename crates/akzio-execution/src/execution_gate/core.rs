@@ -86,11 +86,8 @@ impl ExecutionRuntime {
         }
 
         let account = self.load_account(input, &mut blockers)?;
-        let quotes = self.load_quotes(
-            input,
-            &mut blockers,
-            input.quote_validation_error.is_some(),
-        )?;
+        let quotes =
+            self.load_quotes(input, &mut blockers, input.quote_validation_error.is_some())?;
         if input.quote_validation_error.is_some() {
             blockers.insert(HardBlocker::InvalidQuote);
         }
@@ -147,6 +144,18 @@ impl ExecutionRuntime {
             match allocation {
                 Ok(plan) => {
                     plan.validate()?;
+                    if clock_payload.trading_session() == akzio_domain::TradingSession::Overnight {
+                        if !matches!(quote_payload.feed.as_deref(), Some("boats" | "overnight")) {
+                            blockers.insert(HardBlocker::InvalidQuote);
+                        }
+                        if clock_payload.session.as_ref().is_none_or(|session| {
+                            plan.orders
+                                .iter()
+                                .any(|order| !session.overnight_assets.contains(&order.asset))
+                        }) {
+                            blockers.insert(HardBlocker::MarketClosed);
+                        }
+                    }
                     blockers.extend(
                         self.gate_policy
                             .blockers_for(&plan.factor_exposure, plan.turnover_ppm),

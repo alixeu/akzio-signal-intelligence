@@ -165,7 +165,7 @@ impl Store {
                           t.parent_task_id, t.input_artifacts_json, t.status, t.ready_at,
                           t.lease_id, t.lease_epoch, t.active_attempt_id, t.lease_until,
                           t.worker_id, t.finished_at,
-                          (SELECT COUNT(*) FROM rebuild_attempts AS a WHERE a.task_id = t.task_id)
+                          (SELECT COUNT(*) FROM rebuild_attempts AS a WHERE a.task_id = t.task_id), t.node_spec_json
                    FROM rebuild_tasks AS t
                    WHERE t.run_id = ?1 ORDER BY t.task_id ASC"#,
             )?
@@ -331,7 +331,7 @@ impl Store {
         if graph_artifact.kind != ArtifactKind::WorkflowGraph {
             return Err(StoreError::InvalidWorkflowGraphArtifact);
         }
-        let graph: WorkflowGraph = serde_json::from_slice(&self.read_blob(&graph_artifact.blob)?)?;
+        let graph: WorkflowGraph = serde_json::from_slice(&blob::read_blob_with(connection, &graph_artifact.blob)?)?;
         graph.validate()?;
         Ok(WorkflowRevision {
             revision,
@@ -546,7 +546,7 @@ impl Store {
                 )));
             }
             let schedule: OutcomeSchedule =
-                serde_json::from_slice(&self.read_blob(&artifact.blob)?).map_err(|error| {
+                serde_json::from_slice(&blob::read_blob_with(connection, &artifact.blob)?).map_err(|error| {
                     StoreError::Integrity(format!(
                         "outcome schedule {artifact_id} has invalid payload: {error}"
                     ))

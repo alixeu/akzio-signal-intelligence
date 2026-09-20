@@ -1,4 +1,6 @@
 impl Store {
+    // 在调用方事务内把一个 Canary session 写入对应表；先验证 campaign/阶段/cohort/Run purpose，
+    // 再用不可变 session_key 做幂等保护。该 helper 只建立 Paper/Shadow 调度预留，不提交订单。
     pub(super) fn commit_canary_session_transaction(
         transaction: &Transaction<'_>,
         reservation: &CanarySessionReservation,
@@ -27,6 +29,7 @@ impl Store {
             ));
         }
         if let Some(cohort_id) = &reservation.cohort_id {
+            // paired cohort 必须带交易日和 regime；已有相同主键只能逐字段相等地重放。
             let market_day = reservation.market_day.ok_or_else(|| {
                 StoreError::CanaryCampaignConflict(
                     "canary cohort session has no market day".to_owned(),
@@ -55,6 +58,7 @@ impl Store {
                 )
                 .optional()?;
             if duplicate_session.is_some() {
+                // session_key 在 legacy 与 paired 两张表之间也必须全局唯一，避免同一交易 session 双占用。
                 return Err(StoreError::CanaryCampaignConflict(
                     reservation.session_key.clone(),
                 ));
@@ -78,6 +82,7 @@ impl Store {
             )?;
             return Ok(());
         }
+        // 没有 cohort_id 时走历史单 session 表；它仍按 campaign+level 幂等，并保持 session_key 全局唯一。
         if let Some(existing) =
             read_session(transaction, &reservation.campaign_id, reservation.level)?
         {
@@ -119,6 +124,8 @@ impl Store {
     }
 
     #[allow(clippy::too_many_arguments)]
+    // 预校验 Paper parent、审批、三个 Shadow workflow 与 scheduler epoch，随后在同一 Immediate
+    // 事务内占用 session slot、写入 workflow 和 Canary reservation；返回 slot 不代表 Execution/PaperCommit。
     pub fn reserve_canary_session_with_workflows(
         &self,
         lease: &DaemonLease,
@@ -134,6 +141,7 @@ impl Store {
                 "canary session requires three shadow workflows".to_owned(),
             ));
         }
+        // 这些检查发生在获取写事务前，避免把数量或绑定错误带入 Store 状态变更。
         self.validate_paper_session_reservation(parent, proposal)?;
         self.validate_paper_approval_binding(runtime_manifest, approval)?;
         reservation.validate()?;
@@ -159,6 +167,7 @@ impl Store {
             ));
         }
         for shadow in shadow_workflows {
+            // 每个 Shadow graph 还要经过通用 workflow 校验，包括旧研究链路退役和 Contract 版本边界。
             self.validate_workflow_commit(shadow)?;
         }
         if self.session_slot(&parent.session_key)?.is_some() {
@@ -169,6 +178,7 @@ impl Store {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_daemon_lease(&transaction, lease, parent.reserved_at)?;
+        // session slot、parent workflow、Shadow workflow 和 Canary session 必须原子提交，不能部分成功。
         Self::commit_session_slot_transaction(
             &transaction,
             lease,
@@ -182,6 +192,7 @@ impl Store {
         Self::commit_canary_session_transaction(&transaction, reservation)?;
         transaction.commit()?;
         drop(connection);
+        // 提交后再读取 slot，避免在仍持有 Store 连接时调用会再次获取连接的查询。
         let slot = self
             .session_slot(&parent.session_key)?
             .ok_or_else(|| StoreError::Integrity("session slot missing after commit".to_owned()))?;
@@ -196,6 +207,7 @@ impl Store {
         campaign_id: &ContentHash,
         level: CanaryCampaignStatus,
     ) -> StoreResult<Option<StoredCanarySession>> {
+        // paired cohort 优先返回其 session；没有 paired 记录时才回退到 legacy 单 session。
         if let Some(session) = self.canary_sessions(campaign_id, level)?.into_iter().next() {
             return Ok(Some(session));
         }
@@ -208,6 +220,7 @@ impl Store {
         campaign_id: &ContentHash,
         level: CanaryCampaignStatus,
     ) -> StoreResult<Vec<StoredCanarySession>> {
+        // campaign 或当前阶段没有 cohort 时返回空集合；读取本身不改变 session reservation。
         let connection = self.connection()?;
         let Some(campaign) = read_campaign(&connection, campaign_id)? else {
             return Ok(Vec::new());
@@ -224,6 +237,7 @@ impl Store {
         level: CanaryCampaignStatus,
         session_key: &str,
     ) -> StoreResult<Option<StoredCanarySession>> {
+        // 根据 campaign 是否配置 paired cohort 选择对应表，并在 legacy 路径额外核对 session_key。
         let connection = self.connection()?;
         let Some(campaign) = read_campaign(&connection, campaign_id)? else {
             return Ok(None);
@@ -239,6 +253,7 @@ impl Store {
         &self,
         run_id: &RunId,
     ) -> StoreResult<Option<StoredCanarySession>> {
+        // 无连接调用方的便捷入口；具体查询复用 connection-scoped 实现。
         let connection = self.connection()?;
         self.canary_session_for_run_with_connection(&connection, run_id)
     }
@@ -248,6 +263,7 @@ impl Store {
         connection: &Connection,
         run_id: &RunId,
     ) -> StoreResult<Option<StoredCanarySession>> {
+        // 先查 paired cohort session，再查 legacy session；Run 可能是 parent 或三类 Shadow 之一。
         let cohort_reservation: Option<CohortSessionColumns> = connection
             .query_row(
                 "SELECT cohort_id, campaign_id, stage_json, session_key, market_day, regime, parent_run_id, contract_shadow_run_id, topology_shadow_run_id, bundle_shadow_run_id, scheduler_epoch, reserved_at FROM rebuild_canary_cohort_sessions WHERE parent_run_id = ?1 OR contract_shadow_run_id = ?1 OR topology_shadow_run_id = ?1 OR bundle_shadow_run_id = ?1 LIMIT 1",
@@ -271,6 +287,7 @@ impl Store {
             )
             .optional()?;
         if let Some(columns) = cohort_reservation {
+            // paired 行已经包含 cohort、交易日和 regime，交给统一转换器校验。
             return Ok(Some(stored_cohort_session_from_columns(columns)?));
         }
         let row: Option<(String, String)> = connection
@@ -285,9 +302,12 @@ impl Store {
         };
         let campaign_id = ContentHash::new(campaign_id)?;
         let level: CanaryCampaignStatus = serde_json::from_str(&level_json)?;
+        // legacy 行没有 cohort 字段，按 campaign+level 恢复并由 read_session 兼容旧 level 名称。
         read_session(connection, &campaign_id, level)
     }
 
+    // 校验 campaign 引用的 Contract、Topology、RuntimeManifest、PaperApproval 及其 payload/血缘闭包。
+    // 这是创建/恢复 Canary 前的输入校验，不会写入 Artifact、激活 candidate 或改变 Paper 权限。
     fn validate_campaign_artifacts(&self, spec: &CanaryCampaignSpec) -> StoreResult<()> {
         let references = [
             (
@@ -312,6 +332,7 @@ impl Store {
             ),
         ];
         for (reference, expected_kind, expected_lifecycle) in references {
+            // 先确认引用的 Artifact 身份、kind 和生命周期，防止用 RunScoped/错误类型伪装 canonical 输入。
             let artifact = self.artifact(&reference.artifact_id)?;
             if artifact.kind != expected_kind
                 || artifact.artifact_id != reference.artifact_id
@@ -324,6 +345,7 @@ impl Store {
         }
 
         let candidate_contract_artifact = self.artifact(&spec.candidate_contract.artifact_id)?;
+        // Contract 和 WorkflowGraph 的 payload 也必须通过领域校验，不能只相信 Artifact 元数据。
         let candidate_contract: AgentContract =
             serde_json::from_slice(&self.read_blob(&candidate_contract_artifact.blob)?)?;
         candidate_contract.validate()?;
@@ -339,6 +361,7 @@ impl Store {
                 "campaign candidate cohort identity".to_owned(),
         ));
     }
+    // 候选 contract hash/topology id 形成 cohort 的固定候选身份，供后续 certificate 绑定。
     let expected_candidate_hash = content_hash_json(&serde_json::json!({
         "candidate_contract_hash": candidate_contract.contract_hash,
         "candidate_topology_id": candidate_topology.topology_id,
@@ -348,6 +371,7 @@ impl Store {
             let Some(reference) = &cohort.search_bias_certificate else {
                 continue;
             };
+            // 每个 cohort 的 bias certificate 必须 canonical、可晋级，并完整覆盖 trial ledger。
             cohort_certificates.insert(reference.clone());
             let artifact = self.artifact(&reference.artifact_id)?;
             if artifact.kind != ArtifactKind::SearchBiasCertificate
@@ -376,6 +400,7 @@ impl Store {
                 ));
             }
             let selected_artifact = self.artifact(&certificate.selected_trial.artifact_id)?;
+        // 选中的 ExperimentTrial 必须来自同一 immutable trial refs、holdout 和候选身份。
         let selected_trial: ExperimentTrial =
             serde_json::from_slice(&self.read_blob(&selected_artifact.blob)?)?;
         selected_trial.validate()?;
@@ -416,6 +441,7 @@ impl Store {
         }
 
         let manifest_artifact = self.artifact(&spec.runtime_manifest.artifact_id)?;
+        // RuntimeManifest 的 source revision/notional 必须与 campaign spec 一致。
         let manifest: RuntimeManifest =
             serde_json::from_slice(&self.read_blob(&manifest_artifact.blob)?)?;
         manifest.validate()?;
@@ -428,6 +454,7 @@ impl Store {
         }
 
         let approval_artifact = self.artifact(&spec.paper_approval.artifact_id)?;
+        // Paper approval 只能是 Canary scope，并且绑定同一 RuntimeManifest hash；通过不等于已执行。
         let approval: PaperLaunchApproval =
             serde_json::from_slice(&self.read_blob(&approval_artifact.blob)?)?;
         approval.validate()?;

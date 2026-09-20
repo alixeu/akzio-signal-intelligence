@@ -11,15 +11,17 @@ public struct DetachedRunPayload: Codable, Hashable, Identifiable {
     public let result: String
     public let started: String
     public let stages: [Stage]
+    public let outcomeCaption: String
+    public let language: String?
 
     public struct Stage: Codable, Hashable, Identifiable {
         public let label: String
         public let status: String
         public let time: String
-        public var id: String { "\(label)-\(time)" }
+        public let id: String
     }
 
-    init(_ row: ArchiveRowPresentation) {
+    init(_ row: ArchiveRowPresentation, stages progress: [ArchiveStageProgress]? = nil, outcomeEvidence: OutcomeEvidencePresentation = .unknown, language: AppLanguage? = nil) {
         id = row.runID
         purpose = row.purposeLabel
         topology = row.topology
@@ -29,8 +31,10 @@ public struct DetachedRunPayload: Codable, Hashable, Identifiable {
         model = row.model
         result = PpmFormatter.percent(ppm: row.resultPpm)
         started = row.startedAtLabel
-        stages = row.stageProgress.map {
-            Stage(label: $0.label, status: $0.status.rawValue, time: $0.timeLabel)
+        self.language = language?.resolved.rawValue
+        outcomeCaption = outcomeEvidence.caption
+        stages = (progress ?? row.stageProgress).map {
+            Stage(label: $0.displayLabel, status: $0.status.rawValue, time: $0.timeLabel, id: $0.id)
         }
     }
 }
@@ -39,14 +43,15 @@ struct DetachedRunWindow: View {
     let payload: DetachedRunPayload
 
     @Environment(\.dismiss) private var dismiss
-    @Environment(\.appLanguage) private var language
+    @Environment(\.appLanguage) private var inheritedLanguage
+    private var language: AppLanguage { payload.language.flatMap(AppLanguage.init(rawValue:)) ?? inheritedLanguage }
 
     var body: some View {
         VStack(alignment: .leading, spacing: AkzioLayout.s4) {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(L10n.text("Run Details", language: language)).akzioText(.title)
-                    Text(payload.id).akzioMono(11, color: AkzioColor.mutedText)
+                    Text(payload.id).akzioMono(11, color: AkzioColor.secondaryText).textSelection(.enabled)
                 }
                 Spacer(minLength: AkzioLayout.s3)
                 StatusBadge(WorkflowStatus(rawValue: payload.status)?.status ?? .unavailable)
@@ -67,8 +72,10 @@ struct DetachedRunWindow: View {
                 field("Started", payload.started)
                 field("Duration", payload.duration)
                 field("Result", payload.result)
+                field("Model", payload.model)
             }
 
+            Text(payload.outcomeCaption).akzioText(.bodySmall)
             HairlineDivider()
             Text(L10n.text("Stage Progress", language: language)).akzioText(.sectionTitle)
             PageScroll {
@@ -78,7 +85,7 @@ struct DetachedRunWindow: View {
                             StatusDot(AkzioStatus(rawValue: stage.status) ?? .unavailable, diameter: 6)
                             Text(stage.label).akzioText(.body)
                             Spacer(minLength: AkzioLayout.s3)
-                            Text(stage.time).akzioMono(10, color: AkzioColor.mutedText)
+                            Text(L10n.text(stage.time, language: language)).akzioMono(11, color: AkzioColor.mutedText)
                         }
                         .frame(height: 28)
                         HairlineDivider()
@@ -91,12 +98,14 @@ struct DetachedRunWindow: View {
         .akzioGlassBackdrop(AkzioColor.background(for: .dark))
         .background(WindowChromeConfigurator())
         .preferredColorScheme(.dark)
+        .environment(\.appLanguage, language)
+        .environment(\.locale, language.locale)
     }
 
     private func field(_ label: String, _ value: String) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(L10n.text(label, language: language)).akzioText(.caption)
-            Text(value).akzioMono(11, color: AkzioColor.primaryText).lineLimit(1)
+            Text(L10n.text(value, language: language)).akzioMono(11, color: AkzioColor.primaryText).lineLimit(1).help(value).textSelection(.enabled)
         }
     }
 }

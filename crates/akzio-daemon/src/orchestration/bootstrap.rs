@@ -150,7 +150,7 @@ impl Daemon {
         };
         let workflow = WorkflowRuntime::new(store.clone(), active.recipes)
             .with_agent_budgets(&config.agent_budget)?
-            .with_fixture_mode(fixture_mode);
+            .with_research_settings(&config.research_settings)?;
         let store_executor = StoreExecutor::new(store.clone());
         let (reasoning_events, _) = broadcast::channel(1_024);
         if config.historical_evaluation_condition.is_some()

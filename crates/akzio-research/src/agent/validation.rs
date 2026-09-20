@@ -105,6 +105,27 @@ pub(super) fn validate_schema_value(
     let definition = schema
         .as_object()
         .ok_or_else(|| format!("{path} schema must be an object"))?;
+    if let Some(alternatives) = definition.get("anyOf") {
+        if definition
+            .keys()
+            .any(|key| key != "anyOf" && key != "description")
+        {
+            return Err(format!(
+                "{path} anyOf schema has unsupported sibling constraints"
+            ));
+        }
+        let alternatives = alternatives
+            .as_array()
+            .filter(|items| !items.is_empty())
+            .ok_or_else(|| format!("{path} schema.anyOf must be a nonempty array"))?;
+        return alternatives
+            .iter()
+            .any(|branch| validate_schema_value(value, branch, path).is_ok())
+            .then_some(())
+            .ok_or_else(|| {
+                format!("{path} does not match an authorized evidence/asset scope alternative")
+            });
+    }
     for key in definition.keys() {
         if !matches!(
             key.as_str(),

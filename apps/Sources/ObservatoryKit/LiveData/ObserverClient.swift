@@ -13,6 +13,27 @@ public enum ObserverTransportPolicy {
     /// client keeps margin so it receives the server's availability downgrade.
     public static let standardRequestTimeout: TimeInterval = 25
     public static let snapshotRequestTimeout: TimeInterval = 45
+
+    // Every authenticated Core request shares this policy, including SSE and
+    // Debug POSTs. Validating the initial loopback URL does not authorize a
+    // redirect to another service carrying x-akzio-token or a control body.
+    static let session = URLSession(
+        configuration: .ephemeral,
+        delegate: ObserverRedirectPolicy(),
+        delegateQueue: nil
+    )
+}
+
+private final class ObserverRedirectPolicy: NSObject, URLSessionTaskDelegate {
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        completionHandler(nil)
+    }
 }
 
 public enum ObserverConnectionState: Sendable, Equatable {
@@ -92,6 +113,20 @@ struct ObserverClient: Sendable {
         return try Self.decoder().decode(ObserverRunDetailPayload.self, from: data)
     }
 
+    func fetchBlueprint(purpose: String) async throws -> WorkflowBlueprintPayload {
+        var components = URLComponents(url: endpoint.appending(path: "v1/workflows/blueprint"), resolvingAgainstBaseURL: false)!
+        components.queryItems = [URLQueryItem(name: "purpose", value: purpose)]
+        let payload = try await data(url: components.url!, timeout: ObserverTransportPolicy.standardRequestTimeout)
+        return try Self.decoder().decode(WorkflowBlueprintPayload.self, from: payload)
+    }
+
+    func fetchJournal(runID: String, after: Int64) async throws -> RuntimeJournalPayload {
+        var components = URLComponents(url: endpoint.appending(path: "v1/observer/runs/\(runID)/journal"), resolvingAgainstBaseURL: false)!
+        components.queryItems = [URLQueryItem(name: "after", value: String(after)), URLQueryItem(name: "limit", value: "50")]
+        let payload = try await data(url: components.url!, timeout: ObserverTransportPolicy.standardRequestTimeout)
+        return try Self.decoder().decode(RuntimeJournalPayload.self, from: payload)
+    }
+
     func fetchPortfolioHistory(
         range: EquityRange
     ) async throws -> ObserverSectionPayload<ObserverPortfolioHistoryPayload> {
@@ -133,7 +168,7 @@ struct ObserverClient: Sendable {
                     }
                     var request = authorizedRequest(url: url)
                     request.timeoutInterval = 60
-                    let (bytes, response) = try await URLSession.shared.bytes(for: request)
+                    let (bytes, response) = try await ObserverTransportPolicy.session.bytes(for: request)
                     try Self.validate(response)
                     var eventName = "message"
                     for try await line in bytes.lines {
@@ -190,7 +225,7 @@ struct ObserverClient: Sendable {
     ) async throws -> Data {
         var request = authorizedRequest(url: url)
         request.timeoutInterval = timeout
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await ObserverTransportPolicy.session.data(for: request)
         try Self.validate(response)
         return data
     }

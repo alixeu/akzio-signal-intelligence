@@ -70,6 +70,7 @@ public struct LearningPresentation: Sendable, Hashable {
     public let timeRangeLabel: String
     public let availabilityStatus: AkzioStatus
     public let availabilityReason: String?
+    public let researchAudit: [ResearchAuditRowPresentation]
 
     public init(
         cards: [RetrospectiveCardPresentation],
@@ -79,7 +80,8 @@ public struct LearningPresentation: Sendable, Hashable {
         activePolicyName: String,
         timeRangeLabel: String,
         availabilityStatus: AkzioStatus = .completed,
-        availabilityReason: String? = nil
+        availabilityReason: String? = nil,
+        researchAudit: [ResearchAuditRowPresentation] = []
     ) {
         self.cards = cards
         self.timeline = timeline
@@ -89,6 +91,7 @@ public struct LearningPresentation: Sendable, Hashable {
         self.timeRangeLabel = timeRangeLabel
         self.availabilityStatus = availabilityStatus
         self.availabilityReason = availabilityReason
+        self.researchAudit = researchAudit
     }
 
     public var lessonCandidates: [RetrospectiveCardPresentation] {
@@ -145,14 +148,20 @@ public struct ArchiveRowPresentation: Sendable, Hashable, Identifiable {
 }
 
 public struct ArchiveStageProgress: Sendable, Hashable, Identifiable {
+    public let id: String
     public let label: String
+    public let horizon: String?
     public let status: AkzioStatus
     public let timeLabel: String
 
-    public var id: String { label }
+    public var displayLabel: String {
+        horizon.map { "\(label) · \($0.uppercased())" } ?? label
+    }
 
-    public init(label: String, status: AkzioStatus, timeLabel: String) {
+    public init(id: String, label: String, horizon: String? = nil, status: AkzioStatus, timeLabel: String) {
+        self.id = id
         self.label = label
+        self.horizon = horizon
         self.status = status
         self.timeLabel = timeLabel
     }
@@ -161,7 +170,7 @@ public struct ArchiveStageProgress: Sendable, Hashable, Identifiable {
 public struct ArchivePresentation: Sendable, Hashable {
     public let rows: [ArchiveRowPresentation]
     public let totalRuns: Int
-    public let successRatePpm: Int
+    public let successRatePpm: Int?
     public let page: Int
     public let pageSize: Int
     public let selectedRowID: String?
@@ -170,7 +179,7 @@ public struct ArchivePresentation: Sendable, Hashable {
     public init(
         rows: [ArchiveRowPresentation],
         totalRuns: Int,
-        successRatePpm: Int,
+        successRatePpm: Int?,
         page: Int,
         pageSize: Int,
         selectedRowID: String?,

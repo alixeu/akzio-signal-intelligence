@@ -29,9 +29,10 @@ fn backfill_embedded_blob_refs(connection: &mut Connection) -> StoreResult<()> {
                  )
                ORDER BY artifact_id"#,
         )?
-        .query_map(params![enum_name(ArtifactKind::NormalizedEvidence)], |row| {
-            row.get::<_, String>(0)
-        })?
+        .query_map(
+            params![enum_name(ArtifactKind::NormalizedEvidence)],
+            |row| row.get::<_, String>(0),
+        )?
         .collect::<Result<Vec<_>, _>>()?;
     if artifact_ids.is_empty() {
         return Ok(());
@@ -204,8 +205,8 @@ fn insert_task_node(
     let inserted = transaction.execute(
         r#"INSERT INTO rebuild_tasks
  (task_id, run_id, recipe_id, objective, contract_hash, priority, budget_json, retry_json, on_failure,
- parent_task_id, input_artifacts_json, status, ready_at)
- VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'queued', ?12)"#,
+ parent_task_id, input_artifacts_json, status, ready_at, node_spec_json)
+ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'queued', ?12, ?13)"#,
         params![
             node.task_id.0,
             run_id.0,
@@ -219,6 +220,7 @@ fn insert_task_node(
             node.parent_task_id.as_ref().map(|id| id.0.as_str()),
             serde_json::to_string(&node.input_artifacts)?,
             created_at.to_rfc3339(),
+            node.spec.as_ref().map(serde_json::to_string).transpose()?,
         ],
     )?;
     if inserted != 1 {
@@ -256,7 +258,7 @@ fn canonical_workflow_node(mut node: WorkflowNode) -> WorkflowNode {
 fn assert_permit(transaction: &Transaction<'_>, permit: &TaskWritePermit) -> StoreResult<()> {
     let current = transaction
         .query_row(
-            r#"SELECT run_id, status, lease_id, lease_epoch, active_attempt_id, contract_hash
+            r#"SELECT run_id, status, lease_id, lease_epoch, active_attempt_id, contract_hash, lease_until
                FROM rebuild_tasks WHERE task_id = ?1"#,
             params![permit.task_id.0],
             |row| {
@@ -267,11 +269,13 @@ fn assert_permit(transaction: &Transaction<'_>, permit: &TaskWritePermit) -> Sto
                     row.get::<_, u64>(3)?,
                     row.get::<_, Option<String>>(4)?,
                     row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
                 ))
             },
         )
         .optional()?;
-    let Some((run_id, status, lease_id, epoch, attempt_id, contract_hash)) = current else {
+    let Some((run_id, status, lease_id, epoch, attempt_id, contract_hash, lease_until)) = current
+    else {
         return Err(StoreError::MissingTask(permit.task_id.clone()));
     };
     if run_id != permit.run_id.0
@@ -280,6 +284,10 @@ fn assert_permit(transaction: &Transaction<'_>, permit: &TaskWritePermit) -> Sto
         || epoch != permit.epoch
         || attempt_id.as_deref() != Some(permit.attempt_id.0.as_str())
         || contract_hash.as_deref().map(ContentHash::new).transpose()? != permit.contract_hash
+        // Lease authority uses the actual write time, independently of an
+        // artifact's historical observation/fixture timestamp. Recovery is not
+        // required to revoke an already expired attempt.
+        || lease_until.as_deref().map(parse_time).transpose()?.is_none_or(|until| until <= Utc::now())
     {
         return Err(StoreError::StalePermit(permit.task_id.clone()));
     }
@@ -311,6 +319,47 @@ fn assert_daemon_lease(
         return Err(StoreError::SchedulerFenced(lease.lease_name.clone()));
     }
     Ok(())
+}
+
+/// A broker-session slot is the exclusive, single record of one scheduler-owned
+/// Paper run. `rebuild_session_slots.run_id` carries neither a foreign key nor a
+/// uniqueness constraint, so both halves are asserted here, inside the reserving
+/// transaction, before the row is written:
+///
+/// * the run must already exist, otherwise the slot names a run no reader can
+///   resolve, and `PRAGMA foreign_key_check` cannot see the dangling reference;
+/// * the run must not already own a different slot, which is what
+///   `Store::session_slot_for_run` assumes when it resolves at most one row.
+fn assert_session_slot_run(
+    transaction: &Transaction<'_>,
+    session_key: &str,
+    run_id: &RunId,
+) -> StoreResult<()> {
+    let invalid = || StoreError::InvalidSessionSlot(session_key.to_owned());
+    let run_exists = transaction
+        .query_row(
+            "SELECT 1 FROM rebuild_runs WHERE run_id = ?1",
+            params![run_id.0],
+            |_| Ok(()),
+        )
+        .optional()?;
+    if run_exists.is_none() {
+        return Err(invalid());
+    }
+    let existing = transaction
+        .query_row(
+            "SELECT session_key FROM rebuild_session_slots WHERE run_id = ?1",
+            params![run_id.0],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    match existing {
+        None => Ok(()),
+        // Re-reserving the identical session is handled by the callers' own
+        // duplicate-session check; only a second, different slot is a conflict.
+        Some(existing) if existing == session_key => Ok(()),
+        Some(_) => Err(invalid()),
+    }
 }
 
 fn assert_paper_effect_artifact(

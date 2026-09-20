@@ -9,6 +9,7 @@ import SwiftUI
 struct RunPreviewPanel: View {
     let row: ArchiveRowPresentation
     let stageProgress: [ArchiveStageProgress]
+    let outcomeEvidence: OutcomeEvidencePresentation
     let onViewDetails: () -> Void
     let onOpenInNewWindow: () -> Void
     let onDismiss: () -> Void
@@ -61,7 +62,7 @@ struct RunPreviewPanel: View {
 
                 PillTag(row.purposeLabel, tone: row.purpose.tone)
             }
-            Text(row.runID).akzioMono(9, color: AkzioColor.mutedText).lineLimit(1)
+            Text(row.runID).akzioMono(11, color: AkzioColor.secondaryText).lineLimit(1).help(row.runID).textSelection(.enabled)
         }
         .animation(policy.resolve(Motion.panel), value: row.id)
     }
@@ -92,6 +93,8 @@ struct RunPreviewPanel: View {
             Text(L10n.text(value, language: language))
                 .akzioMono(11, color: AkzioColor.primaryText)
                 .lineLimit(1)
+                .help(value)
+                .textSelection(.enabled)
                 .akzioNumeric(value, policy: policy)
         }
     }
@@ -111,7 +114,7 @@ struct RunPreviewPanel: View {
                 ForEach(Array(stageProgress.enumerated()), id: \.element.id) { index, stage in
                     HStack(spacing: 6) {
                         StatusDot(stage.status, diameter: 6)
-                        Text(L10n.text(stage.label, language: language)).akzioText(.bodySmall).lineLimit(1)
+                        Text(L10n.text(stage.displayLabel, language: language)).akzioText(.bodySmall).lineLimit(1)
                         Spacer(minLength: 4)
                         Text(L10n.text(stage.timeLabel, language: language)).akzioMono(10, color: AkzioColor.mutedText)
                     }
@@ -148,11 +151,11 @@ struct RunPreviewPanel: View {
                 } else {
                     // No sealed number yet — the run has no result to show, and a zero
                     // here would read as a flat outcome that never happened.
-                    UnavailableValue(row.status.resultMissingValue, size: 15)
+                    UnavailableValue(.unavailable, size: 15)
                 }
                 Spacer(minLength: 4)
             }
-            Text(L10n.text(row.status.resultCaption, language: language))
+            Text(outcomeEvidence.caption)
                 .akzioText(.bodySmall, color: AkzioColor.secondaryText)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -191,34 +194,6 @@ struct RunPreviewPanel: View {
                 )
             }
             .buttonStyle(PressableButtonStyle())
-        }
-    }
-}
-
-// MARK: - Result semantics
-
-extension WorkflowStatus {
-    /// Why a run has no result number. A decision that finished without an order is
-    /// Not Applicable, not a failure — there is nothing for a horizon to measure.
-    var resultMissingValue: MissingValue {
-        switch self {
-        case .queued, .leased, .running: .pending
-        case .decisionCompleted: .waiting
-        case .completed, .completedWithExecutionRejection: .unavailable
-        case .failed, .cancelled: .notApplicable
-        }
-    }
-
-    var resultCaption: String {
-        switch self {
-        case .queued: "Not started — no result exists yet."
-        case .leased: "Leased by a worker; execution has not begun."
-        case .running: "Result is sealed after the outcome horizon closes."
-        case .decisionCompleted: "Decision sealed. Awaiting the outcome horizon."
-        case .completed: "Sealed outcome for the run's canonical horizon."
-        case .completedWithExecutionRejection: "Sealed with an execution rejection on record."
-        case .failed: "Run ended in error; no outcome was sealed."
-        case .cancelled: "Cancelled before the horizon could seal."
         }
     }
 }

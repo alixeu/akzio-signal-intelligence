@@ -102,9 +102,10 @@ struct RunArchivePage: View {
                     RunPreviewPanel(
                         row: row,
                         stageProgress: store.selectedArchiveStageProgress,
-                                onViewDetails: { detailPayload = DetachedRunPayload(row) },
+                        outcomeEvidence: store.selectedArchiveOutcomeEvidence,
+                                onViewDetails: { detailPayload = DetachedRunPayload(row, stages: store.selectedArchiveStageProgress, outcomeEvidence: store.selectedArchiveOutcomeEvidence, language: language) },
                                 onOpenInNewWindow: {
-                                    openWindow(value: DetachedRunPayload(row))
+                                    openWindow(value: DetachedRunPayload(row, stages: store.selectedArchiveStageProgress, outcomeEvidence: store.selectedArchiveOutcomeEvidence, language: language))
                                 },
                                 onDismiss: { store.selectedArchiveRowID = nil }
                             )
@@ -203,13 +204,24 @@ struct RunArchivePage: View {
         .animation(policy.resolve(Motion.selection), value: isSelected)
     }
 
+    private var emptyArchiveMessage: String {
+        if !archive.rows.isEmpty { return L10n.text("No runs match filters", language: language) }
+        switch store.observerState {
+        case .offline: return "尚未连接 Core · 历史运行尚未载入"
+        case .connecting: return "正在连接 Core · 等待历史运行"
+        case .stale: return "连接已中断 · 暂无可显示的历史快照"
+        case .connected, .mock: return "暂无历史运行"
+        }
+    }
+
     private var emptyState: some View {
         VStack(spacing: AkzioLayout.s2) {
             Image(systemName: "line.3.horizontal.decrease.circle")
                 .font(.system(size: 20, weight: .light))
                 .foregroundStyle(AkzioColor.mutedText)
-            Text(L10n.text("No runs match filters", language: language))
+            Text(emptyArchiveMessage)
                 .akzioText(.body, color: AkzioColor.secondaryText)
+            if !query.isEmpty || purposeFilter != nil || statusFilter != nil {
             Button(L10n.text("Clear Filters", language: language)) {
                 withAnimation(policy.resolve(Motion.control)) {
                     query = ""
@@ -219,6 +231,7 @@ struct RunArchivePage: View {
             }
             .buttonStyle(PressableButtonStyle())
             .akzioText(.label, color: AkzioColor.primaryGold)
+            }
         }
         .materialize(isVisible: visibleRows.isEmpty, policy: policy)
     }
@@ -231,10 +244,10 @@ struct RunArchivePage: View {
                 selection: $layout,
                 options: ArchiveLayout.allCases.map { (value: $0, label: $0.displayName) }
             )
-            Text(PpmFormatter.share(ppm: archive.successRatePpm))
+            Text(archive.successRatePpm.map { PpmFormatter.share(ppm: $0) } ?? L10n.text("No data", language: language))
                 .akzioMono(11, color: AkzioColor.primaryGold)
-                .akzioNumeric(Double(archive.successRatePpm), policy: policy)
-            Text(L10n.text("success", language: language)).akzioText(.caption)
+                .akzioNumeric(archive.successRatePpm, policy: policy)
+            Text(L10n.text("Workflow completion rate", language: language)).akzioText(.caption)
         }
     }
 
@@ -319,7 +332,7 @@ struct RunArchivePage: View {
     }
 
     private var statsSubtitle: String {
-        "\(L10n.text("Success", language: language)) \(PpmFormatter.share(ppm: archive.successRatePpm)) · \(L10n.text("sorted by", language: language)) \(L10n.text(sortKey.title, language: language))"
+        "\(L10n.text("Workflow completion rate", language: language)) \(archive.successRatePpm.map { PpmFormatter.share(ppm: $0) } ?? L10n.text("No data", language: language)) · \(L10n.text("sorted by", language: language)) \(L10n.text(sortKey.title, language: language))"
     }
 
     private var totalPages: Int {

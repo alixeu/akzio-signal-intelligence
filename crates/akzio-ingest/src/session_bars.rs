@@ -102,7 +102,7 @@ pub fn validate_outcome_price_window(
     Ok(())
 }
 
-fn session_closes(
+pub(super) fn session_closes(
     calendar: &Value,
 ) -> Result<BTreeMap<NaiveDate, DateTime<Utc>>, EvidenceAdapterError> {
     let mut closes = BTreeMap::new();
@@ -137,7 +137,10 @@ fn session_closes(
 }
 
 impl AlpacaPaperEvidenceTransport {
-    async fn bounded_json(&self, url: &reqwest::Url) -> Result<Value, EvidenceAdapterError> {
+    pub(super) async fn bounded_json(
+        &self,
+        url: &reqwest::Url,
+    ) -> Result<Value, EvidenceAdapterError> {
         // These are read-only GETs; use the same bounded connection retry as
         // the other Alpaca acquisition path. HTTP policy failures are not retried.
         let mut attempt = 1_u64;
@@ -199,6 +202,10 @@ impl AlpacaPaperEvidenceTransport {
         else {
             return Err(invalid("bars resource"));
         };
+        let mut market_requests = Vec::new();
+        let market = self
+            .capture_stock(asset.symbol(), cutoff, &mut market_requests)
+            .await?;
         let end_date = end.unwrap_or(cutoff.with_timezone(&New_York).date_naive());
         let start_date = start.unwrap_or(end_date - Duration::days(400));
         if end_date > cutoff.with_timezone(&New_York).date_naive()
@@ -210,12 +217,23 @@ impl AlpacaPaperEvidenceTransport {
             &format!("{}/v2/calendar", self.base_url),
             &[
                 ("start", start_date.to_string()),
-                ("end", end_date.to_string()),
+                (
+                    "end",
+                    (cutoff.with_timezone(&New_York).date_naive() + Duration::days(30)).to_string(),
+                ),
             ],
         )
         .map_err(|_| invalid("calendar URL"))?;
-        let calendar = self.bounded_json(&calendar_url).await?;
+        let calendar = self
+            .capture_get(calendar_url.clone(), &mut market_requests)
+            .await?;
         let all_closes = session_closes(&calendar)?;
+        // Scheduled exchange closes are metadata, never future market observations.
+        let forecast_session_closes = all_closes
+            .iter()
+            .filter(|(_, close)| **close > cutoff)
+            .map(|(date, close)| (date.to_string(), *close))
+            .collect::<BTreeMap<_, _>>();
         let closes = all_closes
             .into_iter()
             .filter(|(_, close)| *close + Duration::minutes(BAR_AVAILABILITY_LAG_MINUTES) <= cutoff)
@@ -247,8 +265,24 @@ impl AlpacaPaperEvidenceTransport {
                     if raw_prices { "raw" } else { "all" }.to_owned(),
                 ),
                 ("sort", if raw_prices { "asc" } else { "desc" }.to_owned()),
-                ("start", start_date.to_string()),
-                ("end", (next_midnight - Duration::seconds(1)).to_rfc3339()),
+                (
+                    "start",
+                    New_York
+                        .from_local_datetime(
+                            &start_date
+                                .and_hms_opt(0, 0, 0)
+                                .ok_or_else(|| invalid("start time"))?,
+                        )
+                        .single()
+                        .ok_or_else(|| invalid("start timezone"))?
+                        .to_rfc3339(),
+                ),
+                (
+                    "end",
+                    (next_midnight - Duration::seconds(1))
+                        .min(cutoff)
+                        .to_rfc3339(),
+                ),
                 ("asof", end_date.to_string()),
             ],
         )
@@ -261,7 +295,7 @@ impl AlpacaPaperEvidenceTransport {
         let mut bars = BTreeMap::<NaiveDate, Value>::new();
         let mut tokens = BTreeSet::new();
         for page_index in 0..MAX_BAR_PAGES {
-            let page = self.bounded_json(&url).await?;
+            let page = self.capture_get(url.clone(), &mut market_requests).await?;
             for bar in page
                 .get("bars")
                 .and_then(Value::as_array)
@@ -285,7 +319,7 @@ impl AlpacaPaperEvidenceTransport {
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned);
-            pages.push(page);
+            pages.push(serde_json::json!({"request_url":url.as_str(),"response":page}));
             if bars.len() >= usize::from(limit) || token.is_none() {
                 break;
             }
@@ -334,15 +368,18 @@ impl AlpacaPaperEvidenceTransport {
             + Duration::minutes(BAR_AVAILABILITY_LAG_MINUTES);
         let observed_at = Utc::now();
         let normalized = serde_json::json!({
+            "market": market, "feed": self.market_data_feed.map(|f| f.as_str()),
+            "request_url": source_uri, "timezone": "America/New_York", "decision_cutoff": cutoff,
             "symbol": asset.symbol(), "bars": selected.iter().map(|(_, bar)| bar).collect::<Vec<_>>(),
             "price_basis": if raw_prices { "raw_requires_stage_action_check" } else { "adjusted_research" },
             "corporate_actions_response": corporate_actions,
             "session_closes": selected.iter().map(|(date, _)| (date.to_string(), closes[date])).collect::<BTreeMap<_, _>>(),
             "content_available_at": content_available_at, "latest_completed_session": latest_session,
+            "forecast_session_closes": forecast_session_closes,
             "calendar_source": calendar_url.as_str(), "availability_lag_minutes": BAR_AVAILABILITY_LAG_MINUTES,
         });
         validate_daily_bar_payload(&normalized).map_err(|_| invalid("OHLCV invalid"))?;
-        let raw = serde_json::to_vec(&serde_json::json!({"calendar": calendar, "pages": pages, "corporate_actions": corporate_actions}))
+        let raw = serde_json::to_vec(&serde_json::json!({"market_requests":market_requests,"bar_request_url":source_uri,"calendar_request_url":calendar_url.as_str(),"calendar": calendar, "pages": pages, "corporate_actions": corporate_actions}))
             .map_err(|_| invalid("provider payload serialization"))?;
         Ok(AcquiredEvidence {
             provenance: EvidenceProvenance {

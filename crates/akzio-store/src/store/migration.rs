@@ -432,7 +432,7 @@ CREATE TABLE rebuild_lesson_evidence_v14 (
     Ok(())
 }
 
-fn table_exists(connection: &Connection, table: &str) -> StoreResult<bool> {
+pub(super) fn table_exists(connection: &Connection, table: &str) -> StoreResult<bool> {
     connection
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -448,9 +448,18 @@ fn table_exists(connection: &Connection, table: &str) -> StoreResult<bool> {
 /// execution commitments. SQLite rebuilds the index directly from metadata.
 pub(super) fn migrate_v14_to_v15(connection: &mut Connection) -> StoreResult<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    // Keep v14 readable by the prior binary when its immutable tasks cannot
-    // yet switch to the release's v18 Contracts. Never strand them in v15.
-    if table_exists(&transaction, "rebuild_contract_catalogue_heads")? {
+    // Reached only from a v13/v14 root. The `< 18` threshold is the historical
+    // Contract boundary of the binary that introduced v15 and is kept verbatim:
+    // it is the frozen upgrade-blocking rule for those old roots, not a claim
+    // about the current Contract version. Stores installed by any recent binary
+    // match no row here. Never strand a blocked old task in v15.
+    // Both tables are probed because this step now runs before the schema batch
+    // that would otherwise have created them: a v13/v14 root predating the
+    // Contract catalogue has no blockers to find, and probing keeps that from
+    // surfacing as a raw `no such table`.
+    if table_exists(&transaction, "rebuild_contract_catalogue_heads")?
+        && table_exists(&transaction, "rebuild_contract_installations")?
+    {
         let hashes = transaction.prepare("SELECT h.contract_hash FROM rebuild_contract_catalogue_heads h JOIN rebuild_contract_installations i ON i.contract_hash=h.contract_hash WHERE i.contract_version < 18 ORDER BY h.purpose")?
             .query_map([], |row| row.get::<_,String>(0))?.collect::<Result<Vec<_>,_>>()?;
         for hash in hashes {

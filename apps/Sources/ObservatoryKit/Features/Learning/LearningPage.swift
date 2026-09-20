@@ -24,6 +24,18 @@ struct LearningPage: View {
     var body: some View {
         PageScaffold(route: .learning) {
             VStack(alignment: .leading, spacing: AkzioLayout.s4) {
+                if !learning.researchAudit.isEmpty {
+                    SectionCard(title: "本次运行的 Lesson 召回与重验") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("召回记录与重验建议来自本次研究；不代表已完成 Outcome 学习或变更 Active Lesson。")
+                                .akzioText(.caption, color: AkzioColor.mutedText)
+                            ForEach(learning.researchAudit) { row in
+                                Text(row.title).akzioText(.bodySmall)
+                                Text(row.detail).akzioText(.caption, color: AkzioColor.mutedText).textSelection(.enabled)
+                            }
+                        }
+                    }
+                }
                 if learning.availabilityStatus == .completed {
                     StagedSection(index: 0) { filters }
                     StagedSection(index: 1) { content }

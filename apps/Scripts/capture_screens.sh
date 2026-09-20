@@ -15,7 +15,7 @@ cd "$(dirname "$0")/.."
 CONFIG="${CONFIG:-release}"
 SIZE="${SIZE:-1512x982}"
 SCALE="${SCALE:-2}"
-OUT_DIR="${OUT_DIR:-../../outputs/observatory-shots}"
+OUT_DIR="${OUT_DIR:-../outputs/observatory-shots}"
 
 echo "building ($CONFIG)…"
 swift build -c "$CONFIG" --product AkzioObservatory >/dev/null
@@ -23,22 +23,23 @@ BIN="$(swift build -c "$CONFIG" --show-bin-path)/AkzioObservatory"
 
 mkdir -p "$OUT_DIR"
 
-ROUTES=(overview workflow intelligence portfolio outcome learning runArchive scenarioGallery)
+ROUTES=(overview workflow intelligence portfolio outcome learning runArchive)
 
 capture() {
-  local scenario="$1" route="$2" suffix="${3:-}"
-  local name="${scenario}-${route}${suffix}"
+  local scenario="$1" route="$2"
+  local name="${scenario}-${route}"
+  # 每个场景/路由只负责生成一张确定性截图；底层进程退出非零时由 set -e 使整批失败。
   "$BIN" --capture \
     --scenario "$scenario" \
     --route "$route" \
     --size "$SIZE" \
     --scale "$SCALE" \
-    ${suffix:+--settings} \
     --out "$OUT_DIR/${name}.png" >/dev/null
   echo "  $name.png"
 }
 
 echo "default scenario — all eight pages:"
+# 默认场景覆盖全部主路由，先验证完整页面矩阵再跑规则专项场景。
 for route in "${ROUTES[@]}"; do
   capture 01 "$route"
 done
@@ -50,6 +51,7 @@ echo "settings layer:"
 echo "  01-settings.png"
 
 echo "rule-bearing scenarios:"
+# 这些场景分别覆盖未触发 Critic、NoOrder、闸门阻断、未封存和数据不可用等状态。
 # 03 critic not triggered · 06 no order · 08 blocked gate · 12 unsealed horizon
 # 16 non-paper paper commit · 17 reduce motion · 18 data unavailable · 19 canary
 declare -a MATRIX=(

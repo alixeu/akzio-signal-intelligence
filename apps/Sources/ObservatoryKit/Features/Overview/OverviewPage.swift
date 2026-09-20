@@ -40,7 +40,7 @@ struct OverviewPage: View {
         } toolbar: {
             HStack(spacing: AkzioLayout.s2) {
             PillTag(store.displayRun.purpose.displayName, tone: store.displayRun.purpose.tone)
-            StatusBadge(store.displayRun.status.status)
+            StatusBadge(store.displayRun.hasRun ? store.displayRun.status.status : .unavailable)
                 Text(store.elapsedLabel).akzioMono(12, color: AkzioColor.primaryText)
             }
         }
@@ -57,7 +57,7 @@ struct OverviewPage: View {
                 selectedStageID: store.selectedStageID,
                 onSelect: { store.selectedStageID = $0 }
             )
-            .frame(minHeight: 400)
+            .frame(height: 400)
         } accessory: {
             HStack(spacing: AkzioLayout.s2) {
                 legend("Live", tone: .gold)
@@ -93,7 +93,7 @@ private struct LiveKpiStrip: View {
         HStack(spacing: AkzioLayout.s3) {
             metric("Source", store.observerState.label, "dot.radiowaves.left.and.right")
             metric("Tasks", String(store.displayWorkflow.nodes.count), "point.3.connected.trianglepath.dotted")
-            metric("Run Status", store.displayRun.status.displayName, "waveform.path.ecg")
+            metric("Run Status", store.displayRun.displayStatus, "waveform.path.ecg")
             metric("Portfolio", L10n.text("Unavailable", language: language), "chart.line.downtrend.xyaxis")
         }
         .frame(maxWidth: .infinity, alignment: .leading)

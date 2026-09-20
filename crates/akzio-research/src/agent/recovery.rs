@@ -5,6 +5,35 @@ enum AgentRecoverySource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum RecoveryUsageFailure {
+    Unknown,
+    Missing(ModelUsage),
+    Inconsistent,
+    OutputLimitExceeded { actual: u32, maximum: u32 },
+    CostOverflow,
+}
+
+impl RecoveryUsageFailure {
+    fn error(&self) -> ResearchError {
+        match self {
+            Self::Unknown => ResearchError::ProviderUsageUnknown,
+            Self::Missing(usage) => ResearchError::ProviderUsageMissing {
+                usage: usage.clone(),
+                trace: None,
+            },
+            Self::Inconsistent => ResearchError::InvalidProviderUsage,
+            Self::OutputLimitExceeded { actual, maximum } => {
+                ResearchError::ProviderOutputLimitExceeded {
+                    actual: *actual,
+                    maximum: *maximum,
+                }
+            }
+            Self::CostOverflow => ResearchError::CostOverflow,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct AgentRecoveryUsage {
     latency_millis: u64,
     input_tokens: u64,
@@ -13,7 +42,7 @@ struct AgentRecoveryUsage {
     reasoning_tokens: u64,
     cost_micros: u64,
     cost_complete: bool,
-    usage_valid: bool,
+    failure: Option<RecoveryUsageFailure>,
 }
 
 impl Default for AgentRecoveryUsage {
@@ -26,7 +55,7 @@ impl Default for AgentRecoveryUsage {
             reasoning_tokens: 0,
             cost_micros: 0,
             cost_complete: true,
-            usage_valid: true,
+            failure: None,
         }
     }
 }
@@ -37,7 +66,7 @@ impl AgentRecoveryUsage {
         request: &AgentModelRequest,
         policy: &ModelBudgetPolicy,
     ) -> Option<()> {
-        self.usage_valid = false;
+        self.failure.get_or_insert(RecoveryUsageFailure::Unknown);
         self.input_tokens = self
             .input_tokens
             .saturating_add(u64::from(estimate_tokens(request).ok()?));
@@ -54,7 +83,20 @@ impl AgentRecoveryUsage {
         policy: &ModelBudgetPolicy,
     ) -> Option<()> {
         if usage.input_tokens.is_none() || usage.output_tokens.is_none() {
-            self.usage_valid = false;
+            self.failure
+                .get_or_insert_with(|| RecoveryUsageFailure::Missing(usage.clone()));
+        }
+        if usage
+            .cached_input_tokens
+            .zip(usage.input_tokens)
+            .is_some_and(|(detail, total)| detail > total)
+            || usage
+                .reasoning_tokens
+                .zip(usage.output_tokens)
+                .is_some_and(|(detail, total)| detail > total)
+        {
+            self.failure
+                .get_or_insert(RecoveryUsageFailure::Inconsistent);
         }
         let resolved = resolve_model_usage(estimate_tokens(request).ok()?, 0, None);
         self.input_tokens = self
@@ -70,10 +112,8 @@ impl AgentRecoveryUsage {
             .reasoning_tokens
             .saturating_add(usage.reasoning_tokens.unwrap_or_default());
         if let Some(pricing) = &policy.pricing {
-            let input_tokens = u32::try_from(
-                usage.input_tokens.unwrap_or(resolved.input_tokens),
-            )
-            .unwrap_or(u32::MAX);
+            let input_tokens = u32::try_from(usage.input_tokens.unwrap_or(resolved.input_tokens))
+                .unwrap_or(u32::MAX);
             let output_tokens =
                 u32::try_from(usage.output_tokens.unwrap_or_default()).unwrap_or(u32::MAX);
             match usage_cost_micros(
@@ -81,7 +121,10 @@ impl AgentRecoveryUsage {
                 pricing,
             ) {
                 Ok(cost) => self.cost_micros = self.cost_micros.saturating_add(cost),
-                Err(_) => self.usage_valid = false,
+                Err(_) => {
+                    self.failure
+                        .get_or_insert(RecoveryUsageFailure::CostOverflow);
+                }
             }
             self.cost_complete = false;
         }
@@ -99,6 +142,30 @@ impl AgentRecoveryUsage {
             estimate_turn_output_tokens(response).ok()?,
             response.telemetry.as_ref(),
         );
+        // Replaying a completed Provider event must preserve the same rejection
+        // boundary as live accounting, including when no pricing is configured.
+        if usage
+            .cached_input_tokens
+            .is_some_and(|detail| detail > usage.input_tokens)
+            || usage
+                .reasoning_tokens
+                .is_some_and(|detail| detail > usage.output_tokens)
+        {
+            self.failure
+                .get_or_insert(RecoveryUsageFailure::Inconsistent);
+        }
+        if let Some(actual) = response
+            .telemetry
+            .as_ref()
+            .and_then(|t| t.output_tokens)
+            .filter(|actual| *actual > u64::from(request.max_output_tokens))
+        {
+            self.failure
+                .get_or_insert(RecoveryUsageFailure::OutputLimitExceeded {
+                    actual: u32::try_from(actual).unwrap_or(u32::MAX),
+                    maximum: request.max_output_tokens,
+                });
+        }
         self.latency_millis = self.latency_millis.saturating_add(
             response
                 .telemetry
@@ -116,7 +183,10 @@ impl AgentRecoveryUsage {
         if let Some(pricing) = &policy.pricing {
             match usage_cost_micros(usage, pricing) {
                 Ok(cost) => self.cost_micros = self.cost_micros.saturating_add(cost),
-                Err(_) => self.usage_valid = false,
+                Err(_) => {
+                    self.failure
+                        .get_or_insert(RecoveryUsageFailure::CostOverflow);
+                }
             }
         }
         Some(())
@@ -158,6 +228,8 @@ impl AgentRecoveryCheckpoint {
 
 #[derive(Debug, Clone)]
 struct AgentRecoveryGuard {
+    initial_phase: AgentTurnPhase,
+    deliberation_repair_tool_set_hash: Option<akzio_domain::ContentHash>,
     contract_hash: akzio_domain::ContentHash,
     context_manifest: akzio_domain::ContextManifestPayload,
     read_grant_identity: akzio_domain::ContentHash,
@@ -169,6 +241,9 @@ struct AgentRecoveryGuard {
 }
 
 impl AgentRecoveryGuard {
+    fn fresh_checkpoint(&self) -> AgentRecoveryCheckpoint {
+        AgentRecoveryCheckpoint { phase: self.initial_phase, ..AgentRecoveryCheckpoint::fresh() }
+    }
     fn tool_set_hash(&self, phase: AgentTurnPhase) -> &akzio_domain::ContentHash {
         match phase {
             AgentTurnPhase::Draft => &self.draft_tool_set_hash,
@@ -214,7 +289,14 @@ struct StoredToolResultPayload {
 
 #[derive(Debug, Clone)]
 enum AgentRecoveryEvent {
-    ProviderCallStarted,
+    ProviderCallStarted {
+        attempt_id: AttemptId,
+        cursor: i64,
+    },
+    ProviderCallFinished {
+        attempt_id: AttemptId,
+        start_cursor: i64,
+    },
     Turn {
         reference: ArtifactRef,
         manifest: akzio_domain::ContextManifestPayload,
@@ -245,21 +327,34 @@ struct AgentRecoveryReducer<'a> {
     guard: &'a AgentRecoveryGuard,
     checkpoint: AgentRecoveryCheckpoint,
     expected_tools: Vec<ExpectedToolCall>,
+    pending_provider_calls: BTreeSet<(AttemptId, i64)>,
 }
 
 impl<'a> AgentRecoveryReducer<'a> {
     fn new(guard: &'a AgentRecoveryGuard) -> Self {
         Self {
             guard,
-            checkpoint: AgentRecoveryCheckpoint::fresh(),
+            checkpoint: guard.fresh_checkpoint(),
             expected_tools: vec![],
+            pending_provider_calls: BTreeSet::new(),
         }
     }
 
     fn fold(mut self, event: AgentRecoveryEvent) -> Option<Self> {
         match event {
-            AgentRecoveryEvent::ProviderCallStarted => {
+            AgentRecoveryEvent::ProviderCallStarted { attempt_id, cursor } => {
+                self.pending_provider_calls
+                    .insert((attempt_id, cursor))
+                    .then_some(())?;
                 self.checkpoint.provider_calls = self.checkpoint.provider_calls.saturating_add(1);
+            }
+            AgentRecoveryEvent::ProviderCallFinished {
+                attempt_id,
+                start_cursor,
+            } => {
+                self.pending_provider_calls
+                    .remove(&(attempt_id, start_cursor))
+                    .then_some(())?;
             }
             AgentRecoveryEvent::Turn {
                 reference,
@@ -312,15 +407,16 @@ impl<'a> AgentRecoveryReducer<'a> {
                         .find(|check| check.check_id == "agent.submit_validation")
                         .map(|check| check.actual.clone())
                         .unwrap_or_else(|| "previous submit_result was rejected".to_owned());
-                    self.checkpoint.pending_tool_outputs.push(ModelToolOutput {
-                        call_id,
-                        output: serde_json::json!({
-                            "ok": false,
-                            "error": "invalid_submission",
-                            "message": message,
-                            "repair_policy": "reuse_previous_submission_and_change_only_rejected_fields",
-                        }),
-                    });
+                    let feedback = if self.guard.initial_phase == AgentTurnPhase::Submit {
+                        submission_rejection_feedback(call_id, message)
+                    } else {
+                        // Outcome keeps its existing two-phase recovery wire format.
+                        ModelToolOutput { call_id, output: json!({
+                            "ok":false, "error":"invalid_submission", "message":message,
+                            "repair_policy":"reuse_previous_submission_and_change_only_rejected_fields",
+                        }) }
+                    };
+                    self.checkpoint.pending_tool_outputs.push(feedback);
                 }
             }
         }
@@ -335,12 +431,14 @@ impl<'a> AgentRecoveryReducer<'a> {
         completed: bool,
     ) -> Option<()> {
         let payload_budget_policy_hash = budget_policy_hash(&payload.budget_policy).ok()?;
+        let metadata_repair = self.guard.deliberation_repair_tool_set_hash.as_ref() == Some(&payload.tool_set_hash)
+            && is_deliberation_repair(&self.checkpoint.pending_tool_outputs)
+            && payload.request.continuation.is_none() && payload.request.tool_outputs.is_empty();
         if !self.expected_tools.is_empty()
             || payload.turn != self.checkpoint.next_model_turn
             || payload.contract_hash != self.guard.contract_hash
             || payload.request.contract_hash != self.guard.contract_hash
-            || payload.request.read_grant_identity.as_ref()
-                != Some(&self.guard.read_grant_identity)
+            || payload.request.read_grant_identity.as_ref() != Some(&self.guard.read_grant_identity)
             || payload.request.context_materialization_identity.as_ref()
                 != Some(&self.guard.context_materialization_identity)
             || payload.context_manifest != payload.request.manifest_artifact_id
@@ -355,10 +453,10 @@ impl<'a> AgentRecoveryReducer<'a> {
                 .is_some_and(|hash| hash != &payload_budget_policy_hash)
             || payload_budget_policy_hash != self.guard.budget_policy_hash
             || payload.tool_set_hash != tool_set_hash(&payload.request).ok()?
-            || &payload.tool_set_hash != self.guard.tool_set_hash(payload.request.phase)
+            || (!metadata_repair && &payload.tool_set_hash != self.guard.tool_set_hash(payload.request.phase))
             || payload.request.phase != self.checkpoint.phase
-            || payload.request.continuation != self.checkpoint.continuation
-            || payload.request.tool_outputs != self.checkpoint.pending_tool_outputs
+            || (!metadata_repair && payload.request.continuation != self.checkpoint.continuation)
+            || (!metadata_repair && payload.request.tool_outputs != self.checkpoint.pending_tool_outputs)
         {
             return None;
         }
@@ -409,12 +507,14 @@ impl<'a> AgentRecoveryReducer<'a> {
                         .tool_calls
                         .into_iter()
                         .map(|call| {
-                            call_ids.insert(call.call_id.clone()).then_some(ExpectedToolCall {
-                                request_hash: payload.request_hash.clone(),
-                                call,
-                                artifact: None,
-                                output: None,
-                            })
+                            call_ids
+                                .insert(call.call_id.clone())
+                                .then_some(ExpectedToolCall {
+                                    request_hash: payload.request_hash.clone(),
+                                    call,
+                                    artifact: None,
+                                    output: None,
+                                })
                         })
                         .collect::<Option<_>>()?;
                 }
@@ -422,7 +522,8 @@ impl<'a> AgentRecoveryReducer<'a> {
             AgentTurnPhase::Submit => {
                 let submission = response.terminal_submission?;
                 self.checkpoint.submit_call_id = Some(submission.call_id);
-                self.checkpoint.submission_attempts = self.checkpoint.submission_attempts.saturating_add(1);
+                self.checkpoint.submission_attempts =
+                    self.checkpoint.submission_attempts.saturating_add(1);
                 self.checkpoint.next_model_turn = payload.turn.saturating_add(1);
                 self.checkpoint.phase = AgentTurnPhase::Submit;
             }
@@ -449,7 +550,17 @@ impl<'a> AgentRecoveryReducer<'a> {
 
     fn finish(mut self, lineage: Vec<AttemptId>) -> Option<AgentRecoveryCheckpoint> {
         self.finish_tool_batch();
-        if !self.expected_tools.is_empty() || self.checkpoint.continuation.is_none() {
+        if !self.expected_tools.is_empty() {
+            return None;
+        }
+        if !self.pending_provider_calls.is_empty() {
+            self.checkpoint.usage.failure = Some(RecoveryUsageFailure::Unknown);
+            self.checkpoint.usage.cost_complete = false;
+        }
+        // A failed first Draft has no accepted continuation, but its provider
+        // cost still belongs to this task. Only a task with no provider call
+        // and no accepted continuation may restart with an empty ledger.
+        if self.checkpoint.continuation.is_none() && self.checkpoint.provider_calls == 0 {
             return None;
         }
         self.checkpoint.source = AgentRecoverySource::Recovered(lineage);
@@ -463,20 +574,38 @@ fn agent_recovery_checkpoint(
     guard: &AgentRecoveryGuard,
 ) -> ResearchResult<AgentRecoveryCheckpoint> {
     let Some(lineage) = recovery_lineage(store, permit)? else {
-        return Ok(AgentRecoveryCheckpoint::fresh());
+        return Ok(guard.fresh_checkpoint());
+    };
+    // Establish whether external work began independently of parsing its audit
+    // payloads. An incompatible/partial history must not erase that expenditure.
+    let mut provider_calls = 0u32;
+    for attempt_id in &lineage {
+        for event in store.attempt_events(&permit.run_id, &permit.task_id, attempt_id)? {
+            if event.lifecycle_kind()? == LifecycleEventType::AgentTurnStarted {
+                provider_calls = provider_calls.saturating_add(1);
+            }
+        }
+    }
+    let fallback = || {
+        let mut checkpoint = guard.fresh_checkpoint();
+        if provider_calls > 0 {
+            checkpoint.source = AgentRecoverySource::Recovered(lineage.clone());
+            checkpoint.provider_calls = provider_calls;
+            checkpoint.usage.failure = Some(RecoveryUsageFailure::Unknown);
+            checkpoint.usage.cost_complete = false;
+        }
+        checkpoint
     };
     let Some(events) = load_recovery_events(store, permit, &lineage)? else {
-        return Ok(AgentRecoveryCheckpoint::fresh());
+        return Ok(fallback());
     };
     let Some(reducer) = events
         .into_iter()
         .try_fold(AgentRecoveryReducer::new(guard), AgentRecoveryReducer::fold)
     else {
-        return Ok(AgentRecoveryCheckpoint::fresh());
+        return Ok(fallback());
     };
-    Ok(reducer
-        .finish(lineage)
-        .unwrap_or_else(AgentRecoveryCheckpoint::fresh))
+    Ok(reducer.finish(lineage.clone()).unwrap_or_else(fallback))
 }
 
 fn recovery_lineage(
@@ -487,8 +616,13 @@ fn recovery_lineage(
     let mut seen = BTreeSet::from([child.clone()]);
     let mut lineage = vec![];
     while let Some(relation) = store.attempt_relation(&child)? {
-        if relation.relation != akzio_domain::AttemptRelationKind::Recovery
-            || relation.run_id != permit.run_id
+        // A scheduler retry belongs to the same task's external expenditure,
+        // just as lease recovery does. Never turn an interrupted provider call
+        // into a fresh budget by crossing a Retry edge.
+        if !matches!(
+            relation.relation,
+            akzio_domain::AttemptRelationKind::Recovery | akzio_domain::AttemptRelationKind::Retry
+        ) || relation.run_id != permit.run_id
             || relation.task_id != permit.task_id
             || !seen.insert(relation.parent_attempt_id.clone())
         {
@@ -508,10 +642,20 @@ fn load_recovery_events(
 ) -> ResearchResult<Option<Vec<AgentRecoveryEvent>>> {
     let mut loaded = vec![];
     for attempt_id in lineage {
+        // Store trajectories serialize model calls within each attempt. The
+        // immutable Started cursor identifies its slot; a terminal from another
+        // attempt must never close it, even if aggregate counts happen to match.
+        let mut pending_start = None;
         for event in store.attempt_events(&permit.run_id, &permit.task_id, attempt_id)? {
             let event_type = event.lifecycle_kind()?;
             if event_type == LifecycleEventType::AgentTurnStarted {
-                loaded.push(AgentRecoveryEvent::ProviderCallStarted);
+                if pending_start.replace(event.cursor).is_some() {
+                    return Ok(None);
+                }
+                loaded.push(AgentRecoveryEvent::ProviderCallStarted {
+                    attempt_id: attempt_id.clone(),
+                    cursor: event.cursor,
+                });
                 continue;
             }
             let expected_kind = match event_type {
@@ -548,18 +692,25 @@ fn load_recovery_events(
                 LifecycleEventType::AgentTurnCompleted
                 | LifecycleEventType::AgentTurnFailed
                 | LifecycleEventType::AgentTurnRetryableFailed => {
-                    let Ok(payload) = serde_json::from_slice::<StoredAgentTurnPayload>(&bytes) else {
+                    let Ok(payload) = serde_json::from_slice::<StoredAgentTurnPayload>(&bytes)
+                    else {
                         return Ok(None);
                     };
                     let manifest_artifact = store.artifact(&payload.context_manifest)?;
                     if manifest_artifact.kind != ArtifactKind::ContextManifest {
                         return Ok(None);
                     }
-                    let Ok(manifest) = serde_json::from_slice::<
-                        akzio_domain::ContextManifestPayload,
-                    >(&store.read_blob(&manifest_artifact.blob)?) else {
+                    let Ok(manifest) = serde_json::from_slice::<akzio_domain::ContextManifestPayload>(
+                        &store.read_blob(&manifest_artifact.blob)?,
+                    ) else {
                         return Ok(None);
                     };
+                    if let Some(start_cursor) = pending_start.take() {
+                        loaded.push(AgentRecoveryEvent::ProviderCallFinished {
+                            attempt_id: attempt_id.clone(),
+                            start_cursor,
+                        });
+                    }
                     AgentRecoveryEvent::Turn {
                         reference,
                         manifest,
@@ -605,6 +756,8 @@ mod recovery_tests {
     fn guard() -> AgentRecoveryGuard {
         let hash = akzio_domain::ContentHash::of_bytes(b"recovery-test");
         AgentRecoveryGuard {
+            initial_phase: AgentTurnPhase::Draft,
+            deliberation_repair_tool_set_hash: None,
             contract_hash: hash.clone(),
             context_manifest: akzio_domain::ContextManifestPayload {
                 schema_version: akzio_domain::DOMAIN_SCHEMA_VERSION,
@@ -626,8 +779,51 @@ mod recovery_tests {
     }
 
     #[test]
-    fn rejected_submit_recovery_reuses_call_and_sends_compact_feedback() {
+    fn direct_submission_recovery_never_invents_a_draft_or_spent_budget() {
+        let mut guard = guard();
+        guard.initial_phase = AgentTurnPhase::Submit;
+        let reducer = AgentRecoveryReducer::new(&guard);
+        assert_eq!(reducer.checkpoint.phase, AgentTurnPhase::Submit);
+        assert_eq!(reducer.checkpoint.provider_calls, 0);
+        assert!(reducer.checkpoint.continuation.is_none());
+        guard.initial_phase = AgentTurnPhase::Draft;
+        assert_eq!(AgentRecoveryReducer::new(&guard).checkpoint.phase, AgentTurnPhase::Draft);
+    }
+
+    #[test]
+    fn provider_terminal_must_close_its_exact_attempt_and_start_cursor() {
         let guard = guard();
+        for (attempt_id, start_cursor) in [("other-attempt", 10), ("attempt", 11)] {
+            let reducer = AgentRecoveryReducer::new(&guard)
+                .fold(AgentRecoveryEvent::ProviderCallStarted {
+                    attempt_id: AttemptId("attempt".into()),
+                    cursor: 10,
+                })
+                .unwrap();
+            assert!(
+                reducer
+                    .fold(AgentRecoveryEvent::ProviderCallFinished {
+                        attempt_id: AttemptId(attempt_id.into()),
+                        start_cursor,
+                    })
+                    .is_none(),
+                "unrelated terminal cannot settle an outstanding call"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_without_provider_work_remains_fresh() {
+        let guard = guard();
+        assert!(AgentRecoveryReducer::new(&guard)
+            .finish(vec![AttemptId("no-model-call".into())])
+            .is_none());
+    }
+
+    #[test]
+    fn rejected_submit_recovery_reuses_call_and_sends_compact_feedback() {
+        let mut guard = guard();
+        guard.initial_phase = AgentTurnPhase::Submit;
         let mut reducer = AgentRecoveryReducer::new(&guard);
         reducer.checkpoint.phase = AgentTurnPhase::Submit;
         reducer.checkpoint.submit_call_id = Some("submit-1".to_owned());
@@ -652,13 +848,86 @@ mod recovery_tests {
         };
 
         let reducer = reducer
-            .fold(AgentRecoveryEvent::StageAcceptance(acceptance))
+            .fold(AgentRecoveryEvent::StageAcceptance(acceptance.clone()))
             .expect("recovery reducer accepts persisted rejection");
         assert_eq!(reducer.checkpoint.pending_tool_outputs.len(), 1);
-        assert_eq!(reducer.checkpoint.pending_tool_outputs[0].call_id, "submit-1");
         assert_eq!(
-            reducer.checkpoint.pending_tool_outputs[0].output["repair_policy"],
-            "reuse_previous_submission_and_change_only_rejected_fields"
+            reducer.checkpoint.pending_tool_outputs[0].call_id,
+            "submit-1"
         );
+        assert_eq!(
+            reducer.checkpoint.pending_tool_outputs[0].output,
+            json!({"ok":false,"error":"invalid_submission",
+                "message":"Agent output did not satisfy Contract schema: research.grounds must be empty"})
+        );
+        guard.initial_phase = AgentTurnPhase::Draft;
+        let mut outcome = AgentRecoveryReducer::new(&guard);
+        outcome.checkpoint.phase = AgentTurnPhase::Submit;
+        outcome.checkpoint.submit_call_id = Some("submit-1".into());
+        let outcome = outcome.fold(AgentRecoveryEvent::StageAcceptance(acceptance)).unwrap();
+        assert_eq!(outcome.checkpoint.pending_tool_outputs[0].output,
+            json!({"ok":false,"error":"invalid_submission","message":"research.grounds must be empty",
+                "repair_policy":"reuse_previous_submission_and_change_only_rejected_fields"}));
+    }
+
+    #[tokio::test]
+    async fn rejection_without_debug_session_survives_retry_with_tool_feedback() {
+        let now = Utc::now();
+        let (store, runtime, attempt) = super::late_model_tests::isolated_agent_attempt(
+            RESEARCH_ANALYST_RECIPE_ID,
+            RunPurpose::Paper,
+            120,
+            now,
+        );
+        let catalogue = ActiveResearchCatalogue::install(&store, now).unwrap();
+        let workflow = akzio_runtime::WorkflowRuntime::new(store.clone(), catalogue.recipes);
+        workflow.replay_run(&attempt.run_id).unwrap();
+        assert!(store.debug_session(&attempt.run_id).unwrap().is_none());
+        runtime
+            .record_submit_rejection(
+                &attempt.permit,
+                "research.analyst",
+                "accepted forecast was modified".into(),
+                vec![],
+                now,
+            )
+            .await
+            .unwrap();
+        workflow.replay_run(&attempt.run_id).unwrap();
+        store.retry_task(&attempt.permit, now, now).unwrap();
+        let replacement = store
+            .claim_next_task_for_workload(
+                "canonical-rejection-retry",
+                now,
+                Duration::minutes(5),
+                akzio_store::TaskWorkload::Any,
+            )
+            .unwrap()
+            .unwrap();
+        workflow.replay_run(&attempt.run_id).unwrap();
+        let lineage = recovery_lineage(&store, &replacement.permit)
+            .unwrap()
+            .unwrap();
+        assert_eq!(lineage, vec![attempt.permit.attempt_id]);
+        let events = load_recovery_events(&store, &replacement.permit, &lineage)
+            .unwrap()
+            .unwrap();
+        let mut guard = guard();
+        guard.initial_phase = AgentTurnPhase::Submit;
+        let mut reducer = AgentRecoveryReducer::new(&guard);
+        reducer.checkpoint.submit_call_id = Some("rejected-real-call".into());
+        for event in events {
+            reducer = reducer
+                .fold(event)
+                .expect("persisted rejection is replayable");
+        }
+        assert_eq!(reducer.checkpoint.pending_tool_outputs.len(), 1);
+        let output = &reducer.checkpoint.pending_tool_outputs[0];
+        assert_eq!(output.call_id, "rejected-real-call");
+        assert_eq!(output.output["error"], "invalid_submission");
+        assert!(output.output["message"]
+            .as_str()
+            .unwrap()
+            .contains("accepted forecast was modified"));
     }
 }

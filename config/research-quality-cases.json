@@ -1,0 +1,149 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "RQ-CONTEXT-01",
+      "crate": "akzio-context",
+      "test": "synthesizer_matrix_lists_exact_selected_evidence_closure",
+      "claim": "Synthesis sees the exact selected evidence closure"
+    },
+    {
+      "id": "RQ-CONTEXT-02",
+      "crate": "akzio-context",
+      "test": "compact_coverage_preserves_all_asset_horizons_and_exact_claim_verification",
+      "claim": "Projection preserves asset and horizon coverage"
+    },
+    {
+      "id": "RQ-CONTEXT-03",
+      "crate": "akzio-context",
+      "test": "producer_scope_distinguishes_additional_coverage_without_disclosing_ungranted_ids",
+      "claim": "Producer overlap does not disclose ungranted IDs"
+    },
+    {
+      "id": "RQ-CONTEXT-04",
+      "crate": "akzio-context",
+      "test": "required_document_metadata_and_facts_are_not_duplicated",
+      "claim": "Required material is not duplicated"
+    },
+    {
+      "id": "RQ-CONTEXT-05",
+      "crate": "akzio-context",
+      "test": "collected_availability_is_not_context_selection",
+      "claim": "Collected does not imply selected"
+    },
+    {
+      "id": "RQ-CONTEXT-06",
+      "crate": "akzio-context",
+      "test": "invesco_json_holdings_are_bounded_and_ranked_by_exact_weight",
+      "claim": "Bounded holdings retain exact weight ranking"
+    },
+    {
+      "id": "RQ-CONTEXT-07",
+      "crate": "akzio-context",
+      "test": "short_holdings_table_is_not_reported_as_omitted",
+      "claim": "Complete short projection is not marked omitted"
+    },
+    {
+      "id": "RQ-CONTEXT-08",
+      "crate": "akzio-context",
+      "test": "no_read_projection_preserves_facts_and_removes_tool_advice",
+      "claim": "No-read projection preserves facts"
+    },
+    {
+      "id": "RQ-REVIEW-01",
+      "crate": "akzio-domain",
+      "test": "issues_require_rejected_scope_and_matching_field",
+      "claim": "Rejected scope requires bounded typed issues"
+    },
+    {
+      "id": "RQ-REVIEW-02",
+      "crate": "akzio-domain",
+      "test": "legacy_review_keeps_decoding_without_issues",
+      "claim": "Historic reviews keep their wire compatibility"
+    },
+    {
+      "id": "RQ-REVIEW-03",
+      "crate": "akzio-domain",
+      "test": "issue_id_ignores_prose",
+      "claim": "Issue identity does not reset after prose edits"
+    },
+    {
+      "id": "RQ-REVIEW-04",
+      "crate": "akzio-domain",
+      "test": "revision_preserves_accepted_forecasts_and_basis",
+      "claim": "Unrelated accepted forecasts and bases are frozen"
+    },
+    {
+      "id": "RQ-REVIEW-05",
+      "crate": "akzio-domain",
+      "test": "allocation_revision_can_rebalance_without_freezing_portfolio_dependencies",
+      "claim": "Dependent allocation can be rebalanced"
+    },
+    {
+      "id": "RQ-REVIEW-06",
+      "crate": "akzio-domain",
+      "test": "stagnation_ignores_reworded_rationale",
+      "claim": "Rewording is not repair progress"
+    },
+    {
+      "id": "RQ-REVIEW-07",
+      "crate": "akzio-domain",
+      "test": "new_evidence_breaks_stagnation",
+      "claim": "New immutable evidence permits further repair"
+    },
+    {
+      "id": "RQ-REVIEW-08",
+      "crate": "akzio-domain",
+      "test": "accepted_scope_progress_breaks_stagnation",
+      "claim": "Newly accepted scope is progress"
+    },
+    {
+      "id": "RQ-LESSON-01",
+      "crate": "akzio-context",
+      "test": "lesson_scope_filters_before_recency",
+      "claim": "Scope filtering precedes recency"
+    },
+    {
+      "id": "RQ-LESSON-02",
+      "crate": "akzio-context",
+      "test": "lesson_ranking_prefers_explicit_requested_scope",
+      "claim": "Specific matching scope outranks generic scope"
+    },
+    {
+      "id": "RQ-LESSON-03",
+      "crate": "akzio-context",
+      "test": "exact_lesson_duplicates_normalize_only_whitespace",
+      "claim": "Only exact normalized content is collapsed"
+    },
+    {
+      "id": "RQ-LESSON-04",
+      "crate": "akzio-context",
+      "test": "lesson_scope_and_exclusions_prevent_duplicate_collapse",
+      "claim": "Scope and exclusions distinguish lessons"
+    },
+    {
+      "id": "RQ-LESSON-05",
+      "crate": "akzio-context",
+      "test": "expired_lesson_is_not_retrievable",
+      "claim": "Expired governance prevents recall"
+    },
+    {
+      "id": "RQ-LESSON-06",
+      "crate": "akzio-context",
+      "test": "usage_exhaustion_requires_revalidation",
+      "claim": "Usage budget is enforced"
+    },
+    {
+      "id": "RQ-LESSON-07",
+      "crate": "akzio-context",
+      "test": "conflicting_lesson_component_is_kept_whole_or_excluded",
+      "claim": "Conflict components are atomic under the selection cap"
+    },
+    {
+      "id": "RQ-LESSON-08",
+      "crate": "akzio-context",
+      "test": "active_snapshot_includes_relevant_lesson_behind_fifty_newer_entries",
+      "claim": "Snapshot pagination includes older relevant lessons"
+    }
+  ]
+}

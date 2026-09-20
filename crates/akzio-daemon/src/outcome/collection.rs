@@ -17,6 +17,13 @@ impl Daemon {
                     "Paper outcome worker requires Alpaca Paper evidence adapter".to_owned(),
                 )
             })?;
+        let market_day = akzio_ingest::market_session_day(now);
+        // Overnight T0 belongs to the following trading date. Before that
+        // date (and on T0 itself), no post-baseline daily session can exist.
+        // Defer before minting a need or requesting an inverted/future range.
+        if market_day <= schedule.baseline_trading_day {
+            return Ok(None);
+        }
         let decision_artifact = self.store.artifact(&schedule.decision.artifact_id)?;
         let decision: Decision =
             serde_json::from_slice(&self.store.read_blob(&decision_artifact.blob)?)?;
@@ -60,8 +67,7 @@ impl Daemon {
                 "bars:{}:1d:{}:252:raw:{}",
                 asset.symbol(),
                 schedule.baseline_trading_day,
-                akzio_ingest::market_session_day(now)
-                    .min(schedule.baseline_trading_day + Duration::days(366))
+                market_day.min(schedule.baseline_trading_day + Duration::days(366))
             );
             let need = EvidenceNeed {
                 schema_version: akzio_domain::DOMAIN_SCHEMA_VERSION,
@@ -104,8 +110,7 @@ impl Daemon {
             .collect::<Vec<_>>();
         if common_dates.len() < 5
             && (bars_by_asset.values().any(|bars| bars.len() >= 252)
-                || akzio_ingest::market_session_day(now)
-                    >= schedule.baseline_trading_day + Duration::days(366))
+                || market_day >= schedule.baseline_trading_day + Duration::days(366))
         {
             return Err(DaemonError::Unavailable(
                 "common-session search exhausted the bounded 252-bar/366-day window".to_owned(),

@@ -37,6 +37,7 @@ public struct TooltipPopover<Label: View, Content: View>: View {
     }
 
     public var body: some View {
+        // hover 时取消旧 Task 再启动新 Task；离开立即隐藏，延迟任务即使稍后醒来也会因取消而不显示。
         label
             .overlay(alignment: alignment) {
                 if isVisible {
@@ -57,6 +58,7 @@ public struct TooltipPopover<Label: View, Content: View>: View {
                 if hovering {
                     let delay: Duration = instant ? .milliseconds(0) : .milliseconds(380)
                     hoverTask = Task {
+                        // Task 的 sleep 只负责延迟，不持有业务资源；SwiftUI 状态写回仍发生在当前 actor。
                         try? await Task.sleep(for: delay)
                         guard !Task.isCancelled else { return }
                         withAnimation(policy.resolve(.easeOut(duration: 0.14))) { isVisible = true }
@@ -101,6 +103,7 @@ public struct StatusExplanation: View {
     }
 
     public var body: some View {
+        // 只在有 detail 时渲染说明；nil 状态不会占位，也不会把 unavailable 误写成数值。
         if let detail = overrideDetail ?? status.detail {
             HStack(spacing: 5) {
                 Image(systemName: status.style.symbol)
@@ -127,6 +130,7 @@ public struct UnavailableValue: View {
     }
 
     public var body: some View {
+        // 缺失值始终显示语义图标和文案；该 View 不把缺失转成 0 或空字符串。
         HStack(spacing: 4) {
             Image(systemName: kind.status.style.symbol)
                 .font(.system(size: size * 0.72, weight: .medium))

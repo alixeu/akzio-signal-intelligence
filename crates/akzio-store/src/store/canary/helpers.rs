@@ -1,3 +1,5 @@
+// 从 campaign 表读取一个可选的 immutable head，并把 JSON、revision、时间恢复为领域对象。
+// campaign 不存在返回 None；负 revision 或坏 JSON/时间属于 Store 完整性错误。
 fn read_campaign(
     connection: &Connection,
     campaign_id: &ContentHash,
@@ -35,6 +37,8 @@ fn read_campaign(
     }))
 }
 
+// 按当前阶段读取旧式单 session 表，同时兼容历史 canary10/25/50 的 level 序列化名称。
+// 该路径只恢复 legacy session；cohort 绑定字段由 paired cohort 表单独保存。
 fn read_session(
     connection: &Connection,
     campaign_id: &ContentHash,
@@ -88,6 +92,7 @@ fn read_session(
     }))
 }
 
+// 通过 cohort_id 和 session_key 读取唯一 paired session，并交给统一列转换器做领域校验。
 fn read_cohort_session_by_key(
     connection: &Connection,
     cohort_id: &ContentHash,
@@ -105,6 +110,7 @@ fn read_cohort_session_by_key(
         .transpose()
 }
 
+// 读取一个 cohort 的全部 paired sessions，并按 session_key 稳定排序后逐条转换。
 fn read_cohort_sessions(
     connection: &Connection,
     cohort_id: &ContentHash,
@@ -120,6 +126,8 @@ fn read_cohort_sessions(
         .collect()
 }
 
+// 根据 campaign 当前阶段判断 reservation 是否必须绑定 cohort、market day 和 regime，
+// 或者必须保持 legacy session 的三个字段为空；这里不修改 reservation。
 fn validate_session_cohort(
     campaign: &CanaryCampaignHead,
     reservation: &CanarySessionReservation,

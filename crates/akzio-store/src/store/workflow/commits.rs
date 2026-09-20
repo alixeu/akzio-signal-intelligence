@@ -50,6 +50,7 @@ impl Store {
         )?;
         cancel_queued_tasks(&transaction, run_id, now)?;
         refresh_run_status(&transaction, run_id, now)?;
+        super::run_control::settle_continuous(&transaction, run_id, now)?;
         transaction.commit()?;
         Ok(true)
     }
@@ -116,6 +117,7 @@ impl Store {
     ) -> StoreResult<RetryTaskResult> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_workflow_executable(&transaction, &permit.run_id)?;
         assert_permit(&transaction, permit)?;
         let (retry, on_failure) = task_retry_policy(&transaction, &permit.task_id)?;
         let attempt_count = task_failure_attempt_count(&transaction, &permit.task_id)?;
@@ -166,15 +168,6 @@ impl Store {
         Ok(RetryTaskResult::Terminal(status))
     }
 
-    pub fn claim_next_task(
-        &self,
-        worker_id: &str,
-        now: DateTime<Utc>,
-        lease_for: Duration,
-    ) -> StoreResult<Option<ClaimedAttempt>> {
-        self.claim_next_task_for_workload(worker_id, now, lease_for, TaskWorkload::Any)
-    }
-
     pub fn claim_next_task_for_workload(
         &self,
         worker_id: &str,
@@ -199,15 +192,16 @@ impl Store {
         let selected = transaction
             .query_row(
         r#"SELECT t.task_id, t.run_id, t.recipe_id, t.objective, t.contract_hash, t.priority,
-        t.budget_json, t.retry_json, t.on_failure, t.parent_task_id, t.input_artifacts_json
+        t.budget_json, t.retry_json, t.on_failure, t.parent_task_id, t.input_artifacts_json, t.node_spec_json
                     FROM rebuild_tasks AS t
                     JOIN rebuild_runs AS r ON r.run_id = t.run_id
-                    LEFT JOIN rebuild_debug_sessions AS debug ON debug.run_id = t.run_id
+                    LEFT JOIN rebuild_run_controls AS debug ON debug.run_id = t.run_id
                WHERE t.status = 'queued' AND t.ready_at <= ?1
-                 AND (debug.run_id IS NOT NULL OR NOT EXISTS (SELECT 1 FROM rebuild_metadata WHERE key='debug_environment'))
-                 AND (debug.run_id IS NULL OR (debug.runtime_identity = ?4 AND (debug.status = 'running'
+                 AND (debug.identity_artifact_id IS NOT NULL OR NOT EXISTS (SELECT 1 FROM rebuild_metadata WHERE key='debug_environment'))
+                 AND (debug.identity_artifact_id IS NULL OR debug.runtime_identity = ?4)
+                 AND (debug.status = 'running'
                       OR (debug.status = 'stepping' AND debug.permitted_task_id = t.task_id
-                          AND debug.active_attempt_id IS NULL))))
+                          AND debug.active_attempt_id IS NULL))
                  AND (?3 = 0 OR (?3 = 1 AND t.recipe_id != ?2) OR (?3 = 2 AND t.recipe_id = ?2))
                  AND (r.status IN ('queued', 'running')
                       OR (r.status = 'completed' AND t.recipe_id = ?2))
@@ -228,6 +222,7 @@ impl Store {
             transaction.commit()?;
             return Ok(None);
         };
+        assert_workflow_executable(&transaction, &run_id)?;
         node.dependencies = task_dependencies(&transaction, &node.task_id)?;
         let permit = TaskWritePermit {
             run_id: run_id.clone(),

@@ -13,18 +13,35 @@ pub(crate) struct PaperExecution<'a> {
 }
 
 impl<'a> PaperExecution<'a> {
+    // 绑定当前 Daemon 的 Store、Gate runtime 和 Paper 调度器；本门面不拥有独立状态。
     pub(crate) const fn new(daemon: &'a Daemon) -> Self {
         Self { daemon }
     }
 
+    // 选择最终 ProposalReview 通过的提案（若存在），否则读取任务终态提案；拒绝审查
+    // 会阻断 Decision。decide 返回并持久化 Decision 结果，但不代表已通过 ExecutionGate。
     pub(crate) fn decision_gate(
         &self,
         task: &ClaimedAttempt,
         now: DateTime<Utc>,
     ) -> Result<TaskCompletion> {
-        let proposal = self
+        let proposal = match self
             .daemon
-            .terminal_input(task, ArtifactKind::DecisionProposal)?;
+            .store
+            .final_proposal_review(&task.run_id, &task.node.task_id)?
+        {
+            // 审查通过时以 Review 绑定的精确 Proposal 为准；审查拒绝不能回退到旧提案，
+            // 没有审查记录时才沿用任务的 DecisionProposal 终态输入。
+            Some((_, review)) if review.accepted() => review.proposal,
+            Some(_) => {
+                return Err(DaemonError::InvalidInput(
+                    "final proposal review rejected; revision limit exhausted".into(),
+                ))
+            }
+            None => self
+                .daemon
+                .terminal_input(task, ArtifactKind::DecisionProposal)?,
+        };
         self.daemon.decision_runtime.decide(&DecisionGateInput {
             permit: task.permit.clone(),
             proposal,
@@ -33,6 +50,8 @@ impl<'a> PaperExecution<'a> {
         Ok(TaskCompletion::Committed)
     }
 
+    // 获取 DecisionContext 和当前执行快照，先处理真实闭市延期，再把全部输入交给
+    // ExecutionGate；Committed 只表示 ExecutionVerdict 已写入 Store，不等于订单受理或成交。
     pub(crate) async fn execution_gate(
         &self,
         task: &ClaimedAttempt,
@@ -56,10 +75,31 @@ impl<'a> PaperExecution<'a> {
                     refreshed.quote_error,
                 )
             } else {
+                // 非生产 Alpaca 路径只读取任务已绑定的快照；生产 Paper 必须在此处
+                // 重新刷新账户、报价和时钟，不能用研究阶段的旧观察替代执行时点数据。
                 let (account, quotes, clock) = self.daemon.execution_snapshot_inputs(task)?;
                 (account, quotes, clock, None)
             };
         let gate_now = Utc::now();
+        // A real closed session is a scheduling wait, not execution permission.
+        // No verdict/plan is committed; the next attempt reacquires all snapshots
+        // and reevaluates the unchanged Decision validity and every Gate.
+        if let Some(reference) = &market_clock_snapshot {
+            // 仅对仍在 Decision validity 内、且时钟观察没有越过新鲜度边界的 Closed
+            // session 延期；延期不提交 Verdict，下一次 Attempt 会重新取三类快照。
+            let clock: MarketClockSnapshot = self.daemon.read_artifact_payload(reference)?;
+            let decision: DecisionContext = self.daemon.read_artifact_payload(&decision_context)?;
+            if let Some(wake) = closed_session_wake(
+                &clock,
+                decision.validity.as_ref(),
+                self.daemon.execution_runtime.execution_policy(),
+                gate_now,
+            ) {
+                return Ok(TaskCompletion::DeferredUntil(wake));
+            }
+        }
+        // 缺少或不合格的执行安全输入由 execution runtime 形成持久化 NoOrder；这里不
+        // 通过 daemon 层补造账户、报价、批准或风险证据。
         let pretrade_safety = self.pretrade_safety_evidence(
             task,
             &decision_context,
@@ -90,6 +130,8 @@ impl<'a> PaperExecution<'a> {
         Ok(TaskCompletion::Committed)
     }
 
+    // 从已持久化的 Decision、执行快照和研究证据构造 PreTradeSafetyEvidence；缺少
+    // Paper approval 或任一必需快照时返回 None，让 ExecutionGate 保持 fail-closed。
     fn pretrade_safety_evidence(
         &self,
         task: &ClaimedAttempt,
@@ -147,6 +189,8 @@ impl<'a> PaperExecution<'a> {
             .collect::<BTreeMap<_, _>>();
         let content_policy = FinancialContentPolicy::default();
         for reference in &decision.evidence {
+            // 只汇总 Decision 已绑定的 NormalizedEvidence；研究证据的来源、质量和
+            // 财经内容分类都保留到依赖闭包，RawEvidence 不在此处直接参与执行判定。
             if reference.kind != ArtifactKind::NormalizedEvidence {
                 continue;
             }
@@ -166,6 +210,8 @@ impl<'a> PaperExecution<'a> {
             if let Ok(GovernedResource::AlpacaBars { asset, .. }) =
                 GovernedResource::parse(payload.source, &payload.resource)
             {
+                // 量化流动性信息仅在已解析的 Alpaca bars 资源中提取；无法解析时保留
+                // 其余证据，不把失败转换成任意流动性数值。
                 if let Some(value) = payload
                     .quant_features
                     .as_ref()
@@ -179,6 +225,8 @@ impl<'a> PaperExecution<'a> {
                     .or_insert(InformationClassification::Public);
             }
             if let Some(content) = payload.financial_content {
+                // 会阻断交易的内容把相关目标标成 Unknown；其余实体分类按最严格值
+                // 合并，避免一条较弱观察覆盖已存在的更高风险分类。
                 let content_blocks_trading = content.blocks_trading(&content_policy);
                 let classification = if content_blocks_trading {
                     InformationClassification::Unknown
@@ -211,15 +259,15 @@ impl<'a> PaperExecution<'a> {
             }
         }
 
-        let (manifest, _) = self
-            .daemon
-            .store
-            .paper_approval_for_run(&task.run_id)?
-            .ok_or_else(|| {
-                DaemonError::InvalidInput(
-                    "Paper pre-trade safety requires an approved runtime manifest".to_owned(),
-                )
-            })?;
+        // Pre-trade safety is assessed against the approved runtime manifest.
+        // Without approval no assessment can be made and none is asserted:
+        // ExecutionGate already holds UnqualifiedRuntime and skips allocation,
+        // so the verdict remains a durable NoOrder without execution authority.
+        let Some((manifest, _)) = self.daemon.store.paper_approval_for_run(&task.run_id)? else {
+            return Ok(None);
+        };
+        // Overnight 的执行行情必须与运行时批准的 feed 对齐：SIP 映射为 BOATS，
+        // 其他配置使用 overnight；这只建立依赖快照，不放宽后续行情质量 Gate。
         let model_freshness_secs = decision
             .validity
             .as_ref()
@@ -227,8 +275,17 @@ impl<'a> PaperExecution<'a> {
             .max(1);
         let model_dependency =
             self.persisted_model_dependency(&task.run_id, &manifest, model_freshness_secs, now)?;
+        let execution_feed = if clock.trading_session() == akzio_domain::TradingSession::Overnight {
+            if manifest.market_data_feed.eq_ignore_ascii_case("sip") {
+                "boats"
+            } else {
+                "overnight"
+            }
+        } else {
+            &manifest.market_data_feed
+        };
         let market_data_dependency =
-            market_data_dependency(&manifest.market_data_feed, &quote_observation, now);
+            market_data_dependency(execution_feed, &quote_observation, now);
         let broker_dependency = alpaca_service_dependency(
             DependencyKind::Broker,
             "paper-account",
@@ -283,6 +340,8 @@ impl<'a> PaperExecution<'a> {
             .validate()
             .map_err(|error| DaemonError::InvalidInput(error.to_string()))?;
 
+        // 返回的只是给 ExecutionGate 使用的依赖/安全观察集合；它本身不产生
+        // ExecutionPlan、Commitment 或 Broker 写入。
         Ok(Some(PreTradeSafetyEvidence {
             homogeneous_agent_count: 1,
             average_daily_dollar_volume,
@@ -292,6 +351,8 @@ impl<'a> PaperExecution<'a> {
         }))
     }
 
+    // 校验引用对应的 Artifact kind 并提取 provenance；对组合账户快照额外检查四个
+    // NormalizedEvidence 是否来自同一服务和 source family，并以最早检索时间约束新鲜度。
     fn persisted_observation(&self, reference: &ArtifactRef) -> Result<PersistedObservation> {
         let artifact = self.daemon.store.artifact(&reference.artifact_id)?;
         if artifact.kind != reference.kind {
@@ -313,6 +374,7 @@ impl<'a> PaperExecution<'a> {
             .filter(|source| source.kind == ArtifactKind::NormalizedEvidence)
             .collect::<Vec<_>>();
         if sources.len() != 4 {
+            // 组合快照来源不完整时保留原始 Partial 观察，不能把缺失来源当成同源成功。
             return Ok(observation);
         }
         let mut combined: Option<(String, PersistedObservation)> = None;
@@ -324,6 +386,7 @@ impl<'a> PaperExecution<'a> {
                 .as_deref()
                 .and_then(|uri| uri.split_once("://"))
             else {
+                // 任一来源没有可解析的网络 URI，就无法证明组合快照的统一外部来源。
                 return Ok(observation);
             };
             let host = remainder.split(['/', '?', '#']).next().unwrap_or_default();
@@ -332,6 +395,8 @@ impl<'a> PaperExecution<'a> {
             }
             let origin = format!("{scheme}://{}", host.to_ascii_lowercase());
             if let Some((prior_origin, prior)) = &mut combined {
+                // 不同 host/origin 或 source family 的输入不得合并成一个健康观察；
+                // 同源时取最早 retrieved_at，保守保持整个组合的有效窗口。
                 if *prior_origin != origin || prior.source_family != current.source_family {
                     return Ok(observation);
                 }
@@ -345,6 +410,8 @@ impl<'a> PaperExecution<'a> {
             .unwrap_or(observation))
     }
 
+    // 在当前 Run 的 AgentTurn 中寻找最新 Synthesizer capability snapshot，比较配置的
+    // RuntimeManifest 与实际模型身份；找不到 durable snapshot 时明确标为 Unavailable。
     fn persisted_model_dependency(
         &self,
         run_id: &RunId,
@@ -358,6 +425,8 @@ impl<'a> PaperExecution<'a> {
             .store
             .recent_artifacts_by_kind(ArtifactKind::AgentTurn, 500)?
         {
+            // 仅接受本 Run、research.synthesizer 请求的 AgentTurn，避免把其他 Run 或
+            // 其他角色的模型调用伪装成当前 Decision 的模型依赖。
             if artifact
                 .origin
                 .as_ref()
@@ -382,6 +451,8 @@ impl<'a> PaperExecution<'a> {
                     )
                 })?,
             )?;
+            // 多次调用只取 created_at 最新的一次；读取 capability 失败直接传播，不能
+            // 用“配置看起来正确”掩盖持久化模型身份缺失。
             if latest
                 .as_ref()
                 .is_none_or(|(prior, _): &(Artifact, _)| prior.created_at < artifact.created_at)
@@ -409,6 +480,8 @@ impl<'a> PaperExecution<'a> {
                     actual_service,
                 )
             } else {
+                // 没有当前 Run 的真实 AgentTurn 时，依赖仍记录配置身份，但健康状态
+                // 为 Unavailable，供后续 Gate 继续 fail-closed。
                 (
                     manifest.provider_id.clone(),
                     manifest.model_id.clone(),
@@ -436,6 +509,8 @@ impl<'a> PaperExecution<'a> {
         ))
     }
 
+    // 从最近持久化的回执和 ExecutionPlan 推导合规基线：每个 client_order_id 只保留
+    // 最新状态，再计算提交/撤改单和同一资产买卖并存等指标；这是 Gate 输入快照，不是成交真值。
     fn recent_compliance_activity(&self, now: DateTime<Utc>) -> Result<ComplianceActivitySnapshot> {
         let cutoff = now - chrono::Duration::days(1);
         let mut latest_receipts = BTreeMap::<String, OrderReceipt>::new();
@@ -444,6 +519,8 @@ impl<'a> PaperExecution<'a> {
             .store
             .recent_artifacts_by_kind(ArtifactKind::OrderReceipt, 500)?
         {
+            // 时间窗先限制在过去 24 小时到 now，随后按 client_order_id 去重，避免重放
+            // 回执重复放大合规计数。
             let receipt: OrderReceipt = self.daemon.read_artifact_payload(&ArtifactRef {
                 artifact_id: artifact.artifact_id,
                 kind: ArtifactKind::OrderReceipt,
@@ -506,6 +583,8 @@ impl<'a> PaperExecution<'a> {
                     | OrderReceiptState::Calculated
             )
         }) {
+            // 回执只说明当前订单状态；通过 plan_hash 反查方向后再统计同资产双向活跃，
+            // 找不到对应计划时不猜测订单方向。
             if let Some(side) = plans
                 .iter()
                 .find(|plan| plan.plan_hash == receipt.plan_hash)
@@ -537,6 +616,8 @@ impl<'a> PaperExecution<'a> {
         })
     }
 
+    // 仅接受 ExecutionGate 的 Accepted verdict，读取有效 broker session 后通过
+    // PaperCommitment runtime 写入确定性 Commitment；NoOrder 不产生 Commitment。
     pub(crate) fn commit(
         &self,
         task: &ClaimedAttempt,
@@ -569,9 +650,13 @@ impl<'a> PaperExecution<'a> {
                 session_key,
                 now,
             })?;
+        // 这里的 Committed 是执行承诺已持久化并通过 lease 边界，不表示 Alpaca 已受理
+        // 或已成交；实际外部 Broker I/O 只在后续 Reconcile 阶段发生。
         Ok(TaskCompletion::Committed)
     }
 
+    // 对 Accepted Commitment 执行 Paper Broker 对账；NoOrder 直接结束该节点，调试
+    // Broker 阻断和未结算回执都保留 Deferred 边界，不把受理状态写成最终成交。
     pub(crate) async fn reconcile(
         &self,
         task: &ClaimedAttempt,
@@ -598,6 +683,7 @@ impl<'a> PaperExecution<'a> {
             &[verdict.clone(), commitment.clone()],
             now,
         )? {
+            // Debug 默认禁止 Broker 写入；保持任务可恢复等待，而不是绕过控制策略。
             return Ok(TaskCompletion::DeferredUntil(now + Duration::seconds(1)));
         }
         let broker = self.daemon.paper.paper_broker.as_ref().ok_or_else(|| {
@@ -622,10 +708,97 @@ impl<'a> PaperExecution<'a> {
         if output.settled {
             Ok(TaskCompletion::Committed)
         } else {
+            // 短轮询未得到终态时保留已提交 Commitment，下一次 Reconcile 继续读取/对账。
             Ok(TaskCompletion::DeferredUntil(
-                now + chrono::Duration::seconds(1),
+                Utc::now() + chrono::Duration::seconds(1),
             ))
         }
+    }
+}
+
+// 只有有效且未过期的 Decision 在可接受年龄范围内遇到 Closed session 才延期；唤醒时间
+// 取下次开市与 Decision validity 的较早者，并至少向未来推进一秒，避免立即忙循环。
+fn closed_session_wake(
+    clock: &MarketClockSnapshot,
+    validity: Option<&akzio_domain::DecisionValidity>,
+    policy: &akzio_execution::ExecutionPolicy,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let session = clock.session.as_ref()?;
+    let validity = validity.filter(|v| v.is_valid_at(now))?;
+    let age = now.signed_duration_since(clock.observed_at).num_seconds();
+    if session.kind != akzio_domain::TradingSession::Closed
+        || age < -policy.max_future_skew_secs
+        || age > policy.max_clock_age_secs
+    {
+        return None;
+    }
+    Some(
+        session
+            .next_open
+            .unwrap_or(now + Duration::minutes(5))
+            .min(validity.valid_until)
+            .max(now + Duration::seconds(1)),
+    )
+}
+
+#[cfg(test)]
+mod session_wait_tests {
+    use super::*;
+
+    #[test]
+    fn closed_wait_expires_with_decision_and_rechecks_new_session() {
+        let now = "2026-09-05T16:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let mut clock = MarketClockSnapshot {
+            schema_version: akzio_domain::DOMAIN_SCHEMA_VERSION,
+            broker_session: "2026-09-05".into(),
+            observed_at: now,
+            is_open: false,
+            session: Some(akzio_domain::TradingSessionSnapshot {
+                kind: akzio_domain::TradingSession::Closed,
+                trade_date: now.date_naive(),
+                next_open: Some(now + Duration::days(2)),
+                ends_at: None,
+                overnight_assets: BTreeSet::new(),
+            }),
+        };
+        let validity = akzio_domain::DecisionValidity {
+            evidence_cutoff: now,
+            generated_at: now,
+            valid_until: now + Duration::minutes(5),
+            maximum_execution_delay_ms: 300_000,
+            market_state_hash: ContentHash::of_bytes(b"fixture"),
+        };
+        let policy = akzio_execution::ExecutionPolicy::default();
+        assert_eq!(
+            closed_session_wake(&clock, Some(&validity), &policy, now),
+            Some(validity.valid_until)
+        );
+        assert_eq!(
+            closed_session_wake(
+                &clock,
+                Some(&validity),
+                &policy,
+                validity.valid_until + Duration::seconds(1)
+            ),
+            None
+        );
+        clock.observed_at = now - Duration::seconds(policy.max_clock_age_secs + 1);
+        assert_eq!(
+            closed_session_wake(&clock, Some(&validity), &policy, now),
+            None
+        );
+        clock.observed_at = now;
+        clock.session.as_mut().unwrap().next_open = Some(now + Duration::minutes(1));
+        assert_eq!(
+            closed_session_wake(&clock, Some(&validity), &policy, now),
+            Some(now + Duration::minutes(1))
+        );
+        clock.session.as_mut().unwrap().kind = akzio_domain::TradingSession::Overnight;
+        assert_eq!(
+            closed_session_wake(&clock, Some(&validity), &policy, now),
+            None
+        );
     }
 }
 
@@ -638,6 +811,8 @@ struct PersistedObservation {
 }
 
 impl PersistedObservation {
+    // 从 Artifact provenance 提取检索时间、来源族、URI 和网络 host，供依赖闭包使用；
+    // provenance 缺失时保留 None，后续状态判断负责区分 Partial/Unavailable。
     fn from_artifact(artifact: &Artifact) -> Self {
         let source_uri = artifact.provenance.source_uri.clone();
         Self {
@@ -660,6 +835,7 @@ struct EvidenceDependencyAggregate {
 }
 
 impl EvidenceDependencyAggregate {
+    // 吸收一条标准化证据的来源、版本、网络依赖和质量缺口，后续 snapshot 再统一归并。
     fn observe(&mut self, payload: &NormalizedEvidencePayload, observation: &PersistedObservation) {
         self.providers.insert(observation.source_family.clone());
         self.services.insert(payload.source.as_str().to_owned());
@@ -689,6 +865,8 @@ impl EvidenceDependencyAggregate {
         decision_created_at: DateTime<Utc>,
         captured_at: DateTime<Utc>,
     ) -> (DependencyKind, DependencySnapshot) {
+        // 没有观察到该类证据时显式返回 NotRequired；有观察但质量不完整时只降为
+        // Partial，不把部分 citations/coverage 提升为 Healthy。
         let Some(observed_at) = self.latest_retrieval else {
             return dependency_snapshot(
                 DependencyDescriptor {
@@ -741,6 +919,7 @@ struct DependencyDescriptor {
     fallback_policy: FallbackPolicy,
 }
 
+// 将内部描述字段和运行时状态组装为带配置/实际服务身份的持久化依赖快照。
 fn dependency_snapshot(
     descriptor: DependencyDescriptor,
     observed_at: DateTime<Utc>,
@@ -777,6 +956,8 @@ fn dependency_snapshot(
     )
 }
 
+// 根据批准的执行 feed 和 provenance 判断行情依赖状态；未经观察的真实 feed 为
+// Partial，fixture 只允许显式的 fixture 例外，夜间非 SIP/BOATS 继续 Degraded。
 fn market_data_dependency(
     configured_feed: &str,
     observation: &PersistedObservation,
@@ -791,7 +972,11 @@ fn market_data_dependency(
         .source_uri
         .as_deref()
         .is_some_and(|uri| uri.starts_with("fixture://"));
-    let status = if !configured_feed.eq_ignore_ascii_case("sip") {
+    // Indicative overnight data retains the existing degraded-data restriction.
+    let status = if !matches!(
+        configured_feed.to_ascii_lowercase().as_str(),
+        "sip" | "boats"
+    ) {
         DependencyHealthStatus::Degraded
     } else if observed_feed.is_none() && !fixture {
         DependencyHealthStatus::Partial
@@ -823,6 +1008,7 @@ fn market_data_dependency(
     )
 }
 
+// 记录由当前 Rust/Store/Manifest 直接提供、无需外部网络观察的健康内部依赖。
 fn internal_healthy_dependency(
     kind: DependencyKind,
     service: &str,
@@ -848,6 +1034,8 @@ fn internal_healthy_dependency(
     )
 }
 
+// 将 Alpaca 账户或时钟观察映射为配置服务与实际 host；缺少 source URI 时保留 Partial，
+// 不凭服务名推断已经建立了外部连接。
 fn alpaca_service_dependency(
     kind: DependencyKind,
     data_classification: &str,
@@ -889,6 +1077,8 @@ fn alpaca_service_dependency(
     )
 }
 
+// 从成功的网络观察中派生 DNS 依赖；fixture 没有网络 host 时是 NotApplicable，真实
+// 运行没有任何 host 则是 Unavailable。
 fn dns_dependency(
     successful_network_observations: &[PersistedObservation],
     fixture_runtime: bool,
@@ -929,6 +1119,7 @@ fn dns_dependency(
     )
 }
 
+// 仅解析 http/https URI 的 host，并统一为小写；fixture 或其他 scheme 不被当作网络成功。
 fn network_host(uri: &str) -> Option<String> {
     let remainder = uri
         .strip_prefix("https://")
@@ -937,6 +1128,7 @@ fn network_host(uri: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
+// 从 URI query 中查找指定的非空参数；不解码或改写值，调用方按自身协议解释结果。
 fn query_parameter<'a>(uri: &'a str, key: &str) -> Option<&'a str> {
     uri.split_once('?')?
         .1
@@ -945,6 +1137,7 @@ fn query_parameter<'a>(uri: &'a str, key: &str) -> Option<&'a str> {
         .find_map(|(candidate, value)| (candidate == key && !value.is_empty()).then_some(value))
 }
 
+// 以 BTreeSet 的稳定顺序合并多个 provider/service/version 标识，形成可复现的审计值。
 fn joined_identity(values: &BTreeSet<String>) -> String {
     values.iter().cloned().collect::<Vec<_>>().join("+")
 }

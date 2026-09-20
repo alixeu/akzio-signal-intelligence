@@ -199,7 +199,8 @@ fn verify_retrospective_history(store: &Store, connection: &Connection) -> Store
     let mut identities = BTreeMap::<_, Vec<(Artifact, Retrospective)>>::new();
     for artifact in read_kind_artifacts(connection, ArtifactKind::Retrospective)? {
         artifact.validate()?;
-        let payload: Retrospective = store.read_artifact_payload(&artifact)?;
+        let payload: Retrospective =
+            store.read_artifact_payload_with_connection(connection, &artifact)?;
         payload.validate()?;
         let run_id = artifact
             .origin
@@ -248,7 +249,8 @@ fn verify_retrospective_history(store: &Store, connection: &Connection) -> Store
                 "retrospective outcome closure is invalid".to_owned(),
             ));
         }
-        let outcome_payload: Outcome = store.read_artifact_payload(&outcome)?;
+        let outcome_payload: Outcome =
+            store.read_artifact_payload_with_connection(connection, &outcome)?;
         if payload.horizon == OutcomeHorizon::T5 {
             outcome_payload.validate_sealed().map_err(|error| {
                 StoreError::Integrity(format!("sealed outcome is invalid: {error}"))
@@ -286,7 +288,8 @@ fn verify_attempt_relation_history(store: &Store, connection: &Connection) -> St
     let mut parent_by_child = BTreeMap::<(RunId, TaskId, AttemptId), AttemptId>::new();
     for artifact in read_kind_artifacts(connection, ArtifactKind::AttemptRelation)? {
         artifact.validate()?;
-        let relation: AttemptRelation = store.read_artifact_payload(&artifact)?;
+        let relation: AttemptRelation =
+            store.read_artifact_payload_with_connection(connection, &artifact)?;
         relation.validate()?;
         let parent_exists = connection
             .query_row(
@@ -358,6 +361,7 @@ fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<(RunId, WorkflowNode
     Ok((
         run_id,
         WorkflowNode {
+            spec: row.get::<_, Option<String>>("node_spec_json")?.map(|v| serde_json::from_str(&v)).transpose().map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?,
             task_id,
             recipe_id,
             contract_hash: row

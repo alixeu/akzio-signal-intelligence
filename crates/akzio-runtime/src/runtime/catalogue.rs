@@ -13,7 +13,6 @@ pub struct TerminalRecipeSet {
 #[derive(Debug, Clone)]
 pub struct RecipeCatalogue {
     pub(super) recipes: BTreeMap<TaskRecipeId, TaskRecipe>,
-    pub(super) planner: TaskRecipeId,
     pub(super) terminals: TerminalRecipeSet,
     pub(super) max_nodes: usize,
 }
@@ -21,7 +20,6 @@ pub struct RecipeCatalogue {
 impl RecipeCatalogue {
     pub fn new(
         recipes: impl IntoIterator<Item = TaskRecipe>,
-        planner: TaskRecipeId,
         terminals: TerminalRecipeSet,
         max_nodes: usize,
     ) -> RuntimeResult<Self> {
@@ -34,14 +32,12 @@ impl RecipeCatalogue {
             .collect::<Result<BTreeMap<_, _>, DomainError>>()?;
         let catalogue = Self {
             recipes,
-            planner,
             terminals,
             max_nodes,
         };
         if catalogue.max_nodes == 0 {
             return Err(RuntimeError::WorkflowNodeLimit);
         }
-        catalogue.assert_planner(&catalogue.planner)?;
         catalogue.assert_terminal(
             &catalogue.terminals.evidence_gate,
             RuntimeTaskClass::Evidence,
@@ -61,14 +57,6 @@ impl RecipeCatalogue {
         catalogue.assert_terminal(&catalogue.terminals.reconcile, RuntimeTaskClass::Reconcile)?;
         catalogue.assert_terminal(&catalogue.terminals.evaluate, RuntimeTaskClass::Evaluate)?;
         Ok(catalogue)
-    }
-
-    pub(super) fn assert_planner(&self, recipe_id: &TaskRecipeId) -> RuntimeResult<()> {
-        let recipe = self.recipe(recipe_id)?;
-        if recipe.task_class != RuntimeTaskClass::Agent || recipe.contract_hash.is_none() {
-            return Err(RuntimeError::PlannerPermitRequired);
-        }
-        Ok(())
     }
 
     pub fn recipe(&self, recipe_id: &TaskRecipeId) -> RuntimeResult<&TaskRecipe> {
@@ -125,8 +113,8 @@ pub struct ActiveContractRecipe {
 
 const ACTIVE_RECIPE_POLICIES: [(&str, ArtifactKind, u8); 4] = [
     (
-        akzio_domain::RESEARCH_PLANNER_RECIPE_ID,
-        ArtifactKind::WorkflowProposalDraft,
+        akzio_domain::RESEARCH_PROPOSAL_REVIEWER_RECIPE_ID,
+        ArtifactKind::ProposalReview,
         100,
     ),
     (
@@ -149,7 +137,6 @@ const ACTIVE_RECIPE_POLICIES: [(&str, ArtifactKind, u8); 4] = [
 pub fn active_recipe_catalogue(
     store: &Store,
     contracts: impl IntoIterator<Item = ActiveContractRecipe>,
-    planner: TaskRecipeId,
     max_nodes: usize,
 ) -> RuntimeResult<RecipeCatalogue> {
     let mut installed_purposes = BTreeSet::new();
@@ -253,36 +240,11 @@ pub fn active_recipe_catalogue(
 
     let (terminal_recipes, terminals) = rust_terminal_recipes()?;
     recipes.extend(terminal_recipes);
-    RecipeCatalogue::new(recipes, planner, terminals, max_nodes)
+    RecipeCatalogue::new(recipes, terminals, max_nodes)
 }
 
 fn recipe_evidence_sources(contract: &akzio_domain::AgentContract) -> BTreeSet<String> {
-    contract
-        .tool_grants
-        .iter()
-        .filter(|grant| grant.kind == akzio_domain::ToolKind::ReadEvidence)
-        .flat_map(|grant| grant.allowed_sources.iter().cloned())
-        .collect()
-}
-
-#[cfg(test)]
-mod news_acquisition_budget_tests {
-    use super::*;
-
-    #[test]
-    fn evidence_recipe_can_complete_two_hosted_model_calls_with_a_finite_deadline() {
-        let (recipes, terminals) = rust_terminal_recipes().unwrap();
-        let evidence = recipes
-            .iter()
-            .find(|recipe| recipe.recipe_id == terminals.evidence_gate)
-            .unwrap();
-        assert_eq!(evidence.budget.max_wall_time_secs, 180);
-        let execution = recipes
-            .iter()
-            .find(|recipe| recipe.recipe_id == terminals.execution_gate)
-            .unwrap();
-        assert_eq!(execution.budget.max_wall_time_secs, 90);
-    }
+    contract.context.permitted_source_families.clone()
 }
 
 pub fn rust_terminal_recipes() -> RuntimeResult<(Vec<TaskRecipe>, TerminalRecipeSet)> {
@@ -292,6 +254,13 @@ pub fn rust_terminal_recipes() -> RuntimeResult<(Vec<TaskRecipe>, TerminalRecipe
     let paper = rust_gate_recipe(PAPER_COMMIT_RECIPE_ID, RuntimeTaskClass::PaperCommit)?;
     let reconcile = rust_gate_recipe(RECONCILE_RECIPE_ID, RuntimeTaskClass::Reconcile)?;
     let evaluate = rust_gate_recipe(EVALUATE_RECIPE_ID, RuntimeTaskClass::Evaluate)?;
+    let mut supplement = rust_gate_recipe(
+        akzio_domain::RESEARCH_SUPPLEMENT_RECIPE_ID,
+        RuntimeTaskClass::ResearchControl,
+    )?;
+    supplement.max_children = 32;
+    supplement.max_depth = 32;
+    supplement.budget.max_wall_time_secs = 180;
     let terminals = TerminalRecipeSet {
         evidence_gate: evidence.recipe_id.clone(),
         decision_gate: decision.recipe_id.clone(),
@@ -301,7 +270,9 @@ pub fn rust_terminal_recipes() -> RuntimeResult<(Vec<TaskRecipe>, TerminalRecipe
         evaluate: evaluate.recipe_id.clone(),
     };
     Ok((
-        vec![evidence, decision, execution, paper, reconcile, evaluate],
+        vec![
+            evidence, decision, execution, paper, reconcile, evaluate, supplement,
+        ],
         terminals,
     ))
 }
@@ -353,4 +324,24 @@ fn rust_gate_recipe(recipe_id: &str, task_class: RuntimeTaskClass) -> RuntimeRes
         retry,
         on_failure: FailureDisposition::FailRun,
     })
+}
+
+#[cfg(test)]
+mod news_acquisition_budget_tests {
+    use super::*;
+
+    #[test]
+    fn evidence_recipe_can_complete_two_hosted_model_calls_with_a_finite_deadline() {
+        let (recipes, terminals) = rust_terminal_recipes().unwrap();
+        let evidence = recipes
+            .iter()
+            .find(|recipe| recipe.recipe_id == terminals.evidence_gate)
+            .unwrap();
+        assert_eq!(evidence.budget.max_wall_time_secs, 180);
+        let execution = recipes
+            .iter()
+            .find(|recipe| recipe.recipe_id == terminals.execution_gate)
+            .unwrap();
+        assert_eq!(execution.budget.max_wall_time_secs, 90);
+    }
 }

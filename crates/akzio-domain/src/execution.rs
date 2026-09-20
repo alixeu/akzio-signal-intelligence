@@ -14,5 +14,6 @@ use crate::{
     TargetPortfolio, DOMAIN_SCHEMA_VERSION,
 };
 include!("execution/snapshots.rs");
+include!("execution/session.rs");
 include!("execution/plan.rs");
 include!("execution/effects.rs");

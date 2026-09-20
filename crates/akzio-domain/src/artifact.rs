@@ -21,6 +21,8 @@ impl fmt::Display for ArtifactId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactKind {
+    /// Durable runtime boundary, never authorized research evidence.
+    RuntimeCheckpoint,
     /// Run-scoped operational audit; never research evidence or canonical learning.
     DebugRecord,
     RawEvidence,
@@ -43,6 +45,7 @@ pub enum ArtifactKind {
     Critique,
     Resolution,
     DecisionProposal,
+    ProposalReview,
     DecisionContext,
     Decision,
     ExecutionContext,
@@ -64,6 +67,12 @@ pub enum ArtifactKind {
     ExperimentTrial,
     SearchBiasCertificate,
     CandidatePolicy,
+    /// Frozen offline calibration consumed by DecisionGate. This is distinct
+    /// from CandidatePolicy, which governs learned Contract/Topology changes.
+    DecisionPolicy,
+    /// Operator-owned risk limits and canonical Outcome-derived calibration inputs.
+    CalibrationRiskLimits,
+    CalibrationDataset,
     Lesson,
     FreezeState,
     QualificationStageReceipt,
@@ -102,6 +111,9 @@ impl ArtifactKind {
                 | Self::ExperimentTrial
                 | Self::SearchBiasCertificate
                 | Self::CandidatePolicy
+                | Self::DecisionPolicy
+                | Self::CalibrationRiskLimits
+                | Self::CalibrationDataset
                 | Self::Lesson
                 | Self::FreezeState
                 | Self::RuntimeManifest
@@ -299,6 +311,27 @@ impl Artifact {
         }
 
         match self.kind {
+            ArtifactKind::RuntimeCheckpoint => {
+                if self.lifecycle != ArtifactLifecycle::RunScoped
+                    || self.producer != "runtime.checkpoint"
+                    || self.provenance.source_family != "akzio.runtime"
+                    || !self.origin.as_ref().is_some_and(|o| {
+                        o.run_id.is_some()
+                            && o.task_id.is_none()
+                            && o.attempt_id.is_none()
+                            && o.contract_hash.is_none()
+                    })
+                    || !self
+                        .source_refs
+                        .iter()
+                        .any(|r| r.kind == ArtifactKind::WorkflowGraph)
+                {
+                    return Err(DomainError::EmptyField {
+                        field: "artifact.runtime_checkpoint_scope",
+                    });
+                }
+                Ok(())
+            }
             ArtifactKind::RawEvidence if !self.source_refs.is_empty() => {
                 Err(DomainError::EmptyField {
                     field: "artifact.raw_source_refs",
@@ -355,7 +388,32 @@ impl Artifact {
                         ArtifactKind::RawEvidence | ArtifactKind::NormalizedEvidence
                     )
                 });
-                if self.source_refs.is_empty() || collection_status || has_evidence {
+                let research_audit = match self.producer.as_str() {
+                    "research.revision.stop" => self
+                        .source_refs
+                        .iter()
+                        .any(|r| r.kind == ArtifactKind::ProposalReview),
+                    "learning.revalidation.suggestion" | "learning.retrieval.audit" => self
+                        .source_refs
+                        .iter()
+                        .any(|r| r.kind == ArtifactKind::Lesson),
+                    "context.coverage" => self
+                        .source_refs
+                        .iter()
+                        .any(|r| r.kind == ArtifactKind::ContextManifest),
+                    "research.supplement.started"
+                    | "research.supplement.disposition"
+                    | "research.supplement.result" => self
+                        .source_refs
+                        .iter()
+                        .any(|r| matches!(r.kind, ArtifactKind::Claim | ArtifactKind::Critique)),
+                    _ => false,
+                };
+                if self.source_refs.is_empty()
+                    || collection_status
+                    || has_evidence
+                    || research_audit
+                {
                     Ok(())
                 } else {
                     Err(DomainError::EmptyField {

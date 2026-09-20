@@ -42,32 +42,6 @@ public enum SharedElementID: Hashable, Sendable {
     /// Sentinel used only when a view intentionally has no shared namespace.
     case noSharedElement
 
-    /// Namespace key string, useful for debugging overlays.
-    public var debugName: String {
-        switch self {
-        case .signalUniverse: "signalUniverse"
-        case .currentNode: "currentNode"
-        case .workflowProgress: "workflowProgress"
-        case .roleCard(let role): "roleCard.\(role.rawValue)"
-        case .confidenceRing: "confidenceRing"
-        case .modelName: "modelName"
-        case .equityValue: "equityValue"
-        case .sparkline: "sparkline"
-        case .positionCard(let asset): "positionCard.\(asset.rawValue)"
-        case .equityLatestPoint: "equityLatestPoint"
-        case .portfolioReturn: "portfolioReturn"
-        case .horizonRing(let horizon): "horizonRing.\(horizon.rawValue)"
-        case .evaluateNode: "evaluateNode"
-        case .outcomeSummary: "outcomeSummary"
-        case .completedRing: "completedRing"
-        case .retrospectiveBadge: "retrospectiveBadge"
-        case .learningNode: "learningNode"
-        case .archiveRow(let id): "archiveRow.\(id)"
-        case .runIdentifier: "runIdentifier"
-        case .runStatus: "runStatus"
-        case .noSharedElement: "noSharedElement"
-        }
-    }
 }
 
 // MARK: - Attachment helper
@@ -86,7 +60,7 @@ extension EnvironmentValues {
 
 extension View {
     /// Attach a shared-element anchor. No-ops safely if the namespace is absent
-    /// (e.g. a component rendered inside the Scenario Gallery).
+    /// (e.g. a standalone component preview).
     public func sharedElement(
         _ id: SharedElementID,
         in namespace: Namespace.ID?,

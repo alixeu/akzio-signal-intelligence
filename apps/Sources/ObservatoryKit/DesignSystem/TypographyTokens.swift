@@ -15,7 +15,7 @@ public enum AkzioFont {
         public static let body: CGFloat = 13
         public static let bodySmall: CGFloat = 12
         public static let label: CGFloat = 11
-        public static let caption: CGFloat = 10
+        public static let caption: CGFloat = 11
     }
 
     public static let display = Font.system(size: Size.display, weight: .semibold)

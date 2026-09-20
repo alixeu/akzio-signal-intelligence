@@ -53,20 +53,22 @@ impl EvidenceRuntime {
             if source.get("status").and_then(Value::as_str) != Some("snapshot") {
                 continue;
             }
+            // A declared snapshot is an integrity claim about this exact raw
+            // bundle. Contradictory metadata is not ordinary missing content.
             let start = source
                 .get("bundle_start_byte")
                 .and_then(Value::as_u64)
                 .and_then(|value| usize::try_from(value).ok())
-                .ok_or(EvidenceRuntimeError::InvalidAcquisition)?;
+                .ok_or(EvidenceRuntimeError::InvalidProvenance)?;
             let end = source
                 .get("bundle_end_byte")
                 .and_then(Value::as_u64)
                 .and_then(|value| usize::try_from(value).ok())
-                .ok_or(EvidenceRuntimeError::InvalidAcquisition)?;
+                .ok_or(EvidenceRuntimeError::InvalidProvenance)?;
             let bytes = raw
                 .get(start..end)
                 .filter(|bytes| !bytes.is_empty())
-                .ok_or(EvidenceRuntimeError::InvalidAcquisition)?;
+                .ok_or(EvidenceRuntimeError::InvalidProvenance)?;
             let bindings = source
                 .get("claim_bindings")
                 .and_then(Value::as_array)
@@ -103,19 +105,19 @@ impl EvidenceRuntime {
             let expected_hash = source
                 .get("content_hash")
                 .and_then(Value::as_str)
-                .ok_or(EvidenceRuntimeError::InvalidAcquisition)?;
+                .ok_or(EvidenceRuntimeError::InvalidProvenance)?;
             if ContentHash::of_bytes(bytes).as_str() != expected_hash {
-                return Err(EvidenceRuntimeError::InvalidAcquisition);
+                return Err(EvidenceRuntimeError::InvalidProvenance);
             }
             let media_type = source
                 .get("media_type")
                 .and_then(Value::as_str)
                 .filter(|value| !value.trim().is_empty())
-                .ok_or(EvidenceRuntimeError::InvalidAcquisition)?;
+                .ok_or(EvidenceRuntimeError::InvalidProvenance)?;
             let blob = self.store.stage_slice(raw_blob, start, end, media_type)?;
             source
                 .as_object_mut()
-                .ok_or(EvidenceRuntimeError::InvalidAcquisition)?
+                .ok_or(EvidenceRuntimeError::InvalidProvenance)?
                 .insert("blob".to_owned(), serde_json::to_value(blob)?);
         }
         Ok(())
@@ -237,7 +239,12 @@ impl EvidenceRuntime {
             _ => None,
         };
         let event_time = match request.source {
-            EvidenceSource::Alpaca => latest_rfc3339_timestamp(&acquired.normalized),
+            EvidenceSource::Alpaca => {
+                let value = &acquired.normalized;
+                if value.get("market").is_some() { latest_rfc3339_timestamp(&value["bars"]) }
+                else if value.get("coverage").is_some() { latest_rfc3339_timestamp(&value["snapshots"]) }
+                else { latest_rfc3339_timestamp(value) }
+            },
             EvidenceSource::Fred => latest_fred_observation_date(&acquired.normalized),
             EvidenceSource::SecEdgar | EvidenceSource::NewsWeb => None,
         };

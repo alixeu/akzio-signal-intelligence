@@ -138,14 +138,20 @@ impl StoreExecutor {
         let (permit, queue_wait) = self.acquire_operation_permit().await?;
         let store = self.store.clone();
         let execution_started = Instant::now();
-        let result = tokio::task::spawn_blocking(move || {
+        let executor = self.clone();
+        tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            operation(store)
+            let result = catch_unwind(AssertUnwindSafe(|| operation(store)));
+            // The work owns completion, even if its awaiting HTTP/task future
+            // is cancelled. Publish before releasing the queue to later work.
+            executor.record_completion(queue_wait, execution_started.elapsed());
+            match result {
+                Ok(value) => value,
+                Err(payload) => resume_unwind(payload),
+            }
         })
         .await
-        .map_err(|error| RuntimeError::StoreExecutor(error.to_string()));
-        self.record_completion(queue_wait, execution_started.elapsed());
-        result
+        .map_err(|error| RuntimeError::StoreExecutor(error.to_string()))
     }
 
     /// Drain prior Store work, run one maintenance operation, and defer every
@@ -172,48 +178,41 @@ impl StoreExecutor {
         let store = self.store.clone();
         let execution_started = Instant::now();
         let started_at = Utc::now();
-        let result = tokio::task::spawn_blocking(move || {
+        let executor = self.clone();
+        tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let operation_result = catch_unwind(AssertUnwindSafe(|| operation(store.clone())));
             let completed_at = Utc::now();
             let lease_deferral = store.defer_live_leases_for_maintenance(started_at, completed_at);
+            let outcome = if matches!(operation_result, Ok(Ok(_))) && lease_deferral.is_ok() {
+                StoreMaintenanceOutcome::Succeeded
+            } else {
+                StoreMaintenanceOutcome::Failed
+            };
+            executor.record_completion(queue_wait, execution_started.elapsed());
+            executor
+                .state
+                .maintenance
+                .send_replace(StoreMaintenanceState::Completed {
+                    kind,
+                    sequence,
+                    outcome,
+                    lease_deferral: lease_deferral.as_ref().copied().unwrap_or_default(),
+                });
+            // Lease preservation and final telemetry belong to the blocking
+            // operation, not its waiter. Both finish before another operation
+            // may acquire the permit and publish a new Running state.
             match operation_result {
-                Ok(Ok(value)) => Ok((value, lease_deferral?)),
-                Ok(Err(error)) => {
-                    let _ = lease_deferral;
-                    Err(error)
+                Ok(Ok(value)) => {
+                    lease_deferral?;
+                    Ok(value)
                 }
-                Err(payload) => {
-                    let _ = lease_deferral;
-                    resume_unwind(payload)
-                }
+                Ok(Err(error)) => Err(error),
+                Err(payload) => resume_unwind(payload),
             }
         })
-        .await;
-        let execution_duration = execution_started.elapsed();
-        self.record_completion(queue_wait, execution_duration);
-
-        match result {
-            Ok(Ok((value, lease_deferral))) => {
-                self.state
-                    .maintenance
-                    .send_replace(StoreMaintenanceState::Completed {
-                        kind,
-                        sequence,
-                        outcome: StoreMaintenanceOutcome::Succeeded,
-                        lease_deferral,
-                    });
-                Ok(value)
-            }
-            Ok(Err(error)) => {
-                self.complete_failed_maintenance(kind, sequence);
-                Err(error)
-            }
-            Err(error) => {
-                self.complete_failed_maintenance(kind, sequence);
-                Err(RuntimeError::StoreExecutor(error.to_string()))
-            }
-        }
+        .await
+        .map_err(|error| RuntimeError::StoreExecutor(error.to_string()))?
     }
 
     /// Reject new work and wait until the active/queued operation set drains.
@@ -280,17 +279,6 @@ impl StoreExecutor {
             .completed_operation_count
             .fetch_add(1, Ordering::Relaxed);
     }
-
-    fn complete_failed_maintenance(&self, kind: StoreMaintenanceKind, sequence: u64) {
-        self.state
-            .maintenance
-            .send_replace(StoreMaintenanceState::Completed {
-                kind,
-                sequence,
-                outcome: StoreMaintenanceOutcome::Failed,
-                lease_deferral: akzio_store::MaintenanceLeaseDeferral::default(),
-            });
-    }
 }
 
 fn duration_nanos(duration: StdDuration) -> u64 {
@@ -300,3 +288,7 @@ fn duration_nanos(duration: StdDuration) -> u64 {
 fn duration_from_nanos(nanos: u64) -> StdDuration {
     StdDuration::from_nanos(nanos)
 }
+
+#[cfg(test)]
+#[path = "store_executor_tests.rs"]
+mod cancellation_tests;

@@ -179,7 +179,14 @@ impl ReconciliationRuntime {
                 kind: artifact.kind,
             })
             .collect::<Vec<_>>();
-        let state = reconciliation_state(&commitment, &normalized_receipts, receipt_refs.len());
+        let state = reconciliation_state_with_reprices(
+            &commitment,
+            &normalized_receipts,
+            &reprices
+                .values()
+                .map(|(_, reprice)| reprice.clone())
+                .collect::<Vec<_>>(),
+        );
         let (achieved_target, achieved_factor_exposure) =
             self.achieved_portfolio(&commitment, &normalized_receipts)?;
         let payload = Reconciliation {
@@ -488,12 +495,22 @@ fn weighted_fill_price(
     Ok(Some(MoneyMicros(weighted)))
 }
 
-fn reconciliation_state(
+fn reconciliation_state_with_reprices(
     commitment: &PaperCommitment,
     receipts: &[OrderReceipt],
-    receipt_count: usize,
+    reprices: &[PaperReprice],
 ) -> ReconciliationState {
-    if receipt_count == commitment.client_order_ids.len()
+    let receipt_count = receipts.len();
+    // A canceled/filled original cannot prove an uncertain replacement never
+    // reached the broker. Only observing its durable successor closes that gap.
+    let successors_observed = reprices.iter().all(|reprice| {
+        receipts.iter().any(|receipt| {
+            receipt.asset == reprice.asset
+                && receipt.client_order_id == reprice.replacement_client_order_id
+        })
+    });
+    if successors_observed
+        && receipt_count == commitment.client_order_ids.len()
         && receipts
             .iter()
             .all(|receipt| receipt.state.is_final_without_successor())
@@ -510,5 +527,75 @@ fn reconciliation_state(
         ReconciliationState::Partial
     } else {
         ReconciliationState::Pending
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_original_does_not_settle_unknown_reprice_successor() {
+        let reference = |kind| ArtifactRef {
+            artifact_id: akzio_domain::ArtifactId(akzio_domain::ContentHash::of_bytes(
+                format!("{kind:?}").as_bytes(),
+            )),
+            kind,
+        };
+        let now = Utc::now();
+        let commitment = PaperCommitment {
+            commitment_id: akzio_domain::PaperCommitmentId::new(),
+            execution_context: reference(ArtifactKind::ExecutionContext),
+            plan_hash: akzio_domain::ContentHash::of_bytes(b"plan"),
+            broker_session: "2026-09-09".into(),
+            client_order_ids: [(Asset::Qqq, "order-r0".into())].into(),
+            created_at: now,
+        };
+        let reprice = PaperReprice {
+            schema_version: akzio_domain::DOMAIN_SCHEMA_VERSION,
+            reprice_id: akzio_domain::PaperRepriceId::new(),
+            commitment: reference(ArtifactKind::ExecutionCommitment),
+            prior_receipt: reference(ArtifactKind::OrderReceipt),
+            asset: Asset::Qqq,
+            prior_client_order_id: "order-r0".into(),
+            replacement_client_order_id: "order-r1".into(),
+            prior_broker_order_id: "original".into(),
+            replacement_limit_price: MoneyMicros(10_000_000),
+            created_at: now,
+        };
+        let mut receipt = OrderReceipt {
+            plan_hash: commitment.plan_hash.clone(),
+            asset: Asset::Qqq,
+            client_order_id: "order-r0".into(),
+            broker_order_id: "original".into(),
+            state: OrderReceiptState::Canceled,
+            requested_quantity_micros: 1_000_000,
+            filled_quantity_micros: 0,
+            remaining_quantity_micros: 1_000_000,
+            average_fill_price: None,
+            broker_updated_at: now,
+            reason: None,
+            observed_at: now,
+        };
+        receipt.validate().unwrap();
+        reprice.validate().unwrap();
+        assert_eq!(
+            reconciliation_state_with_reprices(&commitment, &[receipt.clone()], &[]),
+            ReconciliationState::Complete
+        );
+        assert_eq!(
+            reconciliation_state_with_reprices(
+                &commitment,
+                &[receipt.clone()],
+                std::slice::from_ref(&reprice),
+            ),
+            ReconciliationState::Pending
+        );
+        receipt.client_order_id = "order-r1".into();
+        receipt.broker_order_id = "successor".into();
+        assert_eq!(
+            reconciliation_state_with_reprices(&commitment, &[receipt], &[reprice]),
+            ReconciliationState::Complete
+        );
     }
 }

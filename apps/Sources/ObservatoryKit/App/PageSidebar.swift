@@ -15,11 +15,11 @@ struct PageSidebar: View {
     @Namespace private var highlight
 
     var body: some View {
+        // 主路由按固定顺序展示；Settings 是附加入口，不参与主路由数组。
         VStack(alignment: .leading, spacing: AkzioLayout.s2) {
             windowToolbar
             ForEach(AppRoute.primary) { row($0) }
             Spacer(minLength: AkzioLayout.s6)
-            row(.scenarioGallery)
             settingsRow
         }
         .padding(.horizontal, AkzioLayout.sidebarHorizontalPadding)
@@ -72,6 +72,7 @@ struct PageSidebar: View {
     }
 
     private func row(_ item: AppRoute) -> some View {
+        // 选中态只由传入 route 决定；按钮回调把目标交给上层 Store，侧栏不直接改导航状态。
         let isSelected = item == route
         return Button { onSelect(item) } label: {
             HStack(spacing: AkzioLayout.s2) {
@@ -102,6 +103,7 @@ struct PageSidebar: View {
     }
 
     private var settingsRow: some View {
+        // Settings 不属于 AppRoute，点击只打开覆盖层，不触发页面转场。
         Button(action: onOpenSettings) {
             HStack(spacing: AkzioLayout.s2) {
                 Image(systemName: "gearshape")

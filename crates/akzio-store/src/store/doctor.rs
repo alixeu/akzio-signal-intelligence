@@ -44,6 +44,7 @@ impl Store {
                 ))
             })?;
         }
+        run_control::verify_checkpoints(&connection)?;
         validate_tool_lifecycle_events(&connection, None)?;
         validate_agent_turn_lifecycle_events(&connection, None)?;
         validate_context_lifecycle_events(&connection, None)?;
@@ -134,11 +135,14 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?;
         for (artifact_id, hash, media_type, bytes) in artifacts {
             let artifact_id = ArtifactId(ContentHash::new(artifact_id)?);
-            self.read_blob(&BlobRef {
-                hash: ContentHash::new(hash)?,
-                media_type,
-                bytes,
-            })?;
+            blob::read_blob_with(
+                &connection,
+                &BlobRef {
+                    hash: ContentHash::new(hash)?,
+                    media_type,
+                    bytes,
+                },
+            )?;
             let artifact = read_artifact(&connection, &artifact_id)?;
             artifact.validate()?;
             let mut expected = embedded_blob_refs(&connection, &artifact)?
@@ -233,9 +237,9 @@ impl Store {
                 )));
             }
             let manifest_payload: RuntimeManifest =
-                serde_json::from_slice(&self.read_blob(&manifest.blob)?)?;
+                serde_json::from_slice(&blob::read_blob_with(&connection, &manifest.blob)?)?;
             let approval_payload: PaperLaunchApproval =
-                serde_json::from_slice(&self.read_blob(&approval.blob)?)?;
+                serde_json::from_slice(&blob::read_blob_with(&connection, &approval.blob)?)?;
             manifest_payload.validate()?;
             approval_payload.validate()?;
             let consumed_at = parse_time(&consumed_at)?;
@@ -288,6 +292,34 @@ impl Store {
                     "invalid session slot {session_key}"
                 )));
             }
+            // `run_id` has no foreign key, so `PRAGMA foreign_key_check` above
+            // cannot observe a slot that names a run which does not exist.
+            let run_exists = connection
+                .query_row(
+                    "SELECT 1 FROM rebuild_session_slots AS slot \
+                     JOIN rebuild_runs AS run ON run.run_id = slot.run_id \
+                     WHERE slot.session_key = ?1",
+                    params![session_key],
+                    |_| Ok(()),
+                )
+                .optional()?;
+            if run_exists.is_none() {
+                return Err(StoreError::Integrity(format!(
+                    "session slot {session_key} references missing run {run_id}"
+                )));
+            }
+            // `run_id` also has no uniqueness constraint, while
+            // `session_slot_for_run` resolves at most one slot per run.
+            let slots_for_run: u64 = connection.query_row(
+                "SELECT COUNT(*) FROM rebuild_session_slots WHERE run_id = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )?;
+            if slots_for_run != 1 {
+                return Err(StoreError::Integrity(format!(
+                    "run {run_id} owns {slots_for_run} session slots"
+                )));
+            }
             let graph_artifact_id = ArtifactId(ContentHash::new(graph_artifact_id)?);
             let graph_artifact = read_artifact(&connection, &graph_artifact_id)?;
             if graph_artifact.kind != ArtifactKind::WorkflowGraph {
@@ -296,7 +328,7 @@ impl Store {
                 )));
             }
             let graph: WorkflowGraph =
-                serde_json::from_slice(&self.read_blob(&graph_artifact.blob)?)?;
+                serde_json::from_slice(&blob::read_blob_with(&connection, &graph_artifact.blob)?)?;
             graph.validate()?;
             if graph.topology_id != topology_id {
                 return Err(StoreError::Integrity(format!(
@@ -313,6 +345,19 @@ impl Store {
                     )));
                 }
                 (Some(commitment_artifact_id), Some(committed_at)) => {
+                    // The reprice/cancel tables spell out UNIQUE on their own
+                    // effect artifact; the slot's commitment column does not,
+                    // so two slots adopting one commitment is checked here.
+                    let slots_for_commitment: u64 = connection.query_row(
+                        "SELECT COUNT(*) FROM rebuild_session_slots WHERE commitment_artifact_id = ?1",
+                        params![commitment_artifact_id],
+                        |row| row.get(0),
+                    )?;
+                    if slots_for_commitment != 1 {
+                        return Err(StoreError::Integrity(format!(
+                            "commitment {commitment_artifact_id} is claimed by {slots_for_commitment} session slots"
+                        )));
+                    }
                     let commitment_artifact_id =
                         ArtifactId(ContentHash::new(commitment_artifact_id)?);
                     let commitment_artifact = read_artifact(&connection, &commitment_artifact_id)?;
@@ -321,8 +366,10 @@ impl Store {
                             "session slot {session_key} commitment kind is invalid"
                         )));
                     }
-                    let payload: PaperCommitment =
-                        serde_json::from_slice(&self.read_blob(&commitment_artifact.blob)?)?;
+                    let payload: PaperCommitment = serde_json::from_slice(&blob::read_blob_with(
+                        &connection,
+                        &commitment_artifact.blob,
+                    )?)?;
                     payload.validate()?;
                     let plan = self
                         .validate_execution_commitment_lineage(
@@ -380,10 +427,14 @@ impl Store {
                     "execution reprice artifact kind is invalid".to_owned(),
                 ));
             }
-            let commitment: PaperCommitment =
-                serde_json::from_slice(&self.read_blob(&commitment_artifact.blob)?)?;
-            let reprice: PaperReprice =
-                serde_json::from_slice(&self.read_blob(&reprice_artifact.blob)?)?;
+            let commitment: PaperCommitment = serde_json::from_slice(&blob::read_blob_with(
+                &connection,
+                &commitment_artifact.blob,
+            )?)?;
+            let reprice: PaperReprice = serde_json::from_slice(&blob::read_blob_with(
+                &connection,
+                &reprice_artifact.blob,
+            )?)?;
             commitment.validate()?;
             reprice.validate()?;
             if reprice.commitment.artifact_id != commitment_artifact_id
@@ -413,7 +464,7 @@ impl Store {
                 ));
             }
             let prior: OrderReceipt =
-                serde_json::from_slice(&self.read_blob(&prior_artifact.blob)?)?;
+                serde_json::from_slice(&blob::read_blob_with(&connection, &prior_artifact.blob)?)?;
             if prior.plan_hash != commitment.plan_hash
                 || prior.asset != reprice.asset
                 || prior.client_order_id != reprice.prior_client_order_id
@@ -468,10 +519,12 @@ impl Store {
                     "execution cancel artifact kind is invalid".to_owned(),
                 ));
             }
-            let commitment: PaperCommitment =
-                serde_json::from_slice(&self.read_blob(&commitment_artifact.blob)?)?;
+            let commitment: PaperCommitment = serde_json::from_slice(&blob::read_blob_with(
+                &connection,
+                &commitment_artifact.blob,
+            )?)?;
             let cancel: PaperCancel =
-                serde_json::from_slice(&self.read_blob(&cancel_artifact.blob)?)?;
+                serde_json::from_slice(&blob::read_blob_with(&connection, &cancel_artifact.blob)?)?;
             commitment.validate()?;
             cancel.validate()?;
             if cancel.commitment.artifact_id != commitment_artifact_id
@@ -501,7 +554,7 @@ impl Store {
                 ));
             }
             let prior: OrderReceipt =
-                serde_json::from_slice(&self.read_blob(&prior_artifact.blob)?)?;
+                serde_json::from_slice(&blob::read_blob_with(&connection, &prior_artifact.blob)?)?;
             prior.validate()?;
             if prior.plan_hash != commitment.plan_hash
                 || prior.asset != cancel.asset
@@ -656,6 +709,7 @@ impl Store {
         self.verify_contract_catalogue_history(&connection)?;
         self.verify_policy_evaluation_history(&connection)?;
         self.verify_candidate_policy_history(&connection)?;
+        decision_policy::verify_decision_policy_history(&connection)?;
         self.verify_experiment_history(&connection)?;
         self.verify_lesson_history(&connection)?;
         self.verify_canary_campaign_history(&connection)?;

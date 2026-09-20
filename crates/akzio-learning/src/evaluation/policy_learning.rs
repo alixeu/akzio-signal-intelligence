@@ -1,30 +1,4 @@
 impl EvaluationRuntime {
-    /// Materializes and atomically records a RunScoped T+1/T+3 snapshot with
-    /// its bounded retrospective narrative. No Experience or Evaluation is
-    /// created from this path.
-    #[allow(clippy::too_many_arguments)]
-    pub fn record_partial_retrospective_fenced(
-        &self,
-        lease: &DaemonLease,
-        permit: &TaskWritePermit,
-        materialization: OutcomeMaterializationInput,
-        horizon: OutcomeHorizon,
-        draft: Option<&RetrospectiveDraft>,
-        prior_retrospectives: &[ArtifactRef],
-        now: DateTime<Utc>,
-    ) -> EvaluationRuntimeResult<(Artifact, Artifact)> {
-        self.record_partial_retrospective_with_diagnostic_fenced(
-            lease,
-            permit,
-            materialization,
-            horizon,
-            draft,
-            prior_retrospectives,
-            "model_unavailable",
-            now,
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn record_partial_retrospective_with_diagnostic_fenced(
         &self,

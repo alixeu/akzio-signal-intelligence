@@ -1,5 +1,62 @@
 use super::*;
 
+/// Pair the serialized dispatch lifecycle without inventing a call identity for
+/// starts that have no artifact. This is a read-only projection shared with the
+/// diagnostic exporter; retries close an attempt, not the unknown provider call.
+#[derive(Default)]
+pub(super) struct AgentTurnPairing {
+    pending: BTreeMap<(RunId, Option<TaskId>, Option<AttemptId>), StoredEvent>,
+    unmatched: Vec<StoredEvent>,
+    terminal_artifacts: BTreeSet<ArtifactId>,
+}
+
+impl AgentTurnPairing {
+    pub(super) fn observe(&mut self, event: &StoredEvent) {
+        let key = (
+            event.run_id.clone(),
+            event.task_id.clone(),
+            event.attempt_id.clone(),
+        );
+        match event.event_type.as_str() {
+            "agent.turn_started" => {
+                if let Some(previous) = self.pending.insert(key, event.clone()) {
+                    self.unmatched.push(previous);
+                }
+            }
+            "agent.turn"
+            | "agent.turn_completed"
+            | "agent.turn_failed"
+            | "agent.turn_retryable_failed" => {
+                if let Some(id) = &event.artifact_id {
+                    // A legacy alias for an already observed terminal cannot
+                    // consume a newer dispatch's start.
+                    if self.terminal_artifacts.insert(id.clone()) {
+                        self.pending.remove(&key);
+                    }
+                }
+            }
+            "task.deferred"
+            | "task.retry_scheduled"
+            | "task.retry_exhausted"
+            | "task.recovered"
+            | "task.recovery_exhausted"
+            | "task.cancelled" => {
+                if let Some(start) = self.pending.remove(&key) {
+                    self.unmatched.push(start);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn unmatched_starts(self) -> Vec<StoredEvent> {
+        let mut starts = self.unmatched;
+        starts.extend(self.pending.into_values());
+        starts.sort_by_key(|event| event.cursor);
+        starts
+    }
+}
+
 impl Store {
     pub fn metrics(&self, now: DateTime<Utc>) -> StoreResult<StoreMetrics> {
         let connection = self.connection()?;
@@ -126,8 +183,8 @@ impl Store {
     /// Counted per distinct `AgentTurn` artifact, not per event: a single turn is
     /// announced by `AgentTurnStarted` and closed by one of `AgentTurn`,
     /// `AgentTurnCompleted`, `AgentTurnFailed` or `AgentTurnRetryableFailed`, and
-    /// several of those can name the same artifact. The artifact is the provider
-    /// call, so it is the unit of cost.
+    /// several of those can name the same artifact. Unmatched dispatch starts
+    /// count as calls with unknown usage, without estimating their token cost.
     pub fn run_model_usage(&self, run_id: &RunId) -> StoreResult<RunModelUsage> {
         self.model_usage_for_tasks(run_id, None)
     }
@@ -140,6 +197,7 @@ impl Store {
         const PAGE_SIZE: usize = 256;
         let mut after = 0_i64;
         let mut counted = BTreeSet::new();
+        let mut pairing = AgentTurnPairing::default();
         let mut usage = RunModelUsage::default();
         loop {
             let page = self.events_after(run_id, after, PAGE_SIZE)?;
@@ -153,6 +211,7 @@ impl Store {
                 }) {
                     continue;
                 }
+                pairing.observe(event);
                 if !matches!(
                     event.lifecycle_kind()?,
                     LifecycleEventType::AgentTurn
@@ -214,6 +273,9 @@ impl Store {
                 break;
             }
         }
+        let unknown_calls = pairing.unmatched_starts().len() as u64;
+        usage.turns = usage.turns.saturating_add(unknown_calls);
+        usage.turns_missing_usage = usage.turns_missing_usage.saturating_add(unknown_calls);
         Ok(usage)
     }
 
@@ -301,4 +363,71 @@ pub(super) fn stored_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result
         created_at: parse_time(&row.get::<_, String>(6)?)
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?,
     })
+}
+
+#[cfg(test)]
+mod pairing_tests {
+    use super::*;
+
+    fn event(cursor: i64, attempt: &str, kind: &str, artifact: Option<&str>) -> StoredEvent {
+        StoredEvent {
+            cursor,
+            run_id: RunId("run".into()),
+            task_id: Some(TaskId("task".into())),
+            attempt_id: Some(AttemptId(attempt.into())),
+            event_type: kind.into(),
+            artifact_id: artifact.map(|value| ArtifactId(ContentHash::of_bytes(value.as_bytes()))),
+            created_at: Utc::now(),
+        }
+    }
+
+    fn unmatched(events: &[StoredEvent]) -> Vec<i64> {
+        let mut pairing = AgentTurnPairing::default();
+        for event in events {
+            pairing.observe(event);
+        }
+        pairing
+            .unmatched_starts()
+            .iter()
+            .map(|event| event.cursor)
+            .collect()
+    }
+
+    #[test]
+    fn pairing_never_closes_new_start_with_old_or_other_attempt_terminal() {
+        assert_eq!(
+            unmatched(&[
+                event(1, "a", "agent.turn_completed", Some("legacy")),
+                event(2, "a", "agent.turn_started", None),
+                event(3, "b", "agent.turn_completed", Some("recovered")),
+                event(4, "a", "agent.turn", Some("legacy")),
+            ]),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn pairing_retains_abandoned_start_while_matching_later_attempt_normally() {
+        assert_eq!(
+            unmatched(&[
+                event(1, "a", "agent.turn_started", None),
+                event(2, "a", "task.retry_scheduled", None),
+                event(3, "b", "agent.turn_started", None),
+                event(4, "b", "agent.turn_completed", Some("retry")),
+            ]),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn pairing_accepts_complete_draft_submit_and_deduplicates_terminal_alias() {
+        assert!(unmatched(&[
+            event(1, "a", "agent.turn_started", None),
+            event(2, "a", "agent.turn_completed", Some("draft")),
+            event(3, "a", "agent.turn_started", None),
+            event(4, "a", "agent.turn", Some("draft")),
+            event(5, "a", "agent.turn_completed", Some("submit")),
+        ])
+        .is_empty());
+    }
 }

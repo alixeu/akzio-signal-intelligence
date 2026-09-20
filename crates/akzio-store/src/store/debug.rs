@@ -41,6 +41,8 @@ pub struct DebugArtifactView {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DebugRunView {
+    pub inspection: super::run_control::RunInspection,
+    pub research: serde_json::Value,
     pub session: DebugSession,
     pub workflow_status: WorkflowStatus,
     pub execution_evidence: String,
@@ -129,7 +131,7 @@ impl Store {
     ) -> StoreResult<DebugSession> {
         if !matches!(
             workflow.run.purpose,
-            RunPurpose::Debug | RunPurpose::PositionPlan | RunPurpose::PaperDryRun
+            RunPurpose::Debug | RunPurpose::PositionPlan
         ) {
             return Err(blocked("experiment must be noncanonical"));
         }
@@ -161,6 +163,7 @@ impl Store {
     ) -> StoreResult<DebugSession> {
         let mut connection = self.connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        super::workflow::assert_workflow_executable(&tx, run_id)?;
         let mut session =
             read_session(&tx, run_id)?.ok_or_else(|| blocked("not a Debug session"))?;
         if session.revision != request.expected_revision {
@@ -299,6 +302,7 @@ impl Store {
         let tx = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
         let session = read_session(&tx, run_id)?.ok_or_else(|| blocked("not a Debug session"))?;
         let snapshot = self.workflow_snapshot_with_connection(&tx, run_id)?;
+        let retired = super::workflow::legacy_workflow(&tx, run_id)?;
         if let Some(task_id) = task_id {
             if !snapshot.tasks.iter().any(|t| &t.node.task_id == task_id) {
                 return Err(StoreError::MissingTask(task_id.clone()));
@@ -320,25 +324,17 @@ impl Store {
                 .query_map(params![task.node.task_id.0], |r| Ok(DebugAttemptView {
                     attempt_id: AttemptId(r.get(0)?), status: r.get(1)?, started_at: r.get(2)?, finished_at: r.get(3)?,
                 }))?.collect::<Result<Vec<_>, _>>()?;
-            let reason = task_blocked_reason(&tx, run_id, &task.node.task_id, now)?;
+            let reason = if retired {
+                Some("legacy_workflow_retired".into())
+            } else {
+                task_blocked_reason(&tx, run_id, &task.node.task_id, now)?
+            };
             let retry = retry_eligible(&tx, &task.node.task_id)?;
             let output_refs = tx.prepare("SELECT a.artifact_id,a.kind FROM rebuild_attempt_outputs o JOIN rebuild_artifacts a ON a.artifact_id=o.artifact_id JOIN rebuild_attempts p ON p.attempt_id=o.attempt_id WHERE p.task_id=?1 ORDER BY o.event_id")?
                 .query_map(params![task.node.task_id.0], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?
                 .collect::<Result<Vec<_>, _>>()?.into_iter().map(|(id,kind)| Ok(ArtifactRef {artifact_id:ArtifactId(ContentHash::new(id)?),kind:parse_enum(&kind)?})).collect::<StoreResult<Vec<_>>>()?;
             let role = task.node.recipe_id.as_str().to_owned();
-            let horizon = task
-                .node
-                .objective
-                .split("[research_horizon=")
-                .nth(1)
-                .and_then(|s| s.split(']').next())
-                .map(str::to_owned)
-                .or_else(|| {
-                    ["t1", "t3", "t5"]
-                        .into_iter()
-                        .find(|h| task.node.objective.contains(&format!(" {h} Claim")))
-                        .map(str::to_owned)
-                });
+            let horizon = task.node.execution_spec().horizon_name().map(str::to_owned);
             let business_ready = reason.is_none();
             let step_eligible = business_ready && session.status == DebugStatus::Paused;
             let blocked_reason = reason.or_else(|| {
@@ -387,6 +383,9 @@ impl Store {
             _ => vec![],
         }
         .into_iter()
+        .filter(|action| {
+            !retired && (*action != "resume" || !session.identity.research_only_without_policy())
+        })
         .map(str::to_owned)
         .collect();
         let execution_evidence = if session.identity.run_purpose == RunPurpose::PositionPlan {
@@ -414,7 +413,30 @@ impl Store {
             "not_applicable"
         }
         .to_owned();
+        let tasks = nodes
+            .iter()
+            .map(|n| serde_json::to_value(&n.task))
+            .collect::<Result<Vec<_>, _>>()?;
+        let committed = nodes
+            .iter()
+            .flat_map(|n| n.output_refs.iter().map(|r| r.artifact_id.clone()))
+            .collect();
+        let research = if task_id.is_some() || attempt_id.is_some() {
+            serde_json::Value::Null
+        } else {
+            super::research_review::research_progress(
+                &tasks,
+                &artifacts
+                    .iter()
+                    .map(|a| (&a.artifact, &a.payload))
+                    .collect::<Vec<_>>(),
+                &committed,
+                session.identity.research_only_without_policy(),
+            )
+        };
         Ok(DebugRunView {
+            inspection: self.inspect_run_with_connection(&tx, run_id)?,
+            research,
             execution_evidence,
             session,
             workflow_status: snapshot.status,
@@ -532,8 +554,11 @@ fn insert_session(tx: &Transaction<'_>, identity: &DebugSessionIdentity) -> Stor
         identity.created_at,
     )?;
     insert_artifact(tx, &artifact)?;
-    tx.execute("INSERT INTO rebuild_debug_sessions(run_id,identity_artifact_id,runtime_identity,revision,status,execution_mode,updated_at) VALUES(?1,?2,?4,0,'paused','manual',?3)",
+    let inserted = tx.execute("INSERT INTO rebuild_run_controls(run_id,identity_artifact_id,runtime_identity,revision,status,execution_mode,updated_at) VALUES(?1,?2,?4,0,'paused','manual',?3) ON CONFLICT(run_id) DO UPDATE SET identity_artifact_id=excluded.identity_artifact_id,runtime_identity=excluded.runtime_identity,status='paused',execution_mode='manual',updated_at=excluded.updated_at WHERE rebuild_run_controls.identity_artifact_id IS NULL AND rebuild_run_controls.revision=0",
         params![identity.run_id.0,artifact.artifact_id.0.as_str(),identity.created_at.to_rfc3339(),identity.runtime_identity.as_str()])?;
+    if inserted != 1 {
+        return Err(blocked("run_control_already_owned"));
+    }
     // The same exact lineage rule is used at publication and by Doctor. This
     // records experiment provenance; it grants no Context access to the parent.
     for reference in &artifact.source_refs {
@@ -638,7 +663,7 @@ pub(super) fn cross_run_reference_allowed(
         return Ok(false);
     }
     let registered: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM rebuild_debug_sessions WHERE run_id=?1 AND identity_artifact_id=?2)",
+        "SELECT EXISTS(SELECT 1 FROM rebuild_run_controls WHERE run_id=?1 AND identity_artifact_id=?2)",
         params![run.0,child.artifact_id.0.as_str()],|r|r.get(0))?;
     if !registered {
         return Ok(false);
@@ -657,7 +682,7 @@ pub(super) fn read_session(
     connection: &Connection,
     run_id: &RunId,
 ) -> StoreResult<Option<DebugSession>> {
-    let row=connection.query_row("SELECT identity_artifact_id,revision,status,execution_mode,permitted_task_id,active_attempt_id,paused_at_task_id,updated_at,runtime_identity FROM rebuild_debug_sessions WHERE run_id=?1",params![run_id.0],|r|Ok((r.get::<_,String>(0)?,r.get::<_,u64>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,Option<String>>(6)?,r.get::<_,String>(7)?,r.get::<_,String>(8)?))).optional()?;
+    let row=connection.query_row("SELECT identity_artifact_id,revision,status,execution_mode,permitted_task_id,active_attempt_id,paused_at_task_id,updated_at,runtime_identity FROM rebuild_run_controls WHERE run_id=?1 AND identity_artifact_id IS NOT NULL",params![run_id.0],|r|Ok((r.get::<_,String>(0)?,r.get::<_,u64>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,Option<String>>(6)?,r.get::<_,String>(7)?,r.get::<_,String>(8)?))).optional()?;
     row.map(
         |(id, revision, status, mode, task, attempt, paused, updated, runtime)| {
             let artifact = read_artifact(connection, &ArtifactId(ContentHash::new(id)?))?;
@@ -694,7 +719,7 @@ fn save_session(
     let old = session.revision;
     session.revision += 1;
     session.updated_at = now;
-    let changed=tx.execute("UPDATE rebuild_debug_sessions SET revision=?1,status=?2,execution_mode=?3,permitted_task_id=?4,active_attempt_id=?5,paused_at_task_id=?6,updated_at=?7 WHERE run_id=?8 AND revision=?9",params![session.revision,enum_name(session.status),enum_name(session.execution_mode),session.permitted_task_id.as_ref().map(|x|x.0.as_str()),session.active_attempt_id.as_ref().map(|x|x.0.as_str()),session.paused_at_task_id.as_ref().map(|x|x.0.as_str()),now.to_rfc3339(),session.identity.run_id.0,old])?;
+    let changed=tx.execute("UPDATE rebuild_run_controls SET revision=?1,status=?2,execution_mode=?3,permitted_task_id=?4,active_attempt_id=?5,paused_at_task_id=?6,updated_at=?7 WHERE run_id=?8 AND revision=?9",params![session.revision,enum_name(session.status),enum_name(session.execution_mode),session.permitted_task_id.as_ref().map(|x|x.0.as_str()),session.active_attempt_id.as_ref().map(|x|x.0.as_str()),session.paused_at_task_id.as_ref().map(|x|x.0.as_str()),now.to_rfc3339(),session.identity.run_id.0,old])?;
     if changed != 1 {
         return Err(blocked("revision_conflict"));
     }
@@ -738,6 +763,14 @@ fn task_blocked_reason(
     let row=connection.query_row("SELECT t.status,t.ready_at,r.status,t.recipe_id FROM rebuild_tasks t JOIN rebuild_runs r ON r.run_id=t.run_id WHERE t.run_id=?1 AND t.task_id=?2",params![run_id.0,task_id.0],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()?.ok_or_else(||StoreError::MissingTask(task_id.clone()))?;
     if row.0 != "queued" {
         return Ok(Some(format!("task_{}", row.0)));
+    }
+    if row.3 == "gate.decision"
+        && read_session(connection, run_id)?
+            .is_some_and(|session| session.identity.research_only_without_policy())
+    {
+        return Ok(Some(
+            "research_only_incomplete: DecisionPolicy missing; Decision forbidden".into(),
+        ));
     }
     let dependencies:u64=connection.query_row("SELECT count(*) FROM rebuild_task_dependencies d JOIN rebuild_tasks p ON p.task_id=d.depends_on_task_id WHERE d.task_id=?1 AND p.status NOT IN ('succeeded','skipped')",params![task_id.0],|r|r.get(0))?;
     if dependencies > 0 {
@@ -872,7 +905,7 @@ pub(super) fn settle_attempt(
     now: DateTime<Utc>,
 ) -> StoreResult<()> {
     let Some(mut session) = read_session(tx, &permit.run_id)? else {
-        return Ok(());
+        return super::run_control::settle_continuous(tx, &permit.run_id, now);
     };
     let acceptance = StageAcceptance {
         version: 1,
@@ -926,7 +959,7 @@ pub(super) fn assert_broker_write(connection: &Connection, run_id: &RunId) -> St
     let session = read_session(connection, run_id)?;
     if session
         .as_ref()
-        .is_some_and(|s| s.identity.broker_write_policy == DebugBrokerPolicy::Forbidden)
+        .is_some_and(|s| s.identity.broker_write_policy != DebugBrokerPolicy::PaperAllowed)
         || environment_identity(connection)?.is_some() && session.is_none()
     {
         return Err(StoreError::DebugBrokerWriteForbidden);
@@ -939,6 +972,7 @@ pub(super) fn post_terminal_enqueued(
     run_id: &RunId,
     now: DateTime<Utc>,
 ) -> StoreResult<()> {
+    super::run_control::wake_continuous(tx, run_id, now)?;
     if let Some(mut session) = read_session(tx, run_id)? {
         if session.status == DebugStatus::Completed {
             session.status = if session.execution_mode == DebugExecutionMode::Continuous {

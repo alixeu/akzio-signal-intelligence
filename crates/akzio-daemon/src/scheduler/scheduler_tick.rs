@@ -21,7 +21,7 @@ impl PaperScheduler {
             .execute(move |store| store.session_slot(&stored_session_key))
             .await??
         {
-            self.acquire_or_renew_async(now).await?;
+            self.acquire_or_renew_async().await?;
             let run_id = slot.workflow.run.run_id.clone();
             let health = self
                 .store_executor
@@ -53,36 +53,54 @@ impl PaperScheduler {
                 return self.tick_canary(&campaign, &session_key, clock, now).await;
             }
         }
-        let scheduler = self.clone();
-        let Some((runtime_manifest, approval)) = self
+        // A first canonical research session must be able to earn its future
+        // calibration labels. No active policy means no trading approval is
+        // bound, even if an older approval artifact exists in the Store.
+        let cold_start = self
             .store_executor
-            .execute(move |_| scheduler.current_approval_binding())
-            .await??
-        else {
-            eprintln!("Paper scheduler waiting: no current Paper approval binding");
-            return Ok(None);
-        };
-        let manifest_blob = runtime_manifest.blob.clone();
-        let manifest_payload: RuntimeManifest = serde_json::from_slice(
-            &self
+            .execute(|store| {
+                store
+                    .active_decision_policy()
+                    .map(|policy| policy.is_none())
+            })
+            .await??;
+        let binding = if cold_start {
+            None
+        } else {
+            let scheduler = self.clone();
+            let Some(binding) = self
                 .store_executor
-                .execute(move |store| store.read_blob(&manifest_blob))
-                .await??,
-        )?;
-        if let Some(expected) = &self.runtime_identity_hash {
-            if manifest_payload.runtime_identity_hash()? != *expected {
-                eprintln!("Paper scheduler waiting: runtime identity does not match approval");
+                .execute(move |_| scheduler.current_approval_binding())
+                .await??
+            else {
+                eprintln!("Paper scheduler waiting: no current Paper approval binding");
+                return Ok(None);
+            };
+            Some(binding)
+        };
+        if let Some((runtime_manifest, _)) = &binding {
+            let manifest_blob = runtime_manifest.blob.clone();
+            let manifest_payload: RuntimeManifest = serde_json::from_slice(
+                &self
+                    .store_executor
+                    .execute(move |store| store.read_blob(&manifest_blob))
+                    .await??,
+            )?;
+            if let Some(expected) = &self.runtime_identity_hash {
+                if manifest_payload.runtime_identity_hash()? != *expected {
+                    eprintln!("Paper scheduler waiting: runtime identity does not match approval");
+                    return Ok(None);
+                }
+            }
+            let account_id = clock.paper_account_id().await?;
+            if manifest_payload.broker_account_id != account_id
+                || self
+                    .market_data_feed
+                    .is_none_or(|feed| manifest_payload.market_data_feed != feed.as_str())
+            {
+                eprintln!("Paper scheduler waiting: broker account or market-data feed mismatch");
                 return Ok(None);
             }
-        }
-        let account_id = clock.paper_account_id().await?;
-        if manifest_payload.broker_account_id != account_id
-            || self
-                .market_data_feed
-                .is_none_or(|feed| manifest_payload.market_data_feed != feed.as_str())
-        {
-            eprintln!("Paper scheduler waiting: broker account or market-data feed mismatch");
-            return Ok(None);
         }
         let proposal = match source.proposal(&session_key).await {
             Ok(proposal) => proposal,
@@ -92,7 +110,7 @@ impl PaperScheduler {
             }
             Err(error) => return Err(error),
         };
-        let lease = self.acquire_or_renew_async(now).await?;
+        let lease = self.acquire_or_renew_async().await?;
         let run_id = RunId::new();
         let mut setup_artifacts = Vec::new();
         let mut proposal = proposal;
@@ -185,17 +203,26 @@ impl PaperScheduler {
         let workflow = self.workflow.clone();
         Ok(Some(
             self.store_executor
-                .execute(move |_| {
-                    workflow.reserve_paper_session_with_inputs_for_run_approved(
+                .execute(move |_| match binding {
+                    Some((runtime_manifest, approval)) => workflow
+                        .reserve_paper_session_with_inputs_for_run_approved(
+                            &lease,
+                            run_id,
+                            &session_key,
+                            &proposal,
+                            &setup_artifacts,
+                            &runtime_manifest,
+                            &approval,
+                            now,
+                        ),
+                    None => workflow.reserve_paper_session_with_inputs_for_run(
                         &lease,
                         run_id,
                         &session_key,
                         &proposal,
                         &setup_artifacts,
-                        &runtime_manifest,
-                        &approval,
                         now,
-                    )
+                    ),
                 })
                 .await??,
         ))

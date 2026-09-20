@@ -5,20 +5,21 @@
 mod store;
 pub use crate::store::{
     DebugArtifactView, DebugAttemptView, DebugBundleIntegrity, DebugBundleManifest,
-    DebugBundleRawAccess, DebugNodeView, DebugRunView,
+    DebugBundleRawAccess, DebugNodeView, DebugRunView, ResearchAudit, ResearchAuditRecord,
+    RunCheckpoint, RunControlView, RunEventPage, RunEventView, RunInspection,
 };
 
 pub use crate::store::{
     AlertSeverity, BackupManifest, CanaryCampaignHead, ClaimedAttempt, DaemonLease,
-    ExecutionCommit, ExecutionCommitResult, LessonRevalidationScan, LessonUsage, LessonWriteResult,
-    MaintenanceLeaseDeferral, PolicyEvaluationCommit, PolicyEvaluationResult, PolicyHead,
-    PolicyShadowPairSnapshot, PolicyTransitionRecord, ReleaseEvidenceExpectations, RetentionPlan,
-    RetentionPolicy, RetentionReport, RetryTaskResult, RunExportArtifact, RunExportManifest,
+    DecisionPolicyDescriptor, ExecutionCommit, ExecutionCommitResult, LessonRevalidationScan,
+    LessonUsage, LessonWriteResult, MaintenanceLeaseDeferral, PolicyEvaluationCommit,
+    PolicyEvaluationResult, PolicyHead, PolicyShadowPairSnapshot, PolicyTransitionRecord,
+    ReleaseEvidenceExpectations, RetryTaskResult, RunExportArtifact, RunExportManifest,
     RunLifecycleHealth, RunModelUsage, SessionReservation, SessionSlot, SessionSlotReservation,
     ShadowPairCompletion, ShadowPairWriteResult, StorageInventory, Store, StoreAlert, StoreError,
     StoreMetrics, StoreResult as Result, StoredActiveAttempt, StoredCanarySession, StoredContract,
-    StoredEvent, StoredLesson, StoredRun, StoredShadowPair, StoredTask, StoredTaskSnapshot,
-    SucceededAttemptProof, TaskWorkload, TrajectoryEntry, TrajectoryModelMetadata,
-    TrajectoryToolLifecycle, WorkflowCommit, WorkflowPatchCommit, WorkflowRevision,
+    StoredDecisionPolicy, StoredEvent, StoredLesson, StoredRun, StoredShadowPair, StoredTask,
+    StoredTaskSnapshot, SucceededAttemptProof, TaskWorkload, TrajectoryEntry,
+    TrajectoryModelMetadata, TrajectoryToolLifecycle, WorkflowCommit, WorkflowRevision,
     WorkflowSnapshot,
 };

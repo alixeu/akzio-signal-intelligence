@@ -2,7 +2,7 @@ use super::*;
 
 use akzio_domain::{
     Artifact, ArtifactKind, ArtifactLifecycle, ArtifactRef, LessonAttribution, LessonEvidence,
-    LessonEvidenceSummary, LessonGovernance, LessonOrigin,
+    LessonGovernance, LessonOrigin,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

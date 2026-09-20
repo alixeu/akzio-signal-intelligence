@@ -97,6 +97,7 @@ const MAX_PAPER_REPRICES_PER_ORDER: u8 = 1;
 #[derive(Debug, Clone)]
 pub struct PaperDispatchRuntime {
     store: Store,
+    execution_policy: crate::ExecutionPolicy,
     settlement_timeout: std::time::Duration,
     settlement_action_grace: std::time::Duration,
     failpoint: PaperDispatchFailpoint,
@@ -118,6 +119,7 @@ impl PaperDispatchRuntime {
     pub fn new(store: Store) -> Self {
         Self {
             store,
+            execution_policy: crate::ExecutionPolicy::default(),
             settlement_timeout: std::time::Duration::from_secs(
                 DEFAULT_PAPER_SETTLEMENT_TIMEOUT_SECS,
             ),
@@ -126,6 +128,11 @@ impl PaperDispatchRuntime {
             ),
             failpoint: PaperDispatchFailpoint::Disabled,
         }
+    }
+
+    pub fn with_execution_policy(mut self, policy: crate::ExecutionPolicy) -> Self {
+        self.execution_policy = policy;
+        self
     }
 
     pub fn with_settlement_timeout(mut self, settlement_timeout: std::time::Duration) -> Self {
@@ -153,11 +160,24 @@ impl PaperDispatchRuntime {
     ) -> PaperDispatchResult<PaperDispatchOutput> {
         self.require_paper_run(&input.permit)?;
         self.store.assert_debug_broker_write(&input.permit.run_id)?;
+        let simulated_only = self
+            .store
+            .debug_session(&input.permit.run_id)?
+            .is_some_and(|s| {
+                s.identity.broker_write_policy == akzio_domain::DebugBrokerPolicy::SimulatedOnly
+            });
+        if simulated_only {
+            return Err(PaperError::InvalidCommitment(
+                "legacy simulated broker authority is retired".into(),
+            )
+            .into());
+        }
         let CommittedPlanContext {
             commitment_artifact,
             commitment,
             plan,
         } = self.load_committed_plan(&input.permit, &input.commitment)?;
+        let authorization = self.submission_authorization(&input.permit, &plan)?;
 
         self.ensure_unfrozen()?;
         self.store.validate_daemon_lease(&input.lease, Utc::now())?;
@@ -169,12 +189,14 @@ impl PaperDispatchRuntime {
             input.now,
         )?;
         self.failpoint.trigger_after_effect_intent();
-        let mut execution = broker.execute_commitment(&commitment, &plan).await?;
+        let mut execution = broker
+            .execute_commitment(&commitment, &plan, &authorization)
+            .await?;
         if execution.plan_hash != commitment.plan_hash {
             return Err(PaperDispatchError::BrokerPlanHashMismatch);
         }
         let mut actions = self.durable_order_actions(&input.commitment, &execution)?;
-        self.resume_durable_order_actions(broker, input, &actions, &mut execution)
+        self.resume_durable_order_actions(broker, input, &actions, &authorization, &mut execution)
             .await?;
         self.store.validate_daemon_lease(&input.lease, Utc::now())?;
         execution = reconcile_until_settled(
@@ -204,16 +226,29 @@ impl PaperDispatchRuntime {
             broker_receipts,
             now: input.now,
         })?;
-        let mut settled = execution_is_settled(&execution)?;
-        if !settled && self.has_stale_open_order(&execution, input.now)? {
+        let mut settled = self.reconciliation_is_settled(&reconciliation)?;
+        // Extended day orders may remain live through the trade date's sessions.
+        // A short polling timeout is not a reason to cancel an accepted order.
+        // Regular-hours repricing/cancellation behavior remains unchanged.
+        if !settled
+            && !plan.orders.iter().any(|order| order.extended_hours)
+            && self.has_stale_open_order(&execution, input.now)?
+        {
             reconciliation_runtime.write_progress(
                 &input.lease,
                 &input.permit,
                 &reconciliation,
                 Utc::now(),
             )?;
-            self.act_on_stale_orders(broker, input, &plan, &reconciliation, &mut execution)
-                .await?;
+            self.act_on_stale_orders(
+                broker,
+                input,
+                &plan,
+                &authorization,
+                &reconciliation,
+                &mut execution,
+            )
+            .await?;
             execution = reconcile_until_settled(
                 &self.store,
                 &input.lease,
@@ -237,7 +272,7 @@ impl PaperDispatchRuntime {
                 broker_receipts,
                 now: input.now,
             })?;
-            settled = execution_is_settled(&execution)?;
+            settled = self.reconciliation_is_settled(&reconciliation)?;
         }
         if settled {
             reconciliation_runtime.commit_with_effect(
@@ -263,6 +298,15 @@ impl PaperDispatchRuntime {
             reconciliation,
             settled,
         })
+    }
+
+    fn reconciliation_is_settled(
+        &self,
+        output: &ReconciliationOutput,
+    ) -> PaperDispatchResult<bool> {
+        let payload: akzio_domain::Reconciliation =
+            serde_json::from_slice(&self.store.read_blob(&output.reconciliation.blob)?)?;
+        Ok(payload.state == akzio_domain::ReconciliationState::Complete)
     }
 
     fn durable_order_actions(
@@ -292,6 +336,7 @@ impl PaperDispatchRuntime {
         broker: &B,
         input: &PaperDispatchInput,
         actions: &DurableOrderActions,
+        authorization: &PaperSubmissionAuthorization,
         execution: &mut PaperExecution,
     ) -> PaperDispatchResult<()> {
         for reference in &actions.reprices {
@@ -312,7 +357,13 @@ impl PaperDispatchRuntime {
             };
             if let Some(recovered) = recovered {
                 self.store.validate_daemon_lease(&input.lease, Utc::now())?;
-                let receipt = broker.replace_order(&intent).await?;
+                let receipt = match broker.replace_order(&intent, authorization).await {
+                    Ok(receipt) => receipt,
+                    // Keep the uncertain intent pending, preserve known receipts,
+                    // and allow the risk-reducing cancellation path below.
+                    Err(PaperError::SubmissionUnauthorized) => continue,
+                    Err(error) => return Err(error.into()),
+                };
                 self.store.validate_daemon_lease(&input.lease, Utc::now())?;
                 self.store.settle_paper_effect(
                     &input.lease,
@@ -392,6 +443,7 @@ impl PaperDispatchRuntime {
         broker: &B,
         input: &PaperDispatchInput,
         plan: &ExecutionPlan,
+        authorization: &PaperSubmissionAuthorization,
         reconciliation: &ReconciliationOutput,
         execution: &mut PaperExecution,
     ) -> PaperDispatchResult<()> {
@@ -443,6 +495,9 @@ impl PaperDispatchRuntime {
                 OrderReceiptState::Accepted | OrderReceiptState::PartiallyFilled
             ) && receipt.reprice_count < MAX_PAPER_REPRICES_PER_ORDER
                 && self.store.reprice_for(&input.commitment, asset)?.is_none()
+                && authorization
+                    .assert_current(&plan.plan_hash, Utc::now())
+                    .is_ok()
             {
                 let order = plan
                     .orders
@@ -492,7 +547,12 @@ impl PaperDispatchRuntime {
                     Utc::now(),
                 )?;
                 self.store.validate_daemon_lease(&input.lease, Utc::now())?;
-                let replacement = broker.replace_order(&durable_payload).await?;
+                let replacement = match broker.replace_order(&durable_payload, authorization).await
+                {
+                    Ok(receipt) => receipt,
+                    Err(PaperError::SubmissionUnauthorized) => continue,
+                    Err(error) => return Err(error.into()),
+                };
                 self.store.validate_daemon_lease(&input.lease, Utc::now())?;
                 self.store.settle_paper_effect(
                     &input.lease,
@@ -562,6 +622,74 @@ impl PaperDispatchRuntime {
             return Err(PaperDispatchError::NonPaperRun(purpose));
         }
         Ok(())
+    }
+
+    fn submission_authorization(
+        &self,
+        permit: &TaskWritePermit,
+        plan: &ExecutionPlan,
+    ) -> PaperDispatchResult<PaperSubmissionAuthorization> {
+        let read = |reference: &ArtifactRef, kind| -> PaperDispatchResult<Vec<u8>> {
+            let artifact = self.load_expected(reference, kind)?;
+            Ok(self.store.read_blob(&artifact.blob)?)
+        };
+        let decision: akzio_domain::DecisionContext = serde_json::from_slice(&read(
+            &plan.decision_context,
+            ArtifactKind::DecisionContext,
+        )?)?;
+        decision.validate()?;
+        if decision.run_id != permit.run_id {
+            return Err(PaperDispatchError::ContextMismatch);
+        }
+        let account_artifact =
+            self.load_expected(&plan.account_snapshot, ArtifactKind::NormalizedEvidence)?;
+        let account = serde_json::from_slice(&self.store.read_blob(&account_artifact.blob)?)?;
+        let mut components = Vec::new();
+        if account_artifact.producer == "execution.snapshot.account" {
+            for reference in account_artifact
+                .source_refs
+                .iter()
+                .filter(|source| source.kind == ArtifactKind::NormalizedEvidence)
+            {
+                let artifact = self.load_expected(reference, ArtifactKind::NormalizedEvidence)?;
+                let component = serde_json::from_slice(&self.store.read_blob(&artifact.blob)?)?;
+                components.push((artifact, component));
+            }
+        }
+        let account_observations = submission_authorization::frozen_account_observations(
+            &account_artifact,
+            &account,
+            &components,
+        );
+        let quotes = serde_json::from_slice(&read(
+            &plan.quote_snapshot,
+            ArtifactKind::NormalizedEvidence,
+        )?)?;
+        let clock = serde_json::from_slice(&read(
+            &plan.market_clock_snapshot,
+            ArtifactKind::NormalizedEvidence,
+        )?)?;
+        let approval_expiry =
+            self.store
+                .paper_approval_for_run(&permit.run_id)?
+                .map(|(manifest, approval)| {
+                    manifest
+                        .expires_at
+                        .min(approval.expires_at)
+                        .min(approval.qualification.expires_at)
+                });
+        let mut authorization = PaperSubmissionAuthorization::from_frozen_sources(
+            plan,
+            &self.execution_policy,
+            decision.validity.as_ref(),
+            approval_expiry,
+            &account,
+            &quotes,
+            &clock,
+        )?;
+        authorization
+            .restrict_account_observations(account_observations.as_deref(), &self.execution_policy);
+        Ok(authorization)
     }
 
     fn load_committed_plan(
@@ -693,14 +821,38 @@ async fn reconcile_until_settled<B: CommittedPaperBroker + ?Sized>(
     loop {
         store.validate_daemon_lease(lease, Utc::now())?;
         let execution = broker.reconcile_commitment(commitment, submitted).await?;
-        if execution_is_settled(&execution)? || tokio::time::Instant::now() >= deadline {
+        if execution_is_settled(commitment, &execution)? || tokio::time::Instant::now() >= deadline
+        {
             return Ok(execution);
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 }
 
-fn execution_is_settled(execution: &PaperExecution) -> PaperDispatchResult<bool> {
+pub(super) fn execution_is_settled(
+    commitment: &PaperCommitment,
+    execution: &PaperExecution,
+) -> PaperDispatchResult<bool> {
+    let mut assets = std::collections::BTreeSet::new();
+    for receipt in &execution.orders {
+        let asset = Asset::try_from(receipt.symbol.as_str())?;
+        let original = commitment
+            .client_order_ids
+            .get(&asset)
+            .ok_or(PaperError::CommitmentClientOrderMismatch(asset))?;
+        if !assets.insert(asset)
+            || (receipt.client_order_id != *original
+                && receipt.client_order_id != replacement_client_order_id(original))
+        {
+            return Err(PaperError::CommitmentClientOrderMismatch(asset).into());
+        }
+    }
+    if execution.plan_hash != commitment.plan_hash {
+        return Err(PaperDispatchError::BrokerPlanHashMismatch);
+    }
+    if assets.len() != commitment.client_order_ids.len() {
+        return Ok(false);
+    }
     execution.orders.iter().try_fold(true, |settled, receipt| {
         Ok(settled && receipt_state(&receipt.status)?.is_final_without_successor())
     })
@@ -726,4 +878,52 @@ fn broker_receipt(
         reason: receipt.reason.clone(),
         observed_at,
     })
+}
+
+#[cfg(test)]
+mod settlement_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_subset_does_not_settle_full_commitment() {
+        let hash = ContentHash::of_bytes(b"commitment plan");
+        let commitment = PaperCommitment {
+            commitment_id: akzio_domain::PaperCommitmentId::new(),
+            execution_context: ArtifactRef {
+                artifact_id: akzio_domain::ArtifactId(ContentHash::of_bytes(b"context")),
+                kind: ArtifactKind::ExecutionContext,
+            },
+            plan_hash: hash.clone(),
+            broker_session: "2026-09-09".into(),
+            client_order_ids: [(Asset::Qqq, "qqq".into()), (Asset::Soxx, "soxx".into())].into(),
+            created_at: Utc::now(),
+        };
+        let receipt = |asset: Asset, id: &str| PaperOrderReceipt {
+            client_order_id: id.into(),
+            broker_order_id: format!("broker-{id}"),
+            symbol: asset.symbol().into(),
+            status: "filled".into(),
+            requested_quantity_micros: 1_000_000,
+            filled_quantity_micros: 1_000_000,
+            remaining_quantity_micros: 0,
+            average_fill_price: Some(MoneyMicros(10_000_000)),
+            broker_updated_at: Utc::now(),
+            reason: None,
+            reused: true,
+            reprice_count: 0,
+        };
+        let mut execution = PaperExecution {
+            plan_hash: hash,
+            orders: vec![],
+        };
+        assert!(!execution_is_settled(&commitment, &execution).unwrap());
+        execution.orders.push(receipt(Asset::Qqq, "qqq"));
+        assert!(!execution_is_settled(&commitment, &execution).unwrap());
+        execution.orders.push(receipt(Asset::Soxx, "soxx"));
+        assert!(execution_is_settled(&commitment, &execution).unwrap());
+        execution.orders[1] = receipt(Asset::Qqq, "qqq");
+        assert!(execution_is_settled(&commitment, &execution).is_err());
+        execution.orders[1] = receipt(Asset::Soxx, "unrelated-id");
+        assert!(execution_is_settled(&commitment, &execution).is_err());
+    }
 }

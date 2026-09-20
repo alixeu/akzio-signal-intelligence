@@ -482,6 +482,7 @@ impl AgentContract {
                 | ArtifactKind::Critique
                 | ArtifactKind::Resolution
                 | ArtifactKind::DecisionProposal
+                | ArtifactKind::ProposalReview
                 | ArtifactKind::RetrospectiveDraft
         ) {
             return Err(DomainError::EmptyField {

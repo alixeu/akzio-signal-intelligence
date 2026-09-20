@@ -1,10 +1,9 @@
 impl EvaluationRuntime {
-    fn evaluate_with_retrospective_at_state(
+    fn evaluate_with_retrospective(
         &self,
         lease: Option<&DaemonLease>,
         input: EvaluationInput,
         retrospective_draft: Option<&RetrospectiveDraft>,
-        target_state: Option<PolicyState>,
     ) -> EvaluationRuntimeResult<EvaluationResult> {
         self.require_paper(&input.permit.run_id)?;
         let outcome = materialize_outcome(&input.materialization)?;
@@ -39,7 +38,7 @@ impl EvaluationRuntime {
             token_cost: input.token_cost,
             latency_millis: input.latency_millis,
         };
-        self.evaluate_frozen(lease, sealed, artifact, retrospective_draft, target_state)
+        self.evaluate_frozen(lease, sealed, artifact, retrospective_draft, None)
     }
 
     /// Uses the same eligibility, pair-consumption and policy transaction as T5.

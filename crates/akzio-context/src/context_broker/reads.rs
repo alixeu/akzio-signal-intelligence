@@ -2,6 +2,8 @@ const MAX_CONTEXT_RANGE_BYTES: usize = 32 * 1024;
 const MAX_CONTEXT_SEARCH_RESULTS: usize = 16;
 const MAX_CONTEXT_COMPARE_SOURCES: usize = 4;
 
+// 完整文档响应超过工具上限时必须改用显式 range；这里不做静默截断，避免模型把截断
+// 内容误当作完整证据。
 fn validate_document_response_size(value: &Value) -> ContextResult<()> {
     if serde_json::to_vec(value)?.len() > MAX_CONTEXT_RANGE_BYTES {
         return Err(ContextError::DocumentRequiresRange);
@@ -16,6 +18,8 @@ impl ContextBroker {
         &self, permit: &TaskWritePermit, contract: &AgentContract, grant: &ReadGrant,
         artifact_id: &ArtifactId, now: DateTime<Utc>,
     ) -> ContextResult<Value> {
+        // 先验证当前 grant，再读取并解析完整 JSON；range_metadata 只为能证明字节边界
+        // 的顶层值提供建议，不会扩大读取范围或改写原始 blob。
         let artifact = self.read(permit, contract, grant, artifact_id, now)?;
         let bytes = self.store.read_blob(&artifact.blob)?;
         let value: Value = serde_json::from_slice(&bytes)?;
@@ -29,6 +33,8 @@ impl ContextBroker {
         artifact_id: &ArtifactId,
         now: DateTime<Utc>,
     ) -> ContextResult<ContextReadResult> {
+        // 这是完整文档的受控包装：授权成功后仍执行 32 KiB 检查，过大就返回明确错误，
+        // 由调用方改用 read_range，而不是返回部分文档。
         let (artifact, value) = self.read_document(permit, contract, grant, artifact_id, now)?;
         validate_document_response_size(&value)?;
         Ok(ContextReadResult {
@@ -48,6 +54,8 @@ impl ContextBroker {
         end_byte: usize,
         now: DateTime<Utc>,
     ) -> ContextResult<ContextReadResult> {
+        // grant 校验先于范围校验，随后要求半开区间、32 KiB 上限和完整 UTF-8 边界；返回
+        // 的 text 是原 blob 的字节切片，不提供跨文档或语义层面的额外权限。
         let artifact = self.read(permit, contract, grant, artifact_id, now)?;
         if start_byte >= end_byte || end_byte.saturating_sub(start_byte) > MAX_CONTEXT_RANGE_BYTES {
             return Err(ContextError::InvalidRange);
@@ -81,6 +89,8 @@ impl ContextBroker {
         max_results: usize,
         now: DateTime<Utc>,
     ) -> ContextResult<ContextReadResult> {
+        // 搜索只在当前 Manifest selections 上逐文档做大小写不敏感的子串匹配；它不是
+        // 向量检索，也不会搜索 grant 之外的 Artifact。达到 max_results 后停止读取。
         let query = query.trim();
         if query.is_empty()
             || query.chars().count() > 256
@@ -108,6 +118,8 @@ impl ContextBroker {
                 &selection.artifact.artifact_id,
                 now,
             )?;
+            // 文档 Value 统一转成搜索文本，再把匹配位置映射回原文；单个文档读取失败
+            // 会使整个请求失败，不返回混淆为完整结果的部分成功状态。
             let text = match &value {
                 Value::String(text) => text.clone(),
                 _ => serde_json::to_string(&value)?,
@@ -146,6 +158,8 @@ impl ContextBroker {
         claim_id: &ArtifactId,
         now: DateTime<Utc>,
     ) -> ContextResult<ContextReadResult> {
+        // 先读取并校验 Claim，再按 grounds 去重读取每个已授权证据；Claim 的引用若不在
+        // 当前 grant 或 kind 不一致，整个闭包失败，不把 Claim 单独伪装成完整依据。
         let claim_artifact = self.read(permit, contract, grant, claim_id, now)?;
         if claim_artifact.kind != ArtifactKind::Claim {
             return Err(ContextError::ExpectedClaim);
@@ -190,6 +204,8 @@ impl ContextBroker {
         artifact_ids: &[ArtifactId],
         now: DateTime<Utc>,
     ) -> ContextResult<ContextReadResult> {
+        // 只接受 2～4 个不同的已授权 Artifact，并对每个来源使用同一 governed projection；
+        // 返回并列资料，不在 Context 层替模型或 DecisionGate 解释冲突。
         if !(2..=MAX_CONTEXT_COMPARE_SOURCES).contains(&artifact_ids.len())
             || artifact_ids.iter().collect::<BTreeSet<_>>().len() != artifact_ids.len()
         {
@@ -221,6 +237,8 @@ impl ContextBroker {
 // Lowercasing can change UTF-8 length (for example İ). Keep the mapping to
 // original byte boundaries so a case-insensitive match never corrupts offsets.
 fn search_snippet_range(text: &str, needle: &str) -> Option<(usize, usize, usize)> {
+    // lowercasing 可能改变 UTF-8 字节长度，因此 offsets 为折叠文本的每个字节保存原始
+    // 字符索引，保证命中位置和上下文切片仍落在原字符串边界内。
     let mut folded = String::new();
     let mut offsets = Vec::new();
     let chars = text.char_indices().collect::<Vec<_>>();
@@ -271,6 +289,20 @@ mod comparison_projection_tests {
 
     #[test]
     fn option_chain_projection_is_bounded_and_retains_exact_time_and_source_fields() {
+        let provider_shape = serde_json::json!({"value":{"snapshots":{
+            "QQQ260925C00720000": {
+                "latestQuote":{"bp":1.25,"ap":1.35,"t":"2026-09-18T19:59:59Z"},
+                "latestTrade":{"p":1.30,"t":"2026-09-18T19:58:00Z"},
+                "open_interest":"12", "open_interest_date":"2026-09-17"
+            }
+        }}});
+        let projection = compact_governed_projection(ArtifactKind::NormalizedEvidence, {
+            let mut value = provider_shape;
+            value["resource"] = serde_json::json!("option_chain:QQQ:2026-09-20:2026-10-20");
+            value
+        });
+        assert_eq!(projection["features"]["contracts_with_bid_ask"], 1);
+        assert_eq!(projection["features"]["contracts_with_open_interest"], 1);
         let snapshots = (0..2_048)
             .map(|index| {
                 (
@@ -303,13 +335,15 @@ mod comparison_projection_tests {
         assert_eq!(projected["time_basis"], value["time_basis"]);
         assert_eq!(projected["features"]["contracts_total"], 2_048);
         assert_eq!(projected["features"]["contracts_with_iv"], 2_048);
-        assert_eq!(projected["sample_contracts"].as_array().unwrap().len(), 8);
+        assert_eq!(projected["sample_contracts"].as_array().unwrap().len(), 2);
         assert!(projected["missing_items"].as_array().unwrap().is_empty());
         assert!(serde_json::to_vec(&projected).unwrap().len() < 16 * 1024);
     }
 }
 
 fn range_metadata(value: &Value, bytes: &[u8]) -> Value {
+    // 只有 serde_json 重新编码后与 CAS 字节逐字节一致，顶层字段偏移才可信；键顺序或
+    // 编码不同就不给出 ranges，避免“同长度但错位置”的读取建议。
     // Offsets are safe only when the parsed/re-encoded JSON is byte-identical
     // to the logical CAS bytes. serde_json::Value does not preserve source key
     // order, so a same-length re-encoding is not enough evidence.

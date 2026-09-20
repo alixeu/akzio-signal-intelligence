@@ -1,7 +1,6 @@
 import Foundation
 
 public enum CoreModelStage: String, CaseIterable, Codable, Sendable, Hashable, Identifiable {
-    case planner = "research.planner"
     case analyst = "research.analyst"
     case critic = "research.critic"
     case synthesizer = "research.synthesizer"
@@ -11,7 +10,6 @@ public enum CoreModelStage: String, CaseIterable, Codable, Sendable, Hashable, I
 
     public var displayName: String {
         switch self {
-        case .planner: "Planner"
         case .analyst: "Analyst"
         case .critic: "Critic"
         case .synthesizer: "Synthesizer"
@@ -86,9 +84,6 @@ public struct CoreCredentialStatus: Sendable, Equatable {
         self.fredAPIKey = fredAPIKey
     }
 
-    public var requiredComplete: Bool {
-        llmAPIKey && alpacaAPIKey && alpacaAPISecret && fredAPIKey
-    }
 }
 
 public struct CoreConfigurationDraft: Sendable, Equatable {
@@ -174,12 +169,25 @@ enum CoreRuntimePaths {
         return home
     }
 
+    static func configurationLocation(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> URL {
+        if let path = environment["AKZIO_CORE_CONFIG"], !path.isEmpty {
+            return URL(fileURLWithPath: path)
+        }
+        let home = environment["AKZIO_HOME"].flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0, isDirectory: true) }
+            ?? homeDirectory.appending(path: ".akzio", directoryHint: .isDirectory)
+        return home.appending(path: "config.toml")
+    }
+
     static func configURL() throws -> URL {
         let environment = ProcessInfo.processInfo.environment
         if let path = environment["AKZIO_CORE_CONFIG"], !path.isEmpty {
             return URL(fileURLWithPath: path)
         }
-        let config = try homeURL().appending(path: "config.toml")
+        _ = try homeURL()
+        let config = configurationLocation()
         if !FileManager.default.fileExists(atPath: config.path) {
             try initializeConfiguration(at: config)
         }

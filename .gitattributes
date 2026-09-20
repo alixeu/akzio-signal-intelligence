@@ -1,0 +1,3 @@
+# Preserve the frozen Analyst prompt separator (one space on a blank line).
+# Its exact bytes are protected by the role/Contract regression, not auto-formatting.
+crates/akzio-research/src/agent/prompts/roles/analyst.md whitespace=-blank-at-eol

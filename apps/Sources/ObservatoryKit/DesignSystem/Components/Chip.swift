@@ -32,6 +32,7 @@ public struct Chip: View {
     }
 
     public var body: some View {
+        // 先构造不带交互的内容，再按 action 是否存在包装 Button；无 action 的 tag 不会伪造点击语义。
         let content = HStack(spacing: 5) {
             if let symbol {
                 Image(systemName: symbol)
@@ -91,6 +92,7 @@ public struct AkzioSegmentedControl<Value: Hashable>: View {
     }
 
     public var body: some View {
+        // 选项集合只负责呈现；点击在同一个 withAnimation 中写入 Binding，父 View 仍是选择状态的所有者。
         HStack(spacing: 2) {
             ForEach(options, id: \.value) { option in
                 let isSelected = option.value == selection

@@ -1,4 +1,4 @@
-//! Planner proposal and compiled workflow vocabulary.
+//! Rust proposal and compiled workflow vocabulary, including archived proposal wire types.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -16,6 +16,7 @@ use crate::{
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeTaskClass {
     Evidence,
+    ResearchControl,
     Agent,
     DecisionGate,
     ExecutionGate,
@@ -169,6 +170,8 @@ impl WorkflowProposalDraft {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowProposalTask {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<crate::NodeSpec>,
     pub recipe_id: TaskRecipeId,
     pub objective: String,
     pub depends_on: Vec<String>,
@@ -281,6 +284,8 @@ fn validate_proposal_acyclic<T>(
 /// from a proposal and the installed recipe catalogue.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowNode {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<crate::NodeSpec>,
     pub task_id: TaskId,
     pub recipe_id: TaskRecipeId,
     pub contract_hash: Option<ContentHash>,
@@ -296,6 +301,8 @@ pub struct WorkflowNode {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowGraph {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition_version: Option<u32>,
     /// Frozen at Run creation; empty on legacy graphs.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub agent_budgets: BTreeMap<String, TaskBudget>,
@@ -306,8 +313,34 @@ pub struct WorkflowGraph {
 
 impl WorkflowGraph {
     pub fn validate(&self) -> Result<(), DomainError> {
+        if self
+            .definition_version
+            .is_some_and(|v| v != crate::WORKFLOW_DEFINITION_VERSION)
+        {
+            return Err(DomainError::EmptyField {
+                field: "workflow.definition_version",
+            });
+        }
+        let mut keys = BTreeSet::new();
+        for node in &self.nodes {
+            if let Some(spec) = &node.spec {
+                spec.validate(node.recipe_id.as_str())?;
+                if !keys.insert(&spec.key) {
+                    return Err(DomainError::EmptyField {
+                        field: "workflow.duplicate_node_key",
+                    });
+                }
+            } else if self.definition_version.is_some() {
+                return Err(DomainError::EmptyField {
+                    field: "workflow.missing_node_spec",
+                });
+            }
+        }
         for (purpose, budget) in &self.agent_budgets {
-            if crate::budget::default_agent_budget(purpose).is_none() {
+            // Historical graphs may retain retired Planner budgets; new scheduling rejects the role.
+            if crate::budget::legacy_contract_budget(purpose).is_none()
+                && purpose != crate::RESEARCH_PROPOSAL_REVIEWER_RECIPE_ID
+            {
                 return Err(DomainError::EmptyField {
                     field: "workflow_graph.agent_budgets.role",
                 });
@@ -388,8 +421,7 @@ impl WorkflowGraph {
 /// `PAPER_BARS_LIMIT` sessions actually exist inside the window; roughly 252
 /// trading days fall in 366 calendar days, so 400 leaves headroom for holidays.
 pub const PAPER_BARS_LOOKBACK_DAYS: i64 = 400;
-/// Daily bars every Paper analyst shard is entitled to. The planner may not
-/// lower it, so a shard can always compute a one-year structure.
+/// Daily bars every Paper analyst shard is entitled to for a one-year structure.
 pub const PAPER_BARS_LIMIT: u16 = 252;
 const PAPER_NEWS_LOOKBACK_DAYS: i64 = 14;
 const PAPER_MACRO_LOOKBACK_DAYS: i64 = 366;
@@ -401,10 +433,8 @@ const PAPER_BROKER_NEED_MAX_AGE_SECS: u64 = 300;
 /// session date.
 ///
 /// This is domain policy, not scheduling mechanics: the scheduler mints these
-/// needs, the planner normalizes model-declared needs against the same bounds,
-/// and dispatch re-derives the set to validate a task's granted inputs. All
-/// three must agree, so the vocabulary lives here rather than in any one of
-/// them.
+/// needs and dispatch re-derives the set to validate a task's granted inputs.
+/// Both must agree, so the vocabulary lives here.
 pub fn paper_session_evidence_needs(session_key: &str) -> Vec<EvidenceNeed> {
     let lookback = |days: i64| {
         chrono::NaiveDate::parse_from_str(session_key, "%Y-%m-%d")
@@ -574,29 +604,6 @@ pub fn evidence_acquisition_policy_hash() -> ContentHash {
         ));
     }
     ContentHash::of_bytes(identity.as_bytes())
-}
-
-/// Raise any model-declared daily-bar need up to `PAPER_BARS_LIMIT`. A planner
-/// may widen a window but never shrink the entitlement below what a Paper shard
-/// needs, so this is a floor rather than a rejection.
-pub fn normalize_paper_bars_limit(needs: &mut [EvidenceNeed]) {
-    for need in needs {
-        if need.source_family != "alpaca" {
-            continue;
-        }
-        let mut parts = need.resource.split(':').collect::<Vec<_>>();
-        if parts.len() != 5 || parts[0] != "bars" || parts[2] != "1d" {
-            continue;
-        }
-        let Ok(limit) = parts[4].parse::<u16>() else {
-            continue;
-        };
-        if limit < PAPER_BARS_LIMIT {
-            let floor = PAPER_BARS_LIMIT.to_string();
-            parts[4] = &floor;
-            need.resource = parts.join(":");
-        }
-    }
 }
 
 /// Acquisition failure policy is independent of how many needs are requested.

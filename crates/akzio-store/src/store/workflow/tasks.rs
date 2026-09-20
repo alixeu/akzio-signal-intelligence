@@ -4,8 +4,18 @@ impl Store {
         permit: &TaskWritePermit,
         expires_at: DateTime<Utc>,
     ) -> StoreResult<()> {
-        let connection = self.connection()?;
-        let updated = connection.execute(
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_permit(&transaction, permit)?;
+        let current: String = transaction.query_row(
+            "SELECT lease_until FROM rebuild_tasks WHERE task_id = ?1",
+            params![permit.task_id.0],
+            |row| row.get(0),
+        )?;
+        // A heartbeat queued before maintenance must not shorten the lease
+        // extended by maintenance, nor revive an expired lease.
+        let expires_at = expires_at.max(parse_time(&current)?);
+        let updated = transaction.execute(
             r#"UPDATE rebuild_tasks SET lease_until = ?1
                WHERE task_id = ?2 AND status = 'running' AND lease_id = ?3 AND lease_epoch = ?4
                  AND active_attempt_id = ?5"#,
@@ -20,6 +30,7 @@ impl Store {
         if updated != 1 {
             return Err(StoreError::StalePermit(permit.task_id.clone()));
         }
+        transaction.commit()?;
         Ok(())
     }
 

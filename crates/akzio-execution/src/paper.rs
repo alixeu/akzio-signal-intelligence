@@ -46,6 +46,8 @@ pub enum PaperError {
         status: StatusCode,
         body: String,
     },
+    #[error("frozen decision, approval or execution snapshot no longer authorizes submission")]
+    SubmissionUnauthorized,
     #[error("Alpaca Paper market is closed")]
     MarketClosed,
     #[error("broker response omitted {0}")]
@@ -108,11 +110,15 @@ pub struct PaperExecution {
 /// than weakening endpoint validation with localhost exceptions.
 /// Broker protocol. It accepts only a durable Rust-owned commitment and
 /// the allocation plan it commits to; callers cannot submit a naked plan.
+mod submission_authorization;
+pub use submission_authorization::PaperSubmissionAuthorization;
+
 pub trait CommittedPaperBroker: Send + Sync {
     fn execute_commitment<'a>(
         &'a self,
         commitment: &'a PaperCommitment,
         plan: &'a ExecutionPlan,
+        authorization: &'a PaperSubmissionAuthorization,
     ) -> Pin<Box<dyn Future<Output = Result<PaperExecution>> + Send + 'a>>;
 
     fn reconcile_commitment<'a>(
@@ -129,6 +135,7 @@ pub trait CommittedPaperBroker: Send + Sync {
     fn replace_order<'a>(
         &'a self,
         intent: &'a PaperReprice,
+        authorization: &'a PaperSubmissionAuthorization,
     ) -> Pin<Box<dyn Future<Output = Result<PaperOrderReceipt>> + Send + 'a>>;
 }
 
@@ -173,6 +180,7 @@ fn receipt_state(status: &str) -> PaperDispatchResult<OrderReceiptState> {
 pub struct MarketClock {
     pub is_open: bool,
     pub session_date: NaiveDate,
+    pub session: akzio_domain::TradingSessionSnapshot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -65,27 +65,4 @@ impl EvaluationRuntime {
         self.evaluate_with_retrospective(lease, input, Some(draft))
     }
 
-    pub fn evaluate_with_lease_at_state(
-        &self,
-        lease: Option<&DaemonLease>,
-        input: EvaluationInput,
-        retrospective_draft: Option<&RetrospectiveDraft>,
-        target_state: PolicyState,
-    ) -> EvaluationRuntimeResult<EvaluationResult> {
-        self.evaluate_with_retrospective_at_state(
-            lease,
-            input,
-            retrospective_draft,
-            Some(target_state),
-        )
-    }
-
-    fn evaluate_with_retrospective(
-        &self,
-        lease: Option<&DaemonLease>,
-        input: EvaluationInput,
-        retrospective_draft: Option<&RetrospectiveDraft>,
-    ) -> EvaluationRuntimeResult<EvaluationResult> {
-        self.evaluate_with_retrospective_at_state(lease, input, retrospective_draft, None)
-    }
 }

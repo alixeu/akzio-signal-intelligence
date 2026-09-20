@@ -7,8 +7,11 @@ use std::{
 use sha2::{Digest, Sha256};
 
 fn main() {
+    // 构建脚本只把源树状态和编译器版本写入编译环境；它不读取运行时
+    // Store，也不创建或激活任何研究、Decision 或 Execution 状态。
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest directory"));
     let repository = manifest.join("../..");
+    // 这些路径决定 Cargo 何时重新运行本脚本；目录变化会覆盖其中的源码、配置和文档。
     for watched in [
         "Cargo.lock",
         "Cargo.toml",
@@ -28,6 +31,8 @@ fn main() {
         );
     }
 
+    // 优先保留 Git HEAD 及工作区内容的身份；Git 不可用时退回到受限源树哈希，
+    // 使运行时仍能区分不同的源码输入。
     let source_revision = git_revision(&repository)
         .unwrap_or_else(|| format!("source-tree+{}", source_tree_hash(&repository)));
     println!("cargo:rustc-env=AKZIO_SOURCE_REVISION={source_revision}");
@@ -47,6 +52,8 @@ fn main() {
 }
 
 fn git_revision(repository: &Path) -> Option<String> {
+    // HEAD 是稳定前缀，后缀同时覆盖已跟踪差异和未跟踪文件的路径与内容；
+    // 任一 Git 查询失败都让调用方使用非 Git 的源树回退值。
     let head = String::from_utf8(git_bytes(repository, &["rev-parse", "HEAD"])?).ok()?;
     let mut state = Sha256::new();
     state.update(git_bytes(repository, &["diff", "--binary", "HEAD"])?);
@@ -69,6 +76,8 @@ fn git_revision(repository: &Path) -> Option<String> {
 }
 
 fn git_bytes(repository: &Path, arguments: &[&str]) -> Option<Vec<u8>> {
+    // 只接受成功退出的 Git 标准输出；命令启动失败、非零退出或 stderr
+    // 都统一转成 None，由上层决定是否使用回退身份。
     let output = Command::new("git")
         .arg("-C")
         .arg(repository)
@@ -79,6 +88,8 @@ fn git_bytes(repository: &Path, arguments: &[&str]) -> Option<Vec<u8>> {
 }
 
 fn source_tree_hash(repository: &Path) -> String {
+    // 回退哈希只覆盖与构建相关的源码、配置和脚本，并按相对路径排序，
+    // 以消除目录遍历顺序差异；本地覆盖文件不参与身份计算。
     let mut files = Vec::new();
     for relative in [
         "Cargo.lock",
@@ -115,6 +126,8 @@ fn source_tree_hash(repository: &Path) -> String {
 }
 
 fn collect_files(candidate: &Path, files: &mut Vec<PathBuf>) {
+    // 递归收集文件；无法读取的目录被跳过，因为该函数服务于 Git 回退路径，
+    // 不能把目录读取失败误当成运行时业务错误。
     if candidate.is_file() {
         files.push(candidate.to_path_buf());
         return;
@@ -128,5 +141,6 @@ fn collect_files(candidate: &Path, files: &mut Vec<PathBuf>) {
 }
 
 fn hex(bytes: &[u8]) -> String {
+    // 将摘要的每个字节编码为两个小写十六进制字符，供环境变量和报告使用。
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }

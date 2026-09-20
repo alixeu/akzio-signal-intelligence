@@ -6,10 +6,14 @@ pub(crate) struct AgentSession<'a> {
 }
 
 impl<'a> AgentSession<'a> {
+    // 保存 Daemon 的共享借用，后续候选读取和 AgentRuntime 调用都沿用同一运行时边界。
     pub(crate) const fn new(daemon: &'a Daemon) -> Self {
         Self { daemon }
     }
 
+    // 按任务 recipe 选择已配置模型，把候选 Artifact 和同一 Attempt 的累计预算交给
+    // AgentRuntime；返回的是研究/审查角色提交并通过运行时校验的单个输出 Artifact，
+    // 不是 Decision 或执行许可。
     pub(crate) async fn run(
         &self,
         task: &ClaimedAttempt,
@@ -25,6 +29,9 @@ impl<'a> AgentSession<'a> {
             .await?)
     }
 
+    // 从任务声明、已成功依赖输出和父任务关系构造去重后的候选引用；这里先做 Store
+    // 中的存在性与 kind 校验，真正的 ContextManifest、授权投影和 RawEvidence 隔离由
+    // AgentRuntime/ContextBroker 继续负责。
     pub(crate) fn candidates(&self, task: &ClaimedAttempt) -> Result<Vec<ArtifactRef>> {
         let mut candidates = BTreeMap::<ArtifactId, ArtifactRef>::new();
         let expand_research_sources = should_expand_research_sources(task.node.recipe_id.as_str());
@@ -34,6 +41,8 @@ impl<'a> AgentSession<'a> {
         }
 
         if let Some(parent_task_id) = &task.node.parent_task_id {
+            // 子任务必须把 parent 声明为 dependency；这里只验证父 Attempt 已成功，
+            // 不直接拼接父输出，避免调度层绕过 AgentRuntime 的子上下文收缩策略。
             if !task.node.dependencies.contains(parent_task_id) {
                 return Err(DaemonError::InvalidInput(format!(
                     "agent task {} parent {parent_task_id} is not dependency",
@@ -59,6 +68,8 @@ impl<'a> AgentSession<'a> {
             }
             // AgentRuntime/ContextBroker owns parent projection and context policy.
         } else {
+            // 没有 parent 时，所有显式依赖都必须已经成功；随后只把其正式成功输出
+            // 加入候选，Skipped 或未完成依赖不能被当作可用研究依据。
             let dependencies = task
                 .node
                 .dependencies
@@ -86,6 +97,8 @@ impl<'a> AgentSession<'a> {
                     }
                 }
                 for dependency in dependencies {
+                    // 依赖输出可能为空，但依赖本身仍须是成功状态；空结果最终由
+                    // MissingTaskContext 拦截（有 parent 的任务则交由上面的投影逻辑）。
                     for artifact in self
                         .daemon
                         .store
@@ -104,16 +117,15 @@ impl<'a> AgentSession<'a> {
             }
         }
 
-        if candidates.is_empty()
-            && task.node.recipe_id.as_str() != akzio_domain::RESEARCH_PLANNER_RECIPE_ID
-            && task.node.parent_task_id.is_none()
-        {
+        if candidates.is_empty() && task.node.parent_task_id.is_none() {
             return Err(DaemonError::MissingTaskContext(task.node.task_id.clone()));
         }
 
         Ok(candidates.into_values().collect())
     }
 
+    // 递归纳入一个已声明的 Artifact 及其受支持的研究来源，同时以 ArtifactId 去重并
+    // 拒绝同一 ID 的 kind 漂移；RawEvidence 只用于闭合来源，永不进入模型候选集合。
     fn append_candidate(
         &self,
         candidates: &mut BTreeMap<ArtifactId, ArtifactRef>,
@@ -142,6 +154,8 @@ impl<'a> AgentSession<'a> {
             if artifact.kind == ArtifactKind::SemanticDetail
                 && artifact.producer == "canary.evidence_snapshot"
             {
+                // Shadow canary 的聚合快照本身是可读投影；仅展开其中精确的
+                // NormalizedEvidence 来源，保持父 EvidenceGate 的授权闭包。
                 for source in artifact
                     .source_refs
                     .iter()
@@ -158,6 +172,8 @@ impl<'a> AgentSession<'a> {
                 },
             );
             if expand_research_sources {
+                // Critic/Synthesizer 需要看到研究输出的依据闭包，但只沿允许的
+                // Claim/Critique/标准化证据/语义细节类型递归，不恢复旧 Draft 链路。
                 for source in research_output_source_refs(artifact.kind, &artifact.source_refs) {
                     self.append_candidate(candidates, &source, expand_research_sources)?;
                 }
@@ -167,6 +183,8 @@ impl<'a> AgentSession<'a> {
     }
 }
 
+// 只有 Claim/Critique 的来源闭包会被研究复核角色展开；其他输出不自动传播来源，
+// 以避免把 Decision、Execution 或任意历史 Artifact 混入本次模型上下文。
 fn research_output_source_refs(
     kind: ArtifactKind,
     source_refs: &[ArtifactRef],
@@ -189,6 +207,8 @@ fn research_output_source_refs(
         .collect()
 }
 
+// 研究 Critic 和 Synthesizer 使用完整研究来源闭包；Analyst、Reviewer 及执行节点
+// 保持各自的输入选择边界。
 fn should_expand_research_sources(recipe_id: &str) -> bool {
     matches!(
         recipe_id,

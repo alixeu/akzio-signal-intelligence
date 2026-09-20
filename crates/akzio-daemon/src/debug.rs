@@ -16,11 +16,10 @@ pub struct DebugPrepareRequest {
     pub purpose: RunPurpose,
     #[serde(default)]
     pub paper_allowed: bool,
-    #[serde(default)]
-    pub fixture_controller: bool,
 }
 
 fn default_debug_purpose() -> RunPurpose {
+    // 请求省略 purpose 时默认构造 Paper 研究图；该 serde 默认值不等于已获 Paper approval。
     RunPurpose::Paper
 }
 
@@ -30,19 +29,16 @@ pub struct DebugForkRequest {
     pub task_id: Option<TaskId>,
     pub experiment_id: RunId,
     pub reason: String,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub read_range_probe: bool,
-}
-
-fn is_false(value: &bool) -> bool {
-    !value
 }
 
 impl Daemon {
+    // 仅以 DebugControl 配置是否存在判断控制面是否启用，不代表当前 Run 已准备或可执行。
     pub fn debug_enabled(&self) -> bool {
         self.debug_control.is_some()
     }
 
+    // 校验 Debug prepare 的 purpose、session 和 DecisionPolicy 条件，构造/保留隔离实验；
+    // 返回 DebugSession 只表示图、身份和预约已持久化，尚未运行研究、Decision 或 Broker。
     pub fn prepare_debug(&self, request: &DebugPrepareRequest) -> Result<DebugSession> {
         let config = self
             .debug_control
@@ -51,35 +47,33 @@ impl Daemon {
         if !matches!(
             request.purpose,
             RunPurpose::Paper | RunPurpose::PositionPlan
-        ) || (request.purpose == RunPurpose::PositionPlan
-            && (request.paper_allowed || request.fixture_controller))
+        ) || (request.purpose == RunPurpose::PositionPlan && request.paper_allowed)
         {
+            // Debug 只允许 Paper 或不执行的 PositionPlan；PositionPlan 不能携带 paper_allowed。
             return Err(DaemonError::InvalidInput(
                 "debug prepare requires Paper or non-executing PositionPlan".into(),
             ));
         }
-        if request.fixture_controller {
-            if !self.fixture_mode || request.paper_allowed {
-                return Err(DaemonError::InvalidInput(
-                    "controller fixture requires fixture Core and forbidden broker writes".into(),
-                ));
-            }
-            let now = Utc::now();
-            let graph = self.workflow.bootstrap(RunPurpose::PaperDryRun, "active")?;
-            let workflow = self.workflow.prepare_workflow_commit(
-                RunId::new(),
-                RunPurpose::PaperDryRun,
-                graph,
-                now,
-            )?;
-            let identity = self.debug_identity(&workflow, vec![], false)?;
-            return Ok(self
-                .store
-                .commit_debug_experiment(&workflow, &[], &identity)?);
+        if request.purpose == RunPurpose::PositionPlan
+            && !self.fixture_mode
+            && !(config.decision_policy_status == "store_active_head_missing"
+                && config.decision_policy_input_hash.is_none()
+                && config.decision_policy_artifact.is_none())
+            && (config.decision_policy_status != "ready_for_current_decision"
+                || config.decision_policy_input_hash.is_none()
+                || config.decision_policy_artifact.is_none())
+        {
+            // PositionPlan 要么使用 ready policy，要么显式标记 Store 尚未有 active head；
+            // fixture 的例外只影响隔离验证，不把 policy 缺失变成 Decision/交易授权。
+            return Err(DaemonError::InvalidInput(
+                "PositionPlan requires a ready policy or an explicitly uncalibrated Store".into(),
+            ));
         }
         NaiveDate::parse_from_str(&request.session_key, "%Y-%m-%d")
             .map_err(|_| DaemonError::InvalidInput("session_key must be YYYY-MM-DD".into()))?;
         if request.purpose == RunPurpose::PositionPlan {
+            // PositionPlan 不占 Paper session slot；prepare_position_plan 返回冻结 setup，
+            // 随后以隔离 identity 一次性提交实验图，Decision 之后没有 Execution 链。
             let (workflow, setup) = self.prepare_position_plan(&request.session_key, Utc::now())?;
             let dataset = setup
                 .iter()
@@ -94,6 +88,8 @@ impl Daemon {
                 .commit_debug_experiment(&workflow, &setup, &identity)?);
         }
         if let Some(slot) = self.store.session_slot(&request.session_key)? {
+            // 同一 session 已有实验时只允许返回身份完全兼容的现有 Session；不静默复用
+            // 不同 runtime 或 broker policy 的预约。
             let session = self
                 .store
                 .debug_session(&slot.workflow.run.run_id)?
@@ -108,6 +104,8 @@ impl Daemon {
             }
             return Ok(session);
         }
+        // 新 Paper Debug 实验先创建 scheduler snapshot 和 approved proposal，再把同一
+        // evidence dataset 绑定到 Analyst 节点；后续 worker 才按 permit 执行。
         let now = Utc::now();
         let run_id = RunId::new();
         let setup =
@@ -129,6 +127,8 @@ impl Daemon {
         {
             task.evidence_needs = dataset.clone();
         }
+        // prepare_approved... 只建立冻结 WorkflowCommit/Session reservation；lease 和
+        // approval binding 进入 Store 身份，不能据此声称 Paper 订单已获准或已提交。
         let (reservation, proposal) = self
             .workflow
             .prepare_approved_paper_session_with_inputs_for_run(
@@ -151,6 +151,8 @@ impl Daemon {
         )?)
     }
 
+    // 从隔离 Store、Workflow 和配置快照生成不可变 DebugSessionIdentity；其中 broker policy
+    // 和 learning scope 只是实验身份约束，paper_allowed 不会绕过 PaperLaunchApproval。
     fn debug_identity(
         &self,
         workflow: &akzio_store::WorkflowCommit,
@@ -185,6 +187,7 @@ impl Daemon {
             runtime_identity: config.runtime_identity.clone(),
             decision_policy_status: config.decision_policy_status.clone(),
             decision_policy_input_hash: config.decision_policy_input_hash.clone(),
+            decision_policy_artifact: config.decision_policy_artifact.clone(),
             contract_hashes: workflow
                 .nodes
                 .iter()
@@ -196,11 +199,15 @@ impl Daemon {
             parent_run_id: None,
             parent_task_id: None,
             parent_artifacts: vec![],
-            reason: None,
+            reason: (workflow.run.purpose == RunPurpose::PositionPlan
+                && config.decision_policy_status == "store_active_head_missing")
+                .then(|| "research_only_incomplete: DecisionPolicy missing; manual research only, Decision forbidden".to_owned()),
             created_at: workflow.run.created_at,
         })
     }
 
+    // 在 Store 的 Debug 控制事务前增加 daemon 侧不可用边界：缺 policy 时阻止继续到
+    // Decision，Outcome worker 不可用时阻止单步/重试；其余动作仍由 Store 决定并持久化。
     pub fn control_debug(
         &self,
         run_id: &RunId,
@@ -210,6 +217,28 @@ impl Daemon {
             .debug_control
             .as_ref()
             .ok_or_else(|| DaemonError::InvalidInput("debug_control_disabled".into()))?;
+        if !self.fixture_mode
+            && self
+                .store
+                .debug_session(run_id)?
+                .is_some_and(|session| session.identity.research_only_without_policy())
+        {
+            // research_only_without_policy 只允许手动 Evidence/Analyst/Critic/Synthesizer；
+            // Resume 或直接 step 到 gate.decision 都不能把研究提案提升为 Decision。
+            let starts_decision = request.action == akzio_domain::DebugAction::Resume
+                || self
+                    .store
+                    .workflow_snapshot(run_id)?
+                    .tasks
+                    .iter()
+                    .any(|task| {
+                        Some(&task.node.task_id) == request.task_id.as_ref()
+                            && task.node.recipe_id.as_str() == "gate.decision"
+                    });
+            if starts_decision {
+                return Err(DaemonError::InvalidInput("research_only_incomplete: missing DecisionPolicy; only manual Evidence/Analyst/Critic/Synthesizer steps are allowed".into()));
+            }
+        }
         if matches!(
             request.action,
             akzio_domain::DebugAction::Step | akzio_domain::DebugAction::RetryNode
@@ -219,6 +248,8 @@ impl Daemon {
                     && t.node.recipe_id.as_str() == "learning.outcome_worker"
             })
         {
+            // Outcome worker 关闭时不接受会推进该节点的控制动作，避免产生看似完成但没有
+            // Outcome 处理能力的终态；普通 inspection/pause/abort 仍可继续。
             return Err(DaemonError::Unavailable(
                 "outcome_processing_disabled_or_adapter_unavailable".into(),
             ));
@@ -228,6 +259,8 @@ impl Daemon {
             .debug_control(run_id, request, &config.runtime_identity, Utc::now())?)
     }
 
+    // 读取 Store 的 DebugRunView 后按当前 runtime identity、Outcome 能力和生命周期状态
+    // 修正可用动作/节点原因；这是观察投影，不会推进任务或改变原始 workflow 状态。
     pub fn inspect_debug(
         &self,
         run_id: &RunId,
@@ -242,13 +275,17 @@ impl Daemon {
             .as_ref()
             .is_some_and(|c| c.runtime_identity == view.session.identity.runtime_identity);
         if !identity_matches {
+            // runtime identity 变化后只保留 pause/abort，禁止在旧身份上继续执行或重试。
             view.allowed_actions
                 .retain(|a| matches!(a.as_str(), "pause" | "abort"));
         }
+        view.inspection.allowed_actions = view.allowed_actions.clone();
         let lifecycle = self.store.run_lifecycle_health(run_id)?;
         for node in &mut view.nodes {
             let outcome = node.role == "learning.outcome_worker";
             if outcome {
+                // Outcome 节点的 horizon 来自 Store lifecycle pending 状态，而不是节点名
+                // 或自然日期推断；没有 pending 阶段就保持 None。
                 node.horizon = ["t1", "t3", "t5"]
                     .into_iter()
                     .find(|h| {
@@ -259,7 +296,9 @@ impl Daemon {
                     })
                     .map(str::to_owned);
             }
-            let reason = if !identity_matches {
+            let reason = if node.blocked_reason.as_deref() == Some("legacy_workflow_retired") {
+                Some("legacy_workflow_retired")
+            } else if !identity_matches {
                 Some("runtime_identity_changed: create a new experiment")
             } else if outcome && !self.outcome_processing {
                 Some("outcome_processing_disabled_or_adapter_unavailable")
@@ -267,6 +306,7 @@ impl Daemon {
                 None
             };
             if let Some(reason) = reason {
+                // 每个阻断原因同时关闭 step/retry，避免 UI 显示可操作但后端必然拒绝。
                 node.step_eligible = false;
                 node.retry_eligible = false;
                 node.blocked_reason = Some(reason.into());
@@ -275,18 +315,20 @@ impl Daemon {
         Ok(view)
     }
 
+    // 从一个可执行的非 Paper Debug Run 创建新的隔离实验：只复制 EvidenceNeed 的 setup
+    // 作为新 Run 的采集入口，保留可选父 Attempt 作为 lineage，不复制成功状态或读取授权。
     pub fn fork_debug(&self, run_id: &RunId, request: &DebugForkRequest) -> Result<DebugSession> {
+        self.store.assert_workflow_executable(run_id)?;
         if !self.debug_enabled() || request.reason.trim().is_empty() {
+            // fork 需要启用控制面和非空实验理由，理由会进入新 identity 供审计。
             return Err(DaemonError::InvalidInput(
                 "debug enabled and experiment reason required".into(),
             ));
         }
-        let reason = if request.read_range_probe {
-            format!("{} [read_range_probe]", request.reason)
-        } else {
-            request.reason.clone()
-        };
+        let reason = request.reason.clone();
         if let Some(existing) = self.store.debug_session(&request.experiment_id)? {
+            // 相同 parent/task/reason 的重复请求可幂等返回；同一 experiment_id 的其他
+            // 组合视为冲突，不能覆盖既有实验。
             if existing.identity.parent_run_id.as_ref() == Some(run_id)
                 && existing.identity.parent_task_id.as_ref() == request.task_id.as_ref()
                 && existing.identity.reason.as_ref() == Some(&reason)
@@ -299,15 +341,14 @@ impl Daemon {
             .store
             .debug_session(run_id)?
             .ok_or_else(|| DaemonError::InvalidInput("parent_is_not_debug".into()))?;
-        if request.read_range_probe && source.identity.run_purpose != RunPurpose::PositionPlan {
-            return Err(DaemonError::InvalidInput(
-                "read_range probe requires PositionPlan parent".into(),
-            ));
-        }
         let purpose = source.identity.run_purpose;
         if purpose == RunPurpose::Paper {
+            // Paper Run 的 Session/approval 绑定不能通过 fork 降级成 Debug；需要新的
+            // prepare 流程按 Paper 规则重新预约。
             return Err(DaemonError::InvalidInput("Paper experiment requires fresh prepare with a reserved Session; purpose cannot be downgraded to Debug".into()));
         }
+        // proof 只作为父成功 Attempt 的只读 lineage；没有 task_id 时以父 WorkflowGraph
+        // 作为来源证明，二者都不替代新 Run 的证据采集。
         let proof = request
             .task_id
             .as_ref()
@@ -318,6 +359,8 @@ impl Daemon {
         // outputs remain lineage, never a forged success or an implicit read grant.
         let mut setup = Vec::new();
         for reference in source.identity.dataset {
+            // 新实验只复制 EvidenceNeed 的 payload 并重绑定新 run_id；父产出的 Claim、
+            // RawEvidence 或其他结果不作为新 Run 的 setup 输入。
             let parent = self.store.artifact(&reference.artifact_id)?;
             if parent.kind != ArtifactKind::EvidenceNeed {
                 continue;
@@ -352,10 +395,9 @@ impl Daemon {
             .filter(|t| t.recipe_id.as_str() == akzio_domain::RESEARCH_ANALYST_RECIPE_ID)
         {
             task.evidence_needs = dataset.clone();
-            if request.read_range_probe {
-                task.objective.push_str(" Independent read_range coverage experiment: before writing the Draft memo, call read_range exactly once on a real authorized NormalizedEvidence artifact, start_byte=0 and end_byte=512. Inspect the returned bytes, then complete the normal memo and Submit. A partial JSON prefix is not complete market evidence. Do not broaden any directional claim from this probe; retain all evidence gaps.");
-            }
         }
+        // 新图重新 lower/prepare，保留 purpose；父输出仅写入 identity.parent_artifacts，
+        // 不改变新任务的初始状态或授予隐式 read grant。
         let graph = self.workflow.lower(purpose, &proposal)?;
         let workflow = self.workflow.prepare_workflow_commit(
             request.experiment_id.clone(),
@@ -370,6 +412,7 @@ impl Daemon {
             proof
                 .outputs
                 .into_iter()
+                .filter(|a| a.kind != ArtifactKind::RawEvidence)
                 .map(|a| ArtifactRef {
                     artifact_id: a.artifact_id,
                     kind: a.kind,
@@ -382,6 +425,7 @@ impl Daemon {
             }]
         };
         identity.reason = Some(reason);
+        // commit_debug_experiment 只持久化新隔离实验及其 setup；实际执行仍需后续控制动作。
         Ok(self
             .store
             .commit_debug_experiment(&workflow, &setup, &identity)?)

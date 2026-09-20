@@ -8,6 +8,7 @@ mod financial_content;
 mod news;
 mod official;
 mod paper_decode;
+mod prompts;
 mod quant_features;
 pub mod runtime;
 
@@ -24,11 +25,12 @@ pub use quant_features::{QuantFeatureSnapshot, QUANT_FEATURE_FORMULA_VERSION};
 pub use runtime::validate_outcome_price_window;
 pub use runtime::{
     model_native_web_evidence_transport, validate_daily_bar_payload, AcquiredEvidence,
-    AlpacaMarketDataFeed, AlpacaPaperEvidenceTransport, AsyncEvidenceAdapter, EvidenceAdapter,
-    EvidenceAdapterError, EvidenceBundle, EvidenceCitation, EvidenceContaminationCertificate,
-    EvidenceProvenance, EvidenceQuality, EvidenceRequest, EvidenceRuntime, EvidenceRuntimeError,
-    EvidenceRuntimeResult, EvidenceSource, EvidenceTimeBasis, FixtureEvidenceAdapter,
-    GovernedResource, NativeWebFailureKind, NormalizedEvidencePayload,
+    AlpacaMarketDataFeed, AlpacaOptionDataFeed, AlpacaPaperEvidenceTransport, AsyncEvidenceAdapter,
+    EvidenceAdapter, EvidenceAdapterError, EvidenceBundle, EvidenceCitation,
+    EvidenceContaminationCertificate, EvidenceProvenance, EvidenceQuality, EvidenceRequest,
+    EvidenceRuntime, EvidenceRuntimeError, EvidenceRuntimeResult, EvidenceSource,
+    EvidenceTimeBasis, FixtureEvidenceAdapter, GovernedResource, NativeWebFailureKind,
+    NormalizedEvidencePayload,
 };
 
 /// US ETF session date, including UTC evening/day-boundary differences.

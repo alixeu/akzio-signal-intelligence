@@ -25,10 +25,18 @@ struct RunStatusBar: View {
     @Environment(\.appLanguage) private var language
 
     var body: some View {
+        // 状态栏只读当前投影；Run/设置/归档操作通过闭包回传给 Store，不在 View 内持有业务状态。
         HStack(spacing: AkzioLayout.s4) {
             identity
             HairlineDivider(.vertical).frame(height: 18)
-            vitals
+            ViewThatFits(in: .horizontal) {
+                vitals.fixedSize()
+                HStack(spacing: AkzioLayout.s3) {
+                    StatusDot(run.hasRun ? run.status.status : .unavailable)
+                    Text(L10n.text(run.displayStatus, language: language)).akzioText(.label)
+                    metric("Elapsed", PpmFormatter.elapsed(seconds: run.elapsedSeconds))
+                }.fixedSize()
+            }
             Spacer(minLength: AkzioLayout.s4)
             controls
         }
@@ -72,8 +80,8 @@ struct RunStatusBar: View {
     private var vitals: some View {
         HStack(spacing: AkzioLayout.s4) {
             HStack(spacing: 6) {
-                StatusDot(run.status.status)
-            Text(L10n.text(run.status.displayName, language: language))
+                StatusDot(run.hasRun ? run.status.status : .unavailable)
+            Text(L10n.text(run.displayStatus, language: language))
                     .akzioText(.label, color: AkzioColor.primaryText)
             }
             .sharedElement(.runStatus, in: namespace)
@@ -109,10 +117,16 @@ struct RunStatusBar: View {
     // MARK: Right
 
     private var controls: some View {
+        // 控件可见性由当前连接、Run purpose 和 in-flight 状态共同决定；禁用只阻止重复提交，不取消已有请求。
         HStack(spacing: AkzioLayout.s3) {
-            marketChip
-            dataChip
-            latencyChip
+            if observerState == .mock {
+                Label("Mock", systemImage: "rectangle.dashed")
+                    .akzioText(.label, color: AkzioColor.primaryGold)
+            } else {
+                marketChip
+                dataChip
+                latencyChip
+            }
             runModePicker
             Button(action: onRun) {
                 HStack(spacing: 5) {
@@ -154,6 +168,7 @@ struct RunStatusBar: View {
     }
 
     private var runModePicker: some View {
+        // 仅列出 Rust 允许的 userLaunchModes；选择结果先回传 Store，再由 Store 校验是否正在运行。
         Menu {
             Section(L10n.text("Run mode", language: language)) {
                 ForEach(RunPurpose.userLaunchModes, id: \.self) { purpose in
@@ -192,7 +207,7 @@ struct RunStatusBar: View {
             Circle()
                 .fill(run.marketOpen ? AkzioColor.successDot : AkzioColor.mutedText)
                 .frame(width: 6, height: 6)
-            Text(L10n.text(run.marketOpen ? "Market Open" : "Market Closed", language: language)).akzioText(.label)
+            Text(L10n.text(run.marketStatusKnown ? (run.marketOpen ? "Market Open" : "Market Closed") : "Market unknown", language: language)).akzioText(.label)
         }
     }
 
@@ -214,12 +229,14 @@ struct RunStatusBar: View {
     }
 
     private var effectiveDataStale: Bool {
+        // 连接层 stale/offline 优先级高于快照字段，防止旧快照被显示成实时数据。
         if case .stale = observerState { return true }
         if case .offline = observerState { return true }
         return run.dataStale
     }
 
     private var dataLabel: String {
+        // connecting 明确表示数据尚未取到；mock/connected 才读取快照的 stale/live 标记。
         switch observerState {
         case .connecting: "Data Queued"
         case .stale, .offline: "Data Stale"

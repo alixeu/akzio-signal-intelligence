@@ -33,6 +33,7 @@ public enum CaptureCommand {
     }
 
     public static func run(_ arguments: [String]) -> Int32 {
+        // 参数不完整返回 2；渲染/写文件失败返回 1；只有 PNG 已写入才返回 0。
         guard let options = parse(arguments) else {
             FileHandle.standardError.write(Data(usage.utf8))
             return 2
@@ -62,6 +63,7 @@ public enum CaptureCommand {
     }
 
     static func render(_ options: Options) throws {
+        // 这里构造的是关闭 Core 自动启动的离屏 AppShell，因此截图不会启动真实任务或网络请求。
         let content = AppShell(
             scenario: options.scenario,
             route: options.route,
@@ -77,6 +79,7 @@ public enum CaptureCommand {
         renderer.scale = options.scale
         renderer.isOpaque = true
 
+        // ImageRenderer 可能在布局失败时不给图像；该错误在 run 中转换为非零退出码。
         guard let cgImage = renderer.cgImage else { throw CaptureError.renderFailed }
         let bitmap = NSBitmapImageRep(cgImage: cgImage)
         bitmap.size = NSSize(width: options.width, height: options.height)
@@ -85,6 +88,7 @@ public enum CaptureCommand {
         }
 
         let url = URL(fileURLWithPath: options.output)
+        // 先确保输出目录存在，再用 atomic 写入；写入失败不会报告 captured。
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(),
             withIntermediateDirectories: true
@@ -113,6 +117,7 @@ public enum CaptureCommand {
         var values: [String: String] = [:]
         var flags: Set<String> = []
         var index = 0
+        // 解析器只识别 --key value 和无值 flag；未知 key 保留在字典中，最终由必需字段校验淘汰。
         while index < arguments.count {
             let argument = arguments[index]
             guard argument.hasPrefix("--") else { index += 1; continue }
@@ -127,6 +132,7 @@ public enum CaptureCommand {
             }
         }
 
+        // 场景、路由和输出路径缺一不可；这里的 nil 会让调用方打印完整 usage，而不是部分渲染。
         guard let scenarioToken = values["scenario"],
               let scenario = MockScenario.named(scenarioToken),
               let routeToken = values["route"],
@@ -136,6 +142,7 @@ public enum CaptureCommand {
 
         var width: CGFloat = 1512
         var height: CGFloat = 982
+        // 尺寸非法时保留默认值；scale 同样回退到 2，避免一个坏参数改变渲染目标的可用性。
         if let size = values["size"] {
             let parts = size.lowercased().split(separator: "x").compactMap { Double($0) }
             if parts.count == 2 {

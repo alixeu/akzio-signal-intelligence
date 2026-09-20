@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 akzio-context = { path = "../akzio-context" }
+akzio-ingest = { path = "../akzio-ingest" }
 akzio-domain = { path = "../akzio-domain" }
 akzio-model = { path = "../akzio-model" }
 akzio-runtime = { path = "../akzio-runtime" }
@@ -19,3 +20,6 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+reqwest.workspace = true

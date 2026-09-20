@@ -90,26 +90,49 @@ impl Daemon {
     }
 
     pub(crate) fn retry_run(&self, source_run_id: &RunId) -> Result<RunId> {
+        self.store.assert_workflow_executable(source_run_id)?;
         if self.debug_enabled() {
             return Err(DaemonError::InvalidInput(
                 "use debug retry-node or debug fork for a controlled experiment".into(),
             ));
         }
         match self.store.run_purpose(source_run_id)? {
-            RunPurpose::Debug | RunPurpose::PositionPlan | RunPurpose::PaperDryRun => {}
+            RunPurpose::PositionPlan => {}
             RunPurpose::Paper => {
                 return Err(DaemonError::InvalidInput(
                     "Paper runs are scheduler-owned and cannot be retried by an operator"
                         .to_owned(),
                 ));
             }
-            RunPurpose::Replay | RunPurpose::Shadow => {
+            RunPurpose::Debug
+            | RunPurpose::PaperDryRun
+            | RunPurpose::Replay
+            | RunPurpose::Shadow => {
                 return Err(DaemonError::InvalidInput(
-                    "only Debug and Paper Dry Run runs may be retried by an operator".to_owned(),
+                    "only PositionPlan runs may be retried by an operator".to_owned(),
                 ));
             }
         }
-        Ok(self.workflow.retry_run(source_run_id, Utc::now())?)
+        let source = self.workflow.replay_run(source_run_id)?;
+        if !matches!(
+            source.status,
+            WorkflowStatus::Completed
+                | WorkflowStatus::CompletedWithExecutionRejection
+                | WorkflowStatus::Failed
+                | WorkflowStatus::Cancelled
+        ) {
+            return Err(
+                akzio_runtime::RuntimeError::RetryRunNotTerminal(source_run_id.clone()).into(),
+            );
+        }
+        let now = Utc::now();
+        let session = now
+            .with_timezone(&chrono_tz::America::New_York)
+            .date_naive()
+            .to_string();
+        let (workflow, setup) = self.prepare_position_plan(&session, now)?;
+        self.store.commit_position_plan(&workflow, &setup)?;
+        Ok(workflow.run.run_id)
     }
 
     pub(crate) fn replay_report(&self, run_id: &RunId) -> Result<ReplayReport> {

@@ -2,8 +2,7 @@ import SwiftUI
 
 // MARK: - Retrospective stack
 //
-// A shallow stack: the current card sits forward, neighbours stay visible but dimmer
-// and slightly smaller. Sliding keeps the stack depth — no 3D page flip.
+// One readable retrospective at a time, with explicit previous/next controls.
 struct RetrospectiveCardStack: View {
     let cards: [RetrospectiveCardPresentation]
     @Binding var index: Int
@@ -27,21 +26,10 @@ struct RetrospectiveCardStack: View {
     }
 
     private var stack: some View {
-        ZStack {
-            ForEach(Array(cards.enumerated()), id: \.element.id) { position, card in
-                let distance = position - index
-                if abs(distance) <= 2 {
-                    cardView(card, isCurrent: distance == 0)
-                        .scaleEffect(distance == 0 ? 1 : 0.96)
-                        .offset(x: CGFloat(distance) * 26, y: CGFloat(abs(distance)) * 8)
-                        .opacity(distance == 0 ? 1 : 0.45)
-                        .zIndex(distance == 0 ? 2 : 1 - Double(abs(distance)) * 0.1)
-                        .allowsHitTesting(distance == 0)
-                }
-            }
-        }
-        .animation(policy.resolve(.spring(response: 0.48, dampingFraction: 0.95)), value: index)
-        .frame(height: 268)
+        // Translucent cards must not overlap: neighbouring text remains visible
+        // through the material even when the current card has a higher zIndex.
+        cardView(cards[min(max(index, 0), cards.count - 1)], isCurrent: true)
+            .frame(height: 268)
     }
 
     private func cardView(_ card: RetrospectiveCardPresentation, isCurrent: Bool) -> some View {
@@ -109,8 +97,10 @@ struct RetrospectiveCardStack: View {
         HStack(spacing: AkzioLayout.s2) {
             Button { step(-1) } label: { Image(systemName: "chevron.left") }
                 .buttonStyle(PressableButtonStyle())
+                .disabled(index <= 0)
             Button { step(1) } label: { Image(systemName: "chevron.right") }
                 .buttonStyle(PressableButtonStyle())
+                .disabled(index >= cards.count - 1)
             Text("\(index + 1) / \(cards.count)").akzioMono(11, color: AkzioColor.mutedText)
             Spacer(minLength: AkzioLayout.s2)
             Button {
