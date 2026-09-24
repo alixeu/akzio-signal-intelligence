@@ -6,6 +6,7 @@ import SwiftUI
 // middle, controls on the right. The running dot breathes slowly (2s) instead of
 // blinking, so a long-running run never feels like an alarm.
 struct RunStatusBar: View {
+    // 状态栏是纯展示 View；可运行性、purpose 选择和异步提交结果都由 Store 通过输入/闭包注入。
     let run: RunPresentation
     let health: [HealthMetric]
     let observerState: ObserverConnectionState
@@ -25,6 +26,7 @@ struct RunStatusBar: View {
     @Environment(\.appLanguage) private var language
 
     var body: some View {
+        // ViewThatFits 只改变布局表达，不改变数据来源；窄宽度仍读取同一个 RunPresentation。
         // 状态栏只读当前投影；Run/设置/归档操作通过闭包回传给 Store，不在 View 内持有业务状态。
         HStack(spacing: AkzioLayout.s4) {
             identity
@@ -117,6 +119,7 @@ struct RunStatusBar: View {
     // MARK: Right
 
     private var controls: some View {
+        // Button/Menu 的闭包只发出用户意图；disabled 是防重复提交的 UI 门，不是 Core 的授权判断。
         // 控件可见性由当前连接、Run purpose 和 in-flight 状态共同决定；禁用只阻止重复提交，不取消已有请求。
         HStack(spacing: AkzioLayout.s3) {
             if observerState == .mock {

@@ -18,6 +18,9 @@ use akzio_domain::{
 
 use crate::{EvaluationError, EvaluationRuntime, EvaluationRuntimeResult};
 
+// 文件导读：LessonEvidence 是“决策引用了什么、最终 Outcome 如何关闭”的观察账本，
+// 不是因果证明；Applied/Rejected 都保留，拒绝 Lesson 的 Outcome 也不是反事实收益。
+
 impl EvaluationRuntime {
     /// Build one record per Lesson the decision took a position on.
     ///
@@ -35,6 +38,8 @@ impl EvaluationRuntime {
         outcome: &Outcome,
         recorded_at: DateTime<Utc>,
     ) -> EvaluationRuntimeResult<Vec<LessonEvidence>> {
+        // 只有 sealed Outcome 才能同时提供 T+1/T+3/T+5 utility；Lesson 的应用/拒绝归因
+        // 已由 DecisionContext 强制写入，因此这里按 manifest 中的 Lesson 引用逐条读取。
         context.validate()?;
         // Only a sealed outcome carries all three windows, and canonical
         // learning is defined on sealed outcomes alone.
@@ -65,6 +70,8 @@ impl EvaluationRuntime {
                 .iter()
                 .filter(|reference| reference.kind == ArtifactKind::Lesson)
             {
+                // read_lesson 再次从 Store 验证 kind、BLOB 与 Lesson schema；Experience 或
+                // CandidatePolicy 虽然也有 outcome lineage，但不属于 Lesson evidence。
                 let lesson = self.read_lesson(reference)?;
                 let record = LessonEvidence {
                     schema_version: DOMAIN_SCHEMA_VERSION,
@@ -91,6 +98,8 @@ impl EvaluationRuntime {
         outcome: &Outcome,
         recorded_at: DateTime<Utc>,
     ) -> EvaluationRuntimeResult<Vec<LessonEvidence>> {
+        // Outcome 评估阶段只传 DecisionContext 的 ArtifactRef；正文从同一 Store 读取，避免
+        // 调用者用未持久化的 context 替换正式 provenance。
         let artifact = self.store.artifact(&decision_context.artifact_id)?;
         if artifact.kind != ArtifactKind::DecisionContext {
             return Err(EvaluationError::InvalidMaterialization(
@@ -113,6 +122,8 @@ impl EvaluationRuntime {
         project: impl Fn(&akzio_domain::OutcomeWindow) -> T,
         fallback: T,
     ) -> [T; 3] {
+        // 固定数组槽位与 OutcomeHorizon::ALL 对齐；缺失窗口使用调用方给定 fallback，
+        // 但 sealed 校验会在上层拒绝不完整 Outcome。
         let mut values = [fallback; 3];
         for (index, horizon) in OutcomeHorizon::ALL.into_iter().enumerate() {
             if let Some(window) = outcome
@@ -127,6 +138,8 @@ impl EvaluationRuntime {
     }
 
     fn read_lesson(&self, reference: &ArtifactRef) -> EvaluationRuntimeResult<Lesson> {
+        // Lesson 内容必须来自 Store/CAS 且自身通过 domain validate；仅有一个 kind 正确的
+        // 引用不能绕过 BLOB 或 schema 校验。
         let artifact = self.store.artifact(&reference.artifact_id)?;
         if artifact.kind != ArtifactKind::Lesson {
             return Err(EvaluationError::InvalidMaterialization(

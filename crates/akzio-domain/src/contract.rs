@@ -1,3 +1,5 @@
+// 文件导读：定义 Agent Contract 的上下文/工具授权、Prompt/输出 schema、预算、重试
+// 和任务 recipe，并用内容哈希把这些约束绑定成不可替换的运行时身份。
 //! Versioned model contract vocabulary.
 
 use std::{collections::BTreeSet, fmt};
@@ -18,6 +20,7 @@ use crate::{
 pub struct ContractPurpose(String);
 
 impl ContractPurpose {
+    // 构造非空 purpose；不改变调用方传入的大小写或其余字符。
     pub fn new(value: impl Into<String>) -> Result<Self, DomainError> {
         let value = value.into();
         if value.trim().is_empty() {
@@ -28,6 +31,7 @@ impl ContractPurpose {
         Ok(Self(value))
     }
 
+    // 返回 purpose 的借用文本，供 recipe/预算映射使用。
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -53,6 +57,7 @@ pub struct ContextPolicy {
 }
 
 impl ContextPolicy {
+    // 校验上下文数量/字节/token 预算、来源文本和 RawEvidence 禁止边界。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.permitted_kinds.is_empty()
             || self.min_artifacts > self.max_artifacts
@@ -131,6 +136,7 @@ pub struct DeliberationSummary {
 }
 
 impl DeliberationSummary {
+    // 检查路径长度、候选/不确定性数组配对、ppm 范围、引用去重和不确定性守恒。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.selected_path.trim().is_empty()
             || self.selected_path.chars().count() > 1_000
@@ -167,6 +173,7 @@ impl DeliberationSummary {
                 field: "deliberation.summary",
             });
         }
+        // try_fold 使用 checked_add；累计溢出或总和不等于剩余置信度都会失败。
         if !self.uncertainty_weight_ppm.is_empty()
             && self
                 .uncertainty_weight_ppm
@@ -191,6 +198,7 @@ impl DeliberationSummary {
         Ok(())
     }
 
+    // 在基础校验之外要求来源明确为 model_assessed，并要求两组配对数组完整。
     pub fn validate_model_assessment(&self) -> Result<(), DomainError> {
         self.validate()?;
         if self.assessment_source.as_deref() != Some("model_assessed")
@@ -224,6 +232,7 @@ pub struct AgentOutputEnvelope {
 }
 
 impl PromptBundle {
+    // Prompt 版本必须非零，治理与角色两份 BLOB 引用都必须有效。
     fn validate(&self) -> Result<(), DomainError> {
         if self.version == 0 {
             return Err(DomainError::EmptyField {
@@ -247,7 +256,9 @@ pub struct ToolSpec {
 }
 
 impl ToolSpec {
+    // 只接受小写字母/数字/下划线的工具名，并要求严格 schema 和非空描述。
     fn validate(&self) -> Result<(), DomainError> {
+        // enumerate 闭包允许首字符规则与后续字符规则不同，避免接受前导下划线。
         let valid_name = self.name.bytes().enumerate().all(|(index, byte)| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || (index > 0 && byte == b'_')
         });
@@ -262,11 +273,13 @@ impl ToolSpec {
 }
 
 impl CandidateCapabilityCeiling {
+    // 先验证上限自身，再验证其中列出的工具授权与上下文来源一致。
     pub fn validate(&self) -> Result<(), DomainError> {
         self.context.validate()?;
         validate_tool_grants(&self.tool_grants, &self.context)
     }
 
+    // 判断候选请求是否只收窄而没有扩大 context 和 tool grant 能力。
     pub(super) fn permits(&self, context: &ContextPolicy, tool_grants: &[ToolGrant]) -> bool {
         context
             .permitted_kinds
@@ -284,6 +297,7 @@ impl CandidateCapabilityCeiling {
                     .unwrap_or(self.context.max_bytes)
             && context.max_tokens <= self.context.max_tokens
             && (!context.allow_raw_reread || self.context.allow_raw_reread)
+            // 每个 requested grant 都必须找到同 kind 且覆盖所有来源的 allowed grant。
             && tool_grants.iter().all(|requested| {
                 self.tool_grants.iter().any(|allowed| {
                     allowed.kind == requested.kind
@@ -300,6 +314,7 @@ fn validate_tool_grants(
     tool_grants: &[ToolGrant],
     context: &ContextPolicy,
 ) -> Result<(), DomainError> {
+    // 工具仅允许读取类 kind，来源必须属于 ContextPolicy；Raw reread 还要显式开启。
     if tool_grants.iter().any(|grant| {
         !matches!(
             grant.kind,
@@ -321,6 +336,7 @@ fn validate_tool_specs(
     tool_specs: &[ToolSpec],
     tool_grants: &[ToolGrant],
 ) -> Result<(), DomainError> {
+    // 逐项校验工具声明并用 BTreeSet 拒绝重复名称，再检查 grants 与 specs 双向齐全。
     let mut names = BTreeSet::new();
     for spec in tool_specs {
         spec.validate()?;
@@ -344,6 +360,7 @@ fn validate_tool_specs(
 }
 
 impl OutputContract {
+    // 输出 schema 的合法性由 BlobRef 的统一校验负责。
     fn validate(&self) -> Result<(), DomainError> {
         self.schema.validate()
     }
@@ -375,6 +392,7 @@ pub struct AgentContract {
 
 impl AgentContract {
     #[allow(clippy::too_many_arguments)]
+    // 组装 Contract，先以占位哈希构造完整值，再计算真实 contract_hash 并复核。
     pub fn new(
         contract_id: ContractId,
         version: u32,
@@ -418,6 +436,7 @@ impl AgentContract {
         Ok(contract)
     }
 
+    // 对整个 Contract 序列化后移除自引用 contract_hash，计算剩余内容的身份哈希。
     pub fn expected_hash(&self) -> Result<ContentHash, DomainError> {
         let mut value = serde_json::to_value(self).map_err(|_| DomainError::EmptyField {
             field: "contract.serialize",
@@ -431,6 +450,7 @@ impl AgentContract {
         })
     }
 
+    // 替换候选能力上限后重新计算哈希并校验，返回新的不可变 Contract。
     pub fn with_candidate_capability_ceiling(
         mut self,
         candidate_capability_ceiling: CandidateCapabilityCeiling,
@@ -441,11 +461,13 @@ impl AgentContract {
         Ok(self)
     }
 
+    // 询问当前 Contract 是否允许 candidate 的上下文与工具请求。
     pub fn permits_candidate(&self, candidate: &Self) -> bool {
         self.candidate_capability_ceiling
             .permits(&candidate.context, &candidate.tool_grants)
     }
 
+    // 按顺序校验 schema/身份、Prompt/Context、能力上限、输出、预算、工具和哈希。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != SCHEMA_VERSION {
             return Err(DomainError::EmptyField {
@@ -502,6 +524,7 @@ impl AgentContract {
 pub struct TaskRecipeId(String);
 
 impl TaskRecipeId {
+    // 构造非空 recipe ID；recipe 的字符语义由上层注册表继续限制。
     pub fn new(value: impl Into<String>) -> Result<Self, DomainError> {
         let value = value.into();
         if value.trim().is_empty() {
@@ -512,12 +535,14 @@ impl TaskRecipeId {
         Ok(Self(value))
     }
 
+    // 返回 recipe ID 的借用文本，避免重复分配。
     pub fn as_str(&self) -> &str {
         &self.0
     }
 }
 
 impl fmt::Display for TaskRecipeId {
+    // 将 recipe ID 原样写入格式化目标。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
     }
@@ -539,6 +564,7 @@ pub struct TaskRecipe {
 }
 
 impl TaskRecipe {
+    // 校验优先级、预算、重试、Agent 必须绑定 Contract，以及证据来源名称。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.priority_ceiling > 100 {
             return Err(DomainError::InvalidBudget {

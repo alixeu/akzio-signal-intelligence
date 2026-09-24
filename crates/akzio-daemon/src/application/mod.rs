@@ -10,6 +10,13 @@
 //! - task dispatch -> `OutcomeSealing` / the outcome worker for sealed outcomes;
 //! - HTTP transport -> `Maintenance` -> the runtime-owned Store executor.
 
+// 文件导读：application 门面把 daemon dispatch 与各阶段能力拆开：AgentSession/Evidence
+// 负责研究输入，PaperExecution 负责 deterministic gates/commit/reconcile，OutcomeSealing
+// 负责 schedule。每个门面只借用 Daemon，不复制 Store authority；阶段成功不会跨越到下一
+// 个业务事实。
+// Rust 机制：私有 `mod` 与 `pub(crate) use` 控制可见性；`const fn new` 只保存借用，
+// `StoreExecutor` 句柄用 Clone 进入异步闭包，避免把非 Send 的 Store 引用跨 Future 传递。
+
 mod agent_session;
 mod evidence_acquisition;
 mod maintenance;

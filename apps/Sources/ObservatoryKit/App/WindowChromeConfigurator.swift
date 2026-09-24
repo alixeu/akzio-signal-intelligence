@@ -21,6 +21,7 @@ public enum WindowChromeLayout {
 /// Extends SwiftUI content through the native title bar so the traffic lights
 /// sit inside Akzio's status bar instead of reserving a separate strip.
 struct WindowChromeConfigurator: NSViewRepresentable {
+    // 这是 SwiftUI 值类型到 AppKit 引用对象的桥；updateNSView 只把最新值交给已有 NSView，不复制窗口状态。
     let desktopBlurEnabled: Bool
 
     init(desktopBlurEnabled: Bool = true) {
@@ -35,6 +36,7 @@ struct WindowChromeConfigurator: NSViewRepresentable {
 }
 
 private final class ChromeProbeView: NSView {
+    // Probe 的引用身份跨 SwiftUI 重绘保留 effect view；窗口尚未挂载时所有配置都安全地延后。
     private var desktopBlurEnabled = true
     private var desktopEffectView: NSVisualEffectView?
 

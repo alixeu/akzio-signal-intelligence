@@ -1,3 +1,11 @@
+// 文件导读：本文件承载 CLI 的配置加载、daemon token、服务启动和关闭信号逻辑。它把
+// 本地配置解析为 daemon 的启动输入，再由 daemon 负责 HTTP、worker、scheduler 和
+// Store 事务；token 可用、服务启动或 scheduler tick 成功，都不能越级说明 Run、订单、
+// fill 或跨交易日 Outcome 已完成。
+// Rust 机制：`#[cfg]` 让 Unix 权限实现与其他平台实现分别编译；`Arc` 共享 daemon，
+// `watch` 广播关闭状态，`tokio::spawn` 拥有后台 Future，`try_join!` 等待并行服务且
+// 任一错误都会传播，避免后台任务静默脱离生命周期。
+
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 

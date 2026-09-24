@@ -1,5 +1,8 @@
 use super::*;
 
+// 这是 Contract 自己的最小 JSON Schema 解释器，故意只支持当前已治理的关键词。
+// Schema 通过只是一道 wire 形状检查；Manifest 引用、Artifact kind、Evidence scope、
+// 业务不变量和 ProposalReview 仍由调用方继续校验，未知关键词会拒绝而不是软化 Prompt。
 pub(super) fn validate_model_capabilities(
     snapshot: &ModelCapabilitySnapshot,
     request: &AgentModelRequest,
@@ -36,6 +39,8 @@ pub(super) fn validate_output_schema(
     contract: &AgentContract,
     output: &Value,
 ) -> ResearchResult<()> {
+    // Required deliberation 的外层 envelope 只取 result 做正式输出检查；deliberation
+    // 自身会在 extract_deliberation 中做长度/权重校验，避免把元数据误当业务结果。
     let schema: Value = serde_json::from_slice(&store.read_blob(&contract.output.schema)?)?;
     let schema = if contract.deliberation_policy == DeliberationPolicy::Required {
         schema
@@ -102,6 +107,8 @@ pub(super) fn validate_schema_value(
     schema: &Value,
     path: &str,
 ) -> Result<(), String> {
+    // 先拒绝 unsupported sibling/keyword，再按 type 分派，保持错误路径可解释且不
+    // 通过 anyOf 或 additionalProperties 偷渡一个未定义的权限/引用形状。
     let definition = schema
         .as_object()
         .ok_or_else(|| format!("{path} schema must be an object"))?;
@@ -198,6 +205,8 @@ pub(super) fn validate_schema_value(
     match kind {
         "object" => validate_object_schema(value, definition, path),
         "array" => {
+            // array 只递归 items；object-only 约束出现在数组上属于 Contract 作者错误，
+            // 而不是尝试把它解释成对每个元素的隐含要求。
             let item_schema = definition
                 .get("items")
                 .ok_or_else(|| format!("{path} array schema.items missing"))?;
@@ -236,6 +245,8 @@ pub(super) fn validate_schema_bounds(
     kind: &str,
     path: &str,
 ) -> Result<(), String> {
+    // 每种 JSON 类型只接受对应的边界集合；例如整数不能使用字符串长度，防止
+    // 一个看似有效的 Schema 在不同 validator 中得到不一致结果。
     match kind {
         "integer" | "number" => {
             let actual = value
@@ -385,6 +396,8 @@ pub(super) fn validate_object_schema(
     definition: &serde_json::Map<String, Value>,
     path: &str,
 ) -> Result<(), String> {
+    // 对象属性逐项按白名单解析。additionalProperties 默认 false，只有显式 true
+    // 或另一个 Schema 才允许未知字段；这保证结构化 Submit 不能携带隐藏控制字段。
     if definition.contains_key("items") {
         return Err(format!("{path} object schema contains array-only items"));
     }

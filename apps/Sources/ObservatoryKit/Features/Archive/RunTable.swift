@@ -19,6 +19,7 @@ public enum RunSortKey: String, CaseIterable, Identifiable, Sendable {
 }
 
 struct RunTable: View {
+    // rows 是父页过滤后的只读结果；排序 Binding 和 onSelect 闭包把交互回传给父页。
     let rows: [ArchiveRowPresentation]
     let selectedID: String?
     let rowHeight: CGFloat
@@ -31,6 +32,7 @@ struct RunTable: View {
     @Environment(\.appLanguage) private var language
 
     var body: some View {
+        // ViewThatFits 只在横向空间不足时切换列集合，不改变行数据或排序语义。
         ViewThatFits(in: .horizontal) {
             table(compact: false).frame(minWidth: 1070)
             table(compact: true)
@@ -38,11 +40,13 @@ struct RunTable: View {
     }
 
     private func table(compact: Bool) -> some View {
+        // 表头与行共享 compact 参数；行数组的变化由动画策略平滑反映。
         VStack(alignment: .leading, spacing: 0) {
             header(compact: compact)
             HairlineDivider()
             VStack(spacing: 0) {
                 ForEach(rows) { row in
+                    // 每行闭包捕获当前 row，使用稳定 ID 保持选择和布局连续。
                     rowView(row, compact: compact).id(row.id)
                 }
             }
@@ -82,6 +86,7 @@ struct RunTable: View {
     }
 
     private func sortable(_ key: RunSortKey, width: CGFloat) -> some View {
+        // 排序按钮闭包只切换排序 Binding；同一字段再次点击反转方向。
         Button {
             withAnimation(policy.resolve(Motion.control)) {
                 if sortKey == key { ascending.toggle() } else { sortKey = key; ascending = false }
@@ -106,6 +111,7 @@ struct RunTable: View {
     // MARK: Rows
 
     private func rowView(_ row: ArchiveRowPresentation, compact: Bool) -> some View {
+        // 行按钮把稳定行 ID交给父页；右键复制闭包只写入系统粘贴板。
         let isSelected = row.id == selectedID
         return Button { onSelect(row.id) } label: {
             HStack(spacing: AkzioLayout.s2) {

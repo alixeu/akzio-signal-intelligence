@@ -1,5 +1,8 @@
 use super::*;
 
+// RecipeCatalogue 是 Contract head 到 Workflow recipe 的唯一 lowering 结果。研究
+// roles 的 output kind/预算/retry/termination 必须和 Store canonical installation 一致；
+// Rust terminal recipes 则由本模块固定，模型 proposal 不能命名或替换 Gate。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalRecipeSet {
     pub evidence_gate: TaskRecipeId,
@@ -23,6 +26,8 @@ impl RecipeCatalogue {
         terminals: TerminalRecipeSet,
         max_nodes: usize,
     ) -> RuntimeResult<Self> {
+        // 先验证并按 recipe_id 去重，再验证六类 terminal 的 task class；任何缺口都在
+        // catalogue 建立时暴露，而不是等到某个 Run 半途才发现。
         let recipes = recipes
             .into_iter()
             .map(|recipe| {
@@ -139,6 +144,8 @@ pub fn active_recipe_catalogue(
     contracts: impl IntoIterator<Item = ActiveContractRecipe>,
     max_nodes: usize,
 ) -> RuntimeResult<RecipeCatalogue> {
+    // active contract 逐个比较 Store head 的 hash 和 Artifact，防止一个进程本地的
+    // candidate/旧安装伪装成当前 recipe；Outcome 作为 Evaluate recipe 单独保留两阶段协议。
     let mut installed_purposes = BTreeSet::new();
     let mut recipes = Vec::with_capacity(ACTIVE_RECIPE_POLICIES.len() + 6);
     let mut outcome_worker_installed = false;
@@ -248,6 +255,8 @@ fn recipe_evidence_sources(contract: &akzio_domain::AgentContract) -> BTreeSet<S
 }
 
 pub fn rust_terminal_recipes() -> RuntimeResult<(Vec<TaskRecipe>, TerminalRecipeSet)> {
+    // supplement 虽由 Rust 调度，但不是终端 Gate；它拥有固定最多 32 个 child/depth
+    // 的控制资源，最终仍必须回到 Synthesizer/ProposalReviewer 后的 DecisionGate。
     let evidence = rust_gate_recipe(EVIDENCE_GATE_RECIPE_ID, RuntimeTaskClass::Evidence)?;
     let decision = rust_gate_recipe(DECISION_GATE_RECIPE_ID, RuntimeTaskClass::DecisionGate)?;
     let execution = rust_gate_recipe(EXECUTION_GATE_RECIPE_ID, RuntimeTaskClass::ExecutionGate)?;
@@ -278,6 +287,8 @@ pub fn rust_terminal_recipes() -> RuntimeResult<(Vec<TaskRecipe>, TerminalRecipe
 }
 
 fn rust_gate_recipe(recipe_id: &str, task_class: RuntimeTaskClass) -> RuntimeResult<TaskRecipe> {
+    // Rust gate 的 token/tool budget 是占位的 Store task budget，实际业务 I/O 和 Paper
+    // 权限由各 Gate handler/审批链控制；retry 只对 Evidence/Execution 的特定运输错误开放。
     let retry = match task_class {
         RuntimeTaskClass::Evidence => RetryPolicy {
             max_attempts: 5,

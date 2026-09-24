@@ -7,6 +7,7 @@ import SwiftUI
 // the workflow view. The run identifier and status badge are the shared elements
 // that carry over when "View Details" hands off to the Workflow page.
 struct RunPreviewPanel: View {
+    // 行和阶段是只读展示输入；三个闭包由父页注入，分别负责详情、独立窗口和关闭。
     let row: ArchiveRowPresentation
     let stageProgress: [ArchiveStageProgress]
     let outcomeEvidence: OutcomeEvidencePresentation
@@ -18,6 +19,7 @@ struct RunPreviewPanel: View {
     @Environment(\.appLanguage) private var language
 
     var body: some View {
+        // 预览面板不复制详情页状态，只沿着父页回调触发下一步 UI 数据流。
         VStack(alignment: .leading, spacing: AkzioLayout.s3) {
             header
             HairlineDivider()
@@ -38,6 +40,7 @@ struct RunPreviewPanel: View {
     // MARK: Header
 
     private var header: some View {
+        // 头部同时展示稳定运行 ID、状态和目的；关闭按钮闭包来自父页。
         VStack(alignment: .leading, spacing: AkzioLayout.s2) {
             HStack(alignment: .top, spacing: AkzioLayout.s2) {
                 VStack(alignment: .leading, spacing: 2) {
@@ -70,6 +73,7 @@ struct RunPreviewPanel: View {
     // MARK: Summary
 
     private var summary: some View {
+        // summary 只把 ArchiveRowPresentation 的字段映射成网格，不再派生新的业务状态。
         VStack(alignment: .leading, spacing: AkzioLayout.s2) {
             Text(L10n.text("Summary", language: language)).akzioText(.caption)
             LazyVGrid(
@@ -88,6 +92,7 @@ struct RunPreviewPanel: View {
     }
 
     private func field(_ label: String, _ value: String) -> some View {
+        // 字段闭包捕获当前语言和 motion policy，只影响本地文本和数值表现。
         VStack(alignment: .leading, spacing: 2) {
             Text(L10n.text(label, language: language)).akzioText(.caption)
             Text(L10n.text(value, language: language))
@@ -102,6 +107,7 @@ struct RunPreviewPanel: View {
     // MARK: Stage progress
 
     private var stageSection: some View {
+        // 阶段进度由父页传入的快照驱动，ForEach 闭包按稳定阶段 ID 呈现每一项。
         VStack(alignment: .leading, spacing: AkzioLayout.s2) {
             HStack(spacing: AkzioLayout.s2) {
                 Text(L10n.text("Stage Progress", language: language)).akzioText(.caption)
@@ -127,6 +133,7 @@ struct RunPreviewPanel: View {
     /// Stages that have reached a terminal reading. Running/queued/observing work is
     /// deliberately excluded so the counter never over-reports progress.
     private var settledStages: Int {
+        // filter 闭包只把终态阶段计入计数，运行中和未知状态保持未结算。
         stageProgress.filter { stage in
             switch stage.status {
             case .succeeded, .completed, .completedWithRejection, .accepted, .rejected,
@@ -141,6 +148,7 @@ struct RunPreviewPanel: View {
     // MARK: Result
 
     private var resultSection: some View {
+        // 没有封存结果时显示 Unavailable，避免把缺失结果解释成零值。
         VStack(alignment: .leading, spacing: AkzioLayout.s2) {
             Text(L10n.text("Result", language: language)).akzioText(.caption)
             HStack(alignment: .firstTextBaseline, spacing: AkzioLayout.s2) {
@@ -165,6 +173,7 @@ struct RunPreviewPanel: View {
     // MARK: Actions
 
     private var actions: some View {
+        // 两个按钮都调用父页闭包；本面板不决定导航或窗口生命周期。
         VStack(spacing: AkzioLayout.s2) {
             Button(action: onViewDetails) {
                 HStack(spacing: 5) {

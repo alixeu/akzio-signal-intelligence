@@ -1,3 +1,6 @@
+// 文件职责：把已经通过授权校验的 ContextManifest 物化为模型可见的有界输入视图。
+// 本文件只负责读取、闭包核验、确定性身份和内存 projection；它不提交 Agent 结果，也不推进 Decision、Execution 或 Paper 状态。
+// 选择集合、来源过滤和上下文预算由同一 context_broker 的选择路径提供；这里再次按 Manifest/ReadGrant 读取并核验。
 impl ContextBroker {
     pub fn materialize_for_agent_with_budget(
         &self,
@@ -7,6 +10,9 @@ impl ContextBroker {
         effective_budget: &TaskBudget,
         now: DateTime<Utc>,
     ) -> ContextResult<ContextMaterialization> {
+        // 输入：当前 Attempt 的 permit、Contract、已持久化 Manifest、解析后的累计预算和当前时间。
+        // 输出：成功时拥有 ledger/must_read 的 ContextMaterialization；校验或 CAS 读取失败时用 Result 的 Err 返回。
+        // 参数以借用传入，返回值拥有新建的 Vec/JSON；函数中的 `?` 将底层读取、解析和哈希错误原样向上转交。
         // 将已持久化 Manifest 按当前 Contract/Attempt 的 grant 物化为模型输入。这里
         // 只读取 CAS、生成内存中的 ContextMaterialization，不提交 Agent 结果或任何
         // Decision/Execution/Paper 状态。
@@ -19,11 +25,13 @@ impl ContextBroker {
         }
         self.validate_persisted_grant(permit, contract, &manifest.grant, now)?;
 
+        // 先把授权身份固定下来，再让后续 metadata 与 projection 共享同一个稳定标识。
         let read_grant_identity =
             stable_read_grant_identity(&manifest.grant, &manifest.payload.input_hash)?;
         let mut ledger = Vec::with_capacity(manifest.payload.selections.len());
         let mut must_read = Vec::new();
         for selection in &manifest.payload.selections {
+            // `selection` 是 Manifest 中的借用；按 artifact_id 回到已验证 grant 读取拥有所有权的 Artifact，避免把未选文档带入视图。
             // 本次同步物化已验证完整的不可变 CAS 闭包；逐项继续核验 live permit、
             // readable 集合及类型，避免每读一项又解码整份 Manifest 的所有文档。
             let artifact = self.read_from_validated_grant(
@@ -50,6 +58,7 @@ impl ContextBroker {
                 read_grant_identity: read_grant_identity.clone(),
             };
             if let Some(class) = must_read_class {
+                // Option::Some 只表示该文档要进入 must_read projection；None 仍保留在 ledger，作为可读索引而非静默丢弃。
                 // must_read 只放受控 projection；原始 CAS 文档仍由 grant 和显式读取工具
                 // 管理。研究角色在新 Contract 下没有读取工具，所以 projection 会附带
                 // “原文未开放”的边界提示，而不伪装成完整事实。
@@ -74,6 +83,7 @@ impl ContextBroker {
             ledger.push(metadata);
         }
 
+        // task_contract 同时描述角色、Context policy、可用工具和两类预算；provider 的累计预算与 Context 字节/Token 上限分开呈现。
         let task_contract = serde_json::json!({
             "contract_hash": contract.contract_hash,
             "purpose": contract.purpose,
@@ -96,6 +106,7 @@ impl ContextBroker {
             "budget": effective_budget,
             "budget_semantics": "budget is the resolved cumulative Attempt budget; provider context limits remain separate",
         });
+        // `content_hash_json` 返回 Result，因为身份计算必须能报告序列化/哈希失败，不能用默认值替代授权闭包。
         // materialization_identity 绑定 Manifest 输入、grant、task contract 和实际 ledger；
         // 它是模型输入的确定性身份，不是模型接受、研究完成或 Gate 通过的凭证。
         let materialization_identity = content_hash_json(&serde_json::json!({
@@ -106,6 +117,7 @@ impl ContextBroker {
             "must_read": must_read,
         }))?;
         self.store.validate_task_permit(permit)?;
+        // 成功输出拥有前面收集的 ledger 和 must_read；这一步只返回输入材料，不代表模型已消费或下游 Gate 已通过。
         Ok(ContextMaterialization {
             manifest_artifact_id: manifest.artifact.artifact_id.clone(),
             read_grant_identity,
@@ -123,10 +135,13 @@ impl ContextBroker {
         claim: &Artifact,
         current: &ContextManifest,
     ) -> ContextResult<Value> {
+        // 输入：当前 Claim Artifact 和当前 Manifest 的借用；输出：只描述两份已授权选择的重合关系的 JSON Value。
+        // 唯一 producer Manifest 不存在时返回带 unknown 状态的 Ok；来源闭包不一致时返回 Err，而不是猜测范围。
         // 只读取 Claim provenance 中唯一的 producer Manifest，并把它与当前 Manifest
         // 的已选 evidence 做重合比较；返回的是范围说明，不会向当前 grant 追加 Artifact。
         let refs = claim.source_refs.iter()
             .filter(|r| r.kind == ArtifactKind::ContextManifest).collect::<Vec<_>>();
+        // 切片模式要求恰好一个引用；`else` 分支把零个或多个引用显式降级为未知。
         let [reference] = refs.as_slice() else {
             return Ok(serde_json::json!({"status":"unknown","reason":"no_unique_producer_manifest"}));
         };
@@ -148,6 +163,8 @@ impl ContextBroker {
 }
 
 fn producer_selection_overlap(producer: &[ContextSelection], current: &[ContextSelection]) -> Value {
+    // 输入：producer 与 current selection 切片的借用；输出：拥有新 JSON 的 Value。
+    // 迭代器只借用输入，BTreeSet 保存 ArtifactRef 的排序集合，最终只枚举 current 已经选中的 evidence。
     // 仅公开当前 Manifest 已经选中的 evidence 及其是否也在 producer 选择中，避免借
     // 生产者 provenance 泄露当前 grant 之外的 document_id。
     let selected = producer.iter().map(|s| &s.artifact).collect::<BTreeSet<_>>();
@@ -163,6 +180,8 @@ fn producer_selection_overlap(producer: &[ContextSelection], current: &[ContextS
 
 impl ContextMaterialization {
     pub fn model_context(&self) -> Vec<Value> {
+        // 输入：已物化对象的借用；输出：按 purpose 组织、由调用方拥有的消息 Vec<Value>。
+        // 研究/Outcome 分支在入口处分流；这里不重新读取 CAS，也不扩大原有 grant。
         // 根据 purpose 生成模型看到的消息列表；Outcome 使用独立的两阶段投影，研究
         // 角色使用 projections，Synthesizer 额外生成 coverage matrix。
         // 返回值仍只是输入视图，不代表下游接受。
@@ -189,6 +208,7 @@ impl ContextMaterialization {
             "value": self.task_contract,
         }));
         context.extend(self.must_read.iter().map(|document| {
+            // `map` 闭包借用每个 must_read 文档，只把选定字段复制进新的 JSON 消息。
             serde_json::json!({
                 "type": "must_read",
                 "class": document.class,
@@ -239,6 +259,7 @@ impl ContextMaterialization {
                 })
                 .filter_map(|value| serde_json::from_value::<ArtifactRef>(value.clone()).ok())
                 .filter(|reference| {
+                    // `filter_map` 对无法解码的外部引用返回 None；只有当前 ledger 已有的 evidence 才能进入 closure。
                     matches!(reference.kind, ArtifactKind::NormalizedEvidence | ArtifactKind::SemanticDetail)
                         && selected.contains(reference)
                 })
@@ -279,6 +300,8 @@ impl ContextMaterialization {
     }
 
     fn outcome_model_context(&self) -> Vec<Value> {
+        // 输入：当前物化对象的借用；输出：Outcome Worker 专用的 metadata、Contract 和 projection 消息。
+        // 原文索引仍保留授权身份，数值字段只从拥有的副本压缩，不把叙事 projection 当作新的权威结果。
         // Outcome Worker 仍保留 Manifest/grant 身份和可读文档索引，但只暴露 Outcome
         // 复盘所需字段；Rust 计算的量化结果不会由模型重新生成或写回。
         // Keep the original manifest/grant and complete documents intact. The
@@ -304,6 +327,8 @@ impl ContextMaterialization {
 }
 
 fn outcome_review_projection(kind: ArtifactKind, mut value: Value) -> Value {
+    // 输入：Artifact kind 与可变拥有的 JSON 副本；输出：同一副本的有界 Outcome 展示 Value，不产生 I/O 或 Result。
+    // 分支用 kind 选择字段投影；未知 kind 保持 value 原样，避免展示逻辑改变事实语义。
     // 按 Artifact kind 做 Outcome 专用的展示压缩：数值/时间字段保持 Rust 产出的值，
     // 只移除超出叙事复盘需要的长路径、分箱和引用细节。
     if kind == ArtifactKind::Decision {
@@ -340,6 +365,8 @@ fn outcome_review_projection(kind: ArtifactKind, mut value: Value) -> Value {
 }
 
 fn compact_outcome_numbers(value: &mut Value) {
+    // 输入：可变 JSON 借用；输出：原地修改且无返回值。不存在 windows 时用 Option 的 None 直接结束。
+    // 所有 remove/insert 都作用于 projection 副本，原始 CAS 文档不会被这个借用路径改写。
     // 将每个窗口的大型路径和 benchmark 细节替换为计数/固定字段；输入是投影副本，
     // 不会修改 Store 中的原始 Outcome。
     let Some(windows)=value.get_mut("windows").and_then(Value::as_array_mut) else { return; };
@@ -369,6 +396,8 @@ fn stable_read_grant_identity(
     grant: &ReadGrant,
     manifest_input_hash: &ContentHash,
 ) -> ContextResult<ContentHash> {
+    // 输入：ReadGrant 与 Manifest input hash 的借用；输出：稳定的 ContentHash，失败通过 Result 报告序列化/哈希错误。
+    // 只纳入授权边界和输入闭包，不把 expires_at 等时间变化字段混入逻辑身份。
     // Grant 身份只包含授权边界和 Manifest 输入哈希，供 ledger/materialization 做稳定
     // 绑定；它不包含过期时间，因此同一逻辑授权的身份不因时间流逝而伪造新内容。
     Ok(content_hash_json(&serde_json::json!({
@@ -382,6 +411,8 @@ fn stable_read_grant_identity(
 }
 
 fn must_read_class(selection: &ContextSelection, artifact: &Artifact) -> Option<&'static str> {
+    // 输入：选择记录与已读取 Artifact 的借用；输出：Some(class) 表示进入 must_read，None 表示只进 ledger。
+    // 返回静态类别字符串而非文档内容，调用方随后用 Option 分支决定是否构造 projection。
     // 将选择原因和 Artifact kind 映射成模型视图类别；None 表示只进入 metadata ledger，
     // 不是拒绝或删除 Artifact。
     let reason = selection.reason.trim().to_ascii_lowercase();
@@ -429,6 +460,7 @@ fn must_read_class(selection: &ContextSelection, artifact: &Artifact) -> Option<
 }
 
 const fn context_relevance(kind: ArtifactKind) -> u32 {
+    // 输入：Artifact kind；输出：固定 u32 metadata 排序值。该纯函数不读取授权、不消耗预算，也不决定是否选入。
     // 这是 UI/模型 metadata 的固定相关性排序值，不参与 Contract 预算、Gate 或选择授权。
     match kind {
         ArtifactKind::DecisionContext
@@ -455,6 +487,8 @@ const fn context_relevance(kind: ArtifactKind) -> u32 {
 /// narrative strings are explicitly abbreviated, with full documents readable
 /// through their original grant and artifact identity.
 fn compact_governed_projection(kind: ArtifactKind, value: Value) -> Value {
+    // 输入：Artifact kind 与拥有的完整 JSON Value；输出：新的有界 JSON Value。
+    // value 的所有权允许本地裁剪/递归缩写；projection 只能减少展示细节，不能增加 grant 或改写 Store。
     // 对模型视图做有界投影：NormalizedEvidence 保留资源、质量、时间和量化字段，
     // 大型数组/叙事被明确压缩；原 Value 只在本地副本上变换，CAS 中的完整证据不变。
     if kind == ArtifactKind::NormalizedEvidence && value.get("resource").is_some() {
@@ -535,6 +569,8 @@ const HOLDINGS_WEIGHT_COLUMNS: [&str; 5] = [
 /// decision-relevant facts. Weights and identifiers stay exact; the complete
 /// table remains readable through the original document grant.
 fn compact_fund_holdings(object: &mut serde_json::Map<String, Value>) {
+    // 输入：NormalizedEvidence 投影内部对象的可变借用；输出：原地重排/压缩持仓表，无 Result。
+    // 非 fund_holdings、缺少 data/rows 时通过 Option 的 None 提前返回；识别不到权重列则保留来源顺序并标注未排序。
     const KEPT_ROWS: usize = 12;
     if object.get("category").and_then(Value::as_str) != Some("fund_holdings") {
         return;
@@ -562,6 +598,7 @@ fn compact_fund_holdings(object: &mut serde_json::Map<String, Value>) {
     // issuer publishing both a percent weight and a notional value ranks by the
     // weight it actually declares.
     let weight_column = HOLDINGS_WEIGHT_COLUMNS.iter().find_map(|candidate| {
+        // `find_map` 借用候选列名和列集合，只接受优先级最高的匹配列；没有匹配时返回 None。
         columns
             .iter()
             .find(|column| column.to_lowercase().contains(candidate))
@@ -630,6 +667,8 @@ fn compact_fund_holdings(object: &mut serde_json::Map<String, Value>) {
 /// It is intentionally not a replacement for the source artifact or for news
 /// evidence.
 fn option_chain_projection(value: Value) -> Value {
+    // 输入：拥有的完整 option-chain JSON；输出：固定大小倾向的聚合/样例 projection Value。
+    // 循环借用快照，Option/and_then 只读取存在且可解析的字段；缺失字段进入 missing_items，不伪造默认行情。
     // 遍历完整期权快照只计算有限聚合、缺失项和前两个示例；此处不做交易判断，
     // 也不把截断后的 projection 当作原始 option-chain Artifact。
     let chain = value.get("value").cloned().unwrap_or(Value::Null);
@@ -643,6 +682,7 @@ fn option_chain_projection(value: Value) -> Value {
 
     if let Some(snapshots) = snapshots {
         for (contract, snapshot) in snapshots {
+            // 每个快照只贡献有限计数、统计集合或前两个标量样例，避免把完整链条复制进模型输入。
             let Some(object) = snapshot.as_object() else {
                 continue;
             };
@@ -746,6 +786,7 @@ fn option_chain_projection(value: Value) -> Value {
         let mean = iv_ppm.iter().sum::<i64>() / i64::try_from(iv_ppm.len()).unwrap_or(1);
         serde_json::json!({"min_ppm":min,"max_ppm":max,"mean_ppm":mean})
     };
+    // `take` 在输出侧设置确定性上限；完整 expiration/field 集合仍留在原始授权文档中。
     let expiration_dates = expirations.iter().take(32).cloned().collect::<Vec<_>>();
     let available_fields = available_fields
         .iter()
@@ -797,6 +838,8 @@ impl ContextBroker {
         source: &Artifact,
         now: DateTime<Utc>,
     ) -> ContextResult<Artifact> {
+    // 输入：当前 permit/Contract 的借用、源 Artifact 的借用和当前时间；输出：新建或复用的 RunScoped SemanticDetail Artifact。
+    // CAS staging、Attempt lineage 或 task artifact 写入失败都通过 Result 返回；复用不会继承旧 Attempt 的 grant。
     // 为超大期权 NormalizedEvidence 创建新的 RunScoped SemanticDetail 投影，保留
     // source_artifact 元数据和 source_refs；源 Artifact 不改写，后续授权仍由新 Manifest
     // 决定。若同一 Attempt/Retry/Recovery 已有完全相同投影，则复用该 CAS 对象。
@@ -820,6 +863,7 @@ impl ContextBroker {
     let mut ancestors = BTreeSet::from([permit.attempt_id.clone()]);
     let mut child = permit.attempt_id.clone();
     while let Some(relation) = self.store.attempt_relation(&child)? {
+        // `while let Some` 沿 Retry/Recovery 回溯父 Attempt；集合去重，并在 run/task/关系不符时停止。
         if relation.run_id != permit.run_id || relation.task_id != permit.task_id
             || !matches!(relation.relation, akzio_domain::AttemptRelationKind::Retry | akzio_domain::AttemptRelationKind::Recovery)
             || !ancestors.insert(relation.parent_attempt_id.clone()) {
@@ -828,6 +872,7 @@ impl ContextBroker {
         child = relation.parent_attempt_id;
     }
     for existing in self.store.artifacts_referencing(&source.artifact_id, Some(ArtifactKind::SemanticDetail))? {
+        // 迭代已有引用只寻找完全相同的不可变投影；Option::is_some_and 逐层核验 origin，而不放宽 lineage。
         if existing.producer == "evidence.option_projection"
             && existing.lifecycle == ArtifactLifecycle::RunScoped
             && existing.blob == blob
@@ -872,6 +917,7 @@ impl ContextBroker {
 }
 
 fn finite_number(value: &Value) -> Option<f64> {
+    // 输入：JSON Value 的借用；输出：有限 f64 或 None。解析失败、NaN 和无穷都按字段缺失处理，不返回错误。
     // 接受 JSON number 或可解析字符串，但拒绝 NaN/无穷，供期权聚合和持仓排序使用；
     // 解析失败只让对应字段缺失，不中止整个投影。
     value
@@ -880,6 +926,7 @@ fn finite_number(value: &Value) -> Option<f64> {
         .filter(|value| value.is_finite())
 }
 fn abbreviate_narrative(value: &mut Value) {
+    // 输入：可变 JSON 借用；输出：原地递归压缩，无 Result。字符串超限才替换，数组/对象通过递归借用子值。
     // 递归压缩超过上限的叙事字符串并保留截断标记；数组/对象结构保持不变，数值不改写。
     match value {
         Value::String(s) if s.chars().count() > 600 => {
@@ -904,7 +951,9 @@ fn abbreviate_narrative(value: &mut Value) {
 
 #[cfg(test)]
 mod compact_context_tests {
+    // 测试职责：验证 coverage closure、producer scope 和 metadata/事实去重，不创建真实 Agent 或 Paper 状态。
     use super::*;
+    // 测试无参数并以断言为输出，使用内存中的 ContextMaterialization 检查精确 evidence 闭包。
     #[test]
     fn synthesizer_matrix_lists_exact_selected_evidence_closure() {
         let metadata = |name: &str, kind| ContextDocumentMetadata {
@@ -957,6 +1006,7 @@ mod compact_context_tests {
         assert!(refs.contains(&reference(&descriptive)));
         assert!(!refs.contains(&reference(&private)));
     }
+    // 测试无参数并以断言为输出，确认所有 horizon/asset slot 都被保留且验证状态来自当前 Claim/Critique。
     #[test]
     fn compact_coverage_preserves_all_asset_horizons_and_exact_claim_verification() {
         let hash = content_hash_json(&serde_json::json!("claim")).unwrap();
@@ -986,6 +1036,7 @@ mod compact_context_tests {
         }
         assert_eq!(horizons[0]["claims"], serde_json::json!([]));
     }
+    // 测试无参数并以断言为输出，确认 producer provenance 只说明当前已选项，不泄露 producer 独有 ID。
     #[test]
     fn producer_scope_distinguishes_additional_coverage_without_disclosing_ungranted_ids() {
         let selection = |name| ContextSelection {
@@ -1001,6 +1052,7 @@ mod compact_context_tests {
         assert_eq!(view["current_evidence"][1]["document_id"], serde_json::to_value(additional.artifact.artifact_id).unwrap());
         assert!(!view.to_string().contains(&private.artifact.artifact_id.to_string()));
     }
+    // 测试无参数并以断言为输出，确认 must_read 事实不会同时在 metadata ledger 中重复展开。
     #[test]
     fn required_document_metadata_and_facts_are_not_duplicated() {
         let hash=content_hash_json(&serde_json::json!("test")).unwrap();
@@ -1016,7 +1068,9 @@ mod compact_context_tests {
 
 #[cfg(test)]
 mod availability_projection_tests {
+    // 测试职责：确认 collection availability projection 仍是状态说明，不会变成 ReadGrant 或 selection。
     use super::*;
+    // 测试无参数并以断言为输出，使用内存 JSON 验证可用和不可用资源都保留其状态。
     #[test]
     fn collected_availability_is_not_context_selection() {
         let v=serde_json::json!({"type":"evidence_collection_status","authority":"rust","missing_directional_evidence":"neutralize_affected_slots","requirements":[
@@ -1032,8 +1086,10 @@ mod availability_projection_tests {
 
 #[cfg(test)]
 mod fund_holdings_projection_tests {
+    // 测试职责：验证不同发行方表头下的持仓截断、权重排序和非持仓数据保真。
     use super::*;
 
+    // 测试无参数并以断言为输出，构造 Invesco 风格表格检查最大权重行和保留数量。
     #[test]
     fn invesco_json_holdings_are_bounded_and_ranked_by_exact_weight() {
         let rows = (0..106).map(|i| serde_json::json!({
@@ -1053,6 +1109,7 @@ mod fund_holdings_projection_tests {
         assert_eq!(data["holdings"]["rows"][0][weight], 10.5);
     }
 
+    // 测试辅助函数输入原始行，输出带统一元数据的持仓 JSON；不访问 Store。
     fn holdings(rows: Vec<Value>) -> Value {
         serde_json::json!({"source":"news_web","resource":"research:etf_holdings:TQQQ:2026-09-21",
             "time_basis":{},"quality":{},"quant_features":Value::Null,
@@ -1062,6 +1119,7 @@ mod fund_holdings_projection_tests {
 
     /// ProShares publishes a notional exposure column; iShares a percent weight.
     /// Both must rank by that column and keep only the largest positions.
+    // 测试无参数并以断言为输出，覆盖 notional、百分比和 HoldingsPercent 三种发行方列名。
     #[test]
     fn issuer_holdings_are_ranked_and_bounded() {
         for (column, small, large) in [
@@ -1098,6 +1156,7 @@ mod fund_holdings_projection_tests {
 
     /// iShares publishes both a percent weight and a notional value. The
     /// declared weight must rank the rows; column order must not decide it.
+    // 测试无参数并以断言为输出，确认显式百分比权重优先于 notional value。
     #[test]
     fn declared_weight_outranks_notional_value() {
         let rows = (0..20)
@@ -1122,6 +1181,7 @@ mod fund_holdings_projection_tests {
 
     /// An unrecognized issuer schema has no documented ranking, so rows keep
     /// source order and the projection says the view is unranked.
+    // 测试无参数并以断言为输出，确认未知表头不擅自推断排序。
     #[test]
     fn unknown_holdings_schema_keeps_source_order() {
         let rows = (0..20)
@@ -1140,6 +1200,7 @@ mod fund_holdings_projection_tests {
 
     /// A table already inside the bound is returned whole, so short holdings
     /// tables are not reported as truncated.
+    // 测试无参数并以断言为输出，确认未超出上限的短表不会被标为遗漏。
     #[test]
     fn short_holdings_table_is_not_reported_as_omitted() {
         let rows = vec![serde_json::json!({"Ticker":"AMD","Weight (%)":"9.37"})];
@@ -1151,6 +1212,7 @@ mod fund_holdings_projection_tests {
     }
 
     /// Non-holdings evidence must not be reshaped by the holdings bound.
+    // 测试无参数并以断言为输出，确认普通 market bars 不会套用 fund holdings 投影。
     #[test]
     fn non_holdings_evidence_is_untouched() {
         let value = serde_json::json!({"source":"alpaca","resource":"bars:TQQQ:1d",
@@ -1163,6 +1225,7 @@ mod fund_holdings_projection_tests {
 }
 
 fn projection_only_guidance(value: &mut Value) {
+    // 输入：projection JSON 的可变借用；输出：原地替换已有 full_document 提示，无新事实和错误结果。
     // 仅替换 projection 中已有的 full_document 提示，明确本轮没有原文读取工具；
     // 不新增事实，也不删除投影字段。
     if let Some(object) = value.as_object_mut() {
@@ -1174,7 +1237,9 @@ fn projection_only_guidance(value: &mut Value) {
 
 #[cfg(test)]
 mod projection_access_tests {
+    // 测试职责：确认无读取工具时只替换访问提示，不删除 projection 已有事实。
     use super::*;
+    // 测试无参数并以断言为输出，验证 read_range 建议被替换为“原文未开放”的边界提示。
     #[test]
     fn no_read_projection_preserves_facts_and_removes_tool_advice() {
         let mut value=serde_json::json!({"latest_observations":[{"value":"3.88"}],"full_document":"read_document or read_range using the metadata document_id"});

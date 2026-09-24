@@ -1,3 +1,5 @@
+// 文件导读：daemon lease 用 owner+递增 epoch+expiry fencing scheduler；Paper session slot
+// 由同一 lease 保护并按 session_key 幂等，lease 成功只代表 Store reservation，不代表 broker fill。
 use super::*;
 
 impl Store {
@@ -14,6 +16,7 @@ impl Store {
         self.reserve_paper_session_with_binding(lease, reservation, proposal, None)
     }
 
+    // 在 reservation 前同时验证 approval、manifest session date/expiry/notional，再绑定二者。
     pub fn reserve_paper_session_with_approval(
         &self,
         lease: &DaemonLease,
@@ -113,6 +116,7 @@ impl Store {
         )? == 1)
     }
 
+    // 只延长相同 owner+epoch 的未过期 lease，且不覆盖 maintenance 已延长的时间。
     pub fn heartbeat_daemon_lease(
         &self,
         lease: &DaemonLease,
@@ -146,6 +150,7 @@ impl Store {
         Ok(true)
     }
 
+    // 读取当前 lease row 并解析时间；查询不续租、不抢占 owner。
     pub fn daemon_lease(&self, lease_name: &str) -> StoreResult<Option<DaemonLease>> {
         let connection = self.connection()?;
         connection
@@ -275,6 +280,7 @@ impl Store {
         })
     }
 
+    // 由 slot 行读取 graph Artifact/CAS payload，再恢复 Paper WorkflowCommit 快照。
     pub fn session_slot(&self, session_key: &str) -> StoreResult<Option<SessionSlot>> {
         let row = {
             let connection = self.connection()?;
@@ -345,6 +351,7 @@ impl Store {
         .transpose()
     }
 
+    // 通过 session slot 找到消耗的 approval/manifest，并重新校验两者 hash/source binding。
     pub fn paper_approval_for_run(
         &self,
         run_id: &RunId,

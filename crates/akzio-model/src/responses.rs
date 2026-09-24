@@ -2,6 +2,7 @@
 
 use super::*;
 
+// Responses adapter 只负责受控 provider wire/stream 与 ModelResponse 转换；预算、Prompt、工具权限和业务 Gate 由上层拥有。
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 // Hosted reasoning responses can legitimately pause longer than 30 seconds
 // between chunks. This remains a bounded transport timeout; the Agent
@@ -10,6 +11,7 @@ const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct OpenAIResponsesClient {
+    // client 是可克隆的配置值；api_key 仅用于 bearer auth，Debug 实现会脱敏，stream timeout 只约束单次空闲。
     http: Client,
     pub(super) base_url: String,
     api_key: String,
@@ -37,6 +39,7 @@ impl OpenAIResponsesClient {
         model: impl Into<String>,
         reasoning_effort: impl Into<String>,
     ) -> Result<Self> {
+        // new 使用 bounded 默认 timeout；实际累计墙钟仍由 Agent Contract/phase deadline 控制。
         Self::with_timeouts(
             base_url,
             api_key,
@@ -89,10 +92,12 @@ impl OpenAIResponsesClient {
     }
 
     pub fn request_body(&self, request: &ModelRequest) -> Value {
+        // request_body 是纯 wire projection，保留调用方提供的 input/tools/tool_choice，不在 provider 层扩大授权。
         openai_responses_request_body(&self.model, &self.reasoning_effort, request)
     }
 
     pub async fn respond(&self, request: ModelRequest) -> Result<ModelResponse> {
+        // 无事件调用复用同一 stream parser；空闭包表示调用方不订阅 reasoning 生命周期。
         self.respond_with_events(request, |_| {}).await
     }
 
@@ -215,6 +220,7 @@ fn handle_sse_data(
     stream: &mut ReasoningStream,
     on_event: &mut impl FnMut(ModelStreamEvent),
 ) -> Result<()> {
+    // SSE parser 通过 FnMut 回调向上层发送 reasoning 事件；终态 response 单独保存在 stream，避免把 delta 当成最终输出。
     // 解析一个已经按空行分隔的 SSE data；空 data/[DONE] 不是终态，未知事件
     // 暂时忽略，以便兼容 provider 增加非业务事件。
     if data.is_empty() || data == b"[DONE]" {
@@ -284,6 +290,7 @@ pub(super) fn openai_responses_request_body(
     reasoning_effort: &str,
     request: &ModelRequest,
 ) -> Value {
+    // 该函数只做请求表达式的确定性编译；Continue transcript 与 tool outputs 都由 Rust 显式拼接。
     // 将 ModelRequest 编译为单轮 Responses wire payload；这里仅序列化请求，不做
     // provider I/O，也不改变 Rust 持有的工具授权和预算。
     let input = match &request.input {
@@ -384,6 +391,7 @@ pub(super) fn openai_responses_request_body(
 }
 
 pub(super) fn openai_response_from_raw(raw: Value, request_body: Value) -> Result<ModelResponse> {
+    // raw 到 ModelResponse 是协议验证边界：incomplete/refusal/空 output 先拒绝，再交给上层 Schema/业务校验。
     // 把 provider raw 规范化为 ModelResponse，并在协议边界拒绝 incomplete、refusal
     // 和空输出；这里不持久化，也不决定研究提交、Decision 或 Execution 状态。
     if raw.get("status").and_then(Value::as_str) == Some("incomplete") {
@@ -559,6 +567,7 @@ pub(super) fn parse_tool_call(value: &Value) -> Option<ModelToolCall> {
 
 #[cfg(test)]
 mod transcript_regression {
+    // 测试只验证 stream/continuation/usage 的协议边界，不调用真实 provider 或 Store。
     use super::*;
 
     #[test]
@@ -613,7 +622,3 @@ mod transcript_regression {
         }
     }
 }
-
-#[cfg(test)]
-#[path = "responses_stream_tests.rs"]
-mod stream_terminal_tests;

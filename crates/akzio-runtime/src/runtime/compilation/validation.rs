@@ -1,9 +1,14 @@
+// 编译后校验把结构性事实锁定：每个图必须有唯一 Evidence/Decision 等适用 Gate，
+// 研究不能依赖终端，Decision 只能接研究叶子。Shadow 的 candidate 只有在 Store 安装
+// 记录满足 baseline/预算/termination 子集时才允许出现。
 impl WorkflowRuntime {
     pub(super) fn validate_compiled_graph(
         &self,
         purpose: RunPurpose,
         graph: &WorkflowGraph,
     ) -> RuntimeResult<()> {
+        // terminals/research 分离后，逐 node 对 recipe、Contract、预算、retry、failure
+        // 和 priority 做精确比较；成功只是图合法，不是任何业务阶段已执行。
         self.validate_evidence_gate(graph)?;
         let mut terminals = BTreeMap::<TaskRecipeId, &WorkflowNode>::new();
         let mut research = Vec::new();
@@ -98,6 +103,8 @@ impl WorkflowRuntime {
 
         let expected_decision_dependencies =
             leaf_ids(&research).into_iter().collect::<BTreeSet<_>>();
+        // Decision 必须等待所有研究叶子（包括 ProposalReview/补采后的有效节点），
+        // 不能只依赖 Synthesizer 以外的一个“代表”节点。
         if decision
             .dependencies
             .iter()
@@ -153,6 +160,8 @@ impl WorkflowRuntime {
     }
 
     pub(super) fn validate_evidence_gate(&self, graph: &WorkflowGraph) -> RuntimeResult<()> {
+        // Evidence Gate 是无依赖的唯一根，input_artifacts 必须精确等于全图聚合 Need；
+        // 每个研究根都必须从它开始，防止绕过证据采集直接调用 Agent。
         let evidence_nodes = graph
             .nodes
             .iter()

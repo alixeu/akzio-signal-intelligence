@@ -6,15 +6,20 @@ import SwiftUI
 // right. The page never invents a meeting from configured models: without observed
 // trajectory or validated artifacts it renders an explicit empty state.
 struct IntelligencePage: View {
+    // store 是 Rust/Observer 数据投影的入口；页面只读取 displayCouncil，不在 SwiftUI 层补造分析记录。
     let store: ObservatoryStore
 
+    // Environment 只提供当前显示语言，切换语言不会改变 council 的来源或内容。
     @Environment(\.appLanguage) private var language
 
+    // 计算属性保持 body 的数据流单一：主题和记录都来自同一次 store 投影。
     private var council: CouncilPresentation { store.displayCouncil }
 
     var body: some View {
+        // PageScaffold 的两个闭包分别负责主体与 toolbar；空集合明确显示缺少 Observer 证据的状态。
         PageScaffold(route: .intelligence) {
             if council.topics.isEmpty && council.analysisRecords.isEmpty {
+                // 只有同时没有 topics 和 records 才进入空态，避免把部分观察误报成完全无数据。
                 emptyState
             } else {
                 PageScroll {
@@ -40,6 +45,7 @@ struct IntelligencePage: View {
     }
 
     private var agenda: some View {
+        // agenda 将持久化 topics 直接映射成可读列表；空集合只显示 unavailable 文案。
         SectionCard(
             title: "Observed Topics",
             subtitle: "Derived from durable deliberation and validated artifacts"
@@ -72,6 +78,7 @@ struct IntelligencePage: View {
     }
 
     private var analysisTimeline: some View {
+        // analysisRecords 按 store 提供的顺序展示，并把 actor 标识交给 AnalysisRecordRow。
         SectionCard(
             title: "Analysis Process",
             subtitle: "Chronological Observer record · no hidden reasoning"
@@ -91,6 +98,7 @@ struct IntelligencePage: View {
     }
 
     private var emptyState: some View {
+        // 空态解释数据需要 Rust 发出 Observer-safe trajectory 或 validated artifact，不从 configured model 猜测。
         SectionCard(title: "Observed Intelligence") {
             ContentUnavailableView {
                 Label(

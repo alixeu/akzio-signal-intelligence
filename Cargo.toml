@@ -1,3 +1,5 @@
+# 文件职责：声明 Akzio v2 的 Rust workspace、固定工具链兼容版本和共享依赖版本。
+# 成员列表决定 crate 编译边界；本文件不定义运行时状态、Prompt 或 Paper 权限。
 [workspace]
 members = [
     "crates/akzio-domain",

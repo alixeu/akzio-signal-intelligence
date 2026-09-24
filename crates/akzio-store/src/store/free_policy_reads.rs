@@ -1,3 +1,5 @@
+// 文件导读：Policy/Shadow 的读 helper 恢复消费 head、transition、pair 和 Run purpose，
+// 并核对 cursor 边界；它们只读取 immutable history，不把候选或孤立 Artifact 变成 influence。
 fn read_policy_consumption_head(
     connection: &Connection,
     expected_subject: &PolicySubject,
@@ -43,6 +45,7 @@ fn read_policy_consumption_head(
     }))
 }
 
+// 读取 subject 最新 pair event cursor，作为下一次 evaluation snapshot 的上界候选。
 fn max_shadow_pair_cursor(connection: &Connection, subject: &PolicySubject) -> StoreResult<i64> {
     connection
         .query_row(
@@ -53,6 +56,7 @@ fn max_shadow_pair_cursor(connection: &Connection, subject: &PolicySubject) -> S
         .map_err(Into::into)
 }
 
+// 按 frozen cursor 半开区间统计三个 horizon，避免 evaluation 漏算或重复消费 pair。
 fn shadow_pair_counts_between(
     connection: &Connection,
     subject: &PolicySubject,
@@ -82,6 +86,7 @@ fn shadow_pair_counts_between(
     Ok(counts)
 }
 
+// 提交 evaluation 前重新比较 after/through/counts，阻止 stale snapshot 越过新 pair。
 fn validate_policy_shadow_pair_snapshot(
     connection: &Connection,
     subject: &PolicySubject,
@@ -130,6 +135,7 @@ fn validate_policy_shadow_pair_snapshot(
     Ok(())
 }
 
+// Outcome/Experience/Evaluation/CandidatePolicy 必须走 atomic learning commit，不能走通用 Task Artifact API。
 fn reject_generic_learning_artifact(artifact: &Artifact) -> StoreResult<()> {
     if matches!(
         artifact.kind,
@@ -145,6 +151,7 @@ fn reject_generic_learning_artifact(artifact: &Artifact) -> StoreResult<()> {
     Ok(())
 }
 
+// 幂等重放比较完整 typed identity、Run、transition、cursor 和完成时间。
 fn same_policy_evaluation(
     existing: &StoredPolicyEvaluation,
     commit: &PolicyEvaluationCommit,
@@ -170,6 +177,7 @@ fn same_policy_evaluation(
         && existing.completed_at == commit.completed_at
 }
 
+// 从 subject_id 恢复当前 head，并确认 SQL key 解出的 subject 与调用方一致。
 fn read_policy_head(
     connection: &Connection,
     expected_subject: &PolicySubject,
@@ -210,6 +218,7 @@ fn read_policy_head(
     }))
 }
 
+// 读取单条 immutable transition 及其 evaluation event cursor。
 fn read_policy_transition(
     connection: &Connection,
     transition_id: &PolicyTransitionId,
@@ -267,6 +276,7 @@ fn read_policy_transition(
     }))
 }
 
+// 按 revision 升序恢复一个 subject 的完整 transition history。
 fn read_policy_transitions(
     connection: &Connection,
     expected_subject: &PolicySubject,
@@ -320,6 +330,7 @@ fn read_policy_transitions(
         .collect()
 }
 
+// 从 pair_key 恢复候选/父决策、Outcome 和 horizon；payload closure 由上层继续验证。
 fn read_shadow_pair(
     connection: &Connection,
     pair_key: &ContentHash,
@@ -398,6 +409,7 @@ fn read_shadow_pair(
     }))
 }
 
+// pair 幂等比较故意忽略 completed_at，只比较被比较的决策/context/candidate/horizon identity。
 fn same_shadow_pair(left: &ShadowPairCompletion, right: &ShadowPairCompletion) -> bool {
     left.subject == right.subject
         && left.parent_decision == right.parent_decision
@@ -410,6 +422,7 @@ fn same_shadow_pair(left: &ShadowPairCompletion, right: &ShadowPairCompletion) -
         && left.candidate_outcome == right.candidate_outcome
 }
 
+// purpose 从 rebuild_runs 读取，不接受调用方传入的替代标签。
 fn run_purpose_from_connection(connection: &Connection, run_id: &RunId) -> StoreResult<RunPurpose> {
     let purpose = connection
         .query_row(
@@ -422,6 +435,7 @@ fn run_purpose_from_connection(connection: &Connection, run_id: &RunId) -> Store
     parse_enum(&purpose)
 }
 
+// Run purpose 决定 Task Artifact 可用 lifecycle：Ephemeral 禁止，Canonical 仅 Paper。
 fn assert_task_artifact_lifecycle(
     transaction: &Transaction<'_>,
     run_id: &RunId,

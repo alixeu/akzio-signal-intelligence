@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# 文件职责：在真实 Git 工作区内检查交付 Markdown 的相对本地链接。
+# 它只读取文件和 Git 清单，不启动 Core、不访问 Store，也不修改被检查文档。
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -8,6 +8,7 @@ import SwiftUI
 @MainActor
 @Observable
 public final class ObservatoryStore {
+    // Store 是主 actor 上的引用类型单一数据源：View 读取可观察属性，异步请求完成后只在这里回填状态。
     // Data
     public private(set) var scenario: MockScenario
     public private(set) var snapshot: ObservatorySnapshot
@@ -101,6 +102,7 @@ public final class ObservatoryStore {
         autoStartsCore: Bool = true,
         languageDefaults: UserDefaults = .standard
     ) {
+        // 初始化先建立完整 mock 快照，再根据 autoStartsCore 选择 live/connecting；不会因创建 Store 自动提交 Run。
         // Mock 和 live 共用同一套 Store 字段；只由 autoStartsCore 决定数据源与初始连接状态。
         self.autoStartsCore = autoStartsCore
         self.languageDefaults = languageDefaults
@@ -192,6 +194,7 @@ public final class ObservatoryStore {
         isLive ? (liveProjection?.council ?? LiveProjection.unavailableCouncil) : snapshot.council
     }
     public var displayPortfolio: PortfolioPresentation {
+        // displayPortfolio 只组合服务端投影与本地曲线缓存；缓存缺失时保留服务端字段，不用 UI 推算业务事实。
         guard isLive else { return snapshot.portfolio }
         let base = liveProjection?.portfolio ?? LiveProjection.unavailablePortfolio
         // 先用当前投影作为基线；只有选定区间已有完整曲线缓存时才替换 curve，其余字段保持服务端快照。
@@ -276,6 +279,7 @@ public final class ObservatoryStore {
     }
 
     public func bootstrapCore() async {
+        // 该 async 方法把“外部隔离 Core”与“本地受管 Core”分成两个生命周期分支，二者都必须先通过认证/身份检查。
         // 启动先进入 connecting；环境变量分支只连接外部隔离 Debug Core，否则启动受管的本地 Core。
         guard autoStartsCore else { return }
         dataMode = .live
@@ -386,6 +390,7 @@ public final class ObservatoryStore {
     }
 
     private func connectObserver() {
+        // observerTask 是观察循环的唯一所有者；重连先取消旧 Task，避免两个 SSE 流同时改写同一份投影。
         // 新观察循环会取消旧 Task；每轮先取快照，再订阅其后的 SSE 事件，避免遗漏游标之前的数据。
         observerTask?.cancel()
         dataMode = .live
@@ -462,6 +467,7 @@ public final class ObservatoryStore {
     }
 
     private func apply(_ payload: ObserverSnapshotPayload) {
+        // payload 是一次不可变 Codable 快照；LiveProjection 在主 actor 内由它重建，View 不直接持有解码字典。
         // 只保留属于当前 Run 的 reasoning；随后从新 payload 和剩余记录重建不可变投影。
         let runID = payload.currentRun?.workflow.run.runID
         liveReasoningRecords = liveReasoningRecords.filter { $0.value.runID == runID }
@@ -489,6 +495,7 @@ public final class ObservatoryStore {
         _ event: ObserverReasoningEventPayload,
         receivedAt: Date
     ) {
+        // reasoning 事件是可丢弃/可重复的增量输入；按 run/task/attempt/turn 组成键后再生成新的值投影。
         // 推送事件必须属于当前 Run；不匹配的事件直接丢弃，避免旧连接污染当前页面。
         guard event.runID == livePayload?.currentRun?.workflow.run.runID else { return }
         let id = "reasoning-\(event.runID)-\(event.taskID)-\(event.attemptID)-\(event.turn)"
@@ -612,6 +619,7 @@ public final class ObservatoryStore {
     }
 
     public func selectArchiveRun(_ id: String) {
+        // 详情请求返回的是 Optional 异步结果，只有选择仍等于请求 id 才能写回，防止旧响应覆盖新选择。
         // 再次点击同一行取消选择；异步详情返回前若用户换行，runID 守卫会丢弃过期响应。
         let next = selectedArchiveRowID == id ? nil : id
         selectedArchiveRowID = next

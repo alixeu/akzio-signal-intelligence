@@ -1,3 +1,10 @@
+// 文件导读：bootstrap 负责把配置/模型能力/adapter 注入 Daemon，并构造 WorkflowRuntime、
+// AgentRuntime、Decision/Execution/Outcome runtime 和 PaperScheduler。生产构造不自动写
+// Policy、不启动 worker 或 broker I/O；fixture 构造只提供离线 adapter，不能作为 real
+// LLM/Paper/fill/Outcome 证据。
+// Rust 机制：trait object `Arc<dyn AsyncEvidenceAdapter>`/`Arc<dyn ...Broker>` 做依赖注入；
+// `BTreeMap` 保存 role route；builder 方法按所有权返回 `Self`，`with_*` 链式配置不复制 CAS。
+
 use super::*;
 
 impl Daemon {

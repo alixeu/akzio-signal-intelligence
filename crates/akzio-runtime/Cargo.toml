@@ -1,3 +1,4 @@
+# 文件职责：声明 Workflow 编译、节点生命周期、Store executor 和恢复 crate 的依赖。
 [package]
 name = "akzio-runtime"
 version = "0.2.0"

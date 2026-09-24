@@ -3,6 +3,7 @@ import Foundation
 // MARK: - Learning
 
 public struct RetrospectiveCardPresentation: Sendable, Hashable, Identifiable {
+    // retrospective card 是封存 Outcome 到 Learning 页的值语义投影，结果和 lesson 可分别缺失。
     public let id: String
     public let title: String
     public let dateLabel: String
@@ -34,6 +35,7 @@ public struct RetrospectiveCardPresentation: Sendable, Hashable, Identifiable {
         tags: [String],
         impact: EventPresentation.Severity
     ) {
+        // 初始化保留 diagnosticGaps 和 Optional 数值，页面不从文本猜测模型是否成功。
         self.id = id
         self.title = title
         self.dateLabel = dateLabel
@@ -52,10 +54,12 @@ public struct RetrospectiveCardPresentation: Sendable, Hashable, Identifiable {
 
     /// A retrospective the model could not produce keeps its outcome numbers but
     /// must not present invented conclusions.
+    // isDegraded 是 status 的只读映射，供 lessonCandidates 等过滤边界复用。
     public var isDegraded: Bool { status == .modelUnavailable }
 }
 
 public struct TimelineNodePresentation: Sendable, Hashable, Identifiable {
+    // timeline node 是事件→Decision→Outcome→Lesson 的固定页面坐标投影。
     public enum Kind: String, Sendable, CaseIterable {
         case event, decision, outcome, lesson
 
@@ -87,6 +91,7 @@ public struct TimelineNodePresentation: Sendable, Hashable, Identifiable {
         position: Double,
         isCurrent: Bool
     ) {
+        // position/isCurrent 只描述时间线绘制状态，不改变事件或学习生命周期。
         self.id = id
         self.kind = kind
         self.label = label
@@ -100,6 +105,7 @@ public struct TimelineNodePresentation: Sendable, Hashable, Identifiable {
 /// Policy tracks come in two shapes: memory lifecycle (5 states) and the canary
 /// ladder used by contracts and topologies.
 public struct PolicyTrackPresentation: Sendable, Hashable, Identifiable {
+    // policy track 同时容纳 memoryState/candidateState，但两者都可为 nil 以表达未提供。
     public let subject: PolicySubjectKind
     public let name: String
     public let memoryState: MemoryLifecycle?
@@ -125,6 +131,7 @@ public struct PolicyTrackPresentation: Sendable, Hashable, Identifiable {
         stabilityPpm: Int?,
         exposurePpm: Int?
     ) {
+        // 初始化不把 candidate ladder 误转成 active memory，两个 Optional 保持独立。
         self.subject = subject
         self.name = name
         self.memoryState = memoryState
@@ -138,10 +145,12 @@ public struct PolicyTrackPresentation: Sendable, Hashable, Identifiable {
     }
 
     public var tone: AkzioTone {
+        // memory 优先于 candidate；若两者都缺失使用 neutral，不伪造生命周期。
         memoryState?.tone ?? candidateState?.tone ?? .neutral
     }
 
     public var stateLabel: String {
+        // 标签只在读取时由可用状态派生，完全缺失时返回统一 unavailable 占位。
         memoryState?.displayName ?? candidateState?.displayName ?? MissingValue.unavailable.rawValue
     }
 }

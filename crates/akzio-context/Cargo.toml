@@ -1,3 +1,4 @@
+# 文件职责：声明 Context 沙箱 crate；它依赖领域类型和唯一 Store 读取层，不声明网络或交易能力。
 [package]
 name = "akzio-context"
 version = "0.2.0"

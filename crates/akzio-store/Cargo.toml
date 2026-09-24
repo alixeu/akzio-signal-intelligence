@@ -1,3 +1,4 @@
+# 文件职责：声明 SQLite/CAS 唯一持久化 crate 的依赖；其他 crate 通过它访问 durable state。
 [package]
 name = "akzio-store"
 version = "0.2.0"

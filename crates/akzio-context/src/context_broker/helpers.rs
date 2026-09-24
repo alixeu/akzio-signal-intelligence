@@ -1,3 +1,4 @@
+// 文件导读：提供不带授权语义的 JSON 字符串递归遍历辅助函数。
 // 递归收集 JSON 中所有字符串，供指令样内容等安全指标做完整遍历；函数只写入
 // 调用方提供的输出 Vec，不改变输入 Value，也不承担 Artifact 授权判断。
 fn collect_strings(value: &serde_json::Value, output: &mut Vec<String>) {

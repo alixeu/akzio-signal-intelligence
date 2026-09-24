@@ -1,15 +1,26 @@
+// 文件导读：本文件实现 DecisionRuntime 的主事务。它从 proposal 沿 Manifest 递归读取
+// selected/quarantined/ancestor 闭包，加载 Claim/Critique/Review 与 learning attribution，
+// 再调用 DecisionPolicy 生成 horizon trace、研究分配复核、目标和风险；最终按 Paper 或
+// PositionPlan 选择 Artifact lifecycle，并一次性提交 DecisionContext/Decision。所有
+// iterator/closure 只在内存中汇总已持久化证据，不能新增证据、改变 Prompt 或越过 Execution。
+
 impl DecisionRuntime {
     pub fn new(store: Store, policy: DecisionPolicy) -> DecisionGateResult<Self> {
+        // 入口先校验整份 DecisionPolicy，保证后续 decide 使用的是一个完整的冻结策略。
         policy.validate()?;
         Ok(Self { store, policy })
     }
 
     pub fn policy(&self) -> &DecisionPolicy {
+        // 只读访问策略，供上层展示或测试，不允许在一次 Decision 中间更换校准身份。
         &self.policy
     }
 
     /// Validate, bind, and atomically complete the DecisionGate attempt.
     pub fn decide(&self, input: &DecisionGateInput) -> DecisionGateResult<DecisionGateOutput> {
+        // 顺序是 permit/proposal→Manifest 闭包→draft/Claim/Critique 语义→Review/learning
+        // 归因→研究计划裁剪→horizon/校准/risk→Decision artifacts→Store 原子提交。任何
+        // 失败都停在提交前；Decision 成功也只表示正式决策产物已绑定，不表示 Execution 或成交。
         let decision_gate_started = std::time::Instant::now();
         self.store.validate_task_permit(&input.permit)?;
 
@@ -238,6 +249,8 @@ impl DecisionRuntime {
             maximum_execution_delay_ms: self.policy.maximum_execution_delay_ms,
             market_state_hash: manifest.artifact_id.0.clone(),
         };
+        // 这个闭包只把已计数的通过项转换为 ppm；total=0 保持 None，让“没有可评估证据”
+        // 与“全部通过”在投资逻辑 trace 中保持不同语义。
         let score_ratio = |passing: usize, total: usize| {
             (total > 0).then(|| {
                 u32::try_from(
@@ -272,6 +285,8 @@ impl DecisionRuntime {
             }))
             .chain(draft.evidence.iter().cloned())
             .collect::<BTreeSet<_>>();
+        // flat_map/chain 只沿 Claim、Critique 和 draft 的引用收集去重事件，来源是否真的
+        // 位于对应 Artifact.source_refs 则由后面的 grounded_event_count 独立计算。
         let grounded_event_count = claim_records
             .iter()
             .flat_map(|(artifact, claim)| {
@@ -495,6 +510,10 @@ impl DecisionRuntime {
         critiques: &[(Artifact, ResearchCritique)],
         run_id: &akzio_domain::RunId,
     ) -> DecisionGateResult<ResearchPlanReview> {
+        // 研究分配是模型表达的意图而非订单：逐项删除没有同资产/同 horizon、price+macro
+        // 支撑或 Critique 通过的行，再按静态 gross cap 缩放并把余量归入 cash。最后依据
+        // run purpose 和 policy readiness 分别标记 explicit cash、blocked、not_applicable
+        // 或 pending execution，绝不把它直接当作 ExecutionPlan。
         raw.validate()?;
         let mut validated = raw.clone();
         let mut reasons_by_asset = BTreeMap::<Asset, Vec<String>>::new();
@@ -662,6 +681,8 @@ impl DecisionRuntime {
         claim_records: &[(Artifact, ResearchClaim)],
         raw_confidence_ppm: u32,
     ) -> DecisionGateResult<ConsensusDiversityAssessment> {
+        // 按 Agent task 身份聚合 capability snapshot hash 与内容相似 cluster；相同来源会
+        // 降低独立性/有效置信度，但不会删除 Claim。所有读取仍来自已闭合的 AgentTurn/ground。
         let mut grouped = BTreeMap::<String, (BTreeSet<ContentHash>, BTreeSet<ContentHash>)>::new();
         for (claim_artifact, claim) in claim_records {
             let agent_id = claim_artifact
@@ -726,6 +747,8 @@ impl DecisionRuntime {
         assessment: &ConsensusDiversityAssessment,
         raw_confidence_ppm: u32,
     ) -> u32 {
+        // 相关 consensus 将置信度压到最低门槛，部分证据重叠按 cluster/participant 比例缩放；
+        // 这是 Decision 侧的审计调整，不是模型重新调用。
         if assessment.participant_count > 1 && !assessment.independent {
             raw_confidence_ppm.min(self.policy.min_confidence_ppm)
         } else if assessment.participant_count > 1
@@ -748,6 +771,8 @@ impl DecisionRuntime {
         proposal: &Artifact,
         claim_records: &[(Artifact, ResearchClaim)],
     ) -> DecisionGateResult<Option<u64>> {
+        // 合并 proposal 与 Claim 的 AgentTurn 引用并去重，只有每个 turn 都有 telemetry 才汇总
+        // latency；缺任一项返回 None，不以平均值补齐。
         let mut turns = proposal
             .source_refs
             .iter()
@@ -770,6 +795,7 @@ impl DecisionRuntime {
         &self,
         critique_records: &[(Artifact, ResearchCritique)],
     ) -> DecisionGateResult<Option<u64>> {
+        // 从 Critique source_refs 收集独立 turn 延迟，语义与 model stage 相同。
         let turns = critique_records
             .iter()
             .flat_map(|(critique, _)| critique.source_refs.iter())
@@ -783,6 +809,8 @@ impl DecisionRuntime {
         &self,
         turns: &BTreeSet<ArtifactRef>,
     ) -> DecisionGateResult<Option<u64>> {
+        // 逐个读取 AgentTurn response.telemetry，累加时使用 saturating_add；缺少完整遥测
+        // 只影响审计字段，不阻断已经合法的 Decision。
         if turns.is_empty() {
             return Ok(None);
         }
@@ -809,6 +837,8 @@ impl DecisionRuntime {
         proposal: &Artifact,
         permit: &TaskWritePermit,
     ) -> DecisionGateResult<akzio_domain::ContentHash> {
+        // Proposal 必须是本 run 的 agent.research.synthesizer RunScoped Artifact，并把其
+        // contract hash 同时绑定到 provenance/origin，阻断脱离当前任务的终稿。
         let Some(origin) = proposal.origin.as_ref() else {
             return Err(DecisionGateError::InvalidProposalProvenance);
         };
@@ -836,6 +866,9 @@ fn research_slot_supported(
     claims: &[(Artifact, ResearchClaim)],
     critiques: &[(Artifact, ResearchCritique)],
 ) -> bool {
+    // 判断某资产/horizon 的研究分配是否有 bullish Claim、price+macro directional grounds、
+    // 支持该 Claim 的 Critique，以及 references 闭包；新闻可以补充背景，但不能替代这两类
+    // 直接方向依据。
     claims.iter().any(|(artifact, claim)| {
         if claim.horizon != horizon
             || claim.stance != akzio_domain::ClaimStance::Bullish
@@ -892,6 +925,8 @@ fn has_unverified_critical_claim(
     critiques: &[ResearchCritique],
     forecasts: &[Forecast],
 ) -> bool {
+    // 只对高 materiality 且真正支持非中性 forecast 的 Claim 要求恰好一个 Supported Critique；
+    // 缺失、重复、Contradicted 或 slot blocker 都会让 Decision 保留 UnverifiedClaim。
     claim_refs
         .iter()
         .zip(claims.iter())
@@ -938,6 +973,8 @@ fn build_asset_eligibility(
     portfolio_risk: &PortfolioRiskAssessment,
     target: &TargetPortfolio,
 ) -> BTreeMap<Asset, AssetEligibility> {
+    // 为每个可执行资产汇总方向 forecast、Claim/Critique、horizon conflict、校准与最终 target，
+    // 形成“为何可/不可进入目标”的只读投影；它不重新计算或修改 target。
     Asset::EXECUTABLE
         .into_iter()
         .map(|asset| {

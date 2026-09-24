@@ -1,4 +1,6 @@
 """Run real research in an isolated Store; optionally use native Alpaca Paper on the formal Paper graph."""
+# 文件职责：把一次研究/PositionPlan/Paper 调试运行固定到新隔离 Store，并保存诊断归档。
+# Python 只编排 CLI/Core 和归档；会话日期、Policy、Gate 和业务状态仍由 Rust 投影决定。
 import datetime as dt
 import argparse
 import json
@@ -17,18 +19,21 @@ import zipfile
 
 
 class _NoRedirect(HTTPRedirectHandler):
+    # 认证 header 不能跟随 Location 转发；返回 None 让 urllib 把 307 暴露给调用方。
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         # The original loopback endpoint owns the token; Location grants no
         # authority to receive it, even when the redirected URL is loopback.
         return None
 
 
+# 所有本地 Observer 读取复用这个拒绝重定向的 opener，避免 token 离开原始 endpoint。
 urlopen = build_opener(_NoRedirect()).open
 
 
 def native_paper_session(root, port):
     """Reuse the Core's provider-calendar projection; Python never classifies sessions."""
     # 只读取隔离 Core 已经校验过的 portfolio 投影；缺失或非字符串都不能用本机日期替代。
+    # 该函数只读取 Rust 已校验的 broker_session，不用主机本地日期推断交易时段。
     token = (root / 'store/.daemon-token').read_text().strip()
     request = Request(f'http://127.0.0.1:{port}/v1/observer/snapshot',
                       headers={'x-akzio-token': token})
@@ -47,6 +52,7 @@ def native_paper_session(root, port):
 
 def run(config_path=None, *, research_only=False, keep_artifacts=False, paper=False):
     # `paper` 与 `research_only` 是互斥的工作边界：前者允许正式 Paper 图，后者在研究复核后停止。
+    # run 建立临时目录并统一处理成功、异常和 finally 归档；真正的业务阶段在 execute。
     if paper and research_only:
         raise ValueError('--paper and --research-only select different workflow boundaries')
     os.umask(0o077)
@@ -80,6 +86,7 @@ def run(config_path=None, *, research_only=False, keep_artifacts=False, paper=Fa
 def archive_run(root, configuration):
     # The Rust exporter redacts its bundle. Only diagnostics need additional
     # redaction here; keep bundle bytes intact so checksums remain verifiable.
+    # 归档前先收集并替换凭据，再验证 ZIP 可读性；成功创建 ZIP 不代表 Run 完成。
     secrets = set()
 
     def collect(value):
@@ -131,6 +138,7 @@ def archive_run(root, configuration):
 def migrate_isolated_config(config_text):
     """Remove explicitly retired Planner settings only from this run's copy."""
     # 只在内存中的隔离副本删除退休配置，源文件永不回写；返回删除记录供诊断使用。
+    # re.subn 只操作内存副本，并返回删除记录，调用方据此保留 provenance。
     removed = []
     for header in (r'model\.routes\.(?:"research\.planner"|\'research\.planner\')',
                    r'agent\.budget\.planner'):
@@ -144,6 +152,8 @@ def migrate_isolated_config(config_text):
 
 def execute(repo, root, config_text, source_configuration, source_config_path, cleanup, *, research_only=False, paper=False):
     # 该函数把配置、Store、Core 和 CLI 都绑定到同一个临时 root；Paper 之外 broker 写入保持禁止。
+    # execute 的副作用顺序是：派生隔离配置 -> build/preflight -> 启动 Core -> prepare/推进 -> export。
+    # 任一边界失败都保留诊断文件，不把进程退出或 HTTP 成功当成 Paper 结果。
     with socket.socket() as sock:
         sock.bind(('127.0.0.1', 0))
         port = sock.getsockname()[1]
@@ -180,6 +190,7 @@ def execute(repo, root, config_text, source_configuration, source_config_path, c
 
     def command(name, *args, required=True, timeout=60):
         # 每个 CLI 调用保存 stdout/错误输出；required=False 只允许探测 readiness，其他失败向上抛出。
+        # 每次命令的 stdout/stderr 都落入隔离 root；required=False 只用于 readiness 探测。
         result = subprocess.run(prefix + list(args), env=child_environment, capture_output=True, text=True, timeout=timeout)
         (root / name).write_text(result.stdout if result.returncode == 0 else result.stdout + result.stderr)
         if required and result.returncode:
@@ -342,6 +353,7 @@ def execute(repo, root, config_text, source_configuration, source_config_path, c
 
 
 if __name__ == '__main__':
+    # CLI 入口只解析用户显式模式，最终退出码由 run 的 Rust/Core 观察结果决定。
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('config', nargs='?', help='TOML configuration (default: ~/.akzio/config.toml)')
     parser.add_argument('--research-only', action='store_true', help='Stop after final proposal review with incomplete PositionPlan status, even when Policy is ready; never run Decision')

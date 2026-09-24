@@ -1,3 +1,5 @@
+// 文件导读：负责角色必需输入、Manifest closure 校验、显式候选组装、Grant minting
+// 以及 Lesson/Experience 学习候选筛选；所有候选都经过 Contract、Run 和 budget 收缩。
 impl ContextBroker {
     // 按角色从已经取到的候选 Artifact 中计算不可缺少的输入闭包。这个函数只做
     // Context 完整性校验：它不会抓取新数据，也不会把提案或 Review 视为 Decision。
@@ -6,6 +8,7 @@ impl ContextBroker {
         contract: &AgentContract,
         artifacts: &[Artifact],
     ) -> ContextResult<BTreeSet<ArtifactId>> {
+        // 按 Outcome/研究角色建立不可缺少的 ArtifactId 集合，并验证嵌套 source closure。
         let purpose = contract.purpose.as_str();
         let missing = |requirement: String| ContextError::MissingRequiredInput {
             purpose: purpose.to_owned(),
@@ -129,6 +132,7 @@ impl ContextBroker {
         permit: &TaskWritePermit,
         candidates: &mut Vec<ArtifactRef>,
     ) -> ContextResult<()> {
+        // 对来自 Manifest 的 Critique 追加其同 Attempt、同 Contract、同来源 Manifest 的 Claim。
         // Synthesizer 的候选中若有来自 ContextManifest 的 Critique，则把其被审查的
         // Claim 一并加入候选；加入前验证同 Run、同 Contract 和源 Manifest 的选择闭包，
         // 不允许借 Critique 引用扩大到未授权材料。
@@ -214,6 +218,7 @@ impl ContextBroker {
     // ContextBroker 只持有 Store 句柄；构造本身不打开数据库、不创建 Manifest，也不
     // 产生任何研究或执行状态。
     pub fn new(store: Store) -> Self {
+        // 只保存 Store 句柄；构造器不执行数据库写入或权限变化。
         Self { store }
     }
 
@@ -226,6 +231,7 @@ impl ContextBroker {
         manifest: &ContextManifest,
         now: DateTime<Utc>,
     ) -> ContextResult<Vec<ArtifactRef>> {
+        // 在完整 Manifest closure 验证后返回当前允许影响 Context 的学习 Artifact。
         // 返回 Manifest 闭包中实际影响当前 Context 的 Experience/CandidatePolicy 引用；
         // 当前 Policy head 会在使用时重验，返回该列表不等于激活或修改 Policy。
         self.policy_influences_internal(permit, contract, manifest, now, true)
@@ -239,6 +245,7 @@ impl ContextBroker {
         now: DateTime<Utc>,
         require_live_grant: bool,
     ) -> ContextResult<Vec<ArtifactRef>> {
+        // 从 Store 重载并重算 Manifest 的所有身份、budget、source_refs、readable/raw closure。
         // 重新核对内存 Manifest 与 Store 中的 Artifact/payload、Contract、来源、预算和
         // grant 闭包。require_live_grant=false 仅供成功父 Attempt 的历史证明路径，仍不
         // 放宽 persisted Manifest 的身份与内容校验。
@@ -289,6 +296,7 @@ impl ContextBroker {
         let mut total_bytes = 0_u64;
         let mut projected_bytes = 0_u64;
         let mut estimated_tokens = 0_u32;
+        // 逐项重算 projection budget，并把选择集合同时积累成 source bytes/token 总量。
         for selection in &persisted_payload.selections {
             // 每个选择都重新读取并计算 projection budget，防止 payload 中篡改 token/byte
             // 计数；selected/readable 也必须是一一对应且不重复的 ArtifactId。
@@ -368,6 +376,7 @@ impl ContextBroker {
         now: DateTime<Utc>,
         require_live_grant: bool,
     ) -> ContextResult<Vec<ArtifactRef>> {
+        // 先执行完整 closure，再仅筛出 overlay head 当前允许的 Experience/CandidatePolicy。
         // 先完整验证 Manifest，再只筛出已验证且当前 overlay head 允许的学习影响；
         // 该读取路径不会创建 CandidatePolicy，也不会改变 active head。
         let selected =
@@ -404,6 +413,8 @@ impl ContextBroker {
         now: DateTime<Utc>,
         grant_ttl: Duration,
     ) -> ContextResult<ContextManifest> {
+        // 只从调用方给出的候选构造上下文；排序和预算循环会优先 required inputs，超限则
+        // 跳过可选项、对必需项返回 MissingRequiredInput。
         // 输入候选必须由调用方显式提供；其余材料只来自同一 Store 中受 Contract、Run
         // 和 overlay 规则约束的 Lesson/Experience。assemble 的成功结果只是 Context
         // Manifest + ReadGrant，不代表研究提案已通过、更不代表 Decision/Execution。
@@ -509,6 +520,7 @@ impl ContextBroker {
                 }
             }
         }
+        // 稳定排序综合 purpose、直接引用、confidence 和 artifact_id，确保同一候选集可复现。
         artifacts.sort_by(|left, right| {
             purpose_rank(contract.purpose.as_str(), left)
                 .cmp(&purpose_rank(contract.purpose.as_str(), right))
@@ -668,6 +680,7 @@ impl ContextBroker {
         now: DateTime<Utc>,
         grant_ttl: Duration,
     ) -> ContextResult<ContextManifest> {
+        // 对已预算的 selection 再验证 required closure，持久化 Manifest 后才 mint 当前 Grant。
         // selections 已在 assemble 中完成筛选和预算计算，这里再次读取其 Artifact 来
         // 生成 input_hash、payload 与 source_refs；payload 校验失败或 Store 提交失败时
         // 不返回内存中的 grant。
@@ -756,6 +769,7 @@ impl ContextBroker {
         scope: &ContextQueryScope,
         now: DateTime<Utc>,
     ) -> ContextResult<Vec<ArtifactRef>> {
+        // 按 scope、治理、来源、overlay 和冲突组容量筛选 Lesson，再补充有限 Experience。
         // 从 Store 的 Active 快照中筛选学习覆盖；scope、usage、治理、来源和 overlay
         // 逐层收窄候选，最终只返回最多四个完整冲突组及有限 Experience 引用。
         let mut candidates = Vec::new();
@@ -799,6 +813,7 @@ impl ContextBroker {
                 }
                 audit.push(record);
             }
+            // 相关性、更新时间和 LessonId 共同决定稳定排序。
             ranked.sort_by(|(_,a),(_,b)| lesson_relevance(b,scope).cmp(&lesson_relevance(a,scope))
                 .then_with(|| b.updated_at.cmp(&a.updated_at)).then_with(|| a.lesson_id.cmp(&b.lesson_id)));
             let mut fingerprints = BTreeSet::new();
@@ -870,6 +885,7 @@ impl ContextBroker {
 // 按当前查询 scope 计算 Lesson 的重合维度；返回值只用于确定性排序，不是 Lesson
 // 的有效性或交易方向评分。
 fn lesson_relevance(lesson: &Lesson, scope: &ContextQueryScope) -> (usize, usize, usize, usize) {
+    // 统计 regime/stage/asset/horizon 的交集数量，仅服务于候选排序。
     (lesson.scope.regimes.intersection(&scope.regimes).count(),
         lesson.scope.decision_stages.intersection(&scope.decision_stages).count(),
         lesson.scope.assets.intersection(&scope.assets).count(),
@@ -879,6 +895,7 @@ fn lesson_relevance(lesson: &Lesson, scope: &ContextQueryScope) -> (usize, usize
 // 规范化空白后生成稳定指纹，用于折叠完全重复的 Lesson；scope、排除条件和关键文本
 // 都纳入指纹，因此不能把不同适用范围误合并。
 fn lesson_retrieval_fingerprint(lesson: &Lesson) -> ContextResult<String> {
+    // 规范化空白并纳入 scope/exclusions/关键文本，折叠精确重复而保留范围差异。
     let normalize = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut exclusions = lesson.exclusions.iter().map(|s| normalize(s)).collect::<Vec<_>>();
     exclusions.sort();
@@ -889,6 +906,7 @@ fn lesson_retrieval_fingerprint(lesson: &Lesson) -> ContextResult<String> {
 // 把显式 conflicts_with 构造成无向连通分量，只有完整分量能放入 limit 时才选择；
 // 这样冲突观点不会因容量限制被裁成只剩一侧。
 fn select_lesson_groups(entries: &[(ArtifactId,Vec<ArtifactRef>)], limit: usize) -> Vec<ArtifactId> {
+    // 将 conflicts_with 建成无向图，按完整连通分量选择，避免只暴露冲突一方。
     let mut adjacency = entries.iter().map(|(id,_)|(id.clone(),BTreeSet::new())).collect::<std::collections::BTreeMap<_,_>>();
     for (id,refs) in entries {
         for reference in refs {
@@ -900,6 +918,7 @@ fn select_lesson_groups(entries: &[(ArtifactId,Vec<ArtifactRef>)], limit: usize)
     }
     let mut visited = BTreeSet::new();
     let mut chosen = Vec::new();
+    // BFS 访问每个冲突分量；只有完整分量不超过剩余容量才加入结果。
     for (id,_) in entries {
         if chosen.len()==limit {break;}
         if visited.contains(id) {continue;}

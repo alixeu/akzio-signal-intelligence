@@ -7,6 +7,10 @@ use akzio_domain::{
 };
 use akzio_store::{Store, StoreError};
 
+// 文件导读：执行快照是 Alpaca 证据经过领域类型校验后的 Artifact 投影。sealed trait
+// 把可写入的 payload 限定为账户、报价和时钟三类；materialize_snapshot_artifact 只
+// staging JSON 并组装 Raw/Normalized provenance，真正的 fenced commit 由调用方负责。
+
 #[derive(Debug, Error)]
 pub enum SnapshotArtifactError {
     #[error("{0}")]
@@ -28,23 +32,27 @@ mod sealed {
 }
 
 pub trait ExecutionSnapshotPayload: serde::Serialize + sealed::Sealed {
+    // 统一入口让三种快照在进入执行链前复用各自领域校验；trait 不提供任何 I/O 默认实现。
     fn validate_snapshot(&self) -> Result<(), DomainError>;
 }
 
 impl ExecutionSnapshotPayload for AccountSnapshot {
     fn validate_snapshot(&self) -> Result<(), DomainError> {
+        // 账户快照的活动状态、购买力、持仓与 session 约束由 domain 唯一解释。
         self.validate()
     }
 }
 
 impl ExecutionSnapshotPayload for QuoteSnapshot {
     fn validate_snapshot(&self) -> Result<(), DomainError> {
+        // 报价快照只在结构合法后才能成为执行侧 provenance 的一部分；新鲜度由 Gate 另查。
         self.validate()
     }
 }
 
 impl ExecutionSnapshotPayload for MarketClockSnapshot {
     fn validate_snapshot(&self) -> Result<(), DomainError> {
+        // 时钟快照的交易日/session 结构由 domain 校验，是否仍可提交要在即时刷新后判断。
         self.validate()
     }
 }
@@ -60,6 +68,9 @@ pub fn materialize_snapshot_artifact<T: ExecutionSnapshotPayload>(
     source_uri: Option<String>,
     now: DateTime<Utc>,
 ) -> Result<Artifact, SnapshotArtifactError> {
+    // 输入→校验 payload 和 permit-bound NormalizedEvidence→收集其 Raw/Normalized 引用→
+    // stage JSON→返回待提交 Artifact。这里拒绝跨 run、跨 source family 或非 RunScoped
+    // 来源，防止执行 Gate 把任意证据伪装成账户/报价/时钟快照。
     payload.validate_snapshot()?;
     let first_normalized = normalized_sources.first().ok_or_else(|| {
         SnapshotArtifactError::InvalidInput(

@@ -1,6 +1,9 @@
+// 文件导读：Store 打开路径区分新建、严格只读打开和“存在则只读/不存在才初始化”；
+// schema/metadata 迁移由 initialize 统一处理，现有数据库不会在 open_existing 中被改写。
 use super::*;
 
 impl Store {
+    // 新建或升级入口先建立 SQLite 连接并打开 foreign_keys，再把 staging、嵌入 BLOB 索引和文件权限补齐。
     pub fn open(root: impl AsRef<Path>) -> StoreResult<Self> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root).map_err(|source| StoreError::Io {
@@ -75,12 +78,14 @@ impl Store {
 mod tests {
     use super::*;
 
+    // 每个 schema case 使用唯一临时 Root，测试 metadata/index 迁移而不共享数据库。
     fn scratch_root(label: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/store-schema-tests")
             .join(format!("{label}-{}", RunId::new().0))
     }
 
+    // 只读读取 metadata label，用来区分 schema 版本迁移是否提交。
     fn schema_version(root: &Path) -> Option<String> {
         let connection =
             Connection::open_with_flags(root.join(DATABASE_FILE), OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -95,6 +100,7 @@ mod tests {
             .unwrap()
     }
 
+    // 只读检查 rebuildable index 是否存在，不触碰 schema。
     fn index_exists(root: &Path, index: &str) -> bool {
         let connection =
             Connection::open_with_flags(root.join(DATABASE_FILE), OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -114,6 +120,7 @@ mod tests {
     /// are created unconditionally. Reopening it must relabel it to the current
     /// version and leave the rebuildable index in place, without rewriting CAS.
     #[test]
+    // 旧 label 可在无 active work 时恢复为当前版本并重建索引，不改 CAS。
     fn older_label_is_upgraded_and_rebuildable_index_is_repaired() {
         let root = scratch_root("upgrade-from-16");
         let store = Store::open(&root).unwrap();
@@ -156,6 +163,7 @@ mod tests {
     /// The version label and the schema it describes are committed together, so
     /// a freshly created root is never observable as "current tables, no label".
     #[test]
+    // 新 Root 的 schema label、DDL 和 rebuildable index 一起可见。
     fn fresh_root_is_labelled_with_the_current_version() {
         let root = scratch_root("fresh-label");
         let store = Store::open(&root).unwrap();
@@ -171,6 +179,7 @@ mod tests {
     /// be scheduling against this root. The guard runs before any migration
     /// touches the schema, so the label stays where it was.
     #[test]
+    // active daemon lease 会在迁移前阻断 label 改写。
     fn active_lease_blocks_the_upgrade() {
         let root = scratch_root("upgrade-blocked");
         let store = Store::open(&root).unwrap();
@@ -199,6 +208,7 @@ mod tests {
 
     /// An unknown future label is refused rather than relabelled downward.
     #[test]
+    // 未知 future label 必须拒绝打开，不能向下重标或猜测 schema。
     fn unknown_future_label_is_refused() {
         let root = scratch_root("future-label");
         drop(Store::open(&root).unwrap());
@@ -219,6 +229,7 @@ mod tests {
     }
 
     #[test]
+    // 第一次调用创建并初始化，第二次调用只读重开并返回 initialized=false。
     fn existing_or_initialize_creates_once_then_reopens_read_only() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/store-schema-tests")

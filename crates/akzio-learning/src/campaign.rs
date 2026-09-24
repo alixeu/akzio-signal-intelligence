@@ -17,6 +17,10 @@ use crate::evaluation::{aggregate_calibration_report, AKZIO_MIN_CALIBRATION_SAMP
 
 const PPM_ONE: u32 = 1_000_000;
 
+// 文件导读：这里把同一 Canary cohort 的三类 subject 与 T+1/T+3/T+5 观察汇总成
+// 一个有版本和哈希的评估；它只决定 canary verdict，真正的 Policy head 变更仍由 Store
+// 的带 lease 事务负责。
+
 #[derive(Debug, Error)]
 pub enum CanaryError {
     #[error(transparent)]
@@ -57,6 +61,8 @@ pub fn evaluate_canary_cohort(
         std::array::from_fn(|_| std::array::from_fn(|_| std::array::from_fn(|_| Vec::new())));
     let mut observation_hashes = Vec::with_capacity(observations.len());
 
+    // session_key 与 horizon 共同构成唯一观察身份；同一交易 Session 的三个窗口分别
+    // 计数，market_days/regime 则用于检查跨日和跨市场状态的覆盖，而不是把缺失窗口当成 0。
     for observation in observations {
         observation.validate()?;
         validate_observation_manifest(manifest, observation)?;
@@ -78,6 +84,8 @@ pub fn evaluate_canary_cohort(
         .into_iter()
         .enumerate()
         {
+            // utility 以 ppm 累加后再与样本数比较；forecast score 保留 parent/candidate
+            // 的逐资产分数，下面只有达到最小样本数才会形成 calibration report。
             rollback |= subject_requires_rollback(subject, policy);
             required_metric_unmeasured |= subject_required_metric_unmeasured(subject);
             if let Some(score) = subject.parent.forecast_score {
@@ -117,6 +125,8 @@ pub fn evaluate_canary_cohort(
                         * i128::from(*count)
         });
     let mut calibration_reports = Vec::with_capacity(9);
+    // 9 个 report = 3 个 subject × 3 个 Outcome horizon；样本不足时 report 为 None，
+    // confidence_insufficient 会让 verdict 保持 Defer，不能用单条 T+1/T+3/T+5 观察晋级。
     for (subject_index, subject) in [
         CanarySubjectKind::Contract,
         CanarySubjectKind::Topology,
@@ -162,6 +172,8 @@ pub fn evaluate_canary_cohort(
         .is_some_and(|matrix| !matrix.permits_promotion());
     let governance_missing =
         manifest.promotion_integrity.is_none() || manifest.capability_retention.is_none();
+    // 已测出的退化才允许 Rollback；coverage、置信度、必需指标或治理材料缺失属于
+    // Defer；指标完整但 utility 未达到阈值才是 Hold。未知状态不会被解释成通过。
     let verdict = if rollback || integrity_failed || retention_failed {
         CanaryVerdict::Rollback
     } else if coverage_insufficient
@@ -294,6 +306,7 @@ const fn subject_required_metric_unmeasured(subject: &CanaryPairedSubjectMetrics
 }
 
 const fn horizon_index(horizon: OutcomeHorizon) -> usize {
+    // 固定数组顺序与 OutcomeHorizon::ALL 一致，避免把 T+1/T+3/T+5 的计数错位。
     match horizon {
         OutcomeHorizon::T1 => 0,
         OutcomeHorizon::T3 => 1,
@@ -308,6 +321,7 @@ pub struct CanaryCampaignRuntime {
 
 impl CanaryCampaignRuntime {
     pub fn new(store: Store, minimum_ppm: u32) -> Result<Self, CanaryError> {
+        // minimum_ppm 只是本运行时接收的边界校验；campaign 状态不会在构造时写入 Store。
         if minimum_ppm > PPM_ONE {
             return Err(CanaryError::Domain(
                 akzio_domain::DomainError::InvalidBudget {
@@ -355,6 +369,8 @@ impl CanaryCampaignRuntime {
         evaluation: &CanaryCohortEvaluation,
         now: DateTime<Utc>,
     ) -> Result<CanaryCampaignHead, CanaryError> {
+        // 评估结果已经密封；这里不直接改内存，而是把 lease、campaign、status 和
+        // evaluation 一并交给 Store 的受保护状态迁移，失败时不应留下半个 transition。
         Ok(self.store.transition_canary_campaign_with_evaluation(
             lease,
             campaign_id,

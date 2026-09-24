@@ -1,3 +1,5 @@
+// 文件导读：核心 impl 提供非重入连接 guard、Paper approval/workflow 验证、bootstrap/freeze
+// 写入和专用 Artifact 校验；内部函数优先复用已持有 Connection/Transaction，避免锁重入。
 thread_local! {
     /// Whether this thread currently holds the Store connection. Tracking it
     /// turns a nested acquisition into a diagnosable error instead of a silent,
@@ -7,6 +9,7 @@ thread_local! {
 }
 
 fn connection_held_by_current_thread() -> bool {
+    // 线程局部标记只检测同线程重入，不把跨线程 SQLite Mutex 竞争误判为错误。
     CONNECTION_HELD.with(std::cell::Cell::get)
 }
 
@@ -17,6 +20,7 @@ pub(super) struct ConnectionGuard<'store> {
 }
 
 impl<'store> ConnectionGuard<'store> {
+    // 取得 guard 时登记 owner，Drop 会清除标记；Connection 生命周期仍由 MutexGuard 管理。
     fn new(guard: std::sync::MutexGuard<'store, Connection>) -> Self {
         CONNECTION_HELD.with(|held| held.set(true));
         Self { guard }
@@ -24,6 +28,7 @@ impl<'store> ConnectionGuard<'store> {
 }
 
 impl Drop for ConnectionGuard<'_> {
+    // 释放 guard 前清除线程局部标记，使后续同线程 acquisition 可以继续。
     fn drop(&mut self) {
         CONNECTION_HELD.with(|held| held.set(false));
     }
@@ -32,18 +37,21 @@ impl Drop for ConnectionGuard<'_> {
 impl std::ops::Deref for ConnectionGuard<'_> {
     type Target = Connection;
 
+    // 只读调用沿用 rusqlite Connection API，不复制或打开第二连接。
     fn deref(&self) -> &Self::Target {
         &self.guard
     }
 }
 
 impl std::ops::DerefMut for ConnectionGuard<'_> {
+    // 写事务需要可变 Connection，但仍受同一非重入 guard 约束。
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.guard
     }
 }
 
 impl Store {
+    // 返回 Store Root 路径；不检查或创建数据库。
     pub fn root(&self) -> &Path {
         self.root.as_ref()
     }
@@ -71,6 +79,7 @@ impl Store {
         Ok(ConnectionGuard::new(guard))
     }
 
+    // 以固定页大小沿 cursor 读取完整事件，供导出使用并避免单次不设界查询。
     fn read_all_events(&self, run_id: &RunId) -> StoreResult<Vec<StoredEvent>> {
         const PAGE_SIZE: usize = 256;
         let mut after = 0_i64;
@@ -89,6 +98,7 @@ impl Store {
         Ok(events)
     }
 
+    // 校验 RuntimeManifest/Approval 的 canonical 身份、hash、source closure 和有效期。
     fn validate_paper_approval_binding(
         &self,
         runtime_manifest: &Artifact,
@@ -134,6 +144,7 @@ impl Store {
         reservation: &SessionReservation,
         proposal: &Artifact,
     ) -> StoreResult<()> {
+        // 先验证 Paper graph/proposal/setup EvidenceNeed 的 Run lineage，再允许 slot 事务写入。
         if reservation.session_key.trim().is_empty()
             || reservation.workflow.run.purpose != RunPurpose::Paper
             || reservation.workflow.graph.kind != ArtifactKind::WorkflowGraph
@@ -207,6 +218,7 @@ impl Store {
         Ok(())
     }
 
+    // 拒绝退役 workflow/旧 Contract，并确认 graph payload 与 Run nodes/topology 完全相等。
     pub(super) fn validate_workflow_commit(&self, commit: &WorkflowCommit) -> StoreResult<()> {
         if commit.run.purpose == RunPurpose::PaperDryRun || commit.nodes.iter().any(|n| n.recipe_id.as_str() == "research.planner" || commit.run.purpose == RunPurpose::Debug && n.recipe_id.as_str().starts_with("research.")) {
             return Err(StoreError::DebugControl("legacy_workflow_retired".into()));
@@ -307,6 +319,7 @@ impl Store {
         Ok(artifact)
     }
 
+    // 从 AgentContract 创建无 Run origin 的 canonical catalogue Artifact。
     fn contract_artifact(
         &self,
         contract: &AgentContract,
@@ -331,6 +344,7 @@ impl Store {
         )?)
     }
 
+    // 使用调用方连接恢复安装 Contract，并交叉验证安装列、Artifact kind 和 payload hash。
     fn stored_contract_with_connection(
         &self,
         connection: &Connection,
@@ -385,6 +399,7 @@ impl Store {
         .transpose()
     }
 
+    // 将 Policy transition 投影为 Contract activation/head 变更；输入仍受同一事务保护。
     fn apply_contract_catalogue_transition(
         &self,
         transaction: &Transaction<'_>,

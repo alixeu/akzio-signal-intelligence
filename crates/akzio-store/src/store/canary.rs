@@ -3,6 +3,8 @@
 //! Campaign writes are fenced by the daemon lease in the same SQLite
 //! transaction as the state change.  The learning runtime owns verdict
 //! calculation; this module only persists the validated result.
+// 文件导读：Canary 同时保存 campaign head、legacy/paired session 和四条 Run lineage；
+// 本文件只负责把 SQL 列转换为领域 reservation，是否晋级由 learning 侧计算并提交。
 
 use std::collections::BTreeSet;
 

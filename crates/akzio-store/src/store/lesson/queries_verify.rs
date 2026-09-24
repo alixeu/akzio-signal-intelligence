@@ -1,3 +1,5 @@
+// 文件导读：Lesson 表按需创建，Doctor 再用 head、event、payload 和 evidence ledger
+// 逐层复核；惰性表不存在时只返回空历史，不把缺表误报为 Lesson 已完成。
 impl Store {
     pub(super) fn ensure_lesson_tables(&self) -> StoreResult<()> {
         self.connection()?.execute_batch(

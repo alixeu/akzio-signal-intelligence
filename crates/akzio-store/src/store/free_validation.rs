@@ -1,3 +1,6 @@
+// 文件导读：本文件包含 Store Root 权限、schema 初始化/升级、v18 DDL、Contract catalogue
+// 和 Artifact 插入校验；DDL 与 metadata label 在同一事务中提交，迁移不重写 CAS/历史 hash。
+// 对已写入的文件调用 sync_all；它只提供文件落盘检查，不是 SQLite 事务提交证明。
 fn sync_file(path: &Path) -> StoreResult<()> {
     let file = fs::File::open(path).map_err(|source| StoreError::Io {
         path: path.to_path_buf(),
@@ -10,6 +13,7 @@ fn sync_file(path: &Path) -> StoreResult<()> {
     Ok(())
 }
 
+// Unix 下把 Store Root/导出目录权限收紧为 owner-only；非 Unix 平台保持文件系统默认行为。
 fn secure_directory(path: &Path) -> StoreResult<()> {
     #[cfg(unix)]
     {
@@ -30,6 +34,7 @@ fn secure_directory(path: &Path) -> StoreResult<()> {
     Ok(())
 }
 
+// Unix 下把 SQLite/导出文件权限设为 0600，不涉及数据库内容或 schema。
 fn secure_file(path: &Path) -> StoreResult<()> {
     #[cfg(unix)]
     {
@@ -60,6 +65,7 @@ fn secure_file(path: &Path) -> StoreResult<()> {
 /// The claimable states match `workflow::contract_upgrade_blockers`: a task that
 /// is queued or leased is owned by the old worker just as much as a running one,
 /// and letting it through would strand it after the version changes.
+// 迁移前只读取 queued/leased/running Task 和未过期 daemon lease，旧 worker 活跃时 fail closed。
 fn assert_no_active_work_before_upgrade(connection: &Connection) -> StoreResult<()> {
     let mut blocked = false;
     if migration::table_exists(connection, "rebuild_tasks")? {
@@ -84,6 +90,7 @@ fn assert_no_active_work_before_upgrade(connection: &Connection) -> StoreResult<
     Ok(())
 }
 
+// 在一个初始化事务中创建/升级所有 rebuild_* 表、索引和 metadata schema_version。
 fn initialize(connection: &mut Connection, root: &Path) -> StoreResult<()> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS rebuild_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
@@ -525,6 +532,7 @@ CREATE INDEX IF NOT EXISTS rebuild_artifacts_run_kind
     Ok(())
 }
 
+// 用 PRAGMA table_info 探测历史列，供兼容迁移选择分支。
 fn table_has_column(
     connection: &Connection,
     table: &str,
@@ -537,6 +545,7 @@ fn table_has_column(
     Ok(columns.iter().any(|column| column == required_column))
 }
 
+// 读取 purpose 当前 head 及 activation id；head 只是 immutable activation history 的游标。
 fn contract_catalogue_head(
     connection: &Connection,
     purpose: &ContractPurpose,
@@ -552,6 +561,7 @@ fn contract_catalogue_head(
         .transpose()
 }
 
+// contract_id+version 是安装表唯一身份，重复版本直接拒绝而不是覆盖旧 Artifact。
 fn assert_contract_identity_available(
     connection: &Connection,
     contract: &AgentContract,
@@ -572,6 +582,7 @@ fn assert_contract_identity_available(
     Ok(())
 }
 
+// 写入不可变 Contract installation 元数据，payload/Artifact 已由调用方同一事务准备。
 fn insert_contract_installation(
     transaction: &Transaction<'_>,
     contract: &AgentContract,
@@ -597,6 +608,7 @@ fn insert_contract_installation(
     Ok(())
 }
 
+// 追加 activation history 行并返回 SQLite rowid，后续 head 更新引用该 immutable event。
 fn append_contract_activation(
     transaction: &Transaction<'_>,
     purpose: &ContractPurpose,
@@ -620,6 +632,7 @@ fn append_contract_activation(
     Ok(transaction.last_insert_rowid())
 }
 
+// 以 purpose 单例 head 指向刚追加的 activation，不删除或改写既有 activation。
 fn set_contract_catalogue_head(
     transaction: &Transaction<'_>,
     purpose: &ContractPurpose,
@@ -637,6 +650,7 @@ fn set_contract_catalogue_head(
     Ok(())
 }
 
+// 只做 capability subset 判断：候选不能扩大 output kind、depth、child tasks 或证据要求。
 fn candidate_is_bounded(active: &AgentContract, candidate: &AgentContract) -> bool {
     active.permits_candidate(candidate)
         && active.purpose == candidate.purpose
@@ -646,6 +660,7 @@ fn candidate_is_bounded(active: &AgentContract, candidate: &AgentContract) -> bo
         && candidate.termination.max_depth <= active.termination.max_depth
 }
 
+// Artifact 插入前提升 staged BLOB、检查 source rows；同 hash 重放只接受完全相同的 immutable 内容。
 fn insert_artifact(transaction: &Transaction<'_>, artifact: &Artifact) -> StoreResult<()> {
     artifact.validate()?;
     blob::promote_staged_blob(transaction, &artifact.blob)?;

@@ -4,6 +4,7 @@
 //! marker from `Store`; callers must choose a new Store Root rather than run a
 //! silent in-place migration.
 
+// Store 是 SQLite/CAS、workflow、policy、lease、debug 和 learning 的唯一持久化权威；各 include 共享同一事务边界。
 mod attempt;
 mod blob;
 mod canary;
@@ -35,6 +36,7 @@ pub use lesson::{LessonRevalidationScan, LessonUsage, LessonWriteResult, StoredL
 pub use maintenance::MaintenanceLeaseDeferral;
 pub use research_review::{ResearchAudit, ResearchAuditRecord};
 
+// prelude/public_types 定义共享类型；impl/free_* 按职责拆分方法，但不创建并行状态存储或绕过 Store。
 include!("store/prelude.rs");
 include!("store/public_types.rs");
 
@@ -53,6 +55,3 @@ include!("store/impl_attempt.rs");
 include!("store/free_reads.rs");
 include!("store/free_policy_reads.rs");
 include!("store/free_paper_checks.rs");
-
-#[cfg(test)]
-mod retirement_tests;

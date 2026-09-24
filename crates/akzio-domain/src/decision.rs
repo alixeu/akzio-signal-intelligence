@@ -1,3 +1,5 @@
+// 文件导读：定义 Forecast、DecisionDraft/Context、研究分配、资格诊断和证据资格谓词。
+// 这里把模型研究意图与 Rust 执行目标分开，并集中保留 blocker、风险和可审计 trace。
 //! Typed decision inputs and risk findings.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -68,6 +70,7 @@ pub struct DecisionValidity {
 }
 
 impl DecisionValidity {
+    // 校验证据 cutoff、生成/失效顺序，以及有效窗口不超过最大执行延迟。
     pub fn validate(&self) -> Result<(), DomainError> {
         let allowed = i64::try_from(self.maximum_execution_delay_ms).map_err(|_| {
             DomainError::InvalidBudget {
@@ -89,6 +92,7 @@ impl DecisionValidity {
         Ok(())
     }
 
+    // 判断当前时刻同时位于 valid window 内且没有超过毫秒级执行延迟。
     pub fn is_valid_at(&self, now: DateTime<Utc>) -> bool {
         now >= self.generated_at
             && now <= self.valid_until
@@ -120,6 +124,7 @@ pub struct ForecastThesis {
 }
 
 impl ForecastThesis {
+    // 约束持有天数必须匹配 horizon，并要求退出条件和失效条件非空。
     pub fn validate(&self, horizon: DecisionHorizon) -> Result<(), DomainError> {
         if self.expected_holding_period_days != horizon.trading_days()
             || self.exit_condition.trim().is_empty()
@@ -183,6 +188,7 @@ pub struct ProcessQualityAssessment {
 }
 
 impl ProcessQualityAssessment {
+    // 检查所有已提供的 ppm 质量指标都不超过 100%。
     pub fn validate(&self) -> Result<(), DomainError> {
         if [
             self.event_grounding_ppm,
@@ -204,6 +210,7 @@ impl ProcessQualityAssessment {
         Ok(())
     }
 
+    // 只有七个维度都已测量时才返回完整质量指标中的最低值。
     pub fn measured_floor(&self) -> Option<u32> {
         let metrics = [
             self.event_grounding_ppm,
@@ -224,6 +231,7 @@ impl ProcessQualityAssessment {
     /// when the DecisionGate seals a decision. Execution-owned dimensions are
     /// intentionally excluded so process policy cannot create a circular
     /// dependency on a plan that has not been built yet.
+    // 只聚合研究侧四个维度，避免在执行计划尚未产生时引入执行指标循环依赖。
     pub fn research_measured_floor(&self) -> Option<u32> {
         let metrics = [
             self.event_grounding_ppm,
@@ -240,6 +248,7 @@ impl ProcessQualityAssessment {
     /// Finalize the assessment with values produced by the deterministic
     /// execution gate. Missing research measurements remain missing; callers
     /// must not manufacture an execution-final score from a partial trace.
+    // 研究指标齐全后注入执行 Gate 的三个维度，并重新校验后返回 finalized 副本。
     pub fn execution_finalized(
         &self,
         mandate_consistency_ppm: u32,
@@ -277,6 +286,7 @@ pub struct InvestmentLogicTrace {
 }
 
 impl InvestmentLogicTrace {
+    // 校验事件/Claim/Critique 引用 kind、失效条件和质量/共识子结构。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.observed_events.iter().any(|reference| {
             !matches!(
@@ -319,6 +329,7 @@ pub struct MaterialConflict {
 }
 
 impl MaterialConflict {
+    // 冲突必须绑定 Claim 与 Critique，并提供非空主题和理由。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.claim.kind != ArtifactKind::Claim || self.critique.kind != ArtifactKind::Critique {
             return Err(DomainError::EmptyField {
@@ -405,6 +416,7 @@ pub struct AssetEligibility {
 }
 
 impl AssetEligibility {
+    // 要求 reasons 已排序去重；eligible 只能在四项资格布尔值全为 true 时成立。
     pub fn validate(&self) -> Result<(), DomainError> {
         let mut reasons = self.reasons.clone();
         reasons.sort();
@@ -483,6 +495,7 @@ pub struct PortfolioRiskAssessment {
 }
 
 impl PortfolioRiskAssessment {
+    // 检查风险指标上限、可校准资产数、杠杆持有天数和流动性绑定资产去重。
     pub fn validate(&self) -> Result<(), DomainError> {
         if [
             self.ex_ante_volatility_ppm.unwrap_or_default(),
@@ -512,10 +525,12 @@ impl PortfolioRiskAssessment {
 }
 
 impl DecisionContext {
+    // 没有硬 blocker 且没有 material conflict 才是接受状态；不等同于已执行。
     pub fn accepted(&self) -> bool {
         self.hard_blockers.is_empty() && self.material_conflicts.is_empty()
     }
 
+    // 校验所有血缘 kind、学习引用互斥、目标 universe、风险/validity/trace 和非零目标风险证明。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION {
             return Err(DomainError::EmptyField {
@@ -639,6 +654,7 @@ pub enum DecisionHorizon {
 impl DecisionHorizon {
     pub const ALL: [Self; 3] = [Self::T1, Self::T3, Self::T5];
 
+    // 将 T1/T3/T5 转为其对应的交易日数量。
     pub const fn trading_days(self) -> u8 {
         match self {
             Self::T1 => 1,
@@ -659,6 +675,7 @@ pub struct Forecast {
 }
 
 impl Forecast {
+    // 校验正收益概率上限，并在 thesis 存在时复用 horizon 持有期校验。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.positive_return_probability_ppm > 1_000_000 {
             return Err(DomainError::InvalidDecisionForecastProbability);
@@ -669,6 +686,7 @@ impl Forecast {
         Ok(())
     }
 
+    // 中性 forecast 的判定是期望收益为 0 且正收益概率恰为 500000 ppm。
     pub fn is_neutral(&self) -> bool {
         self.expected_return_ppm == 0 && self.positive_return_probability_ppm == 500_000
     }
@@ -676,6 +694,7 @@ impl Forecast {
     /// Bind a directional forecast to a claim about the same direction.
     /// Expected return determines direction; probability breaks only a zero-return
     /// tie, since skewed distributions can have different mean and median signs.
+    // 先用 expected_return 判断方向，零收益时再用概率与 500000 的比较打破平局。
     pub fn supported_by_stance(&self, stance: crate::ClaimStance) -> bool {
         let direction = self
             .expected_return_ppm
@@ -705,6 +724,7 @@ pub struct ResearchAssetAllocation {
 }
 
 impl ResearchAssetAllocation {
+    // 校验资产/权重/理由、horizon 和 evidence 引用排序去重，以及非零/零行的互斥字段。
     pub fn validate(&self) -> Result<(), DomainError> {
         if !Asset::EXECUTABLE.contains(&self.asset)
             || self.target_weight_ppm.0 > WeightPpm::SCALE
@@ -773,6 +793,7 @@ pub struct ResearchAllocationPlan {
 }
 
 impl ResearchAllocationPlan {
+    // 校验四资产恰好一次、每行合法，并确保资产权重加现金严格等于 1_000_000 ppm。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.cash_weight_ppm.0 > WeightPpm::SCALE
             || self.allocations.len() != Asset::EXECUTABLE.len()
@@ -805,6 +826,7 @@ impl ResearchAllocationPlan {
         Ok(())
     }
 
+    // 查询指定资产的研究权重；找不到时返回零而不修改计划。
     pub fn weight(&self, asset: Asset) -> WeightPpm {
         self.allocations
             .iter()
@@ -812,6 +834,7 @@ impl ResearchAllocationPlan {
             .map_or(WeightPpm::ZERO, |allocation| allocation.target_weight_ppm)
     }
 
+    // 只要任一资产研究权重非零就返回 true，现金不计入该判断。
     pub fn has_non_zero_target(&self) -> bool {
         self.allocations
             .iter()
@@ -845,6 +868,7 @@ pub struct ResearchPlanAdjustment {
 }
 
 impl ResearchPlanAdjustment {
+    // 校验前后权重范围，并要求每次 Rust 调整都有至少一个非空原因。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.from_weight_ppm.0 > WeightPpm::SCALE
             || self.to_weight_ppm.0 > WeightPpm::SCALE
@@ -875,6 +899,7 @@ pub struct ResearchPlanReview {
 }
 
 impl ResearchPlanReview {
+    // 分别校验 raw/validated 计划和调整，再检查 status 与 validated 非零状态一致。
     pub fn validate(&self) -> Result<(), DomainError> {
         self.raw.validate()?;
         self.validated.validate()?;
@@ -940,6 +965,7 @@ pub struct DecisionDraft {
 pub type DecisionProposal = DecisionDraft;
 
 impl DecisionDraft {
+    // 校验模型摘要、置信度、引用 kind、学习引用、冲突闭包、forecast 网格和可选研究分配。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.summary.trim().is_empty() {
             return Err(DomainError::EmptyField {
@@ -1006,6 +1032,7 @@ impl DecisionDraft {
                 });
             }
         }
+        // and_then 只有 forecast 网格通过后才继续校验可选 allocation，保持错误顺序稳定。
         validate_forecasts(&self.forecasts).and_then(|_| {
             self.research_allocation
                 .as_ref()
@@ -1022,6 +1049,7 @@ pub fn validate_decision_evidence_sufficiency(
     draft: &DecisionDraft,
     claims: &[ResearchClaim],
 ) -> Result<(), DomainError> {
+    // 先识别方向 forecast 是否被 blocking gap 命中，再要求 price/macro directional ground。
     let has_gaps = claims.iter().any(|claim| {
         claim.evidence_gaps.iter().any(|gap| {
             draft.forecasts.iter().any(|forecast| {
@@ -1046,6 +1074,7 @@ pub fn validate_decision_evidence_sufficiency(
         return Ok(());
     }
 
+    // 闭包按资产/期限收集方向 domain；News 是覆盖信号，不会替代最小 price/macro 条件。
     let covered = |asset: Asset, horizon: DecisionHorizon| {
         let domains = claims
             .iter()
@@ -1101,6 +1130,7 @@ pub struct Decision {
 }
 
 impl Decision {
+    // 校验 DecisionContext 引用、摘要/置信度、完整 forecast/thesis 和研究计划。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION {
             return Err(DomainError::EmptyField {
@@ -1146,6 +1176,7 @@ impl Decision {
 }
 
 fn validate_forecasts(forecasts: &[Forecast]) -> Result<(), DomainError> {
+    // 用 (asset,horizon) 集合拒绝重复，并要求四资产覆盖三个固定 horizon 的完整网格。
     let mut coverage = std::collections::BTreeSet::new();
     for forecast in forecasts {
         forecast.validate()?;
@@ -1183,6 +1214,7 @@ pub fn validate_legacy_verified_forecast_slots(
     claims: &[(ArtifactRef, ResearchClaim)],
     critiques: &[crate::ResearchCritique],
 ) -> Result<(), DomainError> {
+    // 对每个非中性 slot 收集同 horizon、同 stance 且 Critique 支持的 Claim，再复用旧证据门槛。
     for forecast in draft.forecasts.iter().filter(|f| !f.is_neutral()) {
         let verified = claims
             .iter()
@@ -1223,6 +1255,8 @@ pub fn claim_slot_eligible(
     asset: Asset,
     horizon: DecisionHorizon,
 ) -> bool {
+    // 这是 Context、DecisionGate 共享的权威资格谓词：Claim 自身 ground、Critique 当前验证
+    // 和 price/macro 同资产 scope 必须同时满足，Critic 不能补写缺失 Claim ground。
     if claim.horizon != horizon
         || claim.validate().is_err()
         || claim.stance == crate::ClaimStance::Neutral
@@ -1265,6 +1299,7 @@ pub fn validate_verified_forecast_slots(
     claims: &[(ArtifactRef, ResearchClaim)],
     critiques: &[crate::ResearchCritique],
 ) -> Result<(), DomainError> {
+    // 每个非中性 forecast 都必须找到 draft 已引用、stance 匹配且 claim_slot_eligible 的 Claim。
     for forecast in draft.forecasts.iter().filter(|f| !f.is_neutral()) {
         if !claims.iter().any(|(reference, claim)| {
             draft.claims.contains(reference)
@@ -1288,6 +1323,7 @@ pub fn validate_structured_allocation_eligibility(
     claims: &[(ArtifactRef, ResearchClaim)],
     critiques: &[crate::ResearchCritique],
 ) -> Result<(), DomainError> {
+    // 仅检查非零研究 allocation；它必须引用正收益 forecast、Bullish Claim 和对应证据。
     for allocation in proposal
         .research_allocation
         .iter()
@@ -1326,6 +1362,7 @@ pub fn research_coverage_is_complete(
     claims: &[(ArtifactRef, ResearchClaim)],
     critiques: &[crate::ResearchCritique],
 ) -> bool {
+    // 逐四资产×三 horizon 检查无 blocking gap、Supported Critique 和 price/macro/news 三域。
     use crate::ClaimVerificationStatus;
     Asset::EXECUTABLE.into_iter().all(|asset| {
         DecisionHorizon::ALL.into_iter().all(|horizon| {
@@ -1368,6 +1405,7 @@ mod research_allocation_tests {
     use crate::ArtifactId;
 
     fn evidence_ref() -> ArtifactRef {
+        // 生成稳定的 NormalizedEvidence 引用，供最小 allocation fixture 使用。
         ArtifactRef {
             artifact_id: ArtifactId(ContentHash::of_bytes(b"research-allocation-evidence")),
             kind: ArtifactKind::NormalizedEvidence,
@@ -1375,6 +1413,7 @@ mod research_allocation_tests {
     }
 
     fn zero(asset: Asset) -> ResearchAssetAllocation {
+        // 构造带显式 abstention_reason 的零权重资产行。
         ResearchAssetAllocation {
             asset,
             target_weight_ppm: WeightPpm::ZERO,
@@ -1386,6 +1425,7 @@ mod research_allocation_tests {
     }
 
     #[test]
+    // 研究分配必须显式给出现金，且每个零权重资产都要说明 abstention。
     fn research_allocation_requires_explicit_cash_and_zero_reason() {
         let plan = ResearchAllocationPlan {
             cash_weight_ppm: WeightPpm(900_000),
@@ -1426,6 +1466,7 @@ mod scoped_blocker_tests {
     use std::collections::BTreeSet;
 
     fn evidence_ref(label: &str) -> ArtifactRef {
+        // 以 label 派生确定性 evidence 引用，便于测试跨资产错引。
         ArtifactRef {
             artifact_id: ArtifactId(ContentHash::of_bytes(label.as_bytes())),
             kind: ArtifactKind::NormalizedEvidence,
@@ -1433,6 +1474,7 @@ mod scoped_blocker_tests {
     }
 
     fn directional_ground(label: &str, asset: Asset, domain: ResearchShard) -> EvidenceGround {
+        // 构造指定资产/研究域的方向性 ground。
         EvidenceGround {
             evidence: evidence_ref(label),
             support: format!("authoritative support for {asset:?} {domain:?}"),
@@ -1443,6 +1485,7 @@ mod scoped_blocker_tests {
     }
 
     fn scoped_fixture() -> (DecisionDraft, ResearchClaim, ResearchCritique) {
+        // 建立一个 T1 双资产 fixture，其中 TQQQ 的方向缺口被明确限定，QQQ 保持可验证。
         let claim_ref = ArtifactRef {
             artifact_id: ArtifactId(ContentHash::of_bytes(b"claim")),
             kind: ArtifactKind::Claim,
@@ -1539,6 +1582,7 @@ mod scoped_blocker_tests {
     }
 
     #[test]
+    // 非零 allocation 必须引用同资产的合格 Claim，不能用其他资产 ground 代替。
     fn nonzero_allocation_must_cite_its_eligible_asset_claim() {
         let (mut draft, claim, critique) = scoped_fixture();
         draft.research_allocation = Some(ResearchAllocationPlan {
@@ -1590,6 +1634,7 @@ mod scoped_blocker_tests {
     }
 
     #[test]
+    // 无关 Claim 的未解决 gap 不应污染另一个已完整验证的 slot。
     fn unrelated_claim_gap_cannot_poison_a_verified_slot() {
         let (draft, claim, critique) = scoped_fixture();
         let mut unrelated = claim.clone();
@@ -1610,6 +1655,7 @@ mod scoped_blocker_tests {
     }
 
     #[test]
+    // 新闻缺失作为 warning 时，仍保留已验证的价格/宏观方向资格。
     fn unavailable_news_warning_preserves_verified_price_and_macro_direction() {
         let (draft, mut claim, mut critique) = scoped_fixture();
         claim
@@ -1635,6 +1681,7 @@ mod scoped_blocker_tests {
     }
 
     #[test]
+    // 资格只接受同资产/期限、正式 ground 和当前 Critique 验证，不接受跨 Claim 拼接。
     fn eligibility_uses_formal_grounds_and_matching_verified_scope_only() {
         let (draft, mut claim, mut critique) = scoped_fixture();
         let reference = &draft.claims[0];
@@ -1696,6 +1743,7 @@ mod scoped_blocker_tests {
     }
 
     #[test]
+    // 长度为 12 仍不能掩盖重复 asset/horizon，完整笛卡尔网格才合法。
     fn forecast_grid_rejects_duplicates_even_when_length_is_twelve() {
         let (draft, _, _) = scoped_fixture();
         let forecasts = Asset::EXECUTABLE
@@ -1723,6 +1771,7 @@ mod scoped_blocker_tests {
     }
 
     #[test]
+    // 一个 forecast 的 price 与 macro ground 必须来自同一个 Claim，不能跨 Claim 合并。
     fn forecast_must_not_join_price_and_macro_from_different_claims() {
         let (draft, mut price, mut critique) = scoped_fixture();
         price.evidence_gaps.clear();
@@ -1755,6 +1804,7 @@ mod scoped_blocker_tests {
     }
 
     #[test]
+    // 只限定 TQQQ 的 Critique blocker 不应阻断 QQQ slot；无 scope blocker 才是全局阻断。
     fn scoped_critique_blocker_does_not_block_another_asset_slot() {
         let (draft, claim, critique) = scoped_fixture();
         assert!(critique.blocks_slot(Asset::Tqqq, DecisionHorizon::T1, DecisionHorizon::T1));
@@ -1776,6 +1826,7 @@ mod scoped_blocker_tests {
     }
 
     #[test]
+    // Claim stance 必须与正/负 forecast 方向一致，中性 Claim 不能提供方向支持。
     fn verified_forecast_rejects_opposite_or_neutral_claim_stance() {
         let (draft, mut claim, critique) = scoped_fixture();
         for stance in [ClaimStance::Bearish, ClaimStance::Neutral] {

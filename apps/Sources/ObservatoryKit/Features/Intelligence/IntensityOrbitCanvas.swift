@@ -4,14 +4,17 @@ import SwiftUI
 //
 // Intensity is expressed as orbit layers + core brightness + particle count.
 struct IntensityOrbitCanvas: View {
+    // intensity 是已解析的展示模型；画布只把它转换成亮度、轨道层数和粒子数量。
     @Environment(\.appLanguage) private var language
     let intensity: ReasoningIntensity
 
+    // motionPolicy 与 canvasRenderPolicy 由 Environment 注入，分别控制过渡动画和环境粒子是否运行。
     @Environment(\.motionPolicy) private var policy
     @Environment(\.canvasRenderPolicy) private var canvas
 
     var body: some View {
         VStack(spacing: AkzioLayout.s2) {
+            // AmbientCanvas 的 time 闭包提供动画时钟；内部异步 Canvas 只绘制装饰，不承载可访问文本。
             AmbientCanvas { time in
                 Canvas(rendersAsynchronously: true) { context, size in
                     draw(&context, size: size, time: time)
@@ -32,6 +35,7 @@ struct IntensityOrbitCanvas: View {
     }
 
     private func draw(_ context: inout GraphicsContext, size: CGSize, time: Double) {
+        // draw 接收 Canvas 的 inout context 和当前尺寸，把同一 intensity 投影为中心核心及椭圆轨道。
         let center = CGPoint(x: size.width / 2, y: size.height / 2)
         let span = min(size.width, size.height)
         let core = 8 + 5 * intensity.coreBrightness
@@ -59,6 +63,7 @@ struct IntensityOrbitCanvas: View {
         )
 
         for layer in 0..<intensity.orbitCount {
+            // 每层按相对进度计算 rx/ry；最后一层可按模型要求使用 coral accent，其余保持 gold。
             let progress = Double(layer + 1) / Double(intensity.orbitCount + 1)
             let rx = span * 0.16 + span * 0.30 * progress
             let ry = rx * 0.62
@@ -82,6 +87,7 @@ struct IntensityOrbitCanvas: View {
         time: Double,
         coral: Bool
     ) {
+        // canvas.scaled 负责按渲染策略缩放粒子预算；关闭 ambient 时 drift 为零，仍保留静态投影。
         let perLayer = canvas.scaled(2 + layer)
         guard perLayer > 0 else { return }
         for index in 0..<perLayer {

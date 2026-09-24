@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# 文件职责：以 ad-hoc 身份依次签名 Rust Core、Swift App 和外层 bundle，再执行 deep verify。
+# 这是本地自用检查，不提供 Developer ID、notarization 或生产发布证明。
 # Ad-hoc sign the assembled bundle. Self-use only: no Developer ID, no notarization.
 set -euo pipefail
 

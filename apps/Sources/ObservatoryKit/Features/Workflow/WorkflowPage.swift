@@ -5,6 +5,8 @@ import SwiftUI
 // Progress strip, the DAG itself, and the Stage Inspector on the right. The canvas
 // owns zoom/pan state; the toolbar only mutates that transform.
 struct WorkflowPage: View {
+    // store 是页面唯一的 Rust/Core projection 入口；本页的 State 只保存画布视图偏好，
+    // 不复制 workflow 的 durable 状态。
     let store: ObservatoryStore
 
     @Environment(\.sharedNamespace) private var namespace
@@ -17,9 +19,13 @@ struct WorkflowPage: View {
     @State private var highlightsCriticalPath = true
     @State private var collapsesOptional = false
 
+    // computed property 每次读取最新 displayWorkflow；它不是本地缓存，也不绕过 Store 读取
+    // 原始事件或 SQLite。
     private var workflow: WorkflowPresentation { store.displayWorkflow }
 
     var body: some View {
+        // Debug 模式展示隔离 Core 的专用检查面板；普通模式才展示进度、DAG、Stage Inspector
+        // 和仅影响画布的 toolbar。两条分支都只消费 Store projection。
         PageScaffold(route: .workflow) {
             if store.debugEnabled {
                 ScrollView {
@@ -78,6 +84,8 @@ struct WorkflowPage: View {
     }
 
     private var graph: some View {
+        // graph 把 WorkflowPresentation 的节点/边交给 Canvas，把 selection closure 交回
+        // Store；标题和 legend 仍是展示投影，不会改变 Rust workflow。
         SectionCard(
             title: "Pipeline",
             subtitle: workflow.activeStageID.flatMap { workflow.node(id: $0)?.stage.displayName }
@@ -118,6 +126,8 @@ struct WorkflowPage: View {
     /// "Collapse Optional" is a view control: it hides the Critic branch without
     /// pretending the stage does not exist in the plan.
     private var visibleWorkflow: WorkflowPresentation {
+        // 过滤 optional 节点后同步过滤两端都不存在的边，并重新验证 activeStageID；inspector
+        // 内容与交易日统计保持原 projection，隐藏是视图变换而不是 DAG 删除。
         guard collapsesOptional else { return workflow }
         let nodes = workflow.nodes.filter { !$0.stage.isOptional }
         let ids = Set(nodes.map(\.id))
@@ -139,6 +149,8 @@ struct WorkflowPage: View {
 /// Faint 24pt grid, off by default. Drawn once; it never animates.
 private struct GridBackdrop: View {
     var body: some View {
+        // Canvas 只画固定 24pt 低对比网格并关闭 hit testing；它不参与 DAG layout，也没有
+        // 任何状态或 Core 请求。
         Canvas { context, size in
             var path = Path()
             for x in stride(from: 0, through: size.width, by: 24) {

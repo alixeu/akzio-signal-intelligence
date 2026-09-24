@@ -1,5 +1,8 @@
 use super::*;
 
+// Reducer 把 journal 事件折叠成可验证的 Run/Task 状态；它不执行副作用，也不相信
+// revision row 单独提供的结果。每个事件都要匹配 Run、Task、Attempt、Artifact origin
+// 和前置状态，因而“日志里出现 accepted/started”不会被升级成业务完成。
 impl WorkflowRuntime {
     pub(super) fn reduce_event(
         &self,
@@ -7,6 +10,8 @@ impl WorkflowRuntime {
         replay: &mut ReplayedWorkflow,
         event: &StoredEvent,
     ) -> RuntimeResult<()> {
+        // 先校验事件归属和生命周期，再按事件类别更新 replay；未处理的带/不带 Artifact
+        // 事件都显式失败，避免新事件被静默忽略而破坏恢复一致性。
         if event.run_id != *run_id {
             return Err(Self::replay_error(
                 run_id,
@@ -208,6 +213,8 @@ impl WorkflowRuntime {
         event: &StoredEvent,
         event_type: LifecycleEventType,
     ) -> RuntimeResult<()> {
+        // DebugControl/Budget 是控制或观察记录；StageAcceptance 还服务 SubmitRejected
+        // 的恢复反馈。它们不授予模型权限，也不替代 AgentTurn/Task terminal 状态。
         use akzio_domain::{DebugSession, DebugSessionIdentity, StageAcceptance};
 
         let invalid =
@@ -343,6 +350,8 @@ impl WorkflowRuntime {
     /// are run-level and touch no replayed task state. Replay still checks the
     /// lineage so the event cannot smuggle in a foreign artifact.
     fn reduce_session_setup_event(&self, run_id: &RunId, event: &StoredEvent) -> RuntimeResult<()> {
+        // Scheduler 在 Task 出现前冻结 EvidenceNeed/WorkflowProposal；Replay 只核对
+        // RunScoped Artifact lineage，不把 setup event 误当作 Evidence 已采集。
         if event.task_id.is_some() || event.attempt_id.is_some() {
             return Err(Self::replay_error(
                 run_id,
@@ -381,6 +390,8 @@ impl WorkflowRuntime {
         replay: &mut ReplayedWorkflow,
         event: &StoredEvent,
     ) -> RuntimeResult<()> {
+        // Paper effect 只允许由当前 active Attempt 引用 canonical Commitment/Cancel/Reprice；
+        // 事件存在表示意图/恢复/结算记录，不自动表示 Alpaca 已接受或成交。
         let task = Self::replay_task_mut(run_id, replay, event)?;
         Self::assert_active_attempt(run_id, task, event)?;
         let artifact_id = event.artifact_id.as_ref().ok_or_else(|| {
@@ -420,6 +431,8 @@ impl WorkflowRuntime {
         replay: &ReplayedWorkflow,
         event: &StoredEvent,
     ) -> RuntimeResult<()> {
+        // 普通 Artifact event 可以扩展事件名，但权威仍来自 Artifact origin 与当前
+        // Task permit，而不是 event type 白名单；这保留新研究/Outcome trace 的可审计性。
         if event.event_type.trim().is_empty() {
             return Err(Self::replay_error(
                 run_id,

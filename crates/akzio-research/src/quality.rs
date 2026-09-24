@@ -1,5 +1,9 @@
 //! Fixed, synthetic research-quality experiment. Uses the production context,
 //! role prompts, schema, validator and SQL/CAS authority; never a broker.
+
+// 质量实验复用正式 Agent/Context/Contract 校验，但所有市场材料、日历和模型结果都
+// 是隔离 Store 内的 synthetic 数据。它能回答“协议是否拒绝已知坏样例”，不能证明
+// Policy 校准、Paper 下单、成交、T+1/T+3/T+5 Outcome 或业务收益已经发生。
 use crate::{
     ActiveResearchCatalogue, AgentModel, AgentModelRequest, AgentModelTurn, AgentRuntime,
     ModelClientAdapter, ResearchError, Result,
@@ -22,6 +26,8 @@ fn persist(
     payload: &Value,
     refs: Vec<ArtifactRef>,
 ) -> Result<Artifact> {
+    // 质量记录也走 Artifact + task permit；因此测试输出具有可重放血缘，但不会越过
+    // 隔离 Debug 的 broker_write_policy=forbidden 边界。
     let now = Utc::now();
     let family = if kind == ArtifactKind::NormalizedEvidence {
         "alpaca"
@@ -64,6 +70,8 @@ fn reference(artifact: &Artifact) -> ArtifactRef {
 }
 
 fn attempt(store: &Store, role: &str, objective: &str) -> Result<(AgentRuntime, ClaimedAttempt)> {
+    // 每个 case 固定自己的 Run、Task、预算和 Debug identity。修改本地配置不会
+    // 改写已提交 graph；恢复时仍以 Store 中的 Attempt 消耗为准。
     let now = Utc::now();
     let catalogue = ActiveResearchCatalogue::install(store, now)?.contracts;
     let contract = &catalogue
@@ -230,6 +238,8 @@ impl AgentModel for CountedModel<'_> {
     }
     fn turn<'a>(&'a self, request: AgentModelRequest) -> BoxFuture<'a, Result<AgentModelTurn>> {
         Box::pin(async move {
+            // real 模式先预留调用序号再进入模型；中断或失败的调用也保持已消耗，
+            // 以免质量报告通过重试把有限的外部调用预算“退款”。
             if self.real {
                 let ordinal = self.store.reserve_research_quality_call(
                     self.permit,
@@ -321,6 +331,8 @@ pub async fn verify(
     client: Option<ModelClient>,
     synth_client: Option<ModelClient>,
 ) -> Result<Value> {
+    // report 只读既有 CAS；baseline/candidate/offline 才创建隔离实验并逐 case 推进。
+    // 这里的 passed 仅是质量协议指标，不是正式研究、Decision 或 Paper 的终态。
     let cwd = std::env::current_dir().map_err(|e| ResearchError::Model(e.to_string()))?;
     let root = if root.is_absolute() {
         root.to_owned()
@@ -416,6 +428,8 @@ pub async fn verify(
         .collect::<std::collections::BTreeSet<_>>();
     let mut results = Vec::new();
     for run_index in 0..(if real { 14 } else { CASE_COUNT }) {
+        // 重启时优先复用已持久化结果；只有“已开始但没有 terminal result”的 case
+        // 被视为未知，不会另起 Task 伪造一次干净的预算轨迹。
         let index = if run_index >= CASE_COUNT {
             [0, 4][run_index - CASE_COUNT]
         } else {
@@ -595,6 +609,8 @@ async fn run_repair(
     synth_model: Option<&ModelClientAdapter>,
     reviewer: &ModelClientAdapter,
 ) -> Result<()> {
+    // 修订链固定为 Synthesizer -> ProposalReviewer，最多由预先编译的节点推进；
+    // 修订通过仍只说明 Review 结果可生成，不代表 SQL active Policy 已激活。
     let identity = ContentHash::of_bytes(b"research-quality-synthetic-v1");
     for role in [
         RESEARCH_SYNTHESIZER_RECIPE_ID,
@@ -736,6 +752,8 @@ async fn run_repair(
 }
 
 fn report(store: &Store) -> Result<Value> {
+    // 报告从 CAS 结果和同一 Run 的 AgentTurn 事件重建观测，不从 stderr 或内存状态
+    // 推断完成。missing_observation 明确保留“调用开始但没有终态”的边界。
     let mut results = Vec::new();
     for artifact in store.research_quality_records("research.quality.result")? {
         let mut result: Value = serde_json::from_slice(&store.read_blob(&artifact.blob)?)?;

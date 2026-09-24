@@ -1,3 +1,5 @@
+// 文件导读：定义账户、报价、时钟和因子暴露快照，以及把决策 cutoff 与完成日线
+// 进行比较的纯时间边界；快照只描述已观测事实，不访问 Broker。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Position {
     pub quantity_micros: i64,
@@ -20,6 +22,7 @@ pub struct AccountSnapshot {
 }
 
 impl AccountSnapshot {
+    // 校验账户身份、金额符号、持仓数量/价值和外部持仓/订单字符串。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION || self.broker_session.trim().is_empty() {
             return Err(DomainError::EmptyField {
@@ -60,6 +63,7 @@ pub struct Quote {
 }
 
 impl Quote {
+    // 要求 bid 为正且 ask 严格高于 bid，避免零价或倒置价差进入 Gate。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.bid.0 <= 0 || self.ask.0 <= self.bid.0 {
             return Err(DomainError::InvalidBudget {
@@ -81,6 +85,7 @@ pub struct QuoteSnapshot {
 }
 
 impl QuoteSnapshot {
+    // 校验快照身份，并逐项复用 Quote 的价格约束。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION || self.broker_session.trim().is_empty() {
             return Err(DomainError::EmptyField {
@@ -102,6 +107,7 @@ pub struct MarketClockSnapshot {
 }
 
 impl MarketClockSnapshot {
+    // 优先使用 provider 细分 session；旧 payload 没有 session 时由 is_open 映射 Regular/Closed。
     pub fn trading_session(&self) -> TradingSession {
         self.session.as_ref().map_or(
             if self.is_open {
@@ -113,10 +119,12 @@ impl MarketClockSnapshot {
         )
     }
 
+    // Closed 之外的细分 session 都表示存在可交易时段。
     pub fn tradable(&self) -> bool {
         self.trading_session() != TradingSession::Closed
     }
 
+    // 校验 schema 和 broker session 文本，不在此处重新推断时钟状态。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION || self.broker_session.trim().is_empty() {
             return Err(DomainError::EmptyField {
@@ -133,14 +141,17 @@ pub struct DecisionClock {
 }
 
 impl DecisionClock {
+    // 判断带时间戳的事实是否不晚于决策 cutoff。
     pub fn contains(&self, timestamp: DateTime<Utc>) -> bool {
         timestamp <= self.decision_cutoff
     }
 
+    // 日期粒度 vintage 只需不晚于 cutoff 的自然日。
     pub fn contains_vintage(&self, vintage: chrono::NaiveDate) -> bool {
         vintage <= self.decision_cutoff.date_naive()
     }
 
+    // fixture 保守规则：只有严格早于 cutoff 日期的日线事件才算已完成。
     pub fn contains_completed_daily_bar(&self, event_time: DateTime<Utc>) -> bool {
         // Fixture-only conservative fallback. Production daily bars require
         // provider calendar close plus the acquisition availability delay.
@@ -163,6 +174,7 @@ impl FactorExposure {
     // dependence remain separate stress-test concerns.
     const DAILY_LEVERAGE_MULTIPLIER: u32 = 3;
 
+    // 将资产资本权重转换为同日经济因子暴露；TQQQ/SOXL 按 3x 计算并用 checked_add 防溢出。
     pub fn from_target(target: &TargetPortfolio) -> Result<Self, DomainError> {
         target.validate_universe()?;
         let weight = |asset| target.weights[&asset].0;
@@ -198,6 +210,7 @@ impl FactorExposure {
     pub(crate) fn from_legacy_capital_target(
         target: &TargetPortfolio,
     ) -> Result<Self, DomainError> {
+        // 仅用于解码旧计划：按资本权重聚合，不把杠杆资产转换为 3x 经济暴露。
         target.validate_universe()?;
         let weight = |asset| target.weights[&asset].0;
         let add = |left: u32, right: u32| {
@@ -216,6 +229,7 @@ impl FactorExposure {
         })
     }
 
+    // 检查五个因子暴露不超过两倍三倍杠杆的允许上界。
     pub fn validate(&self) -> Result<(), DomainError> {
         if [
             self.leveraged_equity_ppm,

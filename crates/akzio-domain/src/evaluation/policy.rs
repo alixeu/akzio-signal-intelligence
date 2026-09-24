@@ -1,3 +1,5 @@
+// 文件导读：定义 Memory/Contract/Topology 的 PolicySubject、状态转换、Experience、
+// Evaluation 和 PolicyTransition，保持学习生命周期与业务 Artifact kind 一致。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryLifecycle {
@@ -28,6 +30,7 @@ pub enum PolicySubject {
 }
 
 impl PolicySubject {
+    // 校验三类 policy subject 包装的 ID 非空。
     pub fn validate(&self) -> Result<(), DomainError> {
         let empty = match self {
             Self::Memory(memory_id) => memory_id.0.trim().is_empty(),
@@ -42,6 +45,7 @@ impl PolicySubject {
         Ok(())
     }
 
+    // 以 kind:id 形式生成持久化/查询用的稳定 subject ID。
     pub fn subject_id(&self) -> String {
         match self {
             Self::Memory(memory_id) => format!("memory:{}", memory_id.0),
@@ -50,6 +54,7 @@ impl PolicySubject {
         }
     }
 
+    // 解析 kind:id，并对 Contract hash、其他字符串 ID 复用 subject 校验。
     pub fn from_subject_id(value: &str) -> Result<Self, DomainError> {
         let (kind, id) = value.split_once(':').ok_or(DomainError::EmptyField {
             field: "policy_subject.id",
@@ -68,6 +73,7 @@ impl PolicySubject {
         Ok(subject)
     }
 
+    // 按 subject 类型返回对应的 Candidate 初始状态。
     pub const fn initial_state(&self) -> PolicyState {
         match self {
             Self::Memory(_) => PolicyState::Memory(MemoryLifecycle::Candidate),
@@ -76,6 +82,7 @@ impl PolicySubject {
         }
     }
 
+    // 只接受与 subject 类型相同的 PolicyState，拒绝跨 namespace 转换。
     pub const fn accepts_state(&self, state: PolicyState) -> bool {
         matches!(
             (self, state),
@@ -96,6 +103,7 @@ pub enum PolicyState {
 
 impl PolicyState {
     /// Revocation does not require evidence sufficient to grant new influence.
+    // Contested/Retired 或 Candidate 是收紧权限的方向，不要求授予新影响的证据。
     pub const fn is_restriction_to(self, to: Self) -> bool {
         matches!(
             (self, to),
@@ -111,6 +119,7 @@ impl PolicyState {
             )
         )
     }
+    // 只有 Active/Proven Memory 可影响 Experience，Active Contract/Topology 可影响 CandidatePolicy。
     pub const fn permits_influence_kind(self, kind: ArtifactKind) -> bool {
         matches!(
             (self, kind),
@@ -139,6 +148,7 @@ pub struct CandidatePolicy {
 }
 
 impl CandidatePolicy {
+    // 校验 candidate/baseline 不同、来源 Evaluation 存在，并按 subject kind 检查引用类型。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION {
             return Err(DomainError::EmptyField {
@@ -204,6 +214,7 @@ pub struct Experience {
 }
 
 impl Experience {
+    // 校验 Experience 身份、subject/state 绑定、评估上下文资格和五类核心引用。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION
             || self.experience_id.0.trim().is_empty()
@@ -283,6 +294,7 @@ pub struct Evaluation {
 }
 
 impl Evaluation {
+    // 校验 Evaluation 身份以及 Outcome/Experience 两条来源引用。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION || self.evaluation_id.0.trim().is_empty() {
             return Err(DomainError::EmptyField {
@@ -312,6 +324,7 @@ pub struct PolicyTransition {
 }
 
 impl PolicyTransition {
+    // 校验状态确实发生变化、评估引用有效且 from/to 均属于 subject namespace。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION
             || self.transition_id.0.trim().is_empty()

@@ -1,3 +1,5 @@
+// 文件导读：定义 Agent 任务的输入/输出、工具次数和墙钟预算，以及历史 Contract
+// 默认值、新 Run 默认值和配置覆盖的分层解析规则。
 //! Agent resource governance, independent of provider context-window capacity.
 use crate::{DomainError, TaskBudget};
 use serde::{Deserialize, Serialize};
@@ -30,6 +32,7 @@ pub struct BudgetOverride {
 }
 
 impl BudgetOverride {
+    // 拒绝显式 0 和超过应用输出上限的值；工具数为 0 仍代表合法的无读工具策略。
     fn validate(&self) -> Result<(), DomainError> {
         for (field, value) in [
             ("agent.budget.max_input_tokens", self.max_input_tokens),
@@ -51,6 +54,7 @@ impl BudgetOverride {
         // Zero read tools is a valid governance policy; submit_result is separate.
         Ok(())
     }
+    // 只覆盖配置中显式提供的字段，未提供字段保留传入 TaskBudget。
     fn apply(&self, budget: &mut TaskBudget) {
         if let Some(v) = self.max_input_tokens {
             budget.max_input_tokens = v;
@@ -80,6 +84,7 @@ pub const MAX_AGENT_OUTPUT_TOKENS: u32 = 1_000_000;
 pub const OUTPUT_BUDGET_RESEARCH_CONTRACT_VERSION: u32 = 49;
 
 /// Immutable legacy Contract defaults; preserve existing hashes and ContextPolicy.
+// 按旧 purpose 返回冻结的历史预算；未注册 purpose 返回 None。
 pub fn legacy_contract_budget(purpose: &str) -> Option<TaskBudget> {
     let (input, output, tools, timeout) = match purpose {
         "research.planner" => (12_000, 2_000, 4, 120),
@@ -99,6 +104,7 @@ pub fn legacy_contract_budget(purpose: &str) -> Option<TaskBudget> {
 
 /// Contract 49 changes only the research output dimension. Historical Contract
 /// objects keep their original serialized budgets; ContextPolicy is separate.
+// 将 ProposalReviewer 归并到 Critic 角色，并只把研究输出改为新的应用上限。
 pub fn versioned_contract_budget(purpose: &str) -> Option<TaskBudget> {
     let purpose = if purpose == "research.proposal_reviewer" {
         "research.critic"
@@ -120,6 +126,7 @@ pub fn versioned_contract_budget(purpose: &str) -> Option<TaskBudget> {
 }
 
 /// Defaults for newly created Runs, independent of immutable Contract defaults.
+// 按角色返回新 Run 的预算，并把研究任务墙钟提升到有界的 180 秒。
 pub fn default_agent_budget(purpose: &str) -> Option<TaskBudget> {
     let mut budget = versioned_contract_budget(purpose)?;
     budget.max_input_tokens = 1_000_000;
@@ -137,6 +144,7 @@ pub fn default_agent_budget(purpose: &str) -> Option<TaskBudget> {
 }
 
 impl AgentBudgetConfig {
+    // 逐项验证全局和各角色覆盖，不修改配置本身。
     pub fn validate(&self) -> Result<(), DomainError> {
         for value in [
             &self.default,
@@ -149,6 +157,7 @@ impl AgentBudgetConfig {
         }
         Ok(())
     }
+    // 将 purpose 映射到角色覆盖，先应用全局覆盖，再应用角色覆盖。
     pub fn resolve(&self, purpose: &str) -> Option<TaskBudget> {
         let role = match purpose {
             "research.analyst" => &self.analyst,
@@ -166,6 +175,7 @@ impl AgentBudgetConfig {
         role.apply(&mut budget);
         Some(budget)
     }
+    // 为注册的四类 Agent 和额外 ProposalReviewer 生成完整的确定性预算表。
     pub fn resolved(&self) -> BTreeMap<String, TaskBudget> {
         AGENT_ROLES
             .into_iter()
@@ -188,15 +198,18 @@ pub enum ToolCallLimit {
 }
 
 impl ToolCallLimit {
+    // 有限上限返回数值；Unlimited 不暴露人为伪造的有限值。
     pub fn finite(self) -> Option<u16> {
         match self {
             Self::Limited(value) => Some(value),
             Self::Unlimited => None,
         }
     }
+    // used 不超过有限上限时允许继续；无限上限总是允许。
     pub fn allows(self, used: u64) -> bool {
         self.finite().is_none_or(|limit| used <= u64::from(limit))
     }
+    // 计算剩余次数；无限上限返回 None 表示没有可枚举的剩余额度。
     pub fn remaining(self, used: u64) -> Option<u64> {
         self.finite()
             .map(|limit| u64::from(limit).saturating_sub(used))
@@ -204,6 +217,7 @@ impl ToolCallLimit {
 }
 
 impl Serialize for ToolCallLimit {
+    // 保持旧 wire 格式：有限值是整数，无限值是字符串 unlimited。
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
             Self::Limited(value) => serializer.serialize_u16(*value),
@@ -213,6 +227,7 @@ impl Serialize for ToolCallLimit {
 }
 
 impl<'de> Deserialize<'de> for ToolCallLimit {
+    // 通过无标签枚举同时接受历史整数和明确的 unlimited 字符串，拒绝其他文本。
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
         #[serde(untagged)]
@@ -235,6 +250,7 @@ mod tests {
     use super::*;
 
     #[test]
+    // 新研究预算提升输出和墙钟，但 Outcome 仍保留独立的 4k 输出和原超时。
     fn research_output_defaults_allow_a_million_with_role_appropriate_timeouts() {
         for (_, purpose) in AGENT_ROLES {
             let legacy = legacy_contract_budget(purpose).unwrap();
@@ -264,6 +280,7 @@ mod tests {
     }
 
     #[test]
+    // 覆盖值允许达到上限，0 或超过上限必须失败。
     fn output_override_rejects_more_than_the_application_ceiling() {
         for limit in [1, 1_000_000] {
             let mut settings = AgentBudgetConfig::default();
@@ -278,6 +295,7 @@ mod tests {
     }
 
     #[test]
+    // Contract 版本升级只改变研究输出预算，其他历史维度保持不变。
     fn versioned_contract_changes_only_research_output() {
         for (_, purpose) in AGENT_ROLES {
             let mut expected = legacy_contract_budget(purpose).unwrap();
@@ -289,6 +307,7 @@ mod tests {
     }
 
     #[test]
+    // ProposalReviewer 与 Critic 共享角色预算覆盖，但都不回写旧 Contract 默认值。
     fn new_critic_budget_is_distinct_from_legacy_contract_budget() {
         assert_eq!(
             legacy_contract_budget("research.critic")
@@ -319,6 +338,7 @@ mod tests {
     }
 
     #[test]
+    // TaskBudget 的 JSON 整数/字符串编码保持与历史序列化完全兼容。
     fn legacy_budget_wire_format_is_unchanged() {
         let raw = r#"{"max_input_tokens":48000,"max_output_tokens":6000,"max_wall_time_secs":120,"max_tool_calls":4}"#;
         let budget: TaskBudget = serde_json::from_str(raw).unwrap();

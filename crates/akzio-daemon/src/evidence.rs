@@ -1,5 +1,13 @@
 //! Governed evidence acquisition and snapshot materialization.
 
+// 文件导读：本文件实现 EvidenceNeed → adapter → Raw/NormalizedEvidence → 执行快照的受控
+// 数据流。研究阶段只采集研究证据，并把 ExecutionSafety 标为 deferred；ExecutionGate
+// 再独立刷新账户/报价/时钟。provider 可用、HTTP 成功或 artifact 已写入都不等于 Claim、
+// Decision、Paper submission、fill 或 Outcome 完成，时间 cutoff/provenance 不匹配必须 fail closed。
+// Rust 机制：`join_all` 并发 Future 仍由 Permit/Store 约束；借用的 trait object adapter
+// 通过 `Arc` 共享；`BTreeMap/BTreeSet` 保证资源闭包稳定；`Option` 明确区分缺失快照、
+// quote error 和成功值，`Result` 保留内部身份错误而不降级成普通 coverage gap。
+
 use super::*;
 
 #[derive(Debug)]

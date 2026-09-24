@@ -5,6 +5,7 @@ import SwiftUI
 // The sidebar reads as a workspace navigation surface: context first,
 // then the routes used to inspect the live Core.
 struct PageSidebar: View {
+    // View 是轻量值类型；业务路由由 route 输入，所有副作用通过闭包交回 ObservatoryStore。
     let route: AppRoute
     let theme: SettingsPresentation.Theme
     let onSelect: (AppRoute) -> Void
@@ -15,6 +16,7 @@ struct PageSidebar: View {
     @Namespace private var highlight
 
     var body: some View {
+        // sidebar 每次重算都从同一组输入绘制，matchedGeometryEffect 只负责视觉身份，不保存导航状态。
         // 主路由按固定顺序展示；Settings 是附加入口，不参与主路由数组。
         VStack(alignment: .leading, spacing: AkzioLayout.s2) {
             windowToolbar

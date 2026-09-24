@@ -1,3 +1,5 @@
+// 文件导读：paired cohort 的 observation 以 session+horizon 为幂等键写入，
+// evaluation 只允许总结同一批已持久化事实；Store 保存 verdict，不替 learning 计算 verdict。
 impl Store {
     // 在 daemon lease 保护的 Immediate 事务中记录当前阶段的 paired observations。
     // 每条 observation 必须绑定已预约 cohort session；相同 identity 可幂等重放，不同内容一律冲突。

@@ -11,6 +11,8 @@ pub struct NativeWebPolicy {
     pub max_citations: usize,
 }
 
+// Default trait 只提供 adapter 的静态 policy；Serialize/Deserialize 让 policy 能作为
+// 配置或审计数据往返，均不会触发网络访问，也不会替代 Store 的来源核验。
 impl Default for NativeWebPolicy {
     fn default() -> Self {
         // 默认 allowlist 和数量上限只描述 model adapter 可接受的来源范围；实际
@@ -39,6 +41,8 @@ pub struct NativeWebQuery {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeWebCitation {
+    // 缺失的 provider 元数据由 Serde 保持为 None；adapter 不会用 URL、标题或当前时间
+    // 推造 published_at、revision 或 document_id。
     pub uri: String,
     pub title: Option<String>,
     pub excerpt: Option<String>,
@@ -237,6 +241,8 @@ impl NativeWebPolicy {
     }
 
     pub fn extract_citations(&self, raw: &Value) -> Result<Vec<NativeWebCitation>> {
+        // BTreeMap 以 URI 去重并按 URI 排序；因此返回顺序是规范化后的稳定顺序，
+        // 不承诺等同于 provider 原始嵌套数组的出现顺序。
         // 递归收集 provider raw 中的 url/uri 及其常见元数据，按 URI 合并重复项；
         // 返回前统一执行非空、数量和 HTTPS/host allowlist 校验。
         let mut citations = Vec::new();

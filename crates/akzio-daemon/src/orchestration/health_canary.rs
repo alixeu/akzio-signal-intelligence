@@ -1,3 +1,9 @@
+// 文件导读：本文件管理 worker supervision、health/ready 投影以及 Canary stage/resume。
+// health 读取 Store lease/metrics/Policy 状态，ready 只检查进程配置和 broker 注入；Canary
+// campaign 的 staged/advance 仍不是 active Contract/Topology、Paper fill 或学习晋升证明。
+// Rust 机制：`Arc`/闭包把 daemon 克隆进 TaskHandler；`watch` 只读关闭状态；Store 错误经
+// `Result` 传播，health 用 `Option` 表示没有 scheduler lease/approval，而不是默认健康。
+
 use super::*;
 
 impl Daemon {

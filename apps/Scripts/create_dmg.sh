@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# 文件职责：对已组装并签名的 bundle 生成新的自用 DMG。
+# 它拒绝覆盖已有磁盘映像，暂存目录只用于 hdiutil 输入，不代表发布或 notarization。
 # Package the signed bundle into a self-use .dmg via hdiutil.
 set -euo pipefail
 

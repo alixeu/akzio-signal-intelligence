@@ -1,3 +1,4 @@
+// ContextBroker 的 grant API 是 Agent 读取 Rust/CAS 证据的权限边界；普通 readable、RawEvidence 和 authority blob 分开校验。
 impl ContextBroker {
     // 验证父 Attempt 产出的 Artifact 是否仍能沿父 Manifest、ReadGrant 和
     // 已授权 raw 闭包回溯。RawEvidence/trace 永远不能直接成为子任务的输出来源。
@@ -199,6 +200,7 @@ impl ContextBroker {
         artifact_id: &ArtifactId,
         now: DateTime<Utc>,
     ) -> ContextResult<Artifact> {
+        // 该 helper 只在完整 persisted-closure 校验后调用；仍再次检查 permit/grant，避免内部调用绕过身份或过期时间。
         if !grant.matches_permit(permit) || grant.contract_hash != contract.contract_hash {
             return Err(ContextError::InvalidManifestClosure);
         }
@@ -284,7 +286,6 @@ pub fn read_raw_document(
         let value = self.document_value(&artifact)?;
     Ok((artifact, value))
 }
-
 pub fn read_authority_document(
     &self,
     contract: &AgentContract,

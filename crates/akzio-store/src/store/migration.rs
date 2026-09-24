@@ -1,3 +1,5 @@
+// 文件导读：迁移只处理历史 v13/v14/v15 表形状和可重建索引；每一步先校验旧 JSON/列值，
+// 用临时表重建 SQL 结构，不移动或重写既有 CAS、Commitment、Artifact identity。
 use super::*;
 
 struct LegacyCanaryReservationRow {
@@ -25,6 +27,7 @@ struct LegacyLessonEvidenceRow {
     recorded_at: String,
 }
 
+// 关闭外键仅覆盖旧表重建的必要区间，结束前无论成功失败都尝试恢复 foreign_keys。
 pub(super) fn migrate_v13_to_v14(connection: &mut Connection, root: &Path) -> StoreResult<()> {
     connection.pragma_update(None, "foreign_keys", "OFF")?;
     let migration = migrate_v13_to_v14_transaction(connection, root);
@@ -37,6 +40,7 @@ pub(super) fn migrate_v13_to_v14(connection: &mut Connection, root: &Path) -> St
     }
 }
 
+// 在 Immediate 事务中校验旧 subject、重建 policy/canary/lesson 表并在最后更新 v14 label。
 fn migrate_v13_to_v14_transaction(connection: &mut Connection, root: &Path) -> StoreResult<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
@@ -85,6 +89,7 @@ fn migrate_v13_to_v14_transaction(connection: &mut Connection, root: &Path) -> S
     Ok(())
 }
 
+// 旧 subject_json 必须生成与 subject_id 完全相同的 typed namespace。
 fn validate_legacy_policy_subjects(transaction: &Transaction<'_>, table: &str) -> StoreResult<()> {
     let mut statement =
         transaction.prepare(&format!("SELECT subject_id, subject_json FROM {table}"))?;
@@ -105,6 +110,7 @@ fn validate_legacy_policy_subjects(transaction: &Transaction<'_>, table: &str) -
     Ok(())
 }
 
+// 通过 v14 临时表复制旧 policy/shadow rows，保留所有 Artifact/event/cursor identity。
 fn migrate_policy_tables(transaction: &Transaction<'_>) -> StoreResult<()> {
     transaction.execute_batch(
         r#"
@@ -221,6 +227,7 @@ CREATE INDEX rebuild_shadow_pairs_freshness
     Ok(())
 }
 
+// 将旧 reservation_json 展开为 market_day/regime/index columns，并逐行比较 JSON 与索引列。
 fn migrate_canary_cohort_sessions(transaction: &Transaction<'_>, root: &Path) -> StoreResult<()> {
     if !table_has_column(
         transaction,
@@ -344,6 +351,7 @@ CREATE TABLE rebuild_canary_cohort_sessions_v14 (
     Ok(())
 }
 
+// 将 LessonEvidence JSON 拆成 metrics_json 列，identity/idempotency key 必须保持不变。
 fn migrate_lesson_evidence(transaction: &Transaction<'_>, root: &Path) -> StoreResult<()> {
     if !table_exists(transaction, "rebuild_lesson_evidence")? {
         return Ok(());
@@ -432,6 +440,7 @@ CREATE TABLE rebuild_lesson_evidence_v14 (
     Ok(())
 }
 
+// 只读探测表是否存在，兼容旧 Store 尚未创建惰性 Lesson/Contract 表的情况。
 pub(super) fn table_exists(connection: &Connection, table: &str) -> StoreResult<bool> {
     connection
         .query_row(
@@ -446,6 +455,7 @@ pub(super) fn table_exists(connection: &Connection, table: &str) -> StoreResult<
 
 /// v15 adds a rebuildable origin/kind expression index, never rewrites CAS or
 /// execution commitments. SQLite rebuilds the index directly from metadata.
+// v15 只重建 origin/kind expression index，并在旧 Contract blocker 存在时阻断升级。
 pub(super) fn migrate_v14_to_v15(connection: &mut Connection) -> StoreResult<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     // Reached only from a v13/v14 root. The `< 18` threshold is the historical

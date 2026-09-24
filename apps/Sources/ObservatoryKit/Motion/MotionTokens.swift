@@ -6,6 +6,7 @@ import SwiftUI
 // (no overshoot); bounce is reserved for motion that carried momentum.
 // `easeIn` is never used: it stalls exactly when the user is watching hardest.
 public enum Motion {
+    // 下面的常量按交互、表面、数据和设置层分类，调用方只选择语义而不自行写数值。
     // Interaction
     public static let hover = Animation.spring(response: 0.20, dampingFraction: 1.0)
     public static let selection = Animation.spring(response: 0.28, dampingFraction: 1.0)
@@ -63,6 +64,7 @@ public struct MotionPolicy: Sendable, Equatable {
         case reduced
     }
 
+    // level 决定是否 reduced；intensity 影响距离和粒子数量，routeStrength 只影响跨页编排。
     public var level: Level
     /// 0…1 user-facing intensity from Settings; scales travel distance and particle count.
     public var intensity: Double
@@ -70,6 +72,7 @@ public struct MotionPolicy: Sendable, Equatable {
     public var routeStrength: Double
 
     public init(level: Level = .full, intensity: Double = 1.0, routeStrength: Double = 1.0) {
+        // 策略保留调用方提供的设置值，具体动画解析时再按 level 和范围计算。
         self.level = level
         self.intensity = intensity
         self.routeStrength = routeStrength
@@ -82,28 +85,34 @@ public struct MotionPolicy: Sendable, Equatable {
 
     /// Reduced motion keeps comprehension cues (opacity, colour) and drops travel.
     public func resolve(_ animation: Animation) -> Animation {
+        // 所有局部动画都经这里收敛；reduced 保留短淡出提示但去掉原始弹簧运动。
         isReduced ? .easeOut(duration: 0.22) : animation
     }
 
     /// Continuous ambient loops (orbits, particles, breathing) stop entirely.
+    // continuous ambient motion 必须同时满足非 reduced 和有效强度。
     public var allowsAmbient: Bool { !isReduced && intensity > 0.01 }
 
     /// Travel distance for entrances; reduced motion clamps to a 6pt hint.
     public func travel(_ points: CGFloat) -> CGFloat {
+        // reduced 只保留最多 6pt 的空间提示；完整模式按用户强度缩放位移。
         isReduced ? min(points, 6) : points * CGFloat(max(intensity, 0.2))
     }
 
     /// Shared-element choreography strength; 0 means a plain crossfade handoff.
     public var sharedElementStrength: Double {
+        // 跨页共享元素在 reduced 下退化为普通 crossfade，其余情况受 routeStrength 限制。
         isReduced ? 0 : max(0, min(routeStrength, 1))
     }
 
     public func stagger(_ index: Int) -> Double {
+        // reduced 取消列表错峰，完整模式复用全局 stagger token。
         isReduced ? 0 : Motion.stagger(index)
     }
 }
 
 private struct MotionPolicyKey: EnvironmentKey {
+    // 独立组件没有注入策略时使用完整动效，行为与普通窗口保持一致。
     static let defaultValue = MotionPolicy.full
 }
 

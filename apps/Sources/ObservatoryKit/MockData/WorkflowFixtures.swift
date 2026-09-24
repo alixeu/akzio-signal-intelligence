@@ -5,6 +5,7 @@ import Foundation
 // The DAG shape is fixed; only task statuses move per scenario. Column/row are
 // assigned here so the canvas, the inspector and the accessibility list agree.
 enum WorkflowFixtures {
+    // order 是所有场景共用的 DAG 进度尺；场景只改变节点状态和适用性。
     /// Execution order. The index in this array is the progress ruler.
     static let order: [WorkflowStageKind] = [
         .evidenceGate,
@@ -22,6 +23,7 @@ enum WorkflowFixtures {
 
     /// The stage currently running, or nil when the run reached a terminal state.
     static func activeStage(_ scenario: MockScenario) -> WorkflowStageKind? {
+        // 不同 scenario 把活动游标放到不同阶段；终态场景返回 nil。
         switch scenario {
         case .criticTriggeredMaterialConflict: .critic
         case .allOrdersFilled, .partialFillAndReprice: .reconcile
@@ -35,11 +37,13 @@ enum WorkflowFixtures {
     }
 
     static func nodes(scenario: MockScenario) -> [WorkflowNodePresentation] {
+        // 节点生成从固定 seed 开始，map 闭包将 DAG 顺序、布局和场景状态合成展示节点。
         var generator = SeededGenerator(seed: scenario.seed &+ 307)
         let active = activeStage(scenario)
         let frontier = active.flatMap { stage in order.firstIndex(of: stage) } ?? order.count
 
         return order.enumerated().map { index, stage in
+            // 每次迭代只构造一个节点；generator 仅为已成功且有角色的节点生成置信度。
             let position = WorkflowLayout.position(stage)
             let applicable = stage.requiresPaperRun ? scenario.purpose.submitsPaperOrders : true
             var status: TaskStatus = index < frontier ? .succeeded : (index == frontier ? .running : .pending)
@@ -101,11 +105,13 @@ enum WorkflowFixtures {
         horizon: OutcomeHorizonKind,
         activeStage: WorkflowStageKind?
     ) -> TaskStatus {
+        // horizon 的状态优先由 sealed 集合决定，否则只把当前观察窗口标成 running。
         if scenario.sealedHorizons.contains(horizon) { return .succeeded }
         return activeStage == .horizon(horizon) ? .running : .pending
     }
 
     static func edges(scenario: MockScenario) -> [WorkflowEdgePresentation] {
+        // 边集合固定描述拓扑；Critic 触发时额外加入回环和冲突边供 UI 展示。
         var edges: [WorkflowEdgePresentation] = []
         for index in 1...3 {
             edges.append(.init(from: .evidenceGate, to: .analyst(index), kind: .parallel))

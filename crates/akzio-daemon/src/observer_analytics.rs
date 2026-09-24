@@ -1,3 +1,11 @@
+// 文件导读：这里是 observer 的纯计算层，解析 Paper fill/bar payload，计算组合/基准、
+// P&L、波动、回撤、Outcome horizon 统计和 Policy exposure。输入来自已读取的观察值，
+// 计算结果是展示指标，不是 Rust Decision/Execution authority，也不证明真实账户 NAV 或
+// 后续成交完整。
+// Rust 机制：迭代器、`map/filter_map/fold/try_fold` 以闭包组合转换；`BTreeMap/Set` 提供
+// 稳定排序和去重；`Result<T, String>` 表示 payload 质量错误，整数 `i128` 中间值和显式
+// `try_from` 防止金额/ppm 转换溢出。
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use akzio_domain::{
@@ -69,6 +77,8 @@ pub(crate) fn readiness_ppm(
     auto_paper: bool,
     scheduler_owner_present: bool,
 ) -> u32 {
+    // 只有 Core ready、未 freeze，且 auto_paper 有 active scheduler owner 时才给满 readiness；
+    // 这是服务状态 ppm，不是交易或学习成功率。
     if ready && !frozen && (!auto_paper || scheduler_owner_present) {
         1_000_000
     } else {
@@ -80,6 +90,8 @@ pub(crate) fn parse_fill_activities(
     value: &Value,
     broker_order_ids: &BTreeSet<String>,
 ) -> Result<Vec<ObserverBrokerFill>, String> {
+    // 先验证数组和 100-row 上限，再只保留当前 Run 的 broker_order_id；字段/时间/金额
+    // 解析失败返回错误，防止不完整活动被当作 fill 真值。
     let activities = value
         .as_array()
         .ok_or_else(|| "Alpaca fill activities payload is not an array".to_owned())?;
@@ -138,6 +150,8 @@ pub(crate) fn managed_realized_pnl(
     opening_positions: &Value,
     fills: &[ObserverBrokerFill],
 ) -> Result<i64, String> {
+    // 以 opening positions 的平均成本处理 buy/sell，严格拒绝超卖/未知方向；这是 observer
+    // 的受管订单 P&L 估算，不替代完整账户现金/公司行动账本。
     let mut basis = parse_opening_cost_basis(opening_positions)?;
     let mut realized = 0_i128;
     for fill in fills {
@@ -190,6 +204,7 @@ pub(crate) fn managed_realized_pnl(
 }
 
 pub(crate) fn parse_bar_series(value: &Value) -> Result<Vec<ObserverBarPoint>, String> {
+    // 解析并按 timestamp 排序去重 bars；close 必须为正，空序列返回错误而不构造平线。
     let bars = value
         .get("bars")
         .and_then(Value::as_array)
@@ -231,6 +246,8 @@ pub(crate) fn benchmark_equity_series(
     portfolio: &[(DateTime<Utc>, i64)],
     benchmark: &[ObserverBarPoint],
 ) -> Vec<Option<i64>> {
+    // 用 portfolio 首点和 benchmark 首个可用 close 对齐基准权益；没有同步 benchmark 的
+    // 时间点保留 None，而不是前向填充未来价格。
     let Some((_, opening_equity)) = portfolio.first().copied() else {
         return Vec::new();
     };
@@ -265,6 +282,8 @@ pub(crate) fn portfolio_analytics(
     benchmark: &[ObserverBarPoint],
     current_equity_micros: i64,
 ) -> Result<ObserverPortfolioAnalytics, String> {
+    // 按共同日期计算收益、beta、年化波动、最大回撤和 5% VaR；少于 20 个风险收益点
+    // 保持不可用，避免小样本指标被误读为质量证明。
     let portfolio_by_day = daily_last(portfolio.iter().copied());
     let benchmark_by_day = daily_last(
         benchmark
@@ -326,6 +345,7 @@ pub(crate) fn portfolio_analytics(
 }
 
 pub(crate) fn outcome_statistics(outcomes: &[Outcome]) -> Vec<ObserverOutcomeStatistics> {
+    // 按 T1/T3/T5 聚合已有 utility window；Sharpe 设定最小样本门槛，None 表示统计不足。
     OutcomeHorizon::ALL
         .into_iter()
         .map(|horizon| {
@@ -391,6 +411,8 @@ pub(crate) fn outcome_comparison(
     bars_by_asset: &BTreeMap<Asset, BTreeMap<NaiveDate, MoneyMicros>>,
     baseline_day: NaiveDate,
 ) -> Result<Vec<ObserverOutcomeComparisonPoint>, String> {
+    // 只取四资产共同日期，按 target weights 计算 portfolio 与 QQQ benchmark 的相对曲线；
+    // 缺任一 baseline/future price 立即返回错误，不猜测价格。
     let mut common_days = bars_by_asset
         .values()
         .next()
@@ -455,10 +477,12 @@ pub(crate) fn outcome_comparison(
 pub(crate) fn comparison_max_drawdown_ppm(
     points: &[ObserverOutcomeComparisonPoint],
 ) -> Option<i64> {
+    // 空比较序列保持 None；非空才把 portfolio 曲线交给统一回撤计算器。
     (!points.is_empty()).then(|| max_drawdown_ppm(points.iter().map(|point| point.portfolio_ppm)))
 }
 
 pub(crate) fn compounded_ppm(values: &[i64]) -> Option<i64> {
+    // 对已有 ppm utility 做乘法复合；空样本不返回 0，避免“没有样本”和“零收益”混淆。
     (!values.is_empty()).then(|| {
         let compounded = values
             .iter()
@@ -469,6 +493,8 @@ pub(crate) fn compounded_ppm(values: &[i64]) -> Option<i64> {
 }
 
 pub(crate) const fn policy_exposure_ppm(state: PolicyState) -> Option<u32> {
+    // 只有 active Contract/Topology policy 才展示满 exposure；Memory 或 candidate 状态保持
+    // None，不能从 observer 投影推断已激活的 DecisionPolicy。
     match state {
         PolicyState::Memory(_) => None,
         PolicyState::Contract(CandidatePolicyState::Active)
@@ -478,6 +504,7 @@ pub(crate) const fn policy_exposure_ppm(state: PolicyState) -> Option<u32> {
 }
 
 fn parse_opening_cost_basis(value: &Value) -> Result<BTreeMap<String, CostBasis>, String> {
+    // 把 opening positions 转成 symbol→平均成本 map；provider 数值缺失/非法直接拒绝。
     value
         .as_array()
         .ok_or_else(|| "opening Paper positions payload is not an array".to_owned())?
@@ -511,6 +538,8 @@ fn parse_opening_cost_basis(value: &Value) -> Result<BTreeMap<String, CostBasis>
 }
 
 fn daily_last(values: impl IntoIterator<Item = (DateTime<Utc>, i64)>) -> BTreeMap<NaiveDate, i64> {
+    // 泛型 IntoIterator 允许 portfolio/history 共用按自然日保留最后观察值的逻辑；这里是
+    // 展示聚合，不改变原始逐点轨迹。
     values
         .into_iter()
         .map(|(timestamp, value)| (timestamp.date_naive(), value))
@@ -518,10 +547,12 @@ fn daily_last(values: impl IntoIterator<Item = (DateTime<Utc>, i64)>) -> BTreeMa
 }
 
 fn mean(values: &[f64]) -> f64 {
+    // 调用方已保证非空；借用 slice 避免复制风险收益样本。
     values.iter().sum::<f64>() / values.len() as f64
 }
 
 fn sample_variance(values: &[f64], average: f64) -> f64 {
+    // 使用 n-1 的样本方差；调用方负责至少两个样本的前置条件。
     values
         .iter()
         .map(|value| (value - average).powi(2))
@@ -530,6 +561,7 @@ fn sample_variance(values: &[f64], average: f64) -> f64 {
 }
 
 fn max_drawdown_ppm(values: impl IntoIterator<Item = i64>) -> i64 {
+    // 单遍维护 peak/current drawdown；整数曲线最后统一转 ppm，避免中途改变持久化数值。
     let mut peak = 0_i64;
     let mut drawdown = 0.0_f64;
     for value in values {
@@ -542,12 +574,14 @@ fn max_drawdown_ppm(values: impl IntoIterator<Item = i64>) -> i64 {
 }
 
 fn rounded_ppm(value: f64) -> i64 {
+    // 浮点展示值统一 round 并 clamp 到 i64，防止 observer 指标溢出崩溃。
     (value * PPM)
         .round()
         .clamp(i64::MIN as f64, i64::MAX as f64) as i64
 }
 
 fn json_micros(value: &Value) -> Result<i64, String> {
+    // provider decimal 先交给统一 MoneyMicros parser；失败返回错误而不是默认 0。
     parse_money_micros(value)
         .map(|money| money.0)
         .ok_or_else(|| "decimal value is invalid".to_owned())

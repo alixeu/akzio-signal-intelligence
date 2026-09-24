@@ -1,3 +1,5 @@
+// 文件导读：prelude 统一提供 Store 实现共享的领域类型、SQLite/serde 错误、schema 常量和
+// 只读投影结构；这里的类型定义描述持久化边界，不是额外的内存状态权威。
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -37,6 +39,7 @@ use rusqlite::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
+// 数据库文件名、schema 版本和 Blob 编码标识必须与初始化/迁移/读取路径保持一致。
 const DATABASE_FILE: &str = "akzio.sqlite3";
 const EXPORT_DATABASE_FILE: &str = "akzio-export.sqlite3";
 const POST_TERMINAL_WORKER_RECIPE_ID: &str = akzio_domain::LEARNING_OUTCOME_WORKER_RECIPE_ID;

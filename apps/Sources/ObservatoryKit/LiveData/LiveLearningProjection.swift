@@ -2,11 +2,13 @@ import Foundation
 
 extension LiveProjection {
     static func learning(_ payload: ObserverSnapshotPayload) -> LearningPresentation {
+        // Learning 页面只读取 Core 返回的 artifacts/summary/transitions；Swift 计算的 utility 平均值仅用于展示。
         let section = payload.learning
         let artifacts = section.data?.artifacts ?? []
         let outcomeUtilityByArtifactID = Dictionary(uniqueKeysWithValues: artifacts
             .filter { $0.kind == "outcome" }
             .map { outcome in
+                // 窗口缺失或没有 utility 时保持 nil；平均值不是 Rust 的 canonical marginal utility。
                 let utilities = outcome.payload["windows"]?.array?.compactMap {
                     $0["utility_ppm"]?.int
                 } ?? []
@@ -15,6 +17,7 @@ extension LiveProjection {
             })
         let retrospectives = artifacts.filter { $0.kind == "retrospective" }
         let cards = retrospectives.map { artifact in
+            // retrospective 的 findings/category/conclusion 都是可选 JSON 投影，未知值降为 unresolved/空集合。
             let findings = artifact.payload["findings"]?.array ?? []
             let conclusion = findings.compactMap { $0["conclusion"]?.string }
                 .compactMap(RetrospectiveConclusion.init(rawValue:)).first ?? .unresolved
@@ -52,9 +55,12 @@ extension LiveProjection {
                 isCurrent: index == artifacts.count - 1
             )
         }
+        // summary、transitions 和 researchAudit 都可缺失；Optional 链只填充观察到的字段，其余交给可用性状态解释。
         let summary = section.data?.summary
         let transitions = section.data?.policyTransitions ?? []
+        // 有 metric tracks 时优先使用带样本统计的投影，否则退回 transition 轨迹；两者都为空仍显示 unavailable。
         let metricTracks = (section.data?.policyMetrics ?? []).compactMap(livePolicyTrack)
+        // 返回值是不可变的 UI projection；它不改变 Core artifact，也不把 research audit 提升为 Outcome/Learning 完成。
         return LearningPresentation(
             cards: cards,
             timeline: timeline,
@@ -89,6 +95,7 @@ extension LiveProjection {
     }
 
     static var unavailablePortfolio: PortfolioPresentation {
+        // unavailable 是显式占位值：0/空集合表示“没有可用 live projection”，不代表真实账户为零。
         PortfolioPresentation(
             equityMicros: 0,
             todayPnlMicros: 0,
@@ -119,6 +126,7 @@ extension LiveProjection {
     }
 
     static var unavailableOutcome: OutcomePresentation {
+        // Outcome 缺失时所有 horizon 保持 waiting 且未 sealed，UI 不把自然时间流逝当成窗口完成。
         OutcomePresentation(
             horizons: OutcomeHorizonKind.allCases.map {
                 HorizonPresentation(
@@ -141,6 +149,7 @@ extension LiveProjection {
     }
 
     static var unavailableRun: RunPresentation {
+        // 无当前 Run 时用明确的 stale/unavailable 组合占位，避免时间戳或市场状态被误读为 live 事实。
         RunPresentation(
             runId: MissingValue.unavailable.rawValue,
             purpose: .paper,
@@ -161,6 +170,7 @@ extension LiveProjection {
     }
 
     static var unavailableArchive: ArchivePresentation {
+        // archive 缺失时保持空 rows 和 nil success rate，不能从当前 Run 推导历史成功率。
         ArchivePresentation(
             rows: [],
             totalRuns: 0,
@@ -173,6 +183,7 @@ extension LiveProjection {
     }
 
     static var unavailableCouncil: CouncilPresentation {
+        // council 缺失时不创建 model/trajectory；默认角色只为 UI 结构完整，不代表模型已运行。
         CouncilPresentation(
             roles: [],
             selectedRole: .synthesizer,
@@ -189,6 +200,7 @@ extension LiveProjection {
     }
 
     static var unavailableLearning: LearningPresentation {
+        // 没有 canonical learning 时使用不可用状态，而不是从 debug/isolated artifacts 推断学习成功。
         LearningPresentation(
             cards: [],
             timeline: [],
@@ -210,6 +222,7 @@ extension LiveProjection {
     }
 
     static var unavailableHealth: [HealthMetric] {
+        // health 的空投影把 Core 标记为 elevated risk，提醒 UI 不能把缺失状态当作健康。
         [
             HealthMetric(
                 id: "core",

@@ -1,7 +1,16 @@
+// 文件导读：lease helper 只负责 scheduler daemon lease 的取得、heartbeat、失效重取和
+// StoreExecutor 异步排队。它保护唯一 scheduler owner，不代表 session 已产生或 Paper
+// 订单已提交；测试还验证维护窗口延长 lease 时 heartbeat 不会回退截止时间。
+// Rust 机制：`Mutex` guard 的借用范围覆盖同步 heartbeat，poison 转为显式错误；异步方法
+// clone scheduler 后把闭包 move 进 executor，避免持有 MutexGuard 跨 await；Drop/过期恢复
+// 由 Store 的 durable lease 逻辑负责。
+
 use super::*;
 
 impl PaperScheduler {
     pub(super) fn acquire_or_renew(&self, now: DateTime<Utc>) -> SchedulerResult<DaemonLease> {
+        // 先在 Mutex 内尝试 heartbeat 现有 owner/epoch；durable heartbeat 返回 false 时清空
+        // 本地缓存，再原子 acquire 新 epoch，避免使用过期 lease 写入 Paper 状态。
         let expires_at = now + self.lease_duration;
         let mut held = self
             .lease
@@ -31,6 +40,8 @@ impl PaperScheduler {
     }
 
     pub(super) async fn acquire_or_renew_async(&self) -> SchedulerResult<DaemonLease> {
+        // 取得 lease 的同步 Store 操作排到共享 executor 后才开始计算有效期，队列等待不
+        // 消耗新 lease 的有效窗口。
         let scheduler = self.clone();
         self.store_executor
             .execute(move |_| scheduler.acquire_or_renew(Utc::now()))

@@ -1,3 +1,5 @@
+# 文件职责：macOS Observatory 初始化用户配置时使用的 Paper-engineering 模板。
+# App 复制并替换环境占位符；它不代表已经通过审批、校准或 Paper Gate。
 [daemon]
 # Overridden at launch with AKZIO_STORE_ROOT so Finder launches never depend
 # on the current working directory.

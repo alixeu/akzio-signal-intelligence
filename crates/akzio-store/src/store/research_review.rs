@@ -1,3 +1,5 @@
+// 文件导读：研究审计从已提交的 proposal/review/supplement/context coverage Artifact
+// 重建事实；最终审查只接受依赖闭包内 succeeded Attempt 的最新 revision，不替 Decision 计算结果。
 use super::*;
 use akzio_domain::{ContextManifestPayload, ProposalReview};
 

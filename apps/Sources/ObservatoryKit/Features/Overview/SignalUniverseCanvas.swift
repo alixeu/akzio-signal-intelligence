@@ -6,6 +6,7 @@ import SwiftUI
 // Views sits on top purely for hit testing, tooltips, VoiceOver and shared-element
 // anchors. That split keeps the field cheap while staying accessible.
 struct SignalUniverseCanvas: View {
+    // workflow 是唯一节点数据源；namespace、selectedStageID 和 onSelect 连接跨页动画与选择回调。
     @Environment(\.appLanguage) private var language
     let workflow: WorkflowPresentation
     let namespace: Namespace.ID?
@@ -15,18 +16,22 @@ struct SignalUniverseCanvas: View {
     @Environment(\.motionPolicy) private var policy
     @Environment(\.canvasRenderPolicy) private var canvas
     @Environment(\.akzioLabelDensity) private var labelDensity
+    // 该 State 只控制画布内 inspector 的呈现，不改变 WorkflowPresentation。
     @State private var presentedStageID: String?
 
     private var nodes: [UniverseNode] { SignalUniverseLayout.nodes(from: workflow) }
 
     var body: some View {
+        // GeometryReader 的尺寸同时喂给纯布局函数、Canvas 和命中层，确保绘制与点击重合。
         GeometryReader { proxy in
             ZStack(alignment: .topTrailing) {
                 AmbientCanvas { time in
+                    // time 只驱动环境旋转和粒子；placed 在同一帧被 Canvas 与 overlay 共用。
                     let rotation = SignalUniverseLayout.rotation(time: time, policy: canvas)
                     let placed = positions(in: proxy.size, rotation: rotation)
                     ZStack {
                         Canvas(rendersAsynchronously: true) { context, size in
+                            // Canvas 闭包只消费已计算位置，按轨道、连线、节点三层绘制。
                             drawOrbits(&context, size: size)
                             drawEdges(&context, placed: placed, time: time)
                             drawNodes(&context, placed: placed, time: time)
@@ -44,6 +49,7 @@ struct SignalUniverseCanvas: View {
     }
 
     private func positions(in size: CGSize, rotation: Double) -> [(node: UniverseNode, point: CGPoint)] {
+        // map 闭包把相同 rotation 下的节点模型映射成几何点，不写入状态。
         nodes.map { ($0, SignalUniverseLayout.position($0, in: size, rotation: rotation)) }
     }
 
@@ -86,6 +92,7 @@ struct SignalUniverseCanvas: View {
         placed: [(node: UniverseNode, point: CGPoint)],
         time: Double
     ) {
+        // lookup 闭包把节点 ID 映射到本帧位置，边只连接当前 workflow 中存在的端点。
         let lookup = Dictionary(uniqueKeysWithValues: placed.map { ($0.node.id, $0) })
         for edge in workflow.edges {
             guard let from = lookup[edge.from], let to = lookup[edge.to] else { continue }
@@ -114,6 +121,7 @@ struct SignalUniverseCanvas: View {
         to: CGPoint,
         time: Double
     ) {
+        // 粒子数量受 Canvas 策略限制；每个循环只计算位置，不创建 SwiftUI 状态。
         let count = max(1, canvas.pathParticleBudget / 12)
         for index in 0..<count {
             let offset = Double(index) / Double(count)
@@ -135,6 +143,7 @@ struct SignalUniverseCanvas: View {
         placed: [(node: UniverseNode, point: CGPoint)],
         time: Double
     ) {
+        // 节点绘制读取选中 ID、标签密度和当前阶段，只生成图形上下文内容。
         // Single slow breath, applied only to the current node.
         let phase = (time.truncatingRemainder(dividingBy: Motion.pulsePeriod)) / Motion.pulsePeriod
         let breath = canvas.runsAmbient ? 0.5 - 0.5 * cos(phase * 2 * .pi) : 0.35
@@ -209,6 +218,7 @@ struct SignalUniverseCanvas: View {
     // MARK: Interactive overlay
 
     private func hitLayer(placed: [(node: UniverseNode, point: CGPoint)]) -> some View {
+        // 命中层用真实 Button 覆盖 Canvas；按钮闭包把选择写回父页并切换本地 inspector。
         ZStack {
             ForEach(placed, id: \.node.id) { entry in
                 let radius = SignalUniverseLayout.radius(for: entry.node)
@@ -233,6 +243,7 @@ struct SignalUniverseCanvas: View {
 
     @ViewBuilder
     private func stageOverlay(in size: CGSize) -> some View {
+        // overlay 只在 presentedStageID 有效且能找到节点时出现，关闭闭包清空本地 State。
         if let stageID = presentedStageID,
            let node = workflow.node(id: stageID) {
             let panelSize = AkzioLayout.inspectorOverlaySize(in: size)
@@ -261,6 +272,7 @@ struct SignalUniverseCanvas: View {
 
     /// Only nodes that have a counterpart on another page register an anchor.
     private func anchor(for node: UniverseNode) -> SharedElementID {
+        // 只有跨页面需要过渡的节点返回真实锚点，其余节点明确不参与共享元素。
         if node.isCurrent { return .currentNode }
         switch node.stage {
         case .horizon(let horizon): return .horizonRing(horizon)
@@ -271,6 +283,7 @@ struct SignalUniverseCanvas: View {
     }
 
     private func anchorNamespace(for node: UniverseNode) -> Namespace.ID? {
+        // 锚点和命名空间成对决定是否注册；没有跨页对象时返回 nil。
         switch node.stage {
         case .horizon, .learning, .evaluate: namespace
         default: node.isCurrent ? namespace : nil

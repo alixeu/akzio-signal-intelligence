@@ -1,3 +1,5 @@
+// 文件导读：记录行为候选在各个资格阶段的冻结输入、评估输出和确定性 verdict。
+// receipt_id 由身份字段计算，避免用后续可变字段替换已验收的上下文。
 //! Immutable qualification stage receipts and deterministic evaluation contracts.
 
 use chrono::{DateTime, Utc};
@@ -48,6 +50,7 @@ pub enum QualificationVerdict {
 }
 
 impl QualificationVerdict {
+    // 只有 Pass 是可晋级结果，其余 verdict 都保留为非通过状态。
     pub const fn is_pass(self) -> bool {
         matches!(self, Self::Pass)
     }
@@ -80,12 +83,14 @@ pub struct QualificationStageReceipt {
 }
 
 impl QualificationStageReceipt {
+    // 先封存身份哈希，再验证当前 receipt，返回可持久化的不可变副本。
     pub fn seal(mut self) -> Result<Self, DomainError> {
         self.receipt_id = self.identity_hash()?;
         self.validate()?;
         Ok(self)
     }
 
+    // 哈希覆盖资格输入、评估承诺/reveal、指标、结果和来源引用。
     pub fn identity_hash(&self) -> Result<ContentHash, DomainError> {
         content_hash_json(&serde_json::json!({
             "schema_version": self.schema_version,
@@ -111,6 +116,7 @@ impl QualificationStageReceipt {
         .map_err(|_| DomainError::InvalidContentHash)
     }
 
+    // 校验 schema、场景、ContextManifest kind 以及两侧输出允许的 Artifact kind。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION
             || self.receipt_id != self.identity_hash()?

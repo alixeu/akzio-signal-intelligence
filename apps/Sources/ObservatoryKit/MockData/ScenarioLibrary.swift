@@ -6,6 +6,7 @@ import Foundation
 // the scenario seed and the frozen anchor, so two builds are byte-identical.
 public enum ScenarioLibrary {
     public static func snapshot(_ scenario: MockScenario) -> ObservatorySnapshot {
+        // snapshot 优先读取预构建缓存，保证同一场景在多个页面共享同一份不可变快照。
         cache[scenario] ?? build(scenario)
     }
 
@@ -13,10 +14,12 @@ public enum ScenarioLibrary {
 
     /// Prebuilt once; immutable and safe to share.
     private static let cache: [MockScenario: ObservatorySnapshot] = Dictionary(
+        // map 闭包在初始化阶段为全部场景建立快照；后续读取不会重复生成数据。
         uniqueKeysWithValues: MockScenario.allCases.map { ($0, build($0)) }
     )
 
     public static func build(_ scenario: MockScenario) -> ObservatorySnapshot {
+        // build 是 Mock 数据流的汇聚点：先生成 workflow/run，再组装所有页面展示投影。
         let nodes = WorkflowFixtures.nodes(scenario: scenario)
         let run = run(scenario: scenario)
         let workflow = WorkflowPresentation(
@@ -47,6 +50,7 @@ public enum ScenarioLibrary {
     // MARK: Run header
 
     static func run(scenario: MockScenario) -> RunPresentation {
+        // run 使用独立 salt 生成运行头部；dataLive/dataStale 只表达样例快照边界。
         var generator = SeededGenerator(seed: scenario.seed &+ 1_009)
         let elapsed = elapsedSeconds(scenario: scenario)
         return RunPresentation(
@@ -70,6 +74,7 @@ public enum ScenarioLibrary {
     }
 
     private static func elapsedSeconds(scenario: MockScenario) -> Int {
+        // elapsed 由终态/运行态和 rawValue 固定推导，不使用当前时间。
         switch scenario.workflowStatus {
         case .running: 1_247 + scenario.rawValue * 13
         case .queued, .leased: 0
@@ -78,6 +83,7 @@ public enum ScenarioLibrary {
     }
 
     private static func runID(_ generator: inout SeededGenerator) -> String {
+        // 内部 block 闭包复用传入 generator，生成当前场景的稳定运行 ID。
         let hex = "0123456789abcdef".map { String($0) }
         func block(_ length: Int) -> String {
             (0..<length).map { _ in generator.pick(hex) }.joined()
@@ -98,6 +104,7 @@ public enum ScenarioLibrary {
 
     /// Settings are display-only, but scenario 17 ships with reduce-motion on.
     public static func settings(_ scenario: MockScenario) -> SettingsPresentation {
+        // 设置 fixture 只覆盖场景 17 的减少动效偏好，其余设置使用默认值。
         SettingsPresentation(reduceMotionOverride: scenario.reduceMotionPreferred)
     }
 }

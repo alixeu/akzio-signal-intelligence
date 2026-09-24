@@ -11,6 +11,8 @@ impl EvaluationRuntime {
         diagnostic: &str,
         now: DateTime<Utc>,
     ) -> EvaluationRuntimeResult<(Artifact, Artifact)> {
+        // T+1/T+3 只写当前 due prefix：两份 Artifact 都是 RunScoped，作为可重试诊断
+        // 保存，不进入 canonical Policy head，也不满足 T+5 学习转移。
         let outcome = materialize_partial_outcome(&materialization)?;
         if !outcome
             .windows
@@ -104,6 +106,8 @@ impl EvaluationRuntime {
             &provenance,
             now,
         )?;
+        // Store 在一个 Immediate 事务中校验 lease/permit、来源闭包和 prefix 形状，再同时
+        // 插入 Outcome/Retrospective；重复的完全相同身份可幂等返回，冲突 payload 会失败。
         self.store.record_partial_outcome_retrospective_fenced(
             lease,
             permit,
@@ -150,6 +154,8 @@ impl EvaluationRuntime {
         provenance: &ArtifactProvenance,
         created_at: DateTime<Utc>,
     ) -> EvaluationRuntimeResult<Artifact> {
+        // canonical 只是 Artifact 的生命周期标签；真正是否可见于 Run/Attempt/Policy 索引，
+        // 仍由后续专用 Store commit 决定。
         self.artifact_with_lifecycle(
             kind,
             payload,
@@ -172,6 +178,8 @@ impl EvaluationRuntime {
         provenance: &ArtifactProvenance,
         created_at: DateTime<Utc>,
     ) -> EvaluationRuntimeResult<Artifact> {
+        // stage_json 先得到内容寻址 BLOB，再组装包含 provenance/source_refs 的 Artifact；
+        // 本函数本身不收束 task、policy head 或 succeeded-output 索引。
         let blob = self.store.stage_json(payload)?;
         Ok(Artifact::new(
             kind,

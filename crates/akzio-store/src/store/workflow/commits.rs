@@ -1,3 +1,5 @@
+// 文件导读：本文件处理取消、defer/retry 和 claim。Task 状态、Attempt lease、Run 状态、
+// 生命周期事件与 Debug control 必须在同一事务内收束，读取到的 retry 次数来自 durable rows。
 impl Store {
     pub fn failure_attempts_for_current_stage(&self, task_id: &TaskId) -> StoreResult<u64> {
         let connection = self.connection()?;

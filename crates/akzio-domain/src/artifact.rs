@@ -1,3 +1,5 @@
+// 文件导读：定义 CAS Artifact 的类型、生命周期、来源血缘和内容身份校验。
+// Artifact 的哈希覆盖元数据与 BLOB 引用，source_refs 还承担各类产物的最小血缘约束。
 //! Immutable, content-addressed artifact vocabulary.
 
 use std::{collections::BTreeSet, fmt};
@@ -13,6 +15,7 @@ use crate::{content_hash_json, BlobRef, ContentHash, DomainError, RunId, TaskId}
 pub struct ArtifactId(pub ContentHash);
 
 impl fmt::Display for ArtifactId {
+    // 直接转发底层 ContentHash 的格式化结果，保持 ID 的文本表示一致。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
     }
@@ -83,6 +86,7 @@ pub enum ArtifactKind {
 }
 
 impl ArtifactKind {
+    // 只有列出的种类允许进入 Canonical 生命周期；运行期临时/调试产物不在集合中。
     pub const fn can_be_canonical(self) -> bool {
         matches!(
             self,
@@ -153,6 +157,7 @@ pub struct ArtifactProvenance {
 }
 
 impl ArtifactProvenance {
+    // 校验来源族非空，以及置信度是否仍在 ppm 的 0..=1_000_000 范围内。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.source_family.trim().is_empty() {
             return Err(DomainError::EmptyField {
@@ -177,6 +182,7 @@ pub struct ArtifactOrigin {
 }
 
 impl ArtifactOrigin {
+    // attempt 必须同时带 task，防止把一次尝试伪装成脱离任务的 Artifact 来源。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.attempt_id.is_some() && self.task_id.is_none() {
             return Err(DomainError::AttemptOriginWithoutTask);
@@ -204,6 +210,7 @@ pub struct Artifact {
 
 impl Artifact {
     #[allow(clippy::too_many_arguments)]
+    // 规范化 source_refs 顺序后计算 Artifact ID，并在返回前执行完整 schema 校验。
     pub fn new(
         kind: ArtifactKind,
         blob: BlobRef,
@@ -234,6 +241,7 @@ impl Artifact {
         Ok(artifact)
     }
 
+    // 复制并排序元数据，序列化后移除自引用 artifact_id，再计算内容哈希。
     pub fn expected_hash(&self) -> Result<ContentHash, DomainError> {
         let mut canonical = self.clone();
         canonical.source_refs.sort();
@@ -249,6 +257,7 @@ impl Artifact {
         })
     }
 
+    // 依次检查 schema、文本/来源、生命周期、类型约束和最终内容身份。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != SCHEMA_VERSION {
             return Err(DomainError::EmptyField {
@@ -294,6 +303,7 @@ impl Artifact {
         Ok(())
     }
 
+    // 校验 source_refs 严格排序、无重复/自引用，并按 ArtifactKind 应用血缘规则。
     fn validate_source_refs(&self) -> Result<(), DomainError> {
         if self.source_refs.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(DomainError::EmptyField {
@@ -310,6 +320,7 @@ impl Artifact {
             });
         }
 
+        // match 按产物类型收紧最小来源闭包；未特别列出的类型只接受通用检查。
         match self.kind {
             ArtifactKind::RuntimeCheckpoint => {
                 if self.lifecycle != ArtifactLifecycle::RunScoped
@@ -382,6 +393,7 @@ impl Artifact {
                         .source_refs
                         .iter()
                         .all(|reference| reference.kind == ArtifactKind::EvidenceNeed);
+                // 这些迭代器闭包分别识别已有证据和允许的研究审计来源。
                 let has_evidence = self.source_refs.iter().any(|reference| {
                     matches!(
                         reference.kind,

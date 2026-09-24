@@ -1,6 +1,12 @@
+// Structured protocol 的“动态”部分仍由 Rust 绑定：Manifest 决定可引用 ID 和
+// evidence scope，日历决定 thesis expiry，allocation anyOf 决定零权重弃权与非零
+// 支持条件。Deliberation repair 只修元数据，正式 result 的语义变化必须显式进入新的
+// Proposal/Review lineage，不能借字段修复绕过 ProposalReview。
 // Field-level repair feedback for the structured research protocol. Keep the
 // original assessment and result untouched; the model must correct its values.
 fn validate_research_deliberation(summary: &akzio_domain::DeliberationSummary) -> ResearchResult<()> {
+    // 文本数组与分数数组必须一一对应，且 uncertainty 权重守恒；错误只反馈字段，
+    // 不修改调用方传入的 summary，便于持久化 before/after 对比。
     let mut errors = Vec::new();
     for (field, scores, texts) in [
         ("alternative_match_ppm", summary.alternative_match_ppm.len(), summary.alternatives.len()),
@@ -23,6 +29,8 @@ fn validate_research_deliberation(summary: &akzio_domain::DeliberationSummary) -
 }
 
 fn bind_synthesis_submission_schema(schema: &mut Value) {
+    // Synthesizer 必须保留所有 selected Claim/Critique 以闭合 provenance；零分配和
+    // 非零分配使用互斥 Schema 分支，避免模型用 null/空数组模糊执行意图。
     for field in ["claims", "critiques"] {
         let array = &mut schema["properties"]["result"]["properties"][field];
         let count = array.pointer("/items/properties/artifact_id/enum")
@@ -47,6 +55,8 @@ fn bind_synthesis_submission_schema(schema: &mut Value) {
 // Scope is bound from the same selected evidence inspected by the business
 // validator. Grouping identical scopes avoids repeating a branch per document.
 fn bind_ground_scope_schema(store: &Store, manifest: &ContextManifest, schema: &mut Value, contract_version: u32) -> ResearchResult<()> {
+    // 对相同资产 scope 的 Evidence 合并一个 anyOf 分支，既绑定精确 Artifact ID，
+    // 又避免重复生成等价 Schema；未验证新闻的空 scope 只能走 descriptive 分支。
     let Some(items) = schema.pointer_mut("/properties/result/properties/grounds/items") else { return Ok(()); };
     let allowed = items.pointer("/properties/evidence/properties/artifact_id/enum")
         .and_then(Value::as_array).cloned().unwrap_or_default();
@@ -144,6 +154,8 @@ fn bind_common_forecast_times(
     calendars: &BTreeMap<String, BTreeMap<String, DateTime<Utc>>>,
     now: DateTime<Utc>,
 ) -> ResearchResult<()> {
+    // 只选择四资产都存在且晚于当前提交时刻的共同交易 Session close；自然日/单一
+    // 资产日历不能替代共同 Session，模型提交的 expiry 也不能覆盖 Rust 绑定值。
     if Asset::EXECUTABLE
         .iter()
         .any(|asset| !calendars.contains_key(asset.symbol()))
@@ -353,6 +365,8 @@ mod structured_boundary_tests {
 }
 
 fn semantic_changed_paths(before: &Value, after: &Value, path: &str, changes: &mut Vec<String>) {
+    // 递归只报告 JSON 语义路径，不比较对象键顺序；用于 Review/修复审计，不能把
+    // 变化自动判定为可接受。
     if before == after {
         return;
     }
@@ -372,6 +386,8 @@ fn semantic_changed_paths(before: &Value, after: &Value, path: &str, changes: &m
 }
 
 fn bind_frozen_result(arguments: &mut Value, result: Value) -> ResearchResult<()> {
+    // 只有缺少 result 的 metadata-only repair 可以由 Rust 补回旧结果；模型若同时
+    // 带 result，宁可拒绝也不静默覆盖，保持原始提交和修订之间的可追溯性。
     if arguments.get("result").is_some() {
         return Err(ResearchError::InvalidOutput(
             "deliberation repair must not submit result".into(),
@@ -397,6 +413,8 @@ fn validate_repair_semantics(
     after: &Value,
     feedback: &[ModelToolOutput],
 ) -> ResearchResult<()> {
+    // deliberation 反馈不能改变正式 result；任何语义漂移都必须走普通 Submit/Review
+    // 版本链，而不是把“修复”当作无痕改写。
     if before["result"] != after["result"]
         && feedback.iter().any(|f| {
             f.output["message"]
@@ -411,6 +429,8 @@ fn validate_repair_semantics(
 
 impl AgentRuntime {
     async fn last_structured_submission(&self, traces: &[ArtifactRef]) -> ResearchResult<Value> {
+        // 从最新到最旧的 AgentTurn 找到 immutable result，再采用最近 deliberation；
+        // 这让一次修复只更新元数据，不依赖内存中的模型对象。
         let traces = traces.to_vec();
         self.store_executor
             .execute(move |store| {
@@ -451,6 +471,8 @@ impl AgentRuntime {
         revision: u16,
         feedback: &[ModelToolOutput],
     ) -> ResearchResult<()> {
+        // 记录修订时保留最近两次 terminal submission 的 before/after hash、改变路径和
+        // validation feedback；StageAcceptance 是审计观察，不等于新提案已被 Review 接受。
         let trace_candidates = traces
             .iter()
             .rev()

@@ -2,6 +2,7 @@ import Foundation
 
 enum WorkflowLayout {
     static func position(_ stage: WorkflowStageKind) -> (column: Int, row: Int) {
+        // 这是纯展示布局映射；column/row 不参与 Rust DAG 依赖或执行顺序。
         switch stage {
         case .planner: (0, 1)
         case .evidenceGate: (1, 1)

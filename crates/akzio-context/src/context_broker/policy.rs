@@ -1,3 +1,5 @@
+// 文件导读：落实 ContextPolicy 的 Artifact kind/source/producer 约束、Run/overlay 资格、
+// raw source closure 和精确内部 producer allowlist；所有函数只读验证或构造闭包。
 impl ContextBroker {
     // 检查单个 Artifact 是否同时满足 ContextPolicy、内部 producer/kind allowlist 和
     // 特殊类型规则；RawEvidence 永远不能直接进入 Manifest，ExPost regime 也不能作为
@@ -7,6 +9,7 @@ impl ContextBroker {
         policy: &ContextPolicy,
         artifact: &Artifact,
     ) -> ContextResult<()> {
+        // 先拒绝 Raw/ExPost，再检查 policy、内部 producer 和 source family allowlist。
         if artifact.kind == ArtifactKind::RawEvidence {
             return Err(ContextError::RawEvidenceInManifest);
         }
@@ -38,6 +41,7 @@ impl ContextBroker {
         permit: &TaskWritePermit,
         artifact: &Artifact,
     ) -> ContextResult<()> {
+        // 普通材料必须属于当前 Run；Lesson/Experience/CandidatePolicy 走独立 overlay 资格。
         // 普通 RunScoped 材料必须属于当前 Run；Lesson/Experience/CandidatePolicy 通过
         // 独立 overlay 资格，canary 父证据则只能命中 Store 登记的冻结复用关系。
         if artifact.kind == ArtifactKind::NormalizedEvidence
@@ -66,6 +70,7 @@ impl ContextBroker {
     }
 
     fn overlay_is_eligible(&self, artifact: &Artifact) -> ContextResult<bool> {
+        // 按 ArtifactKind 分别验证 Lesson、canonical Experience 和 CandidatePolicy 的来源/状态。
         // Lesson 依据 payload/lifecycle 判断；Experience/CandidatePolicy 还要满足记录过的
         // influence subject、canonical learning 来源和当前 Policy head。这里只读资格，不激活/更新 head。
         match artifact.kind {
@@ -154,6 +159,7 @@ impl ContextBroker {
     }
 
     fn is_canonical_paper_artifact(&self, artifact: &Artifact) -> ContextResult<bool> {
+        // 仅接受 Canonical 生命周期且来自 RunPurpose::Paper 的产物。
         // CandidatePolicy/Experience 只能引用 Canonical 且属于 canonical learning Run 的
         // Artifact；生命周期或 RunPurpose 不符合时直接退出，避免隔离/调试数据进入正式学习。
         if artifact.lifecycle != ArtifactLifecycle::Canonical {
@@ -170,6 +176,7 @@ impl ContextBroker {
     }
 
     fn read_payload<T: DeserializeOwned>(&self, artifact: &Artifact) -> ContextResult<T> {
+        // 从已通过上层权限检查的 CAS BLOB 反序列化 typed payload，不额外授予访问权。
         // 所有 typed payload 都从 Artifact 的 CAS blob 解码；本 helper 不授予权限，调用方
         // 负责先完成 Artifact/Grant 边界校验，serde 错误原样转成 ContextError。
         Ok(serde_json::from_slice(
@@ -182,6 +189,7 @@ impl ContextBroker {
         policy: &ContextPolicy,
         selections: &[ContextSelection],
     ) -> ContextResult<BTreeSet<ArtifactId>> {
+        // 用 VecDeque/BTreeSet 做有界 BFS，沿 source_refs 收集允许 source family 的 RawEvidence。
         // 从已选 Artifact 沿 source_refs 做有界去重遍历，只收集符合 source family 的
         // RawEvidence；allow_raw_reread=false 时返回空集合，普通 Manifest 仍不暴露原文。
         if !policy.allow_raw_reread {
@@ -193,6 +201,7 @@ impl ContextBroker {
             .map(|selection| selection.artifact.artifact_id.clone())
             .collect::<VecDeque<_>>();
         let mut seen = BTreeSet::new();
+        // pop_front 逐层展开；seen 保证 DAG 共享节点不重复读取，也阻断循环。
         while let Some(artifact_id) = queue.pop_front() {
             if !seen.insert(artifact_id.clone()) {
                 continue;
@@ -222,6 +231,7 @@ impl ContextBroker {
 /// Exact internal producer/kind pairs. External evidence retains the contract's
 /// source allowlist and untrusted-content policy; no namespace wildcard grants.
 fn governed_internal_source(artifact: &Artifact) -> bool {
+    // 用精确的 source_family + (kind, producer) 配对限制内部 Artifact，禁止命名空间通配。
     // 这里是精确的内部 producer/kind 配对；未知 source family 只允许基础外部证据类型，
     // 最终仍要经过 ContextPolicy 的 source allowlist 和不可信内容隔离，不能依赖命名空间通配。
     use ArtifactKind::*;

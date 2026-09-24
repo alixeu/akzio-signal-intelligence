@@ -1,3 +1,11 @@
+// 文件导读：ControlApiClient 是 CLI 到 loopback daemon 的唯一 HTTP/SSE 传输层。它读取
+// 已存在的 `.daemon-token`、限制 loopback、统一附加认证 header，并把 JSON/事件流交给
+// 服务端权威处理；HTTP 200 只证明请求被响应，不能推断 workflow、Paper submission、
+// fill 或 Outcome 状态。
+// Rust 机制：`ControlApiClient` 拥有 Client/Url/token，方法借用 `&self`；泛型
+// `json<T: DeserializeOwned>` 把响应解析为调用方类型；异步 `bytes_stream` 以 Future/Stream
+// 分块处理 SSE，pending UTF-8 字节由可变 Vec 借用保留到下一 chunk。
+
 use super::*;
 
 pub(crate) struct ControlApiClient {
@@ -8,6 +16,8 @@ pub(crate) struct ControlApiClient {
 
 impl ControlApiClient {
     pub(crate) fn from_config(config: &Config) -> Result<Self> {
+        // 只读取已经存在的 token；CLI 查询不会为了“方便”创建认证文件或修改权限，
+        // 启动目标 Core 的 token 与当前 Store Root 不一致时直接失败。
         // A read-only inspect must not create credentials or chmod a Store file.
         let token = validate_daemon_token(
             fs::read_to_string(daemon_token_path(&config.daemon))
@@ -18,6 +28,8 @@ impl ControlApiClient {
     }
 
     pub(crate) fn new(address: SocketAddr, token: String) -> Result<Self> {
+        // Client 禁止 proxy/redirect，确保认证请求留在 loopback 且不会把 token 跟随重定向
+        // 发送到其他 host。
         if !address.ip().is_loopback() {
             bail!("daemon.http_addr must be a loopback address");
         }
@@ -38,6 +50,7 @@ impl ControlApiClient {
     }
 
     pub(crate) fn endpoint(&self, segments: &[&str]) -> Url {
+        // 逐段 push 让 Url 负责转义/路径组合；调用方只提供固定 API segment，不拼接原始 URL。
         let mut url = self.base_url.clone();
         let mut path = url
             .path_segments_mut()
@@ -51,12 +64,15 @@ impl ControlApiClient {
     }
 
     pub(crate) fn request(&self, method: Method, url: Url) -> RequestBuilder {
+        // 所有请求在这里统一加 token，避免某个 handler 忘记认证 header。
         self.client
             .request(method, url)
             .header("x-akzio-token", &self.token)
     }
 
     pub(crate) async fn json<T: DeserializeOwned>(&self, request: RequestBuilder) -> Result<T> {
+        // `T: DeserializeOwned` 要求响应拥有自己的反序列化数据；先检查 HTTP status，
+        // 再消费 Response body，避免把错误 HTML/JSON 当作业务响应。
         let response = request
             .send()
             .await
@@ -233,6 +249,7 @@ impl ControlApiClient {
     }
 
     pub(crate) async fn events(&self, run_id: &str, after: i64) -> Result<()> {
+        // SSE client 只打印服务端已产生的事件；cursor 是观察起点，不是本地状态机的推进命令。
         let mut url = self.endpoint(&["runs", run_id, "events"]);
         url.query_pairs_mut()
             .append_pair("after", &after.to_string());
@@ -277,6 +294,7 @@ fn sse_lines(pending: &mut Vec<u8>, chunk: &[u8]) -> Result<Vec<String>> {
 }
 
 async fn require_success(response: Response) -> Result<Response> {
+    // Response 仍由调用方拥有；失败分支只返回状态错误，不读取或猜测服务端 payload。
     if response.status().is_success() {
         Ok(response)
     } else {
@@ -285,6 +303,7 @@ async fn require_success(response: Response) -> Result<Response> {
 }
 
 fn print_sse_data(event_data: &mut Vec<String>) {
+    // 空行是 SSE event 边界；join 后清空可变 Vec，避免下一个 event 复用旧 data。
     if !event_data.is_empty() {
         println!("{}", event_data.join("\n"));
         event_data.clear();
@@ -292,6 +311,7 @@ fn print_sse_data(event_data: &mut Vec<String>) {
 }
 
 impl ControlApiClient {
+    // Store/Lesson 方法只是固定 endpoint 的薄包装；真正的 CAS/生命周期变更始终在 daemon。
     pub(crate) async fn store_doctor(&self) -> Result<serde_json::Value> {
         self.json(self.request(Method::GET, self.endpoint(&["control", "store", "doctor"])))
             .await

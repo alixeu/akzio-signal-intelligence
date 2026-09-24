@@ -1,3 +1,4 @@
+# 文件职责：声明 akzio CLI 二进制及其对 Daemon、Domain、Execution、Research 和 Store 的编排依赖。
 [package]
 name = "akzio-cli"
 version = "0.2.0"

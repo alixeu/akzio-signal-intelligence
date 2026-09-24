@@ -1,3 +1,6 @@
+// lowering 只接受当前三种活动 RunPurpose，并把 Rust terminal chain 附加到研究图。
+// Shadow 可以替换 Analyst candidate contract，但仍需未激活、能力不扩张且 recipe
+// 参数一致；这不是把 candidate 自动升级为 canonical active Contract。
 impl WorkflowRuntime {
     /// Compile a model proposal into a graph plus Rust-owned terminal gates. The
     /// proposal cannot name any gate recipe, create a contract, or omit final
@@ -7,6 +10,8 @@ impl WorkflowRuntime {
         purpose: RunPurpose,
         proposal: &WorkflowProposal,
     ) -> RuntimeResult<WorkflowGraph> {
+        // 先拒绝退休 purpose 和 proposal 中的非法节点，再由 with_terminal_gates
+        // 补全固定业务链；图构造成功只说明编译结果可检查。
         if !matches!(purpose,RunPurpose::Paper|RunPurpose::PositionPlan|RunPurpose::Shadow) { return Err(RuntimeError::LegacyWorkflowRetired); }
         let nodes = self.lower_research_nodes(proposal)?;
         self.with_terminal_gates(purpose, proposal.topology_id.clone(), nodes)
@@ -38,6 +43,8 @@ impl WorkflowRuntime {
         evidence_inputs: &[ArtifactRef],
         analyst_contract_hash: Option<&ContentHash>,
     ) -> RuntimeResult<WorkflowGraph> {
+        // Shadow fork 重新分配全部 TaskId、重写依赖引用并替换输入 EvidenceNeed，避免
+        // 与父 Run 共用可写 Attempt；历史 Artifact 只通过 reference 保留 provenance。
         candidate.validate()?;
         let mut evidence_inputs = evidence_inputs.to_vec();
         evidence_inputs.sort();

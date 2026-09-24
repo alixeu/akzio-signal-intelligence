@@ -4,6 +4,8 @@
 //! snapshot, follows only the selected run's artifact closure, and writes a
 //! derived directory outside the Store.  It never repairs, migrates, claims,
 //! leases, calls a model, or calls a network adapter.
+// 文件导读：Debug Bundle 从一个 Deferred SQLite snapshot 读取 Run 的事件和 CAS 闭包，
+// 生成脱敏的 JSON/JSONL/Markdown 文件；导出目录是派生快照，不回写 Store，也不证明业务阶段完成。
 
 use super::blob::read_blob_bytes;
 use super::debug::{environment_identity, read_session};
@@ -87,6 +89,7 @@ impl Store {
     /// read transaction.  The target must not exist.  Existing debug
     /// isolation decides whether provider request/result bodies may be
     /// included; the caller cannot elevate that permission with a flag.
+    // 先在同一 Deferred snapshot 收集事件、任务、Artifact/source closure，再在事务外写新目录。
     pub fn export_debug_bundle(
         &self,
         run_id: &RunId,
@@ -628,6 +631,7 @@ impl Store {
     }
 }
 
+// 目标检查会创建并 canonicalize 父目录，但拒绝已存在目标和 Store Root 内路径。
 fn validate_export_target(target: &Path, store_root: &Path) -> StoreResult<()> {
     if target.exists() {
         return Err(StoreError::BackupTargetExists(target.to_path_buf()));
@@ -654,6 +658,7 @@ fn validate_export_target(target: &Path, store_root: &Path) -> StoreResult<()> {
     Ok(())
 }
 
+// 只恢复 Run 的持久身份列；无法解析的历史 purpose 保留为 None，供 bundle 明确显示未知。
 fn read_run_identity(
     connection: &Connection,
     run_id: &RunId,
@@ -693,6 +698,7 @@ fn read_run_identity(
     ))
 }
 
+// raw model 权限同时绑定 purpose、DebugSession、learning scope 和 Store identity，不能由导出参数提升。
 fn raw_model_access(
     connection: &Connection,
     run_id: &RunId,
@@ -754,6 +760,7 @@ fn raw_model_access(
     )
 }
 
+// 跨 Run payload 只允许 session identity 登记的 dataset/parent_artifacts；共享无 origin CAS 可直接闭包读取。
 fn cross_run_payload_allowed(
     artifact: &Artifact,
     run_id: &RunId,
@@ -792,6 +799,7 @@ fn cross_run_payload_allowed(
     })
 }
 
+// typed snapshot 不可读时只返回 SQL 行的保守 fallback，不把 fallback 当成完整 Workflow 证明。
 fn raw_workflow_fallback(
     connection: &Connection,
     run_id: &RunId,
@@ -813,6 +821,7 @@ fn raw_workflow_fallback(
     Ok(json!({"run_id": run_id, "tasks": tasks, "unavailable": "typed_workflow_snapshot"}))
 }
 
+// 事件按 durable cursor 一次性读取，后续派生视图都以这份快照为输入。
 fn read_events_snapshot(connection: &Connection, run_id: &RunId) -> StoreResult<Vec<StoredEvent>> {
     connection
         .prepare("SELECT event_id, run_id, task_id, attempt_id, event_type, artifact_id, created_at FROM rebuild_events WHERE run_id=?1 ORDER BY event_id ASC")?
@@ -821,6 +830,7 @@ fn read_events_snapshot(connection: &Connection, run_id: &RunId) -> StoreResult<
         .map_err(StoreError::from)
 }
 
+// 优先复用 typed workflow JSON；缺失时从 rebuild_tasks 恢复有限字段，保留 not_recorded 边界。
 fn task_index(
     connection: &Connection,
     run_id: &RunId,
@@ -840,6 +850,7 @@ fn task_index(
     Ok(json!({"tasks": tasks}))
 }
 
+// 导出 Task/Attempt 行和固定的 error 未记录说明，不从缺失列推断失败原因。
 fn read_tasks_attempts(
     connection: &Connection,
     run_id: &RunId,
@@ -861,6 +872,7 @@ fn read_tasks_attempts(
     )
 }
 
+// 只把成功 Attempt output 索引加入闭包，避免把任意事件 Artifact 当成正式输出。
 fn attempt_output_ids(connection: &Connection, run_id: &RunId) -> StoreResult<Vec<ArtifactId>> {
     let ids = connection
         .prepare("SELECT o.artifact_id FROM rebuild_attempt_outputs o JOIN rebuild_attempts a ON a.attempt_id=o.attempt_id WHERE a.run_id=?1 ORDER BY o.event_id")?
@@ -875,6 +887,7 @@ fn attempt_output_ids(connection: &Connection, run_id: &RunId) -> StoreResult<Ve
         .collect()
 }
 
+// 用任务 recipe、NodeSpec 和 Artifact payload 为事件补充 role/horizon/phase，不修改原事件。
 fn enrich_event(
     event: StoredEvent,
     task_index: &serde_json::Value,
@@ -920,11 +933,13 @@ fn enrich_event(
     }
 }
 
+// 兼容旧式平铺 task 和当前 node 嵌套 task 的导出字段形状。
 fn task_field<'a>(task: &'a serde_json::Value, field: &str) -> Option<&'a serde_json::Value> {
     task.get(field)
         .or_else(|| task.pointer(&format!("/node/{field}")))
 }
 
+// 只从已经捕获的 BundleArtifact 查 payload；省略或损坏的 Artifact 返回 None。
 fn artifact_payload<'a>(
     artifacts: &'a [BundleArtifact],
     id: &ArtifactId,
@@ -935,6 +950,7 @@ fn artifact_payload<'a>(
         .and_then(|artifact| artifact.payload.as_ref())
 }
 
+// AgentTurn terminal 事件按 attempt 配对；没有 terminal 的 started 记录为 unknown_after_crash。
 fn build_llm_calls(
     events: &[BundleEvent],
     artifacts: &[BundleArtifact],
@@ -1090,6 +1106,7 @@ fn build_llm_calls(
     calls
 }
 
+// Tool 记录只展示持久化调用/结果的生命周期和有限元数据，不从正文推断权限细节。
 fn build_tool_records(
     events: &[BundleEvent],
     artifacts: &[BundleArtifact],
@@ -1128,6 +1145,7 @@ fn build_tool_records(
         .collect()
 }
 
+// Rust decision 记录只投影已持久化的 typed Artifact；缺 payload 时明确标为 missing_payload。
 fn build_rust_decisions(
     events: &[BundleEvent],
     artifacts: &[BundleArtifact],
@@ -1186,6 +1204,7 @@ fn build_rust_decisions(
         .collect()
 }
 
+// 按四资产三期限建立固定 slots，缺失 forecast 保留 not_returned，不把空值解释为中性或安全。
 fn build_decision_matrix(
     artifacts: &[BundleArtifact],
     _task_index: &serde_json::Value,
@@ -1259,6 +1278,7 @@ fn build_decision_matrix(
     json!({"schema_version":DOMAIN_SCHEMA_VERSION,"units":{"probability":"ppm","expected_return":"ppm","weights":"ppm","confidence":"ppm"},"slots":slots,"contexts":contexts,"claims":claims,"critiques":critiques,"research_plans":research_plans,"unmatched_forecasts":forecasts})
 }
 
+// 收集与风险/Policy 相关的已捕获 Artifact，unknown 字段保持 null，不重跑 Gate。
 fn build_policies_and_risk(
     artifacts: &[BundleArtifact],
     debug_session: &Option<serde_json::Value>,
@@ -1286,6 +1306,7 @@ fn build_policies_and_risk(
 // Keep content structured so the same recursive redactor covers JSON and
 // NDJSON provider envelopes. Text is an explicit derived representation, not
 // an assertion that exported bytes have the original CAS hash.
+// 只解码完整 JSON、完整 NDJSON 或明确 UTF-8 文本；部分 JSON 和二进制不被当作成功 payload。
 fn decode_bundle_payload(media_type: &str, bytes: &[u8]) -> Option<serde_json::Value> {
     if let Ok(value) = serde_json::from_slice(bytes) {
         return Some(value);
@@ -1307,6 +1328,7 @@ fn decode_bundle_payload(media_type: &str, bytes: &[u8]) -> Option<serde_json::V
     .then(|| json!({"export_encoding":"utf8", "media_type":media_type, "text":text}))
 }
 
+// 从持久化 provider envelope 提取 acquisition 调用和 usage；模型自述或文章正文不构成调用证据。
 fn observed_acquisition_calls(artifacts: &[BundleArtifact]) -> Vec<serde_json::Value> {
     let mut seen = BTreeSet::new();
     let mut calls = Vec::new();
@@ -1366,6 +1388,7 @@ fn observed_acquisition_calls(artifacts: &[BundleArtifact]) -> Vec<serde_json::V
     calls
 }
 
+// 仅汇总 NormalizedEvidence 中显式 source_review error/validation_failures。
 fn source_review_failures(artifacts: &[BundleArtifact]) -> serde_json::Value {
     let rows = artifacts.iter().filter(|a| a.artifact.kind == ArtifactKind::NormalizedEvidence)
         .filter_map(|artifact| {
@@ -1378,6 +1401,7 @@ fn source_review_failures(artifacts: &[BundleArtifact]) -> serde_json::Value {
     json!(rows)
 }
 
+// 只有 provider_result/audit response 中的 web_search_call.action 才算 observed web action。
 fn observed_web_calls(artifacts: &[BundleArtifact]) -> Vec<serde_json::Value> {
     let mut seen = BTreeSet::new();
     let mut calls = Vec::new();
@@ -1434,6 +1458,7 @@ fn observed_web_calls(artifacts: &[BundleArtifact]) -> Vec<serde_json::Value> {
     calls
 }
 
+// 记录 EvidenceNeed/Raw/Normalized/semantic 的捕获状态，并分离搜索发生与来源核验。
 fn build_evidence_status(
     artifacts: &[BundleArtifact],
     _events: &[BundleEvent],
@@ -1478,6 +1503,7 @@ fn build_evidence_status(
         "hosted_web_search_evidence_is_only_claimed_when_provider_payload_contains_web_search_call_action_sources":true})
 }
 
+// 对每个 ContextManifest 标出 selected/unselected projection；导出存在不等于 cutoff 时可用。
 fn build_context_coverage(artifacts: &[BundleArtifact]) -> serde_json::Value {
     let manifests = artifacts
         .iter()
@@ -1522,6 +1548,7 @@ fn build_context_coverage(artifacts: &[BundleArtifact]) -> serde_json::Value {
     })
 }
 
+// 把每次 AgentTurn 的阶段、usage 和 retry 字段平铺为覆盖投影，不补齐 provider 未返回的值。
 fn build_draft_submit_coverage(calls: &[serde_json::Value]) -> serde_json::Value {
     let records = calls
         .iter()
@@ -1554,6 +1581,7 @@ fn build_draft_submit_coverage(calls: &[serde_json::Value]) -> serde_json::Value
     json!({"schema_version": DOMAIN_SCHEMA_VERSION, "records": records})
 }
 
+// 将 acceptance artifact 与 workflow status 分开统计；NOT_RUN/NOT_REACHED 都不会变成 PASS。
 fn build_stage_acceptance(
     artifacts: &[BundleArtifact],
     tasks: &[serde_json::Value],
@@ -1586,6 +1614,7 @@ fn build_stage_acceptance(
     json!({"schema_version": DOMAIN_SCHEMA_VERSION, "records": records, "tasks":tasks,"counts":counts,"workflow_status_counts":workflow_status_counts,"not_run_is_not_pass": true})
 }
 
+// 汇总失败、crash unknown、cancel、tool failure 和缺失/损坏记录，保留 raw access 权限边界。
 fn build_failures_and_missing(
     events: &[BundleEvent],
     calls: &[serde_json::Value],
@@ -1617,6 +1646,7 @@ fn build_failures_and_missing(
     })
 }
 
+// 按 role 聚合 requested/actual model、reasoning effort 和 usage 缺失计数。
 fn build_model_routes(calls: &[serde_json::Value]) -> serde_json::Value {
     let mut routes = BTreeMap::<String, serde_json::Value>::new();
     for call in calls {
@@ -1671,6 +1701,7 @@ fn build_model_routes(calls: &[serde_json::Value]) -> serde_json::Value {
     json!({"schema_version":DOMAIN_SCHEMA_VERSION,"routes":routes.values().collect::<Vec<_>>()})
 }
 
+// 只渲染已持久化且通过权限的 provider-visible material，不渲染隐藏推理或未授权正文。
 fn render_transcript(calls: &[serde_json::Value], access: &DebugBundleRawAccess) -> String {
     let mut output = String::from("# LLM transcript\n\n");
     output.push_str("This document contains persisted provider-visible material only. It does not contain hidden chain-of-thought. Opaque encrypted continuation is redacted.\n\n");
@@ -1767,6 +1798,7 @@ fn render_transcript(calls: &[serde_json::Value], access: &DebugBundleRawAccess)
     output
 }
 
+// 按 event cursor 渲染 Rust Artifact trace，明确 not_recorded 而不重新执行规则。
 fn render_rust_decisions(records: &[serde_json::Value]) -> String {
     let mut output = String::from("# Rust decision trace\n\n");
     output.push_str("Records are ordered by persisted event cursor. Fields absent from the runtime payload are `not_recorded`; this exporter does not rerun rules or infer a first blocker.\n\n");
@@ -1814,6 +1846,7 @@ fn render_rust_decisions(records: &[serde_json::Value]) -> String {
     output
 }
 
+// 生成面向人工的摘要；zero target/失败计数只描述快照，不推出安全性或业务完成。
 fn render_summary(
     run: &serde_json::Value,
     workflow: &serde_json::Value,
@@ -1886,6 +1919,7 @@ fn render_summary(
     )
 }
 
+// 说明 bundle 的只读性质、脱敏 hash 和 join 顺序，避免 README 被误读成运行验收。
 fn render_readme(access: &DebugBundleRawAccess) -> String {
     format!(
         "# Akzio Debug Bundle\n\nThis directory is a share-safe, read-only projection of one persisted Run. It was generated without calling a model, fetching evidence, placing an order, repairing Store data, or rerunning a decision.\n\n- Exporter: `{EXPORTER_VERSION}`\n- Provider request/result detail: `{}` (`{}`)\n- `source_artifact_hash` identifies the CAS object; `export_payload_hash` identifies the redacted exported payload. They are intentionally different when redaction occurred.\n- `not_returned`, `not_recorded`, `not_authorized`, and `unknown_after_crash` are evidence boundaries, not inferred values.\n- `checksums.sha256` covers every regular file except itself. No symlinks are permitted.\n\nJoin order: `timeline.jsonl` cursor → `llm_calls.jsonl` call/artifact refs → `tools.jsonl` call_id → `rust_decisions.jsonl` artifact/event refs. `SUMMARY.md` is the short human-readable orientation; the JSONL files are the machine-readable facts.\n",
@@ -1898,6 +1932,7 @@ fn render_readme(access: &DebugBundleRawAccess) -> String {
     )
 }
 
+// 在同一 task/attempt 的已排序调用中寻找前一个 call_id，缺失时保持 None。
 fn parent_call_id_for_event(event: &BundleEvent, calls: &[serde_json::Value]) -> Option<String> {
     let current = event.call_id.as_deref()?;
     calls
@@ -1912,10 +1947,12 @@ fn parent_call_id_for_event(event: &BundleEvent, calls: &[serde_json::Value]) ->
         .map(str::to_owned)
 }
 
+// recipe 已是 Store 记录的 role 标识，这里只做字符串投影，不映射成新的业务角色。
 fn role_name(recipe: &str) -> String {
     recipe.to_owned()
 }
 
+// 对 JSON 记录逐项调用 share-safe redactor，并集中收集 redaction notes。
 fn redact_records(
     records: &[serde_json::Value],
     redactions: &mut Vec<String>,
@@ -1926,12 +1963,14 @@ fn redact_records(
         .collect()
 }
 
+// 复制后脱敏，调用方的内存 payload 不会被导出器原地改写。
 fn redact_value(value: &serde_json::Value, redactions: &mut Vec<String>) -> serde_json::Value {
     let mut value = value.clone();
     redact_share_safe(&mut value, redactions);
     value
 }
 
+// 递归处理对象、数组和 credential-bearing text；token usage 等非敏感字段原样保留。
 fn redact_share_safe(value: &mut serde_json::Value, redactions: &mut Vec<String>) {
     match value {
         serde_json::Value::Object(map) => {
@@ -1964,6 +2003,7 @@ fn redact_share_safe(value: &mut serde_json::Value, redactions: &mut Vec<String>
     }
 }
 
+// 判断字段名是否属于凭据、cookie、header 或加密续接内容。
 fn is_sensitive_key(key: &str) -> bool {
     [
         "api_key",
@@ -1986,6 +2026,7 @@ fn is_sensitive_key(key: &str) -> bool {
     })
 }
 
+// 判断字符串是否包含常见 bearer/key/token 片段；命中后只输出结构化 marker。
 fn looks_sensitive(value: &str) -> bool {
     [
         "Bearer ",
@@ -2002,11 +2043,13 @@ fn looks_sensitive(value: &str) -> bool {
     .any(|needle| value.contains(needle))
 }
 
+// marker 保留原始类型、长度和 hash 指纹，便于审计但不保留秘密正文。
 fn redaction_marker(value: &serde_json::Value, reason: &str) -> serde_json::Value {
     let bytes = serde_json::to_vec(value).unwrap_or_default();
     json!({"redacted":true,"reason":reason,"original_type":match value { serde_json::Value::Null=>"null",serde_json::Value::Bool(_)=>"bool",serde_json::Value::Number(_)=>"number",serde_json::Value::String(_)=>"string",serde_json::Value::Array(_)=>"array",serde_json::Value::Object(_)=>"object" },"original_bytes":bytes.len(),"security_fingerprint":ContentHash::of_bytes(&bytes)})
 }
 
+// 根据正文中最长连续反引号选择更长 fence，确保渲染不会截断 payload。
 fn markdown_fence(text: &str) -> String {
     let mut longest = 0usize;
     let mut current = 0usize;
@@ -2022,6 +2065,7 @@ fn markdown_fence(text: &str) -> String {
     format!("{fence}json\n{text}\n{fence}\n")
 }
 
+// 以 create_new 写入 JSON 并把实际文件字节 hash 放入 bundle manifest。
 fn write_json_file(
     target: &Path,
     name: &str,
@@ -2034,6 +2078,7 @@ fn write_json_file(
     Ok(())
 }
 
+// JSONL 按记录逐行序列化，空集合也会生成可校验的空文件。
 fn write_jsonl_file(
     target: &Path,
     name: &str,
@@ -2050,6 +2095,7 @@ fn write_jsonl_file(
     Ok(())
 }
 
+// 文本写入复用相同的 create_new、sync 和 hash 约束。
 fn write_text_file(
     target: &Path,
     name: &str,
@@ -2062,6 +2108,7 @@ fn write_text_file(
     Ok(())
 }
 
+// 文件必须不存在，写完后 sync 并设置权限；失败不会报告已完成导出。
 fn write_new_file(path: &Path, bytes: &[u8]) -> StoreResult<()> {
     let mut file = OpenOptions::new()
         .write(true)
@@ -2082,7 +2129,9 @@ fn write_new_file(path: &Path, bytes: &[u8]) -> StoreResult<()> {
     secure_file(path)
 }
 
+// 递归枚举 bundle regular files，拒绝 symlink，供 checksums 生成使用。
 fn collect_files(root: &Path) -> StoreResult<Vec<PathBuf>> {
+    // 递归过程保持目标目录内的路径约束，不跟随符号链接。
     fn walk(current: &Path, output: &mut Vec<PathBuf>) -> StoreResult<()> {
         for entry in fs::read_dir(current).map_err(|source| StoreError::Io {
             path: current.to_path_buf(),
@@ -2121,6 +2170,7 @@ mod tests {
     use super::*;
 
     #[test]
+    // 成功 Task 但缺 acceptance 只应得到 NOT_RUN/NOT_REACHED，不能由 workflow 成功推导测试通过。
     fn succeeded_workflow_without_acceptance_is_not_test_pass() {
         let tasks = vec![
             json!({"node":{"task_id":"a","recipe_id":"research.analyst"},"status":"succeeded"}),
@@ -2135,6 +2185,7 @@ mod tests {
     }
 
     #[test]
+    // acquisition 审计把 provider call、source metadata 和 review failure 分开统计。
     fn acquisition_audit_separates_calls_metadata_and_review_errors() {
         let now = Utc::now();
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2199,6 +2250,7 @@ mod tests {
     }
 
     #[test]
+    // 只接受完整 JSON/NDJSON 或文本 payload，部分 JSON 和二进制必须保持不可读边界。
     fn text_and_ndjson_export_preserve_content_without_accepting_partial_json() {
         let payload = decode_bundle_payload("text/html; charset=utf-8", b"<p>source</p>").unwrap();
         assert_eq!(payload["text"], "<p>source</p>");
@@ -2217,6 +2269,7 @@ mod tests {
     }
 
     #[test]
+    // 脱敏结果保留长度/指纹和 usage 字段，但不泄漏 credential 文本。
     fn share_safe_redaction_keeps_length_and_fingerprint_without_secret() {
         let mut value = json!({"Authorization":"Bearer sk-secret", "nested":{"encrypted_content":"opaque"}, "input_tokens": 12});
         let mut redactions = Vec::new();
@@ -2228,6 +2281,7 @@ mod tests {
     }
 
     #[test]
+    // Markdown fence 长度必须超过正文内已有的连续反引号。
     fn markdown_fence_grows_past_embedded_backticks() {
         let text = "json ``` inside";
         let rendered = markdown_fence(text);

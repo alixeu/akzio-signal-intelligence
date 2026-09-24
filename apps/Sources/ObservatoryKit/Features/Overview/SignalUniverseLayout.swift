@@ -6,6 +6,7 @@ import SwiftUI
 // functions of the snapshot, so the canvas and the interactive overlay agree and a
 // screenshot is reproducible.
 struct UniverseNode: Identifiable, Hashable {
+    // UniverseNode 是 WorkflowNodePresentation 的几何投影，保留状态和轨道信息供 Canvas 使用。
     let id: String
     let stage: WorkflowStageKind
     let status: AkzioStatus
@@ -18,6 +19,7 @@ struct UniverseNode: Identifiable, Hashable {
 }
 
 enum SignalUniverseLayout {
+    // 所有函数都是纯几何计算；Canvas 和命中层必须使用同一套结果。
     /// Radii as fractions of the card's own width and height. Scaling each axis
     /// independently is what lets the field fill a wide card instead of leaving a
     /// dead band above and below a circle inscribed in the shorter side.
@@ -41,6 +43,7 @@ enum SignalUniverseLayout {
     }
 
     static func nodes(from workflow: WorkflowPresentation) -> [UniverseNode] {
+        // group/map 闭包按阶段轨道重新组织 workflow 节点，并固定每个节点的槽位角度。
         let grouped = Dictionary(grouping: workflow.nodes) { orbit(for: $0.stage) }
         var result: [UniverseNode] = []
         for orbitIndex in 0..<orbits.count {
@@ -66,6 +69,7 @@ enum SignalUniverseLayout {
 
     /// `rotation` is the ambient drift in radians; 0 renders the canonical frame.
     static func position(_ node: UniverseNode, in size: CGSize, rotation: Double) -> CGPoint {
+        // 位置由节点固有角度、轨道半径和当前环境旋转共同决定；rotation 为零即稳定基准帧。
         let orbit = orbits[min(node.orbit, orbits.count - 1)]
         let half = extent(orbit, in: size)
         // Outer orbits drift slower, like a real system.
@@ -87,6 +91,7 @@ enum SignalUniverseLayout {
 
     /// Edges drawn in the field: the pipeline order, plus the three horizon spurs.
     static func edges(from workflow: WorkflowPresentation) -> [(String, String)] {
+        // filter/map 闭包只抽取非冲突边；SignalUniverseCanvas 会按完整边模型决定样式。
         workflow.edges
             .filter { $0.kind != .conflict }
             .map { ($0.from, $0.to) }
@@ -94,6 +99,7 @@ enum SignalUniverseLayout {
 
     /// Ambient drift in radians for a given time, or 0 when motion is paused.
     static func rotation(time: Double, policy: CanvasRenderPolicy) -> Double {
+        // 动效策略暂停时返回零，使离屏截图和减少动效场景保持确定性。
         guard policy.runsAmbient else { return 0 }
         return time / Motion.ambientPeriod * 2 * .pi * 0.08
     }

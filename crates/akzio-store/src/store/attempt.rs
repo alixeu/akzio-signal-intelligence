@@ -1,3 +1,5 @@
+// 文件导读：本文件提供 Attempt 关系、补采额度和 Attempt 事件的只读查询；
+// 这些查询验证持久化 lineage，但不会凭读取结果发布输出或改变任务状态。
 use super::*;
 
 impl Store {

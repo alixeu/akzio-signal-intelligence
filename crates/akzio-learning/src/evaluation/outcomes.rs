@@ -5,6 +5,8 @@ impl EvaluationRuntime {
         retrospective: &Retrospective,
         created_at: DateTime<Utc>,
     ) -> EvaluationRuntimeResult<()> {
+        // 只有已提交的 T+5 retrospective lesson_proposals 才进入这里；每条 proposal
+        // 先验收并写成 Draft + outcome_quarantined，绝不会因为一次 Outcome 自动变成 Active。
         for (index, candidate) in retrospective.lesson_proposals.iter().enumerate() {
             candidate.validate()?;
             let statement = candidate.statement.trim();
@@ -44,6 +46,8 @@ impl EvaluationRuntime {
                     created_at,
                 )),
             };
+            // source_refs 同时保留 retrospective 和 proposal evidence，供后续人工治理/召回
+            // 审计；空 statement 被跳过，因此“有 proposal”不等于“写入一条 Lesson”。
             self.store
                 .write_lesson(&lesson, retrospective_artifact, created_at)?;
         }
@@ -51,6 +55,8 @@ impl EvaluationRuntime {
     }
 
     fn require_paper(&self, run_id: &akzio_domain::RunId) -> EvaluationRuntimeResult<()> {
+        // Outcome/Learning 的 canonical 写入只允许 Paper；隔离 Debug 或 PositionPlan 在
+        // 这里 fail closed，不会靠调用方传入的 payload 伪装成正式样本。
         require_canonical_purpose(self.store.run_purpose(run_id)?)
     }
 
@@ -64,6 +70,8 @@ impl EvaluationRuntime {
         diagnostic_gap: &str,
         now: DateTime<Utc>,
     ) -> EvaluationRuntimeResult<(Artifact, Artifact)> {
+        // Rust-only 路径只封存数值 Outcome 和“模型不可用”的 T5 retrospective；它不创建
+        // Experience/Evaluation，也不推进 Policy，便于把部分完成与学习资格分开记录。
         self.seal_outcome_with_retrospective_fenced(
             lease,
             permit,
@@ -83,6 +91,8 @@ impl EvaluationRuntime {
         diagnostic_gap: &str,
         now: DateTime<Utc>,
     ) -> EvaluationRuntimeResult<(Artifact, Artifact)> {
+        // 有 draft 时只接受同一 outcome_id/T5 的受治理叙事，并把 draft 的来源和已提交
+        // draft Artifact 引用并入 source_refs；没有 draft 仍可形成可审计的 ModelUnavailable。
         self.seal_outcome_for_evaluation_fenced(
             lease,
             permit,
@@ -203,6 +213,8 @@ impl EvaluationRuntime {
                 now,
             )?
         };
+        // 该 Store 入口在同一带 lease 的事务中写 canonical Outcome 与 T5 retrospective；
+        // complete_task=false 可保留可重试的已密封进度，true 才同时收束当前 task。
         self.store.write_outcome_retrospective_fenced(
             lease,
             permit,

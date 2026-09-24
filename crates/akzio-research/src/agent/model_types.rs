@@ -1,3 +1,6 @@
+// 这些类型是 Rust-owned Agent/Model seam 的可持久化形状。Request 携带 Contract、
+// Manifest、ReadGrant/Materialization identity 和当前阶段；Turn 只描述模型观测，
+// 真正的 Artifact 提交、StageAcceptance 与业务完成仍在 AgentRuntime 中完成。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentToolCall {
     pub call_id: String,
@@ -164,6 +167,8 @@ struct TurnRecord {
 /// Deliberately tiny seam. The production `akzio-model` adapter and fixture tests
 /// both implement this; no execution/policy authority crosses it.
 pub trait AgentModel: Send + Sync {
+    // 默认 capability/预算是未知或空政策；生产调用必须由 Runtime 结合实际 probe
+    // 和冻结预算再次校验，trait 本身不授予工具、订单或拓扑权限。
     fn capability_snapshot(&self) -> ModelCapabilitySnapshot {
         ModelCapabilitySnapshot::unknown()
     }
@@ -213,6 +218,8 @@ impl ModelClientAdapter {
         debug: bool,
         response_language: impl Into<String>,
     ) -> Self {
+        // capability 在适配器创建时快照，之后作为每个 AgentTurn 的 provenance；
+        // with_capability_snapshot 仅用于测试/已审计 probe 的明确替换。
         let capability_snapshot = client.capability_snapshot();
         Self {
             client,
@@ -263,6 +270,9 @@ impl AgentModel for ModelClientAdapter {
         on_event: ModelEventSink,
     ) -> BoxFuture<'a, ResearchResult<AgentModelTurn>> {
         Box::pin(async move {
+            // Continue 请求只携带模型 continuation 与已持久化 ToolResult；Fresh 请求
+            // 才发送 objective/context。terminal tool 被强制 required，确保 Submit
+            // 结果不会因为普通文本返回而被误认为正式输出。
             let terminal_name = request
                 .terminal
                 .as_ref()
@@ -368,6 +378,8 @@ impl AgentModel for ModelClientAdapter {
                 .then(|| response.output_text.trim().to_owned());
             let mut terminal_submission = None;
             let mut tool_calls = Vec::new();
+            // 将 submit_result 与普通读取 ToolCall 分开；多个 terminal submission
+            // 是歧义错误，不能任意挑一个提交以掩盖模型返回不确定性。
             for call in response.tool_calls {
                 if call.name == TERMINAL_SUBMISSION_TOOL {
                     if terminal_submission.is_some() {

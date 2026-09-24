@@ -6,6 +6,12 @@
 //! Rust validates the temporal split, fits the forecast bins and risk model,
 //! and emits a provenance-bearing policy document for operator review.
 
+// 文件导读：这是离线历史校准边界，不是 Live DecisionGate 的在线拟合器。调用方提供带
+// provider/model/Contract/Decision provenance 的预测样本和四资产价格序列；本文件先验证
+// 训练时间严格早于 realized return、样本/价格面完整，再按概率 bin 拟合 calibration、按
+// 共同日期收益拟合资产风险与 covariance，最后生成带 input/output/risk hash 的候选
+// DecisionPolicyArtifact。生成候选不会自动写 active head 或取得 Paper 执行资格。
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use akzio_domain::{
@@ -59,6 +65,8 @@ pub struct HistoricalForecastProvenance {
 
 impl HistoricalForecastProvenance {
     fn validate(&self) -> OfflineCalibrationResult<()> {
+        // 校验 provider/model/route 和 Decision/DecisionContext 引用 kind，确保历史预测不是
+        // 无来源的数字样本。
         if self.provider_id.trim().is_empty()
             || self.model_id.trim().is_empty()
             || self.route.trim().is_empty()
@@ -118,6 +126,8 @@ pub struct OfflineRiskLimits {
 
 impl OfflineRiskLimits {
     pub fn validate(&self) -> OfflineCalibrationResult<()> {
+        // 先检查 operator 明确给出的权重、尾部损失和杠杆持有上限，再借用 DecisionPolicy
+        // 的领域校验，防止校准流程生成运行时不能读取的策略。
         if self.max_capital_weight_ppm == 0
             || self.max_capital_weight_ppm > 1_000_000
             || self.liquidity_weight_cap_ppm == 0
@@ -210,6 +220,8 @@ impl DecisionPolicyArtifact {
     pub const SCHEMA_VERSION: u32 = 1;
 
     pub fn validate(&self) -> OfflineCalibrationResult<()> {
+        // 验证 envelope/schema/provenance、内嵌 policy 以及 risk/output 内容 hash；只有三者
+        // 一致的 immutable CAS payload 才能交给 operator inspect/validate/activate。
         if self.schema_version != Self::SCHEMA_VERSION
             || self.provenance.policy_version.trim().is_empty()
             || self.provenance.algorithm_version.trim().is_empty()
@@ -253,6 +265,8 @@ impl DecisionPolicyArtifact {
 
     /// Load the complete provenance-bearing envelope from SQL CAS bytes.
     pub fn decode_strict(bytes: &[u8]) -> OfflineCalibrationResult<Self> {
+        // 先要求完整的 provenance-bearing envelope，再反序列化和 validate；裸旧 policy
+        // 即使字段看似合法，也不能被当作当前校准结果。
         let value: serde_json::Value = serde_json::from_slice(bytes)?;
         if value.get("policy").is_none() {
             return Err(OfflineCalibrationError::InvalidInput(
@@ -270,6 +284,9 @@ pub fn build_offline_decision_policy(
     input: &OfflineCalibrationInput,
     frozen_at: DateTime<Utc>,
 ) -> OfflineCalibrationResult<DecisionPolicyArtifact> {
+    // 输入→时间/来源/价格面校验→四资产×三 horizon 的概率 bin→共同价格收益风险模型→
+    // 应用 operator limits→计算 provenance hashes→返回候选。所有 iterator 只读历史输入，
+    // 不写 Store、不伪造缺失样本，也不自动激活 policy。
     validate_input(input, frozen_at)?;
     let input_hash = content_hash_json(&serde_json::to_value(input)?)?;
     let fit_dataset_hash = content_hash_json(&serde_json::to_value(&input.forecasts)?)?;
@@ -349,6 +366,8 @@ fn validate_input(
     input: &OfflineCalibrationInput,
     frozen_at: DateTime<Utc>,
 ) -> OfflineCalibrationResult<()> {
+    // 检查元数据、source run 唯一性、四资产价格序列、forecast provenance 和 cutoff/realized
+    // 时间关系；任何未来信息或跨模型样本混入都会在拟合前失败。
     input.risk_limits.validate()?;
     if input.schema_version != 1
         || input.policy_version.trim().is_empty()
@@ -450,6 +469,8 @@ fn fit_forecast_calibration(
     fit_dataset_hash: ContentHash,
     frozen_at: DateTime<Utc>,
 ) -> OfflineCalibrationResult<FrozenForecastCalibration> {
+    // 过滤同资产同 horizon 的样本，按十个连续 ppm 区间统计正例、alpha 和 Brier；空 bin
+    // 保持中性/零 alpha，实际样本不足则返回 InsufficientSamples 而不是插值。
     let samples = input
         .forecasts
         .iter()
@@ -541,6 +562,8 @@ fn fit_forecast_calibration(
 fn fit_risk_model(
     input: &OfflineCalibrationInput,
 ) -> OfflineCalibrationResult<(BTreeMap<Asset, AssetRiskCalibration>, PortfolioRiskModel)> {
+    // 先构造四资产共同日期的收益矩阵，再用 QQQ 作为 benchmark 计算波动率、beta、尾部
+    // expected shortfall、gap loss 和对称 covariance；风险值超范围或缺共同样本会拒绝。
     let returns = common_returns(input)?;
     let benchmark = returns.get(&Asset::Qqq).ok_or_else(|| {
         OfflineCalibrationError::RiskUnavailable("QQQ benchmark is missing".to_owned())
@@ -654,6 +677,8 @@ fn fit_risk_model(
 fn common_returns(
     input: &OfflineCalibrationInput,
 ) -> OfflineCalibrationResult<BTreeMap<Asset, Vec<f64>>> {
+    // 以日期为键合并各资产收盘价，只保留四资产都存在的日期，再按相邻价格计算 ppm 收益；
+    // 这样 covariance 不会因不同资产缺日而错位。
     let mut by_date = BTreeMap::<NaiveDate, BTreeMap<Asset, i64>>::new();
     for series in &input.price_series {
         for point in &series.points {
@@ -691,10 +716,12 @@ fn common_returns(
 }
 
 fn mean(values: &[f64]) -> f64 {
+    // 统计 helper 对空 slice 使用保护性分母；调用方仍在上层保证有效样本数量。
     values.iter().sum::<f64>() / values.len().max(1) as f64
 }
 
 fn variance(values: &[f64]) -> f64 {
+    // 计算样本方差，分母至少为一，供波动率和 benchmark 可测性判断使用。
     let average = mean(values);
     values
         .iter()
@@ -704,6 +731,7 @@ fn variance(values: &[f64]) -> f64 {
 }
 
 fn covariance(left: &[f64], right: &[f64]) -> f64 {
+    // 以 zip 保持同日期配对，计算两个收益序列的样本协方差。
     let left_mean = mean(left);
     let right_mean = mean(right);
     left.iter()
@@ -714,6 +742,7 @@ fn covariance(left: &[f64], right: &[f64]) -> f64 {
 }
 
 fn checked_risk_value(value: f64, asset: Asset, label: &str) -> OfflineCalibrationResult<u32> {
+    // 将浮点风险指标收敛到有限的 ppm 整数范围；NaN、无穷和异常大值都 fail closed。
     if !value.is_finite() || value <= 0.0 || value > 3_000_000.0 {
         return Err(OfflineCalibrationError::RiskUnavailable(format!(
             "{asset} {label} is outside the validated range"
@@ -723,6 +752,7 @@ fn checked_risk_value(value: f64, asset: Asset, label: &str) -> OfflineCalibrati
 }
 
 fn checked_covariance(value: f64, left: Asset, right: Asset) -> OfflineCalibrationResult<i64> {
+    // covariance 单独使用更宽的有符号范围，并在序列化前做有限性/幅度检查。
     if !value.is_finite() || value.abs() > 9_000_000_000_000.0 {
         return Err(OfflineCalibrationError::RiskUnavailable(format!(
             "covariance {left}/{right} is outside the validated range"
@@ -737,6 +767,8 @@ mod tests {
     use akzio_domain::Forecast;
 
     fn fixture_input() -> OfflineCalibrationInput {
+        // 离线测试 fixture 明确标为 fixture provider/model，只验证拟合和 provenance 规则，
+        // 不代表真实模型或 canonical Store 样本。
         let training_start = DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
@@ -829,6 +861,8 @@ mod tests {
 
     #[test]
     fn offline_policy_is_provenance_bound_and_can_produce_nonzero_target() {
+        // 正常 fixture 应生成可校验的候选策略，并证明完整 calibration 面可以产生非零 target；
+        // 这仍只是 offline-verified，不是 Paper 或 learning 资格。
         let input = fixture_input();
         let frozen_at = input.training_end + chrono::Duration::days(1);
         let artifact = build_offline_decision_policy(&input, frozen_at).unwrap();
@@ -867,6 +901,7 @@ mod tests {
 
     #[test]
     fn insufficient_historical_forecasts_never_build_a_policy() {
+        // 删除一个预测样本必须在对应 asset/horizon 处阻断，而不是降低 min_samples 或补样本。
         let mut input = fixture_input();
         input.forecasts.truncate(359);
         let error =
@@ -880,6 +915,7 @@ mod tests {
 
     #[test]
     fn strict_decode_rejects_bare_legacy_policy_without_provenance() {
+        // 旧裸策略不能通过当前严格解码入口。
         let bytes = serde_json::to_vec(&DecisionPolicy::default()).unwrap();
         assert!(DecisionPolicyArtifact::decode_strict(&bytes).is_err());
     }

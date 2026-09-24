@@ -1,3 +1,5 @@
+// 文件导读：把 Store/HTTP 使用的事件字符串限制在 Rust 拥有的生命周期事件白名单内。
+// parse 负责输入边界校验，as_str 负责把枚举稳定地编码回历史兼容字符串。
 //! Append-only durable event envelope.
 
 use crate::DomainError;
@@ -90,6 +92,7 @@ pub enum LifecycleEventType {
 }
 
 impl LifecycleEventType {
+    // 将持久化/传输层的字符串映射为受控枚举；未知值立即返回领域错误。
     pub fn parse(value: &str) -> Result<Self, DomainError> {
         let event = match value {
             "runtime.checkpoint_saved" => Self::RunCheckpointSaved,
@@ -169,6 +172,7 @@ impl LifecycleEventType {
         Ok(event)
     }
 
+    // 把枚举值编码为与 Store 历史列兼容的静态字符串，不分配新 String。
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::RunCheckpointSaved => "runtime.checkpoint_saved",

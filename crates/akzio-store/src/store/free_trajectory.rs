@@ -1,3 +1,5 @@
+// 文件导读：事件生命周期验证按 Tool/AgentTurn/Context 三类状态机扫描 cursor 顺序，
+// 只接受可闭合的 started/terminal 关系；process crash 的未闭合调用保留为可审计未知。
 struct LifecycleRow {
     cursor: i64,
     run_id: RunId,

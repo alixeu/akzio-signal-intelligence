@@ -1,3 +1,5 @@
+// 文件导读：定义 ContextManifest 的选择、隔离、投影和一次性读取授权。
+// 这里的类型只表达 Rust 已经决定的边界，实际材料读取仍由 akzio-context 执行。
 //! Context-manifest and read-grant domain vocabulary.
 
 use std::collections::BTreeSet;
@@ -47,6 +49,7 @@ pub struct ContextSelection {
 
 /// Hashes the ordered (artifact ID, kind) tuples. Selection metadata is excluded;
 /// order and repeated references are part of the existing identity contract.
+// 仅取有序选择中的 ID/kind 元组计算身份哈希；reason 和预算字段不会改变该身份。
 pub fn manifest_input_hash(
     selections: &[ContextSelection],
 ) -> Result<ContentHash, serde_json::Error> {
@@ -75,6 +78,7 @@ pub struct ContextManifestPayload {
 }
 
 impl ContextManifestPayload {
+    // 校验 schema、数量、源/投影字节预算、token 估算、kind/trust 及 quarantine 唯一性。
     pub fn validate(&self, policy: &ContextPolicy) -> Result<(), DomainError> {
         if self.schema_version != SCHEMA_VERSION
             || self.selections.len() < usize::from(policy.min_artifacts)
@@ -87,6 +91,7 @@ impl ContextManifestPayload {
                 field: "context_manifest",
             });
         }
+        // any 闭包把每个选择项的局部字段和信任边界组合成单一拒绝条件。
         if self.selections.iter().any(|selection| {
             selection.reason.trim().is_empty()
                 || selection.estimated_tokens == 0
@@ -106,6 +111,7 @@ impl ContextManifestPayload {
             .map(|selection| &selection.artifact)
             .collect::<BTreeSet<_>>();
         let mut quarantined = BTreeSet::new();
+        // BTreeSet 同时检查 quarantine 不重复，并让后续验证保持确定性。
         if self.quarantined.iter().any(|quarantine| {
             !matches!(
                 quarantine.artifact.kind,
@@ -138,6 +144,7 @@ pub struct ContextProjection {
 }
 
 impl ContextProjection {
+    // 验证父清单类型、原因和允许集合；RawEvidence 以及重复 ID 都被拒绝。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.parent_manifest.kind != ArtifactKind::ContextManifest
             || self.reason.trim().is_empty()
@@ -177,6 +184,7 @@ pub struct ReadGrant {
 }
 
 impl ReadGrant {
+    // 比较一次运行尝试的全部身份字段，防止旧 permit 被另一任务或 lease 借用。
     pub fn matches_permit(&self, permit: &TaskWritePermit) -> bool {
         self.run_id == permit.run_id
             && self.task_id == permit.task_id
@@ -186,6 +194,7 @@ impl ReadGrant {
             && permit.contract_hash.as_ref() == Some(&self.contract_hash)
     }
 
+    // 在有效期内按 raw 标志选择普通 readable 集合或原始来源闭包进行授权判断。
     pub fn permits(&self, artifact_id: &ArtifactId, raw: bool, now: DateTime<Utc>) -> bool {
         now < self.expires_at
             && if raw {
@@ -208,6 +217,7 @@ pub struct TaskWritePermit {
 }
 
 impl TaskWritePermit {
+    // 把 permit 的运行/任务/尝试身份转换为新 Artifact 的 provenance 来源。
     pub fn artifact_origin(&self) -> ArtifactOrigin {
         ArtifactOrigin {
             run_id: Some(self.run_id.clone()),

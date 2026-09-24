@@ -1,3 +1,10 @@
+// 文件导读：Observatory 配置命令只维护本地 TOML 的安全读写和 UI 可编辑投影，不启动
+// daemon、不创建 Run、不读取 Store active head，也不授予 Paper/Decision/Execution 权限。
+// 写回采用临时文件后 rename；配置成功保存与模型能力探测、Paper submission、fill、
+// Outcome 完成是独立事实。
+// Rust 机制：`&Path` 和 `&Command` 让入口只借用输入；serde/toml 的反序列化用
+// `Result` fail closed，`Option` 保留可选凭据，`toml::Value` 的可变借用只修改指定 table。
+
 fn handle_observatory_config(config_path: &Path, command: &ObservatoryConfigCommand) -> Result<()> {
     // 配置入口只负责本地 TOML 的创建、读取和更新；它不启动 daemon、不创建 Run，
     // 也不把编辑后的模型字段视为已经通过 Paper/Decision Gate。

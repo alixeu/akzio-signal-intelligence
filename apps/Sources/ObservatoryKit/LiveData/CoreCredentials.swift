@@ -1,6 +1,7 @@
 import Foundation
 
 public enum CoreModelStage: String, CaseIterable, Codable, Sendable, Hashable, Identifiable {
+    // Raw value 是 Rust 配置中的稳定 route key；Hashable/Identifiable 让字典和 SwiftUI 列表都使用同一身份。
     case analyst = "research.analyst"
     case critic = "research.critic"
     case synthesizer = "research.synthesizer"
@@ -19,6 +20,7 @@ public enum CoreModelStage: String, CaseIterable, Codable, Sendable, Hashable, I
 }
 
 public struct CoreStageModelConfiguration: Codable, Sendable, Equatable {
+    // 配置模型是值语义快照；Codable 的 CodingKeys 只负责 Swift 属性与既有 JSON/TOML 投影字段对齐。
     public var model: String
     public var reasoningEffort: String
     public var responseLanguage: String?
@@ -37,6 +39,7 @@ public struct CoreStageModelConfiguration: Codable, Sendable, Equatable {
 }
 
 public struct CoreConfiguration: Codable, Sendable, Equatable {
+    // 这是已经解析的配置值，不暴露 Codable 自定义逻辑；密钥只在受控启动/保存路径中流转。
     public let provider: String
     public let llmBaseURL: String
     public let llmAPIKey: String
@@ -50,6 +53,7 @@ public struct CoreConfiguration: Codable, Sendable, Equatable {
     public let secUserAgent: String?
 
     public var isComplete: Bool {
+        // isComplete 只判断必填值是否存在；它不验证 provider 能力、模型可用性或 Paper 业务资格。
         !provider.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !llmBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !llmAPIKey.isEmpty
@@ -67,6 +71,7 @@ public struct CoreConfiguration: Codable, Sendable, Equatable {
 }
 
 public struct CoreCredentialStatus: Sendable, Equatable {
+    // Status 只携带布尔存在性，不把 API key/secret 回显给 Settings 或日志。
     public let llmAPIKey: Bool
     public let alpacaAPIKey: Bool
     public let alpacaAPISecret: Bool
@@ -87,6 +92,7 @@ public struct CoreCredentialStatus: Sendable, Equatable {
 }
 
 public struct CoreConfigurationDraft: Sendable, Equatable {
+    // Draft 是 Settings 表单的可变值副本；保存前仍需经过 trim、完整性校验和 Core CLI 写入。
     public var provider = "openai_responses"
     public var llmBaseURL = ""
     public var llmAPIKey = ""
@@ -129,6 +135,7 @@ enum CoreCredentialError: LocalizedError {
 
 enum CoreRuntimePaths {
     static func executableURL() throws -> URL {
+        // 可执行文件优先尊重显式环境覆盖，再按 bundle/debug/release 候选查找；找不到时返回启动错误。
         let environment = ProcessInfo.processInfo.environment
         if let path = environment["AKZIO_CORE_EXECUTABLE"], !path.isEmpty {
             return URL(fileURLWithPath: path)
@@ -155,6 +162,7 @@ enum CoreRuntimePaths {
         environment: [String: String] = ProcessInfo.processInfo.environment,
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
     ) throws -> URL {
+        // home 是本地运行时根目录；创建后立即收紧到 0700，避免 Store、日志和 token 被其他用户读取。
         let home: URL
         if let path = environment["AKZIO_HOME"], !path.isEmpty {
             home = URL(fileURLWithPath: path, isDirectory: true)
@@ -173,6 +181,7 @@ enum CoreRuntimePaths {
         environment: [String: String] = ProcessInfo.processInfo.environment,
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
     ) -> URL {
+        // 路径选择是纯环境/默认值解析；真正创建配置和权限设置由 configURL 负责。
         if let path = environment["AKZIO_CORE_CONFIG"], !path.isEmpty {
             return URL(fileURLWithPath: path)
         }
@@ -182,6 +191,7 @@ enum CoreRuntimePaths {
     }
 
     static func configURL() throws -> URL {
+        // configURL 首次使用时通过 Rust observatory-config 初始化，而不是 Swift 复制模板语义。
         let environment = ProcessInfo.processInfo.environment
         if let path = environment["AKZIO_CORE_CONFIG"], !path.isEmpty {
             return URL(fileURLWithPath: path)
@@ -199,6 +209,7 @@ enum CoreRuntimePaths {
     }
 
     static func storeURL() throws -> URL {
+        // Store 路径始终位于同一受保护 AKZIO home 下，Debug/隔离边界由 Core 配置和 Store 自己执行。
         try homeURL().appending(path: "store", directoryHint: .isDirectory)
     }
 
@@ -229,6 +240,7 @@ enum CoreRuntimePaths {
     }
 
     private static func initializeConfiguration(at config: URL) throws {
+        // 初始化是一次受控子进程调用；只有退出码为 0 才把 stdout 之外的配置视为成功，stderr 仅转成错误信息。
         let process = Process()
         process.executableURL = try executableURL()
         process.arguments = [
@@ -311,6 +323,7 @@ private struct CoreFileConfiguration: Codable {
     }
 
     init(from decoder: Decoder) throws {
+        // 文件里的 stageModels 是 String key 字典；这里逐项映射到受限 CoreModelStage，未知 route 直接解码失败。
         let container = try decoder.container(keyedBy: CodingKeys.self)
         provider = try container.decode(String.self, forKey: .provider)
         llmBaseURL = try container.decode(String.self, forKey: .llmBaseURL)
@@ -343,6 +356,7 @@ private struct CoreFileConfiguration: Codable {
     }
 
     func encode(to encoder: Encoder) throws {
+        // 编码时把 enum key 还原为稳定 rawValue，保证写回格式与 Rust observatory-config 的字段契约一致。
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(provider, forKey: .provider)
         try container.encode(llmBaseURL, forKey: .llmBaseURL)
@@ -362,12 +376,14 @@ private struct CoreFileConfiguration: Codable {
 }
 
 struct CoreCredentialStore {
+    // CredentialStore 只通过 Rust CLI 的 get/set 读写配置；环境变量是草稿回退，不是另一份持久化权威。
     private enum ConfigurationAction: String {
         case get
         case set
     }
 
     static func status() -> CoreCredentialStatus {
+        // status 允许配置不完整时仍渲染 Settings；try? 失败会落到环境草稿并只暴露存在性。
         let draft = savedDraft()
         return CoreCredentialStatus(
             llmAPIKey: hasValue(draft.llmAPIKey),
@@ -378,10 +394,12 @@ struct CoreCredentialStore {
     }
 
     static func savedDraft() -> CoreConfigurationDraft {
+        // 文件读取失败不把 App 变成 mock；这里只返回表单可显示的环境/默认草稿，启动时仍会再次严格解析。
         (try? fileDraft()) ?? environmentDraft()
     }
 
     static func resolved() throws -> CoreConfiguration? {
+        // resolved 的 nil 表示“配置文件可读但必填项未齐”，由 supervisor 显示 needsConfiguration。
         let draft = try fileDraft()
         let configuration = CoreConfiguration(
             provider: draft.provider,
@@ -400,6 +418,7 @@ struct CoreCredentialStore {
     }
 
     static func save(_ draft: CoreConfigurationDraft) throws {
+        // save 先构造清洗后的值类型配置，再交给 Core CLI；Swift 不直接编辑 TOML 或 SQLite。
         let configuration = CoreConfiguration(
             provider: draft.provider.trimmingCharacters(in: .whitespacesAndNewlines),
             llmBaseURL: draft.llmBaseURL.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -437,6 +456,7 @@ struct CoreCredentialStore {
     }
 
     static func clear() throws {
+        // clear 只清空凭据字段，保留 provider/模型/route 等非秘密设置；之后 Core 必须重新配置才能启动。
         var draft = try fileDraft()
         draft.llmAPIKey = ""
         draft.alpacaAPIKey = ""
@@ -459,6 +479,7 @@ struct CoreCredentialStore {
     }
 
     private static func fileDraft() throws -> CoreConfigurationDraft {
+        // fileDraft 读取 CLI 返回的 JSON，再把文件值与环境占位符解析到一个新的 Draft，不共享可变引用。
         let data = try runConfigurationCommand(.get)
         let configuration = try JSONDecoder().decode(CoreFileConfiguration.self, from: data)
         var draft = environmentDraft()
@@ -477,6 +498,7 @@ struct CoreCredentialStore {
     }
 
     private static func resolvedSavedValue(_ value: String, fallback: String) -> String {
+        // $NAME 或 $NAME/suffix 是存储层的环境占位符；缺失环境变量时保留 fallback，不把未知占位符当秘密正文。
         guard value.hasPrefix("$") else { return value }
         let placeholder = String(value.dropFirst())
         let parts = placeholder.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
@@ -498,6 +520,7 @@ struct CoreCredentialStore {
         _ action: ConfigurationAction,
         input: Data? = nil
     ) throws -> Data {
+        // Process 的 stdout/stderr 和可选 stdin 都在同一调用中收束；非零退出统一转为 CoreCredentialError。
         let process = Process()
         process.executableURL = try CoreRuntimePaths.executableURL()
         process.arguments = [
@@ -531,6 +554,7 @@ struct CoreCredentialStore {
     }
 
     private static func environmentDraft() -> CoreConfigurationDraft {
+        // 环境变量只生成初始 Draft；JSON route 解码失败时保持默认 route，而不是猜测配置含义。
         let environment = ProcessInfo.processInfo.environment
         var draft = CoreConfigurationDraft()
         draft.llmBaseURL = environment["LLM_GATEWAY_BASE_URL"] ?? ""

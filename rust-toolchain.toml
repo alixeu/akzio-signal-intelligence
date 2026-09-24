@@ -1,3 +1,4 @@
+# 文件职责：锁定 workspace 使用的 Rust 编译器与开发组件版本，避免不同工具链改变校验结果。
 [toolchain]
 channel = "1.96.0"
 components = ["rustfmt", "clippy"]

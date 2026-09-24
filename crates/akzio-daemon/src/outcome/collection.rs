@@ -1,3 +1,10 @@
+// 文件导读：Outcome collection 在独立 outcome lease 下读取 baseline Decision/ExecutionContext
+// 和 Alpaca raw daily bars，寻找四资产共同的 T+1/T+3/T+5 session，构造可封存的
+// OutcomeMaterializationInput。窗口不足只 Deferred；真实 bars/风险评估和后续 seal 分开，
+// 不把采集完成写成 fill、NAV 或 learning 资格。
+// Rust 机制：`BTreeMap<Asset, BTreeMap<Date, MoneyMicros>>` 对齐共同日期；`join_all`/迭代器
+// 组合异步采集；fenced Store write 依赖 lease/permit，`Option<CollectedOutcome>` 表示尚未成熟。
+
 use super::*;
 
 impl Daemon {
@@ -9,6 +16,8 @@ impl Daemon {
         schedule: &OutcomeSchedule,
         now: DateTime<Utc>,
     ) -> Result<Option<CollectedOutcome>> {
+        // market_day <= baseline 时先 Deferred，避免 mint 未来/倒置的 bars Need；之后每个
+        // asset 独立采集、按共同 session 对齐，并把 risk-ground-truth 作为独立受审计输入。
         let adapter = self
             .production_evidence
             .get(&EvidenceSource::Alpaca)
@@ -185,6 +194,8 @@ impl Daemon {
         decision_producer_identity: &str,
         now: DateTime<Utc>,
     ) -> Result<Vec<(ArtifactRef, RiskGroundTruthAssessment)>> {
+        // 只接受当前 Run、当前 schedule、canonical producer 的 assessment，并检查 source
+        // closure；缺 assessment 不被默认填成满分。
         let mut assessments = Vec::new();
         for artifact in self.store.artifacts_referencing(
             &schedule_reference.artifact_id,
@@ -241,6 +252,8 @@ impl Daemon {
         need: &EvidenceNeed,
         now: DateTime<Utc>,
     ) -> Result<Artifact> {
+        // 先复用同一 task 已创建且 provenance 完整的 Need；否则在 outcome lease fencing 下
+        // 新建一份，保证 crash/retry 不重写旧 CAS。
         for artifact in self
             .store
             .run_artifacts_by_kind(&task.run_id, ArtifactKind::EvidenceNeed)?
@@ -319,6 +332,8 @@ impl Daemon {
     }
 
     pub(crate) fn paper_baseline_day(&self, run_id: &RunId) -> Result<NaiveDate> {
+        // Baseline 来自 scheduler session slot，而不是当前自然日/UTC 日期；没有 slot 的
+        // Paper Run 不能被 Outcome worker 猜测继续。
         let slot = self.store.session_slot_for_run(run_id)?.ok_or_else(|| {
             DaemonError::InvalidInput(format!("Paper run {run_id} has no session slot"))
         })?;

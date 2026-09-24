@@ -4,6 +4,15 @@
 //! while the Store and runtimes own durable state, contracts, context
 //! grants, task attempts, and workflow transitions.
 
+// 文件导读：本文件是 daemon 的组合根。它组装 StoreExecutor、WorkflowRuntime、AgentRuntime、
+// Paper scheduler、worker、HTTP/SSE、observer 和 Outcome worker，但不把 Policy、Contract、
+// Gate 或 CAS 规则下沉成调度层的私有真相。CLI/HTTP 请求进入这里后，必须沿 permit → Store
+// 事务 → runtime 的顺序推进；研究、Decision、ExecutionVerdict、Paper commitment、fill、
+// Outcome 和 learning 各自有独立 Artifact/事件边界。
+// Rust 机制：`Daemon` 持有 `Arc`、trait object 和 runtime 句柄；`Result`/thiserror 把各 crate
+// 错误保留为类型；`broadcast`/`watch` 分别承担观察事件与关闭信号，`async` Future 的 Send
+// 边界由 Tokio 任务和 StoreExecutor 共同约束。
+
 mod application;
 mod debug;
 mod dispatch;
@@ -169,6 +178,8 @@ pub enum DaemonError {
 
 impl From<PaperDecodeError> for DaemonError {
     fn from(error: PaperDecodeError) -> Self {
+        // Provider decode 的四类结果映射到 daemon 的稳定错误边界；Unavailable/InvalidInput
+        // 保持 fail-closed，Json/Domain 保留原始类型，避免把坏 payload 变成成功快照。
         match error {
             PaperDecodeError::Unavailable(message) => Self::Unavailable(message),
             PaperDecodeError::InvalidInput(message) => Self::InvalidInput(message),
@@ -429,6 +440,8 @@ pub struct DebugCoreConfig {
 
 impl Daemon {
     fn model_for(&self, purpose: &str) -> &ModelClientAdapter {
+        // ProposalReviewer 复用 Critic route；返回借用保证调用方不能替换 stage model，
+        // 真实调用仍由 AgentRuntime 绑定 Contract、预算和 capability snapshot。
         let purpose = if purpose == akzio_domain::RESEARCH_PROPOSAL_REVIEWER_RECIPE_ID {
             akzio_domain::RESEARCH_CRITIC_RECIPE_ID
         } else {
@@ -507,6 +520,7 @@ pub struct LessonInput {
 }
 
 fn default_lesson_confidence() -> u32 {
+    // serde default 只补齐 Lesson 草稿的初始置信度；它不是审核通过或学习权重。
     500_000
 }
 
@@ -578,6 +592,8 @@ pub struct PaperApprovalResponse {
 
 mod orchestration;
 fn retry_cause_for_daemon_error(error: &DaemonError) -> Option<RetryCause> {
+    // 仅把明确可重试的研究 transport/adapter 错误映射为 RetryCause；未知/internal 错误
+    // 留给 runtime 的 Failed 语义，避免扩大重试预算。
     match error {
         DaemonError::Research(error) => error.retry_cause(),
         DaemonError::Evidence(EvidenceRuntimeError::Adapter(
@@ -592,6 +608,8 @@ fn debug_fixture_evidence(
     resource: &str,
     now: DateTime<Utc>,
 ) -> AcquiredEvidence {
+    // 生成完全离线、可重复的 fixture payload；其中 synthetic weekday/bar/news 只用于
+    // 正式拓扑验证，绝不冒充交易所 calendar、真实模型或 Paper provider。
     let source_uri = if source == EvidenceSource::Alpaca && resource.starts_with("bars:") {
         format!(
             "fixture://{}/{resource}?adjustment=all&feed=iex",
@@ -698,6 +716,7 @@ fn debug_fixture_evidence(
 }
 
 fn evidence_source(source_family: &str) -> Result<EvidenceSource> {
+    // 资源的 source_family 必须命中受支持的 adapter 枚举；未知字符串不被猜测为默认源。
     match source_family {
         "alpaca" => Ok(EvidenceSource::Alpaca),
         "sec_edgar" => Ok(EvidenceSource::SecEdgar),
@@ -711,6 +730,7 @@ fn evidence_source(source_family: &str) -> Result<EvidenceSource> {
 
 impl From<StoredEvent> for EventView {
     fn from(event: StoredEvent) -> Self {
+        // 事件投影只保留 observer 所需的 cursor/type/task/time；它是只读视图，不回写事件。
         Self {
             cursor: event.cursor,
             event_type: event.event_type,
@@ -722,6 +742,8 @@ impl From<StoredEvent> for EventView {
 
 /// Resolve the canonical installed Synthesizer identity in an isolated scratch Store.
 pub fn canonical_synthesizer_contract_hash(store: &Store) -> Result<ContentHash> {
+    // 该 helper 安装/读取当前研究 catalogue 以获得 canonical Synthesizer Contract hash；
+    // 调用方用于身份比对，不由此激活 Policy 或修改已有 Run 的 Contract。
     let catalogue = akzio_research::ActiveResearchCatalogue::install(store, Utc::now())?;
     let hash = catalogue
         .contracts

@@ -1,4 +1,9 @@
+// ProposalReview 的 Schema 生成与 identity 绑定是研究提案进入 DecisionGate 前的
+// 最后一道模型协议边界。Rust 负责把精确 proposal hash、Manifest、Contract 写回
+// Review，不允许模型自报身份；Review 通过也只说明 17 个 scope 的依据经过审查。
 fn reviewed_research_schema(mut schema: Value) -> Value {
+    // 当前结构化研究把旧 supplemental_needs 换成类型化请求；实际资源与 cutoff
+    // 仍由 Rust 的补采协调节点冻结，Schema 不直接授权采集。
     if let Some(gap) = schema.pointer_mut("/properties/evidence_gaps/items") {
         gap["properties"]
             .as_object_mut()
@@ -23,6 +28,8 @@ fn reviewed_research_schema(mut schema: Value) -> Value {
     schema
 }
 fn reviewed_proposal_schema() -> Value {
+    // numeric_basis 固定覆盖 12 个 Forecast、4 个资产 allocation 和 cash 共 17 项，
+    // 让 Reviewer 能逐项判断单位、方法、假设和不确定性，而不是只看 summary。
     let mut schema = decision_proposal_output_schema();
     schema["properties"]["numeric_basis"] = json!({"type":"array","minItems":17,"maxItems":17,
         "items":{"type":"object","additionalProperties":false,"properties":{
@@ -38,6 +45,8 @@ fn reviewed_proposal_schema() -> Value {
     schema
 }
 fn proposal_review_schema() -> Value {
+    // 每个 scope 都必须产生 assessment；issues 只描述可检查的修订问题，不能成为
+    // 隐含的交易授权或 Policy 激活信号。
     let mut schema = json!({"type":"object","additionalProperties":false,"properties":{
         "proposal":artifact_ref_schema(&["decision_proposal"]),
         "proposal_hash":{"type":"string"},"manifest":artifact_ref_schema(&["context_manifest"]),"contract_hash":{"type":"string"},
@@ -63,6 +72,8 @@ fn proposal_review_schema() -> Value {
     schema
 }
 fn remove_review_identity(schema: &mut Value) {
+    // 模型 wire 不填写 proposal/manifest/contract identity；这些字段由当前 Manifest
+    // 和 Store artifact hash 注入，避免模型把旧 Review 绑定到新提案。
     let result = &mut schema["properties"]["result"];
     for key in ["proposal", "proposal_hash", "manifest", "contract_hash"] {
         result["properties"].as_object_mut().unwrap().remove(key);
@@ -78,6 +89,8 @@ fn bind_review_identity(
     contract: &AgentContract,
     arguments: &mut Value,
 ) -> ResearchResult<()> {
+    // Review 只能绑定 Manifest 中唯一的 DecisionProposal，并使用其实际 blob hash。
+    // 这里成功只是形成可验证的 Review payload，后续仍需 Rust Review/Decision Gate。
     let proposals = manifest
         .payload
         .selections

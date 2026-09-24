@@ -16,6 +16,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+// 文件导读：qualification 是纯离线、确定性的 sealed 结果组装；它不运行模型、不采集
+// 证据、不访问 Broker、不写 Store，结果也不能替代真实 Paper 或 T+1/T+3/T+5 验收。
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QualificationScenarioObservation {
     pub scenario_id: String,
@@ -69,6 +72,8 @@ pub enum QualificationRunError {
 pub fn run_offline_model_qualification(
     input: &OfflineModelQualificationInput,
 ) -> Result<OfflineModelQualificationResult, QualificationRunError> {
+    // 先完成输入/证据闭包校验，再按 stage/scenario 排序，保证 fingerprint 和 report 的
+    // 内容不受调用者传入顺序影响。
     validate_input(input)?;
 
     let mut scenarios = input.scenarios.clone();
@@ -115,6 +120,8 @@ pub fn run_offline_model_qualification(
             })
             .collect(),
     };
+    // receipt 只把已提交的 measured_metrics 绑定到 challenger；没有 receipt 的场景保留
+    // 默认空指标，但其 deterministic challenger verdict 仍由场景观察和完整闭包校验约束。
     capability_retention
         .validate()
         .map_err(|_| QualificationRunError::InvalidInput("capability_retention"))?;
@@ -141,6 +148,8 @@ pub fn run_offline_model_qualification(
         .try_into()
         .map_err(|_| QualificationRunError::InvalidInput("critical_regressions"))?;
     let stage_passed = |stage| {
+        // 每个阶段要求该阶段所有场景的 challenger_passed；Canary 还必须通过 capability
+        // retention，避免单一成功场景掩盖关键回归或 rollback 失败。
         scenarios
             .iter()
             .filter(|scenario| scenario.stage == stage)
@@ -175,6 +184,8 @@ pub fn run_offline_model_qualification(
 }
 
 fn validate_input(input: &OfflineModelQualificationInput) -> Result<(), QualificationRunError> {
+    // 必需 scenario、五个有序 stage evaluation、receipt identity 和观察 verdict 必须闭合；
+    // 缺一个就返回明确错误，不能用“阶段没有场景所以 all=true”伪造通过。
     input
         .key
         .validate()
@@ -227,6 +238,8 @@ fn validate_input(input: &OfflineModelQualificationInput) -> Result<(), Qualific
         return Err(QualificationRunError::InvalidEvidenceClosure);
     }
     for receipt in &input.receipts {
+        // receipt 的 qualification key、双 snapshot 和 frozen manifest 必须与本次输入相同；
+        // deterministic verdict 若与 scenario 不同，也属于证据闭包错误。
         receipt
             .validate()
             .map_err(|_| QualificationRunError::InvalidEvidenceClosure)?;
@@ -254,6 +267,8 @@ fn validate_input(input: &OfflineModelQualificationInput) -> Result<(), Qualific
 fn stage_evidence(
     input: &OfflineModelQualificationInput,
 ) -> Result<ModelQualificationEvidence, QualificationRunError> {
+    // 五个 ArtifactRef 都从同一 frozen_context_manifest 资格链取得，并要求引用 kind 正确
+    // 且无重复；这里仍只组装引用，不读取 BLOB 或改变任何 Store 状态。
     let get = |stage| {
         input
             .stage_evaluations

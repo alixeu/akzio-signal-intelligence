@@ -1,3 +1,9 @@
+// 文件导读：runtime HTTP handler 提供 workflow blueprint、Run inspection 和分页 journal。
+// blueprint 只读编译器输出不创建 Run；inspection/journal 只展示 Store 的 durable state，
+// 不领取 task、刷新 evidence 或改变状态，因而不能把查询成功当作业务完成。
+// Rust 机制：Query/Path 的 serde 解析把分页和 ID 变成强类型；StoreExecutor 闭包拥有
+// `RunId` 后在串行 Store 通道执行；`Result<Json<T>, StatusCode>` 显式映射 MissingRun 与内部错误。
+
 #[derive(Debug, Deserialize)]
 struct BlueprintQuery {
     purpose: RunPurpose,
@@ -17,6 +23,8 @@ async fn http_workflow_blueprint(
     Query(query): Query<BlueprintQuery>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<akzio_domain::WorkflowBlueprint>, StatusCode> {
+    // Blueprint 只调用与执行相同的 compiler，返回 deterministic graph projection；它不写
+    // Store、不创建 EvidenceNeed/Run，也不探测模型或 broker。
     authorize(&daemon, &headers)?;
     if !matches!(
         query.purpose,
@@ -44,6 +52,8 @@ async fn http_run_inspection(
     Path(run_id): Path<String>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<akzio_store::RunInspection>, StatusCode> {
+    // Inspection 通过 StoreExecutor 读取 checkpoint/allowed_actions；runtime identity 不匹配
+    // 时 daemon 只收紧动作，不能由 HTTP client 自行恢复权限。
     authorize(&daemon, &headers)?;
     let operation = daemon.clone();
     daemon
@@ -60,6 +70,8 @@ async fn http_run_inspection(
 
 impl Daemon {
     pub(crate) fn runtime_inspection(&self, run: &RunId) -> Result<akzio_store::RunInspection> {
+        // 这是 observer 的权限投影层：仅按当前 Debug runtime identity 过滤 allowed_actions，
+        // 原始 workflow/task/lease 状态仍由 Store 保持不变。
         let mut view = self.store.inspect_run(run)?;
         if view.control.debug_identity.is_some()
             && !self.debug_control.as_ref().is_some_and(|config| {
@@ -79,6 +91,8 @@ async fn http_run_journal(
     Query(query): Query<JournalQuery>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<akzio_store::RunEventPage>, StatusCode> {
+    // Journal 以 after/limit/task/attempt 做只读分页；非法范围在访问 Store 前拒绝，避免
+    // 把大范围日志扫描当成运行控制。
     authorize(&daemon, &headers)?;
     if query.after < 0 || query.limit.is_some_and(|limit| !(1..=500).contains(&limit)) {
         return Err(StatusCode::BAD_REQUEST);
@@ -101,6 +115,7 @@ async fn http_run_journal(
 }
 
 fn runtime_store_status(error: StoreError) -> StatusCode {
+    // 只把 MissingRun 暴露为 404，其余 Store 失败保持 500，避免客户端猜测内部状态。
     match error {
         StoreError::MissingRun(_) => StatusCode::NOT_FOUND,
         _ => StatusCode::INTERNAL_SERVER_ERROR,

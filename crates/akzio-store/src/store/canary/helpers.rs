@@ -1,3 +1,5 @@
+// 文件导读：这些 helper 只从 campaign/session 表恢复 immutable head 和 reservation，
+// 同时兼容旧 level 编码；它们不会产生新的 session，也不会改变 active 标志。
 // 从 campaign 表读取一个可选的 immutable head，并把 JSON、revision、时间恢复为领域对象。
 // campaign 不存在返回 None；负 revision 或坏 JSON/时间属于 Store 完整性错误。
 fn read_campaign(

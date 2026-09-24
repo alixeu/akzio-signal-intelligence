@@ -1,5 +1,11 @@
 //! Persist real acquisition audits using the ordinary Store permit and EvidenceRuntime.
 //! This evidence-only graph cannot invoke a model, DecisionGate or broker.
+// 文件导读：market audit 是独立的 evidence-only 图：在调用方提供的新 Store 中提交
+// EvidenceNeed，验证并物化 Raw/NormalizedEvidence，再写完整性报告。它不创建研究提案、
+// Decision、ExecutionPlan、Paper commitment、订单或 Outcome；报告成功只证明这条审计图的
+// bounded persistence 边界。
+// Rust 机制：函数借用 `&Store`/`&EvidenceRequest`，trait runtime 消费 permit 但返回
+// 强类型 bundle；`match` 在成功/失败分支分别 commit attempt，`?` 保证失败不会伪装成成功。
 use super::*;
 
 pub fn persist_market_audit_capture(
@@ -7,6 +13,8 @@ pub fn persist_market_audit_capture(
     request: &EvidenceRequest,
     acquired: AcquiredEvidence,
 ) -> Result<Value> {
+    // 先从正式 evidence recipe 构造一个最小 Debug-purpose workflow，再用新的 Run/Task
+    // permit 写 Need 和采集结果；这里不借用 daemon scheduler/AgentRuntime。
     let now = Utc::now();
     let (recipes, terminals) = akzio_runtime::rust_terminal_recipes()?;
     let recipe = recipes
@@ -64,6 +72,8 @@ pub fn persist_market_audit_capture(
         graph: graph_artifact,
         nodes: graph.nodes,
     })?;
+    // claim 后的 permit 把写入绑定到本次 attempt；materialize_validated 同时校验来源、
+    // freshness 和 quality，成功/失败分别关闭 attempt，保持审计图可恢复。
     let task = store
         .claim_next_task_for_workload(
             "market-audit",

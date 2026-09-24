@@ -15,6 +15,9 @@ use chrono::{DateTime, NaiveDate, Utc};
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 
+// 文件导读：OutcomeSchedule 是 T0 Paper 终态到未来 T+1/T+3/T+5 worker 的不可变桥梁；
+// 本文件只验证并提交 lineage，不读取未来行情、不计算指标，也不提前改变 Policy。
+
 #[derive(Debug, Error)]
 pub enum OutcomeScheduleError {
     #[error(transparent)]
@@ -62,6 +65,8 @@ pub struct OutcomeSchedulingRuntime {
 
 impl OutcomeSchedulingRuntime {
     pub fn new(store: Store) -> Self {
+        // 默认不启用 worker：schedule 构造本身没有副作用，是否安装 post-terminal worker
+        // 只在 commit 时由显式配置决定。
         Self {
             store,
             enqueue_worker: false,
@@ -69,6 +74,7 @@ impl OutcomeSchedulingRuntime {
     }
 
     pub fn with_worker_enabled(mut self, enabled: bool) -> Self {
+        // 该开关只选择两种既有 Store commit 入口，不改变 schedule payload 或 Paper 资格。
         self.enqueue_worker = enabled;
         self
     }
@@ -77,6 +83,8 @@ impl OutcomeSchedulingRuntime {
         &self,
         input: &OutcomeScheduleInput,
     ) -> OutcomeScheduleResult<OutcomeScheduleOutput> {
+        // schedule 先核验 permit 和 Paper purpose，再从同一 Store/CAS 读取 Decision、Context、
+        // ExecutionContext 与执行终态；任何 lineage 不一致都在写入前返回错误。
         self.store.validate_task_permit(&input.permit)?;
         let purpose = self.store.run_purpose(&input.permit.run_id)?;
         if purpose != RunPurpose::Paper {
@@ -157,6 +165,8 @@ impl OutcomeSchedulingRuntime {
             source_refs,
             input.now,
         )?;
+        // 这里仅 stage payload 并返回 Artifact；尚未 commit，所以调用者丢弃 output 不会留下
+        // 一个看似已创建的 OutcomeSchedule 或未来 worker。
         Ok(OutcomeScheduleOutput { schedule })
     }
 
@@ -166,6 +176,8 @@ impl OutcomeSchedulingRuntime {
         output: &OutcomeScheduleOutput,
         now: DateTime<Utc>,
     ) -> OutcomeScheduleResult<()> {
+        // 启用 worker 时 Store 把 schedule、成功 Attempt 和 post-terminal worker 放进同一
+        // 事务；否则只按普通 succeeded Attempt 提交 schedule。两条路径都不会密封 Outcome。
         if self.enqueue_worker {
             self.store
                 .commit_outcome_schedule_with_worker(permit, &output.schedule, now)?;
@@ -185,6 +197,8 @@ impl OutcomeSchedulingRuntime {
         lineage: &OutcomeExecutionLineage,
         execution_context: &ArtifactRef,
     ) -> OutcomeScheduleResult<()> {
+        // NoOrder 只需绑定 NoOrder verdict/context；ReconciledPaper 还必须依次绑定 Accepted
+        // verdict、ExecutionCommitment 和 Complete Reconciliation，不能把 accepted 当 filled。
         match lineage {
             OutcomeExecutionLineage::NoOrder { execution_verdict } => {
                 let verdict =
@@ -271,6 +285,7 @@ impl OutcomeSchedulingRuntime {
 }
 
 fn require_complete_reconciliation(state: ReconciliationState) -> OutcomeScheduleResult<()> {
+    // 只有完整对账才允许建立“已执行” Outcome lineage；部分成交/待成交继续留在执行链。
     if state != ReconciliationState::Complete {
         return Err(OutcomeScheduleError::InvalidLineage(
             "reconciliation_not_complete",

@@ -3,6 +3,8 @@
 use super::*;
 
 pub(super) fn provider_schema(value: &Value) -> Value {
+    // 这是对 serde_json::Value 的纯转换：输入 Schema 不被原地修改，返回的新树才是
+    // provider wire 用的参数 Schema；Rust 本地校验仍使用调用方持有的原始树。
     // 递归生成 provider 可接受的参数 Schema：移除仅供本地校验的长度、数值和
     // 属性约束；带 properties 的对象再由当前属性集合重建 required，保持 wire
     // payload 与 Rust 侧实际字段边界一致。

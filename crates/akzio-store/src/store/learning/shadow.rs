@@ -1,3 +1,5 @@
+// 文件导读：这里写入未封存的 T1/T3 Outcome 与 Retrospective 快照；RunScoped 中间结果
+// 不进入 succeeded-output 索引，直到符合 T5/完整任务边界才由专用路径发布。
 impl Store {
     /// Records retry/recovery/replay/shadow lineage as an immutable
     /// RunScoped artifact. Parent attempts must already exist and the

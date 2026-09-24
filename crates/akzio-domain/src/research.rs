@@ -1,3 +1,5 @@
+// 文件导读：定义研究意图、EvidenceGround/Gap、Claim、Critique 和 Resolution。
+// 每个公开校验都把模型提交限制在 Rust 已授权的证据 kind、资产/期限范围和预算内。
 //! Typed, evidence-bound research artifacts.
 
 use std::collections::BTreeSet;
@@ -67,6 +69,7 @@ pub struct ClaimVerificationEvidence {
 }
 
 impl ClaimVerificationEvidence {
+    // 只接受标准化证据或语义细节引用，拒绝 RawEvidence 直接进入复核闭包。
     pub fn validate(&self) -> Result<(), DomainError> {
         if !matches!(
             self.evidence.kind,
@@ -79,6 +82,7 @@ impl ClaimVerificationEvidence {
         Ok(())
     }
 
+    // authority 非 Unrated 且时间有效于决策 cutoff 时，才是当前权威验证引用。
     pub fn is_current_authoritative(&self) -> bool {
         self.authority != SourceAuthority::Unrated
             && self.temporal_validity == TemporalValidity::ValidAtDecisionCutoff
@@ -138,6 +142,7 @@ pub struct ResearchIntent {
 }
 
 impl ResearchIntent {
+    // 依据 source_family 把意图归入固定研究 shard，不从 query 文本猜测类别。
     pub fn shard(&self) -> ResearchShard {
         match self.source_family.as_str() {
             "alpaca" => ResearchShard::PriceMarketStructure,
@@ -147,6 +152,7 @@ impl ResearchIntent {
         }
     }
 
+    // 校验 schema、文本/窗口/数量/来源白名单，并阻止用 Alpaca bars 请求新闻。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION
             || self.source_family.trim().is_empty()
@@ -172,6 +178,7 @@ impl ResearchIntent {
         // A market-price adapter cannot satisfy an explicit news acquisition.
         // This rejects the observed cross-domain request; it is not a general
         // natural-language classifier and does not manufacture a replacement.
+        // lowercase 后用字符切分识别英文 news；这只是明确的跨域保护，不是语义分类器。
         let query = self.query.to_lowercase();
         if self.source_family == "alpaca"
             && (self.resource == "bars" || self.resource.starts_with("bars:"))
@@ -198,6 +205,7 @@ impl ResearchIntent {
         Ok(())
     }
 
+    // 校验意图后降级为不含 query/资产窗口的 EvidenceNeed，供工作流授权使用。
     pub fn evidence_need(&self) -> Result<EvidenceNeed, DomainError> {
         self.validate()?;
         Ok(EvidenceNeed {
@@ -223,6 +231,7 @@ pub struct EvidenceGround {
 }
 
 impl EvidenceGround {
+    // 证据必须是标准化/语义 kind，文本非空；Directional ground 必须声明资产范围。
     pub fn validate(&self) -> Result<(), DomainError> {
         if !matches!(
             self.evidence.kind,
@@ -261,6 +270,7 @@ pub struct EvidenceGap {
 }
 
 impl EvidenceGap {
+    // 判断一个 gap 是否阻断指定资产/期限；空集合继承 Claim horizon 或覆盖全部资产。
     pub fn blocks_slot(
         &self,
         asset: Asset,
@@ -275,6 +285,7 @@ impl EvidenceGap {
                 self.horizons.contains(&horizon)
             }
     }
+    // 校验主题/理由、可重试阻断缺口必须有补采请求，以及补采总量上限。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.topic.trim().is_empty() || self.rationale.trim().is_empty() {
             return Err(DomainError::EmptyField {
@@ -319,6 +330,7 @@ pub struct ResearchClaim {
 }
 
 impl ResearchClaim {
+    // 组合通用身份、ppm、grounds 和 gaps 校验，保证 Claim 具备完整证据闭包。
     pub fn validate(&self) -> Result<(), DomainError> {
         validate_research_identity(self.schema_version, &self.topic, &self.statement)?;
         validate_ppm(self.materiality_ppm, "research.claim.materiality_ppm")?;
@@ -327,6 +339,7 @@ impl ResearchClaim {
         validate_gaps(&self.evidence_gaps)
     }
 
+    // 仅返回 Claim grounds 的去重 Artifact 引用，供 Artifact provenance 绑定。
     pub fn source_refs(&self) -> Vec<ArtifactRef> {
         ground_refs(&self.grounds)
     }
@@ -362,6 +375,7 @@ impl ResearchCritique {
         horizon: DecisionHorizon,
         claim_horizon: DecisionHorizon,
     ) -> bool {
+        // 非 blocker 直接放行；有范围的阻断 gap 按 gap 范围判断，无范围则是 Claim-wide。
         if !self.blocker {
             return false;
         }
@@ -378,6 +392,7 @@ impl ResearchCritique {
             .any(|gap| gap.blocks_slot(asset, horizon, claim_horizon))
     }
 
+    // 校验目标 kind、grounds/gaps、验证引用闭包、blocker 一致性及 Supported/Contradicted 语义。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION
             || self.target.kind != ArtifactKind::Claim
@@ -399,6 +414,7 @@ impl ResearchCritique {
         validate_gaps(&self.evidence_gaps)?;
         validate_verification_refs(&self.supporting_refs)?;
         validate_verification_refs(&self.conflicting_refs)?;
+        // 用引用集合检查 supporting/conflicting refs 是否都来自本 Critique grounds。
         let ground_refs = self
             .grounds
             .iter()
@@ -453,6 +469,7 @@ impl ResearchCritique {
         }
     }
 
+    // 汇总 target、grounds 和验证引用，排序去重后形成稳定 source closure。
     pub fn source_refs(&self) -> Vec<ArtifactRef> {
         let mut refs = BTreeSet::from([self.target.clone()]);
         refs.extend(ground_refs(&self.grounds));
@@ -478,6 +495,7 @@ pub struct ResearchResolution {
 }
 
 impl ResearchResolution {
+    // 校验 Claim/Critique kind、理由和剩余证据缺口，保留未解决状态而不强行清空。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION
             || self.claim.kind != ArtifactKind::Claim
@@ -492,6 +510,7 @@ impl ResearchResolution {
         validate_gaps(&self.remaining_gaps)
     }
 
+    // 返回 Claim、Critique 及 Resolution grounds 的去重引用集合。
     pub fn source_refs(&self) -> Vec<ArtifactRef> {
         let mut refs = BTreeSet::from([self.claim.clone(), self.critique.clone()]);
         refs.extend(ground_refs(&self.grounds));
@@ -504,6 +523,7 @@ fn validate_research_identity(
     topic: &str,
     statement: &str,
 ) -> Result<(), DomainError> {
+    // 研究对象的 schema、topic、statement 都必须非空。
     if schema_version != DOMAIN_SCHEMA_VERSION
         || topic.trim().is_empty()
         || statement.trim().is_empty()
@@ -516,6 +536,7 @@ fn validate_research_identity(
 }
 
 fn validate_ppm(value: u32, field: &'static str) -> Result<(), DomainError> {
+    // 统一限制 ppm 不超过 100%，并把具体字段带回错误。
     if value > 1_000_000 {
         return Err(DomainError::InvalidBudget { field });
     }
@@ -523,6 +544,7 @@ fn validate_ppm(value: u32, field: &'static str) -> Result<(), DomainError> {
 }
 
 fn validate_grounds(grounds: &[EvidenceGround]) -> Result<(), DomainError> {
+    // 至少一个 ground；逐个校验并用集合拒绝同一 Artifact 的重复引用。
     if grounds.is_empty() {
         return Err(DomainError::EmptyField {
             field: "research.grounds",
@@ -541,6 +563,7 @@ fn validate_grounds(grounds: &[EvidenceGround]) -> Result<(), DomainError> {
 }
 
 fn validate_gaps(gaps: &[EvidenceGap]) -> Result<(), DomainError> {
+    // gaps 上限为 MAX_EVIDENCE_GAPS，并逐项复用 EvidenceGap 的补采约束。
     if gaps.len() > MAX_EVIDENCE_GAPS {
         return Err(DomainError::InvalidBudget {
             field: "research.evidence_gaps",
@@ -553,6 +576,7 @@ fn validate_gaps(gaps: &[EvidenceGap]) -> Result<(), DomainError> {
 }
 
 fn validate_verification_refs(references: &[ClaimVerificationEvidence]) -> Result<(), DomainError> {
+    // 校验每个验证引用并拒绝同一 evidence 重复出现。
     let mut seen = BTreeSet::new();
     for reference in references {
         reference.validate()?;
@@ -566,6 +590,7 @@ fn validate_verification_refs(references: &[ClaimVerificationEvidence]) -> Resul
 }
 
 fn ground_refs(grounds: &[EvidenceGround]) -> Vec<ArtifactRef> {
+    // 提取 grounds 的 ArtifactRef，排序去重后转回 Vec 供序列化/血缘使用。
     grounds
         .iter()
         .map(|ground| ground.evidence.clone())
@@ -578,6 +603,7 @@ fn ground_refs(grounds: &[EvidenceGround]) -> Vec<ArtifactRef> {
 mod acquisition_semantics_tests {
     use super::*;
     #[test]
+    // 覆盖跨域采集保护、日期窗口错误和不可重试缺口的语义。
     fn news_cannot_be_acquired_as_price_bars_but_gap_may_remain_unfilled() {
         let intent = ResearchIntent {
             schema_version: DOMAIN_SCHEMA_VERSION,
@@ -634,6 +660,7 @@ mod acquisition_semantics_tests {
 mod critique_blocking_gap_tests {
     use super::*;
     #[test]
+    // 已支持的价格 ground 不能消除同资产同期限的方向阻断 gap。
     fn supported_price_does_not_clear_direction_blocking_gap() {
         let mut critique: ResearchCritique = serde_json::from_value(serde_json::json!({
             "schema_version": DOMAIN_SCHEMA_VERSION,
@@ -656,6 +683,7 @@ mod critique_blocking_gap_tests {
     }
 
     #[test]
+    // 验证引用越出 grounds 时，错误必须指出具体外部 Artifact。
     fn verification_ref_outside_grounds_names_the_offending_artifact() {
         let ground_id = "b".repeat(64);
         let outside_id = "c".repeat(64);

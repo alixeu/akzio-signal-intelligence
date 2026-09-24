@@ -1,3 +1,6 @@
+// 文件导读：本文件把研究 Agent 的底层 Context/Store/Domain/JSON/Runtime 错误和
+// Contract、预算、来源闭包、legacy/review 语义拒绝统一成 ResearchResult；它只负责
+// 校验与错误分类，不授予工具、Decision、Paper 或 Outcome 执行权限。
 #[derive(Debug, Error)]
 pub enum ResearchError {
     #[error(transparent)]
@@ -127,8 +130,12 @@ pub enum ResearchError {
     ModelRefused(String),
 }
 
+// #[from] 变体让下层 Result 通过 ? 原样上收；其余变体表达可审计的研究边界，不能被
+// retry 或调用方自动降级成成功输出。
 impl ResearchError {
     pub fn retry_cause(&self) -> Option<RetryCause> {
+        // 只有 invalid output/缺少最终输出及显式 invalid_output debug 类别可重试；
+        // Store、Context、预算、provider 拒绝、legacy 阻断等错误返回 None，避免盲目重发。
         match self {
             Self::InvalidOutput(_)
             | Self::MissingFinalOutput
@@ -143,6 +150,8 @@ impl ResearchError {
 
 pub type ResearchResult<T> = Result<T, ResearchError>;
 
+// canonical definition 是 Rust 代码中的 Contract 基线；下面的 helper 会把 prompt/schema
+// 作为 CAS artifact 写入 Store，再计算并校验 contract_hash，不读取模型返回值来决定权限。
 struct CanonicalContractDefinition {
     purpose: &'static str,
     responsibility: &'static str,
@@ -156,6 +165,8 @@ struct CanonicalContractDefinition {
 }
 
 fn canonical_active_contracts(store: &Store) -> ResearchResult<Vec<AgentContract>> {
+    // 每个受支持 purpose 都在这里声明输出 kind、Context allowlist、预算、termination 和
+    // failure disposition；最终只由 canonical_active_contract 构造并 validate。
     [
         CanonicalContractDefinition {
             purpose: RESEARCH_ANALYST_RECIPE_ID,
@@ -266,6 +277,8 @@ fn canonical_active_contract(
     store: &Store,
     definition: CanonicalContractDefinition,
 ) -> ResearchResult<AgentContract> {
+    // outcome 使用冻结的 Contract/Prompt 版本和受控读工具，其余研究角色使用当前 active
+    // 版本；两者都共享 24 artifact/Context 与预算边界，生成后立即 expected_hash/validate。
     let outcome = definition.purpose == LEARNING_OUTCOME_WORKER_RECIPE_ID;
     let role_prompt = prompts::role_prompt(definition.purpose)?;
     let prompt = PromptBundle {
@@ -329,6 +342,8 @@ fn canonical_active_contract(
 }
 
 fn governed_context_sources() -> BTreeSet<String> {
+    // Context source family 是显式 allowlist；它限制授权投影来源，不是网络域名或任意文件
+    // 路径，后续 ContextBroker 仍会检查 kind、producer、Run 和 lifecycle。
     GOVERNED_EVIDENCE_SOURCE_FAMILIES
         .into_iter()
         .chain([
@@ -344,6 +359,8 @@ fn governed_context_sources() -> BTreeSet<String> {
 }
 
 fn evidence_read_grants() -> Vec<ToolGrant> {
+    // Outcome 才获得 ReadEvidence grant；grant 只声明 source family，实际 artifact/range
+    // 读取仍由 ContextBroker 按当前 permit 和 Manifest 校验。
     vec![ToolGrant {
         kind: ToolKind::ReadEvidence,
         // Context selection and tool results share the same source authority.
@@ -353,6 +370,8 @@ fn evidence_read_grants() -> Vec<ToolGrant> {
 }
 
 fn active_retry_policy() -> RetryPolicy {
+    // active Contract 固定最多两次尝试，并分别允许 transport、rate-limit、invalid-output
+    // 重试；这只是 retry policy，不能覆盖 ResearchError::retry_cause 的不可重试边界。
     RetryPolicy {
         max_attempts: 2,
         initial_backoff_ms: 250,
@@ -363,6 +382,8 @@ fn active_retry_policy() -> RetryPolicy {
 }
 
 fn validate_proposal_at(proposal: &DecisionDraft, now: DateTime<Utc>) -> ResearchResult<()> {
+    // proposal 校验先逐行检查 allocation 语义，再检查整体 schema 和 thesis expiry；错误都
+    // 作为 InvalidOutput 返回，不能用零权重或历史 cutoff 自动修补模型结果。
     if let Some(plan) = &proposal.research_allocation {
         let errors = plan.allocations.iter().enumerate().filter_map(|(index, row)| {
             row.validate().err().map(|error| format!(
@@ -392,6 +413,8 @@ fn validate_proposal_at(proposal: &DecisionDraft, now: DateTime<Utc>) -> Researc
 }
 
 fn validate_claim_submission(claim: &ResearchClaim) -> ResearchResult<()> {
+    // Claim 的每个 ground 只能引用一次 evidence；重复引用返回 InvalidOutput，之后才进入
+    // domain validate，避免把重复依据伪装成更多独立支持。
     let mut evidence = BTreeSet::new();
     for ground in &claim.grounds {
         if !evidence.insert(&ground.evidence) {
@@ -407,6 +430,8 @@ fn validate_claim_submission(claim: &ResearchClaim) -> ResearchResult<()> {
 }
 
 fn validate_critique_submission(critique: &ResearchCritique) -> ResearchResult<()> {
+    // SUPPORTED 必须有当前有效的 supporting_refs 且没有 conflicting_refs；counterevidence
+    // 保留在输入中，不能为了通过校验而删除或降格为模型意见。
     if critique.verification_status == ClaimVerificationStatus::Supported {
         if critique.supporting_refs.is_empty() {
             return Err(ResearchError::InvalidOutput(
@@ -477,6 +502,8 @@ fn research_output_source_refs(
     now: DateTime<Utc>,
     contract_version: u32,
 ) -> ResearchResult<Vec<ArtifactRef>> {
+    // 按输出 ArtifactKind 分支解析并校验 payload，再计算 source_refs 与 Manifest 闭包；
+    // 任一 serde/Store/Domain/引用错误经 ResearchResult 传播，成功只表示引用闭包合法。
     let refs = match kind {
         ArtifactKind::Claim => {
             let claim: ResearchClaim = serde_json::from_value(output.clone()).map_err(|error| {
@@ -753,6 +780,8 @@ fn validate_research_allocation_sufficiency(
     claims: &[(ArtifactRef, ResearchClaim)],
     critiques: &[ResearchCritique],
 ) -> ResearchResult<()> {
+    // 没有 allocation 或全现金是合法研究结果；只有非零权重行才必须闭合到同期限、
+    // bullish、非阻断 Claim、SUPPORTED Critique 以及对应 evidence_refs。
     let Some(plan) = proposal.research_allocation.as_ref() else {
         return Ok(());
     };
@@ -826,6 +855,8 @@ fn validate_decision_source_closure(
     declared_evidence: &BTreeSet<ArtifactRef>,
     selected: &BTreeSet<ArtifactRef>,
 ) -> ResearchResult<()> {
+    // DecisionProposal 的 Claim/Critique 来源必须回到 submitted claims、declared evidence
+    // 和 selected Manifest；该函数只验证 provenance 闭包，不授予 Decision/Execution 权限。
     for source in source_refs {
         match source.kind {
             ArtifactKind::Claim if owner_kind == ArtifactKind::Critique => {
@@ -861,6 +892,8 @@ fn validate_claim_ground_scopes(
     manifest: &ContextManifest,
     contract_version: u32,
 ) -> ResearchResult<()> {
+    // 每个 ground 先按 artifact_id 精确匹配 Manifest，再从 Store 读取其 payload 推导资产
+    // scope/domain；Directional ground 还必须是 citation-complete 的 NormalizedEvidence。
     let selected = manifest
         .payload
         .selections
@@ -970,6 +1003,7 @@ fn validate_claim_ground_scopes(
 }
 
 fn evidence_has_complete_citations(payload: &Value) -> bool {
+    // 只接受 payload 中明确的布尔 true；缺失、null 或 model_reviewed 本身都不等于来源已核验。
     payload
         .pointer("/quality/citations_complete")
         .and_then(Value::as_bool)
@@ -993,6 +1027,8 @@ fn describe_assets(assets: &BTreeSet<Asset>) -> String {
 }
 
 fn evidence_asset_scope(payload: &Value) -> ResearchResult<Option<BTreeSet<Asset>>> {
+    // resource 前缀和 paper payload 决定资产 scope；未知但结构合法的资源返回 None，格式
+    // 错误则返回 InvalidOutput，不能从任意文本猜测资产范围。
     let resource = payload.get("resource").and_then(Value::as_str);
     if let Some(resource) = resource {
         if let Some(symbol) = resource
@@ -1048,6 +1084,7 @@ fn evidence_asset_scope(payload: &Value) -> ResearchResult<Option<BTreeSet<Asset
 }
 
 fn evidence_domain(payload: &Value) -> ResearchResult<Option<ResearchShard>> {
+    // domain 同样只由受支持的 resource 前缀映射；未知资源保持 None，不被转换成方向性领域。
     let Some(resource) = payload.get("resource").and_then(Value::as_str) else {
         return Ok(None);
     };
@@ -1075,6 +1112,8 @@ fn evidence_domain(payload: &Value) -> ResearchResult<Option<ResearchShard>> {
 }
 
 fn scoped_symbols(value: Option<&Value>) -> ResearchResult<Option<BTreeSet<Asset>>> {
+    // paper.positions 等数组必须逐项有合法 symbol；Option::None 表示字段缺失时进入错误，
+    // 不是“任意资产都匹配”。
     let Some(Value::Array(items)) = value else {
         return Err(ResearchError::InvalidOutput(
             "asset-scoped evidence payload is not an array".to_owned(),
@@ -1095,6 +1134,8 @@ fn scoped_symbols(value: Option<&Value>) -> ResearchResult<Option<BTreeSet<Asset
 }
 
 fn scoped_object_keys(value: Option<&Value>) -> ResearchResult<Option<BTreeSet<Asset>>> {
+    // quotes/positions 对象的 key 被逐个解析为 Asset；未知 key 返回 InvalidOutput，不静默
+    // 丢弃或扩大 scope。
     let Some(Value::Object(items)) = value else {
         return Err(ResearchError::InvalidOutput(
             "asset-scoped evidence payload is not an object".to_owned(),
@@ -1109,6 +1150,8 @@ fn scoped_object_keys(value: Option<&Value>) -> ResearchResult<Option<BTreeSet<A
     Ok(Some(assets))
 }
 
+// 以下 allocation tests 使用固定的中性/全现金 fixture 验证研究授权条件；它们不调用真实
+// 模型或 Paper，也不把通过的 allocation validation 当作 Decision/Outcome 证明。
 #[cfg(test)]
 mod allocation_authority_tests {
     use super::*;
@@ -1121,6 +1164,8 @@ mod allocation_authority_tests {
         Vec<(ArtifactRef, ResearchClaim)>,
         Vec<ResearchCritique>,
     ) {
+        // fixture 构造一个 QQQ T1 的 Price+Macro Claim/Critique，同时让四资产 allocation
+        // 默认为显式 abstention；后续 helper 只改变目标行来测试闭包边界。
         let reference = |label: &str, kind| ArtifactRef {
             artifact_id: ArtifactId(akzio_domain::ContentHash::of_bytes(label.as_bytes())),
             kind,
@@ -1181,6 +1226,8 @@ summary: "research only".to_owned(),
 
     #[test]
     fn proposal_rejection_identifies_every_invalid_allocation_row() {
+        // 清空所有 abstention_reason 后，错误消息必须列出每一行和最后一行的索引，便于修复
+        // 而不是只报告第一个 allocation 错误。
         let (mut draft, _, _) = fixture();
         for row in &mut draft.research_allocation.as_mut().unwrap().allocations {
             row.abstention_reason = None;
@@ -1194,6 +1241,7 @@ summary: "research only".to_owned(),
     }
 
     fn allocate_qqq(draft: &mut DecisionDraft) {
+        // helper 只给 QQQ 配置 10% 目标、T1 和 claim ref，并把现金降为 90%；它不创建订单。
         let plan = draft.research_allocation.as_mut().unwrap();
         plan.cash_weight_ppm = WeightPpm(900_000);
         let row = plan
@@ -1209,12 +1257,15 @@ summary: "research only".to_owned(),
 
     #[test]
     fn supported_research_allows_explicit_cash() {
+        // 全现金计划即使存在支持性研究，也可以通过；研究建议不强制承担风险。
         let (draft, claims, critiques) = fixture();
         assert!(validate_research_allocation_sufficiency(&draft, &claims, &critiques).is_ok());
     }
 
     #[test]
     fn allocation_rejects_absent_or_bearish_support_and_accepts_positive_support() {
+        // 正确 T1/正收益/同一 claim 可通过；期限错配、中性 forecast、无关引用、缺失 claim
+        // 或 bearish stance 都必须阻断非零 allocation。
         let (mut draft, mut claims, critiques) = fixture();
         allocate_qqq(&mut draft);
         assert!(validate_research_allocation_sufficiency(&draft, &claims, &critiques).is_ok());
@@ -1263,12 +1314,16 @@ summary: "research only".to_owned(),
     }
 }
 
+// model_reviewed 与 citations_complete 不是 source_verified；只有 news payload 明确记录
+// source_document.source_verified=true 才能支持方向性使用，非 news 资源不经过该门。
 fn news_source_verified(payload: &Value) -> bool {
     !payload.get("resource").and_then(Value::as_str).is_some_and(|r| r.starts_with("news:"))
         || payload.pointer("/value/source_document/source_verified").and_then(Value::as_bool) == Some(true)
 }
 
 fn validate_supplemental_resources(gaps: &[akzio_domain::EvidenceGap]) -> ResearchResult<()> {
+    // 每个 supplemental need 都交给 ingest 的 GovernedResource parser；跨资产资源或未知
+    // source family 返回 InvalidOutput，避免把任意字符串当作合法补采请求。
     for need in gaps.iter().flat_map(|gap| &gap.supplemental_needs) {
         let source: akzio_ingest::EvidenceSource = serde_json::from_value(json!(need.source_family))
             .map_err(|e| ResearchError::InvalidOutput(format!("supplemental source: {e}")))?;
@@ -1278,71 +1333,15 @@ fn validate_supplemental_resources(gaps: &[akzio_domain::EvidenceGap]) -> Resear
     Ok(())
 }
 
+// 这些 submission tests 同时验证历史 Contract 兼容、当前 source verification 和 governed
+// supplemental resource parser；通过只代表离线 payload 校验，不代表真实采集或 Outcome。
 #[cfg(test)]
 mod review_submission_tests {
     use super::*;
     #[test]
-    fn submission_and_wire_schema_agree_on_unverified_news() {
-        let now = Utc::now();
-        let (store, runtime, attempt) = super::late_model_tests::isolated_outcome_attempt(120, now);
-        let payload = json!({"resource":"news:SOXX:2026-09-08:2026-09-22:market",
-            "quality":{"citations_complete":true},
-            "value":{"source_document":{"source_verified":false,"status":"model_reviewed"}}});
-        let artifact = Artifact::new(
-            ArtifactKind::NormalizedEvidence, store.stage_json(&payload).unwrap(),
-            "evidence.normalize", ArtifactLifecycle::RunScoped,
-            ArtifactProvenance { source_family:"news_web".into(), observed_at:Some(now),
-                retrieved_at:now, source_uri:None, confidence_ppm:1_000_000,
-                producer_contract_hash:None },
-            Some(attempt.permit.artifact_origin()), vec![], now,
-        ).unwrap();
-        store.write_task_artifact(&attempt.permit, &artifact, LifecycleEventType::ArtifactCommitted, now).unwrap();
-        let reference = ArtifactRef {artifact_id:artifact.artifact_id, kind:artifact.kind};
-        let contract = &runtime.contract(attempt.node.contract_hash.as_ref().unwrap()).unwrap().contract;
-        let manifest = ContextBroker::new(store.clone()).assemble(
-            &attempt.permit, contract, &akzio_domain::ContextQueryScope::for_node(&attempt.node), attempt.node.input_artifacts.iter().cloned().chain([reference.clone()]), now, Duration::minutes(5),
-        ).unwrap();
-        assert!(manifest.payload.selections.iter().any(|s| s.artifact == reference));
-        let mut claim = json!({"schema_version":DOMAIN_SCHEMA_VERSION,"topic":"SOXX news",
-            "statement":"Market background, not an asset-specific event", "horizon":"t5",
-            "stance":"neutral","materiality_ppm":100000,"confidence_ppm":100000,
-            "grounds":[{"evidence":reference,"support":"Market background","role":"directional",
-                "assets":["SOXX"],"domain":"news_event"}],"evidence_gaps":[]});
-        let validate = |value: &Value, version| research_output_source_refs(
-            &store, ArtifactKind::Claim, value, &manifest, now, version);
-        assert!(validate(&claim, 61).is_ok(), "historical qualification is unchanged");
-        assert!(matches!(validate(&claim, 63), Err(ResearchError::InvalidOutput(message))
-            if message.contains("not source verified")));
-        claim["grounds"][0]["role"] = json!("descriptive");
-        // The wire schema already requires scope-free background. The business
-        // validator must enforce the same rule for non-structured submissions.
-        assert!(validate(&claim, 63).is_err());
-        claim["grounds"][0]["assets"] = json!([]);
-        claim["grounds"][0]["domain"] = Value::Null;
-        assert!(validate(&claim, 63).is_ok());
-        let mut schema = json!({"properties":{"result":{"properties":{"grounds":{"items":evidence_ground_schema()}}}}});
-        schema["properties"]["result"]["properties"]["grounds"]["items"]["properties"]["evidence"]["properties"]["artifact_id"]["enum"] = json!([reference.artifact_id]);
-        bind_ground_scope_schema(&store, &manifest, &mut schema, 63).unwrap();
-        let ground_schema = &schema["properties"]["result"]["properties"]["grounds"]["items"];
-        assert!(validate_schema_value(&claim["grounds"][0], ground_schema, "$").is_ok());
-        claim["grounds"][0]["role"] = json!("directional");
-        assert!(validate_schema_value(&claim["grounds"][0], ground_schema, "$").is_err());
-        claim["grounds"][0]["role"] = json!("descriptive");
-        claim["evidence_gaps"] = json!([{"topic":"news","rationale":"refresh background",
-            "impact":"warning","retriable":true,"supplemental_needs":[{
-                "schema_version":DOMAIN_SCHEMA_VERSION,"source_family":"news_web",
-                "resource":"news:TQQQ,QQQ,SOXX,SOXL:2026-09-08:2026-09-22:market",
-                "query":"news","assets":["SOXX"],"window_start":null,"window_end":null,
-                "max_age_secs":3600,"max_results":8}]}]);
-        assert!(validate(&claim, 61).is_ok());
-        assert!(matches!(validate(&claim, 63), Err(ResearchError::InvalidOutput(message))
-            if message.contains("invalid supplemental resource")));
-        claim["evidence_gaps"][0]["supplemental_needs"][0]["resource"] =
-            json!("news:SOXX:2026-09-08:2026-09-22:market");
-        assert!(validate(&claim, 63).is_ok());
-    }
-    #[test]
     fn model_review_and_complete_citations_do_not_grant_news_direction() {
+        // citations_complete/model_reviewed 只能证明 payload 形状或模型审查状态；方向性资格
+        // 仍取决于显式 source_verified，非 news series 则不走新闻来源门。
         let mut payload=json!({"resource":"news:SOXX:2026-09-08:2026-09-22:market",
             "quality":{"citations_complete":true},"value":{"source_document":{"source_verified":false,"status":"model_reviewed"}}});
         assert!(!news_source_verified(&payload));
@@ -1355,6 +1354,8 @@ mod review_submission_tests {
     }
     #[test]
     fn supplemental_requests_use_the_adapter_resource_parser() {
+        // 多资产 news resource、合法单资产 news resource 和错误 fred/source 组合分别覆盖
+        // parser 的拒绝、接受和 source-family 校验路径。
         let mut gaps: Vec<akzio_domain::EvidenceGap>=serde_json::from_value(json!([{
             "topic":"news","rationale":"refresh","impact":"warning","retriable":true,
             "supplemental_needs":[{"schema_version":DOMAIN_SCHEMA_VERSION,"source_family":"news_web",

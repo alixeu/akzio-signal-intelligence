@@ -3,6 +3,7 @@ import Foundation
 import Observation
 import Security
 
+// 状态是可跨并发边界传递的值语义枚举；failed 单独携带本地化诊断，其余 case 不保存可变进程对象。
 public enum RustCoreState: Sendable, Equatable {
     case stopped
     case needsConfiguration
@@ -13,6 +14,7 @@ public enum RustCoreState: Sendable, Equatable {
     case stopping
 
     public var label: String {
+        // label 只把状态映射成稳定 UI 文案，不暴露错误详情或改变状态。
         switch self {
         case .stopped: "Stopped"
         case .needsConfiguration: "Needs Configuration"
@@ -25,11 +27,13 @@ public enum RustCoreState: Sendable, Equatable {
     }
 
     public var detail: String? {
+        // 只有 failed 携带 detail，其他状态返回 nil 让 UI 保持明确的无诊断边界。
         guard case .failed(let message) = self else { return nil }
         return message
     }
 }
 
+// Connection 是启动完成后的不可变 endpoint/token 快照；传给客户端时不会共享 supervisor 的可变字段。
 public struct RustCoreConnection: Sendable, Equatable {
     public let endpoint: URL
     public let controlToken: String
@@ -38,6 +42,7 @@ public struct RustCoreConnection: Sendable, Equatable {
 @MainActor
 @Observable
 public final class RustCoreSupervisor {
+    // Supervisor 由 MainActor 串行管理 UI 状态和 Process 引用；异步网络/等待通过 await 返回主 actor 更新。
     public static let shared = RustCoreSupervisor()
 
     public private(set) var state: RustCoreState = .stopped
@@ -56,14 +61,17 @@ public final class RustCoreSupervisor {
     private init() {}
 
     public func start() async -> RustCoreConnection? {
+        // 已运行时直接复用 connection；nil 表示配置、启动或 ready 流程没有完成。
         if process?.isRunning == true { return connection }
         do {
+            // CredentialStore 是启动前的认证边界；没有配置只进入 needsConfiguration，不启动本地进程。
             guard let configuration = try CoreCredentialStore.resolved() else {
                 state = .needsConfiguration
                 return nil
             }
             state = .starting
             recentOutput = ""
+            // executable/config/store 都由受控路径解析；storePath 只供 UI 观察，Store 目录由 Core 使用。
             let executable = try CoreRuntimePaths.executableURL()
             let config = try CoreRuntimePaths.configURL()
             let store = try CoreRuntimePaths.storeURL()
@@ -71,10 +79,12 @@ public final class RustCoreSupervisor {
             try openLog()
             appendOutput("\n=== Akzio Core start \(Date().formatted(.iso8601)) ===\n")
             let endpoint = URL(string: "http://127.0.0.1:7342")!
+            // 端口占用在启动前拒绝，避免把其他进程误认成当前 Core。
             if await endpointIsOccupied(endpoint) {
                 throw CoreLaunchError.portOccupied
             }
 
+            // token 与 Process pipe 一起创建；子进程只接收隔离后的环境变量，不共享 Swift 对象。
             let controlToken = try loadOrCreateControlToken(store: store)
             let process = Process()
             let stdinPipe = Pipe()
@@ -93,6 +103,7 @@ public final class RustCoreSupervisor {
             attachOutput(stdoutPipe.fileHandleForReading)
             attachOutput(stderrPipe.fileHandleForReading)
             expectedStop = false
+            // terminationHandler 是异步闭包：弱引用 supervisor，并回到 MainActor 更新状态，防止进程退出后悬挂引用。
             process.terminationHandler = { [weak self] process in
                 Task { @MainActor in
                     guard let self else { return }
@@ -111,6 +122,7 @@ public final class RustCoreSupervisor {
             self.stderrPipe = stderrPipe
             state = .waitingReady
 
+            // 先等待带 token 的 /ready，再通过 ObserverClient fetchSnapshot 验证 HTTP 连接确实可用。
             try await waitUntilReady(
                 endpoint: endpoint,
                 controlToken: controlToken,
@@ -124,6 +136,7 @@ public final class RustCoreSupervisor {
             state = .ready
             return connection
         } catch {
+            // 任一配置、Process、ready 或 snapshot 错误都回收资源并进入 failed，不返回半初始化 connection。
             stop()
             state = .failed(error.localizedDescription)
             return nil
@@ -131,11 +144,13 @@ public final class RustCoreSupervisor {
     }
 
     public func restart() async -> RustCoreConnection? {
+        // restart 复用同一 stop/start 生命周期，确保旧进程、pipe、token 引用先被清理。
         stop()
         return await start()
     }
 
     public func stop() {
+        // stop 可重复调用；没有 Process 时仍关闭日志并回到 stopped。
         guard let process else {
             closeLog()
             state = .stopped
@@ -143,6 +158,7 @@ public final class RustCoreSupervisor {
         }
         expectedStop = true
         state = .stopping
+        // 先关闭 stdin 并请求优雅退出，最多等待五秒，超时才使用 SIGKILL。
         try? stdinPipe?.fileHandleForWriting.close()
         if process.isRunning { process.terminate() }
         let deadline = Date().addingTimeInterval(5)
@@ -158,11 +174,13 @@ public final class RustCoreSupervisor {
         stderrPipe = nil
         connection = nil
         controlToken = nil
+        // 清空所有引用和 readabilityHandler，避免旧进程输出继续写入当前 supervisor。
         closeLog()
         state = .stopped
     }
 
     public func submitRun(purpose: RunPurpose) async throws -> String {
+        // 只有 userLaunchModes 可由 App 提交；状态/connection/token 任一缺失都在 HTTP I/O 前抛出 notReady。
         guard RunPurpose.userLaunchModes.contains(purpose) else {
             throw CoreLaunchError.runRejected
         }
@@ -176,6 +194,7 @@ public final class RustCoreSupervisor {
         request.setValue("application/json", forHTTPHeaderField: "content-type")
         request.httpBody = try JSONEncoder().encode(RunSubmissionRequest(purpose: purpose))
         request.timeoutInterval = 60
+        // 请求带 x-akzio-token 认证并使用受控 session；非 2xx 先尝试解析 Core 的拒绝原因。
         let (data, response) = try await ObserverTransportPolicy.session.data(for: request)
         guard let response = response as? HTTPURLResponse,
               (200..<300).contains(response.statusCode)
@@ -191,6 +210,7 @@ public final class RustCoreSupervisor {
         controlToken: String,
         process: Process
     ) async throws {
+        // ready 轮询最多五分钟；每次请求携带 control token，进程退出或超时都保留明确错误。
         let deadline = ContinuousClock.now.advanced(by: .seconds(300))
         while ContinuousClock.now < deadline {
             guard process.isRunning else { throw CoreLaunchError.exitedBeforeReady }
@@ -202,12 +222,14 @@ public final class RustCoreSupervisor {
             {
                 return
             }
+            // Task.sleep 只暂停当前 async task，不阻塞 MainActor 的 UI 运行循环。
             try await Task.sleep(for: .milliseconds(200))
         }
         throw CoreLaunchError.readyTimeout
     }
 
     private func endpointIsOccupied(_ endpoint: URL) async -> Bool {
+        // 这是启动前的只读探测；任何可连接响应都视为端口已被占用，不尝试控制未知进程。
         var request = URLRequest(url: endpoint.appending(path: "ready"))
         request.timeoutInterval = 0.5
         return (try? await ObserverTransportPolicy.session.data(for: request)) != nil
@@ -217,6 +239,7 @@ public final class RustCoreSupervisor {
         configuration: CoreConfiguration,
         store: URL
     ) -> [String: String] {
+        // 子进程环境以当前父环境为基础，只注入 Core store、Paper endpoint、模型路由和认证配置。
         var environment = ProcessInfo.processInfo.environment
         environment["AKZIO_STORE_ROOT"] = store.path
         environment["AKZIO_EXIT_ON_STDIN_EOF"] = "1"
@@ -228,6 +251,7 @@ public final class RustCoreSupervisor {
         let routes = Dictionary(uniqueKeysWithValues: configuration.stageModels.map {
             ($0.key.rawValue, $0.value)
         })
+        // 路由字典编码失败时不写入 routes 变量；其他已验证配置仍会传给子进程。
         if let data = try? JSONEncoder().encode(routes),
            let value = String(data: data, encoding: .utf8) {
             environment["AKZIO_MODEL_ROUTES_JSON"] = value
@@ -245,6 +269,7 @@ public final class RustCoreSupervisor {
     }
 
     private func loadOrCreateControlToken(store: URL) throws -> String {
+        // token 文件位于本次 Core store 下；已有 token 必须是非空单行 UTF-8，并强制回写 0600 权限。
         let fileManager = FileManager.default
         try fileManager.createDirectory(at: store, withIntermediateDirectories: true)
         let tokenURL = store.appendingPathComponent(".daemon-token", isDirectory: false)
@@ -264,6 +289,7 @@ public final class RustCoreSupervisor {
             return token
         }
 
+        // 没有合法旧 token 时用系统安全随机源创建一次，再以 atomic 写入并收紧权限。
         let token = try randomToken()
         try Data(token.utf8).write(to: tokenURL, options: .atomic)
         try fileManager.setAttributes(
@@ -274,6 +300,7 @@ public final class RustCoreSupervisor {
     }
 
     private func randomToken() throws -> String {
+        // SecRandomCopyBytes 失败即抛错；随机字节转成固定长度 hex，不使用可预测的时间/进程信息。
         var bytes = [UInt8](repeating: 0, count: 32)
         let status = bytes.withUnsafeMutableBytes { buffer in
             SecRandomCopyBytes(kSecRandomDefault, buffer.count, buffer.baseAddress!)
@@ -287,6 +314,7 @@ public final class RustCoreSupervisor {
     }
 
     private func attachOutput(_ handle: FileHandle) {
+        // readabilityHandler 捕获 weak self；availableData 的异步回调把 UTF-8 文本交回 MainActor，空数据表示 EOF。
         handle.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
@@ -295,6 +323,7 @@ public final class RustCoreSupervisor {
     }
 
     private func appendOutput(_ text: String) {
+        // 日志同时写入 0600 文件和内存环形尾部；recentOutput 限制为最后 8,192 个 UTF-8 字节附近的字符窗口。
         if let data = text.data(using: .utf8) {
             try? logHandle?.write(contentsOf: data)
         }
@@ -305,6 +334,7 @@ public final class RustCoreSupervisor {
     }
 
     private func openLog() throws {
+        // 日志文件由受控运行时路径创建，随后设置 0600 并 seek 到末尾，保留本次 Core 的追加历史。
         let url = try CoreRuntimePaths.logURL()
         if !FileManager.default.fileExists(atPath: url.path) {
             FileManager.default.createFile(atPath: url.path, contents: nil)
@@ -319,11 +349,13 @@ public final class RustCoreSupervisor {
     }
 
     private func closeLog() {
+        // closeLog 是幂等清理，忽略关闭失败但清空 handle，避免后续输出写到旧文件句柄。
         try? logHandle?.close()
         logHandle = nil
     }
 }
 
+// 启动/控制错误保持为值语义枚举，供 UI 显示稳定 description 而不泄露 token 或完整请求体。
 enum CoreLaunchError: LocalizedError {
     case missingConfiguration
     case missingExecutable
@@ -336,6 +368,7 @@ enum CoreLaunchError: LocalizedError {
     case runFailure(String)
 
     var errorDescription: String? {
+        // errorDescription 只提供用户可读原因；具体认证材料和 provider 响应不在这里回显。
         switch self {
         case .missingConfiguration: "Core credentials are not configured"
         case .missingExecutable: "Bundled Rust core executable was not found"
@@ -351,6 +384,7 @@ enum CoreLaunchError: LocalizedError {
 }
 
 private struct RunSubmission: Decodable {
+    // Rust 返回的 run_id 通过 CodingKeys 从协议字段映射到 Swift 属性。
     let runID: String
 
     enum CodingKeys: String, CodingKey {
@@ -359,7 +393,9 @@ private struct RunSubmission: Decodable {
 }
 
 private struct RunSubmissionRequest: Encodable {
+    // 提交请求只编码受控 RunPurpose，不能从 UI 字符串拼接任意命令。
     let purpose: RunPurpose
 }
 
+// 非 2xx 的最小错误 envelope，只读取 Core 提供的 error 文本。
 private struct RunRejection: Decodable { let error: String }

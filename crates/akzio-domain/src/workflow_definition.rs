@@ -1,3 +1,5 @@
+// 文件导读：定义冻结的 NodeSpec、历史节点读取适配、可检查 WorkflowBlueprint 以及
+// Mermaid 投影；执行权限只来自类型化字段，objective 文本不作为权威来源。
 //! Frozen workflow control metadata. Prose is never an execution authority.
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -20,6 +22,7 @@ pub struct NodeSpec {
 }
 
 impl NodeSpec {
+    // 将可选 horizon 转成模型协议使用的 t1/t3/t5 名称。
     pub fn horizon_name(&self) -> Option<&'static str> {
         self.horizon.map(|h| match h {
             DecisionHorizon::T1 => "t1",
@@ -28,6 +31,7 @@ impl NodeSpec {
         })
     }
 
+    // 创建只有 key 的通用阶段 spec，其余维度保持未知。
     pub fn stage(key: impl Into<String>) -> Self {
         Self {
             key: key.into(),
@@ -37,6 +41,7 @@ impl NodeSpec {
         }
     }
 
+    // 校验 key 字符集，并按 recipe 检查 horizon、round、revision 的组合合法性。
     pub fn validate(&self, recipe: &str) -> Result<(), DomainError> {
         let research_pair = matches!(
             recipe,
@@ -71,12 +76,14 @@ impl NodeSpec {
 /// Read adapter for already frozen historical nodes. New definitions always
 /// carry NodeSpec; callers must never persist this inferred value over old CAS.
 pub fn historical_node_spec(key: &str, objective: &str) -> NodeSpec {
+    // 仅为历史 payload 生成内存读取投影，不把推断值写回旧 CAS。
     fn marker<'a>(text: &'a str, name: &str) -> Option<&'a str> {
         text.split_once(&format!("[{name}="))?
             .1
             .split_once(']')
             .map(|v| v.0)
     }
+    // 优先读取显式 marker，再兼容旧的“t1 Claim/Critique”措辞。
     let horizon = marker(objective, "research_horizon")
         .or_else(|| marker(objective, "outcome_horizon"))
         .or_else(|| {
@@ -101,6 +108,7 @@ pub fn historical_node_spec(key: &str, objective: &str) -> NodeSpec {
 /// Tolerant read projection for partial/legacy export payloads. An invalid
 /// explicit spec is unknown; it must not fall back to prose.
 pub fn projected_node_spec(node: &serde_json::Value) -> Option<NodeSpec> {
+    // 显式 spec 存在但反序列化失败时返回 None；不会用 prose 覆盖损坏的显式值。
     if let Some(spec) = node.get("spec").filter(|v| !v.is_null()) {
         return serde_json::from_value(spec.clone()).ok();
     }
@@ -111,6 +119,7 @@ pub fn projected_node_spec(node: &serde_json::Value) -> Option<NodeSpec> {
 }
 
 impl WorkflowNode {
+    // 新节点使用持久化 spec，旧节点只在读取时按历史适配器推断。
     pub fn execution_spec(&self) -> NodeSpec {
         self.spec
             .clone()
@@ -119,6 +128,7 @@ impl WorkflowNode {
 
     /// Render the existing model-facing scope notation from typed authority.
     /// This preserves the research request protocol while stored objective is prose.
+    // 将 typed spec 渲染成模型可见 marker，再追加原 objective；无 spec 时保留原文。
     pub fn model_objective(&self) -> String {
         let Some(spec) = &self.spec else {
             return self.objective.clone();
@@ -175,6 +185,7 @@ pub struct WorkflowBlueprint {
 }
 
 impl WorkflowGraph {
+    // 先验证图，再以 TaskId 映射成无运行期 ID 的可检查 blueprint，并计算定义哈希。
     pub fn blueprint(&self, purpose: RunPurpose) -> Result<WorkflowBlueprint, DomainError> {
         self.validate()?;
         let keys: BTreeMap<&TaskId, String> = self
@@ -182,6 +193,7 @@ impl WorkflowGraph {
             .iter()
             .map(|n| (&n.task_id, n.execution_spec().key))
             .collect();
+        // 闭包把每个不可变 WorkflowNode 投影成 BlueprintNode，依赖按 key 排序。
         let mut nodes = self
             .nodes
             .iter()
@@ -238,7 +250,9 @@ impl WorkflowGraph {
 }
 
 impl WorkflowBlueprint {
+    // 生成只引用经过验证逻辑 key 的 Mermaid 文本，依赖箭头按 blueprint 顺序输出。
     pub fn mermaid(&self) -> String {
+        // enumerate 闭包把节点序号转为 n0/n1… 的 Mermaid 内部 ID。
         let ids: BTreeMap<_, _> = self
             .nodes
             .iter()

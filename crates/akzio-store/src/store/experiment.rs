@@ -1,6 +1,9 @@
+// 文件导读：实验 Trial 和 SearchBiasCertificate 以 canonical Artifact 保存；
+// 本文件按 PolicySubject 筛选并在完整性巡检时复核 source_refs，不负责计算实验结论。
 use super::*;
 
 impl Store {
+    // 先恢复全部同类 Artifact，再按 typed subject 过滤和时间排序；读取不会激活候选。
     pub fn experiment_trial_ledger(
         &self,
         subject: &PolicySubject,
@@ -36,6 +39,7 @@ impl Store {
             .collect())
     }
 
+    // Doctor 使用已持有连接逐项检查实验负载、生命周期和 trial/certificate 来源闭包。
     pub(super) fn verify_experiment_history(&self, connection: &Connection) -> StoreResult<()> {
         for artifact in read_kind_artifacts(connection, ArtifactKind::ExperimentTrial)? {
             if artifact.lifecycle != ArtifactLifecycle::Canonical {

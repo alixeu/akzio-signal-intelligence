@@ -31,6 +31,9 @@ use akzio_store::{
 
 const PPM_ONE: u32 = 1_000_000;
 
+// 文件导读：EvaluationRuntime 只接收受治理的观察和已存在的 Artifact 引用；T+1/T+3/T+5
+// 的数值由 Rust 重建，后续模块再把密封 T+5 结果交给 Store 的 Policy/Lesson 事务。
+
 /// Akzio policy, not an external statistical standard. Fewer than three fresh
 /// paired outcomes per horizon cannot advance memory by default.
 pub const AKZIO_MIN_FRESH_PAIRS_PER_HORIZON: u64 = 3;
@@ -186,6 +189,8 @@ pub fn horizon_observations(
     expected_evidence_count: u64,
     observed_evidence_count: u64,
 ) -> EvaluationRuntimeResult<Vec<GovernedHorizonObservation>> {
+    // common_dates 是四个可执行资产的共同交易日序列；只有完整对齐的日期才可作为某个
+    // Outcome horizon 的未来价格，缺一只资产或缺一天都报错而不补默认价格。
     if observed_evidence_count > expected_evidence_count {
         return Err(EvaluationError::InvalidMaterialization(
             "evidence observation count",
@@ -229,6 +234,8 @@ pub fn daily_observations(
     bars_by_asset: &BTreeMap<Asset, BTreeMap<NaiveDate, MoneyMicros>>,
     common_dates: &[NaiveDate],
 ) -> EvaluationRuntimeResult<Vec<GovernedDailyObservation>> {
+    // 日频路径给回撤、tracking error、beta、Sortino 和 benchmark 使用；它同样要求每个
+    // 共同交易日都有四资产价格，因此自然日流逝不会推进 T+1/T+3/T+5。
     common_dates
         .iter()
         .map(|observed_trading_day| {
@@ -298,6 +305,8 @@ pub fn realized_execution(
 ) -> EvaluationRuntimeResult<RealizedExecution> {
     account.validate()?;
     cost_model.validate()?;
+    // 兼容入口只能看到 account mark 和 plan limit，不能伪造 arrival/baseline quote；
+    // 后面清空 signed implementation effect，避免把 limit 诊断与真实估值差额重复计费。
     let prices = Asset::EXECUTABLE
         .into_iter()
         .map(|asset| {
@@ -342,6 +351,8 @@ pub fn realized_execution_at_prices(
     account.validate()?;
     cost_model.validate()?;
     validate_prices(prices)?;
+    // 先从账户持仓与 equity 重建数量和现金，再只应用唯一终态 Receipt；随后用冻结的
+    // execution-context midpoint 估值，不能把之后账户的再平衡混进这个 Outcome。
     let mut quantities = Asset::EXECUTABLE
         .into_iter()
         .map(|asset| {
@@ -377,11 +388,15 @@ pub fn realized_execution_at_prices(
         .sum::<i128>();
     let mut order_cost_attributions = Vec::with_capacity(receipts.len());
     if matches!(execution, OutcomeExecutionLineage::ReconciledPaper { .. }) {
+        // ReconciledPaper 必须有完整 ExecutionPlan 和每个订单的终态 receipt；NoOrder
+        // 则禁止携带 plan/fill，二者是互斥的执行证据边界。
         let plan = plan.ok_or(EvaluationError::InvalidMaterialization("execution plan"))?;
         plan.validate()?;
         for receipt in receipts {
             receipt.validate()?;
             if let Some(previous) = seen_receipts.insert(receipt.client_order_id.clone(), receipt) {
+                // 恢复重放的完全相同 receipt 可幂等跳过；同一 client_order_id 的不同内容
+                // 是冲突，而不是“多一笔成交”。
                 if previous == receipt {
                     continue;
                 }
@@ -518,6 +533,8 @@ pub fn realized_execution_at_prices(
             Ok((*asset, WeightPpm(ppm)))
         })
         .collect::<EvaluationRuntimeResult<BTreeMap<_, _>>>()?;
+    // 权重、turnover、fee 和 signed price effect 都以同一 equity/ppm 基准计算；负仓位
+    // 或算术溢出会返回错误，cash 则按现有账户/成交重建结果保留，不在此处另加规则。
     let target = TargetPortfolio { weights };
     target.validate_universe()?;
     let turnover_ppm = ratio_of_equity_ppm(fill_notional_micros, equity)?;
@@ -548,6 +565,7 @@ pub fn realized_execution_at_prices(
 }
 
 fn ratio_of_equity_ppm(value: i128, equity: i128) -> EvaluationRuntimeResult<u32> {
+    // 这是所有执行成本比例的共同分母检查：equity 必须为正，负值表示输入或方向不合法。
     if value < 0 || equity <= 0 {
         return Err(EvaluationError::InvalidMaterialization("execution ratio"));
     }

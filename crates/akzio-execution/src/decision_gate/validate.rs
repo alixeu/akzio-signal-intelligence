@@ -1,3 +1,8 @@
+// 文件导读：这些校验函数把 DecisionProposal 的 Artifact provenance、ContextManifest 的
+// 选择/隔离/祖先闭包和 DecisionDraft 的引用闭包分层检查。它们只读取 Store 并返回选中的
+// ArtifactRef 集合；任何 RawEvidence、错误 lifecycle、跨 task/run 引用或未归因 Lesson/
+// Experience 都在 Decision 事务前拒绝。
+
 impl DecisionRuntime {
     fn validate_manifest(
         &self,
@@ -6,6 +11,8 @@ impl DecisionRuntime {
         contract_hash: &akzio_domain::ContentHash,
         permit: &TaskWritePermit,
     ) -> DecisionGateResult<BTreeSet<ArtifactRef>> {
+        // 先绑定 proposal 与 manifest 的 origin/contract，再校验 payload 的 schema、trust、
+        // token/byte 统计和 source closure，最后返回 selected 集合供 draft references 检查。
         let proposal_origin = proposal
             .origin
             .as_ref()
@@ -57,6 +64,8 @@ impl DecisionRuntime {
         permit: &TaskWritePermit,
         visiting: &mut BTreeSet<ArtifactId>,
     ) -> DecisionGateResult<()> {
+        // 递归检查当前 Manifest 的 selected/quarantined/ancestor 三组引用互斥且完整；
+        // visiting 集合用于阻断循环，递归返回时移除当前节点以允许其他分支复用祖先。
         if !visiting.insert(manifest.artifact_id.clone()) {
             return Err(DecisionGateError::InvalidManifestClosure);
         }
@@ -189,6 +198,9 @@ impl DecisionRuntime {
         draft: &DecisionDraft,
         selected: &BTreeSet<ArtifactRef>,
     ) -> DecisionGateResult<()> {
+        // 把 draft 中 claims、critiques、evidence、research allocation 和 learning/conflict
+        // 引用逐一限制在 Manifest selected 集合；对 selected 的 Lesson/Experience 还要求
+        // 明确 applied 或 rejected，防止“模型看过但未声明影响”的隐式学习。
         for reference in draft
             .claims
             .iter()

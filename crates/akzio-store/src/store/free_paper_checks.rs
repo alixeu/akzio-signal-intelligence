@@ -1,7 +1,10 @@
+// 文件导读：这些窄校验把 Artifact kind/lifecycle/origin 与 Paper/Shadow purpose 绑定，
+// 并提供 source-ref 集合、Policy transition 和序列化 enum 的确定性辅助，不计算交易结果。
 fn workflow_graph_run_purpose(
     connection: &Connection,
     artifact_id: &ArtifactId,
 ) -> StoreResult<RunPurpose> {
+    // 通过 graph_artifact_id 反查唯一 Run purpose，避免调用方自行声明候选图身份。
     let purpose = connection
         .query_row(
             "SELECT purpose FROM rebuild_runs WHERE graph_artifact_id = ?1",
@@ -14,6 +17,7 @@ fn workflow_graph_run_purpose(
 }
 
 fn artifact_run_purpose(connection: &Connection, artifact: &Artifact) -> StoreResult<RunPurpose> {
+    // RunScoped Artifact 必须携带 origin.run_id，再由 SQL Run 行决定 purpose。
     let run_id = artifact
         .origin
         .as_ref()
@@ -29,6 +33,7 @@ fn assert_artifact_from_allowed_purposes(
     artifact: &Artifact,
     allowed_purposes: &[RunPurpose],
 ) -> StoreResult<()> {
+    // 对 Paper-only 与 Paper/Shadow 混合闭包分别返回不同错误，保留 canonical learning 边界。
     let purpose = artifact_run_purpose(connection, artifact)?;
     if allowed_purposes.contains(&purpose) {
         return Ok(());
@@ -45,10 +50,12 @@ fn assert_artifact_from_paper_with_connection(
     connection: &Connection,
     artifact: &Artifact,
 ) -> StoreResult<()> {
+    // canonical Policy/Outcome 只接受 Paper Run 来源。
     assert_artifact_from_allowed_purposes(connection, artifact, &[RunPurpose::Paper])
 }
 
 fn assert_paper_run(transaction: &Transaction<'_>, run_id: &RunId) -> StoreResult<()> {
+    // learning/commitment 写事务内再次读取 Run purpose，拒绝 PositionPlan/Debug 冒充 Paper。
     let purpose = run_purpose_from_connection(transaction, run_id)?;
     if purpose != RunPurpose::Paper {
         return Err(StoreError::NonCanonicalLearningPurpose(purpose));
@@ -61,6 +68,7 @@ fn read_required_artifact(
     reference: &ArtifactRef,
     error: &'static str,
 ) -> StoreResult<Artifact> {
+    // 引用 kind 与 SQL Artifact kind 必须同时匹配。
     let artifact = read_artifact(connection, &reference.artifact_id)?;
     if artifact.kind != reference.kind {
         return Err(StoreError::InvalidLearningCommit(error));
@@ -72,6 +80,7 @@ fn assert_canonical_paper_artifact(
     connection: &Connection,
     artifact: &Artifact,
 ) -> StoreResult<()> {
+    // parent decision/outcome 必须 canonical 且来自 Paper。
     if artifact.lifecycle != ArtifactLifecycle::Canonical {
         return Err(StoreError::InvalidLearningCommit(
             "shadow_pair.parent_lifecycle",
@@ -84,6 +93,7 @@ fn assert_shadow_candidate_artifact(
     connection: &Connection,
     artifact: &Artifact,
 ) -> StoreResult<()> {
+    // candidate 可来自 Paper 或 RunScoped Shadow，但 Shadow candidate 不能伪装 canonical。
     match artifact_run_purpose(connection, artifact)? {
         RunPurpose::Paper => Ok(()),
         RunPurpose::Shadow if artifact.lifecycle != ArtifactLifecycle::Canonical => Ok(()),
@@ -101,6 +111,7 @@ fn assert_candidate_decision_binding(
     candidate_decision: &Artifact,
     completion: &ShadowPairCompletion,
 ) -> StoreResult<()> {
+    // candidate decision 的 contract/topology 从 origin 或成功 Analyst task lineage 复核。
     let origin = candidate_decision
         .origin
         .as_ref()
@@ -143,6 +154,7 @@ fn assert_candidate_decision_binding(
 }
 
 fn outcome_schedule_source_refs(schedule: &OutcomeSchedule) -> Vec<ArtifactRef> {
+    // 按 NoOrder/ReconciledPaper 变体展开 schedule 的完整 source closure。
     let mut references = vec![
         schedule.decision.clone(),
         schedule.decision_context.clone(),
@@ -167,6 +179,7 @@ fn outcome_schedule_source_refs(schedule: &OutcomeSchedule) -> Vec<ArtifactRef> 
 
 #[allow(clippy::match_like_matches_macro)]
 fn is_allowed_policy_transition(from: PolicyState, to: PolicyState) -> bool {
+    // 只列出领域允许的 memory/contract/topology 状态边，不接受任意 from/to 组合。
     use akzio_domain::{CandidatePolicyState as Candidate, MemoryLifecycle as Memory};
 
     match (from, to) {
@@ -227,6 +240,7 @@ fn is_allowed_policy_transition(from: PolicyState, to: PolicyState) -> bool {
 }
 
 fn has_exact_source_refs(artifact: &Artifact, expected: &[ArtifactRef]) -> bool {
+    // 用去重后的 (id,kind) 指纹比较，同时拒绝 artifact 自身 source_refs 内的重复项。
     let actual = artifact
         .source_refs
         .iter()
@@ -250,6 +264,7 @@ fn source_ref_fingerprint(reference: &ArtifactRef) -> (String, String) {
 }
 
 fn same_paper_commitment(left: &PaperCommitment, right: &PaperCommitment) -> bool {
+    // 幂等恢复只比较计划、context、session 和 client_order_ids，不比较创建时间。
     left.plan_hash == right.plan_hash
         && left.execution_context == right.execution_context
         && left.broker_session == right.broker_session
@@ -257,6 +272,7 @@ fn same_paper_commitment(left: &PaperCommitment, right: &PaperCommitment) -> boo
 }
 
 fn enum_name<T: Serialize>(value: T) -> String {
+    // Store SQL 使用 serde 的 snake_case 字符串作为 enum 列值。
     serde_json::to_value(value)
         .expect("enum serializes")
         .as_str()
@@ -265,6 +281,7 @@ fn enum_name<T: Serialize>(value: T) -> String {
 }
 
 fn status_counts(connection: &Connection, table: &str) -> StoreResult<BTreeMap<String, u64>> {
+    // 仅供受控的固定表名调用方读取状态聚合；表名不是外部输入入口。
     let sql = format!("SELECT status, COUNT(*) FROM {table} GROUP BY status ORDER BY status");
     let mut statement = connection.prepare(&sql)?;
     let rows = statement.query_map([], |row| {
@@ -275,10 +292,12 @@ fn status_counts(connection: &Connection, table: &str) -> StoreResult<BTreeMap<S
 }
 
 fn parse_enum<T: for<'de> serde::Deserialize<'de>>(value: &str) -> StoreResult<T> {
+    // 从 SQL 字符串恢复 serde enum，未知值按 Json/Integrity 边界返回。
     serde_json::from_value(serde_json::Value::String(value.to_owned())).map_err(StoreError::Json)
 }
 
 fn parse_task_status(value: &str) -> StoreResult<TaskStatus> {
+    // Task SQL 的 queued 名称对应领域 Pending，其余状态保持显式映射。
     match value {
         "queued" => Ok(TaskStatus::Pending),
         "running" => Ok(TaskStatus::Running),
@@ -300,6 +319,7 @@ fn is_trajectory_redacted_kind(kind: ArtifactKind) -> bool {
 }
 
 fn trajectory_output_refs(artifact: &Artifact) -> Vec<ArtifactRef> {
+    // trajectory 输出保留自身和非 Raw/非模型细节 source refs，并稳定排序去重。
     let mut refs = vec![ArtifactRef {
         artifact_id: artifact.artifact_id.clone(),
         kind: artifact.kind,

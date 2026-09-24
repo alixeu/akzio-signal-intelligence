@@ -1,3 +1,11 @@
+// 文件导读：Debug CLI 连接隔离 Core 的 prepare/inspect/step/resume/fork/export 入口，并
+// 保持 fixture、真实模型探测和只读导出彼此分离。CLI 只发送带 expected revision 的控制
+// 请求，Store/CAS 才决定 claim、lease、状态和权限；accepted/Completed 或导出成功都不
+// 等于 Decision、Paper submission、fill 或 Outcome/learning 完成。
+// Rust 机制：clap derive 宏生成强类型枚举；异步控制使用 `Future`/`await`，`watch` 负责
+// 关闭传播，`Arc::make_mut` 只在测试 fixture 独占时复制写时数据，`Result`/`Option` 明确
+// 区分缺失资源、阻断和实际错误。
+
 fn default_outcome_processing() -> bool {
     // Debug/fixture 默认保留 Outcome worker；这只决定后续评估是否可处理，
     // 不会把 PositionPlan 的研究或 Decision 结果提升为 Paper 执行。

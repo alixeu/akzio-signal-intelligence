@@ -1,3 +1,5 @@
+// 文件导读：提供所有 crate 共用的领域错误、资产/金额/哈希标量、任务预算和生命周期枚举。
+// 这里是 Rust 状态与序列化语义的基础层，保持纯计算，不接触外部 I/O。
 //! The versioned, Rust-owned language shared by every Akzio module.
 //!
 //! This crate deliberately contains no database, model, network, or filesystem
@@ -93,6 +95,7 @@ pub enum Asset {
 impl Asset {
     pub const EXECUTABLE: [Self; 4] = [Self::Tqqq, Self::Qqq, Self::Soxx, Self::Soxl];
 
+    // 将内部资产枚举映射为系统允许的四个 ETF 代码。
     pub const fn symbol(self) -> &'static str {
         match self {
             Self::Tqqq => "TQQQ",
@@ -104,6 +107,7 @@ impl Asset {
 }
 
 impl fmt::Display for Asset {
+    // Display 直接复用 symbol，保证日志/错误文本与 wire 资产代码一致。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.symbol())
     }
@@ -112,6 +116,7 @@ impl fmt::Display for Asset {
 impl TryFrom<&str> for Asset {
     type Error = DomainError;
 
+    // 先裁剪空白并转大写，再只接受四个可执行资产，其余输入返回 UnsupportedAsset。
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         match value.trim().to_ascii_uppercase().as_str() {
             "TQQQ" => Ok(Self::Tqqq),
@@ -124,6 +129,7 @@ impl TryFrom<&str> for Asset {
 }
 
 impl<'de> Deserialize<'de> for Asset {
+    // 通过 String 反序列化后复用 TryFrom，确保 JSON 输入和手工解析共享白名单。
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -156,6 +162,7 @@ pub struct MoneyMicros(pub i64);
 impl MoneyMicros {
     pub const ZERO: Self = Self(0);
 
+    // 把美元分转换为百万分美元；saturating_mul 避免 i64 溢出回绕。
     pub const fn from_usd_cents(cents: i64) -> Self {
         Self(cents.saturating_mul(10_000))
     }
@@ -166,6 +173,7 @@ impl MoneyMicros {
 pub struct ContentHash(String);
 
 impl ContentHash {
+    // 只接受小写十六进制 SHA-256 文本；长度或字符不符时拒绝构造。
     pub fn new(value: impl Into<String>) -> Result<Self, DomainError> {
         let value = value.into();
         if value.len() != 64
@@ -178,22 +186,27 @@ impl ContentHash {
         Ok(Self(value))
     }
 
+    // 对任意字节计算 SHA-256，并把摘要编码为小写十六进制字符串。
     pub fn of_bytes(bytes: &[u8]) -> Self {
         Self(format!("{:x}", Sha256::digest(bytes)))
     }
 
+    // 暴露借用的哈希文本，避免为读取生成新的 String。
     pub fn as_str(&self) -> &str {
         &self.0
     }
 }
 
 impl fmt::Display for ContentHash {
+    // 直接写出底层摘要文本。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
     }
 }
 
+// 递归规范化 JSON 的嵌套数组/对象后序列化，保证同一值使用稳定字节表示。
 pub fn canonical_json_bytes(value: &Value) -> Result<Vec<u8>, serde_json::Error> {
+    // 该局部函数按引用匹配 Value；叶子节点克隆，容器节点递归收集新容器。
     fn canonicalize(value: &Value) -> Value {
         match value {
             Value::Array(items) => Value::Array(items.iter().map(canonicalize).collect()),
@@ -210,6 +223,7 @@ pub fn canonical_json_bytes(value: &Value) -> Result<Vec<u8>, serde_json::Error>
     serde_json::to_vec(&canonicalize(value))
 }
 
+// 复用规范化 JSON 字节计算内容哈希，序列化失败原样向调用方传播。
 pub fn content_hash_json(value: &Value) -> Result<ContentHash, serde_json::Error> {
     canonical_json_bytes(value).map(|bytes| ContentHash::of_bytes(&bytes))
 }
@@ -231,6 +245,7 @@ pub struct TargetPortfolio {
 }
 
 impl TargetPortfolio {
+    // 为全部四个可执行资产建立零权重表；现金保持隐含。
     pub fn zeroed() -> Self {
         Self {
             weights: Asset::EXECUTABLE
@@ -240,6 +255,7 @@ impl TargetPortfolio {
         }
     }
 
+    // 检查权重表既没有缺少可执行资产，也没有额外资产。
     pub fn validate_universe(&self) -> Result<(), DomainError> {
         if self.weights.len() != Asset::EXECUTABLE.len()
             || !Asset::EXECUTABLE
@@ -260,6 +276,7 @@ pub struct BlobRef {
 }
 
 impl BlobRef {
+    // 只校验媒体类型非空；哈希和字节数的语义由更高层 Artifact 校验组合。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.media_type.trim().is_empty() {
             return Err(DomainError::EmptyField {
@@ -282,6 +299,7 @@ pub enum RunPurpose {
 }
 
 impl RunPurpose {
+    // 只有正式 Paper Run 的目的允许进入 canonical learning 语义。
     pub const fn is_canonical_learning(self) -> bool {
         matches!(self, Self::Paper)
     }
@@ -300,6 +318,7 @@ pub enum TaskStatus {
 }
 
 impl TaskStatus {
+    // 终态是不再等待后续执行的四种状态，Pending/Leased/Running 仍可推进。
     pub const fn is_terminal(self) -> bool {
         matches!(
             self,
@@ -356,6 +375,7 @@ pub struct RetryPolicy {
 }
 
 impl RetryPolicy {
+    // 构造一个不重试、单次尝试且无退避的策略。
     pub const fn none() -> Self {
         Self {
             max_attempts: 1,
@@ -366,6 +386,7 @@ impl RetryPolicy {
         }
     }
 
+    // max_attempts 必须为正；其他开关可按角色由调用方组合。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.max_attempts == 0 {
             return Err(DomainError::InvalidBudget {
@@ -385,6 +406,7 @@ pub struct TerminationPolicy {
 }
 
 impl TerminationPolicy {
+    // 构造不允许创建子任务的叶节点策略，同时要求证据完成后停止。
     pub const fn leaf() -> Self {
         Self {
             max_child_tasks: 0,
@@ -404,6 +426,7 @@ pub enum FailureDisposition {
 }
 
 impl TaskBudget {
+    // 输入、输出、墙钟三项都必须为正；工具调用上限由 ToolCallLimit 自身表达。
     pub fn validate(&self) -> Result<(), DomainError> {
         for (field, value) in [
             ("max_input_tokens", self.max_input_tokens),

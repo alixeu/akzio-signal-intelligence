@@ -1,4 +1,6 @@
 //! Read-only size attribution. Never prints prompts, evidence, or opaque reasoning.
+// 文件导读：示例只通过 open_existing 读取 AgentTurn 与 Contract CAS，按 JSON 结构计算
+// 大小归因；它不写 Store、不解密 continuation，也不把指标解释成研究/Decision 完成。
 use akzio_domain::{ArtifactId, ArtifactKind, ContentHash, RunId};
 use akzio_store::Store;
 use serde_json::{json, Value};

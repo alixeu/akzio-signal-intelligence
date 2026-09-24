@@ -3,6 +3,12 @@
 //! Adapters acquire bytes; agents only receive immutable artifacts. The
 //! enclosing `TaskRuntime` commits a completed task attempt through `Store`.
 
+// 文件导读：runtime.rs 定义 EvidenceRequest、有限 GovernedResource、时间/来源/质量模型和
+// EvidenceRuntime 的公共错误边界。请求在 provider I/O 前解析成 allowlisted 资源；采集后
+// 必须同时满足 raw 非空、URI 安全、citation 精确绑定、available/event/release/vintage 不
+// 越 cutoff、retrieval 不早于 availability。这里不执行模型或订单，只为后续 Context 提供
+// 可验证的 Raw→Normalized 证据契约。
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 
@@ -33,6 +39,8 @@ pub enum EvidenceSource {
 
 impl EvidenceSource {
     pub const fn as_str(self) -> &'static str {
+        // 固定 source family 字符串用于 EvidenceNeed、Artifact producer 和 provenance，不能
+        // 由请求文本自定义。
         match self {
             Self::Alpaca => "alpaca",
             Self::SecEdgar => "sec_edgar",
@@ -54,6 +62,8 @@ pub struct EvidenceRequest {
 
 impl EvidenceRequest {
     fn validate(&self) -> Result<(), EvidenceRuntimeError> {
+        // 限制 resource 长度、max_age 和资源枚举；GovernedResource parse 是 transport 前的
+        // 第二层语法/业务边界。
         if self.resource.trim().is_empty()
             || self.resource.chars().count() > 2_048
             || self.max_age <= Duration::zero()
@@ -155,6 +165,8 @@ pub enum GovernedResource {
 
 impl GovernedResource {
     pub fn parse(source: EvidenceSource, resource: &str) -> Result<Self, EvidenceRuntimeError> {
+        // 先做统一长度检查，再按 source 分派到封闭 parser；返回的 enum 是 adapter 构造 URL
+        // 和选择时基的唯一权威，原字符串不会直接当 endpoint。
         let resource = resource.trim();
         if resource.is_empty() || resource.chars().count() > 2_048 {
             return Err(EvidenceRuntimeError::InvalidRequest);
@@ -168,6 +180,8 @@ impl GovernedResource {
     }
 
     fn parse_news(resource: &str) -> Result<Self, EvidenceRuntimeError> {
+        // 区分 official research、限定窗口的 RecentNews 和显式 query，并限制资产、topic、
+        // 31 天窗口；未知 category 不落入自由查询分支。
         let parts = resource.split(':').collect::<Vec<_>>();
         if let ["research", category, symbol, as_of] = parts.as_slice() {
             let asset =
@@ -222,6 +236,8 @@ impl GovernedResource {
     }
 
     fn parse_alpaca(resource: &str) -> Result<Self, EvidenceRuntimeError> {
+        // 只接受 Paper account/positions/orders/clock/quotes/fills、资产报价/日线、公司行动
+        // 和期权链几类有限形态，并限制日期跨度、页数与可执行资产。
         match resource {
             "paper.account" => return Ok(Self::AlpacaAccount),
             "paper.positions" => return Ok(Self::AlpacaPositions),
@@ -340,6 +356,8 @@ impl GovernedResource {
     }
 
     fn parse_fred(resource: &str) -> Result<Self, EvidenceRuntimeError> {
+        // 解析 observations/vintages/release calendar 的 series、窗口和 vintage 关系；
+        // FRED resource 的日期窗口有界，vintage 必须早于窗口起点。
         let parts = resource.split(':').collect::<Vec<_>>();
         if parts.first() == Some(&"release_calendar") {
             let [_, start, end, vintage] = parts.as_slice() else {
@@ -415,6 +433,8 @@ impl GovernedResource {
     }
 
     fn parse_sec(resource: &str) -> Result<Self, EvidenceRuntimeError> {
+        // 将 SEC submissions/companyfacts/filing 资源拆成规范 CIK、accession 和主文档，
+        // URL 细节留给 direct adapter，避免自由拼接路径。
         let parts = resource.split(':').collect::<Vec<_>>();
         match parts.as_slice() {
             ["sec" | "submissions", cik] => Ok(Self::SecSubmissions {
@@ -438,6 +458,8 @@ impl GovernedResource {
 }
 
 fn governed_news_query(resource: &str) -> Result<String, EvidenceRuntimeError> {
+    // 将 official 资源渲染为受控研究主题；普通 news:/query: 才保留查询文本，并由长度/来源
+    // policy 在后续 adapter 再验证。
     let parts = resource.split(':').collect::<Vec<_>>();
     if let ["research", category, symbol, as_of] = parts.as_slice() {
         let asset = Asset::try_from(*symbol).map_err(|_| EvidenceRuntimeError::InvalidRequest)?;
@@ -468,6 +490,7 @@ fn governed_news_query(resource: &str) -> Result<String, EvidenceRuntimeError> {
 }
 
 fn normalized_cik(value: &str) -> Result<String, EvidenceRuntimeError> {
+    // 去掉可选 CIK 前缀、只接受正数字并左补零到十位，保证 SEC URL/identity 稳定。
     let digits = value.strip_prefix("CIK").unwrap_or(value);
     if digits.is_empty() || digits.len() > 10 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(EvidenceRuntimeError::InvalidRequest);
@@ -482,6 +505,7 @@ fn normalized_cik(value: &str) -> Result<String, EvidenceRuntimeError> {
 }
 
 fn valid_accession(value: &str) -> bool {
+    // SEC accession 必须是固定 20 位数字并在 10/13 位有连字符。
     let bytes = value.as_bytes();
     bytes.len() == 20
         && bytes[10] == b'-'
@@ -493,6 +517,7 @@ fn valid_accession(value: &str) -> bool {
 }
 
 fn valid_primary_document(value: &str) -> bool {
+    // 主文档只允许有限 ASCII 文件名，不接受路径穿越、隐藏文件或控制字符。
     !value.is_empty()
         && value.len() <= 128
         && !value.starts_with('.')
@@ -505,6 +530,8 @@ fn valid_primary_document(value: &str) -> bool {
 /// payloads may still use a minimal close-only shape, but provider data must
 /// carry a timestamped, positive and internally consistent daily bar.
 pub fn validate_daily_bar_payload(value: &Value) -> Result<(), EvidenceRuntimeError> {
+    // 逐 bar 验证 timestamp 严格递增、交易日唯一、OHLCV 为正且 high/low 包含 open/close；
+    // 这是生产 provider 的形状门，不把 close-only fixture 误当完整实时日线。
     let bars = value
         .get("bars")
         .and_then(Value::as_array)
@@ -541,6 +568,7 @@ pub fn validate_daily_bar_payload(value: &Value) -> Result<(), EvidenceRuntimeEr
 }
 
 fn positive_market_number(value: Option<&Value>) -> Result<f64, EvidenceRuntimeError> {
+    // 接受数字或十进制字符串，但只返回 finite positive 值，拒绝 NaN/Infinity/零。
     let value = value.ok_or(EvidenceRuntimeError::InvalidAcquisition)?;
     let number = value
         .as_f64()
@@ -581,6 +609,8 @@ pub struct EvidenceTimeBasis {
 
 impl EvidenceTimeBasis {
     fn validate(&self) -> Result<(), EvidenceRuntimeError> {
+        // 所有 event/release/available/vintage 都必须落在 DecisionClock 许可范围，release
+        // 不得晚于 availability，retrieved 不得早于 availability；任一关系破坏即污染。
         if !self.decision_clock.contains(self.available_at)
             || self
                 .event_time
@@ -617,6 +647,8 @@ pub struct EvidenceContaminationCertificate {
 
 impl EvidenceContaminationCertificate {
     fn for_time_basis(time_basis: &EvidenceTimeBasis) -> Result<Self, EvidenceRuntimeError> {
+        // 证书只在完整时间基准通过后生成，并把每个通过条件固化为布尔事实，不自行计算未来
+        // 时间或替换缺失字段。
         time_basis.validate()?;
         Ok(Self {
             available_at_or_before_cutoff: true,
@@ -635,6 +667,8 @@ impl EvidenceProvenance {
         source_uri: &str,
         observed_at: DateTime<Utc>,
     ) -> Result<(), EvidenceRuntimeError> {
+        // provenance 的 source_uri/observed_at 必须和 acquisition 顶层一致，document/revision
+        // 不能是空值；每个 citation 的 byte slice 必须等于 quote 原文。
         if self.source_uri != source_uri
             || self.observed_at != observed_at
             || self.dedupe_key.trim().is_empty()
@@ -674,6 +708,8 @@ pub struct EvidenceQuality {
 
 impl Default for EvidenceQuality {
     fn default() -> Self {
+        // 默认表示 adapter 已提供完整、标准化且 citation 完整的结果；不代表外部来源已
+        // 通过 source verification，source-specific adapter 可显式降低它。
         Self {
             completeness_ppm: 1_000_000,
             citations_complete: true,
@@ -684,6 +720,8 @@ impl Default for EvidenceQuality {
 
 impl EvidenceQuality {
     fn validate(&self) -> Result<(), EvidenceRuntimeError> {
+        // completeness 只允许 ppm 范围内，normalized 必须为真；缺口由 adapter 保留而不是
+        // 用默认值补齐。
         if self.completeness_ppm > 1_000_000 || !self.normalized {
             return Err(EvidenceRuntimeError::InvalidQuality);
         }
@@ -729,6 +767,8 @@ pub struct EvidenceBundle {
 
 /// Read one byte offset out of a persisted claim binding.
 pub(crate) fn claim_binding_byte(binding: &Value, field: &str) -> Option<usize> {
+    // 从 JSON claim binding 读取非负 byte offset；这里只做投影，不验证与 raw 的对应关系，
+    // 真正的 quote/hash 闭包由 materialize_normalized 执行。
     binding
         .get(field)
         .and_then(Value::as_u64)
@@ -741,6 +781,8 @@ pub(crate) fn claim_binding_byte(binding: &Value, field: &str) -> Option<usize> 
 /// request, so a credential-bearing or fragment-carrying URL never reaches the
 /// network; the materialization path re-checks the sealed `source_uri`.
 pub(crate) fn governed_source_uri_is_safe(source_uri: &str) -> bool {
+    // URI 只要含认证、fragment 或 token/secret/password/api_key/authorization query 就不安全；
+    // 此检查在独立 fetch 前和 materialization 时各执行一次。
     let Ok(parsed) = Url::parse(source_uri) else {
         return false;
     };
@@ -771,6 +813,8 @@ pub fn model_native_web_evidence_transport(
     client: ModelClient,
     source: EvidenceSource,
 ) -> EvidenceRuntimeResult<std::sync::Arc<dyn AsyncEvidenceAdapter>> {
+    // 仅创建绑定 source 的 native-web adapter；实际 search/citation/source fetch 仍由 adapter
+    // 的 policy 和模型协议逐层校验。
     Ok(std::sync::Arc::new(
         adapters::ModelNativeWebEvidenceTransport::for_source(client, source)?,
     ))
@@ -827,6 +871,7 @@ mod retired_resource_tests {
     use super::*;
     #[test]
     fn bare_fixture_resources_are_rejected() {
+        // 资源必须包含完整资产/窗口等参数，禁止用裸 fixture 名绕过 GovernedResource 解析。
         for resource in ["quote", "bars"] {
             assert!(GovernedResource::parse(EvidenceSource::Alpaca, resource).is_err());
         }

@@ -15,6 +15,7 @@ import SwiftUI
 @MainActor
 public enum CaptureCommand {
     public struct Options: Sendable {
+        // Options 是一次截图请求的值快照；Sendable 让参数可安全地从命令入口传到主 actor 渲染。
         public var scenario: MockScenario
         public var route: AppRoute
         public var output: String
@@ -29,10 +30,12 @@ public enum CaptureCommand {
     /// Returns true when the arguments asked for a capture, so `main` knows not to
     /// open a window. Deliberately not actor-isolated: it only reads the argv array.
     public nonisolated static func handles(_ arguments: [String]) -> Bool {
+        // 这里只做纯数组查询，不触碰 AppKit/SwiftUI 状态，所以可以在任意执行上下文判断入口。
         arguments.contains("--capture")
     }
 
     public static func run(_ arguments: [String]) -> Int32 {
+        // run 把解析、主 actor 渲染和文件写入的 throws 结果压缩成 CLI 约定的退出码。
         // 参数不完整返回 2；渲染/写文件失败返回 1；只有 PNG 已写入才返回 0。
         guard let options = parse(arguments) else {
             FileHandle.standardError.write(Data(usage.utf8))
@@ -63,6 +66,7 @@ public enum CaptureCommand {
     }
 
     static func render(_ options: Options) throws {
+        // render 只接收已解析的值类型 Options；失败通过 throws 返回给 run，不在 UI 中显示错误。
         // 这里构造的是关闭 Core 自动启动的离屏 AppShell，因此截图不会启动真实任务或网络请求。
         let content = AppShell(
             scenario: options.scenario,
@@ -114,6 +118,7 @@ public enum CaptureCommand {
     """
 
     static func parse(_ arguments: [String]) -> Options? {
+        // parse 的 Optional 表示“是否具备最小可渲染输入”；尺寸、scale 等可选字段各自回退默认值。
         var values: [String: String] = [:]
         var flags: Set<String> = []
         var index = 0

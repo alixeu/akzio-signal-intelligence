@@ -56,6 +56,7 @@ impl std::fmt::Debug for OfficialInstrumentEvidenceTransport {
 
 impl OfficialInstrumentEvidenceTransport {
     pub fn new() -> Result<Self, EvidenceAdapterError> {
+        // issuer 直连客户端禁止自动 redirect，并设置连接/整体超时；构造失败通过 Result 传回而不生成不可用适配器。
         let client = Client::builder()
             .http1_only()
             .redirect(reqwest::redirect::Policy::none())
@@ -67,6 +68,7 @@ impl OfficialInstrumentEvidenceTransport {
     }
 
     async fn fetch(&self, source_uri: &str) -> Result<HttpDocument, EvidenceAdapterError> {
+        // URL 必须是 HTTPS 且 host 在固定发行方 allowlist 内；这是发起 HTTP I/O 前的权限边界。
         let url = Url::parse(source_uri)
             .map_err(|_| EvidenceAdapterError::DataQuality("official URL is invalid".into()))?;
         if url.scheme() != "https" || !official_host_allowed(url.host_str().unwrap_or_default()) {
@@ -87,6 +89,7 @@ impl OfficialInstrumentEvidenceTransport {
             .send()
             .await
             .map_err(|error| EvidenceAdapterError::Transport(error.to_string()))?;
+        // 先按 HTTP 状态分类，再比较最终 URL；任何 redirect 都被拒绝，不把跳转后的站点默认为官方来源。
         crate::runtime::classify_evidence_response(&response)?;
         if response.url() != &url {
             return Err(EvidenceAdapterError::Policy {
@@ -103,6 +106,7 @@ impl OfficialInstrumentEvidenceTransport {
                 "official response exceeds the bounded body limit".into(),
             ));
         }
+        // content_length 只是早期上限检查，流式读取还会再次检查累计 body，防止 provider 不报长度时越过边界。
         let media_type = response
             .headers()
             .get(header::CONTENT_TYPE)
@@ -122,6 +126,7 @@ impl OfficialInstrumentEvidenceTransport {
                     .and_then(|value| value.to_str().ok())
                     .map(str::to_owned)
             });
+        // ETag/Last-Modified 是可选 revision；available_at 优先取 Last-Modified，其次才使用 HTTP Date。
         let available_at = response
             .headers()
             .get(header::LAST_MODIFIED)
@@ -153,6 +158,7 @@ impl OfficialInstrumentEvidenceTransport {
                 "official response is empty".into(),
             ));
         }
+        // 返回值同时保留原始 body、媒体类型和版本头；上层 parser 决定如何转换为 normalized evidence。
         Ok(HttpDocument {
             url: source_uri.to_owned(),
             body,
@@ -167,6 +173,7 @@ impl OfficialInstrumentEvidenceTransport {
         request: &EvidenceRequest,
         cutoff: DateTime<Utc>,
     ) -> Result<AcquiredEvidence, EvidenceAdapterError> {
+        // official adapter 只服务 NewsWeb 下的 typed issuer resources；先检查 source，再解析 GovernedResource。
         if request.source != EvidenceSource::NewsWeb {
             return Err(EvidenceAdapterError::SourceMismatch);
         }
@@ -178,6 +185,7 @@ impl OfficialInstrumentEvidenceTransport {
                     reason: error.to_string(),
                 }
             })?;
+        // match 将不同官方材料分派到各自 parser；最近新闻、未类型化查询和不支持类别显式返回 gap。
         match governed {
             GovernedResource::OfficialFundHoldings { asset, as_of } => {
                 self.acquire_holdings(asset, as_of, cutoff).await
@@ -213,6 +221,7 @@ impl OfficialInstrumentEvidenceTransport {
         requested_as_of: NaiveDate,
         cutoff: DateTime<Utc>,
     ) -> Result<AcquiredEvidence, EvidenceAdapterError> {
+        // 四只资产映射到各自发行方 endpoint；parser 返回 effective_as_of 与结构化 rows，原始响应仍原样保留。
         let document = match asset {
             Asset::Qqq => self.fetch(INVESCO_HOLDINGS).await?,
             Asset::Tqqq => self.fetch(PROSHARES_HOLDINGS).await?,
@@ -225,6 +234,7 @@ impl OfficialInstrumentEvidenceTransport {
             Asset::Soxx => parse_ishares_holdings(&document.body, asset)?,
             Asset::Soxl => parse_direxion_holdings(&document.body, asset)?,
         };
+        // 发行方文档的有效日期必须不晚于请求日期和 cutoff，不能用 HTTP retrieval 时间替代业务日期。
         validate_effective_date(effective_as_of, requested_as_of, cutoff)?;
         let source_document = source_document_metadata(
             &document,
@@ -256,8 +266,10 @@ impl OfficialInstrumentEvidenceTransport {
         requested_as_of: NaiveDate,
         cutoff: DateTime<Utc>,
     ) -> Result<AcquiredEvidence, EvidenceAdapterError> {
+        // 指数元数据需要发行方 API 或产品页中的身份/benchmark 事实；每个分支都单独验证日期和文本证据。
         let (document, effective_as_of, benchmark_index, data) = match asset {
             Asset::Qqq => {
+                // QQQ 同时读取 JSON details 和官方页面，只有两者能证明产品与 Nasdaq-100 的绑定才继续。
                 let details = self.fetch(INVESCO_DETAILS).await?;
                 let page = self.fetch(INVESCO_PAGE).await?;
                 let details_value: Value = serde_json::from_slice(&details.body).map_err(|_| {
@@ -298,6 +310,7 @@ impl OfficialInstrumentEvidenceTransport {
                 )
             }
             Asset::Tqqq => {
+                // TQQQ 的产品版本由 issuer parser 选择，不能从页面响应时间推导有效日期。
                 let mut document = self.fetch(PROSHARES_PAGE).await?;
                 let (text, effective) = proshares_product_version(&mut document, cutoff)?;
                 if !text.contains("TQQQ") || !text.contains("Nasdaq-100 Index") {
@@ -313,6 +326,7 @@ impl OfficialInstrumentEvidenceTransport {
                 )
             }
             Asset::Soxx => {
+                // SOXX 页面必须同时出现资产身份、benchmark 和不晚于 cutoff 的 as-of 日期。
                 let document = self.fetch(ISHARES_PAGE).await?;
                 let text = String::from_utf8_lossy(&document.body);
                 if !text.contains("SOXX") || !text.contains("NYSE Semiconductor Index") {
@@ -333,11 +347,13 @@ impl OfficialInstrumentEvidenceTransport {
                 )
             }
             Asset::Soxl => {
+                // SOXL 当前没有可接受的产品页解析器；明确报告 NotConfigured，不把 holdings CSV 当成指数元数据。
                 return Err(EvidenceAdapterError::NotConfigured(
                     "Direxion product-page metadata is protected by a browser challenge; holdings CSV is registered independently".into(),
                 ));
             }
         };
+        // 解析得到的有效日期再次和请求 cutoff 比较，normalized 才能声明 complete official source。
         validate_effective_date(effective_as_of, requested_as_of, cutoff)?;
         let source_document = source_document_metadata(
             &document,
@@ -369,8 +385,10 @@ impl OfficialInstrumentEvidenceTransport {
         requested_as_of: NaiveDate,
         cutoff: DateTime<Utc>,
     ) -> Result<AcquiredEvidence, EvidenceAdapterError> {
+        // 杠杆条款只在页面明确包含资产、daily reset、倍数和 benchmark 时转换；缺少解析器的 SOXL 保持缺口。
         let (document, effective_as_of, benchmark_index, multiple, text) = match asset {
             Asset::Tqqq => {
+                // TQQQ 的 description 由内容 revision 定日期，文本关键词只用于确认条款完整性。
                 let mut document = self.fetch(PROSHARES_PAGE).await?;
                 let (text, effective) = proshares_product_version(&mut document, cutoff)?;
                 if !text.contains("TQQQ")
@@ -385,12 +403,14 @@ impl OfficialInstrumentEvidenceTransport {
                 (document, effective, "Nasdaq-100 Index", 3_u8, text)
             }
             Asset::Soxl => {
+                // 原始 PDF header 不足以证明完整条款，因此不从中提升 evidence。
                 return Err(EvidenceAdapterError::NotConfigured(
                     "Direxion leverage terms require the issuer page/PDF text parser; no text is promoted from a raw PDF header".into(),
                 ));
             }
             _ => return Err(EvidenceAdapterError::SourceMismatch),
         };
+        // 条款的 effective_as_of 仍必须早于请求日期和 cutoff，避免未来版本污染历史研究。
         validate_effective_date(effective_as_of, requested_as_of, cutoff)?;
         let source_document = source_document_metadata(
             &document,
@@ -425,6 +445,7 @@ impl OfficialInstrumentEvidenceTransport {
         normalized: Value,
         effective_as_of: NaiveDate,
     ) -> Result<AcquiredEvidence, EvidenceAdapterError> {
+        // 组装结果时同时返回 provider 原文与 normalized 投影；revision 优先使用响应头，否则回退到 body hash。
         let observed_at = Utc::now();
         let published_at = effective_as_of
             .and_hms_opt(0, 0, 0)
@@ -460,6 +481,7 @@ impl AsyncEvidenceAdapter for OfficialInstrumentEvidenceTransport {
         &'a self,
         request: &'a EvidenceRequest,
     ) -> BoxFuture<'a, Result<AcquiredEvidence, EvidenceAdapterError>> {
+        // trait 的无 cutoff 入口使用当前 UTC 时间；需要重放或历史校验时由 acquire_at 注入固定 cutoff。
         self.acquire_at(request, Utc::now())
     }
 
@@ -468,11 +490,13 @@ impl AsyncEvidenceAdapter for OfficialInstrumentEvidenceTransport {
         request: &'a EvidenceRequest,
         cutoff: DateTime<Utc>,
     ) -> BoxFuture<'a, Result<AcquiredEvidence, EvidenceAdapterError>> {
+        // BoxFuture 把 async acquire_inner 适配到共享 trait；所有解析、权限和日期错误都沿 Result 返回。
         Box::pin(async move { self.acquire_inner(request, cutoff).await })
     }
 }
 
 fn official_host_allowed(host: &str) -> bool {
+    // allowlist 按完整 host 比较；未列出的域名即使返回相似内容也不能作为官方证据来源。
     matches!(
         host,
         "dng-api.invesco.com"
@@ -485,6 +509,7 @@ fn official_host_allowed(host: &str) -> bool {
 }
 
 fn issuer_for(asset: Asset) -> &'static str {
+    // 将领域资产映射到其发行方标签，仅用于 normalized/provenance，不参与网络重定向或内容猜测。
     match asset {
         Asset::Qqq => "Invesco",
         Asset::Tqqq => "ProShares",
@@ -494,6 +519,7 @@ fn issuer_for(asset: Asset) -> &'static str {
 }
 
 fn request_resource(asset: Asset, category: &str, as_of: NaiveDate) -> String {
+    // 资源 ID 由 typed asset、类别和请求日期确定，供 provenance 绑定原始请求语义。
     format!("research:{category}:{}:{as_of}", asset.symbol())
 }
 
@@ -503,6 +529,7 @@ fn source_document_metadata(
     effective_as_of: NaiveDate,
     coverage: &str,
 ) -> Value {
+    // source_document 明确记录 direct acquisition、policy 版本、完整覆盖、原文 hash 和 revision，供后续来源校验使用。
     json!({
         "acquisition_kind": "official_direct",
         "acquisition_mode": akzio_domain::EvidenceAcquisitionMode::VerifiedSource.as_str(),
@@ -527,6 +554,7 @@ fn validate_effective_date(
     requested_as_of: NaiveDate,
     cutoff: DateTime<Utc>,
 ) -> Result<(), EvidenceAdapterError> {
+    // 同时比较日历日期与请求日期；未来版本直接返回 DataQuality，不以 provider 的 retrieval 时间掩盖日期越界。
     if effective_as_of > cutoff.date_naive() || effective_as_of > requested_as_of {
         return Err(EvidenceAdapterError::DataQuality(format!(
             "official source version {effective_as_of} is after requested cutoff {requested_as_of}"
@@ -539,6 +567,7 @@ fn proshares_product_version(
     document: &mut HttpDocument,
     cutoff: DateTime<Utc>,
 ) -> Result<(String, NaiveDate), EvidenceAdapterError> {
+    // ProShares 优先解析带 fundSymbol/status/saved 的 JSON；不符合 JSON 时才回退到页面文本日期提取。
     let invalid = |message: &str| EvidenceAdapterError::DataQuality(message.into());
     if let Ok(value) = serde_json::from_slice::<Value>(&document.body) {
         if value.get("fundSymbol").and_then(Value::as_str) != Some("TQQQ")
@@ -570,6 +599,7 @@ fn proshares_product_version(
         return Ok((format!("TQQQ: {description}"), saved.date_naive()));
     }
     let text = String::from_utf8_lossy(&document.body).into_owned();
+    // 页面回退只接受 cutoff 内的 as-of 或已解析的响应可用时间，不能把当前抓取时刻当成产品版本。
     let effective = latest_as_of_date(&text, cutoff.date_naive())
         .or_else(|| document.available_at.map(|v| v.date_naive()))
         .ok_or_else(|| invalid("ProShares product page has no as-of date"))?;
@@ -580,6 +610,7 @@ fn parse_invesco_holdings(
     body: &[u8],
     asset: Asset,
 ) -> Result<(NaiveDate, Value), EvidenceAdapterError> {
+    // Invesco holdings 是 JSON；先核对 ticker/cusip 和 effectiveBusinessDate，再要求 holdings 数量与总数一致。
     let value: Value = serde_json::from_slice(body)
         .map_err(|_| EvidenceAdapterError::DataQuality("invalid Invesco holdings JSON".into()))?;
     let identity = value
@@ -623,6 +654,7 @@ fn parse_proshares_holdings(
     body: &[u8],
     asset: Asset,
 ) -> Result<(NaiveDate, Value), EvidenceAdapterError> {
+    // ProShares CSV 的 AS OF 行提供业务日期，解析后只选择目标 Fund Ticker，其他行不进入 normalized rows。
     let text = std::str::from_utf8(body).map_err(|_| {
         EvidenceAdapterError::DataQuality("ProShares holdings are not UTF-8 CSV".into())
     })?;
@@ -668,6 +700,7 @@ fn parse_ishares_holdings(
     body: &[u8],
     asset: Asset,
 ) -> Result<(NaiveDate, Value), EvidenceAdapterError> {
+    // iShares 先检查首行基金身份和 Fund Holdings as-of，再保留非空 CSV 行及原始列名映射。
     let text = std::str::from_utf8(body).map_err(|_| {
         EvidenceAdapterError::DataQuality("iShares holdings are not UTF-8 CSV".into())
     })?;
@@ -714,6 +747,7 @@ fn parse_direxion_holdings(
     body: &[u8],
     asset: Asset,
 ) -> Result<(NaiveDate, Value), EvidenceAdapterError> {
+    // Direxion 以 TradeDate/AccountTicker 定位目标资产；先筛选账户，再从首个保留行读取有效日期。
     let text = std::str::from_utf8(body).map_err(|_| {
         EvidenceAdapterError::DataQuality("Direxion holdings are not UTF-8 CSV".into())
     })?;
@@ -756,6 +790,7 @@ fn parse_direxion_holdings(
 }
 
 fn csv_row_object(headers: &[String], row: &[String]) -> Result<Value, EvidenceAdapterError> {
+    // CSV 行宽多余时只允许空尾列，缺列补空字符串；任何非空越界字段都会返回 DataQuality，避免静默丢列。
     let mut values = row.to_vec();
     if values.len() > headers.len() {
         if values[headers.len()..]
@@ -785,6 +820,7 @@ fn csv_row_object(headers: &[String], row: &[String]) -> Result<Value, EvidenceA
 }
 
 fn parse_csv(text: &str) -> Result<Vec<Vec<String>>, EvidenceAdapterError> {
+    // 这是受限的 CSV 转换器：保留引号内逗号/换行和双引号转义，并以行数上限防止无界输入。
     let mut rows = Vec::new();
     let mut row = Vec::new();
     let mut field = String::new();
@@ -830,6 +866,7 @@ fn parse_csv(text: &str) -> Result<Vec<Vec<String>>, EvidenceAdapterError> {
 }
 
 fn parse_mdy_date(value: &str) -> Option<NaiveDate> {
+    // 发行方日期格式不统一；按固定格式顺序尝试，无法解析时返回 None 交给调用方生成明确错误。
     let value = value.trim().trim_matches('"');
     [
         "%m/%d/%Y",
@@ -843,6 +880,7 @@ fn parse_mdy_date(value: &str) -> Option<NaiveDate> {
 }
 
 fn latest_as_of_date(text: &str, cutoff: NaiveDate) -> Option<NaiveDate> {
+    // 只收集不晚于 cutoff 的 as-of 日期；显式 marker 找不到时再扫描日期 token，结果为空则保持 None。
     let mut dates = Vec::new();
     for marker in ["as of ", "As of ", "AS OF "] {
         let mut start = 0;

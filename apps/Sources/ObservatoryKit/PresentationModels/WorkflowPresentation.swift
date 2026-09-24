@@ -3,6 +3,7 @@ import Foundation
 // MARK: - Workflow graph
 
 public enum WorkflowEdgeKind: String, Sendable, CaseIterable {
+    // edge kind 保留 Rust workflow 拓扑语义；虚线和色调只是 Canvas 的派生呈现。
     case sequential
     case parallel
     case optional
@@ -18,6 +19,7 @@ public enum WorkflowEdgeKind: String, Sendable, CaseIterable {
         }
     }
 
+    // optional/loopBack 使用虚线，冲突与关键路径的语义由 tone 单独映射。
     public var isDashed: Bool { self == .optional || self == .loopBack }
     public var tone: AkzioTone {
         switch self {
@@ -30,6 +32,7 @@ public enum WorkflowEdgeKind: String, Sendable, CaseIterable {
 }
 
 public struct WorkflowNodePresentation: Sendable, Hashable, Identifiable {
+    // 节点是 Rust/Mock workflow 的值语义投影；taskID 可缺失时由 stage.id 提供 UI 稳定 ID。
     public let taskID: String?
     public let stage: WorkflowStageKind
     public let taskStatus: TaskStatus
@@ -55,6 +58,7 @@ public struct WorkflowNodePresentation: Sendable, Hashable, Identifiable {
         column: Int,
         row: Int
     ) {
+        // 初始化保留 task status、适用性和诊断 Optional，布局坐标与节点一起冻结。
         self.taskID = taskID
         self.stage = stage
         self.taskStatus = taskStatus
@@ -69,14 +73,17 @@ public struct WorkflowNodePresentation: Sendable, Hashable, Identifiable {
     /// The single place where `Skipped` + optional becomes `Not Triggered`, and a
     /// non-Paper Paper Commit becomes `Not Applicable`.
     public var status: AkzioStatus {
+        // status 是 TaskStatus 加 stage 上下文的唯一展示转换入口。
         taskStatus.status(optional: stage.isOptional, applicable: isApplicable)
     }
 
+    // 页面读取派生状态，不改变 taskStatus 原值。
     public var isActive: Bool { status == .running }
     public var isBlocked: Bool { !blockers.isEmpty }
 }
 
 public struct WorkflowEdgePresentation: Sendable, Hashable, Identifiable {
+    // 边只保存两端稳定字符串 ID 和 edge kind，页面可直接按节点投影绘制。
     public let from: String
     public let to: String
     public let kind: WorkflowEdgeKind
@@ -84,11 +91,13 @@ public struct WorkflowEdgePresentation: Sendable, Hashable, Identifiable {
     public var id: String { "\(from)->\(to)" }
 
     public init(from: WorkflowStageKind, to: WorkflowStageKind, kind: WorkflowEdgeKind) {
+        // 阶段输入在初始化时转成 stage.id；这一步不访问或修改 Rust 依赖图。
         self.from = from.id
         self.to = to.id
         self.kind = kind
     }
     public init(fromTask: String, toTask: String, kind: WorkflowEdgeKind) {
+        // 该初始化器用于已有 Observer task ID 的边，保留原始字符串以便回溯。
         self.from = fromTask
         self.to = toTask
         self.kind = kind
@@ -98,6 +107,7 @@ public struct WorkflowEdgePresentation: Sendable, Hashable, Identifiable {
 // MARK: - Stage inspector
 
 public struct StageToolEventPresentation: Sendable, Hashable, Identifiable {
+    // 工具事件是已脱敏的生命周期投影；sequence 作为 inspector 的时间排序依据。
     public let id: String
     public let sequence: Int64
     public let callID: String?
@@ -106,6 +116,7 @@ public struct StageToolEventPresentation: Sendable, Hashable, Identifiable {
     public let turn: Int?
 
     public init(cursor: Int64, callID: String?, name: String, lifecycle: String, turn: Int?) {
+        // callID 缺失时使用固定 tool 前缀构成可识别 ID，不伪造调用 ID。
         self.id = "\(callID ?? "tool")-\(cursor)"
         self.sequence = cursor
         self.callID = callID
@@ -116,6 +127,7 @@ public struct StageToolEventPresentation: Sendable, Hashable, Identifiable {
 }
 
 public struct StageLLMOutputPresentation: Sendable, Hashable, Identifiable {
+    // LLM output 只承载可展示的正文和元数据，不代表隐藏推理链或 provider envelope。
     public let id: String
     public let sequence: Int64
     public let kind: String
@@ -123,6 +135,7 @@ public struct StageLLMOutputPresentation: Sendable, Hashable, Identifiable {
     public let body: String
 
     public init(id: String, kind: String, createdAt: Date, body: String, sequence: Int64 = 0) {
+        // sequence 默认从零开始，调用方有真实序列时再覆盖以参与排序。
         self.id = id
         self.sequence = sequence
         self.kind = kind
@@ -133,6 +146,7 @@ public struct StageLLMOutputPresentation: Sendable, Hashable, Identifiable {
 }
 
 public struct ResearchAuditRowPresentation: Sendable, Hashable, Identifiable {
+    // research audit row 是已验证/脱敏的依据摘要，references 仍由上游决定。
     public let id: String
     public let title: String
     public let detail: String
@@ -141,6 +155,7 @@ public struct ResearchAuditRowPresentation: Sendable, Hashable, Identifiable {
 }
 
 public struct StageInspectorPresentation: Sendable, Hashable {
+    // inspector 聚合节点的模型、证据、工具和诊断投影，页面只读取这些公开字段。
     public let researchAudit: [ResearchAuditRowPresentation]
     public let stageTitle: String
     public let status: AkzioStatus
@@ -170,6 +185,7 @@ public struct StageInspectorPresentation: Sendable, Hashable {
     /// This is a projection of already-redacted telemetry and validated artifacts,
     /// never the provider's hidden chain of thought.
     public var analysisRecords: [AnalysisRecordPresentation] {
+        // 先用 tool/LLM sequence 计算边界，再将摘要、工具事件和 Rust conclusion 合并排序。
         let sequences = toolEvents.map(\.sequence) + llmOutputs.map(\.sequence)
         let firstSequence = (sequences.min() ?? 1) - 1
         let lastSequence = (sequences.max() ?? firstSequence) + 1
@@ -206,6 +222,7 @@ public struct StageInspectorPresentation: Sendable, Hashable {
         }
 
         rows.append(contentsOf: toolEvents.map { event in
+            // map 闭包把 Observer 工具生命周期压缩成可见详情，不展开工具参数或秘密。
             let details = [
                 event.lifecycle.capitalized,
                 event.turn.map { "T\($0)" },
@@ -237,6 +254,7 @@ public struct StageInspectorPresentation: Sendable, Hashable {
             )
         }
         return rows.map { row in
+            // map 闭包把 inspector 自身的 taskID/horizon 补到每条记录，随后按 sequence 稳定排序。
             var value = row
             value.taskID = taskID ?? row.taskID
             value.horizon = horizon ?? row.horizon
@@ -272,6 +290,7 @@ public struct StageInspectorPresentation: Sendable, Hashable {
         horizon: String? = nil,
         researchAudit: [ResearchAuditRowPresentation] = []
     ) {
+        // 初始化保留所有 Optional 诊断和已脱敏记录；analysisRecords 在读取时才派生。
         self.stageTitle = stageTitle
         self.status = status
         self.model = model
@@ -300,6 +319,7 @@ public struct StageInspectorPresentation: Sendable, Hashable {
 }
 
 public struct WorkflowPresentation: Sendable, Hashable {
+    // WorkflowPresentation 是页面读取的聚合快照；nodes/edges 与 inspector 共享同一 run 投影。
     public let nodes: [WorkflowNodePresentation]
     public let edges: [WorkflowEdgePresentation]
     public let activeStageID: String?
@@ -317,6 +337,7 @@ public struct WorkflowPresentation: Sendable, Hashable {
         totalTradingDays: Int,
         stageInspectors: [String: StageInspectorPresentation] = [:]
     ) {
+        // 初始化不重排或修复输入数组；顺序和 stageInspectors 映射由上游投影负责。
         self.nodes = nodes
         self.edges = edges
         self.activeStageID = activeStageID
@@ -327,19 +348,23 @@ public struct WorkflowPresentation: Sendable, Hashable {
     }
 
     public func node(id: String) -> WorkflowNodePresentation? {
+        // first 闭包按展示 ID 查询节点；缺失时返回 nil，让页面明确处理不可用选择。
         nodes.first { $0.id == id }
     }
 
     public func inspector(for stageID: String?) -> StageInspectorPresentation {
+        // 指定阶段优先读取专属 inspector，缺失或 nil 时回退聚合 inspector。
         guard let stageID else { return inspector }
         return stageInspectors[stageID] ?? inspector
     }
 
+    // 计数 computed property 只读取节点数组；不把展示计数写回 Observer 状态。
     public var completedCount: Int { nodes.filter { $0.taskStatus == .succeeded }.count }
     public var activeCount: Int { nodes.filter(\.isActive).count }
     public var queuedCount: Int { nodes.filter { $0.taskStatus == .pending || $0.taskStatus == .leased }.count }
     public var alertCount: Int { nodes.filter { $0.isBlocked || $0.taskStatus == .failed }.count }
     public var progressFraction: Double {
+        // 空节点图返回零；否则按 succeeded 数量计算页面进度，不混入 skipped/notApplicable。
         guard !nodes.isEmpty else { return 0 }
         return Double(completedCount) / Double(nodes.count)
     }

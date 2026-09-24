@@ -1,16 +1,20 @@
 import SwiftUI
 
+// 文件职责：编辑 Canvas 质量、标签密度和推理可视化开关，并展示当前 CanvasRenderPolicy 的实际预算。
+// settings 是可绑定的 UI 选择；canvasPolicy 是 Store 根据设置/窗口状态计算出的只读预算快照。
 // MARK: - Model display
 //
 // Render budgets for the two Canvas surfaces plus the label policy. Quality is not
 // cosmetic: it caps particle and node counts, which is what keeps a long-running
 // window from heating up.
 struct ModelDisplaySection: View {
+    // canvasPolicy 的 Sendable/Equatable 值语义让本页只展示已解析预算，不直接管理 Canvas 生命周期。
     @Binding var settings: SettingsPresentation
     let canvasPolicy: CanvasRenderPolicy
     @Environment(\.appLanguage) private var language
 
     var body: some View {
+        // body 的 CaseIterable map 闭包生成 segmented options；budget 行只格式化 policy 输出，不反向修改设置。
         VStack(alignment: .leading, spacing: AkzioLayout.s4) {
             SettingsSection("Rendering") {
                 SettingsSegmented(
@@ -51,6 +55,7 @@ struct ModelDisplaySection: View {
     }
 
     private func budget(_ label: String, _ value: String) -> some View {
+        // 输入标签和值文本，输出只读预算单元；数值格式化已在调用点完成，helper 不承担计算策略。
         VStack(alignment: .leading, spacing: 2) {
             Text(L10n.text(label, language: language)).akzioText(.caption)
             Text(value).akzioMono(11, color: AkzioColor.primaryText)

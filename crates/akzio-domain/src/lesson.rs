@@ -1,3 +1,5 @@
+// 文件导读：定义可复用 Lesson 的治理、scope、生命周期和观察性归因记录。
+// Lesson 不直接授予执行权限；是否可检索由 ContextManifest、生命周期和治理预算共同决定。
 //! Reusable learning statements, kept separate from outcome-backed experiences.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -56,6 +58,7 @@ pub struct LessonGovernance {
 }
 
 impl LessonGovernance {
+    // 构造 operator review 的 90 天有效治理，初始使用预算为 100 次。
     pub fn operator_reviewed(now: DateTime<Utc>) -> Self {
         Self {
             valid_from: now,
@@ -73,6 +76,7 @@ impl LessonGovernance {
         }
     }
 
+    // 构造 OutcomeDerived 隔离状态：无截止时间但有一次使用预算和 quarantine 原因。
     pub fn outcome_quarantined(now: DateTime<Utc>) -> Self {
         Self {
             valid_from: now,
@@ -90,6 +94,7 @@ impl LessonGovernance {
         }
     }
 
+    // 构造 paired outcome 复核后的 Verified 治理，使用预算为 20 次、有效 30 天。
     pub fn outcome_revalidated(now: DateTime<Utc>) -> Self {
         Self {
             valid_from: now,
@@ -107,6 +112,7 @@ impl LessonGovernance {
         }
     }
 
+    // 校验 verifier、ppm/次数、时间顺序、regime 兼容性和 quarantine 文本边界。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.verifier_id.trim().is_empty()
             || self.verifier_version.trim().is_empty()
@@ -135,6 +141,7 @@ impl LessonGovernance {
         Ok(())
     }
 
+    // 判断当前时间、使用次数、冲突计数、失败计数和 regime 兼容性是否允许检索。
     pub fn permits_retrieval(
         &self,
         now: DateTime<Utc>,
@@ -152,6 +159,7 @@ impl LessonGovernance {
             } else if regimes.is_empty() {
                 false
             } else {
+                // 任一请求 regime 达到 500000 ppm 兼容度即可通过；空请求不冒充匹配。
                 regimes.iter().any(|regime| {
                     self.regime_compatibility
                         .get(regime)
@@ -174,6 +182,7 @@ pub struct LessonScope {
 }
 
 impl LessonScope {
+    // 校验 regime/stage 文本和集合数量上限。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.regimes.iter().any(|value| value.trim().is_empty())
             || self
@@ -193,6 +202,7 @@ impl LessonScope {
         Ok(())
     }
 
+    // 对四个维度执行“空 scope 通配、非空 scope 需相交”的检索匹配规则。
     pub fn matches(
         &self,
         assets: &BTreeSet<Asset>,
@@ -252,6 +262,7 @@ pub struct Lesson {
 }
 
 impl Lesson {
+    // 校验 Lesson 内容、引用边界、来源/生命周期/审批和治理 quarantine 约束。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION
             || self.lesson_id.0.trim().is_empty()
@@ -331,6 +342,7 @@ impl Lesson {
         Ok(())
     }
 
+    // 只有 Active 且治理许可通过时，Lesson 才能进入当前 Context。
     pub fn is_retrievable(
         &self,
         now: DateTime<Utc>,
@@ -358,6 +370,7 @@ pub enum LessonAttribution {
 }
 
 impl LessonAttribution {
+    // 将 DecisionContext 的归因枚举编码为稳定文本。
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Applied => "applied",
@@ -401,6 +414,7 @@ pub struct LessonEvidence {
 }
 
 impl LessonEvidence {
+    // 校验 schema、Lesson/DecisionContext/Outcome 引用 kind 和 calibration ppm 范围。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION || self.lesson_id.0.trim().is_empty() {
             return Err(DomainError::EmptyField {
@@ -431,6 +445,7 @@ impl LessonEvidence {
     /// Idempotency identity. Deliberately excludes `recorded_at` so that
     /// reprocessing the same (lesson, decision, outcome) triple is a no-op rather
     /// than a duplicate row.
+    // 以 lesson_id、decision_context 和 outcome 三元组作为重复处理的幂等键。
     pub fn idempotency_key(&self) -> (String, String, String) {
         (
             self.lesson_id.0.clone(),
@@ -439,6 +454,7 @@ impl LessonEvidence {
         )
     }
 
+    // 对不含 recorded_at 的幂等身份字段计算内容哈希。
     pub fn identity_hash(&self) -> Result<ContentHash, serde_json::Error> {
         let (lesson_id, decision_context, outcome) = self.idempotency_key();
         crate::content_hash_json(&serde_json::json!({
@@ -456,6 +472,7 @@ impl LessonEvidence {
     /// day yields the same evidence with a later timestamp, so comparing it must
     /// not report a conflict. Every field that carries meaning is compared, so a
     /// changed attribution or utility is still rejected as tampering.
+    // 比较所有有业务含义的字段，忽略仅表示写入时刻的 recorded_at。
     pub fn describes_same_observation(&self, other: &Self) -> bool {
         self.schema_version == other.schema_version
             && self.lesson_id == other.lesson_id

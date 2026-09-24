@@ -1,3 +1,5 @@
+// 文件导读：定义带版本、分类时点和多维概率分布的市场 Regime 快照。
+// DecisionTime 快照可用于决策/检索；ExPost 快照只能留作事后研究，避免前视偏差。
 //! Typed, Versioned, Decision-Time Aware Market Regime Snapshots.
 //!
 //! Enforces strict separation between DecisionTime (prior to decision_at, valid
@@ -25,6 +27,7 @@ pub struct RegimeDistribution<T: Ord + Serialize> {
 }
 
 impl<T: Ord + Serialize> RegimeDistribution<T> {
+    // 保存概率表和主导状态；不在构造阶段隐式修正概率，统一由 validate 检查。
     pub fn new(probabilities_ppm: BTreeMap<T, u32>, dominant: T) -> Self {
         Self {
             probabilities_ppm,
@@ -32,6 +35,7 @@ impl<T: Ord + Serialize> RegimeDistribution<T> {
         }
     }
 
+    // 检查概率非空、主导值存在且总和未超过允许的近似 ppm 上限。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.probabilities_ppm.is_empty() {
             return Err(DomainError::EmptyField {
@@ -41,6 +45,7 @@ impl<T: Ord + Serialize> RegimeDistribution<T> {
         if !self.probabilities_ppm.contains_key(&self.dominant) {
             return Err(DomainError::InvalidDistribution);
         }
+        // 迭代器闭包把 u32 概率提升到 u64 后求和，避免累计溢出。
         let total: u64 = self.probabilities_ppm.values().map(|&v| v as u64).sum();
         if total > 1_000_005 {
             return Err(DomainError::InvalidDistribution);
@@ -118,12 +123,14 @@ pub struct RegimeSnapshot {
 }
 
 impl RegimeSnapshot {
+    // 用当前字段重算 snapshot_hash，再验证时间边界和所有维度分布。
     pub fn seal(mut self) -> Result<Self, DomainError> {
         self.snapshot_hash = self.identity_hash()?;
         self.validate()?;
         Ok(self)
     }
 
+    // 计算不含 snapshot_hash 自引用的稳定身份哈希。
     pub fn identity_hash(&self) -> Result<ContentHash, DomainError> {
         content_hash_json(&serde_json::json!({
             "schema_version": self.schema_version,
@@ -147,6 +154,7 @@ impl RegimeSnapshot {
         .map_err(|_| DomainError::InvalidContentHash)
     }
 
+    // 验证 schema、DecisionTime 的 as_of 截止、身份哈希和五个分布。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION {
             return Err(DomainError::EmptyField {
@@ -177,6 +185,7 @@ impl RegimeSnapshot {
     }
 
     /// Verifies whether this snapshot can participate in DecisionContext / retrieval.
+    // 只有 DecisionTime 且信息不晚于调用方决策时点的快照可进入决策上下文。
     pub fn permits_decision_context(&self, decision_at: DateTime<Utc>) -> bool {
         self.classification_kind == RegimeClassificationKind::DecisionTime
             && self.as_of <= decision_at
@@ -184,6 +193,7 @@ impl RegimeSnapshot {
     }
 
     /// Set of canonical labels for compatibility checking across retrieval and lesson scopes.
+    // 将五个主导枚举转换为基础标签和带维度前缀的标签，放入有序集合去重。
     pub fn canonical_regime_labels(&self) -> BTreeSet<String> {
         let mut labels = BTreeSet::new();
 

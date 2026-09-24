@@ -6,12 +6,15 @@ import SwiftUI
 // and `riskRecall` are optional in the domain, so a missing one reads `Unavailable`
 // and hides its bar entirely.
 struct OutcomeMetricGrid: View {
+    // window 是可选的 sealed Outcome 投影；nil 时只显示 waiting，不把缺失指标填成零。
     let window: OutcomeWindowPresentation?
 
+    // policy 控制数字过渡，language 只影响 label；指标值和排序由 Rust 投影定义。
     @Environment(\.motionPolicy) private var policy
     @Environment(\.appLanguage) private var language
 
     var body: some View {
+        // ViewBuilder 的 if let 决定是否生成完整四列网格；可选 effect/risk 字段在网格内部继续保持边界。
         SectionCard(title: "Window Metrics", subtitle: window?.horizon.windowLabel) {
             if let window {
                 LazyVGrid(
@@ -60,6 +63,7 @@ struct OutcomeMetricGrid: View {
         arrow: String? = nil,
         bar: Double? = nil
     ) -> some View {
+        // metric 将已格式化的 value、可选箭头和可选比例条组合；nil bar 不渲染任何虚构的进度。
         VStack(alignment: .leading, spacing: 3) {
             Text(L10n.text(label, language: language)).akzioText(.caption).lineLimit(1)
             HStack(spacing: 4) {
@@ -81,6 +85,7 @@ struct OutcomeMetricGrid: View {
 
     /// Optional in Rust, optional here: no bar and no invented zero.
     private func optionalMetric(_ label: String, ppm: Int?, index: Int) -> some View {
+        // optionalMetric 对应 Rust 的 Optional：有值时显示数值和 bar，nil 时只显示 Unavailable。
         VStack(alignment: .leading, spacing: 3) {
             Text(L10n.text(label, language: language)).akzioText(.caption).lineLimit(1)
             if let ppm {

@@ -1,3 +1,10 @@
+// 文件导读：Canary completion 汇总父 Outcome 与 contract/topology/bundle 三个 Shadow
+// Outcome，建立 paired observations，按 promotion policy 记录 evaluation 并推进 campaign
+// verdict。它只影响 candidate 的 policy subject/Canary 状态，不能直接激活 Contract、拓扑、
+// Lesson 或 Paper 权限；缺 narrative/Shadow outcome 会保留等待。
+// Rust 机制：数组/迭代器按固定 subject 顺序配对；闭包 `metrics` 借用 Daemon 并返回
+// `Result`；`Option` 区分 process quality unknown，lease/permit 通过 Store fencing 保证原子写入。
+
 use super::*;
 
 impl Daemon {
@@ -10,6 +17,8 @@ impl Daemon {
         materialization: Option<&OutcomeMaterializationInput>,
         retrospective_draft: Option<&RetrospectiveDraft>,
     ) -> Result<bool> {
+        // 先锁定 campaign/session level，再读取三个 Shadow sealed Outcome；任何 candidate
+        // identity、cohort、process-quality 或 paired metric 不一致都阻断 promotion。
         let campaign = self
             .store
             .canary_campaign(&session.reservation.campaign_id)?

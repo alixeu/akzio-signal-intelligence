@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# 文件职责：批量调用确定性 Swift capture 入口，生成 UI 回归截图矩阵。
+# 该脚本只构建并渲染离屏页面，不连接 Core、不启动 Paper，也不把截图当作业务证明。
 # Batch screenshot evidence for Akzio Observatory.
 #
 # Renders every page for the default scenario, plus the scenarios that exercise the
@@ -28,6 +30,7 @@ ROUTES=(overview workflow intelligence portfolio outcome learning runArchive)
 capture() {
   local scenario="$1" route="$2"
   local name="${scenario}-${route}"
+  # 参数只决定截图身份；真正的场景/路由校验由 Swift capture 入口完成。
   # 每个场景/路由只负责生成一张确定性截图；底层进程退出非零时由 set -e 使整批失败。
   "$BIN" --capture \
     --scenario "$scenario" \

@@ -1,3 +1,9 @@
+// 文件导读：runs observer 读取 canonical Outcome 并按 horizon 展示进度、窗口、统计和
+// portfolio/QQQ 比较；同时聚合 learning Artifact。读取旧 Outcome、部分窗口或 NoOrder
+// 都保持其原始语义，不能把 Observer 的 progress 变成真实成交、账户 NAV 或 T+5 学习资格。
+// Rust 机制：迭代器 `filter/map/collect` 组成稳定 projection；Artifact payload 通过泛型
+// 读取并用 `Result` 校验；`Option` 区分没有窗口/没有基线/未计算 comparison。
+
 use super::*;
 
 impl Daemon {
@@ -5,6 +11,8 @@ impl Daemon {
         &self,
         observed_at: DateTime<Utc>,
     ) -> Result<ObserverSection<ObserverOutcome>> {
+        // 选择已有 Outcome 中窗口最完整/最新的一份作为当前投影，并只用 sealed Outcome
+        // 计算统计；partial/NoOrder 的窗口仍展示其状态，不被升级成完成样本。
         let artifacts = self
             .store
             .recent_artifacts_by_kind(ArtifactKind::Outcome, 100)?;
@@ -112,6 +120,8 @@ impl Daemon {
         &self,
         outcome: &Outcome,
     ) -> Result<Vec<ObserverOutcomeComparisonPoint>> {
+        // 优先使用 Outcome 已冻结的 nav_path；否则从 baseline quotes + 四资产共同 bars
+        // 重建比较曲线。缺 baseline/price 时返回 unavailable，而不是填 1.0。
         if let Some(window) = outcome.windows.iter().max_by_key(|w| w.horizon) {
             if !window.nav_path.is_empty() {
                 let schedule: OutcomeSchedule = self.read_artifact_payload(&outcome.schedule)?;
@@ -197,6 +207,8 @@ impl Daemon {
         &self,
         observed_at: DateTime<Utc>,
     ) -> Result<ObserverSection<ObserverLearning>> {
+        // 跨 Outcome/Retrospective/Experience/Evaluation 收集只读 Artifact 并按 subject 查
+        // policy transitions；空集合保持 pending，不创建或推进任何学习状态。
         let mut artifacts = Vec::new();
         let mut seen = BTreeSet::new();
         for kind in [

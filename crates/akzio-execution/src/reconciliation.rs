@@ -1,5 +1,11 @@
 //! Typed reconciliation for durable Paper commitments.
 
+// 文件导读：ReconciliationRuntime 负责把已持久化 Commitment、订单 action intent 和
+// Broker 回执重建为 CAS Artifact。它不发请求；先确认 Paper purpose、原/替换/取消引用
+// 与 plan hash，再按资产去重回执、合并 repriced 数量和加权成交价，重建执行后目标。
+// Complete 只有在所有订单有最终状态且每个 replacement successor 已被观察时成立；
+// write_progress 允许 partial/pending 继续恢复，commit/commit_with_effect 才推进 task。
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use akzio_domain::{
@@ -65,6 +71,7 @@ pub struct ReconciliationRuntime {
 
 impl ReconciliationRuntime {
     pub fn new(store: Store) -> Self {
+        // 对账读取同一个 V2Store，避免内存中的 broker 结果成为第二持久化权威。
         Self { store }
     }
 
@@ -72,6 +79,9 @@ impl ReconciliationRuntime {
         &self,
         input: &ReconciliationInput,
     ) -> ReconciliationResult<ReconciliationOutput> {
+        // 输入→加载 Commitment/action artifacts→校验每个回执的 plan/client ID→合并
+        // replacement→重建 achieved portfolio→生成 Receipt/Reconciliation Artifact。该方法
+        // 只 stage 结果，不改变 task 状态，调用方随后按 settled 与否选择提交或写进度。
         let purpose = self.store.run_purpose(&input.permit.run_id)?;
         if purpose != RunPurpose::Paper {
             return Err(ReconciliationError::NonPaperRun(purpose));
@@ -225,6 +235,8 @@ impl ReconciliationRuntime {
         output: &ReconciliationOutput,
         now: DateTime<Utc>,
     ) -> ReconciliationResult<()> {
+        // 没有 broker effect intent 的普通完成路径，把所有 receipt 与 reconciliation 在
+        // 同一个 fenced attempt 中发布并结束 task。
         let mut artifacts = output.receipts.clone();
         artifacts.push(output.reconciliation.clone());
         self.store
@@ -241,6 +253,8 @@ impl ReconciliationRuntime {
         recovered: bool,
         now: DateTime<Utc>,
     ) -> ReconciliationResult<()> {
+        // 已记录 Paper effect intent 的路径同时结算 effect，标记 recovered 与否，保证
+        // 请求前/请求后崩溃恢复不会提前发布不完整的成功输出。
         let mut artifacts = output.receipts.clone();
         artifacts.push(output.reconciliation.clone());
         self.store
@@ -255,6 +269,8 @@ impl ReconciliationRuntime {
         output: &ReconciliationOutput,
         now: DateTime<Utc>,
     ) -> ReconciliationResult<()> {
+        // partial/pending 只逐个写入中间 Artifact；若 payload 已 Complete/Failed 则拒绝
+        // 当作“进度”覆盖终态，保留 CAS 历史和下一次恢复入口。
         let payload: Reconciliation =
             serde_json::from_slice(&self.store.read_blob(&output.reconciliation.blob)?)?;
         if matches!(
@@ -284,6 +300,8 @@ impl ReconciliationRuntime {
         reprice: &PaperReprice,
         replacement: &OrderReceipt,
     ) -> ReconciliationResult<OrderReceipt> {
+        // 读取 prior receipt 后区分“broker 重复返回原数量”和“replacement 只剩余数量”两种
+        // wire 语义；仅在数量、ID、资产和 plan 都闭合时累加成交量并计算加权成交价。
         let prior_artifact =
             self.load_expected(&reprice.prior_receipt, ArtifactKind::OrderReceipt)?;
         let prior: OrderReceipt =
@@ -342,6 +360,8 @@ impl ReconciliationRuntime {
         commitment: &PaperCommitment,
         receipts: &[OrderReceipt],
     ) -> ReconciliationResult<(TargetPortfolio, FactorExposure)> {
+        // 从 ExecutionContext→ExecutionPlan→账户快照恢复初始市值，再把实际 filled quantity
+        // × average price 按买卖方向应用；这描述执行后敞口，不是后续账户 NAV 或学习结果。
         let context_artifact = self.load_expected(
             &commitment.execution_context,
             ArtifactKind::ExecutionContext,
@@ -434,6 +454,7 @@ impl ReconciliationRuntime {
         reference: &ArtifactRef,
         expected: ArtifactKind,
     ) -> ReconciliationResult<Artifact> {
+        // 读取前同时检查引用 kind 与 Store kind，保持 CAS lineage 的类型闭包。
         let artifact = self.store.artifact(&reference.artifact_id)?;
         if reference.kind != expected || artifact.kind != expected {
             return Err(ReconciliationError::WrongArtifactKind {
@@ -452,6 +473,8 @@ impl ReconciliationRuntime {
         source_refs: Vec<ArtifactRef>,
         input: &ReconciliationInput,
     ) -> ReconciliationResult<Artifact> {
+        // 统一 stage 对账 payload，并继承当前 permit 的 provenance；发布仍由 fenced Store
+        // 方法完成。
         Ok(Artifact::new(
             kind,
             self.store.stage_json(payload)?,
@@ -469,6 +492,8 @@ fn weighted_fill_price(
     prior: &OrderReceipt,
     replacement: &OrderReceipt,
 ) -> ReconciliationResult<Option<MoneyMicros>> {
+    // 以两段成交数量加权平均价格，零成交返回 None；缺少有成交段的 average price 或
+    // 乘加溢出都保持 RepriceMismatch，不能用零价填充。
     let total_quantity = prior
         .filled_quantity_micros
         .checked_add(replacement.filled_quantity_micros)
@@ -500,6 +525,8 @@ fn reconciliation_state_with_reprices(
     receipts: &[OrderReceipt],
     reprices: &[PaperReprice],
 ) -> ReconciliationState {
+    // 先要求所有 durable successor 都被观察，再判断回执数量与每个状态；原单终态但
+    // successor 未知时保留 Pending，防止把“取消原单”误报为整体完成。
     let receipt_count = receipts.len();
     // A canceled/filled original cannot prove an uncertain replacement never
     // reached the broker. Only observing its durable successor closes that gap.
@@ -536,6 +563,7 @@ mod recovery_tests {
 
     #[test]
     fn terminal_original_does_not_settle_unknown_reprice_successor() {
+        // 回归测试覆盖不确定替换：原订单已取消仍不能在 successor 未观察时关闭 commitment。
         let reference = |kind| ArtifactRef {
             artifact_id: akzio_domain::ArtifactId(akzio_domain::ContentHash::of_bytes(
                 format!("{kind:?}").as_bytes(),

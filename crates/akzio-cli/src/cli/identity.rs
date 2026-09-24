@@ -1,3 +1,10 @@
+// 文件导读：本文件把配置、源码、模型能力、Contract/Prompt/拓扑、Policy 和治理规则
+// 汇总为可审计的 RuntimeIdentity，并从 SQL Store 的 CAS active head 读取 DecisionPolicy。
+// 这里的身份/哈希只描述运行输入和授权匹配条件；它不是 Paper approval、Decision、
+// ExecutionVerdict、Paper submission、fill 或 Outcome 的证明。
+// Rust 机制：借用的 `&Config`/`&Store` 只读访问权威输入；`Option` 区分缺失 active head
+// 与真实值；泛型 serde 序列化和 `Result` 链把哈希计算、日期解析、文件读写错误逐层传播。
+
 use akzio_execution::DecisionPolicyArtifact;
 
 fn configured_synthesizer_identity(model: &OpenAIResponsesConfig) -> Result<(String, ContentHash)> {

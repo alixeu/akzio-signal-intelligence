@@ -4,6 +4,7 @@ import Foundation
 
 enum EventFixtures {
     static func events(scenario: MockScenario) -> [EventPresentation] {
+        // 事件数组按场景优先级追加，返回顺序就是 LatestEventCard 的最新到最旧数据流。
         var items: [EventPresentation] = []
 
         if scenario.criticTriggered {
@@ -88,6 +89,7 @@ enum EventFixtures {
     }
 
     static func agents(scenario: MockScenario) -> [AgentRailItem] {
+        // Agent fixture 与 workflowStatus/criticTriggered 对齐，进度数值仍由场景 seed 决定。
         var generator = SeededGenerator(seed: scenario.seed &+ 501)
         let synthesizerActive = scenario == .paperRunningSynthesizerActive
 
@@ -146,10 +148,12 @@ enum EventFixtures {
     }
 
     static func health(scenario: MockScenario) -> [HealthMetric] {
+        // 健康指标使用独立 salt；dataUnavailable 由嵌套闭包统一转换为 nil 和 Unavailable。
         let unavailable = scenario.dataUnavailable
         var generator = SeededGenerator(seed: scenario.seed &+ 977)
 
         func metric(_ id: String, _ label: String, _ value: String, _ fraction: Double?, risky: Bool = false) -> HealthMetric {
+            // metric 闭包集中处理不可用场景，调用方只提供正常状态下的展示值。
             HealthMetric(
                 id: id,
                 label: label,
@@ -179,10 +183,12 @@ enum EventFixtures {
 
 /// The real configured model plus mock alternates for the gallery.
 enum ModelCatalog {
+    // gallery 只供模型选择展示；primary 对应配置模型，alternates 不会改变运行时权限。
     static let primary = "gpt-5.6-luna"
     static let alternates = ["claude-4.2-sonnet", "gemini-3.1-pro", "gpt-5.6-luna-mini", "qwen-3.5-max"]
 
     static let gallery: [ModelOption] = {
+        // 闭包一次性构造不可变候选列表，保持 primary 选中、其余模型未选中。
         var options = [ModelOption(name: primary, tier: "Primary Path", isSelected: true)]
         options += alternates.enumerated().map { index, name in
             ModelOption(name: name, tier: index == 0 ? "Alternate" : "Candidate", isSelected: false)

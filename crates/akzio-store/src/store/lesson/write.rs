@@ -1,3 +1,5 @@
+// 文件导读：Lesson 写入保留 source/supersedes/conflicts 的 CAS 闭包，并以独立 head/event
+// 维护生命周期；debug 隔离 Store 不能借此把 Lesson 提升为 canonical Active。
 impl Store {
     /// Persist an operator or outcome-derived Lesson with its source artifact.
     /// The source and Lesson are inserted atomically and a dedicated immutable

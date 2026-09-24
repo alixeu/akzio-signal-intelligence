@@ -1,3 +1,5 @@
+// 文件导读：本文件处理 Task permit 的 heartbeat、事件、Artifact 写入和 Attempt 提交；
+// 每个公开写入口都在最终事务内再次核验 permit，外部副作用不能仅凭预检查获得授权。
 impl Store {
     pub fn heartbeat_task(
         &self,

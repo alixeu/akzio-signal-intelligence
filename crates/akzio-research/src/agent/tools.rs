@@ -1,5 +1,8 @@
 use super::*;
 
+// Tool 执行是 Outcome 的受控读取路径：先写 ToolCall，再执行 ContextBroker，最后
+// 写 ToolResult。任何错误都尽量留下可恢复的失败 Artifact；这不是网络/文件/交易
+// 沙箱，研究 Analyst/Critic/Synthesizer 只拥有 Submit，不会进入这里。
 impl AgentRuntime {
     pub(super) fn execute_tool(
         &self,
@@ -10,6 +13,8 @@ impl AgentRuntime {
         request_hash: &akzio_domain::ContentHash,
         now: DateTime<Utc>,
     ) -> ResearchResult<ToolResult> {
+        // 先持久化调用意图，保证进程中断时恢复器能区分“未开始”与“已开始但未知”。
+        // 成功结果的 source_refs 同时保留 call 与实际读取 Artifact 的血缘。
         let call_artifact = self.tool_artifact(
             permit,
             contract,
@@ -71,6 +76,8 @@ impl AgentRuntime {
                 })
             }
             Err(error) => {
+                // DocumentRequiresRange 是可反馈给模型的受控失败，其他错误返回 Runtime
+                // 失败；两者都先写 ToolFailed，避免把模型看见的错误从审计中抹掉。
                 let range_hint = if matches!(
                     error,
                     ResearchError::Context(akzio_context::ContextError::DocumentRequiresRange)
@@ -165,6 +172,8 @@ impl AgentRuntime {
         call: &AgentToolCall,
         now: DateTime<Utc>,
     ) -> ResearchResult<ContextReadResult> {
+        // permit、Contract tool_specs、ToolGrant 和来源白名单是四层授权。即使
+        // ContextBroker 成功读到 Artifact，来源不在当前 Contract 也必须拒绝。
         if !grant.matches_permit(permit) {
             return Err(ResearchError::GrantPermitMismatch);
         }
@@ -191,6 +200,8 @@ impl AgentRuntime {
             return Err(ResearchError::ToolNotGranted(call.name.clone()));
         }
         let raw = tool.kind == akzio_domain::ToolKind::ReadRawEvidence;
+        // read_artifact 仅为历史别名；是否可读 raw 由安装 Contract 的 ToolKind 决定，
+        // 不是由模型传参决定。当前活动研究 Contract 不授予 RawEvidence。
         let result = match call.name.as_str() {
             "read_artifact" | "read_document" => {
                 let artifact_id = strict_artifact_id_argument(&call.arguments, &call.name)?;
@@ -246,6 +257,8 @@ impl AgentRuntime {
             }
         };
         for artifact in &result.artifacts {
+            // 读取返回的每个 Artifact 都重新检查 producer source，防止工具内部的
+            // 一个聚合结果把未授权来源夹带进 Outcome 上下文。
             if !contract
                 .tool_grants
                 .iter()
@@ -283,6 +296,8 @@ pub(super) fn strict_artifact_id_argument(
     arguments: &Value,
     tool_name: &str,
 ) -> ResearchResult<ArtifactId> {
+    // 严格参数解析拒绝额外字段和别名；ContentHash::new 再验证 64 字符身份，
+    // 不接受模型自行拼接的 resource 名或 ContextManifest ID。
     let object = arguments.as_object().ok_or_else(|| {
         ResearchError::InvalidOutput(format!(
             "tool {tool_name} arguments do not match its strict schema"
@@ -413,6 +428,8 @@ pub(super) fn model_tool_definitions(
     context: &ContextBroker,
     contract: &AgentContract,
 ) -> ResearchResult<Vec<AgentToolDefinition>> {
+    // 模型看到的工具定义由 Contract 的 authority blob 反序列化，并与内置严格
+    // Schema 比较；定义通过不代表本次调用已获得 Grant。
     contract
         .tool_specs
         .iter()

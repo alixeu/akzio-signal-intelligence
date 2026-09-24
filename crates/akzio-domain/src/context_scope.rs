@@ -1,3 +1,5 @@
+// 文件导读：把已类型化的 WorkflowNode 映射为 Lesson 检索维度；它只描述相关性，
+// 不创建或扩大任何 Artifact 读取授权。
 //! Rust-owned relevance query. This does not grant access to any artifact.
 use std::collections::BTreeSet;
 
@@ -20,6 +22,7 @@ pub struct ContextQueryScope {
 impl ContextQueryScope {
     /// The caller must validate the node against its persisted execution scope.
     pub fn for_node(node: &WorkflowNode) -> Self {
+        // 仅接受当前允许的 recipe；未知节点返回空 scope，避免从文本推断范围。
         let recipe = node.recipe_id.as_str();
         let mut scope = Self::default();
         if !matches!(
@@ -50,7 +53,9 @@ impl ContextQueryScope {
         scope
     }
 
+    // 空的 Lesson 维度表示该 Lesson 未限定该维度；非空维度必须与请求集合相交。
     pub fn matches(&self, lesson: &LessonScope) -> bool {
+        // 泛型闭包同时复用于四个 BTreeSet，Ord 约束保证 disjoint 比较有确定顺序。
         fn overlaps<T: Ord>(applicable: &BTreeSet<T>, requested: &BTreeSet<T>) -> bool {
             applicable.is_empty() || !applicable.is_disjoint(requested)
         }
@@ -66,6 +71,7 @@ mod tests {
     use super::*;
     use crate::{FailureDisposition, NodeSpec, RetryPolicy, TaskBudget, TaskId, TaskRecipeId};
 
+    // 构造带固定类型化 NodeSpec 的最小 WorkflowNode，供 scope 行为测试复用。
     fn node(recipe: &str) -> WorkflowNode {
         WorkflowNode {
             spec: Some(NodeSpec {
@@ -94,6 +100,7 @@ mod tests {
     }
 
     #[test]
+    // 类型化 horizon 必须优先于 objective 中可能冲突的普通文本。
     fn typed_node_scope_wins_over_conflicting_objective() {
         let query = ContextQueryScope::for_node(&node(crate::RESEARCH_ANALYST_RECIPE_ID));
         assert_eq!(query.horizons, BTreeSet::from([DecisionHorizon::T1]));
@@ -105,6 +112,7 @@ mod tests {
     }
 
     #[test]
+    // 未知 horizon 保持未知，不被解释成覆盖全部 horizon。
     fn unknown_horizon_does_not_mean_all_horizons() {
         let mut scoped_lesson = LessonScope::default();
         scoped_lesson.horizons.insert(DecisionHorizon::T5);
@@ -130,6 +138,7 @@ mod tests {
     }
 
     #[test]
+    // 历史节点没有 NodeSpec 时使用既有读取适配器，不改写原节点。
     fn historical_node_uses_existing_read_adapter_without_rewriting_it() {
         let mut historical = node(crate::RESEARCH_CRITIC_RECIPE_ID);
         historical.spec = None;

@@ -4,6 +4,11 @@
 //! contracts into one fail-closed assessment. Missing market or compliance
 //! data never grants execution authorization.
 
+// 文件导读：本模块把容量、信息分类、合规活动和依赖闭包合成一个安全快照。输入由
+// ExecutionGate 以外部采集结果提供，Rust 再依据目标是否增加风险选择“新风险”或
+// “风险降低”许可；缺少成交量、分类、依赖许可或任何合规结果时，assessment 保留
+// 缺口并拒绝执行，而不是把缺失解释成安全。
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use akzio_domain::{
@@ -22,6 +27,7 @@ pub struct PreTradeSafetyPolicy {
 
 impl PreTradeSafetyPolicy {
     pub fn validate(&self) -> Result<(), DomainError> {
+        // 先验证容量和合规策略本身，确保后面每个资产的 assessment 都使用已知边界。
         self.capacity.validate()?;
         self.compliance.validate()?;
         Ok(())
@@ -31,6 +37,8 @@ impl PreTradeSafetyPolicy {
         &self,
         input: &PreTradeSafetyInput,
     ) -> Result<PreTradeSafetyAssessment, DomainError> {
+        // 先检查账户、资产集合和参与者数量，再以 BTreeSet/BTreeMap 累积缺失项与违规项；
+        // 最终 permits_execution 同时要求数据完整、容量可行、合规无违规和依赖许可。
         self.validate()?;
         input.target.validate_universe()?;
         if input.account_equity.0 <= 0
@@ -160,6 +168,8 @@ pub struct PreTradeSafetyInput {
 /// them with the Rust-derived target, order sides, and current account equity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreTradeSafetyEvidence {
+    // 这些字段是 Gate 刷新得到的外部事实投影；它们不携带订单权限，权限仍由下方
+    // assess 根据 target 与 now 重新组合并验证。
     pub homogeneous_agent_count: u32,
     pub average_daily_dollar_volume: BTreeMap<Asset, MoneyMicros>,
     pub information_classifications: BTreeMap<Asset, InformationClassification>,

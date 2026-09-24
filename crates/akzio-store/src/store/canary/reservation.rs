@@ -1,3 +1,5 @@
+// 文件导读：Canary reservation 把 Paper parent、三个 Shadow workflow 和 campaign
+// session 绑定到同一事务；session_key/cohort 主键提供持久幂等，不代表已经下单或成交。
 impl Store {
     // 在调用方事务内把一个 Canary session 写入对应表；先验证 campaign/阶段/cohort/Run purpose，
     // 再用不可变 session_key 做幂等保护。该 helper 只建立 Paper/Shadow 调度预留，不提交订单。
@@ -207,6 +209,7 @@ impl Store {
         campaign_id: &ContentHash,
         level: CanaryCampaignStatus,
     ) -> StoreResult<Option<StoredCanarySession>> {
+        // paired cohort 优先，legacy session 只在当前阶段没有 cohort 记录时回退。
         // paired cohort 优先返回其 session；没有 paired 记录时才回退到 legacy 单 session。
         if let Some(session) = self.canary_sessions(campaign_id, level)?.into_iter().next() {
             return Ok(Some(session));
@@ -220,6 +223,7 @@ impl Store {
         campaign_id: &ContentHash,
         level: CanaryCampaignStatus,
     ) -> StoreResult<Vec<StoredCanarySession>> {
+        // 先恢复 campaign 当前 cohort，再按 cohort_id 稳定读取所有 paired sessions。
         // campaign 或当前阶段没有 cohort 时返回空集合；读取本身不改变 session reservation。
         let connection = self.connection()?;
         let Some(campaign) = read_campaign(&connection, campaign_id)? else {
@@ -237,6 +241,7 @@ impl Store {
         level: CanaryCampaignStatus,
         session_key: &str,
     ) -> StoreResult<Option<StoredCanarySession>> {
+        // 根据 campaign schema 选择 paired/legacy 表，并在 legacy 路径复核 session_key。
         // 根据 campaign 是否配置 paired cohort 选择对应表，并在 legacy 路径额外核对 session_key。
         let connection = self.connection()?;
         let Some(campaign) = read_campaign(&connection, campaign_id)? else {
@@ -253,6 +258,7 @@ impl Store {
         &self,
         run_id: &RunId,
     ) -> StoreResult<Option<StoredCanarySession>> {
+        // 无连接调用方的便捷入口，具体查询交给 connection-scoped 版本。
         // 无连接调用方的便捷入口；具体查询复用 connection-scoped 实现。
         let connection = self.connection()?;
         self.canary_session_for_run_with_connection(&connection, run_id)
@@ -263,6 +269,7 @@ impl Store {
         connection: &Connection,
         run_id: &RunId,
     ) -> StoreResult<Option<StoredCanarySession>> {
+        // 先查 paired cohort 的四条 Run lineage，再兼容旧单 session 表。
         // 先查 paired cohort session，再查 legacy session；Run 可能是 parent 或三类 Shadow 之一。
         let cohort_reservation: Option<CohortSessionColumns> = connection
             .query_row(

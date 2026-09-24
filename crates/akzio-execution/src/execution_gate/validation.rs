@@ -1,5 +1,6 @@
 impl ExecutionRuntime {
     fn read_payload<T: DeserializeOwned>(&self, artifact: &Artifact) -> ExecutionGateResult<T> {
+        // 只从 Store blob 反序列化指定类型；所有业务校验由调用方在得到 typed payload 后显式执行。
         Ok(serde_json::from_slice(
             &self.store.read_blob(&artifact.blob)?,
         )?)
@@ -10,6 +11,8 @@ impl ExecutionRuntime {
         artifact: &Artifact,
         decision: &DecisionContext,
     ) -> ExecutionGateResult<()> {
+        // 检查 DecisionContext 的 run、market-state manifest 以及 claims/critiques/evidence/
+        // learning/conflict 的 source_refs 闭包，确保执行使用的不是脱离本 Run 的研究结果。
         if artifact
             .origin
             .as_ref()
@@ -67,6 +70,8 @@ impl ExecutionRuntime {
         decision_artifact: &Artifact,
         decision: &DecisionContext,
     ) -> ExecutionGateResult<()> {
+        // 学习 Experience/CandidatePolicy 只有在同一 Manifest 选中、canonical Paper、subject
+        // 与历史记录一致且当前 policy head 允许时才能影响 Decision；任何缺口都 fail closed。
         if decision.policy_influences.is_empty() {
             return Ok(());
         }
@@ -154,6 +159,8 @@ impl ExecutionRuntime {
     }
 
     fn is_canonical_paper(&self, artifact: &Artifact) -> ExecutionGateResult<bool> {
+        // lifecycle 和 origin/run purpose 必须同时满足，隔离 Debug 或 RunScoped 产物不能被
+        // 提升成 canonical Paper policy influence。
         if artifact.lifecycle != ArtifactLifecycle::Canonical {
             return Ok(false);
         }
@@ -168,6 +175,8 @@ impl ExecutionRuntime {
     }
 
     fn frozen(&self) -> ExecutionGateResult<bool> {
+        // 读取最新 canonical FreezeState；没有状态表示未冻结，存在但类型/lifecycle 不对则
+        // 报完整性错误，不把坏状态当作可执行。
         let Some(artifact) = self
             .store
             .latest_artifact_by_kind(ArtifactKind::FreezeState)?
@@ -190,6 +199,7 @@ impl ExecutionRuntime {
         source_refs: Vec<ArtifactRef>,
         input: &ExecutionGateInput,
     ) -> ExecutionGateResult<Artifact> {
+        // 仅 stage ExecutionGate 结果并绑定当前 permit/run provenance，正式发布交给 commit。
         Ok(Artifact::new(
             kind,
             self.store.stage_json(payload)?,

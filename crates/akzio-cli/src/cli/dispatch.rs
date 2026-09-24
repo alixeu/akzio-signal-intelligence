@@ -1,3 +1,9 @@
+// 文件导读：本文件把 CLI 的高层命令转换为已认证的回环 HTTP 调用，或在明确边界内
+// 启动/查询 Store 控制面。它只负责参数编码、响应解码和输出，不在本地重算 readiness、
+// Gate 或调度状态；daemon 的 HTTP handler 和 Rust runtime 才是状态/权限权威。
+// Rust 机制：命令通过枚举 `match` 穷举；`&Config`/`&Path` 是只读借用，闭包用 `move`
+// 捕获拥有的值交给异步 executor，`Result` 链上的 `?` 保持 HTTP 错误不会被误报为成功。
+
 async fn dispatch_control(command: Command, config: &Config, config_path: &Path) -> Result<()> {
     // 将需要 daemon 控制面的 Workflow/Run/Canary/Daemon 命令统一转为 HTTP 请求；
     // 本地处理的 ObservatoryConfig、Calibration、Evidence 和 ModelQualification 在这里

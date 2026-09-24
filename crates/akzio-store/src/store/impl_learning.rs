@@ -1,4 +1,7 @@
+// 文件导读：这里验证 CandidatePolicy、canonical evaluation、OutcomeSchedule execution lineage
+// 和 Shadow pair sources；只有 typed payload、purpose、source closure 全部匹配才允许进入学习提交。
 impl Store {
+    // Doctor 从 CandidatePolicy source_evaluation 和 baseline/candidate Artifact 重建候选历史。
     fn verify_candidate_policy_history(&self, connection: &Connection) -> StoreResult<()> {
         let artifact_ids = connection
             .prepare(
@@ -60,6 +63,7 @@ impl Store {
         Ok(())
     }
 
+    // 在外层 evaluation 事务中验证 sealed Outcome、T5 narrative、Experience/Evaluation 和 candidate policy 闭包。
     fn validate_policy_evaluation_commit_with_connection(
         &self,
         connection: &Connection,
@@ -318,6 +322,7 @@ impl Store {
         Ok(())
     }
 
+    // 按 subject 区分 Contract 与 Topology candidate，核对 lifecycle、purpose、hash 和 bounded capability。
     fn validate_candidate_policy_sources(
         &self,
         connection: &Connection,
@@ -372,6 +377,7 @@ impl Store {
         }
     }
 
+    // Shadow pair 必须同时指向 canonical parent、允许的 candidate 和共同 execution context。
     fn assert_shadow_pair_sources_with_connection(
         &self,
         connection: &Connection,
@@ -439,10 +445,12 @@ impl Store {
         Ok(())
     }
 
+    // 无事务调用方通过 Store 连接读取 durable/staged payload；调用方已持有连接时使用下一个 helper。
     fn read_artifact_payload<T: DeserializeOwned>(&self, artifact: &Artifact) -> StoreResult<T> {
         Ok(serde_json::from_slice(&self.read_blob(&artifact.blob)?)?)
     }
 
+    // 复用调用方 Connection，确保事务内可见 staged blob 与未提交 Artifact。
     pub(super) fn read_artifact_payload_with_connection<T: DeserializeOwned>(
         &self,
         connection: &Connection,
@@ -457,6 +465,7 @@ impl Store {
         )?)
     }
 
+    // 从 Outcome schedule 引用出发校验 purpose/lifecycle、source refs 和 execution lineage。
     fn read_outcome_schedule_with_connection(
         &self,
         connection: &Connection,
@@ -516,6 +525,7 @@ impl Store {
         Ok(schedule)
     }
 
+    // NoOrder 与 ReconciledPaper 分支分别验证 verdict/context，或 commitment/reconciliation receipt 链。
     fn validate_outcome_schedule_execution_lineage(
         &self,
         connection: &Connection,

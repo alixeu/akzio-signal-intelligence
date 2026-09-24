@@ -1,3 +1,5 @@
+// 文件导读：定义 RuntimeIdentity、运行期授权清单、Paper 启动审批和 T+5 后研究审批。
+// 这些类型把代码/配置/模型/Policy/证据身份绑定到可验证的时间与范围窗口。
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, NaiveDate, Utc};
@@ -57,6 +59,7 @@ impl RuntimeIdentity {
     /// behavior surface currently represented by RuntimeIdentity. A changed
     /// provider/model route, prompt/contract/tool capability, config or
     /// retrieval/governance bundle therefore cannot reuse an old report.
+    // 先验证身份，再把 provider/model/prompt/tool/config/context 的哈希投影成资格键。
     pub fn qualification_key(&self) -> Result<ModelQualificationKey, DomainError> {
         self.validate()?;
         Ok(ModelQualificationKey {
@@ -74,6 +77,7 @@ impl RuntimeIdentity {
         })
     }
 
+    // 按 profile 校验必填文本、feed、模型日期、legacy 兼容字段和组件 bundle 完整性。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.code_revision.trim().is_empty()
             || self.provider_id.trim().is_empty()
@@ -129,6 +133,7 @@ impl RuntimeIdentity {
                 return Err(DomainError::InvalidContentHash);
             }
         }
+        // 研究 profile 必须声明所有影响治理行为的组件哈希，缺任何一项即拒绝。
         if research_profile {
             for component in [
                 "instrument_evidence_registry",
@@ -180,6 +185,7 @@ impl RuntimeIdentity {
         Ok(())
     }
 
+    // legacy-v2 只哈希历史允许字段；新 profile 哈希完整序列化身份。
     pub fn identity_hash(&self) -> Result<ContentHash, DomainError> {
         self.validate()?;
         if self.experiment_profile == "legacy-v2" {
@@ -204,14 +210,17 @@ impl RuntimeIdentity {
     }
 }
 
+// serde 缺少旧字段时恢复历史 profile 名称。
 fn legacy_experiment_profile() -> String {
     "legacy-v2".to_owned()
 }
 
+// serde 缺少旧字段时恢复历史 toolchain 标记。
 fn legacy_rust_toolchain() -> String {
     "unrecorded-legacy-v2".to_owned()
 }
 
+// 计算空组件表的稳定 bundle 哈希，用作 legacy 默认值。
 fn empty_component_bundle_hash() -> ContentHash {
     runtime_component_bundle_hash(&BTreeMap::new())
         .expect("serializing an empty component map is infallible")
@@ -221,6 +230,7 @@ fn validate_hash_bundle(
     components: &BTreeMap<String, ContentHash>,
     bundle_hash: &ContentHash,
 ) -> Result<(), DomainError> {
+    // 组件表必须非空、名称非空，并且其规范化 JSON 哈希要等于 bundle_hash。
     if components.is_empty()
         || components.keys().any(|name| name.trim().is_empty())
         || content_hash_json(
@@ -237,6 +247,7 @@ fn validate_hash_bundle(
 pub fn runtime_component_bundle_hash(
     components: &BTreeMap<String, ContentHash>,
 ) -> Result<ContentHash, DomainError> {
+    // 对按键有序的 BTreeMap 直接序列化并计算 bundle 身份哈希。
     content_hash_json(
         &serde_json::to_value(components).map_err(|_| DomainError::InvalidContentHash)?,
     )
@@ -289,6 +300,7 @@ pub struct RuntimeManifest {
 }
 
 impl RuntimeManifest {
+    // 复用 RuntimeIdentity 校验，再检查 broker、名义金额、日期窗口和模型 cutoff。
     pub fn validate(&self) -> Result<(), DomainError> {
         self.runtime_identity().validate()?;
         if self.schema_version != DOMAIN_SCHEMA_VERSION
@@ -312,6 +324,7 @@ impl RuntimeManifest {
         Ok(())
     }
 
+    // 校验后按 profile 选择 legacy 字段投影或完整 manifest 序列化来计算哈希。
     pub fn manifest_hash(&self) -> Result<ContentHash, DomainError> {
         self.validate()?;
         if self.experiment_profile == "legacy-v2" {
@@ -342,11 +355,13 @@ impl RuntimeManifest {
             .map_err(|_| DomainError::InvalidContentHash)
     }
 
+    // 返回经过 manifest 校验的 RuntimeIdentity 哈希，供审批绑定。
     pub fn runtime_identity_hash(&self) -> Result<ContentHash, DomainError> {
         self.validate()?;
         self.runtime_identity().identity_hash()
     }
 
+    // 从 manifest 字段复制出不含授权窗口/账户信息的运行身份快照。
     pub fn runtime_identity(&self) -> RuntimeIdentity {
         RuntimeIdentity {
             code_revision: self.code_revision.clone(),
@@ -374,6 +389,7 @@ impl RuntimeManifest {
         }
     }
 
+    // 判断 session 在允许日期内且当前时刻尚未超过 expires_at。
     pub fn permits(&self, session: NaiveDate, now: DateTime<Utc>) -> bool {
         self.validate().is_ok()
             && session >= self.allowed_session_start
@@ -381,6 +397,7 @@ impl RuntimeManifest {
             && now <= self.expires_at
     }
 
+    // legacy-v2 只能历史读取；新 session 授权还必须通过普通 permits 检查。
     pub fn authorizes_new_session(&self, session: NaiveDate, now: DateTime<Utc>) -> bool {
         self.experiment_profile != "legacy-v2" && self.permits(session, now)
     }
@@ -404,6 +421,7 @@ pub struct PaperLaunchApproval {
 }
 
 impl PaperLaunchApproval {
+    // 计算不含 approval_hash 自引用的审批内容哈希。
     pub fn unsigned_hash(&self) -> Result<ContentHash, DomainError> {
         content_hash_json(&serde_json::json!({
             "schema_version": self.schema_version,
@@ -421,6 +439,7 @@ impl PaperLaunchApproval {
         .map_err(|_| DomainError::InvalidContentHash)
     }
 
+    // 校验审批身份、引用 kind、时间顺序、资格/mandate 和最终审批哈希。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION
             || self.operator_identity.trim().is_empty()
@@ -481,12 +500,14 @@ pub struct PostOutcomeResearchApproval {
 }
 
 impl PostOutcomeResearchApproval {
+    // 先封存 approval_id，再验证完整的 T1/T3/T5、评估和 operator 信息。
     pub fn seal(mut self) -> Result<Self, DomainError> {
         self.approval_id = self.identity_hash()?;
         self.validate()?;
         Ok(self)
     }
 
+    // 对审批涉及的行为、运行、Outcome、评估、学习和理由字段计算身份哈希。
     pub fn identity_hash(&self) -> Result<ContentHash, DomainError> {
         content_hash_json(&serde_json::json!({
             "schema_version": self.schema_version,
@@ -507,6 +528,7 @@ impl PostOutcomeResearchApproval {
         .map_err(|_| DomainError::InvalidContentHash)
     }
 
+    // 检查 schema、哈希、operator、三个 Outcome、Evaluation 和非空理由集合。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION
             || self.approval_id != self.identity_hash()?

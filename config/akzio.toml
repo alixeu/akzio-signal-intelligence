@@ -1,3 +1,5 @@
+# 文件职责：本地 CLI/Daemon 的 fixture 默认配置模板。
+# 运行时会把环境变量和 Store Root 解析为实际值；本文件只声明配置，不保存状态或凭据。
 [daemon]
 store_root = ".akzio/store"
 http_addr = "127.0.0.1:7342"

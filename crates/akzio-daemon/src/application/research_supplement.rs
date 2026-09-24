@@ -1,3 +1,10 @@
+// 文件导读：shared supplemental 只从冻结 EvidenceNeed 和 Claim/Critique gap 展开受治理
+// 资源，按稳定顺序、每轮最多 8 个 distinct resource、先持久化 started 再做外部 I/O。
+// disposition 的 accepted/deduplicated/unknown_after_crash/no_new_facts 只决定受影响
+// horizon 是否允许一次 rerun，不改旧 Claim/Critique，也不直接生成 Proposal/Decision。
+// Rust 机制：泛型 `supplement_record<T: Serialize>` 统一写 CAS；闭包排序/过滤借用行，
+// BTreeMap/Set 保证去重与恢复稳定；async `join_all` 并发采集但所有输出仍用 permit 写入。
+
 use crate::*;
 use akzio_domain::ResearchCritique;
 use akzio_domain::{

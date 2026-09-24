@@ -1,3 +1,4 @@
+// 文件导读：维护窗口只延长开始时仍有效的 Task/daemon lease；它不改 owner、epoch、任务结果或历史事件。
 use super::*;
 
 /// Canonical lease rows extended after one drained maintenance operation.
@@ -11,6 +12,7 @@ pub struct MaintenanceLeaseDeferral {
 }
 
 impl Store {
+    // 先在一个 Immediate 事务中锁定候选租约并按原值条件更新，避免覆盖并发接管或恢复。
     /// Preserve live task and daemon ownership across a drained maintenance
     /// window. Expired leases remain expired and can still be recovered.
     pub fn defer_live_leases_for_maintenance(

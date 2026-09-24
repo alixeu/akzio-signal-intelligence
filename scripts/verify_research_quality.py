@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Run the fixed offline catalog and bind each stable ID to an actual test result."""
+# 文件职责：执行固定的离线研究质量测试，并把每个稳定 case ID 绑定到真实测试输出。
+# 它不调用真实模型、Broker 或生产 Store；report 的 tier 只表示 offline-verified。
 import argparse
 import datetime
 import json
@@ -12,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def main():
+    # main 先读取不可变 catalog，再逐 crate 执行测试，最后把缺失 case 保留为 not_observed。
     # 目录中的稳定 case ID 与实际 crate 测试结果逐一绑定；脚本只报告离线证据，不启动真实模型。
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path)

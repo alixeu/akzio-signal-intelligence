@@ -1,11 +1,15 @@
 //! Deterministic model fixture used by the formal Paper and PositionPlan graphs.
 
+// Fixture 只模拟模型在 Submit 边界返回的结构化数据；它不模拟券商、时钟、成交、
+// Policy 或 Outcome。正式 Runtime 仍会重新绑定 Manifest 引用、校验 Contract，
+// 并把中性/零目标结果与后续 Decision、Execution、Paper 状态分开持久化。
 use std::collections::BTreeMap;
 
 use akzio_model::ModelClient;
 use serde_json::Value;
 
 pub fn fixture_claim_output() -> Value {
+    // Claim 明确保持 neutral，避免离线样例把“有输出”误读成有方向性证据。
     serde_json::json!({
         "schema_version": akzio_domain::DOMAIN_SCHEMA_VERSION,
         "topic": "fixture_market_regime",
@@ -29,6 +33,7 @@ pub fn fixture_claim_output() -> Value {
 }
 
 pub fn fixture_critique_output() -> Value {
+    // Critic 记录信息不足而非凭空制造反证；这仍然是结构化审查产物，不是 Gate 放行。
     serde_json::json!({
         "schema_version": akzio_domain::DOMAIN_SCHEMA_VERSION,
         "target": {
@@ -52,6 +57,8 @@ pub fn fixture_critique_output() -> Value {
 }
 
 pub fn fixture_model_client() -> ModelClient {
+    // 每个 purpose/phase 使用相同的闭包构造 Submit 响应；BTreeMap 使 fixture 选择
+    // 按角色隔离，重复请求不会消耗另一任务的响应或跨 Run 共享可变状态。
     let mut claim = fixture_claim_output();
     claim["horizon"] = serde_json::json!("$fixture.task.horizon");
     claim["grounds"][0]["evidence"] = serde_json::json!(
@@ -98,6 +105,7 @@ pub fn fixture_model_client() -> ModelClient {
         })
         .collect::<Vec<_>>();
     let responses = |output: Value| {
+        // Research 角色没有 Draft；Outcome 的两阶段 fixture 在 ModelClient 侧另行配置。
         let output = serde_json::json!({
             "result": output,
             "deliberation": {

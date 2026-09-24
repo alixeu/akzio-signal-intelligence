@@ -4,6 +4,7 @@ import Foundation
 
 enum CouncilFixtures {
     static func uncertainties(scenario: MockScenario) -> [UncertaintyPresentation] {
+        // 数据不可用时不返回不确定性权重；正常场景的 label 顺序固定。
         guard !scenario.dataUnavailable else { return [] }
         var generator = SeededGenerator(seed: scenario.seed &+ 401)
         let labels = [
@@ -18,6 +19,7 @@ enum CouncilFixtures {
     }
 
     static func alternatives(scenario: MockScenario) -> [AlternativePresentation] {
+        // alternatives 是固定的研究分支展示，第三项在数据不可用时保持 nil 匹配度。
         var generator = SeededGenerator(seed: scenario.seed &+ 419)
         return [
             AlternativePresentation(
@@ -39,6 +41,7 @@ enum CouncilFixtures {
     }
 
     static func basisArtifacts(scenario: MockScenario) -> [BasisArtifact] {
+        // 基础材料列表随 stale/critic 场景追加提示，反映上下文来源而不伪造新证据。
         var items = [
             BasisArtifact(label: "12 normalized documents", symbol: "doc.text.magnifyingglass"),
             BasisArtifact(label: "Quote snapshot", symbol: "chart.bar"),
@@ -55,6 +58,7 @@ enum CouncilFixtures {
 
     /// config/akzio.toml sets `low`; the gallery scenarios exercise the other steps.
     static func intensity(scenario: MockScenario) -> ReasoningIntensity {
+        // reasoning intensity 由 scenario 选择展示级别；不改变实际模型配置。
         switch scenario {
         case .criticTriggeredMaterialConflict, .decisionBlocked: .high
         case .policyProven, .policyContested: .medium
@@ -63,6 +67,7 @@ enum CouncilFixtures {
     }
 
     static func roles(scenario: MockScenario) -> [RoleCardPresentation] {
+        // roles 用同一 generator 生成 token/latency 等指标，状态与场景的 workflow 对齐。
         var generator = SeededGenerator(seed: scenario.seed &+ 433)
         let running = scenario.workflowStatus == .running
 
@@ -72,6 +77,7 @@ enum CouncilFixtures {
             status: AkzioStatus,
             hasMetrics: Bool = true
         ) -> RoleCardPresentation {
+            // card 闭包统一处理有指标与无指标角色，缺失值继续保持 nil。
             RoleCardPresentation(
                 role: role,
                 model: model,
@@ -104,6 +110,7 @@ enum CouncilFixtures {
     }
 
     static func council(scenario: MockScenario) -> CouncilPresentation {
+        // council 汇总角色、模型候选、替代方案、不确定性和依据材料，供 Intelligence 页面读取。
         let cards = roles(scenario: scenario)
         let selected: AgentRole = scenario.criticTriggered ? .critic : .synthesizer
         var generator = SeededGenerator(seed: scenario.seed &+ 461)
@@ -125,6 +132,7 @@ enum CouncilFixtures {
     }
 
     static func inspector(scenario: MockScenario, nodes: [WorkflowNodePresentation]) -> StageInspectorPresentation {
+        // inspector 优先选择当前节点，其次选择失败节点，最后回退到节点列表首项。
         let node = nodes.first { $0.isActive } ?? nodes.first { $0.taskStatus == .failed } ?? nodes[0]
         var generator = SeededGenerator(seed: scenario.seed &+ 487)
         return StageInspectorPresentation(

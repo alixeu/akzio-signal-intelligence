@@ -1,3 +1,10 @@
+// 文件导读：Outcome worker 以每个 Run/outcome_id 独立 daemon lease 处理最早未完成的
+// horizon，先持久化证据和 Rust stage packet，再做一次有界 narrative 调用，最后由
+// EvaluationRuntime 记录 Partial 或 sealed T5。Late catch-up 只看当前 cutoff；model error
+// 可退化为 Rust-only diagnostic，但不能伪造 narrative、fill、NAV 或 learning qualification。
+// Rust 机制：`Drop` guard 覆盖错误/取消；`Option` 表示 draft/父 canary/成熟窗口缺失；
+// `Vec::retain` 截断事实到 horizon，async AgentRuntime Future 与 fenced Store write 顺序明确。
+
 use super::*;
 
 impl Daemon {
@@ -6,6 +13,8 @@ impl Daemon {
         task: &ClaimedAttempt,
         now: DateTime<Utc>,
     ) -> Result<TaskCompletion> {
+        // 一个 task 只推进当前最早 pending horizon；先做 purpose/schedule/narrative repair
+        // 分流，再取得独立 outcome lease，保证 Session T0 与历史 Outcome 不互相阻塞。
         if self.store.run_purpose(&task.run_id)? != RunPurpose::Paper {
             return Ok(TaskCompletion::NoOutput);
         }
@@ -371,6 +380,8 @@ impl Daemon {
 }
 
 fn outcome_failure_category(error: &akzio_research::ResearchError) -> &'static str {
+    // 只把 ResearchError 归一为诊断类别，不把错误正文或 provider 响应注入 Outcome；类别
+    // 供 Rust-only retrospective 记录，不能改变数值 Outcome 的 authoritative 来源。
     use akzio_research::ResearchError;
     match error {
         ResearchError::Context(_) => "context_rejected",

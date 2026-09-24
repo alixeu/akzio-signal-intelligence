@@ -1,3 +1,10 @@
+// 文件导读：本构建脚本只计算源码输入身份和 Rust 编译器版本，并把结果作为编译期环境
+// 变量交给 CLI 的 RuntimeIdentity 使用。它不打开 Store、不启动 daemon，也不参与
+// research、Decision、Execution、Paper submission、fill 或 Outcome 的运行时状态推进。
+// Rust 机制：`build.rs` 在编译阶段运行；`PathBuf` 拥有路径，`&Path` 借用路径，`?`/`Option`
+// 用于把外部命令和文件读取失败收敛为可控的回退，而 `println!("cargo:...")` 是 Cargo
+// 识别的构建指令，不是应用运行时日志。
+
 use std::{
     env, fs,
     path::{Path, PathBuf},

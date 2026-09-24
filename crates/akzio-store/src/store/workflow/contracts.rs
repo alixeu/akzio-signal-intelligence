@@ -1,3 +1,5 @@
+// 文件导读：Contract 安装记录不可变，catalogue head 只是当前选择的重建游标；
+// 初次安装、canonical bounded upgrade、candidate 安装和激活分别对应不同授权路径。
 impl Store {
     pub fn active_contract(
         &self,

@@ -1,3 +1,4 @@
+// 文件导读：保存跨 crate 共用的领域 schema 版本和因子风险上限结构。
 //! Canonical artifact, contract, workflow, and authority schema.
 //!
 //! This module is intentionally introduced beside the former vocabulary while the
@@ -19,7 +20,9 @@ pub struct FactorLimits {
 }
 
 impl FactorLimits {
+    // 校验四类因子上限都不超过 100%（以 ppm 表示）；失败只返回领域错误，不做截断。
     pub fn validate(&self) -> Result<(), DomainError> {
+        // 数组迭代器配合 any 闭包集中检查“任一值越界”的条件。
         if [
             self.global_leveraged_equity_ppm,
             self.nasdaq_ppm,

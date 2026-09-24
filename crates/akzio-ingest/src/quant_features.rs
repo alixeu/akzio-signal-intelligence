@@ -9,6 +9,12 @@ use crate::runtime::{
     GovernedResource,
 };
 
+// 文件导读：QuantFeatureSnapshot 只从一个已治理、升序、OHLCV 完整的 Alpaca 日线 payload
+// 计算点时特征。build_quant_feature_snapshot 先绑定 bars resource、availability/cutoff、
+// adjustment/feed，再用整数 ppm/micros 和有限浮点统计生成收益、波动、ATR、回撤、成交额
+// 与 gap；feature snapshot 的版本和 sample window 会随 NormalizedEvidence 保存，不能被
+// 后续模型自行重算或拿下载时间替代可用时间。
+
 pub const QUANT_FEATURE_FORMULA_VERSION: &str = "akzio.quant.daily.v1";
 const PARTS_PER_MILLION: i128 = 1_000_000;
 const ANNUAL_TRADING_DAYS: f64 = 252.0;
@@ -47,6 +53,8 @@ pub struct QuantFeatureSnapshot {
 
 impl QuantFeatureSnapshot {
     pub fn validate(&self) -> EvidenceRuntimeResult<()> {
+        // 验证公式版本、资源类型、调整/feed、样本窗口和每个特征所需的最小 bars 数；缺少
+        // 足够历史只保留 None，不用零值冒充有效统计。
         let count = usize::try_from(self.sample_count)
             .map_err(|_| EvidenceRuntimeError::InvalidAcquisition)?;
         let valid_feed = self
@@ -102,6 +110,9 @@ pub(crate) fn build_quant_feature_snapshot(
     source_uri: &str,
     decision_clock: &DecisionClock,
 ) -> EvidenceRuntimeResult<QuantFeatureSnapshot> {
+    // 输入→资源/日线形状校验→按 production session_closes 或受控 fixture cutoff 确认
+    // available_at→解析 bars→逐项计算特征→validate。任何未来数据、未知 query metadata
+    // 或非 finite 数值都在返回前 fail closed。
     if !matches!(
         GovernedResource::parse(EvidenceSource::Alpaca, source_resource),
         Ok(GovernedResource::AlpacaBars { .. })
@@ -171,6 +182,8 @@ pub(crate) fn build_quant_feature_snapshot(
 }
 
 fn parse_bars(value: &Value) -> EvidenceRuntimeResult<Vec<DailyBar>> {
+    // 将 provider 字段映射为内部整数 DailyBar；外层质量门已检查顺序/价格关系，这里仍对
+    // 每个字段和 timestamp 做 typed 解析。
     value
         .get("bars")
         .and_then(Value::as_array)
@@ -197,6 +210,7 @@ fn parse_bars(value: &Value) -> EvidenceRuntimeResult<Vec<DailyBar>> {
 }
 
 fn market_micros(value: Option<&Value>) -> EvidenceRuntimeResult<u64> {
+    // 用有限正浮点乘一百万并四舍五入为 micros；解析失败或超范围不做饱和。
     let value = value.ok_or(EvidenceRuntimeError::InvalidAcquisition)?;
     let number = value
         .as_f64()
@@ -211,6 +225,8 @@ fn market_micros(value: Option<&Value>) -> EvidenceRuntimeResult<u64> {
 }
 
 fn source_metadata(source_uri: &str) -> EvidenceRuntimeResult<(String, Option<String>)> {
+    // 从已治理 URL 读取 adjustment/feed，并要求 adjustment=all 和有限 feed，保证公式的
+    // 输入口径与 provider 请求一致。
     let parsed = Url::parse(source_uri).map_err(|_| EvidenceRuntimeError::InvalidAcquisition)?;
     let query = parsed
         .query_pairs()
@@ -231,6 +247,7 @@ fn source_metadata(source_uri: &str) -> EvidenceRuntimeResult<(String, Option<St
 }
 
 fn trailing_return_ppm(bars: &[DailyBar], days: usize) -> EvidenceRuntimeResult<Option<i64>> {
+    // 以最新收盘相对 days 个 bars 前收盘计算有符号 ppm；历史不足时返回 None。
     if bars.len() <= days {
         return Ok(None);
     }
@@ -240,6 +257,8 @@ fn trailing_return_ppm(bars: &[DailyBar], days: usize) -> EvidenceRuntimeResult<
 }
 
 fn realized_volatility_ppm(bars: &[DailyBar], days: usize) -> EvidenceRuntimeResult<Option<u64>> {
+    // 对最近 days+1 个收盘计算 log return 的总体方差并按 sqrt(252) 年化，非有限值交给
+    // ppm 边界检查拒绝。
     if bars.len() <= days {
         return Ok(None);
     }
@@ -259,6 +278,7 @@ fn realized_volatility_ppm(bars: &[DailyBar], days: usize) -> EvidenceRuntimeRes
 }
 
 fn atr_price_micros(bars: &[DailyBar], days: usize) -> EvidenceRuntimeResult<Option<u64>> {
+    // 用前一日 close 与当日 high/low 的最大距离构造 true range，再对最近窗口求整数均值。
     if bars.len() <= days {
         return Ok(None);
     }
@@ -281,6 +301,7 @@ fn atr_price_micros(bars: &[DailyBar], days: usize) -> EvidenceRuntimeResult<Opt
 }
 
 fn maximum_drawdown_ppm(bars: &[DailyBar]) -> EvidenceRuntimeResult<u32> {
+    // 单次前向迭代维护历史 peak，计算 peak 到当前 close 的最大百分比回撤。
     let mut peak = bars
         .first()
         .ok_or(EvidenceRuntimeError::InvalidAcquisition)?
@@ -298,6 +319,7 @@ fn average_dollar_volume_micros(
     bars: &[DailyBar],
     days: usize,
 ) -> EvidenceRuntimeResult<Option<u64>> {
+    // 对最近窗口计算 close×volume 的日均名义成交额；u128 中间值避免资产数量放大时溢出。
     if bars.len() < days {
         return Ok(None);
     }
@@ -318,6 +340,7 @@ fn average_dollar_volume_micros(
 }
 
 fn latest_gap_ppm(bars: &[DailyBar]) -> EvidenceRuntimeResult<Option<i64>> {
+    // 比较最新 open 与前一日 close，保留跳空方向和 ppm 符号。
     if bars.len() < 2 {
         return Ok(None);
     }
@@ -331,6 +354,7 @@ fn latest_gap_ppm(bars: &[DailyBar]) -> EvidenceRuntimeResult<Option<i64>> {
 }
 
 fn signed_ratio_ppm(numerator: i128, denominator: u64) -> EvidenceRuntimeResult<i64> {
+    // 统一执行带方向的整数比例和对称四舍五入，避免负数除法向零截断造成偏差。
     let scaled = numerator
         .checked_mul(PARTS_PER_MILLION)
         .ok_or(EvidenceRuntimeError::InvalidAcquisition)?;
@@ -344,6 +368,7 @@ fn signed_ratio_ppm(numerator: i128, denominator: u64) -> EvidenceRuntimeResult<
 }
 
 fn unsigned_ratio_ppm(numerator: u64, denominator: u64) -> EvidenceRuntimeResult<u32> {
+    // 计算非负 ppm 比例并在转换为 u32 前检查乘法/结果范围。
     let scaled = u128::from(numerator)
         .checked_mul(PARTS_PER_MILLION as u128)
         .ok_or(EvidenceRuntimeError::InvalidAcquisition)?;
@@ -352,6 +377,7 @@ fn unsigned_ratio_ppm(numerator: u64, denominator: u64) -> EvidenceRuntimeResult
 }
 
 fn finite_nonnegative_ppm(value: f64) -> EvidenceRuntimeResult<u64> {
+    // 将非负有限浮点指标转换为 ppm；NaN、无穷和超范围不静默截断。
     let scaled = (value * PARTS_PER_MILLION as f64).round();
     if !scaled.is_finite() || scaled < 0.0 || scaled > u64::MAX as f64 {
         return Err(EvidenceRuntimeError::InvalidAcquisition);
@@ -360,5 +386,6 @@ fn finite_nonnegative_ppm(value: f64) -> EvidenceRuntimeResult<u64> {
 }
 
 fn return_is_valid(value: Option<i64>, expected: bool) -> bool {
+    // 只允许与样本数量匹配的可选收益，并拒绝低于 -100% 的不可能值。
     value.is_some() == expected && value.is_none_or(|value| value > -1_000_000)
 }

@@ -5,14 +5,17 @@ import SwiftUI
 // Running agents float to the top. Reordering is a spring on the row's geometry, so
 // rows glide past each other instead of blinking into new slots.
 struct ActiveAgentsList: View {
+    // agents 是 Overview 的只读展示投影；namespace 可选，用于跨页面的角色卡共享元素。
     let agents: [AgentRailItem]
     let namespace: Namespace.ID?
 
     @Environment(\.motionPolicy) private var policy
     @Environment(\.appLanguage) private var language
+    // rows 只负责列表内部的几何匹配，不承载业务数据或导航状态。
     @Namespace private var rows
 
     private var sorted: [AgentRailItem] {
+        // 排序闭包先把运行中的 Agent 提到前面，再按进度和 ID 稳定排序。
         agents.sorted { lhs, rhs in
             if lhs.status.isLive != rhs.status.isLive { return lhs.status.isLive }
             if lhs.progressPpm != rhs.progressPpm { return lhs.progressPpm > rhs.progressPpm }
@@ -21,6 +24,7 @@ struct ActiveAgentsList: View {
     }
 
     var body: some View {
+        // 列表读取 sorted 派生结果；每一行的共享元素和选择动画都不修改 agents。
         SectionCard(
             title: "Active Agents",
             subtitle: "\(agents.count) \(L10n.text("roles", language: language))",
@@ -46,10 +50,12 @@ struct ActiveAgentsList: View {
 
     /// One anchor per role: the first row of that role in display order.
     private func isRoleAnchor(_ agent: AgentRailItem) -> Bool {
+        // 闭包选择当前显示顺序中每个 role 的第一行，避免同角色锚点互相覆盖。
         sorted.first { $0.role == agent.role }?.id == agent.id
     }
 
     private func row(_ agent: AgentRailItem) -> some View {
+        // 单行根据 status 决定显示标签或进度条，所有文本由环境语言本地化。
         HStack(spacing: AkzioLayout.s2) {
             StatusDot(agent.status)
             VStack(alignment: .leading, spacing: 1) {

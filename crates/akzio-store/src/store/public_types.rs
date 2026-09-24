@@ -1,3 +1,5 @@
+// 文件导读：本文件定义 Store 对外返回的 lease、Paper slot、Policy/Shadow、生命周期和
+// model usage 投影；这些值是从 SQL/CAS 重建的快照或提交结果，不提供可变数据库句柄。
 fn push_alert(
     alerts: &mut Vec<StoreAlert>,
     code: &str,

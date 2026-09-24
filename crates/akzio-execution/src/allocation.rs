@@ -1,5 +1,10 @@
 //! Model-free conversion from a typed decision and broker snapshots to orders.
 
+// 文件导读：这里是 Decision 到 ExecutionPlan 的纯 Rust 转换层。输入必须是已接受的
+// DecisionContext，并且账户、报价、市场时钟属于同一 broker session；随后按目标权重
+// 计算资产差额、验证报价和购买力、缩放买单、统计换手，最后把快照 Artifact 引用与
+// 重新计算的 plan hash 一起返回。它不写 Store，也不调用 Broker。
+
 use akzio_domain::{
     AccountSnapshot, ArtifactRef, Asset, ContentHash, DecisionContext, DomainError, ExecutionPlan,
     FactorExposure, MarketClockSnapshot, MoneyMicros, OrderIntent, OrderSide, QuoteSnapshot,
@@ -49,15 +54,18 @@ pub struct AllocationRuntime {
 
 impl AllocationRuntime {
     pub fn new(policy: ExecutionPolicy) -> AllocationResult<Self> {
+        // 分配器创建时就冻结并校验执行策略，后续每次分配不会临时接受模型提供的限制。
         policy.validate()?;
         Ok(Self { policy })
     }
 
     pub fn policy(&self) -> &ExecutionPolicy {
+        // 暴露只读策略引用，供 Gate 读取上限而不取得修改执行参数的所有权。
         &self.policy
     }
 
     pub fn allocate(&self, input: &AllocationInput) -> AllocationResult<ExecutionPlan> {
+        // 常规入口使用策略内的单次最大名义金额；需要审批上限时由 Gate 调用带 limit 的入口。
         self.allocate_with_limit(input, self.policy.max_new_notional)
     }
 
@@ -66,6 +74,8 @@ impl AllocationRuntime {
         input: &AllocationInput,
         maximum_total_notional: MoneyMicros,
     ) -> AllocationResult<ExecutionPlan> {
+        // 这里先做领域校验、Decision 接受状态和 session 对齐，再进入订单计算；因此
+        // 关闭市场或混合快照不会被后面的金额计算掩盖成可执行计划。
         input.decision_context.validate()?;
         input.account.validate()?;
         input.quotes.validate()?;
@@ -94,6 +104,9 @@ fn build_execution_plan(
     input: &AllocationInput,
     maximum_total_notional: MoneyMicros,
 ) -> std::result::Result<ExecutionPlan, ExecutionError> {
+    // 逐资产把 target weight 映射为当前市值差额：先验证资产全集和 gross exposure，
+    // 再只为非零差额生成限价单。订单生成完成后才统一处理买入上限、购买力、换手和
+    // achieved target，避免把“计划目标”误写成“已成交结果”。
     let target = &input.decision_context.target;
     let account = &input.account;
     let quotes = &input.quotes;
@@ -233,6 +246,8 @@ fn scale_buy_orders_to_limit(
     orders: &mut Vec<OrderIntent>,
     maximum_buy_notional: MoneyMicros,
 ) -> std::result::Result<(), ExecutionError> {
+    // 只按比例压缩买单，卖单保持原值；整数余数按固定 Asset 顺序分配，保证相同输入
+    // 仍得到相同的订单顺序和 plan hash。
     if maximum_buy_notional.0 < 0 {
         return Err(ExecutionError::NewNotionalExceeded);
     }
@@ -292,6 +307,8 @@ struct OrderNotionals {
 }
 
 fn order_notionals(orders: &[OrderIntent]) -> std::result::Result<OrderNotionals, ExecutionError> {
+    // 用迭代器输入逐单累加买、卖、换手和净现金需求，并在每次 checked_add 时阻断溢出。
+    // risk_increasing 只代表买入侧，不把尚未成交的卖出所得提前算进购买力。
     let mut gross_buy = 0_i128;
     let mut gross_sell = 0_i128;
     for order in orders {
@@ -325,6 +342,8 @@ fn target_after_orders(
     account: &AccountSnapshot,
     orders: &[OrderIntent],
 ) -> std::result::Result<TargetPortfolio, ExecutionError> {
+    // 按订单的名义金额推导“订单执行后假设目标”，用于风控和审计，不是 Broker 回报的
+    // 实际持仓；负市值和超过 ppm 范围都在这里拒绝。
     let mut achieved = TargetPortfolio::zeroed();
     for asset in Asset::EXECUTABLE {
         let mut market_value = i128::from(

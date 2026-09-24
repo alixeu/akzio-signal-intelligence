@@ -6,6 +6,7 @@ import Foundation
 // the full curve in Portfolio and the comparison chart in Outcome are the same
 // numbers — which is what lets the shared-element handoff land pixel-perfectly.
 public enum CurveFixtures {
+    // baseEquity 是所有曲线和百分比换算共用的固定基准，不代表真实账户余额。
     public static let baseEquity: Double = 1_028_645.72
 
     /// Intraday equity plus benchmark, one point per five minutes of the session.
@@ -13,6 +14,7 @@ public enum CurveFixtures {
         scenario: MockScenario,
         range: EquityRange = .oneDay
     ) -> [EquityPoint] {
+        // 两个 walk 使用不同 salt 生成 portfolio/benchmark，再由 map 闭包对齐时间点。
         var generator = SeededGenerator(seed: scenario.seed &+ 11)
         let count = range.pointCount
         let drift = scenario.dataStale ? 0.004 : 0.0148
@@ -42,12 +44,14 @@ public enum CurveFixtures {
 
     /// Compact series for KPI cards and position cards.
     public static func spark(scenario: MockScenario, salt: UInt64, trend: Double) -> [Double] {
+        // spark 是 KPI/仓位卡片的短序列，salt 让不同卡片共享场景但不重叠波形。
         var generator = SeededGenerator(seed: scenario.seed &+ salt)
         return generator.walk(count: 34, start: 100, drift: trend, volatility: 0.006)
     }
 
     /// Outcome comparison chart: portfolio vs benchmark across the observed horizon.
     public static func comparison(scenario: MockScenario, horizon: OutcomeHorizonKind) -> [EquityPoint] {
+        // comparison 为已观测 horizon 生成成对曲线；长度由 horizon 的交易日数决定。
         var generator = SeededGenerator(seed: scenario.seed &+ 71 &+ UInt64(horizon.tradingDays))
         let count = 12 * horizon.tradingDays
         let portfolio = generator.walk(count: count, start: 100, drift: 0.0146, volatility: 0.0042)
@@ -65,6 +69,7 @@ public enum CurveFixtures {
 
     /// Retrospective card thumbnails; sign of `trend` decides the tone.
     public static func retrospectiveSpark(scenario: MockScenario, index: Int, trend: Double) -> [Double] {
+        // retrospective 缩略图使用卡片索引作为额外 salt，趋势符号只影响样例走向。
         var generator = SeededGenerator(seed: scenario.seed &+ 131 &+ UInt64(index))
         return generator.walk(count: 28, start: 100, drift: trend, volatility: 0.010)
     }
@@ -73,6 +78,7 @@ public enum CurveFixtures {
 
     /// Actual vs target weights. Targets are the policy; actuals drift off them.
     public static func allocations(scenario: MockScenario) -> [AllocationRow] {
+        // 目标权重固定，前四类产生 drift，cash 用反向差值保持总权重闭合。
         let targets: [(String, Int)] = [
             (TradableAsset.tqqq.rawValue, 300_000),
             (TradableAsset.qqq.rawValue, 250_000),
@@ -94,6 +100,7 @@ public enum CurveFixtures {
     }
 
     public static func positions(scenario: MockScenario) -> [PositionPresentation] {
+        // positions 闭包把每个可交易资产的 allocation、market value、P&L 和 spark 组合起来。
         let allocations = allocations(scenario: scenario)
         var generator = SeededGenerator(seed: scenario.seed &+ 67)
         return TradableAsset.allCases.enumerated().map { index, asset in

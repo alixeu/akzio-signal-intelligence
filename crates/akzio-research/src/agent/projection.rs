@@ -1,3 +1,6 @@
+// 历史实验投影只在请求进入模型前做可逆的标识符/日历遮蔽，返回后再还原到
+// Rust/Store 使用的真实值。遮蔽改变的是模型可见文本，不改变 Manifest、Evidence
+// 或 Contract 身份；任何不可逆/不匹配的值都保留原样，不把实验映射当作业务事实。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HistoricalProjection {
     condition: akzio_domain::ExperimentCondition,
@@ -13,6 +16,8 @@ impl HistoricalProjection {
     }
 
     fn project_request(&self, request: &mut AgentModelRequest) {
+        // Request 内既有 prose，也有 JSON context、ToolResult、Schema 和 terminal
+        // 定义；逐个位置投影可避免模型从 key、错误反馈或 continuation 泄露真实值。
         if !self.masks_identifiers() && !self.masks_calendar() {
             return;
         }
@@ -41,6 +46,8 @@ impl HistoricalProjection {
     }
 
     fn restore_turn(&self, turn: &mut AgentModelTurn) {
+        // 只还原模型可写字段；continuation identity 与 telemetry 不在映射范围内，
+        // 这样恢复时仍由原始 provider/Store 记录判断，不篡改调用证据。
         if !self.masks_identifiers() && !self.masks_calendar() {
             return;
         }
@@ -81,6 +88,8 @@ impl HistoricalProjection {
     }
 
     fn map_value(&self, value: &mut Value, reverse: bool) {
+        // Object key 也必须映射。std::mem::take 暂时移出 Map，避免在迭代期间修改
+        // 容器；递归处理数组/对象，标量 null/bool/number 不含待遮蔽文本。
         match value {
             Value::String(text) => {
                 *text = if reverse {
@@ -154,6 +163,7 @@ fn map_identifier_tokens(text: &str, reverse: bool) -> String {
 
     let mut output = String::with_capacity(text.len());
     let mut token = String::new();
+    // 闭包把一个完整 token 原子写回，保证 SOXL 等标识符不会被逐字符替换成混合值。
     let flush = |output: &mut String, token: &mut String| {
         if token.is_empty() {
             return;
@@ -175,6 +185,8 @@ fn map_identifier_tokens(text: &str, reverse: bool) -> String {
 }
 
 fn map_calendar_dates(text: &str, cutoff: chrono::NaiveDate, reverse: bool) -> String {
+    // 正向把 ISO 日期转换为相对 cutoff 的固定宽度 DAY 偏移，反向只解析该格式；
+    // checked_add_signed 失败时保留原 token，避免溢出生成伪日期。
     use std::sync::OnceLock;
 
     static ISO_DATE: OnceLock<Regex> = OnceLock::new();
@@ -212,4 +224,3 @@ fn map_calendar_dates(text: &str, cutoff: chrono::NaiveDate, reverse: bool) -> S
             .into_owned()
     }
 }
-

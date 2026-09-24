@@ -1,3 +1,5 @@
+// 文件导读：定义 Paper-only Canary 的阶段状态、晋级政策、成对 cohort/observation、
+// 校准结果和 session reservation；本模块只做序列化与确定性校验，不执行晋级动作。
 //! Domain vocabulary for a Paper-only canary campaign.
 //!
 //! The campaign state machine is deliberately kept in the domain crate so
@@ -47,6 +49,7 @@ impl CanaryCampaignStatus {
     #[allow(non_upper_case_globals)]
     pub const Canary50: Self = Self::ValidationStage3;
 
+    // 返回状态机的下一个合法状态；Completed/Frozen 没有后继。
     pub const fn next(self) -> Option<Self> {
         match self {
             Self::Staged => Some(Self::ValidationStage1),
@@ -58,6 +61,7 @@ impl CanaryCampaignStatus {
         }
     }
 
+    // 判断当前状态是否属于四个需要观察数据的 Canary level。
     pub const fn is_level(self) -> bool {
         matches!(
             self,
@@ -68,6 +72,7 @@ impl CanaryCampaignStatus {
         )
     }
 
+    // 将 Canary level 映射为历史 CandidatePolicyState；非 level 状态无映射。
     pub const fn policy_state(self) -> Option<crate::CandidatePolicyState> {
         match self {
             Self::ValidationStage1 => Some(crate::CandidatePolicyState::Canary10),
@@ -78,6 +83,7 @@ impl CanaryCampaignStatus {
         }
     }
 
+    // 返回面向 UI/报告的稳定显示名称。
     pub const fn display_name(self) -> &'static str {
         match self {
             Self::Staged => "Staged",
@@ -90,6 +96,7 @@ impl CanaryCampaignStatus {
         }
     }
 
+    // 仅为三个旧存储名提供兼容映射，其他状态没有旧名称。
     pub const fn legacy_storage_name(self) -> Option<&'static str> {
         match self {
             Self::ValidationStage1 => Some("canary10"),
@@ -117,6 +124,7 @@ pub struct CanaryPromotionPolicy {
 }
 
 impl CanaryPromotionPolicy {
+    // 校验 ppm、非零样本/市场日、regime 文本和可选搜索偏差政策。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.minimum_evidence_completeness_ppm > 1_000_000
             || self.minimum_risk_recall_ppm > 1_000_000
@@ -143,6 +151,7 @@ impl CanaryPromotionPolicy {
         Ok(())
     }
 
+    // 对完整晋级阈值配置计算身份哈希。
     pub fn identity_hash(&self) -> ContentHash {
         let value = serde_json::to_value(self).expect("CanaryPromotionPolicy serializes");
         content_hash_json(&value).expect("CanaryPromotionPolicy canonical JSON serializes")
@@ -179,11 +188,13 @@ pub struct CanaryCohortManifest {
 }
 
 impl CanaryCohortManifest {
+    // 根据不可变 cohort 字段生成 cohort_id，返回带身份的副本。
     pub fn seal(mut self) -> Self {
         self.cohort_id = self.identity_hash();
         self
     }
 
+    // 对 cohort 的 campaign、合约/拓扑、观察窗口、数据集和治理证据计算哈希。
     pub fn identity_hash(&self) -> ContentHash {
         let value = serde_json::json!({
             "schema_version": self.schema_version,
@@ -209,6 +220,7 @@ impl CanaryCohortManifest {
         content_hash_json(&value).expect("CanaryCohortManifest canonical JSON serializes")
     }
 
+    // 校验 stage、日期/资产/market regime、数据集区分、证书 kind 和可选能力矩阵。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION
             || self.cohort_id != self.identity_hash()
@@ -240,6 +252,7 @@ impl CanaryCohortManifest {
         Ok(())
     }
 
+    // 查询某个市场日的 regime；未登记日期返回 None，不做最近邻推断。
     pub fn regime_for(&self, market_day: NaiveDate) -> Option<&str> {
         self.market_regimes.get(&market_day).map(String::as_str)
     }
@@ -270,6 +283,7 @@ pub struct CanaryPairedOutcomeMetrics {
 }
 
 impl CanaryPairedOutcomeMetrics {
+    // 从 OutcomeWindow 复制观察日、证据/风险/收益指标；process_quality 初始未知。
     pub fn from_outcome_window(window: &OutcomeWindow) -> Self {
         Self {
             observed_trading_day: window.observed_trading_day,
@@ -286,10 +300,12 @@ impl CanaryPairedOutcomeMetrics {
 
     /// False when risk recall was never measured for this window. Callers must
     /// defer instead of promoting or rolling back on an unmeasured metric.
+    // Option 保留“未测量”和“测得零”两种状态的差异。
     pub const fn risk_recall_is_measured(&self) -> bool {
         self.risk_recall_ppm.is_some()
     }
 
+    // 校验所有可选 ppm、旧 confidence 字段和聚合 ForecastScore。
     pub fn validate(&self) -> Result<(), DomainError> {
         if [
             self.evidence_completeness_ppm,
@@ -324,10 +340,12 @@ impl CanaryPairedSubjectMetrics {
     /// False when either side of the pair lacks a measured risk recall. An
     /// unmeasured pair carries no risk evidence at all, so it can neither
     /// justify promotion nor prove degradation.
+    // 父/候选两侧都测得 risk recall 才能把成对指标用于晋级或回滚判断。
     pub const fn risk_recall_is_measured(&self) -> bool {
         self.parent.risk_recall_is_measured() && self.candidate.risk_recall_is_measured()
     }
 
+    // 分别校验两侧，并要求观察交易日一致，防止配对跨窗口。
     pub fn validate(&self) -> Result<(), DomainError> {
         self.parent.validate()?;
         self.candidate.validate()?;
@@ -359,6 +377,7 @@ pub struct CanaryPairedObservation {
 }
 
 impl CanaryPairedObservation {
+    // 校验 session/date/regime、数据集区分、成本模型以及三类成对 subject 指标。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION
             || self.session_key != self.market_day.to_string()
@@ -376,6 +395,7 @@ impl CanaryPairedObservation {
         self.bundle.validate()
     }
 
+    // 对完整 observation 序列化后计算稳定内容哈希。
     pub fn identity_hash(&self) -> ContentHash {
         let value = serde_json::to_value(self).expect("CanaryPairedObservation serializes");
         content_hash_json(&value).expect("CanaryPairedObservation canonical JSON serializes")
@@ -417,6 +437,7 @@ pub struct CanaryCalibrationReport {
 }
 
 impl CanaryCalibrationReport {
+    // 对存在的 parent/candidate CalibrationReport 逐个复用其领域校验。
     pub fn validate(&self) -> Result<(), DomainError> {
         if let Some(report) = self.parent {
             report.validate()?;
@@ -429,11 +450,13 @@ impl CanaryCalibrationReport {
 }
 
 impl CanaryCohortEvaluation {
+    // 计算 evaluation_id 并返回封存后的副本。
     pub fn seal(mut self) -> Self {
         self.evaluation_id = self.identity_hash();
         self
     }
 
+    // 哈希覆盖观察集合、阈值绑定、verdict、样本计数、regime 和搜索证书引用。
     pub fn identity_hash(&self) -> ContentHash {
         let value = serde_json::json!({
             "schema_version": self.schema_version,
@@ -450,6 +473,7 @@ impl CanaryCohortEvaluation {
         content_hash_json(&value).expect("CanaryCohortEvaluation canonical JSON serializes")
     }
 
+    // 校验身份哈希、校准报告和可选 SearchBiasCertificate 引用 kind。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION
             || self.evaluation_id != self.identity_hash()
@@ -505,6 +529,7 @@ pub struct CanaryCampaignSpec {
 }
 
 impl CanaryCampaignSpec {
+    // 校验 campaign 基础身份/名义额度、候选引用 kind，并在配置 cohort 时逐 stage 对齐政策。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION
             || self.source_revision.trim().is_empty()
@@ -547,6 +572,7 @@ impl CanaryCampaignSpec {
                     });
                 }
                 let policy_hash = policy.identity_hash();
+                // 先确认 cohort_id 唯一，再逐个固定 level 检查父身份、regime 和样本容量。
                 let cohort_ids = cohorts
                     .iter()
                     .map(|cohort| &cohort.cohort_id)
@@ -595,12 +621,14 @@ impl CanaryCampaignSpec {
         Ok(())
     }
 
+    // 查找指定 level 的 cohort manifest；不存在时返回 None。
     pub fn cohort(&self, stage: CanaryCampaignStatus) -> Option<&CanaryCohortManifest> {
         self.cohorts
             .iter()
             .find(|cohort| cohort.validation_stage == stage)
     }
 
+    // 只有同时存在 promotion policy 和 cohort 列表才认为已配置成对 Canary。
     pub fn has_paired_cohorts(&self) -> bool {
         self.promotion_policy.is_some() && !self.cohorts.is_empty()
     }
@@ -627,6 +655,7 @@ pub struct CanarySessionReservation {
 }
 
 impl CanarySessionReservation {
+    // 校验 level/session/调度 epoch、四个不同 Run ID，以及 cohort 三元组的一致性。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION
             || !self.level.is_level()
@@ -653,6 +682,7 @@ impl CanarySessionReservation {
             }
         }
 
+        // BTreeSet 用于确认父 Run 与三个 shadow Run 没有复用同一身份。
         let run_ids = [
             &self.parent_run_id,
             &self.contract_shadow_run_id,

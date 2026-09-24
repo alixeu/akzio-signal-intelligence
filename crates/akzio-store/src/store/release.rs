@@ -1,3 +1,5 @@
+// 文件导读：release evidence 是 canonical Store 的只读投影，聚合 workflow、approval、
+// execution、Outcome、learning 和 broker lineage；expectations 只作比较门槛，不补造证据。
 use super::*;
 
 const SCHEDULER_LEASE_NAME: &str = "akzio.local.scheduler";

@@ -7,6 +7,7 @@ import SwiftUI
 // shows a glass tooltip; the latest point diffuses once when the series changes and
 // then stops.
 struct EquityCurveChart: View {
+    // curve、range 和 benchmarkLabel 都来自当前 PortfolioPresentation；该 View 只做图表/hover 投影。
     let curve: [EquityPoint]
     let range: EquityRange
     let benchmarkLabel: String
@@ -15,12 +16,14 @@ struct EquityCurveChart: View {
 
     @Environment(\.motionPolicy) private var policy
     @Environment(\.appLanguage) private var language
+    // hovered 与 bloomTick 是本地交互/动画状态，不会回写曲线或账户数据。
     @State private var hovered: EquityPoint?
     @State private var bloomTick = 0
 
     private var tone: AkzioTone { isGain ? .gold : .coral }
 
     var body: some View {
+        // Chart 的 result builder 组合 portfolio、可选 benchmark、latest marker 和 hover RuleMark。
         Chart {
             ForEach(curve) { point in
                 LineMark(
@@ -46,6 +49,7 @@ struct EquityCurveChart: View {
                 .interpolationMethod(.monotone)
 
                     if let benchmark = point.benchmark {
+                        // benchmark 是逐点 Optional；缺失点跳过 LineMark，避免用 0 伪造比较路径。
                         LineMark(
                         x: .value("Time", point.chartX),
                             y: .value("Benchmark", benchmark),
@@ -58,6 +62,7 @@ struct EquityCurveChart: View {
             }
 
             if let latest = curve.last {
+                // latest marker 只在曲线非空时存在，并通过 shared element 与 Outcome 视觉连接。
                 PointMark(
                     x: .value("Time", latest.chartX),
                     y: .value("Equity", latest.portfolio)
@@ -73,6 +78,7 @@ struct EquityCurveChart: View {
             }
 
             if let hovered {
+                // hover 状态只增加当前样本的竖向 RuleMark，不改变原始 curve。
                 RuleMark(x: .value("Time", hovered.chartX))
                     .foregroundStyle(AkzioColor.gold(0.35))
                     .lineStyle(StrokeStyle(lineWidth: 1, dash: [2, 3]))
@@ -102,6 +108,7 @@ struct EquityCurveChart: View {
             }
         }
         .chartOverlay { proxy in
+            // overlay 闭包捕获 ChartProxy/GeometryProxy；连续 hover 时按像素位置解析最近样本，结束时清空 State。
             GeometryReader { geometry in
                 Rectangle()
                     .fill(.clear)
@@ -129,6 +136,7 @@ struct EquityCurveChart: View {
 
     @ViewBuilder
     private var tooltip: some View {
+        // tooltip 是 hovered 的可选 ViewBuilder 分支；它只展示当前样本和可选 benchmark。
         if let hovered {
             VStack(alignment: .leading, spacing: 3) {
                 Text(hovered.axisLabel(for: range, locale: language.locale)).akzioText(.caption)
@@ -147,6 +155,7 @@ struct EquityCurveChart: View {
     }
 
     private func sample(at location: CGPoint, proxy: ChartProxy, geometry: GeometryProxy) -> EquityPoint? {
+        // plotFrame 或 value(atX:) 任一不可用都返回 nil；成功后在同一 curve 中选择 chartX 最近点。
         guard let frame = proxy.plotFrame else { return nil }
         let origin = geometry[frame].origin
         guard let x: Double = proxy.value(atX: location.x - origin.x) else { return nil }
@@ -154,6 +163,7 @@ struct EquityCurveChart: View {
     }
 
     private var axisPoints: [EquityPoint] {
+        // 短曲线保留全部点，长曲线等距挑六个索引作为轴标签，避免重采样业务数据。
         guard curve.count > 6 else { return curve }
         return (0..<6).map { tick in
             curve[Int((Double(tick) * Double(curve.count - 1) / 5).rounded())]

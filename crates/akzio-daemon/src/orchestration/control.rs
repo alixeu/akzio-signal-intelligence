@@ -1,3 +1,10 @@
+// 文件导读：control 暴露 scheduler/worker 的启动、取消、retry、replay 和 freeze 操作。
+// retry 只允许明确的 PositionPlan，Paper 由 scheduler/Session slot 管理；serve 成功只
+// 表示后台服务存活，Run、Decision、Paper submission、fill 和 Outcome 仍由各自事件证明。
+// Rust 机制：泛型 `C: BrokerSessionClock + ?Sized`/`P: PaperWorkflowSource + ?Sized` 接受
+// trait object；`tokio::try_join!` 并行等待 scheduler 与 worker，共享 `watch::Receiver` 的
+// clone 传播停止信号，`&RunId` 借用避免控制接口夺取 ID 所有权。
+
 use super::*;
 
 impl Daemon {

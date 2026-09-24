@@ -1,5 +1,12 @@
+// 文件导读：这些 AlpacaPaper 方法是只读账户/持仓/历史/时钟接口，以及带恢复语义的
+// commitment 执行入口。execute_committed 先校验 plan/commitment，再按 replacement
+// 和原始 client_order_id 查找已存在订单；只有缺失订单且当前授权与交易 session 都仍
+// 有效时才 POST。reconcile_committed 只刷新既有 broker order，不创建新订单。
+
 impl AlpacaPaper {
     pub fn new(base_url: impl Into<String>, credentials: PaperCredentials) -> Result<Self> {
+        // 先验证 exact Paper endpoint，再构造禁止重定向的 HTTP client；任何 endpoint
+        // 不匹配都在网络 I/O 前返回。
         let supplied = base_url.into();
         if !is_alpaca_paper_base_url(&supplied) {
             return Err(PaperError::NonPaperEndpoint(supplied));
@@ -23,24 +30,30 @@ impl AlpacaPaper {
     }
 
     pub fn from_env() -> Result<Self> {
+        // 环境只提供 endpoint/凭据来源，最终仍复用 new 的 Paper endpoint 检查。
         let base_url = env::var("ALPACA_PAPER_BASE_URL")
             .unwrap_or_else(|_| "https://paper-api.alpaca.markets".to_owned());
         Self::new(base_url, PaperCredentials::from_env()?)
     }
 
     pub async fn account(&self) -> Result<Value> {
+        // 账户读取是执行快照的原始输入，不在 adapter 内解释余额或授权。
         self.get_json("/v2/account").await
     }
 
     pub async fn positions(&self) -> Result<Value> {
+        // 持仓读取保留 broker 原始 JSON，后续 ingest/执行快照负责标准化和 provenance。
         self.get_json("/v2/positions").await
     }
 
     pub async fn portfolio_history(&self, range: PortfolioHistoryRange) -> Result<Value> {
+        // 通过枚举窗口读取历史净值，避免把用户字符串直接变成外部路径。
         self.get_json(range.path()).await
     }
 
     pub async fn market_clock(&self) -> Result<MarketClock> {
+        // 先取 Alpaca clock，再以其美东日期请求相邻日历，最后由领域 TradingSession
+        // 计算 Regular/Extended/Overnight/Closed；is_open 本身不单独决定可提交性。
         let clock = self.get_json("/v2/clock").await?;
         let timestamp: DateTime<Utc> = required_string(&clock, "timestamp")?
             .parse()
@@ -64,6 +77,9 @@ impl AlpacaPaper {
         plan: &ExecutionPlan,
         authorization: &PaperSubmissionAuthorization,
     ) -> Result<PaperExecution> {
+        // 恢复路径先查替换订单和原订单，已存在的 broker effect 只作为 reused 事实保留；
+        // 逐单二次检查授权/时段后才允许 POST。部分恢复遇到窗口失效会停止补发，但不会
+        // 丢弃已查到的 receipts。
         validate_commitment(commitment, plan)?;
         let mut orders = Vec::with_capacity(plan.orders.len());
         for order in &plan.orders {
@@ -131,6 +147,8 @@ impl AlpacaPaper {
         commitment: &PaperCommitment,
         execution: &PaperExecution,
     ) -> Result<PaperExecution> {
+        // 对已返回的 broker order 做只读刷新，并确认每个 client_order_id 是原始或唯一
+        // durable replacement；不会因为对账缺数据而创建新的订单。
         if execution.plan_hash != commitment.plan_hash {
             return Err(PaperError::CommitmentPlanHashMismatch);
         }

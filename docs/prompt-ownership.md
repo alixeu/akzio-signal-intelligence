@@ -36,7 +36,6 @@
 ## 检查入口
 
 - [角色正文基线](../crates/akzio-research/src/agent/prompts/mod.rs)：五个完整角色的 SHA-256、未知角色、阶段/版本/修复分支。
-- [派发渲染回归](../crates/akzio-research/src/agent/prompt_render_tests.rs)：验证 Outcome 的真实 AgentRuntime 两阶段请求、冻结权威正文、工具和恢复边界。正式研究图另由 `debug verify-fixture` 及 daemon 协议测试验证。
 - [来源清单检查](../crates/akzio-research/src/prompt_registry.rs)：稳定 ID 和路径唯一、正文有效、角色及采集长文档无漏登记。
 - 受影响 crates 检查及 workspace、隔离 fixture 验证遵循 [开发 Workflow](development-workflow.md)。
 

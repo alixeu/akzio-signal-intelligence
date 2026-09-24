@@ -1,3 +1,7 @@
+// Agent 主循环把固定 WorkflowNode、Store permit、ContextManifest、模型 Future 和
+// 结构化 Submit 串成一条可恢复的 Attempt。研究角色从 Submit 开始；只有 Outcome
+// 保留 Draft→受控读取→Submit。每次 provider/tool/validation/persist 都有独立的
+// 错误边界，模型返回或 TaskSucceeded 仍不等于 Decision、Paper 成交或 Outcome 封存。
 // The Attempt wall-time remains the Contract's fixed total. Draft needs the
 // larger share because it may perform a real provider call plus bounded reads;
 // Submit is deliberately kept within the remaining 30% and cannot extend the
@@ -5,6 +9,8 @@
 // 66s even when the Contract still had 54s left.
 const DRAFT_WALL_TIME_FRACTION: f32 = 0.70;
 fn outcome_phase_output_cap(budget: &AgentRunBudget, phase: AgentTurnPhase) -> ResearchResult<u32> {
+    // Outcome 预留至少一半 output 给 Submit，并在 70% 墙钟处结束 Draft；这是同一
+    // Attempt 的总预算切分，不会因阶段切换重置 usage 或延长 deadline。
     let reserve = if phase == AgentTurnPhase::Draft { (budget.max_output_tokens / 2).max(1) } else { 0 };
     if phase == AgentTurnPhase::Draft && (budget.remaining_output_tokens()? <= reserve
         || budget.started.elapsed() >= budget.wall_time.mul_f32(DRAFT_WALL_TIME_FRACTION)) {
@@ -21,6 +27,8 @@ fn phase_output_cap(
     _contract_version: u32,
     provider_cap: Option<u32>,
 ) -> ResearchResult<u32> {
+    // 研究 Submit 使用剩余全局 output cap；Outcome 走上面的两阶段 cap。Provider
+    // capability 只能进一步收紧请求，不会扩大 Contract 预算。
     if purpose == LEARNING_OUTCOME_WORKER_RECIPE_ID {
         return outcome_phase_output_cap(budget, phase);
     }
@@ -49,6 +57,8 @@ const REPAIR_ROUND_WALL_TIME_FRACTION: f32 = 0.5;
 /// The rejection itself is still recorded either way; this only decides whether
 /// asking the model to fix it can plausibly finish inside the same allowance.
 fn repair_round_fits(phase_deadline: StdDuration, elapsed: StdDuration) -> bool {
+    // 结构化拒绝已经持久化；这里只判断同一 deadline 是否还容得下第二次 provider
+    // Future，避免把原始 validation rejection 覆盖成无意义的 wall_time 错误。
     phase_deadline.saturating_sub(elapsed)
         >= phase_deadline.mul_f32(REPAIR_ROUND_WALL_TIME_FRACTION)
 }
@@ -109,6 +119,8 @@ impl AgentRuntime {
         now: DateTime<Utc>,
         budget: &mut AgentRunBudget,
     ) -> ResearchResult<Artifact> {
+        // 入口先校验 permit、task、Contract 和冻结 Node，再创建任何 Model/Context
+        // 副作用。NodePolicyMismatch 表示持久化图与调用方不一致，不是允许模型继续的提示。
         self.validate_authority_permit(permit).await?;
         if permit.task_id != node.task_id {
             return Err(ResearchError::TaskMismatch);
@@ -175,6 +187,8 @@ impl AgentRuntime {
         let query_scope = akzio_domain::ContextQueryScope::for_node(node);
         let candidates = candidates.into_iter().collect::<Vec<_>>();
         let manifest = if let Some(parent_task_id) = &node.parent_task_id {
+            // 有 parent 时只从父成功 Attempt 证明组装 child Manifest；没有 parent 则
+            // 从当前候选 EvidenceNeed 建立新的 Grant。两条路径都由 StoreExecutor 串行。
             if !node.dependencies.contains(parent_task_id) {
                 return Err(ResearchError::InvalidOutput(
                     "parent task is not a declared dependency".to_owned(),
@@ -251,6 +265,8 @@ impl AgentRuntime {
             LEARNING_OUTCOME_WORKER_RECIPE_ID => false,
             _ => return Err(ResearchError::InvalidOutput("legacy_workflow_retired".into())),
         };
+        // 这个分支是活动协议的硬选择：研究/Review Submit-only，Outcome Draft/Submit；
+        // 旧 Planner 或旧研究 Contract 不会通过 fallback 获得运行能力。
         // Choose the research or Outcome protocol explicitly.
         let prompt = if direct_structured {
             prompts::structured_request_prompt(
@@ -342,6 +358,8 @@ impl AgentRuntime {
         let provider_output_cap = prefetched_capabilities.declared_max_output_tokens;
         let mut prefetched_capabilities = Some(prefetched_capabilities);
         if matches!(&recovery.source, AgentRecoverySource::Recovered(_)) {
+            // 恢复先充值已验证 checkpoint；未知用量会在 restore 中直接 fail closed，
+            // 不会把中断的 Provider Future 当成尚未开始。
             budget.restore(&recovery)?;
         }
         self.observe_debug_budget(permit, budget, "AttemptBudgetReady")
@@ -357,6 +375,8 @@ impl AgentRuntime {
         let started = budget.started;
         let wall_time = budget.wall_time;
         loop {
+            // 每轮都在 dispatch 前检查共享 wall clock、phase deadline、output reservation
+            // 和 cumulative budget；任何拒绝发生在 AgentTurnStarted 之前都不会留下假调用。
             budget.check_wall()?;
             if installed.contract.version >= akzio_domain::budget::OUTPUT_BUDGET_RESEARCH_CONTRACT_VERSION
                 && started.elapsed() >= model_phase_deadline(wall_time, phase, installed.contract.version) {
@@ -429,6 +449,8 @@ impl AgentRuntime {
                 request.prompt.push_str(prompts::CRITIC_VERDICT_GUIDANCE);
             }
             let frozen_result = if direct_structured && is_deliberation_repair(&pending_tool_outputs) {
+                // deliberation 修复只能复用上一份 immutable result；模型获得反馈和旧
+                // deliberation，不得借修复机会重写 Claim/Forecast/Review 正式结果。
                 let original = self.last_structured_submission(&trace_refs).await?;
                 request.context = vec![json!({"type":"deliberation_repair","previous_deliberation":original["deliberation"],"validation_feedback":pending_tool_outputs,"frozen_result_hash":akzio_domain::ContentHash::of_bytes(&serde_json::to_vec(&original["result"])?)})];
                 request.continuation = None;
@@ -529,6 +551,8 @@ impl AgentRuntime {
                 budget.reserve_output_tokens(reserved_output_tokens)?;
                 let event_permit = permit.clone();
                 let event_now = logical_now(event_time_origin, started.elapsed());
+                // Started 事件先入 Store，再 poll provider Future。这样取消/崩溃即使没有
+                // response 也能由 recovery 识别为已消耗且 usage unknown 的调用。
                 self.store_executor
                     .execute(move |store| {
                         store.append_task_event(
@@ -587,6 +611,8 @@ impl AgentRuntime {
                         maximum_secs: node.budget.max_wall_time_secs,
                     })
                 } else {
+                    // timeout 只停止当前等待者；Store 的 Started/失败 trace 和预算记录
+                    // 仍在同一个 Attempt 语义内，不能把取消当作 Provider 未发生。
                     tokio::time::timeout(
                         remaining,
                         model.turn_with_events(request.clone(), on_event),
@@ -605,6 +631,8 @@ impl AgentRuntime {
                         break (turn, runtime_snapshot, request_hash);
                     }
                     Err(error) => {
+                        // Provider 错误先写失败 Turn、再计 usage、再按 RetryPolicy 和
+                        // 剩余时间决定重试；输入/未知成本错误优先于 transport retry。
                         let retryable = retryable_model_error(&error, &installed.contract.retry);
                         let draft_deadline = phase == AgentTurnPhase::Draft
                             && matches!(error, ResearchError::WallTimeExceeded { .. });
@@ -682,6 +710,8 @@ impl AgentRuntime {
                 projection.restore_turn(&mut turn);
             }
             if started.elapsed() > wall_time {
+                // Future 返回得太晚时仍可能带有完整 telemetry；先把已知 usage 记入失败
+                // trace，禁止把 late memo 当成已完成 Draft，更不能进入 Submit。
                 // The provider completed, but the phase did not. Account known
                 // usage and keep this as a failed turn so recovery cannot treat
                 // the late memo as accepted Draft output.
@@ -778,6 +808,8 @@ impl AgentRuntime {
                 return Err(ResearchError::AmbiguousSubmission);
             }
             if phase == AgentTurnPhase::Draft && !turn.tool_calls.is_empty() {
+                // Outcome Draft 的每次读取都走持久化 ToolCall→ToolResult；ToolResult
+                // 作为 continuation 输入继续占用同一预算，研究 Submit-only 不会进入此分支。
                 budget.record_tool_calls(
                     u32::try_from(turn.tool_calls.len())
                         .map_err(|_| ResearchError::ToolBudgetExceeded)?,
@@ -840,6 +872,8 @@ impl AgentRuntime {
                 .ok_or(ResearchError::MissingFinalOutput)?;
 
             if direct_structured && submission_attempts > 0 {
+                // 第二次结构化提交先登记 immutable before/after revision；只有字段级
+                // rejection 才允许有界修复，已通过字段和精确 ArtifactRef 不能被顺手润色。
                 self.record_structured_revision(permit, &trace_refs, model_turn, &validation_feedback).await?;
             }
 
@@ -858,6 +892,9 @@ impl AgentRuntime {
             let validated = self
                 .store_executor
                 .execute(move |_| {
+                    // Schema、reference kind、Rust-owned calendar、Review identity、
+                    // deliberation 和 source closure 在同一 Store snapshot 中校验，防止
+                    // 校验看到的 Artifact 与最终写入的血缘分叉。
                     if let Some(schema) = &bound_wire_schema {
                         validate_schema_value(&validation_arguments, schema, "$")
                             .map_err(ResearchError::InvalidOutput)?;
@@ -955,6 +992,8 @@ impl AgentRuntime {
                             started.elapsed(),
                         ) =>
                 {
+                    // 修复只把结构化拒绝作为下一轮 ToolOutput 反馈；不会新建无限 Agent
+                    // 或重置 submission_attempts/预算，时间不足时直接保留原始拒绝。
                     submission_attempts = submission_attempts.saturating_add(1);
                     pending_tool_outputs.push(submission_rejection_feedback(submission.call_id, message));
                     model_turn = model_turn.saturating_add(1);
@@ -981,6 +1020,8 @@ impl AgentRuntime {
             let output_artifact = self
                 .store_executor
                 .execute(move |store| {
+                    // DeliberationNote 和正式 output 在同一个 StoreExecutor 队列中 staged，
+                    // 但 Artifact 的 kind/producer/origin 仍区分“模型研究产物”和“解释元数据”。
                     if let Some(note) = deliberation_note {
                         store.write_task_artifact(
                             &output_permit,
@@ -1016,6 +1057,8 @@ impl AgentRuntime {
 
     async fn record_pipeline_latency(&self, permit: &TaskWritePermit, phase: &str, stage: &str,
         elapsed: StdDuration, succeeded: bool, revision: u16) -> ResearchResult<()> {
+        // PipelineLatency 仅是 Debug observation；即使 succeeded=true，也不改变 Task
+        // 状态、Decision、Paper 或 Outcome 的业务接受度。
         let permit = permit.clone();
         let phase = phase.to_owned();
         let stage = stage.to_owned();
@@ -1046,6 +1089,8 @@ impl AgentRuntime {
         evidence_refs: Vec<ArtifactRef>,
         now: DateTime<Utc>,
     ) -> ResearchResult<()> {
+        // SubmitRejected 对 canonical Run 也必须写入 StageAcceptance，因为 recovery
+        // 需要把同一个 call_id 的拒绝反馈送回模型；它不是 TaskFailed 的替代品。
         let permit = permit.clone();
         let stage = stage.to_owned();
         self.store_executor

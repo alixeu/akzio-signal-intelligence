@@ -4,6 +4,14 @@
 //! remains in `akzio-runtime`; Paper commitment and broker I/O remain in
 //! `akzio-execution`.
 
+// 文件导读：scheduler 只负责 broker-authoritative session、lease fencing、proposal 选择和
+// 每日 Paper slot reservation。它不执行研究模型、不计算 Decision、不提交订单；后续 worker
+// 才按 graph 推进 Evidence → research → Decision → Execution → Paper/Outcome。lease/slot
+// 成功是调度事实，不能越级说明 Run、submission、fill 或 Outcome 完成。
+// Rust 机制：`BrokerSessionClock`/`PaperWorkflowSource` 是 Send + Sync trait，方法返回带
+// 生命周期的 boxed Future；`Arc<Mutex<Option<DaemonLease>>>` 缓存租约且处理 poisoning；
+// `StoreExecutor` 串行化持久化，`?Sized` 让引用型 trait object 可注入。
+
 use std::{
     future::Future,
     pin::Pin,
@@ -80,6 +88,7 @@ pub struct AlpacaPaperSessionClock {
 
 impl AlpacaPaperSessionClock {
     pub fn new(paper: AlpacaPaper) -> Self {
+        // 只保存已经构造且已通过 Paper endpoint 检查的 client；构造 clock 本身不发请求。
         Self { paper }
     }
 }
@@ -88,6 +97,7 @@ impl BrokerSessionClock for AlpacaPaperSessionClock {
     fn open_session_key<'a>(
         &'a self,
     ) -> Pin<Box<dyn Future<Output = SchedulerResult<Option<String>>> + Send + 'a>> {
+        // Future 在 await 时读取 broker clock；Closed 返回 None，绝不使用本机日期创建 slot。
         Box::pin(async move {
             let clock = self
                 .paper
@@ -102,6 +112,7 @@ impl BrokerSessionClock for AlpacaPaperSessionClock {
     fn paper_account_id<'a>(
         &'a self,
     ) -> Pin<Box<dyn Future<Output = SchedulerResult<String>> + Send + 'a>> {
+        // 账户 ID 只用于 approval/runtime binding；缺 id 是 Clock 错误，不回退到配置字符串。
         Box::pin(async move {
             self.paper
                 .account()
@@ -137,6 +148,7 @@ pub struct StorePaperWorkflowSource {
 
 impl StorePaperWorkflowSource {
     pub fn new(store: Store) -> Self {
+        // source 与 StoreExecutor 指向同一 Store；bootstrap 默认为 None，避免凭空生成 proposal。
         Self {
             store_executor: StoreExecutor::new(store.clone()),
             store,
@@ -145,6 +157,7 @@ impl StorePaperWorkflowSource {
     }
 
     pub fn with_store_executor(mut self, store_executor: StoreExecutor) -> Self {
+        // builder 只替换 executor 句柄，保留 store/proposal 选择语义。
         self.store_executor = store_executor;
         self
     }
@@ -154,6 +167,8 @@ impl StorePaperWorkflowSource {
         workflow: WorkflowRuntime,
         topology_id: impl Into<String>,
     ) -> Self {
+        // bootstrap 仅供首次 scheduler session 使用，实际 reservation 仍由 WorkflowRuntime
+        // 和 lease 事务持久化，不在这里创建 Run。
         self.bootstrap = Some((workflow, topology_id.into()));
         self
     }
@@ -170,6 +185,8 @@ impl StorePaperWorkflowSource {
         &self,
         proposal: &WorkflowProposal,
     ) -> SchedulerResult<bool> {
+        // 扫描 proposal 的 RunScoped EvidenceNeed；跨 Run 输入会让后续 reservation fail closed，
+        // 因此在选择阶段跳过，而不是改写历史 Artifact。
         for task in proposal.tasks.values() {
             for reference in &task.evidence_needs {
                 let artifact = self.store.artifact(&reference.artifact_id)?;
@@ -193,6 +210,8 @@ impl StorePaperWorkflowSource {
     }
 
     fn proposal_sync(&self) -> SchedulerResult<WorkflowProposal> {
+        // 同步读取 active/candidate topology head 和最近 Paper proposal；优先 canonical durable
+        // proposal，找不到才使用受控 bootstrap，避免每 tick 重新编译或混入旧 Run 输入。
         let candidate_subject = PolicySubject::Topology(TopologyId(
             STRUCTURED_CRITIQUE_CANDIDATE_TOPOLOGY_ID.to_owned(),
         ));
@@ -251,6 +270,8 @@ impl PaperWorkflowSource for StorePaperWorkflowSource {
         &'a self,
         _session_key: &'a str,
     ) -> Pin<Box<dyn Future<Output = SchedulerResult<WorkflowProposal>> + Send + 'a>> {
+        // clone source 后把只读选择闭包放入 StoreExecutor；返回的 proposal 仍需 tick 再绑定
+        // 当前 session 的 snapshots/lease。
         Box::pin(async move {
             let source = self.clone();
             self.store_executor

@@ -1,3 +1,5 @@
+// 文件导读：研究质量记录只在隔离 Store 中按 Artifact 计数；reserve 发生在 provider I/O 前，
+// 因而进程中断也不会把已经消费的调用额度退回。
 use super::*;
 
 impl Store {

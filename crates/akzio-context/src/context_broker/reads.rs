@@ -1,3 +1,5 @@
+// 文件导读：实现受 Grant 限制的完整文档、字节范围、子串搜索、Claim evidence 和来源对比。
+// 工具响应有明确字节上限，过大内容必须由调用方显式分段读取，不能静默截断。
 const MAX_CONTEXT_RANGE_BYTES: usize = 32 * 1024;
 const MAX_CONTEXT_SEARCH_RESULTS: usize = 16;
 const MAX_CONTEXT_COMPARE_SOURCES: usize = 4;
@@ -5,6 +7,7 @@ const MAX_CONTEXT_COMPARE_SOURCES: usize = 4;
 // 完整文档响应超过工具上限时必须改用显式 range；这里不做静默截断，避免模型把截断
 // 内容误当作完整证据。
 fn validate_document_response_size(value: &Value) -> ContextResult<()> {
+    // 以 JSON 序列化后的字节数检查工具响应上限。
     if serde_json::to_vec(value)?.len() > MAX_CONTEXT_RANGE_BYTES {
         return Err(ContextError::DocumentRequiresRange);
     }
@@ -18,6 +21,7 @@ impl ContextBroker {
         &self, permit: &TaskWritePermit, contract: &AgentContract, grant: &ReadGrant,
         artifact_id: &ArtifactId, now: DateTime<Utc>,
     ) -> ContextResult<Value> {
+        // 在普通读取授权后，为与 CAS 字节完全一致的 JSON 提供顶层字段范围提示。
         // 先验证当前 grant，再读取并解析完整 JSON；range_metadata 只为能证明字节边界
         // 的顶层值提供建议，不会扩大读取范围或改写原始 blob。
         let artifact = self.read(permit, contract, grant, artifact_id, now)?;
@@ -33,6 +37,7 @@ impl ContextBroker {
         artifact_id: &ArtifactId,
         now: DateTime<Utc>,
     ) -> ContextResult<ContextReadResult> {
+        // 完整读取必须小于 32 KiB；超限返回 DocumentRequiresRange 而不是部分成功。
         // 这是完整文档的受控包装：授权成功后仍执行 32 KiB 检查，过大就返回明确错误，
         // 由调用方改用 read_range，而不是返回部分文档。
         let (artifact, value) = self.read_document(permit, contract, grant, artifact_id, now)?;
@@ -54,6 +59,7 @@ impl ContextBroker {
         end_byte: usize,
         now: DateTime<Utc>,
     ) -> ContextResult<ContextReadResult> {
+        // 校验半开字节范围、上限和 UTF-8 边界，返回原 blob 的精确切片。
         // grant 校验先于范围校验，随后要求半开区间、32 KiB 上限和完整 UTF-8 边界；返回
         // 的 text 是原 blob 的字节切片，不提供跨文档或语义层面的额外权限。
         let artifact = self.read(permit, contract, grant, artifact_id, now)?;
@@ -89,6 +95,7 @@ impl ContextBroker {
         max_results: usize,
         now: DateTime<Utc>,
     ) -> ContextResult<ContextReadResult> {
+        // 只在 manifest selections 内做大小写不敏感子串搜索，并受结果数上限约束。
         // 搜索只在当前 Manifest selections 上逐文档做大小写不敏感的子串匹配；它不是
         // 向量检索，也不会搜索 grant 之外的 Artifact。达到 max_results 后停止读取。
         let query = query.trim();
@@ -107,6 +114,7 @@ impl ContextBroker {
         let needle = query.to_lowercase();
         let mut artifacts = Vec::new();
         let mut matches = Vec::new();
+        // 按清单顺序读取文档；命中 max_results 后停止后续读取。
         for selection in manifest.selections {
             if matches.len() >= max_results {
                 break;
@@ -158,6 +166,7 @@ impl ContextBroker {
         claim_id: &ArtifactId,
         now: DateTime<Utc>,
     ) -> ContextResult<ContextReadResult> {
+        // 读取 Claim 并按 grounds 去重展开已授权证据，保持 kind 与引用闭包一致。
         // 先读取并校验 Claim，再按 grounds 去重读取每个已授权证据；Claim 的引用若不在
         // 当前 grant 或 kind 不一致，整个闭包失败，不把 Claim 单独伪装成完整依据。
         let claim_artifact = self.read(permit, contract, grant, claim_id, now)?;
@@ -204,6 +213,7 @@ impl ContextBroker {
         artifact_ids: &[ArtifactId],
         now: DateTime<Utc>,
     ) -> ContextResult<ContextReadResult> {
+        // 对 2..=4 个不同 Artifact 使用同一 compact projection 并列返回，不解释冲突。
         // 只接受 2～4 个不同的已授权 Artifact，并对每个来源使用同一 governed projection；
         // 返回并列资料，不在 Context 层替模型或 DecisionGate 解释冲突。
         if !(2..=MAX_CONTEXT_COMPARE_SOURCES).contains(&artifact_ids.len())
@@ -237,6 +247,7 @@ impl ContextBroker {
 // Lowercasing can change UTF-8 length (for example İ). Keep the mapping to
 // original byte boundaries so a case-insensitive match never corrupts offsets.
 fn search_snippet_range(text: &str, needle: &str) -> Option<(usize, usize, usize)> {
+    // 为每个折叠字符保存原始字符索引，处理 Unicode lower-case 扩展后仍能返回原文边界。
     // lowercasing 可能改变 UTF-8 字节长度，因此 offsets 为折叠文本的每个字节保存原始
     // 字符索引，保证命中位置和上下文切片仍落在原字符串边界内。
     let mut folded = String::new();
@@ -264,6 +275,7 @@ mod comparison_projection_tests {
     use super::*;
 
     #[test]
+    // 完整文档超限必须要求 read_range，不能静默返回截断值。
     fn oversized_full_document_is_rejected_not_silently_truncated() {
         let value = serde_json::json!({"text": "x".repeat(32768)});
         assert!(matches!(validate_document_response_size(&value), Err(ContextError::DocumentRequiresRange)));
@@ -272,6 +284,7 @@ mod comparison_projection_tests {
     }
 
     #[test]
+    // 来源比较使用有界 projection，不重复把 252 根日线全部放入返回值。
     fn comparison_uses_governed_projection_without_replaying_252_bars() {
         let value = serde_json::json!({"resource":"bars:SOXX:1d:2025-08-05:252", "source":"alpaca",
             "time_basis":{"decision_clock":{"decision_cutoff":"2026-09-09T07:00:00Z"}},
@@ -288,6 +301,7 @@ mod comparison_projection_tests {
     }
 
     #[test]
+    // 期权 projection 保留精确时间/来源字段，同时限制合约样本和响应大小。
     fn option_chain_projection_is_bounded_and_retains_exact_time_and_source_fields() {
         let provider_shape = serde_json::json!({"value":{"snapshots":{
             "QQQ260925C00720000": {
@@ -342,6 +356,7 @@ mod comparison_projection_tests {
 }
 
 fn range_metadata(value: &Value, bytes: &[u8]) -> Value {
+    // 只有 re-encode 后字节完全相同才计算顶层 JSON 值范围，避免键序不同导致错误偏移。
     // 只有 serde_json 重新编码后与 CAS 字节逐字节一致，顶层字段偏移才可信；键顺序或
     // 编码不同就不给出 ranges，避免“同长度但错位置”的读取建议。
     // Offsets are safe only when the parsed/re-encoded JSON is byte-identical
@@ -372,6 +387,7 @@ fn range_metadata(value: &Value, bytes: &[u8]) -> Value {
 mod range_metadata_tests {
     use super::*;
     #[test]
+    // 对 canonical JSON 的顶层字段，建议范围切片必须能还原对应 Value。
     fn recommended_ranges_are_exact_json_values() {
         let v=serde_json::json!({"bars":[1,2,3],"label":"价格", "quant_features":{"return_ppm":12}});
         let bytes=serde_json::to_vec(&v).unwrap();
@@ -385,6 +401,7 @@ mod range_metadata_tests {
     }
 
     #[test]
+    // 原始键序与 serde_json 重编码不一致时，不得发出不可信范围提示。
     fn key_order_mismatch_never_emits_wrong_ranges() {
         let bytes = br#"{"z":{"value":1},"a":{"value":2}}"#;
         let value: Value = serde_json::from_slice(bytes).unwrap();

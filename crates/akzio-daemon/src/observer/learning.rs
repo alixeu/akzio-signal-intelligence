@@ -1,3 +1,9 @@
+// 文件导读：learning observer 只汇总已经持久化的 Outcome、Retrospective、Experience、
+// Evaluation 和 PolicyTransition，生成 30 天展示指标。它不推进评估、不激活 Policy、不
+// 晋升 Lesson；缺少风险真值、NAV 或样本时保留 None/Unavailable，不能用图表反推学习完成。
+// Rust 机制：BTreeMap/Set 关联 Artifact ID 并去重；闭包按时间窗聚合；泛型
+// `recent_typed_artifacts<T: DeserializeOwned>` 复用解码边界，`Option` 表示基线/统计不足。
+
 use super::*;
 
 impl Daemon {
@@ -6,6 +12,8 @@ impl Daemon {
         now: DateTime<Utc>,
         visible_transitions: &[ObserverPolicyTransition],
     ) -> Result<(ObserverLearningSummary, Vec<ObserverPolicyMetrics>)> {
+        // 先加载有限窗口 Artifact，再按 outcome/experience/subject 关联；所有指标都是
+        // persisted facts 的投影，缺失关联直接跳过而不创建补偿记录。
         let outcomes = self.recent_typed_artifacts::<Outcome>(ArtifactKind::Outcome, 100)?;
         let retrospectives =
             self.recent_typed_artifacts::<Retrospective>(ArtifactKind::Retrospective, 200)?;
@@ -242,6 +250,8 @@ impl Daemon {
     }
 
     fn observer_outcome_baseline_equity(&self, outcome: &Outcome) -> Result<i64> {
+        // 沿 OutcomeSchedule → ExecutionContext → AccountSnapshot 读取冻结 baseline；没有
+        // account snapshot 时返回 unavailable，不能用当前账户余额倒填历史。
         let schedule_artifact = self.store.artifact(&outcome.schedule.artifact_id)?;
         let schedule: OutcomeSchedule =
             serde_json::from_slice(&self.store.read_blob(&schedule_artifact.blob)?)?;
@@ -267,6 +277,8 @@ impl Daemon {
     where
         T: DeserializeOwned,
     {
+        // 泛型解码让每种 learning kind 经过同一 CAS read boundary；limit 保持 observer 查询
+        // 有界，反序列化失败直接传播而不是静默丢掉坏 Artifact。
         self.store
             .recent_artifacts_by_kind(kind, limit)?
             .into_iter()

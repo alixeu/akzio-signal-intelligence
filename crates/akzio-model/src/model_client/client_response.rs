@@ -1,5 +1,7 @@
 impl ModelClient {
     pub async fn respond(&self, request: ModelRequest) -> Result<ModelResponse> {
+        // async 调用只等待同一轮结果；provider、SSE 终态、fixture 解析产生的
+        // ModelError 都原样沿 Result 返回，不在这一层自动重试或吞错。
         // 普通调用复用带事件入口，但不向调用方暴露 reasoning 流事件。
         self.respond_with_events(request, |_| {}).await
     }
@@ -9,6 +11,8 @@ impl ModelClient {
         request: ModelRequest,
         on_event: impl FnMut(ModelStreamEvent),
     ) -> Result<ModelResponse> {
+        // FnMut 是同步回调：真实 client 在异步读取 SSE 时按 reasoning 事件调用它，
+        // 但回调本身不拥有终态，也不能让 EOF 绕过 Responses 终态校验。
         // 真实 provider 负责网络、SSE 和终态解析；各 fixture 分支只在本地把 raw
         // 值规范化为同一个 ModelResponse 形状，且都保留本次 request body。
         match self {
@@ -27,6 +31,8 @@ impl ModelClient {
             Self::FixtureByPurpose(outputs) => {
                 // purpose fixture 需要显式 fixture_key；Mutex 保护每个 purpose 的
                 // FIFO，pop_front 让同一 purpose 的多次调用按测试预设消耗。
+                // Arc 使 client 的 clone 仍指向同一张表；锁只覆盖取出一个 Value，随后
+                // 的 JSON/Responses 解析在解锁后进行，避免把解析时间占在共享锁内。
                 let key = request
                     .fixture_key
                     .as_deref()
@@ -51,6 +57,8 @@ impl ModelClient {
             Self::FixtureByPurposePhase(templates) => {
                 // 阶段 fixture 是不可变的 [Draft, Submit] 模板；tool_choice 只决定
                 // 读取哪一格，不会把 Draft 受理或 Submit 结果写入 durable Store。
+                // 这里没有 Mutex：Arc 共享的是只读 BTreeMap，调用每次 clone 当前模板，
+                // 因而重复调用不会耗尽阶段模板。
                 let purpose = request
                     .fixture_key
                     .as_deref()
@@ -72,6 +80,8 @@ impl ModelClient {
             Self::FixtureSequence(values) => {
                 // 序列 fixture 跨 purpose 共享一个受 Mutex 保护的 FIFO，耗尽时直接
                 // 返回 FixtureExhausted，不能循环复用旧响应。
+                // Arc 保证并发/克隆出来的 client 竞争同一个顺序；Mutex guard 在 pop_front
+                // 完成后释放，响应规范化和错误传播不持有队列锁。
                 let raw = values
                     .lock()
                     .expect("fixture response sequence poisoned")

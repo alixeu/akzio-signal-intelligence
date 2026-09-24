@@ -1,7 +1,15 @@
+// 文件导读：snapshot 把 StoreExecutor 内的 run/health/outcome/learning 只读快照与外部
+// Paper portfolio 查询合并成一次 ObserverSnapshot。生成快照会记录 observed_at/cursor，
+// 但不会锁住 workflow 或改变状态；ready/portfolio/outcome 的字段都必须按各自证据等级解释。
+// Rust 机制：闭包 move 进 StoreExecutor 后通过 `??` 分开处理 executor 与 Store 两层 Result；
+// `tokio::join!/timeout` 并行外部读取，`Option` 和 ObserverSection 保留 partial/unavailable。
+
 use super::*;
 
 impl Daemon {
     pub(crate) async fn observer_snapshot(&self) -> Result<ObserverSnapshot> {
+        // Store 内 projection 在同一 executor 操作中读取，再独立读取外部 portfolio；这样
+        // snapshot 明确记录 generated_at/cursor，而不会把慢 broker 请求持有 Store 锁。
         let generated_at = Utc::now();
         let operation = self.clone();
         let (recent_runs, current_run, run_summaries, health, ready, outcome, learning) = self
@@ -71,6 +79,8 @@ impl Daemon {
     }
 
     pub(crate) fn observer_run_detail(&self, run_id: &RunId) -> Result<ObserverRunDetail> {
+        // detail 按 bounded event/trajectory/artifact limit 组装一次 Run 的审计视图；所有
+        // Artifact payload 仍经过白名单类型解码。
         let workflow = self.store.workflow_snapshot(run_id)?;
         let events = self
             .store
@@ -101,6 +111,8 @@ impl Daemon {
     }
 
     fn observer_run_summary(&self, run_id: &RunId) -> Result<ObserverRunSummary> {
+        // summary 只取短轨迹和最大已存在 Outcome utility；缺 Outcome 返回 None，不把 NoOrder
+        // 或没有窗口写成零收益。
         let trajectory = self.store.recent_trajectory(run_id, 64)?;
         let telemetry = observer_run_telemetry(&trajectory);
         let result_utility_ppm = trajectory
@@ -139,6 +151,8 @@ impl Daemon {
         &self,
         range: ObserverPortfolioRange,
     ) -> ObserverSection<ObserverPortfolioHistory> {
+        // history 与 QQQ benchmark 并行查询；benchmark 缺失只保留 portfolio points，section
+        // 仍区分 provider history error 与 benchmark unavailable。
         let Some(paper) = self.paper.paper_observer.as_ref() else {
             return ObserverSection::unavailable("Alpaca Paper observer is not configured");
         };
@@ -183,6 +197,8 @@ impl Daemon {
         range: ObserverPortfolioRange,
         now: DateTime<Utc>,
     ) -> Result<Vec<crate::observer_analytics::ObserverBarPoint>> {
+        // 通过 governed Alpaca adapter 获取 benchmark bars，并在解析层验证 timestamp/close；
+        // 这是 observer benchmark，不参与 Decision/Outcome 的正式输入。
         let adapter = self
             .production_evidence
             .get(&EvidenceSource::Alpaca)

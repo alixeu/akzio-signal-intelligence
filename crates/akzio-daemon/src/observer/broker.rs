@@ -1,3 +1,10 @@
+// 文件导读：broker observer 读取 Paper account/positions/history/fills，并把 Store 中的
+// 订单、ExecutionPlan、Outcome 等 Artifact 转为只读展示对象。它按 run/订单 ID 过滤，
+// 不把 broker response 反写成 commitment/fill，也不替代 Reconcile 或 Outcome accounting。
+// Rust 机制：`impl Daemon` 方法借用 Store/observer；泛型 `typed_observer_payload<T>` 要求
+// DeserializeOwned + Serialize；`tokio::try_join!/timeout` 并行、有界地等待外部请求，
+// `Option`/ObserverSection 区分缺配置、超时和可用数据。
+
 use super::*;
 
 impl Daemon {
@@ -6,6 +13,8 @@ impl Daemon {
         trajectory: &[TrajectoryEntry],
         include: impl Fn(ArtifactKind) -> bool,
     ) -> Result<Vec<ObserverArtifactView>> {
+        // trajectory 只提供候选 ID；include predicate 和 seen 去重后才读取 CAS，保证 observer
+        // 不扫描任意文件/RawEvidence，也不重复暴露同一 Artifact。
         let mut seen = BTreeSet::new();
         let mut artifacts = Vec::new();
         for entry in trajectory {
@@ -28,6 +37,8 @@ impl Daemon {
         &self,
         artifact: &Artifact,
     ) -> Result<Option<ObserverArtifactView>> {
+        // 只有白名单业务 Artifact kind 才反序列化为 observer payload；未知 kind 保持 None，
+        // runtime_manifest/approval 另从对应绑定读取，避免把非公开原文泄露给 UI。
         let payload = match artifact.kind {
             ArtifactKind::WorkflowProposalDraft => {
                 self.typed_observer_payload::<WorkflowProposalDraft>(artifact)?
@@ -98,12 +109,15 @@ impl Daemon {
     where
         T: DeserializeOwned + Serialize,
     {
+        // 泛型 T 同时约束反序列化和重新序列化，保证 view 经过领域类型校验而不是直接透传 blob。
         Ok(serde_json::to_value(serde_json::from_slice::<T>(
             &self.store.read_blob(&artifact.blob)?,
         )?)?)
     }
 
     pub(super) fn observer_approval(&self, now: DateTime<Utc>) -> Result<ObserverApprovalStatus> {
+        // approval status 同时比较 expiry 与当前 daemon runtime identity；valid 只表示 binding
+        // 仍匹配，不表示 Gate 已通过或订单已提交。
         let Some(artifact) = self
             .store
             .latest_artifact_by_kind(ArtifactKind::PaperLaunchApproval)?
@@ -148,6 +162,8 @@ impl Daemon {
         observed_at: DateTime<Utc>,
         current_run: Option<&ObserverRunDetail>,
     ) -> ObserverSection<ObserverPortfolio> {
+        // 先并行获取 account/positions/clock，再按 bounded timeout 获取 history/benchmark/fills；
+        // 任一外部观察失败只影响相应 section，不写入 Store 或改变 Paper state。
         let Some(paper) = self.paper.paper_observer.as_ref() else {
             return ObserverSection::unavailable("Alpaca Paper observer is not configured");
         };
@@ -288,6 +304,8 @@ impl Daemon {
     }
 
     async fn observer_fill_activities(&self, broker_session: &str) -> Result<Value> {
+        // fill activities 通过 governed Alpaca evidence adapter 获取并留在只读 Value；这里只
+        // 过滤/展示回执，不能替代 Reconciliation 对账。
         let adapter = self
             .production_evidence
             .get(&EvidenceSource::Alpaca)
@@ -307,6 +325,8 @@ impl Daemon {
     }
 
     fn observer_normalized_resource(&self, run_id: &RunId, resource: &str) -> Option<Value> {
+        // 只在最近 NormalizedEvidence 中按 run_id/resource 找已持久化快照；找不到返回 None，
+        // 不向 broker 回补或从任意文件猜测 baseline。
         self.store
             .recent_artifacts_by_kind(ArtifactKind::NormalizedEvidence, 500)
             .ok()?
@@ -322,6 +342,7 @@ impl Daemon {
     }
 
     fn observer_position_sparklines(&self, run_id: &RunId) -> Result<BTreeMap<String, Vec<i64>>> {
+        // Sparkline 从该 Run 的 bars 归一化为相对 ppm；它是可视化序列，不是收益/Outcome 标签。
         let mut sparklines = BTreeMap::new();
         for artifact in self
             .store

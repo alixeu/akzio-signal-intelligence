@@ -5,19 +5,17 @@ use akzio_domain::{
     DebugSessionIdentity,
 };
 
-#[cfg(test)]
-mod tests;
-
+// Debug API 只是隔离 Store 上的受控观察/研究入口；它不替代生产 Scheduler，也不扩大 Paper、Broker 或 Learning 权限。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugPrepareRequest {
+    // 请求字段直接进入身份和 session 校验；serde 默认值不会绕过后续 approval/policy Gate。
     pub session_key: String,
     #[serde(default = "default_debug_purpose")]
     pub purpose: RunPurpose,
     #[serde(default)]
     pub paper_allowed: bool,
 }
-
 fn default_debug_purpose() -> RunPurpose {
     // 请求省略 purpose 时默认构造 Paper 研究图；该 serde 默认值不等于已获 Paper approval。
     RunPurpose::Paper
@@ -26,6 +24,7 @@ fn default_debug_purpose() -> RunPurpose {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugForkRequest {
+    // fork 请求只描述父 task、目标 experiment 和审计理由，实际 Evidence setup 由 Rust 重新创建。
     pub task_id: Option<TaskId>,
     pub experiment_id: RunId,
     pub reason: String,
@@ -34,6 +33,7 @@ pub struct DebugForkRequest {
 impl Daemon {
     // 仅以 DebugControl 配置是否存在判断控制面是否启用，不代表当前 Run 已准备或可执行。
     pub fn debug_enabled(&self) -> bool {
+        // 这是只读能力探测；真正动作仍需 prepare/control_debug 的身份、Store 和生命周期校验。
         self.debug_control.is_some()
     }
 

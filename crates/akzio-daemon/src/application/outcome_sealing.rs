@@ -1,3 +1,10 @@
+// 文件导读：OutcomeSealing 在 Paper terminal graph 完成后读取 Decision、Context、Verdict
+// 和必要的 Commitment/Reconciliation，提交冻结 OutcomeSchedule；PositionPlan 不创建
+// schedule，Shadow 进入独立评估。Committed 只代表后续 T+1/T+3/T+5 已排期，不能代表
+// Paper fill、sealed Outcome 或 learning eligibility。
+// Rust 机制：借用 Daemon 的门面按 `RunPurpose` 分支；`ExecutionVerdict` 枚举保证 NoOrder
+// 与 Accepted lineage 不混淆；`?` 让缺失 Artifact/校验错误在写 schedule 前 fail closed。
+
 use crate::*;
 
 /// Schedules and seals outcome lineage for terminal workflow tasks.

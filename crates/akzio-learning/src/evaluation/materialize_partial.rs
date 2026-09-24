@@ -4,12 +4,16 @@
 pub fn materialize_partial_outcome(
     input: &OutcomeMaterializationInput,
 ) -> EvaluationRuntimeResult<Outcome> {
+    // Partial 只取当前已经到期的 T+1 或 T+3 前缀；它是 RunScoped 诊断快照，不是
+    // sealed Outcome，也不会单独满足 T+5 learning 资格。
     input.validate_base()?;
 
     let forecasts = index_forecasts(&input.forecasts)?;
     let (execution, full_nav_path) = input.execution_and_nav()?;
     let mut observations = BTreeMap::new();
     for observation in &input.observations {
+        // completed_trading_sessions 以四资产共同 Session 计数；自然日或单资产新价格
+        // 都不能让一个 horizon 提前到期，重复 horizon 也必须显式失败。
         if !observation
             .horizon
             .is_due_after(observation.completed_trading_sessions)
@@ -49,6 +53,8 @@ pub fn materialize_partial_outcome(
     }
     windows.sort_by_key(|window| window.horizon);
 
+    // Store 的 partial 写入路径还会检查 T1=1 个窗口、T3=完整 T1/T3 前缀以及 RunScoped
+    // 生命周期；这里的 validate() 只确认当前未封存快照自身可解码。
     let outcome = input.outcome_snapshot(&execution, windows, None);
     outcome.validate()?;
     Ok(outcome)

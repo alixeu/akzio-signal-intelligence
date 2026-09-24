@@ -1,3 +1,7 @@
+// AgentRuntime 把 Store、ContextBroker、Contract catalogue 和异步执行绑定在一起；
+// AgentRunBudget 则是一个 Attempt 生命周期内的可恢复账本。字段看似普通计数，
+// 但 output reservation、Provider usage unknown、cost policy hash 和 wall clock
+// 都必须跨重试保留，不能因 Future 取消或进程重启而重新获得额度。
 #[derive(Debug, Clone)]
 pub struct AgentRuntime {
     store: Store,
@@ -54,6 +58,8 @@ impl AgentRunBudget {
             "cost_micros":self.cost_complete.then_some(self.cost_micros),"budget_policy_hash":self.budget_policy_hash})
     }
     pub fn new(policy: &TaskBudget, retry: &RetryPolicy) -> Self {
+        // max_model_calls 由有限 tool-call 上限和 retry 次数推导；unlimited 不被
+        // 偷换成 u16::MAX，真正的上限仍由 token、时间和 Provider 账本约束。
         Self {
             started: Instant::now(),
             wall_time: StdDuration::from_secs(u64::from(policy.max_wall_time_secs)),
@@ -80,6 +86,7 @@ impl AgentRunBudget {
     }
 
     fn attach_budget_policy(&mut self, policy: &ModelBudgetPolicy) -> ResearchResult<()> {
+        // 首次调用冻结价格/路由策略哈希；恢复或后续轮次不允许换价重算同一 Run。
         validate_budget_policy(policy)?;
         let hash = budget_policy_hash(policy)?;
         let first_policy = self.budget_policy_hash.is_none();
@@ -190,6 +197,8 @@ impl AgentRunBudget {
     /// Per-call output ceiling constrained by both the remaining whole-task
     /// token budget and the configured whole-task cost cap.
     fn output_tokens_for_call(&self, estimated_input: u32) -> ResearchResult<u32> {
+        // 先保留整个任务的 output headroom，再按输入保守成本推导单次 cap；这个
+        // cap 只是请求上限，不是 Provider 已使用的事实，真实 telemetry 仍需独立记账。
         let token_ceiling = self.remaining_output_tokens()?;
         let Some(policy) = &self.budget_policy else {
             return Ok(token_ceiling);
@@ -256,6 +265,8 @@ impl AgentRunBudget {
     }
 
     fn record_resolved_usage(&mut self, usage: ResolvedModelUsage) -> ResearchResult<()> {
+        // 先写入累计 input/output/reasoning/cost，再返回超限错误。错误之后的恢复
+        // 必须看见已经发生的消耗，不能因为返回 Err 就把 Provider 调用退款。
         let input = u32::try_from(usage.input_tokens).unwrap_or(u32::MAX);
         let output = u32::try_from(usage.output_tokens).unwrap_or(u32::MAX);
         let input_total = self.input_tokens.saturating_add(input);
@@ -326,6 +337,8 @@ impl AgentRunBudget {
     }
 
     fn record_failed_turn(&mut self, estimated_input: u32) -> ResearchResult<()> {
+        // 没有闭合 usage 的失败调用会把 output 标为 unknown；有硬成本上限时还要
+        // 立即阻断，因为无法证明下一次重试仍在预算内。
         self.output_usage_unknown = true;
         self.record_input(estimated_input)?;
         if self
@@ -358,6 +371,8 @@ impl AgentRunBudget {
     }
 
     fn restore(&mut self, checkpoint: &AgentRecoveryCheckpoint) -> ResearchResult<()> {
+        // checkpoint 先复现持久化失败，再逐项核对调用/工具/token/cost 上限。只有
+        // 没有任何 Provider 调用的真正 fresh retry 才能从零账本开始。
         if let Some(failure) = &checkpoint.usage.failure {
             return Err(failure.error());
         }

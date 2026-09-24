@@ -1,8 +1,12 @@
 import Foundation
 
+// Debug payloads are immutable, Sendable projections. They expose Core-owned actions and
+// reasons without recreating Rust workflow eligibility inside the Swift client.
+
 // The Core owns every eligibility flag. Unknown business payloads stay inspectable
 // without making the Swift layer another workflow or contract implementation.
 struct DebugSessionPayload: Decodable, Sendable {
+    // JSONValue 保留未知 identity 字段；runID 只是可选投影，缺失时返回空串而不伪造 ID。
     let identity: JSONValue
     let revision: UInt64
     let status: String
@@ -12,6 +16,7 @@ struct DebugSessionPayload: Decodable, Sendable {
 }
 
 struct DebugNodePayload: Decodable, Identifiable, Sendable {
+    // node/task 字段由 Core 解码；业务状态缺失时仅显示 unknown，不在 UI 推导 eligible/retry。
     let task: JSONValue
     let role: String
     let horizon: String?
@@ -53,6 +58,7 @@ struct DebugRunList: Decodable, Sendable {
 
 extension ObserverClient {
     func debugRuns() async throws -> DebugRunList {
+        // async throws 把网络、认证、HTTP 和 Codable 失败原样交给 Store，View 不吞掉权限错误。
         try await debugRequest(path: "v1/debug/runs")
     }
 
@@ -61,12 +67,14 @@ extension ObserverClient {
     }
 
     func debugControl(run: String, action: String, revision: UInt64, task: String?) async throws -> DebugSessionPayload {
+        // control 请求携带 Core 返回的 expected revision；CAS 冲突必须让调用方刷新，而不是猜新 revision。
         var body: [String: Any] = ["action": action, "expected_revision": revision]
         if let task { body["task_id"] = task }
         return try await debugRequest(path: "v1/debug/runs/\(run)/control", body: body)
     }
 
     func debugPrepare(session: String, purpose: String) async throws -> DebugSessionPayload {
+        // Swift 只请求 paper_allowed=false 的隔离 Debug 会话；真正的 purpose/隔离校验仍在 Core。
         try await debugRequest(path: "v1/debug/runs", body: ["session_key": session, "purpose": purpose, "paper_allowed": false])
     }
 
@@ -77,6 +85,7 @@ extension ObserverClient {
     }
 
     private func debugRequest<T: Decodable>(path: String, body: [String: Any]? = nil) async throws -> T {
+        // 泛型 T 只要求 Decodable；同一认证请求路径可返回不同的只读 payload，但不授予额外业务权限。
         var request = URLRequest(url: endpoint.appending(path: path))
         request.setValue(token, forHTTPHeaderField: "x-akzio-token")
         request.timeoutInterval = ObserverTransportPolicy.standardRequestTimeout

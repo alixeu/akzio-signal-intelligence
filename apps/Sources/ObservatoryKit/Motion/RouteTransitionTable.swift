@@ -5,6 +5,7 @@ import SwiftUI
 // One entry per unordered page pair. Forward and reverse read the same row, which
 // is what guarantees "every forward transition has a reverse".
 public struct RouteTransitionDescriptor: Sendable {
+    // descriptor 是两条 route 之间的静态编排说明，实际动画由 MotionPolicy 和 coordinator 解析。
     public enum Style: Sendable {
         /// Natural shared elements exist: hand geometry over between pages.
         case sharedElement
@@ -29,6 +30,7 @@ public struct RouteTransitionDescriptor: Sendable {
         forwardNote: String,
         reverseNote: String
     ) {
+        // 初始化只保存共享元素、弹簧响应和诊断文字，不在 descriptor 内启动动画。
         self.style = style
         self.anchors = anchors
         self.response = response
@@ -37,6 +39,7 @@ public struct RouteTransitionDescriptor: Sendable {
     }
 
     public var animation: Animation {
+        // 基础动画保留 descriptor 的 response，最终是否降级由 TransitionCoordinator 决定。
         .spring(response: response, dampingFraction: 0.95)
     }
 }
@@ -44,10 +47,12 @@ public struct RouteTransitionDescriptor: Sendable {
 public enum RouteTransitionTable {
     /// Unordered pair key so both directions resolve to the same row.
     private static func key(_ a: AppRoute, _ b: AppRoute) -> String {
+        // 排序后的 key 让正向和反向 route 共享同一条 descriptor。
         [a.rawValue, b.rawValue].sorted().joined(separator: "↔")
     }
 
     public static func descriptor(from: AppRoute, to: AppRoute) -> RouteTransitionDescriptor {
+        // 未登记的页面组合安全回退到 crossfade，不猜测共享元素关系。
         table[key(from, to)] ?? crossfade
     }
 
@@ -60,6 +65,7 @@ public enum RouteTransitionTable {
     )
 
     static let table: [String: RouteTransitionDescriptor] = [
+        // 表内每个闭包式初始化项只描述一组 route 的共享锚点和前后方向说明。
         key(.overview, .workflow): RouteTransitionDescriptor(
             anchors: [.signalUniverse, .currentNode, .workflowProgress],
             forwardNote: "Outer orbits dim, the orbital layout unfolds into the full DAG, paths extend, and Stage Inspector enters from the right.",
@@ -120,6 +126,7 @@ public enum RouteTransitionTable {
     ]
 
     static let archiveHandoff = RouteTransitionDescriptor(
+        // Archive 到任意页面都使用不带共享锚点的统一交接描述。
         style: .crossfade,
         anchors: [],
         response: 0.64,
@@ -129,6 +136,7 @@ public enum RouteTransitionTable {
 
     /// Settings is a layer, not a route: it materializes in place.
     public static let settingsLayer = RouteTransitionDescriptor(
+        // Settings 是覆盖层而不是 route，因此只需要原地 materialize/dematerialize 描述。
         style: .crossfade,
         anchors: [],
         response: 0.52,

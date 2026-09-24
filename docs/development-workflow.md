@@ -63,7 +63,7 @@ fixture 退出后不能假设 daemon 仍在。缺少适用服务时报告独立 
 `daemon.manual_paper=true` 仅配置手动 Paper 运行能力，初始化与自动 Paper 相同的 Broker、runtime identity 和启动校验；`auto_paper=false` 时不会自动创建新 T0。内置 App 模板默认采用这组配置。隔离 Debug Core 拒绝日常启动接口，不能通过切换界面解除 Store 隔离或 Broker 限制。已有日常配置需要显式迁移后生效。
 
 
-SwiftUI 或 App/Core 接口修改还需运行与改动相关的 Swift 检查。当前可用的检查入口为 `swift run --package-path apps DebugContractChecks`；完整 Bundle 构建不能替代实际 UI 验收。
+SwiftUI 或 App/Core 接口修改还需运行与改动相关的 Swift 检查；完整 Bundle 构建不能替代实际 UI 验收。
 
 macOS 分发版本统一通过 `scripts/update_app_and_submit_debug.sh` 编译、打包与签名。Bundle 必须包含 `Contents/MacOS/akzio-core`。脚本始终保留构建产物，并拒绝覆盖已有 Bundle；使用工作区内新的 Bundle 目标，例如：
 
@@ -74,17 +74,6 @@ AKZIO_APP_BUNDLE="$PWD/apps/dist/akzio-review-$(date -u +%Y%m%dT%H%M%SZ).app" ba
 已有目标不可覆盖；清理构建目录、删除旧 Bundle 仍须明确授权。源码入口见 [打包脚本](../scripts/update_app_and_submit_debug.sh) 和 [构建脚本](../apps/Scripts/build_app.sh)。
 
 `apps/Scripts/create_dmg.sh` 接受同一个 `AKZIO_APP_BUNDLE`，可用 `AKZIO_DMG_PATH` 指定新的 DMG 路径；已有 DMG 不会被覆盖。
-
-脚本离线回归入口：
-
-```bash
-python3 scripts/tests/check_markdown_scope.py
-python3 scripts/tests/check_position_plan_isolation.py
-python3 scripts/tests/check_position_plan_redirect.py
-python3 scripts/tests/check_shell_scripts.py
-swift run --package-path apps DebugContractChecks
-python3 scripts/tests/check_observer_redirect.py "$(swift build --package-path apps --show-bin-path)/DebugContractChecks"
-```
 
 真实 PositionPlan 的现行入口是 `python3 scripts/position_plan_run.py`：默认读取 `~/.akzio/config.toml`，也可追加配置路径覆盖。脚本复制配置并创建新的 `.akzio/` 隔离 Store，不让 Debug Core 打开 `~/.akzio/store`；它只从原配置的 canonical SQL Store 复制 active DecisionPolicy 的精确 CAS Artifact。canonical Store 数据库尚不存在时由 Rust Store 初始化完整 schema；已有数据库始终只读打开。数据库无法读取、版本不兼容或完整性失败时直接阻断。DecisionPolicy 的风险限制、dataset 和候选 policy 全部保存为 SQL CAS Artifact；旧文件配置与 JSON 文件输入命令已移除。operator 使用 `calibration activate --store <canonical-store> --policy <artifact-id>` 选择已存候选版本，启动流程不会自动激活。随后 Rust calibration preflight 分别报告 research_capable 和 decision_capable：没有 active head 时默认在 LLM 前停止；显式 `--research-only` 才进入已标记 incomplete 的研究，并在终稿审查结束后停止，Decision 不运行；即使 Policy 已就绪，`--research-only` 也保持此研究边界，审查拒绝与缺 Policy 分别报告；已安装 policy 的 Artifact ID、input hash、模型/版本和 Synthesizer Contract 校验失败时，在 daemon/模型探测前停止并输出诊断 ZIP。运行使用受控 `debug prepare/resume`，Session Identity 固定同一 policy Artifact，调用真实模型但禁止 Broker 写入。结束时自动生成 `.akzio/position-plan-*.zip` 并输出 `ZIP=<绝对路径>`，包含导出 bundle 和脱敏后的运行日志、状态 JSON，不包含配置文件、Store 或认证 Token。`EXPORT_STATUS` 表示导出完整性：`complete`、`partial` 或尚无 bundle 的 `unavailable`；异常中止时 ZIP 可能只有诊断信息。退出码 0 表示运行完成且导出完整，1 表示运行失败、预检阻断或显式 research-only incomplete，2 表示运行完成但导出不完整；具体状态以 FINAL_STATUS 和 summary.json 为准。旧 `debug_goal_run.zsh` 和 `paper_canary_run.zsh` 已移除，不再使用其临时验收流程。
 

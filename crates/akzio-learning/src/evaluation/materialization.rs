@@ -5,6 +5,8 @@ impl EvaluationRuntime {
         input: EvaluationInput,
         retrospective_draft: Option<&RetrospectiveDraft>,
     ) -> EvaluationRuntimeResult<EvaluationResult> {
+        // 入口先锁定 Paper purpose，再由 Rust 从原始观察密封 Outcome；已存在同一
+        // outcome_id 的 Artifact 会复用，避免重试产生第二份数值事实。
         self.require_paper(&input.permit.run_id)?;
         let outcome = materialize_outcome(&input.materialization)?;
         let now = Utc::now();
@@ -61,6 +63,8 @@ impl EvaluationRuntime {
         retrospective_draft: Option<&RetrospectiveDraft>,
         target_state: Option<PolicyState>,
     ) -> EvaluationRuntimeResult<EvaluationResult> {
+        // 这里重新从 CAS 读取 OutcomeSchedule、Outcome 和 retrospective draft，并逐项
+        // 校验 Run、T+5、subject 与候选 Policy 绑定；传入一个“看起来完成”的引用不足以越过这些 Gate。
         if input.outcome.kind != ArtifactKind::Outcome
             || outcome_artifact.kind != ArtifactKind::Outcome
             || outcome_artifact
@@ -110,6 +114,8 @@ impl EvaluationRuntime {
             .store
             .policy_evaluation_for_outcome(&input.subject, &input.outcome)?
         {
+            // 相同 subject/outcome 的重复请求走幂等读取路径；若要求 CandidatePolicy，
+            // 还必须找到与原 Evaluation 完全绑定的已记录 Artifact，否则报错而不补造。
             let evaluation: Evaluation =
                 serde_json::from_slice(&self.store.read_blob(&existing.blob)?)?;
             let mut candidate_policy = None;
@@ -195,6 +201,8 @@ impl EvaluationRuntime {
         let quality_metrics_measured = self.policy.risk_recall_is_measured(&outcome)
             && self.policy.evidence_completeness_is_measured(&outcome)
             && research_sufficient;
+        // learning_eligible 同时需要风险真值、证据完整度和研究覆盖；缺一项只会让
+        // Experience 记录为不可学习，Outcome/Experience 本身仍可作为审计事实保留。
         let producer_contract_hashes = context
             .claims
             .iter()
@@ -476,6 +484,11 @@ impl EvaluationRuntime {
                 },
             )?
             .policy_head;
+        // Store 在同一 SQLite Immediate 事务中校验 lease/permit、写入 Outcome、T5
+        // retrospective、Experience、Evaluation、可选 CandidatePolicy、Lesson evidence
+        // 和 policy cursor/transition；事务失败时不把内存里已构造的对象当成已提交。
+        // 随后的 LessonProposal 写入是逐条的后续 Store 操作：若其中一条失败，前一事务
+        // 已提交的 canonical Evaluation/Policy 不回滚，已成功写入的 Lesson 也保留并可审计。
         self.materialize_retrospective_lessons(
             &retrospective_for_lessons,
             &retrospective_payload,

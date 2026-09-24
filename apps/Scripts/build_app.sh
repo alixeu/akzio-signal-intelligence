@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# 文件职责：在 SwiftPM 与 Cargo 都成功后组装新的 macOS .app bundle。
+# 它拒绝覆盖已有 bundle，复制 Rust CLI 作为 Core，并生成版本化 Info.plist；不启动业务。
 # Assemble a double-clickable .app from the SwiftPM build product.
 # No Xcode required: pure `swift build` + bundle layout.
 set -euo pipefail

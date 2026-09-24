@@ -1,3 +1,5 @@
+// 文件导读：定义 EvidenceNeed、模型提案的草稿/定稿格式，以及运行时消费的不可变
+// WorkflowGraph；同时集中生成 Paper Session 的证据词汇和采集策略身份。
 //! Rust proposal and compiled workflow vocabulary, including archived proposal wire types.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -38,6 +40,7 @@ impl EvidenceNeed {
     /// lowered form of an intent, so a need built directly by Rust or proposed
     /// by a model may not widen the source vocabulary, the resource length, or
     /// the freshness window the evidence runtime will accept.
+    // 校验 schema、来源/资源文本、最大新鲜度和固定 source-family 白名单。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != SCHEMA_VERSION
             || self.source_family.trim().is_empty()
@@ -81,6 +84,7 @@ pub struct WorkflowProposalDraft {
 }
 
 impl WorkflowProposalDraft {
+    // 校验草稿身份、任务 recipe/优先级、证据去重、研究意图预算和依赖无环性。
     pub fn validate(
         &self,
         recipes: &BTreeMap<TaskRecipeId, TaskRecipe>,
@@ -111,6 +115,7 @@ impl WorkflowProposalDraft {
                     field: "workflow_proposal_draft.priority",
                 });
             }
+            // BTreeSet 去重保证同一任务不会重复请求同一 EvidenceNeed。
             let unique_needs = task.evidence_needs.iter().collect::<BTreeSet<_>>();
             if unique_needs.len() != task.evidence_needs.len() {
                 return Err(DomainError::EmptyField {
@@ -128,6 +133,7 @@ impl WorkflowProposalDraft {
                     ));
                 }
             }
+            // 按 need 去重，并按 ResearchShard 计数限制单任务补采范围。
             let mut unique_intents = BTreeSet::new();
             let mut shard_counts = BTreeMap::<ResearchShard, usize>::new();
             for intent in &task.research_intents {
@@ -188,6 +194,7 @@ pub struct WorkflowProposal {
 }
 
 impl WorkflowProposal {
+    // 校验定稿身份、recipe/优先级、EvidenceNeed Artifact 引用唯一性和依赖无环性。
     pub fn validate(
         &self,
         recipes: &BTreeMap<TaskRecipeId, TaskRecipe>,
@@ -218,6 +225,7 @@ impl WorkflowProposal {
                     field: "workflow_proposal.priority",
                 });
             }
+            // 只比较 ArtifactId 去重，并额外确认每条引用的 kind 正确。
             let evidence_need_ids = task
                 .evidence_needs
                 .iter()
@@ -254,6 +262,7 @@ fn validate_proposal_acyclic<T>(
     tasks: &BTreeMap<String, T>,
     dependencies: fn(&T) -> &[String],
 ) -> Result<(), DomainError> {
+    // 使用三色 DFS：1 表示当前递归路径，2 表示已完成；回到 1 即发现环。
     fn visit<T>(
         alias: &str,
         tasks: &BTreeMap<String, T>,
@@ -266,6 +275,7 @@ fn validate_proposal_acyclic<T>(
             _ => {}
         }
         states.insert(alias.to_owned(), 1);
+        // 递归先走依赖，再把当前节点标为完成，保证共享依赖只验证一次。
         for dependency in dependencies(&tasks[alias]) {
             visit(dependency, tasks, dependencies, states)?;
         }
@@ -312,6 +322,7 @@ pub struct WorkflowGraph {
 }
 
 impl WorkflowGraph {
+    // 校验 definition/spec、预算角色、节点身份、依赖存在性和 TaskId 图无环。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self
             .definition_version
@@ -357,6 +368,7 @@ impl WorkflowGraph {
                 field: "workflow_graph.nodes",
             });
         }
+        // BTreeMap 让 TaskId 到节点的查找和后续 DFS 都是确定性的。
         let nodes = self
             .nodes
             .iter()
@@ -391,6 +403,7 @@ impl WorkflowGraph {
             }
         }
 
+        // 节点图使用同样的三色 DFS，区分重复访问和循环依赖。
         fn visit(
             node_id: &TaskId,
             nodes: &BTreeMap<TaskId, &WorkflowNode>,
@@ -436,6 +449,8 @@ const PAPER_BROKER_NEED_MAX_AGE_SECS: u64 = 300;
 /// needs and dispatch re-derives the set to validate a task's granted inputs.
 /// Both must agree, so the vocabulary lives here.
 pub fn paper_session_evidence_needs(session_key: &str) -> Vec<EvidenceNeed> {
+    // 以 session_key 为截止日生成 Broker、日线、新闻、宏观和 instrument evidence 需求。
+    // 日期无法解析时保留原 key，避免在领域层猜测一个替代交易日。
     let lookback = |days: i64| {
         chrono::NaiveDate::parse_from_str(session_key, "%Y-%m-%d")
             .ok()
@@ -457,6 +472,7 @@ pub fn paper_session_evidence_needs(session_key: &str) -> Vec<EvidenceNeed> {
         "paper.quotes".to_owned(),
         "paper.clock".to_owned(),
     ];
+    // 迭代固定四资产，将同一日期窗口展开为资源字符串。
     resources.extend(
         crate::Asset::EXECUTABLE
             .into_iter()
@@ -490,6 +506,7 @@ pub fn paper_session_evidence_needs(session_key: &str) -> Vec<EvidenceNeed> {
 }
 
 fn paper_need_source_family(resource: &str) -> &'static str {
+    // 根据资源前缀选择 Alpaca、news_web 或 FRED；未知非 Alpaca 前缀落到 fred。
     if resource.starts_with("bars:") || resource.starts_with("paper.") {
         "alpaca"
     } else if resource.starts_with("news:") {
@@ -520,6 +537,7 @@ pub enum EvidenceAcquisitionMode {
 }
 
 impl EvidenceAcquisitionMode {
+    // 返回持久化策略使用的稳定名称。
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ModelReviewed => "model_reviewed",
@@ -528,6 +546,7 @@ impl EvidenceAcquisitionMode {
         }
     }
 
+    // 只有 VerifiedSource 要求 Rust 对 provider 引用执行独立来源抓取。
     pub const fn requires_independent_fetch(self) -> bool {
         matches!(self, Self::VerifiedSource)
     }
@@ -546,6 +565,8 @@ pub fn evidence_acquisition_mode(
     _purpose: RunPurpose,
     need: &EvidenceNeed,
 ) -> EvidenceAcquisitionMode {
+    // 直接 API family 一律 VerifiedSource，news_web 的研究 issuer 资源也独立验证；
+    // 其余 provider-mediated 新闻保持 ModelReviewed，不受 purpose 文本影响。
     if need.source_family != "news_web" {
         return EvidenceAcquisitionMode::VerifiedSource;
     }
@@ -567,6 +588,7 @@ pub fn evidence_acquisition_mode(
 /// mapping it produces, so any change to `evidence_acquisition_mode` changes
 /// the recorded identity.
 pub fn evidence_acquisition_policy_hash() -> ContentHash {
+    // 枚举所有 purpose 和受治理 source family，哈希模式输出以固定策略身份。
     const PURPOSES: [RunPurpose; 6] = [
         RunPurpose::Debug,
         RunPurpose::PositionPlan,
@@ -615,6 +637,7 @@ pub enum EvidenceCriticality {
     Enhancement,
 }
 impl EvidenceNeed {
+    // 将 EvidenceNeed 按资源前缀分类为执行安全、方向研究或增强数据。
     pub fn criticality(&self) -> EvidenceCriticality {
         if self.source_family == "alpaca" && self.resource.starts_with("paper.") {
             EvidenceCriticality::ExecutionSafety

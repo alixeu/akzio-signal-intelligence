@@ -1,11 +1,14 @@
 import SwiftUI
 
+// 文件职责：集中定义深灰、金色、珊瑚色及语义色调，供 View 和 Modifier 通过名称复用。
+// 这些 token 是值语义的静态 Color/Gradient；调用方只消费结果，不在组件中重新发明颜色或状态含义。
 // MARK: - Palette
 //
 // Hard constraint from the spec: deep grey + warm gold + coral only.
 // No purple, no blue-violet, no neon. Low-saturation green is allowed *only*
 // for tiny success dots and positive-return micro copy.
 public enum AkzioColor {
+    // 基础表面、文字和高光 token 共同约束整套液态玻璃层级；成功绿只保留给极小状态提示。
     public static let appBackground = Color(hex: 0x1A1A1A)
     public static let deepBackground = Color(hex: 0x1D1D1D)
     public static let raisedSurface = Color(hex: 0x232323)
@@ -27,6 +30,7 @@ public enum AkzioColor {
     public static let successDot = Color(hex: 0x5E8F6B)
 
     // MARK: Sidebar reference surface
+    // 侧栏引用同一套 surface/text/hairline token；theme 变体由函数返回，不复制第二套调色板。
     //
     // The sidebar follows the same theme surface as the page; the glass material,
     // edge and depth provide separation without introducing a second solid palette.
@@ -61,6 +65,7 @@ public enum AkzioColor {
     }
 
     // MARK: Derived
+    // 输入 opacity，输出带统一主题色的 Color；透明度只改变显示强度，不改变语义类别。
     public static func gold(_ opacity: Double) -> Color { primaryGold.opacity(opacity) }
     public static func coral(_ opacity: Double) -> Color { actionCoral.opacity(opacity) }
 
@@ -97,6 +102,7 @@ public enum AkzioTone: Sendable, Hashable {
     case neutral
     case muted
 
+    // computed property 将值语义的 tone 映射成展示色；它不保存 View 状态，也不依赖 Environment。
     public var color: Color {
         switch self {
         case .gold: AkzioColor.primaryGold
@@ -106,6 +112,7 @@ public enum AkzioTone: Sendable, Hashable {
         }
     }
 
+    // glow 是同一 tone 的装饰性光晕；缺省/静默语义使用低强度或透明色，而不是另造状态。
     public var glow: Color {
         switch self {
         case .gold: AkzioColor.goldGlow
@@ -119,6 +126,7 @@ public enum AkzioTone: Sendable, Hashable {
 // MARK: - Hex support
 
 extension Color {
+    // 输入 0xRRGGBB 的无符号整数，输出固定 sRGB、alpha=1 的 Color；位移只拆分通道，不做运行时状态转换。
     public init(hex: UInt32) {
         self.init(
             .sRGB,

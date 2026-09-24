@@ -1,5 +1,13 @@
 //! Exhaustive runtime task dispatch.
 
+// 文件导读：任务 dispatch 是 workflow recipe 到应用门面的唯一选择点。它先让
+// `NodeExecutor` 接住 Store 已 claim 的 permit，再按 task class 进入 research/evidence/
+// decision/execution/paper/reconcile/evaluate；错误由 runtime 转成 Deferred/Retry/Failed，
+// 不把 handler 的 `Ok` 解释成业务完成。
+// Rust 机制：`NodeExecutor` 返回带生命周期的 `Pin<Box<dyn Future + Send>>`，使 trait
+// 可以在 Tokio worker 中执行；迭代器闭包收集祖先输出，`BTreeMap/BTreeSet` 保证去重和稳定
+// 顺序，借用 `&ClaimedAttempt` 防止 handler 越权取得 permit 所有权。
+
 use super::*;
 
 impl Daemon {

@@ -1,12 +1,14 @@
 import SwiftUI
 
 public enum ArchiveQuery {
+    // 这些查询函数只在内存中的展示快照上工作，不代表对真实历史账本发起分页请求。
     public static func sorted(
         _ rows: [ArchiveRowPresentation],
         by key: RunSortKey,
         ascending: Bool
     ) -> [ArchiveRowPresentation] {
         rows.sorted { lhs, rhs in
+            // 排序闭包先按用户选择的字段比较，无法比较时用稳定 ID 保证顺序可复现。
             let ordered: Bool?
             switch key {
             case .started:
@@ -23,6 +25,7 @@ public enum ArchiveQuery {
     }
 
     public static func page<T>(_ values: [T], number: Int, size: Int) -> [T] {
+        // 页码和页大小先被夹在合法范围内，避免空数组或过大的页码造成越界。
         let size = max(1, size)
         let page = min(max(1, number), pageCount(total: values.count, size: size))
         let start = (page - 1) * size
@@ -57,6 +60,7 @@ public enum ArchiveQuery {
 struct RunArchivePage: View {
     let store: ObservatoryStore
 
+    // Environment 提供共享动画、语言和新窗口入口；筛选/排序/分页均是本页 State。
     @Environment(\.sharedNamespace) private var namespace
     @Environment(\.motionPolicy) private var policy
     @Environment(\.appLanguage) private var language
@@ -74,6 +78,7 @@ struct RunArchivePage: View {
     private var archive: ArchivePresentation { store.displayArchive }
 
     var body: some View {
+        // 页面把 Store 的 archive 投影读成表格或卡片；筛选变化只重置本页页码。
         PageScaffold(route: .runArchive) {
             VStack(alignment: .leading, spacing: AkzioLayout.s2) {
                 StagedSection(index: 0) {
@@ -94,6 +99,7 @@ struct RunArchivePage: View {
                         ledger
                     }
                     if let row = selectedRow {
+                        // 预览回调捕获当前 row、Store 和语言，把详情或窗口动作交回父页。
                         CollapsibleInspector(
                             title: "Run Preview",
                             symbol: "sidebar.trailing",
@@ -131,6 +137,7 @@ struct RunArchivePage: View {
     // MARK: Ledger
 
     private var ledger: some View {
+        // ledger 根据本地 layout State 选择表格或卡片，两种呈现共享同一份 visibleRows。
         SectionCard(title: "Runs", subtitle: statsSubtitle) {
             Group {
                 switch layout {
@@ -158,6 +165,7 @@ struct RunArchivePage: View {
     }
 
     private var cardGrid: some View {
+        // 每张卡的选择闭包只写入选中的行 ID，不直接修改 archive 快照。
         PageScroll {
             LazyVGrid(
                 columns: [GridItem(.adaptive(minimum: 236), spacing: AkzioLayout.s3)],
@@ -176,6 +184,7 @@ struct RunArchivePage: View {
     }
 
     private func runCard(_ row: ArchiveRowPresentation) -> some View {
+        // 卡片状态由传入行和 Store 当前选择派生，按钮闭包捕获该行的稳定 ID。
         let isSelected = row.id == store.selectedArchiveRowID
         return VStack(alignment: .leading, spacing: AkzioLayout.s2) {
             HStack(spacing: AkzioLayout.s2) {
@@ -215,6 +224,7 @@ struct RunArchivePage: View {
     }
 
     private var emptyState: some View {
+        // 空态区分“没有历史数据”和“筛选后无匹配”，清除闭包只恢复筛选 State。
         VStack(spacing: AkzioLayout.s2) {
             Image(systemName: "line.3.horizontal.decrease.circle")
                 .font(.system(size: 20, weight: .light))
@@ -239,6 +249,7 @@ struct RunArchivePage: View {
     // MARK: Toolbar and pagination
 
     private var toolbar: some View {
+        // 工具栏只修改 layout Binding；统计文本来自当前 archive 投影，不重新读取 Store。
         HStack(spacing: AkzioLayout.s2) {
             AkzioSegmentedControl(
                 selection: $layout,
@@ -252,6 +263,7 @@ struct RunArchivePage: View {
     }
 
     private var paginationBar: some View {
+        // 分页按钮闭包只递增或递减页码，enabled 条件保证动作不会越界。
         HStack(spacing: AkzioLayout.s2) {
             Text(rangeLabel).akzioMono(10, color: AkzioColor.mutedText)
             Spacer(minLength: AkzioLayout.s3)
@@ -271,6 +283,7 @@ struct RunArchivePage: View {
         enabled: Bool,
         action: @escaping () -> Void
     ) -> some View {
+        // action 是父页提供的无参闭包；本组件只负责把它包成可禁用的按钮。
         Button(action: action) {
             Image(systemName: symbol)
                 .font(.system(size: 9, weight: .bold))
@@ -287,6 +300,7 @@ struct RunArchivePage: View {
     /// Sort and filter are applied to the loaded page only — pagination here is a
     /// visual mock over a fixture page, not a query against a real ledger.
     private var filteredRows: [ArchiveRowPresentation] {
+        // filter 闭包组合三个纯匹配函数，结果随后按 State 指定字段排序。
         let filtered = archive.rows.filter { row in
             matchesQuery(row) && matchesPurpose(row) && matchesStatus(row)
         }
@@ -294,6 +308,7 @@ struct RunArchivePage: View {
     }
 
     private var visibleRows: [ArchiveRowPresentation] {
+        // visibleRows 是当前页的派生数组，页面不会因翻页改变底层 archive.rows。
         ArchiveQuery.page(filteredRows, number: page, size: archive.pageSize)
     }
 
@@ -315,6 +330,7 @@ struct RunArchivePage: View {
     }
 
     private var selectedRow: ArchiveRowPresentation? {
+        // 仅当 Store 的选择仍存在于当前可见页时显示预览，筛选变化不会显示过期行。
         guard let id = store.selectedArchiveRowID else { return nil }
         return visibleRows.first { $0.id == id }
     }
@@ -351,6 +367,7 @@ struct RunArchivePage: View {
     }
 
     private var densityBinding: Binding<SettingsPresentation.Density> {
+        // Binding 的 get/set 闭包把 ArchiveFilterBar 的密度选择映射到 Store 设置。
         Binding(
             get: { store.settings.density },
             set: { store.settings.density = $0 }
@@ -358,6 +375,7 @@ struct RunArchivePage: View {
     }
 
     private func select(_ id: String) {
+        // 选择动作由父页统一包裹面板动画，再交给 Store 保存选中行。
         withAnimation(policy.resolve(Motion.panel)) {
             store.selectArchiveRun(id)
         }

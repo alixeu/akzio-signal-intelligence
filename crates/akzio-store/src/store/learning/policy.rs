@@ -1,3 +1,5 @@
+// 文件导读：canonical PolicyEvaluation 把 sealed Outcome、T5 retrospective、Experience、
+// Evaluation、可选 CandidatePolicy 和消费 cursor 放进一个 Immediate 事务；重复提交只复核同一内容。
 impl Store {
     /// Commit canonical learning while fencing an optional daemon worker in
     /// the same SQLite transaction as the policy/evaluation writes.

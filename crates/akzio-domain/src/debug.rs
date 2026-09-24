@@ -1,9 +1,12 @@
+// 文件导读：描述 Debug session 的不可变身份、可变控制头和验收记录。
+// 这些状态只改变调度/观察权限，不改变业务 Contract 或放宽 Paper/学习边界。
 //! Execution control changes scheduling authority, never a business contract.
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{ArtifactRef, AttemptId, ContentHash, RunId, RunPurpose, TaskId};
 
+// 为历史 Debug identity 缺少该字段时提供稳定的反序列化默认值。
 fn default_debug_policy_status() -> String {
     "legacy_unknown".to_owned()
 }
@@ -88,6 +91,7 @@ pub struct DebugSessionIdentity {
 impl DebugSessionIdentity {
     /// Frozen session authority shared by inspection and control. Fixture runs
     /// do not pretend to have a real calibrated policy.
+    // PositionPlan 的真实模型运行在没有安装 DecisionPolicy 时只能研究，不进入 Decision。
     pub fn research_only_without_policy(&self) -> bool {
         self.run_purpose == RunPurpose::PositionPlan
             && self.llm_mode != DebugLlmMode::Fixture

@@ -4,12 +4,14 @@ import Foundation
 
 /// `OutcomeHorizon` — crates/akzio-domain/src/evaluation.rs:14
 public enum OutcomeHorizonKind: String, CaseIterable, Sendable, Identifiable {
+    // horizon rawValue 对应 Rust evaluation wire 值，tradingDays 使用交易日而非日历日。
     case t1
     case t3
     case t5
 
     public var id: String { rawValue }
     public var tradingDays: Int {
+        // 交易日数量是窗口计算和布局排序的单一派生来源。
         switch self {
         case .t1: 1
         case .t3: 3
@@ -19,11 +21,13 @@ public enum OutcomeHorizonKind: String, CaseIterable, Sendable, Identifiable {
 
     public var displayName: String { "T+\(tradingDays)" }
     /// Trading sessions, never calendar days.
+    // windowLabel 只生成页面说明，不扩大实际 Outcome 窗口。
     public var windowLabel: String { tradingDays == 1 ? "1 Trading Session" : "\(tradingDays) Trading Sessions" }
 }
 
 /// `MemoryLifecycle` — evaluation.rs:460
 public enum MemoryLifecycle: String, CaseIterable, Sendable, Identifiable {
+    // 生命周期值直接对应 learning/evaluation 状态，tone/symbol 是纯 UI 映射。
     case candidate
     case active
     case proven
@@ -55,6 +59,7 @@ public enum MemoryLifecycle: String, CaseIterable, Sendable, Identifiable {
 
 /// `CandidatePolicyState` — evaluation.rs:470. The canary ladder exists in code.
 public enum CandidatePolicyState: String, CaseIterable, Sendable, Identifiable {
+    // candidate/canary/active 保留政策暴露阶段，不等同于正式激活授权。
     case candidate
     case canary10 = "canary10"
     case canary25 = "canary25"
@@ -78,6 +83,7 @@ public enum CandidatePolicyState: String, CaseIterable, Sendable, Identifiable {
 
 /// `PolicySubject` — evaluation.rs:481
 public enum PolicySubjectKind: String, CaseIterable, Sendable {
+    // subject 标记政策轨道作用域，页面只读取名称和图标映射。
     case memory
     case contract
     case topology
@@ -94,6 +100,7 @@ public enum PolicySubjectKind: String, CaseIterable, Sendable {
 
 /// `RetrospectiveCategory` — evaluation.rs:174
 public enum RetrospectiveCategory: String, CaseIterable, Sendable, Identifiable {
+    // category 是 retrospective 标签值；displayName 不参与 lesson 聚合逻辑。
     case research
     case evidence
     case risk
@@ -108,6 +115,7 @@ public enum RetrospectiveCategory: String, CaseIterable, Sendable, Identifiable 
 
 /// `RetrospectiveConclusion` — evaluation.rs:186
 public enum RetrospectiveConclusion: String, CaseIterable, Sendable {
+    // 结论枚举区分结果语义，tone/symbol 仅用于页面表达。
     case worked
     case failed
     case mixed
@@ -143,6 +151,7 @@ public enum RetrospectiveConclusion: String, CaseIterable, Sendable {
 
 /// `RetrospectiveStatus` — evaluation.rs:195
 public enum RetrospectiveStatus: String, CaseIterable, Sendable {
+    // modelUnavailable 保留模型缺失边界，不能由页面推导为 complete。
     case complete
     case modelUnavailable = "model_unavailable"
 

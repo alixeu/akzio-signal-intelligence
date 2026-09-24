@@ -4,6 +4,8 @@ impl ExecutionRuntime {
         input: &ExecutionGateInput,
         blockers: &mut BTreeSet<HardBlocker>,
     ) -> ExecutionGateResult<Option<(Artifact, AccountSnapshot)>> {
+        // 缺账户直接累积 MissingAccount 并返回 None；存在时验证 NormalizedEvidence payload
+        // 和 lifecycle，保留 artifact 与 typed snapshot 的配对供后续 provenance 使用。
         let Some(reference) = &input.account_snapshot else {
             blockers.insert(HardBlocker::MissingAccount);
             return Ok(None);
@@ -23,6 +25,8 @@ impl ExecutionRuntime {
         blockers: &mut BTreeSet<HardBlocker>,
         invalid_quote: bool,
     ) -> ExecutionGateResult<Option<(Artifact, QuoteSnapshot)>> {
+        // quote_validation_error 与真正缺引用分开映射，便于 NoOrder 区分“供应商回了坏报价”
+        // 和“没有报价”；payload 合法不等于新鲜，freshness 在 derive_snapshot_blockers 检查。
         let Some(reference) = &input.quote_snapshot else {
             blockers.insert(if invalid_quote {
                 HardBlocker::InvalidQuote
@@ -45,6 +49,8 @@ impl ExecutionRuntime {
         input: &ExecutionGateInput,
         blockers: &mut BTreeSet<HardBlocker>,
     ) -> ExecutionGateResult<Option<(Artifact, MarketClockSnapshot)>> {
+        // 时钟缺失按 MarketClosed 处理；有效 payload 仍需在当前时间窗口、broker session 和
+        // tradable 状态上复核。
         let Some(reference) = &input.market_clock_snapshot else {
             blockers.insert(HardBlocker::MarketClosed);
             return Ok(None);
@@ -66,6 +72,8 @@ impl ExecutionRuntime {
         now: DateTime<Utc>,
         blockers: &mut BTreeSet<HardBlocker>,
     ) {
+        // 把账户、quotes、clock 的年龄、外部持仓、未托管订单、session 不一致和三源时间偏差
+        // 累积为独立 blocker；任何一个来源过期都不会被其他来源的较新时间掩盖。
         if let Some(account) = account {
             if outside_freshness_window(
                 account.observed_at,
@@ -125,6 +133,8 @@ impl ExecutionRuntime {
     }
 
     fn allocation_blockers(&self, error: AllocationError, blockers: &mut BTreeSet<HardBlocker>) {
+        // 将分配器的细粒度错误映射成稳定领域 blocker；错误仍保留在 gate 结果的原因集合，
+        // 不通过“吞掉错误”制造可执行 plan。
         match error {
             AllocationError::DecisionRejected => {
                 blockers.insert(HardBlocker::NoExecutableOrder);
@@ -173,6 +183,7 @@ impl ExecutionRuntime {
         reference: &ArtifactRef,
         expected: ArtifactKind,
     ) -> ExecutionGateResult<Artifact> {
+        // Store 实际 Artifact kind 与引用声明必须同时匹配，保证后续 serde 类型和 lineage 一致。
         let artifact = self.store.artifact(&reference.artifact_id)?;
         if reference.kind != expected || artifact.kind != expected {
             return Err(ExecutionGateError::WrongArtifactKind {

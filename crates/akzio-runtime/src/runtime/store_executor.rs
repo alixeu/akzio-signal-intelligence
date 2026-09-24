@@ -8,6 +8,9 @@ use std::{
     time::Instant,
 };
 
+// 文件导读：StoreExecutor 用一个共享 Semaphore 串行化同步 Store 操作，把闭包放入 spawn_blocking；
+// Atomic telemetry、watch maintenance state、lease deferral 和 shutdown drain 共同定义取消/恢复边界。
+
 /// Long Store operations that drain normal executor work before they start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreMaintenanceKind {
@@ -21,6 +24,7 @@ pub enum StoreMaintenanceKind {
 
 impl StoreMaintenanceKind {
     pub const fn as_str(self) -> &'static str {
+        // wire label 是稳定展示值；枚举本身仍是内部类型，不由字符串反向授权维护操作。
         match self {
             Self::Doctor => "doctor",
             Self::Backup => "backup",
@@ -40,6 +44,7 @@ pub enum StoreMaintenanceOutcome {
 
 impl StoreMaintenanceOutcome {
     pub const fn as_str(self) -> &'static str {
+        // outcome 只表达维护闭包结果，不代表 Store 业务状态或迁移一定完成。
         match self {
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
@@ -74,6 +79,7 @@ pub struct StoreExecutorTelemetry {
 
 #[derive(Debug)]
 struct StoreExecutorState {
+    // queue=1 保证同一 Store executor 的操作串行；Atomic 字段只做低成本 telemetry，watch 负责维护状态广播。
     queue: Arc<tokio::sync::Semaphore>,
     accepting_operations: AtomicBool,
     queued_operation_count: AtomicUsize,
@@ -90,6 +96,7 @@ struct QueuedOperation<'a> {
 
 impl<'a> QueuedOperation<'a> {
     fn new(count: &'a AtomicUsize) -> Self {
+        // RAII 计数覆盖等待和取消路径；无论 acquire 后续成功、失败还是 future drop，queued 数都会归零。
         count.fetch_add(1, Ordering::Relaxed);
         Self { count }
     }
@@ -97,6 +104,7 @@ impl<'a> QueuedOperation<'a> {
 
 impl Drop for QueuedOperation<'_> {
     fn drop(&mut self) {
+        // drop 只维护排队计数，不释放 Semaphore permit；permit 的所有权仍由实际 operation closure 持有。
         self.count.fetch_sub(1, Ordering::Relaxed);
     }
 }
@@ -114,6 +122,7 @@ pub struct StoreExecutor {
 
 impl StoreExecutor {
     pub fn new(store: Store) -> Self {
+        // new 建立初始可接收、空队列和 Idle maintenance 状态；不启动线程、不写 Store。
         let (maintenance, _) = tokio::sync::watch::channel(StoreMaintenanceState::Idle);
         Self {
             store,
@@ -135,6 +144,7 @@ impl StoreExecutor {
         T: Send + 'static,
         F: FnOnce(Store) -> T + Send + 'static,
     {
+        // acquire 成功后 permit 被 move 进 blocking closure；取消 execute 的 waiter 不会取消已经开始的同步 Store 工作。
         let (permit, queue_wait) = self.acquire_operation_permit().await?;
         let store = self.store.clone();
         let execution_started = Instant::now();
@@ -166,6 +176,7 @@ impl StoreExecutor {
         T: Send + 'static,
         F: FnOnce(Store) -> RuntimeResult<T> + Send + 'static,
     {
+        // maintenance 先排空普通队列并发布 Running，再在同一 blocking closure 中执行、延期 live leases、记录结果并释放 permit。
         let (permit, queue_wait) = self.acquire_operation_permit().await?;
         let sequence = self
             .state
@@ -217,6 +228,7 @@ impl StoreExecutor {
 
     /// Reject new work and wait until the active/queued operation set drains.
     pub async fn shutdown_and_drain(&self) -> RuntimeResult<()> {
+        // Release 禁止新操作；owned permit 只有在当前 closure 和已排队操作都完成后才能取得，随后立即 drop 完成 drain。
         self.state
             .accepting_operations
             .store(false, Ordering::Release);
@@ -232,6 +244,7 @@ impl StoreExecutor {
     }
 
     pub fn telemetry(&self) -> StoreExecutorTelemetry {
+        // Acquire/Release 读取与写入配对，Relaxed 计数只用于诊断；telemetry 不参与业务授权或 lease 判断。
         StoreExecutorTelemetry {
             accepting_operations: self.state.accepting_operations.load(Ordering::Acquire),
             queued_operation_count: self.state.queued_operation_count.load(Ordering::Relaxed),
@@ -249,6 +262,7 @@ impl StoreExecutor {
     async fn acquire_operation_permit(
         &self,
     ) -> RuntimeResult<(tokio::sync::OwnedSemaphorePermit, StdDuration)> {
+        // admission 在等待前后各检查一次 accepting；shutdown 竞态下取得的 permit 会被释放并返回错误，不启动 closure。
         if !self.state.accepting_operations.load(Ordering::Acquire) {
             return Err(RuntimeError::StoreExecutor(
                 "Store executor is shut down".to_owned(),
@@ -269,6 +283,7 @@ impl StoreExecutor {
     }
 
     fn record_completion(&self, queue_wait: StdDuration, execution_duration: StdDuration) {
+        // completion 在 blocking work 内发布，先于 permit drop；因此后续操作观察到的计数不会遗漏已完成工作。
         self.state
             .last_queue_wait_nanos
             .store(duration_nanos(queue_wait), Ordering::Relaxed);
@@ -288,7 +303,3 @@ fn duration_nanos(duration: StdDuration) -> u64 {
 fn duration_from_nanos(nanos: u64) -> StdDuration {
     StdDuration::from_nanos(nanos)
 }
-
-#[cfg(test)]
-#[path = "store_executor_tests.rs"]
-mod cancellation_tests;

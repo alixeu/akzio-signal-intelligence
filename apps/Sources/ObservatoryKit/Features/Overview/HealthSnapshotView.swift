@@ -5,12 +5,14 @@ import SwiftUI
 // Five vitals. A gauge only turns coral once the metric is actually in its risk
 // band, and an absent metric leaves the bar empty rather than drawing 0%.
 struct HealthSnapshotView: View {
+    // metrics 是 Store 或 Mock 场景提供的健康指标投影；本视图只解释已给出的风险标记。
     let metrics: [HealthMetric]
 
     @Environment(\.motionPolicy) private var policy
     @Environment(\.appLanguage) private var language
 
     var body: some View {
+        // enumerated 闭包给每行一个稳定的渐入序号，指标值本身仍由传入模型决定。
         SectionCard(
             title: "Health Snapshot",
             subtitle: "Risk, data and process vitals",
@@ -26,6 +28,7 @@ struct HealthSnapshotView: View {
     }
 
     private func row(_ metric: HealthMetric) -> some View {
+        // 缺失 fraction 时不绘制比例条；风险颜色只由模型的 isElevatedRisk 驱动。
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: AkzioLayout.s2) {
                 Text(L10n.text(metric.label, language: language)).akzioText(.label)

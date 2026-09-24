@@ -4,6 +4,7 @@ import Foundation
 
 /// Research roles as they appear in `akzio-research` contracts.
 public enum AgentRole: String, CaseIterable, Sendable, Identifiable {
+    // rawValue 是跨 Rust 合同和 Swift 展示层的稳定角色标识，displayName 等属性只提供 UI 语义。
     case planner
     case analyst
     case critic
@@ -13,6 +14,7 @@ public enum AgentRole: String, CaseIterable, Sendable, Identifiable {
     public var id: String { rawValue }
 
     public var displayName: String {
+        // 名称、职责和图标都是由枚举值派生的只读展示映射，不回写运行时角色。
         switch self {
         case .planner: "Planner"
         case .analyst: "Analyst"
@@ -43,11 +45,13 @@ public enum AgentRole: String, CaseIterable, Sendable, Identifiable {
     }
 
     /// The Critic is the only optional role in the workflow.
+    // isOptional 只供 workflow 展示判断，不改变 Rust 侧任务是否创建。
     public var isOptional: Bool { self == .critic }
 }
 
 /// Reasoning effort reported by the Rust model adapter.
 public enum ReasoningIntensity: String, CaseIterable, Sendable, Identifiable {
+    // 该 enum 对应 Rust adapter 报告的推理强度；数值视觉参数由 computed property 派生。
     case none
     case minimal
     case low
@@ -61,6 +65,7 @@ public enum ReasoningIntensity: String, CaseIterable, Sendable, Identifiable {
 
     /// Orbit rings drawn by `IntensityOrbitCanvas`.
     public var orbitCount: Int {
+        // 轨道数量是显示密度映射，不是模型预算或实际调用次数。
         switch self {
         case .none: 0
         case .minimal, .low: 1
@@ -71,6 +76,7 @@ public enum ReasoningIntensity: String, CaseIterable, Sendable, Identifiable {
     }
 
     public var coreBrightness: Double {
+        // 核心亮度只决定画布颜色强度，保留与强度枚举一一对应的稳定值。
         switch self {
         case .none: 0.18
         case .minimal: 0.26
@@ -88,6 +94,7 @@ public enum ReasoningIntensity: String, CaseIterable, Sendable, Identifiable {
 
 /// Canonical pipeline stages, in execution order.
 public enum WorkflowStageKind: Hashable, Sendable, Identifiable {
+    // 阶段 enum 是 workflow 图的 Swift 投影；关联值保留 Analyst 序号和 horizon 语义。
     case planner
     case evidenceGate
     case analyst(Int)
@@ -102,6 +109,7 @@ public enum WorkflowStageKind: Hashable, Sendable, Identifiable {
     case horizon(OutcomeHorizonKind)
 
     public var id: String {
+        // id 供节点、边和 accessibility overlay 对齐，不能替代 Rust taskID。
         switch self {
         case .planner: "planner"
         case .evidenceGate: "evidence_gate"
@@ -119,6 +127,7 @@ public enum WorkflowStageKind: Hashable, Sendable, Identifiable {
     }
 
     public var displayName: String {
+        // displayName 只面向页面文本；关联值由同一 stage 映射为可读标签。
         switch self {
         case .planner: "Planner"
         case .evidenceGate: "Evidence Gate"
@@ -136,6 +145,7 @@ public enum WorkflowStageKind: Hashable, Sendable, Identifiable {
     }
 
     public var symbol: String {
+        // SF Symbol 是视觉映射，和阶段 wire 名称保持解耦。
         switch self {
         case .planner: "map"
         case .evidenceGate: "shield.lefthalf.filled"
@@ -153,10 +163,12 @@ public enum WorkflowStageKind: Hashable, Sendable, Identifiable {
     }
 
     /// Only the Critic is optional; only Paper Commit can be not-applicable.
+    // 这两个判断供 presentation status 映射使用，不在展示层新增阶段。
     public var isOptional: Bool { self == .critic }
     public var requiresPaperRun: Bool { self == .paperCommit }
 
     public var role: AgentRole? {
+        // 只有能对应 Agent 的阶段返回 role；门控和结构节点保持 nil。
         switch self {
         case .planner: .planner
         case .analyst: .analyst

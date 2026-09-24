@@ -1,3 +1,11 @@
+// 文件导读：AgentSession 把已 claim 的 Attempt、候选 Artifact、daemon 选择的 stage model
+// 和同一 Attempt 的累计预算交给 AgentRuntime。它只产生 Claim/Critique/Proposal 等研究
+// Artifact；ContextManifest/ReadGrant、Prompt Contract 和输出校验仍在 research/context
+// runtime，研究输出不自动成为 Decision 或执行许可。
+// Rust 机制：结构体持有 `&Daemon` 借用，避免复制运行时状态；`&mut AgentRunBudget` 明确
+// 跨调用共享预算；BTreeMap 按 ArtifactId 去重，闭包只捕获受控引用，Result 保留 kind
+// 漂移/依赖未完成等错误。
+
 use crate::*;
 
 /// Model-mediated session execution with daemon-owned routing and budget.

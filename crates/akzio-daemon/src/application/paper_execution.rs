@@ -1,3 +1,11 @@
+// 文件导读：PaperExecution 串起 DecisionGate → ExecutionGate → PaperCommitment → Reconcile。
+// Decision 只产出目标与 DecisionContext；ExecutionVerdict 仍可能是 NoOrder；Commitment 是
+// 外部 I/O 前的确定性幂等记录；Reconcile 才接触 Paper broker，accepted/partially_filled
+// 仍不是最终 fill。PositionPlan、Debug forbidden、缺 Policy 和闭市等待均在对应边界保留。
+// Rust 机制：门面借用 `&Daemon`；async execution/reconcile 返回 Future；BTreeMap/Set 组装
+// 依赖闭包，`Option` 表示快照/approval 缺失，枚举 `ExecutionVerdict`/`OrderSide` 保证
+// 状态分支穷尽，`i128` 中间运算配合 `try_from` 防止金额溢出。
+
 use crate::*;
 use akzio_domain::{
     ComplianceActivitySnapshot, ComplianceControl, DependencyClosure, DependencyHealthStatus,

@@ -1,3 +1,5 @@
+# 文件职责：离线 Debug Controller 验证的隔离配置。
+# debug_control 和禁止 Paper 的设置只作用于该 fixture Core，不改变 canonical Store。
 # Offline controller proof only. No credentials, network providers or Broker.
 [daemon]
 # Keep checkpoints outside build products removed by distribution packaging.

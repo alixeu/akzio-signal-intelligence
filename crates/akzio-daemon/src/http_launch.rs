@@ -1,4 +1,9 @@
-// Native App requests reuse the formal graph and scheduler authorities.
+// 文件导读：Native App 的 `/runs` 入口只复用正式 PositionPlan graph 或 Paper scheduler。
+// 它拒绝浏览器来源和隔离 Debug Core；PositionPlan 在 Decision 后结束，Paper 只返回
+// scheduler reservation 的 RunId。返回 RunId/HTTP 成功不等于模型完成、Decision 通过、
+// Paper submission、fill 或 Outcome 成熟。
+// Rust 机制：Axum `State/Json/HeaderMap` extractor 取得请求；闭包 move 进 StoreExecutor
+// 取得原子 commit；`match` 穷举 RunPurpose，`Option` 表示 scheduler 尚未创建 slot。
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RunLaunchRequest {

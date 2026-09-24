@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+# 文件职责：按固定顺序重建 Observatory、检查两个可执行文件存在，再执行自用签名。
+# 它不启动 App、不提交 Paper 请求，也不覆盖已有 bundle。
 # Build and sign the distributable Observatory app, preserving build products.
 set -euo pipefail
 

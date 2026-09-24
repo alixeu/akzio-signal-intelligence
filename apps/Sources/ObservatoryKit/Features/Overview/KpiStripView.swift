@@ -7,6 +7,7 @@ let overviewKpiCardMinHeight: CGFloat = 44
 // Four tiles. Values count up rather than swap, and the equity value plus its
 // sparkline are the shared elements that fly into the Portfolio page.
 struct KpiStripView: View {
+    // 三份展示投影分别提供资产、流程和共享元素来源；KPI 不拥有这些数据的生命周期。
     let portfolio: PortfolioPresentation
     let workflow: WorkflowPresentation
     let namespace: Namespace.ID?
@@ -17,6 +18,7 @@ struct KpiStripView: View {
     private var confidencePpm: Int? { workflow.inspector.confidencePpm }
 
     var body: some View {
+        // 四张卡读取同一批投影，Environment 只提供动效和语言策略。
         HStack(spacing: AkzioLayout.s3) {
             equityCard
             todayCard
@@ -29,6 +31,7 @@ struct KpiStripView: View {
     // MARK: Tiles
 
     private var equityCard: some View {
+        // 资产数值和 sparkline 使用同一 portfolio 快照，并把两个元素注册给 Portfolio 页面。
         VStack(alignment: .leading, spacing: 6) {
             Text(L10n.text("Total Equity", language: language)).akzioText(.caption)
             Text(PpmFormatter.currency(micros: portfolio.equityMicros))
@@ -54,6 +57,7 @@ struct KpiStripView: View {
     }
 
     private var todayCard: some View {
+        // 当日盈亏同时显示绝对值、百分比和 benchmark 标签，全部来自 portfolio 投影。
         VStack(alignment: .leading, spacing: 6) {
             Text(L10n.text("Today P&L", language: language)).akzioText(.caption)
             Text(PpmFormatter.currency(micros: portfolio.todayPnlMicros, signed: true))
@@ -80,6 +84,7 @@ struct KpiStripView: View {
     }
 
     private var confidenceCard: some View {
+        // confidencePpm 为空时保持 Unavailable；可用时数值和圆环共享同一置信度输入。
         HStack(spacing: AkzioLayout.s3) {
             VStack(alignment: .leading, spacing: 6) {
             Text(L10n.text("Decision Confidence", language: language)).akzioText(.caption)
@@ -113,6 +118,7 @@ struct KpiStripView: View {
     }
 
     private var progressCard: some View {
+        // 工作流进度由节点数量和完成数派生，不把百分比反写回 WorkflowPresentation。
         VStack(alignment: .leading, spacing: 6) {
             Text(L10n.text("Workflow Progress", language: language)).akzioText(.caption)
             Text(PpmFormatter.share(

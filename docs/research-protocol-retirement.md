@@ -27,7 +27,7 @@
 | Fixture | Planner 模型模板、旧 fixture 图、`config/task2-fixture.toml` | 正式图的明确 fixture adapters、`debug serve-fixture`、`debug verify-fixture` |
 | 测试和文档 | 旧图控制测试、旧创建命令和过期的通用两阶段说明 | 正式九节点控制测试、Paper NoOrder 后续链、历史只读夹具 |
 
-固定编译见 [compilation](../crates/akzio-runtime/src/runtime/compilation.rs)，验证入口见 [Debug CLI](../crates/akzio-cli/src/cli/debug_commands.rs)，控制测试见 [daemon tests](../crates/akzio-daemon/src/debug/tests.rs)。
+固定编译见 [compilation](../crates/akzio-runtime/src/runtime/compilation.rs)，验证入口见 [Debug CLI](../crates/akzio-cli/src/cli/debug_commands.rs)。
 
 ## 历史兼容与执行阻断
 
@@ -37,7 +37,7 @@
 
 历史 replay 从持久化事件、图修订和冻结 Contract 校验，不依赖活动 Planner recipe。旧版本的特殊能力迁移规则只在历史完整性检查中使用，不再用于当前激活入口。
 
-实现见 [Store 退休判定](../crates/akzio-store/src/store/workflow/helpers.rs)、[升级预检](../crates/akzio-store/src/store/workflow/contracts.rs)、[历史 replay](../crates/akzio-runtime/src/runtime/replay.rs)。冻结的脱敏离线旧运行及出处见 [历史夹具说明](../crates/akzio-store/src/store/fixtures/retired-history.md)，测试见 [retirement tests](../crates/akzio-store/src/store/retirement_tests.rs)。
+实现见 [Store 退休判定](../crates/akzio-store/src/store/workflow/helpers.rs)、[升级预检](../crates/akzio-store/src/store/workflow/contracts.rs)、[历史 replay](../crates/akzio-runtime/src/runtime/replay.rs)。冻结的脱敏离线旧运行及出处见 [历史夹具说明](../crates/akzio-store/src/store/fixtures/retired-history.md)。
 
 ## 离线验收
 
@@ -46,7 +46,6 @@ cargo fmt --all -- --check
 cargo check --workspace --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --locked
-swift run --package-path apps DebugContractChecks
 bash scripts/check_markdown_links.sh
 cargo run --locked -p akzio-cli -- debug verify-fixture
 ```

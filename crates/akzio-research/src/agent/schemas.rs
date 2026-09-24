@@ -1,6 +1,10 @@
 use super::*;
 
+// Schema 是模型 wire 边界，不是业务验收本身。这里限定字段、数量、枚举和引用形状；
+// Store/Manifest/Contract 之后还会校验引用闭包、Evidence scope、horizon、Review
+// 和 Budget。研究 Submit 与 Outcome Draft/Submit 使用同一 envelope，但阶段能力不同。
 pub(super) fn deliberation_output_schema(result_schema: &Value) -> Value {
+    // result 与 deliberation 必须同次提交；权重守恒和模型评估来源由结构化校验继续确认。
     json!({
         "type": "object",
         "required": ["result", "deliberation"],
@@ -77,6 +81,7 @@ pub(super) fn compare_sources_tool_input_schema() -> Value {
 }
 
 pub(super) fn context_tool_input_schema(name: &str) -> Option<Value> {
+    // 只返回 ContextBroker 支持的严格参数 Schema；未知工具不产生 fallback 权限。
     match name {
         "read_artifact" | "read_document" | "read_claim_evidence" => {
             Some(artifact_id_tool_input_schema())
@@ -89,6 +94,8 @@ pub(super) fn context_tool_input_schema(name: &str) -> Option<Value> {
 }
 
 pub(super) fn evidence_read_tool_specs(store: &Store) -> ResearchResult<Vec<ToolSpec>> {
+    // Outcome 的五个只读工具使用 Store staged JSON Schema，读取前仍需 ReadGrant、
+    // source/kind/Run/lifecycle 校验；Schema 本身不把原文或 SQL 暴露给模型。
     [
         (
             "read_document",
@@ -130,6 +137,8 @@ pub(super) fn evidence_read_tool_specs(store: &Store) -> ResearchResult<Vec<Tool
 }
 
 pub(super) fn retrospective_draft_output_schema() -> Value {
+    // Outcome 只能提交定性复盘、受限 LessonProposal 和来源引用；权威收益率、滑点、
+    // 风险真值与 Policy 决策不在模型输出字段中，而由 Rust 后续阶段计算。
     let reference_kinds = [
         "claim",
         "critique",
@@ -188,6 +197,8 @@ pub(super) fn retrospective_draft_output_schema() -> Value {
 }
 
 pub(super) fn research_intent_output_schema() -> Value {
+    // 研究角色只提出类型化补采意图。资源语法、时间窗口、cutoff 和最多八项预算由
+    // Rust 绑定冻结 Run，避免模型把一个字符串直接变成可执行采集请求。
     json!({
         "type": "object",
         "properties": {
@@ -391,6 +402,8 @@ pub(super) fn evidence_gap_schema() -> Value {
 }
 
 pub(super) fn decision_proposal_output_schema() -> Value {
+    // Synthesizer wire 仍是研究提案：12 个 Forecast 和四资产+现金研究分配不等于
+    // Decision target/order。后续 ProposalReview、DecisionPolicy 与 ExecutionGate 独立生效。
     json!({
         "type": "object",
         "properties": {

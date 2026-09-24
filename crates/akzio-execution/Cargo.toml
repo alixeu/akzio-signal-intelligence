@@ -1,3 +1,4 @@
+# 文件职责：声明 Decision/Execution Gate、Paper transport 和 Commitment crate 的依赖边界。
 [package]
 name = "akzio-execution"
 version = "0.2.0"

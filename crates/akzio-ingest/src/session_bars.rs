@@ -1,5 +1,10 @@
 //! Session-aware, bounded Alpaca daily-bar acquisition. Calendar and each page
 //! are retained in RawEvidence; normalized prices carry their availability basis.
+
+// 文件导读：日线采集先抓 clock/market snapshot 与交易日历，按美东 close+20 分钟筛出已
+// 完成的共同 Session，再分页读取有界 bars，并把每次请求、calendar、page、corporate action
+// 原文全部放入 RawEvidence。NormalizedEvidence 只暴露 cutoff 内且 OHLCV 合法的 bars；
+// raw_prices 还要求 corporate-action 窗口完整，Outcome 若窗口含公司行动会 fail closed。
 use super::*;
 use chrono::{NaiveDate, NaiveTime, TimeZone};
 use chrono_tz::America::New_York;
@@ -11,6 +16,8 @@ const MAX_PROVIDER_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) fn classify_evidence_response(
     response: &reqwest::Response,
 ) -> Result<(), EvidenceAdapterError> {
+    // 只把成功、鉴权、限流、临时和永久 HTTP 状态映射为明确 adapter 结果；429 的 retry-after
+    // 支持秒数或日期并有上限，避免错误响应被当作空证据。
     let status = response.status();
     match status.as_u16() {
         200..=299 => Ok(()),
@@ -42,6 +49,7 @@ pub(crate) fn classify_evidence_response(
 }
 
 fn invalid(message: &str) -> EvidenceAdapterError {
+    // 统一构造 provider data-quality 错误，让调用方区分数据坏、等待发布和网络失败。
     EvidenceAdapterError::DataQuality(message.to_owned())
 }
 
@@ -52,6 +60,8 @@ pub fn validate_outcome_price_window(
     baseline: NaiveDate,
     through: NaiveDate,
 ) -> Result<(), EvidenceAdapterError> {
+    // 逐类读取 corporate action 的真实生效字段，并要求 pagination 完整；baseline 之后、
+    // through 之内出现未建账的 split/dividend/merge 等动作时拒绝数值 Outcome。
     let response = normalized
         .get("corporate_actions_response")
         .ok_or_else(|| invalid("Outcome corporate-action evidence missing"))?;
@@ -105,6 +115,8 @@ pub fn validate_outcome_price_window(
 pub(super) fn session_closes(
     calendar: &Value,
 ) -> Result<BTreeMap<NaiveDate, DateTime<Utc>>, EvidenceAdapterError> {
+    // 把 Alpaca calendar 的美东 close 转成 UTC，并拒绝重复日期/模糊时区；这是可用性边界
+    // 元数据，不是未来价格事实。
     let mut closes = BTreeMap::new();
     for session in calendar
         .as_array()
@@ -141,6 +153,8 @@ impl AlpacaPaperEvidenceTransport {
         &self,
         url: &reqwest::Url,
     ) -> Result<Value, EvidenceAdapterError> {
+        // 对 GET 仅在连接/超时错误下做最多四次短退避，HTTP policy/data 错误不重试；body
+        // 有 8 MiB 上限后才 JSON decode，避免无限读取外部响应。
         // These are read-only GETs; use the same bounded connection retry as
         // the other Alpaca acquisition path. HTTP policy failures are not retried.
         let mut attempt = 1_u64;
@@ -191,6 +205,9 @@ impl AlpacaPaperEvidenceTransport {
         resource: &str,
         cutoff: DateTime<Utc>,
     ) -> Result<AcquiredEvidence, EvidenceAdapterError> {
+        // 输入→解析 bars 资源→clock/calendar cutoff→分页并去重→可选 corporate actions→
+        // 构造 session_closes/content_available_at→验证 OHLCV→保存 Raw/Normalized。分页 token
+        // 重复、latest session 不足或未来 bar 都返回 Pending/DataQuality，不降级成旧数据。
         let GovernedResource::AlpacaBars {
             asset,
             start,

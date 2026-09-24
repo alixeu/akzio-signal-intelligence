@@ -1,3 +1,10 @@
+// 文件导读：EvidenceAcquisition 是 Evidence Gate 和一次补采的应用门面。它复用 daemon
+// 的 adapter/Store/permit，区分 Shadow 父证据复用、首轮 EvidenceNeed 采集和 supplemental
+// 新事实；Succeeded 只表示相应 Artifact 已提交，不代表研究、Decision、订单或 Outcome。
+// Rust 机制：`&'a Daemon` 让门面不拥有状态；异步方法返回 Future 并在调用方 await，
+// `Vec<(ArtifactRef, Artifact, EvidenceNeed)>` 同时携带身份/正文/强类型需求，借用与
+// `Result` 防止未授权 payload 进入模型。
+
 use crate::*;
 
 /// Governed evidence collection, including the single supplemental round.

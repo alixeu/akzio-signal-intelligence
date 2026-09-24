@@ -1,3 +1,11 @@
+// 文件导读：本文件实现只读 readiness/preflight、风险限制写入、Outcome 数据集收集、
+// Policy candidate build/validate/activate 和 evidence audit。它坚持 SQL Store/CAS 为
+// 权威：成熟 Outcome 不是 active Policy，candidate 不是激活，Paper NoOrder 也不是校准
+// 完成；CLI 的报告只反映已持久化事实和明确缺口。
+// Rust 机制：泛型 `persist_calibration_artifact<T: Serialize>` 约束输入可序列化；闭包和
+// 迭代器按 Artifact DAG 聚合样本；`Option`/`Result` 区分 no_schedule、pending、blocked
+// 和真实错误；测试用 cfg(test) 只验证离线 Store 行为。
+
 use akzio_domain::{
     Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle, ArtifactProvenance, ArtifactRef,
     Decision, DecisionContext, DecisionHorizon, MoneyMicros, Outcome, OutcomeHorizon,

@@ -1,3 +1,5 @@
+// 文件导读：Lesson 采用独立的惰性表和 canonical CAS Artifact；证据账本只记录
+// 已封存 Outcome 对 Lesson 的观察关联，和 Policy 激活、Paper 执行不是同一状态。
 use super::*;
 
 use akzio_domain::{
@@ -12,6 +14,7 @@ pub(super) struct LessonEvidenceMetrics {
 }
 
 impl From<&LessonEvidence> for LessonEvidenceMetrics {
+    // 将领域数组复制到 SQL metrics_json 使用的窄投影，避免把整个 LessonEvidence 序列化进表。
     fn from(evidence: &LessonEvidence) -> Self {
         Self {
             utility_ppm_by_horizon: evidence.utility_ppm_by_horizon,

@@ -6,6 +6,8 @@ pub fn apply_risk_ground_truth_assessments(
     assessments: &[(ArtifactRef, RiskGroundTruthAssessment)],
     used_at: DateTime<Utc>,
 ) -> EvaluationRuntimeResult<()> {
+    // 一个 horizon 只能绑定一个已封存的外部 RiskGroundTruthAssessment；assessment 由
+    // 独立 reviewer 提供，本模块只检查身份、日期、集合子集关系并把引用挂到观察上。
     let mut seen = BTreeSet::new();
     for (assessment_ref, assessment) in assessments {
         if assessment_ref.kind != ArtifactKind::RiskGroundTruthAssessment
@@ -58,6 +60,8 @@ impl EvaluationRuntime {
         assessment: &RiskGroundTruthAssessment,
         now: DateTime<Utc>,
     ) -> EvaluationRuntimeResult<Artifact> {
+        // 记录前必须是 Paper，并验证 schedule/Decision producer/basis refs 的 CAS 身份；
+        // 这里不生成 reviewer、风险标签或“默认正确”的测量值。
         self.require_paper(&permit.run_id)?;
         assessment.validate_sealed_at(now)?;
         let schedule_artifact = self.store.artifact(&assessment.schedule.artifact_id)?;
@@ -113,6 +117,8 @@ impl EvaluationRuntime {
             source_refs,
             now,
         )?;
+        // write_task_artifact_fenced 把 permit/可选 lease、Artifact 和生命周期事件放入
+        // 同一 Store 事务；成功返回才表示 assessment 已持久化，之前的内存对象不算记录。
         self.store.write_task_artifact_fenced(
             lease,
             permit,

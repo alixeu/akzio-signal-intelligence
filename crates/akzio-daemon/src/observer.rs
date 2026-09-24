@@ -1,3 +1,11 @@
+// 文件导读：observer 只把 Store/CAS、Run lifecycle、Paper 只读快照和学习 Artifact 组合
+// 为 UI/API 投影。它不领取 task、不改变 Gate、不发送订单；Available/Pending/Unavailable
+// 明确区分已观察事实、等待中的 Outcome 和 provider/权限缺口，不能把曲线或 200 响应写成
+// fill、账户 NAV、Policy 激活或 learning 完成。
+// Rust 机制：泛型 `ObserverSection<T>` 用 `Option<T>` 承载可选数据；observer 子模块通过
+// `#[path] mod` 共享私有类型；trait/泛型解析 payload，`tokio::join!/timeout` 并行且有界
+// 读取外部 Paper 数据，StoreExecutor 保持持久化读取串行。
+
 use super::*;
 use crate::observer_analytics::{
     benchmark_equity_series, comparison_max_drawdown_ppm, compounded_ppm, managed_realized_pnl,
@@ -38,6 +46,7 @@ pub(crate) struct ObserverSection<T> {
 
 impl<T> ObserverSection<T> {
     fn available(observed_at: DateTime<Utc>, data: T) -> Self {
+        // Available 同时携带 observation time 和拥有的 T；None 只用于明确无数据的 section。
         Self {
             status: ObserverSectionStatus::Available,
             observed_at: Some(observed_at),
@@ -47,6 +56,7 @@ impl<T> ObserverSection<T> {
     }
 
     fn unavailable(reason: impl Into<String>) -> Self {
+        // Unavailable 保留原因而不构造默认对象，避免 UI 把 provider/权限失败看成零值。
         Self {
             status: ObserverSectionStatus::Unavailable,
             observed_at: None,
@@ -56,6 +66,7 @@ impl<T> ObserverSection<T> {
     }
 
     fn pending(reason: impl Into<String>) -> Self {
+        // Pending 表示流程尚未产生足够 durable Outcome/portfolio 事实，与 unavailable 不同。
         Self {
             status: ObserverSectionStatus::Pending,
             observed_at: None,
@@ -248,6 +259,7 @@ pub(crate) enum ObserverPortfolioRange {
 
 impl ObserverPortfolioRange {
     fn paper_range(self) -> PortfolioHistoryRange {
+        // 显式映射 UI range 到 broker API enum，不让字符串直接进入外部请求。
         match self {
             Self::OneDay => PortfolioHistoryRange::OneDay,
             Self::OneWeek => PortfolioHistoryRange::OneWeek,
@@ -257,6 +269,7 @@ impl ObserverPortfolioRange {
     }
 
     fn as_query_value(self) -> &'static str {
+        // 返回静态 query 值，避免把 range 序列化成不受支持的任意窗口。
         match self {
             Self::OneDay => "1d",
             Self::OneWeek => "1w",
@@ -266,6 +279,8 @@ impl ObserverPortfolioRange {
     }
 
     fn benchmark_start(self, now: DateTime<Utc>) -> NaiveDate {
+        // 这是 observer 查询的有界起点；实际交易日过滤仍由 provider/bar 对齐逻辑决定，
+        // 不是 Outcome 的交易 Session 计数。
         let days = match self {
             Self::OneDay => 1,
             Self::OneWeek => 8,

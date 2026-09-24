@@ -1,9 +1,12 @@
+// 文件导读：查询 impl 把 Artifact、WorkflowRevision/Snapshot、Trajectory 和 OutcomeSchedule
+// 恢复成只读投影；SQL 结果会继续校验 graph/task/attempt/source lineage，而不是只信列值。
 impl Store {
     pub fn artifact(&self, artifact_id: &ArtifactId) -> StoreResult<Artifact> {
         let connection = self.connection()?;
         read_artifact(&connection, artifact_id)
     }
 
+    // 先运行 Contract/Policy history 校验，再按 source_artifact_id/kind 查询引用者。
     pub fn artifacts_referencing(
         &self,
         source_artifact_id: &ArtifactId,
@@ -74,6 +77,7 @@ impl Store {
             .collect()
     }
 
+    // 使用调用方连接恢复指定 revision，避免事务内再次获取 Store Mutex。
     fn workflow_revision_with_connection(
         &self,
         connection: &Connection,
@@ -102,6 +106,7 @@ impl Store {
         self.hydrate_workflow_revision(connection, row)
     }
 
+    // 在同一连接中读取 Run、最新 revision、Task active Attempt、dependencies 和 cancel 标志。
     fn workflow_snapshot_with_connection(
         &self,
         connection: &Connection,
@@ -320,6 +325,7 @@ impl Store {
         })
     }
 
+    // 从 graph Artifact/CAS payload 恢复 typed WorkflowRevision，并确认 kind/时间有效。
     fn hydrate_workflow_revision(
         &self,
         connection: &Connection,
@@ -341,6 +347,7 @@ impl Store {
         })
     }
 
+    // 按 revision 0..head 重放 graph predecessor、budget 和 proposal source closure。
     fn verify_workflow_history(
         &self,
         connection: &Connection,
@@ -381,6 +388,7 @@ impl Store {
         Ok(())
     }
 
+    // 将单个 lifecycle event 转为脱敏 trajectory entry；provider/tool payload 解析失败仍保留元数据。
     fn trajectory_entry(&self, event: &StoredEvent) -> StoreResult<Option<TrajectoryEntry>> {
         let lifecycle = event.lifecycle_kind()?;
         let base = |artifact: Option<&Artifact>| TrajectoryEntry {
@@ -515,6 +523,7 @@ impl Store {
         }
     }
 
+    // Doctor 逐个验证 OutcomeSchedule 的 purpose/lifecycle/source closure 和 execution lineage。
     fn verify_outcome_schedule_history(&self, connection: &Connection) -> StoreResult<()> {
         let artifact_ids = connection
             .prepare(

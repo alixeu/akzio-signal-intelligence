@@ -5,6 +5,7 @@ import SwiftUI
 // Search plus five facets. Every control here is a view filter over the loaded page —
 // it never queries or mutates the Store.
 struct ArchiveFilterBar: View {
+    // Binding 把筛选输入直接交给 RunArchivePage；本组件只负责编辑和展示，不加载数据。
     @Binding var query: String
     @Binding var purpose: RunPurpose?
     @Binding var status: WorkflowStatus?
@@ -14,9 +15,11 @@ struct ArchiveFilterBar: View {
 
     @Environment(\.motionPolicy) private var policy
     @Environment(\.appLanguage) private var language
+    // 本地状态属于筛选条生命周期；当前筛选选项由 Menu 直接展开，值仍通过上面的 Binding 回流。
     @State private var showsMore = false
 
     var body: some View {
+        // 每个控件都修改父页的 Binding，activeFilters/resultLabel 则是父页计算好的只读反馈。
         VStack(alignment: .leading, spacing: AkzioLayout.s2) {
             HStack(spacing: AkzioLayout.s2) {
                 searchField
@@ -50,6 +53,7 @@ struct ArchiveFilterBar: View {
     }
 
     private var searchField: some View {
+        // TextField 绑定查询字符串；清除按钮闭包只清空本地输入，不触发额外查询。
         HStack(spacing: 5) {
             Image(systemName: "magnifyingglass")
                 .font(.system(size: 10, weight: .medium))
@@ -77,6 +81,7 @@ struct ArchiveFilterBar: View {
     }
 
     private var purposeMenu: some View {
+        // 菜单闭包捕获 Binding，通过 nil 表示取消目的筛选。
         Menu {
             Button(L10n.text("All Purposes", language: language)) { purpose = nil }
             Divider()
@@ -91,6 +96,7 @@ struct ArchiveFilterBar: View {
     }
 
     private var statusMenu: some View {
+        // 状态菜单与目的菜单保持同一数据流，只改变父页传入的状态 Binding。
         Menu {
             Button(L10n.text("All Statuses", language: language)) { status = nil }
             Divider()

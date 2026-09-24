@@ -6,6 +6,8 @@ import SwiftUI
 // Title and status change first; metrics and prose follow in a short stagger, so
 // the eye lands on "what is this / how is it doing" before the detail arrives.
 struct StageInspectorPanel: View {
+    // inspector/node 都是已由 ObservatoryStore 组装的只读 projection；onDismiss 是可选的
+    // UI 闭包，面板不会从这里重新读取 Rust Store 或 provider raw payload。
     let inspector: StageInspectorPresentation
     let node: WorkflowNodePresentation?
     let namespace: Namespace.ID?
@@ -16,6 +18,8 @@ struct StageInspectorPanel: View {
     @Environment(\.appLanguage) private var language
 
     var body: some View {
+        // 各 section 以 projection 中的数组是否为空决定是否显示；analysisRecords 已是
+        // Observer-safe 的模型/工具/ Rust 输出记录，不等于隐藏 chain-of-thought。
         VStack(alignment: .leading, spacing: AkzioLayout.s3) {
             header
             HairlineDivider()
@@ -129,6 +133,8 @@ struct StageInspectorPanel: View {
     // MARK: Header
 
     private var header: some View {
+        // header 先展示阶段名称和 status，再按可选 onDismiss 闭包渲染关闭按钮；Environment
+        // 的 motion/language 只控制动画和本地化。
         VStack(alignment: .leading, spacing: AkzioLayout.s2) {
             HStack(spacing: AkzioLayout.s2) {
                 Image(systemName: node?.stage.symbol ?? "circle")
@@ -162,6 +168,8 @@ struct StageInspectorPanel: View {
     // MARK: Metrics
 
     private var metrics: some View {
+        // metrics 只格式化已有计数、延迟、token 和 confidence；PpmFormatter 不会重新计算
+        // Rust 的业务指标，也不会把 nil latency/token 当成零值写回 projection。
         LazyVGrid(
             columns: [GridItem(.flexible(), alignment: .leading), GridItem(.flexible(), alignment: .leading)],
             alignment: .leading,
@@ -180,6 +188,7 @@ struct StageInspectorPanel: View {
     }
 
     private func metric(_ label: String, _ value: String) -> some View {
+        // metric 的 value 已在调用点完成单位格式化；akzioNumeric 仅影响数值展示动画。
         VStack(alignment: .leading, spacing: 2) {
             Text(L10n.text(label, language: language)).akzioText(.caption)
             Text(L10n.text(value, language: language))
@@ -194,6 +203,8 @@ struct StageInspectorPanel: View {
         index: Int,
         @ViewBuilder content: () -> Content
     ) -> some View {
+        // @ViewBuilder content 是同步的局部构建闭包；index 只决定 staggeredReveal 的动画
+        // 顺序，不改变 section 的数据生命周期。
         VStack(alignment: .leading, spacing: AkzioLayout.s2) {
             Text(L10n.text(title, language: language)).akzioText(.caption)
             content()
@@ -203,6 +214,8 @@ struct StageInspectorPanel: View {
 
 }
 
+// AnalysisRecordRow 只展示 Store 投影的时间线记录；ObservedMarkdown 负责本地文本分块，
+// copy/timestamp 两个 helper 也只触及桌面端展示环境。
 /// Chat-style Observer transcript. Model summaries conclusions share one
 /// AI voice; tool lifecycle stays visually distinct.
 struct AnalysisRecordRow: View {
@@ -212,6 +225,8 @@ struct AnalysisRecordRow: View {
     @Environment(\.appLanguage) private var language
 
     var body: some View {
+        // tool、Rust output 和普通模型记录用不同 accent 区分；record.isStreaming 只显示
+        // 活跃标记，不能据此断言底层模型连接仍然存在。
         VStack(alignment: .leading, spacing: AkzioLayout.s3) {
             HStack(alignment: .firstTextBaseline, spacing: AkzioLayout.s2) {
                 Text(L10n.text(record.kind.displayName, language: language))
@@ -268,6 +283,7 @@ struct AnalysisRecordRow: View {
     }
 
     private var accent: Color {
+        // accent 是 kind 到颜色的确定性映射，颜色变化不参与状态判定。
         switch record.kind {
         case .tool:
             Color(nsColor: .systemPurple)
@@ -279,6 +295,8 @@ struct AnalysisRecordRow: View {
     }
 
     private var localizedBody: String {
+        // tool 记录只把第一个 " · " 前的事件名本地化，参数/其余审计文本原样保留；其他
+        // 记录整体交给 L10n，避免修改 Store 中的原始 body。
         guard record.kind == .tool else {
             return L10n.text(record.body, language: language)
         }
@@ -290,11 +308,14 @@ struct AnalysisRecordRow: View {
     }
 
     private func copyBody() {
+        // 复制写入 macOS pasteboard，不回写 record，也不触发 Core/Store 请求。
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(record.body, forType: .string)
     }
 
     private func timestamp(_ date: Date) -> String {
+        // DateFormatter 每次按当前语言 locale 格式化观察时间；它只改变显示格式，不改变
+        // projection 中的 Date 或事件顺序。
         let formatter = DateFormatter()
         formatter.locale = language.locale
         formatter.dateFormat = "dd/MM/yyyy, h:mm:ss a"

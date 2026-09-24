@@ -1,3 +1,5 @@
+// 文件导读：Campaign head 的 stage/transition 使用 daemon lease 和 Immediate 事务；
+// 重复 verdict 只返回已有 head，状态推进不会重新计算或覆盖历史评价。
 impl Store {
     pub fn stage_canary_campaign(
         &self,

@@ -1,3 +1,6 @@
+// 文件导读：本文件是低层读取/状态收束 helper：Attempt outputs 只索引成功提交的 Artifact，
+// run status 从全部 Task 行派生，所有 JSON/时间/Policy subject 解析失败都以 Integrity 返回。
+// 成功 Attempt 的 Artifact 与对应 artifact.committed cursor 建立唯一索引，重复插入保持幂等。
 fn record_attempt_output(
     transaction: &Transaction<'_>,
     permit: &TaskWritePermit,
@@ -18,6 +21,7 @@ fn record_attempt_output(
     Ok(())
 }
 
+// 先确认 Attempt 和 Task 都是 succeeded，再按 artifact.committed 事件恢复正式输出。
 fn read_committed_attempt_outputs(
     connection: &Connection,
     expected_run_id: Option<&RunId>,
@@ -88,6 +92,7 @@ fn read_committed_attempt_outputs(
         .collect()
 }
 
+// 所有 Task 离开 queued/running 后才更新 Run 终态；失败优先于全 cancelled。
 fn refresh_run_status(
     transaction: &Transaction<'_>,
     run_id: &RunId,
@@ -118,6 +123,7 @@ fn refresh_run_status(
     Ok(())
 }
 
+// 从 Artifact 行和 source refs 重建领域对象，列值/JSON/时间任一损坏都阻断读取。
 fn read_artifact(connection: &Connection, artifact_id: &ArtifactId) -> StoreResult<Artifact> {
     let row = connection
         .query_row(
@@ -183,6 +189,7 @@ fn read_artifact(connection: &Connection, artifact_id: &ArtifactId) -> StoreResu
     })
 }
 
+// 按 created_at/artifact_id 稳定顺序读取指定 kind，不改变 lifecycle 或 head。
 fn read_kind_artifacts(connection: &Connection, kind: ArtifactKind) -> StoreResult<Vec<Artifact>> {
     let mut statement = connection.prepare(
         "SELECT artifact_id FROM rebuild_artifacts WHERE kind = ?1 ORDER BY created_at ASC, artifact_id ASC",
@@ -195,6 +202,7 @@ fn read_kind_artifacts(connection: &Connection, kind: ArtifactKind) -> StoreResu
         .collect()
 }
 
+// Doctor 按 Run/outcome/horizon 识别最多一条正常记录和一条合法 narrative repair。
 fn verify_retrospective_history(store: &Store, connection: &Connection) -> StoreResult<()> {
     let mut identities = BTreeMap::<_, Vec<(Artifact, Retrospective)>>::new();
     for artifact in read_kind_artifacts(connection, ArtifactKind::Retrospective)? {
@@ -284,6 +292,7 @@ fn verify_retrospective_history(store: &Store, connection: &Connection) -> Store
     Ok(())
 }
 
+// 验证每个 AttemptRelation 的 parent/child 存在、单父关系和无环链。
 fn verify_attempt_relation_history(store: &Store, connection: &Connection) -> StoreResult<()> {
     let mut parent_by_child = BTreeMap::<(RunId, TaskId, AttemptId), AttemptId>::new();
     for artifact in read_kind_artifacts(connection, ArtifactKind::AttemptRelation)? {
@@ -347,6 +356,7 @@ fn verify_attempt_relation_history(store: &Store, connection: &Connection) -> St
     Ok(())
 }
 
+// 将 Task SQL 列解析为 WorkflowNode；dependencies 在独立查询中恢复以保持列职责清晰。
 fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<(RunId, WorkflowNode)> {
     let task_id = TaskId(row.get(0)?);
     let run_id = RunId(row.get(1)?);
@@ -382,6 +392,7 @@ fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<(RunId, WorkflowNode
     ))
 }
 
+// Store 时间统一按 RFC3339 解析为 UTC，坏时间作为 Integrity 而不是默认当前时间。
 fn parse_time(value: &str) -> StoreResult<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .map(|value| value.with_timezone(&Utc))
@@ -395,6 +406,7 @@ fn parse_persisted_subject(subject_id: &str) -> StoreResult<PolicySubject> {
     Ok(PolicySubject::from_subject_id(subject_id)?)
 }
 
+// 由 evaluation_artifact_id 恢复 policy ledger 行，并把 subject/cursor/state 解析为 typed 值。
 fn read_policy_evaluation(
     connection: &Connection,
     evaluation_artifact_id: &ArtifactId,
@@ -475,6 +487,7 @@ fn read_run_kind_artifacts(
         .collect()
 }
 
+// 仅允许同一 T5 Outcome 的 ModelUnavailable -> Complete narrative revision。
 fn valid_retrospective_repair(
     previous: &Artifact,
     old: &Retrospective,

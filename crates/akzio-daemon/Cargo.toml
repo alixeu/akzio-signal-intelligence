@@ -1,3 +1,4 @@
+# 文件职责：声明常驻 Daemon、HTTP/SSE、调度和 worker 分发 crate 的依赖边界。
 [package]
 name = "akzio-daemon"
 version = "0.2.0"

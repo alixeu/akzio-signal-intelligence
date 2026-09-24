@@ -1,3 +1,5 @@
+// 文件导读：这里仅探测 Lesson 三张表的形状，兼容没有 evidence ledger 的旧 Store；
+// 它不会创建表，创建动作由 lesson/queries_verify.rs 的显式入口负责。
 fn ensure_lesson_table_set(connection: &Connection) -> StoreResult<u64> {
     let table_count = connection.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('rebuild_lesson_heads', 'rebuild_lesson_events', 'rebuild_lesson_evidence')",

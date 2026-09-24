@@ -1,6 +1,9 @@
 const NO_LLM_QQQ_WEIGHT_PPM: u32 = 500_000;
 const NO_LLM_SOXX_WEIGHT_PPM: u32 = 500_000;
 
+// 文件导读：benchmark 只对同一冻结观察路径做归因；它报告可用或不可用的原因，
+// 不会把样本不足、退化参考路径或非正 NAV 静默转换成 0 收益。
+
 pub(super) struct OutcomeBenchmarkAttributionInput<'a> {
     pub target: &'a TargetPortfolio,
     pub baseline_prices: &'a BTreeMap<Asset, MoneyMicros>,
@@ -16,6 +19,8 @@ pub(super) struct OutcomeBenchmarkAttributionInput<'a> {
 pub(super) fn outcome_benchmark_attributions(
     input: OutcomeBenchmarkAttributionInput<'_>,
 ) -> EvaluationRuntimeResult<Vec<OutcomeBenchmarkAttribution>> {
+    // 只截取 observed_through 之前已经治理的日频观察；portfolio_net_return 先合并
+    // 估值调整并扣除真实交易成本/可扣滑点，再与各 benchmark 的净值路径比较。
     let governed_observations = input
         .daily_observations
         .iter()
@@ -48,6 +53,8 @@ pub(super) fn outcome_benchmark_attributions(
     OutcomeBenchmark::ALL
         .into_iter()
         .map(|benchmark| {
+            // 每类 benchmark 有自己的最小样本数，同时不能早于当前 Outcome horizon；
+            // 不满足时保留 Unavailable(reason)，这样部分窗口仍可审计而不是伪造结果。
             let required_samples = benchmark
                 .minimum_samples()
                 .max(u32::from(input.horizon.trading_days()));
@@ -103,6 +110,7 @@ pub(super) fn outcome_benchmark_attributions(
                     )
                 }
                 OutcomeBenchmark::BetaMatchedQqq => {
+                    // beta 缩放需要投资组合与 QQQ 日收益长度相同且参考方差非退化。
                     let Some(scale_ppm) = beta_scale_ppm(&gross_portfolio_path, &qqq_path) else {
                         return unavailable_attribution(
                             benchmark,
@@ -120,6 +128,8 @@ pub(super) fn outcome_benchmark_attributions(
                     )
                 }
                 OutcomeBenchmark::VolatilityTargetedQqq => {
+                    // 波动率缩放同样要求两个路径有足够样本和正的有限标准差；scale 只
+                    // 用于构造诊断 benchmark NAV，不改变原始 portfolio 结果。
                     let Some(scale_ppm) = volatility_scale_ppm(&gross_portfolio_path, &qqq_path)
                     else {
                         return unavailable_attribution(
@@ -143,6 +153,7 @@ pub(super) fn outcome_benchmark_attributions(
 }
 
 fn benchmark_target(benchmark: OutcomeBenchmark) -> TargetPortfolio {
+    // benchmark target 复用四资产执行全集；Cash/派生 QQQ benchmark 不在这里伪造持仓。
     let mut target = TargetPortfolio::zeroed();
     match benchmark {
         OutcomeBenchmark::Qqq => {
@@ -198,6 +209,8 @@ fn available_attribution(
     portfolio_net_return_ppm: i64,
     scale_ppm: Option<i64>,
 ) -> EvaluationRuntimeResult<OutcomeBenchmarkAttribution> {
+    // active_return = 组合净收益 - benchmark 最终 NAV 收益；definition hash 随结果保存，
+    // 让同一 benchmark 口径的变化不会悄悄重解释历史 Outcome。
     let benchmark_return_ppm = nav_path
         .last()
         .ok_or(EvaluationError::InvalidMaterialization(
@@ -247,6 +260,8 @@ fn scaled_qqq_attribution(
     portfolio_net_return_ppm: i64,
     required_samples: u32,
 ) -> EvaluationRuntimeResult<OutcomeBenchmarkAttribution> {
+    // 每天按 scale 缩放 QQQ 的日收益并递推 NAV；一旦派生 NAV 非正，该 benchmark 只记为
+    // unavailable，避免用无效路径算 active return。
     let mut previous_nav = i64::from(PPM_ONE);
     let mut path = Vec::with_capacity(qqq_path.len());
     for point in qqq_path {
@@ -280,6 +295,7 @@ fn scaled_qqq_attribution(
 }
 
 fn beta_scale_ppm(portfolio: &[OutcomeNavPoint], qqq: &[OutcomeNavPoint]) -> Option<i64> {
+    // beta = Cov(portfolio, QQQ) / Var(QQQ)，返回 ppm；方差为零时没有可识别的缩放因子。
     let portfolio_returns = portfolio
         .iter()
         .map(|point| point.portfolio_daily_return_ppm as f64)
@@ -310,6 +326,7 @@ fn beta_scale_ppm(portfolio: &[OutcomeNavPoint], qqq: &[OutcomeNavPoint]) -> Opt
 }
 
 fn volatility_scale_ppm(portfolio: &[OutcomeNavPoint], qqq: &[OutcomeNavPoint]) -> Option<i64> {
+    // volatility target 用 portfolio 波动率 / QQQ 波动率；标准差函数会拒绝太短或退化路径。
     let portfolio_returns = portfolio
         .iter()
         .map(|point| point.portfolio_daily_return_ppm as f64)

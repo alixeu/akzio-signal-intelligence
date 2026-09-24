@@ -1,3 +1,5 @@
+// 文件导读：定义实验 Trial、指标、搜索偏差政策和证书。
+// 时间点泄漏控制与搜索偏差控制分开记录，任何一项缺失都不会被另一项推断补齐。
 //! Immutable experiment-trial and search-bias evidence contracts.
 //!
 //! These records separate point-in-time leakage controls from search-bias
@@ -48,6 +50,7 @@ pub struct ExperimentTrialMetrics {
 }
 
 impl ExperimentTrialMetrics {
+    // 检查共同切片数量、收益/Sharpe 的幅度边界，拒绝异常大数污染比较。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.slice_returns_ppm.len() < 2
             || self.slice_returns_ppm.len() > 10_000
@@ -110,12 +113,14 @@ pub struct ExperimentTrial {
 }
 
 impl ExperimentTrial {
+    // 先按当前身份字段计算 trial_id，再验证完整生命周期和状态条件。
     pub fn seal(mut self) -> Result<Self, DomainError> {
         self.trial_id = self.identity_hash()?;
         self.validate()?;
         Ok(self)
     }
 
+    // 哈希覆盖候选、数据集窗口、模型身份、状态、指标、来源和时间字段。
     pub fn identity_hash(&self) -> Result<ContentHash, DomainError> {
         content_hash_json(&serde_json::json!({
             "schema_version": self.schema_version,
@@ -154,6 +159,7 @@ impl ExperimentTrial {
         .map_err(|_| DomainError::InvalidContentHash)
     }
 
+    // 校验日期不重叠/不逆序、holdout 访问计数、状态特定字段和指标结构。
     pub fn validate(&self) -> Result<(), DomainError> {
         self.subject.validate()?;
         if self.schema_version != DOMAIN_SCHEMA_VERSION
@@ -237,6 +243,7 @@ impl ExperimentTrial {
     }
 
     pub const fn is_contamination_controlled(&self) -> bool {
+        // 只有 FullyMasked 或 PostCutoffForward 能证明该 Trial 具备污染控制条件。
         matches!(
             self.condition,
             ExperimentCondition::FullyMasked | ExperimentCondition::PostCutoffForward
@@ -259,11 +266,13 @@ pub struct SearchBiasAcceptancePolicy {
 }
 
 impl SearchBiasAcceptancePolicy {
+    // 计算政策自身的序列化身份哈希，供证书绑定。
     pub fn identity_hash(&self) -> Result<ContentHash, DomainError> {
         content_hash_json(&serde_json::to_value(self).map_err(|_| DomainError::InvalidContentHash)?)
             .map_err(|_| DomainError::InvalidContentHash)
     }
 
+    // 校验最小全局试验数和两个概率/错误率的 ppm 上限。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.min_global_trial_count < 2
             || self.max_probability_of_backtest_overfitting_ppm > 1_000_000
@@ -286,6 +295,7 @@ pub struct MetricIdentity {
 }
 
 impl MetricIdentity {
+    // 指标名和版本非空；实现/假设哈希由调用方提供并参与上层证书身份。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.metric_name.trim().is_empty() || self.metric_version.trim().is_empty() {
             return Err(DomainError::EmptyField {
@@ -328,12 +338,14 @@ pub struct SearchBiasCertificate {
 }
 
 impl SearchBiasCertificate {
+    // 先封存 certificate_id，再验证 Trial 引用、holdout、污染和指标条件。
     pub fn seal(mut self) -> Result<Self, DomainError> {
         self.certificate_id = self.identity_hash()?;
         self.validate()?;
         Ok(self)
     }
 
+    // 哈希覆盖所有试验统计、污染对照、Policy/Metric 身份和创建时间。
     pub fn identity_hash(&self) -> Result<ContentHash, DomainError> {
         content_hash_json(&serde_json::json!({
             "schema_version": self.schema_version,
@@ -359,6 +371,7 @@ impl SearchBiasCertificate {
         .map_err(|_| DomainError::InvalidContentHash)
     }
 
+    // 校验证书身份、Trial 集合排序/计数、指标范围和 selected_condition 所需字段。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION
             || self.certificate_id != self.identity_hash()?
@@ -422,6 +435,7 @@ impl SearchBiasCertificate {
         Ok(())
     }
 
+    // 判断证书是否已有晋级所需的核心统计量、唯一 holdout 和非污染结果。
     pub fn is_promotion_ready(&self) -> bool {
         self.deflated_sharpe_ratio_ppm.is_some()
             && self.probability_of_backtest_overfitting_ppm.is_some()
@@ -431,6 +445,7 @@ impl SearchBiasCertificate {
             && self.contamination_risk != Some(true)
     }
 
+    // 将证书指标与接受政策逐项比较；任何结构/策略校验失败都返回 false。
     pub fn permits_promotion(&self, policy: &SearchBiasAcceptancePolicy) -> bool {
         self.validate().is_ok()
             && policy.validate().is_ok()

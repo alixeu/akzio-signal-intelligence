@@ -1,3 +1,5 @@
+// 文件导读：本文件提供 Outcome/Retrospective、Policy head/transition 和消费 cursor 的
+// 只读历史查询；每个返回值都来自 canonical evaluation 或明确的 Run artifact lineage。
 impl Store {
     /// Authoritative once-per-subject Outcome consumption lookup.
     pub fn policy_evaluation_for_outcome(

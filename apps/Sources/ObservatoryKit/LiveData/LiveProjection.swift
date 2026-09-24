@@ -1,6 +1,7 @@
 import Foundation
 
 struct LiveProjection: Sendable {
+    // Projection 是跨 Task 传递的不可变值快照；View 读取它，不直接共享 Observer 的可变解码对象。
     let generatedAt: Date
     let run: RunPresentation
     let workflow: WorkflowPresentation
@@ -19,6 +20,7 @@ struct LiveProjection: Sendable {
         reasoningRecords: [LiveReasoningRecord] = [],
         now: Date = Date()
     ) {
+        // 一个 payload 只生成一套 run/workflow/archive/页面投影；now 可注入以保持截图和测试确定性。
         generatedAt = payload.generatedAt
         let workflows = payload.runs
         let current = workflows.first
@@ -47,6 +49,7 @@ struct LiveProjection: Sendable {
         outcome = Self.outcome(payload)
         learning = Self.learning(payload)
         let readinessPpm = payload.core.readinessPpm.map(Int.init)
+        // health 只汇总 Core 已提供的 readiness/health/policy/news/alerts/cursor，不把缺失值补成成功。
         health = [
             HealthMetric(
                 id: "readiness",
@@ -106,6 +109,7 @@ struct LiveProjection: Sendable {
         payload: ObserverSnapshotPayload,
         now: Date
     ) -> RunPresentation {
+        // 没有 current workflow 时返回明确 unavailable/debug 占位；有 workflow 时 elapsed 由快照时间和注入 now 得到。
         guard let workflow else {
             return RunPresentation(
                 runId: "unavailable",
@@ -153,6 +157,7 @@ struct LiveProjection: Sendable {
         outcome: ObserverOutcomePayload?,
         reasoningRecords: [LiveReasoningRecord]
     ) -> WorkflowPresentation {
+        // workflow 投影只把 Core task/dependency/trajectory 映射到布局；stage/status 的解释仍是显示层映射。
         guard let workflow else { return unavailableWorkflow }
         let trajectory = detail?.trajectory ?? []
         var analystIndex = 0
@@ -194,6 +199,7 @@ struct LiveProjection: Sendable {
             uniqueKeysWithValues: (detail?.artifacts ?? []).map { ($0.artifactID, $0) }
         )
         let inspectorPairs: [(String, StageInspectorPresentation)] = workflow.tasks.compactMap {
+            // 每个 task 只生成自己的 inspector；找不到 stage 时返回 nil，不为未知 recipe 猜测角色。
             task -> (String, StageInspectorPresentation)? in
             guard let stage = taskStages[task.node.taskID] else { return nil }
             return (
@@ -243,6 +249,7 @@ struct LiveProjection: Sendable {
         reasoningRecords: [LiveReasoningRecord],
         researchAudit: [ResearchAuditRowPresentation] = []
     ) -> StageInspectorPresentation {
+        // inspector 的 token/tool/model 字段来自 trajectory 的最后/累计记录；Optional 保持“未观测”与 0 区分。
         let entries = trajectory.filter { $0.taskID == task.node.taskID }
         let deliberation = entries.compactMap(\.deliberation).last
         let uncertaintyWeights = deliberation?.uncertaintyWeightPpm ?? []
@@ -279,6 +286,7 @@ struct LiveProjection: Sendable {
                 outputTokens: entry.outputTokens.map(Int.init)
             )
         }
+        // CoreModelStage 命中时才显示模型/provider 缺失；纯 Rust task 明确显示 Rust/N/A，避免混淆执行器与 LLM。
         let modelMediated = CoreModelStage(rawValue: task.node.recipeID) != nil
         return StageInspectorPresentation(
             stageTitle: stage.displayName,
@@ -333,6 +341,7 @@ struct LiveProjection: Sendable {
         from entries: [ObserverTrajectoryPayload],
         artifactsByID: [String: ObserverArtifactPayload]
     ) -> [ObserverArtifactPayload] {
+        // 通过 artifactID 和 outputRefs 去重，再按 trajectory 首次出现顺序返回可展示的模型产物。
         var seen = Set<String>()
         var artifactIDs: [String] = []
         for entry in entries {
@@ -352,6 +361,7 @@ struct LiveProjection: Sendable {
     }
 
     private static func modelConclusion(from artifact: ObserverArtifactPayload) -> String? {
+        // 不同 artifact kind 使用各自受控字段读取结论；未知 kind 返回 nil，不把任意 JSON 文本当成结论。
         let keys: [String]
         switch artifact.kind {
         case "claim":
@@ -367,6 +377,7 @@ struct LiveProjection: Sendable {
     }
 
     private static func boundedJSON(_ payload: JSONValue) -> String {
+        // 大 payload 只在 UI 展示层截断到行数/字符数上限；原始 Codable/Store Artifact 不被修改。
         let rendered = payload.prettyPrinted
         let lines = rendered.split(separator: "\n", omittingEmptySubsequences: false)
         let lineLimited = lines.prefix(80).joined(separator: "\n")
@@ -383,6 +394,7 @@ struct LiveProjection: Sendable {
     ]
 
     static var unavailableWorkflow: WorkflowPresentation {
+        // 没有 durable workflow 时保留空 nodes/edges 和 unavailable inspector，UI 不模拟任务进度。
         WorkflowPresentation(
             nodes: [],
             edges: [],
@@ -410,6 +422,7 @@ struct LiveProjection: Sendable {
         _ workflows: [ObserverWorkflowPayload],
         summaries: [String: ObserverRunSummaryPayload]
     ) -> ArchivePresentation {
+        // archive 每行保留 Run 的原始 purpose/status；successRate 只按 terminal runs 计算，未结束 Run 不进入分母。
         let rows = workflows.map { workflow -> ArchiveRowPresentation in
             let status = workflowStatus(workflow.status)
             let summary = summaries[workflow.run.runID]
@@ -458,6 +471,7 @@ struct LiveProjection: Sendable {
     }
 
     private static func agents(_ workflow: ObserverWorkflowPayload?) -> [AgentRailItem] {
+        // agent rail 是 task 的显示列表；Rust task 没有模型轨迹时显示 Rust task，不冒充 LLM 调用。
         guard let workflow else { return [] }
         var analystIndex = 0
         return workflow.tasks.compactMap { task in
@@ -480,6 +494,7 @@ struct LiveProjection: Sendable {
         for recipeID: String,
         analystIndex: inout Int
     ) -> WorkflowStageKind {
+        // recipeID 到 UI stage 是兼容映射；未命名节点按出现顺序编号 analyst，不能反向改变 Core graph。
         let value = recipeID.lowercased()
         if value.contains("planner") { return .planner }
         if value.contains("evidence") { return .evidenceGate }
@@ -496,18 +511,22 @@ struct LiveProjection: Sendable {
     }
 
     private static func runPurpose(_ value: String) -> RunPurpose {
+        // 未知 purpose 只回退 debug 展示；这不会修改 Rust payload 或授予新的执行权限。
         RunPurpose(rawValue: value) ?? .debug
     }
 
     private static func workflowStatus(_ value: String) -> WorkflowStatus {
+        // 未知 workflow status 回退 queued，保持状态机的保守显示边界。
         WorkflowStatus(rawValue: value) ?? .queued
     }
 
     private static func taskStatus(_ value: String) -> TaskStatus {
+        // 未知 task status 回退 pending，不把未识别状态当成 succeeded。
         TaskStatus(rawValue: value) ?? .pending
     }
 
     private static func dateLabel(_ date: Date) -> String {
+        // DateFormatter 仅负责稳定的 POSIX 展示格式，Date 本身和 Core 时间戳不被修改。
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "yyyy-MM-dd HH:mm"
@@ -515,6 +534,7 @@ struct LiveProjection: Sendable {
     }
 
     private static func timeLabel(_ date: Date) -> String {
+        // 时间标签同样是纯 projection helper，用于 archive/event 的显示，不参与排序。
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "HH:mm:ss"
@@ -525,6 +545,7 @@ struct LiveProjection: Sendable {
 
 private extension WorkflowStatus {
     var isTerminal: Bool {
+        // 终态集合只影响 archive success-rate 分母；queued/leased/running 保持未完成。
         switch self {
         case .queued, .leased, .running: false
         case .decisionCompleted, .completed, .completedWithExecutionRejection, .failed, .cancelled:

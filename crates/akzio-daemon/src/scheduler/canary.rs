@@ -1,3 +1,11 @@
+// 文件导读：Canary scheduler 在有效 approval/runtime identity、candidate Contract/Topology、
+// broker account/feed 和当前 active analyst 条件都匹配时，原子准备 parent Paper Run 与
+// 三个 Shadow Run。它只预约比较实验，不把 candidate 变成 active，也不授予 Paper fill 或
+// learning 权限；后续 Outcome/canary evaluation 另行完成。
+// Rust 机制：泛型 clock 借用 trait object 并 await 外部观察；多个 `move` 闭包分别拥有
+// run/proposal/setup 进入 StoreExecutor；`Option`/`Result` 把缺 approval、缺 cohort、身份
+// 漂移转换为等待或 fail closed。
+
 use super::*;
 
 impl PaperScheduler {

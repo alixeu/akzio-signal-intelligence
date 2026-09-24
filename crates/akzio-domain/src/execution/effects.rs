@@ -1,3 +1,5 @@
+// 文件导读：记录执行 Gate 的 NoOrder/Accepted verdict、冻结状态、Commitment、
+// Broker receipt、取消/重价 lineage 和 Reconciliation；每个对象先落 Rust 意图再允许副作用。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NoOrder {
     pub execution_context: ArtifactRef,
@@ -6,6 +8,7 @@ pub struct NoOrder {
 }
 
 impl NoOrder {
+    // NoOrder 必须关联 ExecutionContext，并至少记录一个硬 blocker。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.execution_context.kind != ArtifactKind::ExecutionContext || self.blockers.is_empty()
         {
@@ -25,6 +28,7 @@ pub enum ExecutionVerdict {
 }
 
 impl ExecutionVerdict {
+    // Accepted 只检查上下文 kind；NoOrder 复用其完整 blocker 校验。
     pub fn validate(&self) -> Result<(), DomainError> {
         match self {
             Self::Accepted { execution_context } => {
@@ -51,6 +55,7 @@ pub struct FreezeState {
 }
 
 impl FreezeState {
+    // 校验 schema 和非空冻结/解冻原因；历史状态以新 Artifact 追加而非原地修改。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION || self.reason.trim().is_empty() {
             return Err(DomainError::EmptyField {
@@ -72,6 +77,7 @@ pub struct PaperCommitment {
 }
 
 impl PaperCommitment {
+    // 校验 commitment 身份、执行上下文、broker session 和所有 client order ID 非空。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.commitment_id.0.trim().is_empty()
             || self.broker_session.trim().is_empty()
@@ -110,6 +116,7 @@ pub enum OrderReceiptState {
 }
 
 impl OrderReceiptState {
+    // 终态不应再有后继 receipt；这些状态之外仍可能收到 Broker 更新。
     pub const fn is_final_without_successor(self) -> bool {
         matches!(
             self,
@@ -117,6 +124,7 @@ impl OrderReceiptState {
         )
     }
 
+    // 判断状态是否允许后续对账/更新事件继续到达。
     pub const fn may_receive_further_updates(self) -> bool {
         matches!(
             self,
@@ -150,6 +158,7 @@ pub struct OrderReceipt {
 }
 
 impl OrderReceipt {
+    // 校验订单身份、数量守恒、价格符号以及 state 与成交/剩余数量的一致性。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.client_order_id.trim().is_empty()
             || self.broker_order_id.trim().is_empty()
@@ -175,6 +184,7 @@ impl OrderReceipt {
                 field: "order_receipt.quantity",
             });
         }
+        // match 把 Broker 状态映射到精确的成交量/均价条件，避免只看 status 字符串。
         let state_is_consistent = match self.state {
             OrderReceiptState::Accepted => {
                 self.filled_quantity_micros == 0
@@ -237,6 +247,7 @@ pub struct PaperCancel {
 }
 
 impl PaperCancel {
+    // 取消意图必须绑定原 Commitment、Prior receipt 和两侧 broker/client ID。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION
             || self.cancel_id.0.trim().is_empty()
@@ -270,6 +281,7 @@ pub struct PaperReprice {
 }
 
 impl PaperReprice {
+    // 校验重价对象身份，并强制 client order ID 只能沿 r0 -> r1 单一 lineage。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION
             || self.reprice_id.0.trim().is_empty()
@@ -282,6 +294,7 @@ impl PaperReprice {
                 field: "paper_reprice",
             });
         }
+        // let-else 要求 prior ID 明确以 -r0 结尾，否则不能构成合法重价链。
         let Some(base) = self.prior_client_order_id.strip_suffix("-r0") else {
             return Err(DomainError::InvalidRepriceLineage);
         };
@@ -315,6 +328,7 @@ pub struct Reconciliation {
 }
 
 impl Reconciliation {
+    // 校验 Commitment/receipt kind；Complete 必须有 receipt，成就组合和因子暴露要成对出现。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.reconciliation_id.0.trim().is_empty()
             || self.commitment.kind != ArtifactKind::ExecutionCommitment

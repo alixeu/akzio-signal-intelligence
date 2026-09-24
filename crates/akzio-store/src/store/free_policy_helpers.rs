@@ -1,3 +1,5 @@
+// 文件导读：任务结束 helper 负责把 terminal event、Task/Attempt 状态、失败传播、Debug settle
+// 放进调用方事务；它只收束已经通过 permit 检查的 Attempt，不决定模型或业务是否“成功”。
 fn finish_permitted_task(
     transaction: &Transaction<'_>,
     permit: &TaskWritePermit,
@@ -76,6 +78,7 @@ fn finish_permitted_task(
     Ok(status)
 }
 
+// FailRun 时只取消 queued Task，running Attempt 仍由其 permit/lease 自己收束。
 fn cancel_queued_tasks(
     transaction: &Transaction<'_>,
     run_id: &RunId,
@@ -111,6 +114,7 @@ fn cancel_queued_tasks(
     Ok(())
 }
 
+// FailTask 逐轮传播 failed/cancelled parent，直到没有新的 queued dependent。
 fn cancel_failed_dependents(
     transaction: &Transaction<'_>,
     run_id: &RunId,
@@ -159,6 +163,7 @@ fn cancel_failed_dependents(
     }
 }
 
+// 统一校验事件列形状后插入自增 cursor，并在同一事务中更新 RunControl checkpoint boundary。
 fn append_event(
     transaction: &Transaction<'_>,
     run_id: &RunId,
@@ -192,6 +197,7 @@ fn append_event(
     Ok(cursor)
 }
 
+// 只允许无 Artifact 的 started/abandoned Attempt 事实通过专用入口写入。
 fn append_task_event(
     transaction: &Transaction<'_>,
     permit: &TaskWritePermit,
@@ -219,6 +225,7 @@ fn append_task_event(
     )
 }
 
+// 用事件类型定义 task/attempt/artifact 三列的允许组合，拒绝半成品 lineage。
 fn validate_event_shape(
     event_type: LifecycleEventType,
     has_task_id: bool,

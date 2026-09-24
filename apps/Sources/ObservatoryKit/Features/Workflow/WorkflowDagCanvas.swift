@@ -5,6 +5,8 @@ import SwiftUI
 // Six edge kinds and nine node states in one Canvas. Zoom and pan only change the
 // transform — the layout is never recomputed, so dragging stays free.
 struct WorkflowDagCanvas: View {
+    // workflow、selectedStageID 和所有 shows* 参数都是页面传入的 projection/本地显示状态；
+    // scale/offset 通过 Binding 回写父 View，onSelect 只报告节点 id。
     let workflow: WorkflowPresentation
     let selectedStageID: String?
     let namespace: Namespace.ID?
@@ -22,9 +24,13 @@ struct WorkflowDagCanvas: View {
     @State private var appearTime: Double?
     @GestureState private var dragTranslation: CGSize = .zero
 
+    // layout 由节点的 id/column/row signature 缓存；Canvas 的 status/动画变化不会改变
+    // positions，故缩放和平移只改 transform。
     private var layout: DagLayout { DagLayout.layout(for: workflow.nodes) }
 
     var body: some View {
+        // GeometryReader 提供 viewport，AmbientCanvas 提供时间 tick；内层 Canvas 开启异步
+        // 绘制但仍只读 workflow，命中层单独负责 SwiftUI 的可访问点击。
         GeometryReader { proxy in
             AmbientCanvas { time in
                 let elapsed = growthElapsed(now: time)
@@ -52,6 +58,7 @@ struct WorkflowDagCanvas: View {
                 )
                 .contentShape(Rectangle())
                 .gesture(pan)
+                // appearTime 只在首次出现时记录，避免每个 ambient tick 重置路径动画起点。
                 .onAppear { if appearTime == nil { appearTime = time } }
             }
         }
@@ -61,6 +68,8 @@ struct WorkflowDagCanvas: View {
     }
 
     private var pan: some Gesture {
+        // GestureState 只保存当前拖动帧的临时 translation；结束时才把增量提交到 offset，
+        // 不会把手势坐标写入 Rust workflow。
         DragGesture()
             .updating($dragTranslation) { value, state, _ in state = value.translation }
             .onEnded { value in
@@ -71,6 +80,8 @@ struct WorkflowDagCanvas: View {
 
     /// Path growth runs once on entry. With motion reduced the graph is already whole.
     private func growthElapsed(now: Double) -> Double {
+        // 无 ambient 或尚未记录 appearTime 时直接返回 99，等价于“已完成生长”；这是视觉
+        // fallback，不是节点终态。
         guard canvas.runsAmbient, let appearTime else { return 99 }
         return max(0, now - appearTime)
     }
@@ -78,6 +89,8 @@ struct WorkflowDagCanvas: View {
     // MARK: Edges
 
     private func drawEdges(_ context: inout GraphicsContext, elapsed: Double, time: Double) {
+        // 缺失端点的边被跳过；其余边根据 EdgeKind 绘制线型/颜色，criticalPath 只是视觉
+        // 强调，conflict 的第二道线也不改变 edge 数据。
         for (index, edge) in workflow.edges.enumerated() {
             guard let from = layout.point(edge.from), let to = layout.point(edge.to) else { continue }
             let growth = PathGrowth.staggered(index: index % 6, elapsed: elapsed, policy: policy)
@@ -116,6 +129,8 @@ struct WorkflowDagCanvas: View {
 
     /// Analyst → Synthesizer is the only convergence that carries particles.
     private func converges(_ edge: WorkflowEdgePresentation) -> Bool {
+        // 粒子只在目标为 Synthesizer 且该节点当前 active 时出现；不表示证据已经提交或运行
+        // 已完成，只是 bounded ambient feedback。
         edge.to == WorkflowStageKind.synthesizer.id && workflow.node(id: edge.to)?.isActive == true
     }
 
@@ -125,6 +140,7 @@ struct WorkflowDagCanvas: View {
         to: CGPoint,
         time: Double
     ) {
+        // particle 数量受 Environment 的 budget 限制；phase 只由画布时间计算位置和透明度。
         let count = max(2, canvas.pathParticleBudget / 20)
         for index in 0..<count {
             let phase = (time / 0.9 + Double(index) / Double(count)).truncatingRemainder(dividingBy: 1)
@@ -141,6 +157,8 @@ struct WorkflowDagCanvas: View {
     // MARK: Nodes
 
     private func drawNodes(_ context: inout GraphicsContext, elapsed: Double, time: Double) {
+        // node status 决定 tone/fill/ring，selectedStageID 只改变描边宽度；pulse/breath 是
+        // 时间驱动的展示值，不会反写 task status。
         let phase = (time.truncatingRemainder(dividingBy: Motion.pulsePeriod)) / Motion.pulsePeriod
         let breath = canvas.runsAmbient ? 0.5 - 0.5 * cos(phase * 2 * .pi) : 0.4
         // Conflict pulse is a decaying one-shot, not a loop.
@@ -221,6 +239,8 @@ struct WorkflowDagCanvas: View {
         at point: CGPoint,
         radius: CGFloat
     ) {
+        // gate 只在被阻断或 task succeeded 时画图标；没有 mark 时保持空白，颜色和图标同时
+        // 提供状态信息，避免颜色本身成为唯一语义。
         let isGate = node.stage == .evidenceGate || node.stage == .decisionGate || node.stage == .executionGate
         guard isGate else { return }
         let mark: String? = node.isBlocked ? "exclamationmark" : (node.taskStatus == .succeeded ? "checkmark" : nil)
@@ -236,6 +256,7 @@ struct WorkflowDagCanvas: View {
     }
 
     private func fill(_ node: WorkflowNodePresentation) -> Color {
+        // fill 是 status 到颜色的纯映射；同一个颜色不会成为业务状态的反向写入口。
         switch node.status {
         case .running, .observing: AkzioColor.gold(0.30)
         case .succeeded, .completed: AkzioColor.raisedSurface
@@ -250,6 +271,8 @@ struct WorkflowDagCanvas: View {
     // MARK: Hit layer
 
     private var hitLayer: some View {
+        // hitLayer 复用同一 layout 放置透明 Button；点击闭包只调用 onSelect(node.id)，视觉
+        // 交互层与 GraphicsContext 的绘制层彼此分离。
         ZStack(alignment: .topLeading) {
             ForEach(workflow.nodes) { node in
                 if let point = layout.point(node.id) {

@@ -1,8 +1,13 @@
+// 这里把 WorkflowProposal 的研究任务 lowering 成固定 NodeSpec/TaskId，并补齐
+// Evidence→Research→Decision→Execution/Paper/Reconcile/Evaluate 的依赖。EvidenceNeed
+// 只是待采集需求，不是已经拿到的证据；graph 编译成功也不表示模型或券商阶段完成。
 impl WorkflowRuntime {
     pub(super) fn lower_research_nodes(
         &self,
         proposal: &WorkflowProposal,
     ) -> RuntimeResult<Vec<WorkflowNode>> {
+        // proposal.validate 先检查引用/DAG，随后 Runtime 限制 fanout/depth/node class；
+        // 新 TaskId 只在本次编译生成，提交后的 graph 不会因重启重新分配。
         proposal.validate(&self.catalogue.recipes)?;
         self.validate_proposal_limits(proposal)?;
         if proposal.tasks.len() > self.catalogue.max_nodes {
@@ -75,6 +80,8 @@ impl WorkflowRuntime {
         &self,
         proposal: &WorkflowProposal,
     ) -> RuntimeResult<()> {
+        // children 按直接依赖统计，depth 用栈遍历每个 recipe 的后代；这是固定拓扑
+        // 的结构性预算，不等于模型的 token budget 或 Provider 调用次数。
         let mut children = BTreeMap::<String, Vec<String>>::new();
         for (alias, task) in &proposal.tasks {
             for dependency in &task.depends_on {
@@ -117,6 +124,8 @@ impl WorkflowRuntime {
         topology_id: String,
         mut nodes: Vec<WorkflowNode>,
     ) -> RuntimeResult<WorkflowGraph> {
+        // EvidenceNeed 先聚合进唯一 Evidence Gate，再由叶研究节点闭合到 Decision。
+        // PositionPlan 在 Decision 后结束；Paper 才继续 Execution/PaperCommit/Reconcile/Evaluate。
         let evidence_needs = self.aggregate_evidence_needs(&nodes)?;
         let mut evidence = self.gate_node(
             &self.catalogue.terminals.evidence_gate,
@@ -204,6 +213,8 @@ impl WorkflowRuntime {
         &self,
         nodes: &[WorkflowNode],
     ) -> RuntimeResult<Vec<ArtifactRef>> {
+        // 同一个 Need 在多个节点出现只保留一个精确 ArtifactRef；kind 不对、同一任务
+        // 内重复或非 EvidenceNeed 都是编译错误，不能用去重掩盖非法输入。
         let mut needs = BTreeMap::new();
         for node in nodes {
             let mut task_needs = BTreeSet::new();
@@ -226,6 +237,8 @@ impl WorkflowRuntime {
         recipe_id: &TaskRecipeId,
         dependencies: Vec<akzio_domain::TaskId>,
     ) -> RuntimeResult<WorkflowNode> {
+        // Gate Node 没有 Agent Contract hash 和输入 Artifact，业务 handler 会从依赖/Store
+        // 读取 Rust-owned 状态；spec.stage 保证历史 inspection 能识别其阶段。
         let recipe = self.catalogue.recipe(recipe_id)?;
         Ok(WorkflowNode {
             spec: Some(akzio_domain::NodeSpec::stage(recipe_id.as_str())),
@@ -249,6 +262,8 @@ impl WorkflowRuntime {
         source_refs: Vec<ArtifactRef>,
         now: DateTime<Utc>,
     ) -> RuntimeResult<Artifact> {
+        // graph Artifact 必须用同一 Store staging connection，source_refs 只记录 proposal
+        // 等上游身份；Artifact 本身仍等待 workflow commit 事务才能成为运行事实。
         Ok(Artifact::new(
             ArtifactKind::WorkflowGraph,
             // Prepared workflow Artifacts must be committed through this Store instance.

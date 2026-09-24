@@ -1,6 +1,9 @@
 import Foundation
 
+// Core payload 全部是不可变 Decodable/Sendable 值快照；CodingKeys 负责 snake_case 协议到 Swift 命名的单向投影。
+
 struct ObserverSnapshotPayload: Decodable, Sendable {
+    // eventCursor 是快照与 SSE 增量的衔接点；currentRun/section data 可为空，表示服务端暂时没有该事实。
     let schemaVersion: Int
     let generatedAt: Date
     let eventCursor: Int64
@@ -30,6 +33,7 @@ struct ObserverSnapshotPayload: Decodable, Sendable {
 }
 
 struct ObserverCorePayload: Decodable, Sendable {
+    // ready/readiness 只描述 Core 自身可用性，approval/health 仍分别保留，不能合并成 UI 的单一成功布尔值。
     let ready: Bool
     let readinessPpm: UInt32?
     let autoPaper: Bool
@@ -46,6 +50,7 @@ struct ObserverCorePayload: Decodable, Sendable {
 }
 
 struct ObserverApprovalPayload: Decodable, Sendable {
+    // approval 的 operator/reason/expiresAt 可为空；状态本身不被客户端推断为 Paper 授权。
     let status: String
     let operatorIdentity: String?
     let reason: String?
@@ -60,6 +65,7 @@ struct ObserverApprovalPayload: Decodable, Sendable {
 }
 
 struct ObserverHealthPayload: Decodable, Sendable {
+    // health 将冻结、Policy、NewsWeb、scheduler 和 alerts 分字段传递，Optional 表示对应服务尚未报告。
     let status: String
     let frozen: Bool
     let decisionPolicyStatus: String?
@@ -84,12 +90,14 @@ struct ObserverHealthPayload: Decodable, Sendable {
 }
 
 struct ObserverAlertPayload: Decodable, Sendable {
+    // alert 是 Core 已聚合的只读计数；Swift 不合并或提升 severity。
     let code: String
     let severity: String
     let count: UInt64
 }
 
 struct ObserverSectionPayload<T: Decodable & Sendable>: Decodable, Sendable {
+    // 泛型 section 共享 status/observedAt/reason/data；data 为 nil 时 reason/status 是唯一可展示依据。
     let status: String
     let observedAt: Date?
     let reason: String?
@@ -104,6 +112,7 @@ struct ObserverSectionPayload<T: Decodable & Sendable>: Decodable, Sendable {
 }
 
 struct ObserverRunDetailPayload: Decodable, Sendable {
+    // detail 把 workflow、事件、trajectory、artifact 和 telemetry 绑定在同一 Run 快照内，避免跨 Run 拼接。
     let inspection: RuntimeInspectionPayload?
     let workflow: ObserverWorkflowPayload
     let events: [ObserverEventPayload]
@@ -119,6 +128,7 @@ struct ObserverRunDetailPayload: Decodable, Sendable {
 }
 
 struct ObserverRunTelemetryPayload: Decodable, Sendable {
+    // telemetry 的模型/耗时/token 字段可缺失，toolCalls/turns 则保留 Rust 给出的整数值。
     let modelID: String?
     let latencyMillis: UInt64?
     let inputTokens: UInt64?
@@ -137,6 +147,7 @@ struct ObserverRunTelemetryPayload: Decodable, Sendable {
 }
 
 struct ObserverRunSummaryPayload: Decodable, Sendable {
+    // summary 通过 runID 与 workflow 关联；brokerSession 和 utility 缺失时保持 Optional。
     let runID: String
     let modelID: String?
     let latencyMillis: UInt64?
@@ -153,6 +164,7 @@ struct ObserverRunSummaryPayload: Decodable, Sendable {
 }
 
 struct ObserverEventPayload: Decodable, Sendable {
+    // event 的 cursor 是稳定身份，taskID 可为空以覆盖 Run 级生命周期事件。
     let cursor: Int64
     let eventType: String
     let taskID: String?
@@ -167,6 +179,7 @@ struct ObserverEventPayload: Decodable, Sendable {
 }
 
 struct ObserverTrajectoryPayload: Decodable, Sendable {
+    // trajectory 的 model/tool/deliberation/outputRefs 都是 Optional，因为 Rust 事件阶段可能只提供其中一类信息。
     let cursor: Int64
     let taskID: String?
     let turn: UInt32?
@@ -203,6 +216,7 @@ struct ObserverTrajectoryPayload: Decodable, Sendable {
 }
 
 struct ObserverToolLifecyclePayload: Decodable, Sendable {
+    // tool lifecycle 只保存 provider/Runtime 已报告的阶段；callID 和 name 缺失不被 UI 补造。
     let callID: String?
     let name: String?
     let lifecycle: String
@@ -215,6 +229,7 @@ struct ObserverToolLifecyclePayload: Decodable, Sendable {
 }
 
 struct ObserverArtifactReferencePayload: Decodable, Sendable {
+    // output reference 只携带 CAS artifact 的 ID/kind，实际内容仍由 artifact payload 单独解码。
     let artifactID: String
     let kind: String
 
@@ -225,6 +240,7 @@ struct ObserverArtifactReferencePayload: Decodable, Sendable {
 }
 
 struct ObserverModelMetadataPayload: Decodable, Sendable {
+    // model metadata 的 snake_case 字段映射为 Swift camelCase，provider/model/reasoning 均可未观测。
     let providerID: String?
     let modelID: String?
     let reasoningEffort: String?
@@ -237,6 +253,7 @@ struct ObserverModelMetadataPayload: Decodable, Sendable {
 }
 
 struct ObserverDeliberationPayload: Decodable, Sendable {
+    // 不确定性与备选分数保持数组原貌；投影层按 index 对齐，缺少对应权重时保留 nil。
     let selectedPath: String
     let alternatives: [String]
     let alternativeMatchPpm: [UInt32]?
@@ -259,6 +276,7 @@ struct ObserverDeliberationPayload: Decodable, Sendable {
 }
 
 struct ObserverArtifactPayload: Decodable, Sendable {
+    // artifact payload 使用 JSONValue 保留未知 schema；artifactID/kind/createdAt 仍提供稳定展示身份。
     let artifactID: String
     let kind: String
     let createdAt: Date
@@ -273,6 +291,7 @@ struct ObserverArtifactPayload: Decodable, Sendable {
 }
 
 struct ObserverLearningPayload: Decodable, Sendable {
+    // Learning section 同时承载不可变 artifact、transition 和可选 summary/metric 投影；缺一不互相推导。
     let artifacts: [ObserverArtifactPayload]
     let policyTransitions: [JSONValue]
     let summary: ObserverLearningSummaryPayload?
@@ -287,6 +306,7 @@ struct ObserverLearningPayload: Decodable, Sendable {
 }
 
 struct ObserverLearningSummaryPayload: Decodable, Sendable {
+    // summary 的金额、Ppm 和 delta 字段分别保留可选性，避免把没有 canonical learning 的窗口显示为零。
     let rangeDays: UInt32
     let attributedUtilityMicros: Int64?
     let attributedUtilityPpm: Int64?
@@ -309,6 +329,7 @@ struct ObserverLearningSummaryPayload: Decodable, Sendable {
 }
 
 struct ObserverImpactAreaPayload: Decodable, Sendable {
+    // impact area 是 Rust 归因后的值语义记录，category 保留原始类别，impactPpm 仅做类型映射。
     let category: String
     let impactPpm: Int64
 

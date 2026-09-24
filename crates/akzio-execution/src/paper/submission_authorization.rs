@@ -1,6 +1,10 @@
 use super::*;
 use akzio_domain::{AccountSnapshot, DecisionValidity, MarketClockSnapshot, QuoteSnapshot};
 
+// 文件导读：授权对象是由不可变 plan、DecisionValidity、approval、账户/报价/时钟观察时间
+// 和 TradingSession 交集计算出的临时许可。它不进入旧 plan hash，也不赋予 recovery 读
+// 权之外的能力；window 为空时只能查询已有 Broker effect，不能产生新的 POST/PATCH。
+
 /// Read projection of the existing governed normalized payload, not a second
 /// persisted evidence format. Remaining provider content is irrelevant here.
 #[derive(Debug, Deserialize)]
@@ -17,6 +21,9 @@ pub(super) fn frozen_account_observations(
     account: &AccountSnapshot,
     components: &[(Artifact, FrozenAccountComponent)],
 ) -> Option<Vec<DateTime<Utc>>> {
+    // 逐个核对 aggregate account snapshot 的四类 Alpaca normalized source，要求资源集合、
+    // lineage、producer、观察时间和 permit origin 全部吻合；缺一项就返回 None，避免用
+    // 聚合时间掩盖某个过期 positions/fills 组件。
     if snapshot.producer != "execution.snapshot.account" {
         return None;
     }
@@ -92,6 +99,8 @@ impl PaperSubmissionAuthorization {
         session: &akzio_domain::TradingSessionSnapshot,
         legacy_session: &str,
     ) -> bool {
+        // 新 snapshot 使用冻结的 TradingSession kind/date；只有旧数据没有 session 时才按
+        // Regular + legacy session 字符串兼容，不能用旧日期覆盖已识别的夜盘类型。
         self.session.as_ref().map_or_else(
             || {
                 session.kind == akzio_domain::TradingSession::Regular
@@ -105,6 +114,8 @@ impl PaperSubmissionAuthorization {
         observations: Option<&[DateTime<Utc>]>,
         policy: &crate::ExecutionPolicy,
     ) {
+        // 将各账户组件的 [最早可用, 最晚过期] 窗口逐个求交；任一时间算术失败或交集为空
+        // 就取消发送窗口，而不是放宽到 aggregate observed_at。
         let Some(observations) = observations else {
             self.window = None;
             return;
@@ -138,6 +149,9 @@ impl PaperSubmissionAuthorization {
         quotes: &QuoteSnapshot,
         clock: &MarketClockSnapshot,
     ) -> Result<Self> {
+        // 先保留 plan hash/session，再依次检查 validity、approval、四份快照、policy hash、
+        // session/tradable 和每个订单报价，最后取所有时效及交易 session 结束时间的交集。
+        // 缺少 approval 时返回无 window 的只读授权，而不是伪造 Paper 发送资格。
         let mut authorization = Self {
             plan_hash: plan.plan_hash.clone(),
             window: None,
@@ -201,6 +215,8 @@ impl PaperSubmissionAuthorization {
     }
 
     pub(super) fn assert_current(&self, plan_hash: &ContentHash, now: DateTime<Utc>) -> Result<()> {
+        // 新 Broker effect 前的最后一道时间/身份检查；恢复读取不调用这个方法，因此过期
+        // 后仍能查找并保存已发生的订单效果。
         if self.plan_hash != *plan_hash
             || !self
                 .window
@@ -212,6 +228,7 @@ impl PaperSubmissionAuthorization {
     }
 
     pub(super) fn assert_replacement_current(&self, now: DateTime<Utc>) -> Result<()> {
+        // 替换动作沿用原 plan hash 和同一发送窗口，不因 successor 产生新的宽限期。
         self.assert_current(&self.plan_hash, now)
     }
 }

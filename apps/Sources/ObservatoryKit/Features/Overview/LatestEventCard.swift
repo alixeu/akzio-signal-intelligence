@@ -5,16 +5,19 @@ import SwiftUI
 // When a new event arrives the border pulses grey → coral → neutral exactly once.
 // It never keeps flashing: a persistent alarm stops being information.
 struct LatestEventCard: View {
+    // events 按最新优先传入；卡片只负责展开最近事件和最多五条补充事件。
     let events: [EventPresentation]
 
     @Environment(\.motionPolicy) private var policy
     @Environment(\.appLanguage) private var language
+    // pulseTick 是一次性动画触发器，expanded 只控制更多历史事件的本地展开。
     @State private var pulseTick = 0
     @State private var expanded = false
 
     private var latest: EventPresentation? { events.first }
 
     var body: some View {
+        // latest 变化触发一次边框脉冲；事件内容本身不通过动画状态重新生成。
         SectionCard(title: "Latest Event", subtitle: latest?.relativeLabel) {
             if let latest {
                 VStack(alignment: .leading, spacing: AkzioLayout.s2) {
@@ -79,6 +82,7 @@ struct LatestEventCard: View {
     }
 
     private func localizedDetail(_ detail: String) -> String {
+        // 任务前缀单独翻译，其余详情交给 L10n；这里不改变事件原文。
         guard detail.hasPrefix("Task ") else {
             return L10n.text(detail, language: language)
         }

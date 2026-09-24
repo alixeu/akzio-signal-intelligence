@@ -1,3 +1,5 @@
+// 文件导读：Task 完成、过期恢复和 committed outputs 都通过 permit/attempt 校验；
+// 只有成功 Attempt 的正式输出进入 rebuild_attempt_outputs，普通事件不会自动成为输出。
 impl Store {
     pub fn finish_task(
         &self,

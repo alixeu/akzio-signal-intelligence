@@ -2,6 +2,8 @@
 //!
 //! The root surface exports only the source-incompatible CAS, SQLite graph,
 //! append-only events, permits, leases, slots, policy transitions, and Doctor.
+// 文件导读：本 crate 的公开边界只暴露 Store 及其只读投影/提交结果；具体的
+// SQLite 表、CAS BLOB、事务、租约和完整性校验都留在 store 模块内部，避免调用方绕过存储约束。
 mod store;
 pub use crate::store::{
     DebugArtifactView, DebugAttemptView, DebugBundleIntegrity, DebugBundleManifest,

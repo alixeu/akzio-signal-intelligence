@@ -12,6 +12,11 @@ use crate::runtime::{
     EvidenceQuality, EvidenceRequest, EvidenceSource, GovernedResource,
 };
 
+// 文件导读：direct.rs 是 SEC/FRED 的只读直接适配器。它用有限 GovernedResource 构造 HTTPS
+// URL，先经过共享 rate gate，再发禁止重定向的 GET；响应经过状态码、JSON 形状、vintage
+// 和窗口校验后，才生成带 ETag/hash 的 AcquiredEvidence。凭据只在请求 header/query 中
+// 使用，错误按鉴权/限流/临时/数据质量区分，不被包装成可用证据。
+
 const SEC_DATA_BASE: &str = "https://data.sec.gov";
 const SEC_ARCHIVES_BASE: &str = "https://www.sec.gov";
 const FRED_BASE: &str = "https://api.stlouisfed.org";
@@ -31,6 +36,8 @@ struct RateGate {
 
 impl RateGate {
     fn new(interval: Duration) -> Self {
+        // 所有同类 direct transport 共享一个 Arc<Mutex<Instant>>，把请求间隔串行化而不
+        // 阻塞其他 source 的线程。
         Self {
             next: Mutex::new(Instant::now()),
             interval,
@@ -38,6 +45,7 @@ impl RateGate {
     }
 
     async fn wait(&self) {
+        // 持有 mutex 计算下一允许时刻，必要时异步 sleep；释放后请求才真正开始。
         let mut next = self.next.lock().await;
         let now = Instant::now();
         if *next > now {
@@ -65,12 +73,14 @@ impl std::fmt::Debug for SecEdgarDirectTransport {
 
 impl SecEdgarDirectTransport {
     pub fn from_env() -> Result<Self, EvidenceAdapterError> {
+        // 环境只提供 SEC User-Agent，随后仍走 new 的长度/控制字符和 client policy 校验。
         let user_agent = env::var("SEC_USER_AGENT")
             .map_err(|_| EvidenceAdapterError::Transport("SEC_USER_AGENT is not set".to_owned()))?;
         Self::new(user_agent)
     }
 
     pub fn new(user_agent: impl Into<String>) -> Result<Self, EvidenceAdapterError> {
+        // 构造禁止重定向、限时且带共享 rate gate 的 SEC client；无效身份在网络前失败。
         let user_agent = user_agent.into();
         if user_agent.trim().is_empty()
             || user_agent.len() > 256
@@ -95,6 +105,8 @@ impl SecEdgarDirectTransport {
     }
 
     fn request_for(resource: &str) -> Result<(Url, bool), EvidenceAdapterError> {
+        // 先解析有限 SEC resource，再把 CIK/accession/document 映射到固定 host；返回 bool
+        // 标识 JSON filing 与原文 filing，供后续采用不同 normalized 形状。
         let parsed = GovernedResource::parse(EvidenceSource::SecEdgar, resource)
             .map_err(|_| EvidenceAdapterError::DataQuality("invalid SEC resource".to_owned()))?;
         let (url, json_body) = match parsed {
@@ -134,6 +146,8 @@ impl SecEdgarDirectTransport {
         source: EvidenceSource,
         resource: &str,
     ) -> Result<AcquiredEvidence, EvidenceAdapterError> {
+        // SEC 流程是 source/resource 校验→rate gate→GET→HTTP/空 body→JSON shape→Raw/normalized
+        // provenance。HTML filing 只保留长度/hash 元数据，不凭页面文本生成未经解析的事实。
         if source != EvidenceSource::SecEdgar {
             return Err(EvidenceAdapterError::SourceMismatch);
         }
@@ -209,6 +223,8 @@ impl AsyncEvidenceAdapter for SecEdgarDirectTransport {
         &'a self,
         request: &'a EvidenceRequest,
     ) -> BoxFuture<'a, Result<AcquiredEvidence, EvidenceAdapterError>> {
+        // Box::pin 把 source 检查和 acquire_inner 的异步所有权交给 runtime；请求来源不匹配
+        // 在 I/O 前返回。
         Box::pin(async move {
             if request.source != EvidenceSource::SecEdgar {
                 return Err(EvidenceAdapterError::SourceMismatch);
@@ -236,12 +252,14 @@ impl std::fmt::Debug for FredDirectTransport {
 
 impl FredDirectTransport {
     pub fn from_env() -> Result<Self, EvidenceAdapterError> {
+        // 读取 FRED API key 后复用 new，缺 key 不启动任何请求。
         let api_key = env::var("FRED_API_KEY")
             .map_err(|_| EvidenceAdapterError::Transport("FRED_API_KEY is not set".to_owned()))?;
         Self::new(api_key)
     }
 
     pub fn new(api_key: impl Into<String>) -> Result<Self, EvidenceAdapterError> {
+        // 校验 key 格式并建立禁止重定向/限时 client，rate gate 单独限制 FRED 请求频率。
         let api_key = api_key.into();
         if api_key.trim().is_empty() || api_key.len() > 128 || api_key.contains(['\r', '\n']) {
             return Err(EvidenceAdapterError::Transport(
@@ -262,6 +280,8 @@ impl FredDirectTransport {
     }
 
     fn request_for(resource: &str) -> Result<(Url, Url, FredPayloadKind), EvidenceAdapterError> {
+        // 将 series/vintages/release_calendar 解析为公开审计 URI 和带 key 的请求 URI；返回
+        // payload kind 使响应字段校验与窗口处理保持类型化。
         let parsed = GovernedResource::parse(EvidenceSource::Fred, resource)
             .map_err(|_| EvidenceAdapterError::DataQuality("invalid FRED resource".to_owned()))?;
         let (path, series_id, start, end, vintage, kind) = match parsed {
@@ -351,6 +371,8 @@ impl FredDirectTransport {
         source: EvidenceSource,
         resource: &str,
     ) -> Result<AcquiredEvidence, EvidenceAdapterError> {
+        // FRED 流程在请求中加入 key，读取后验证 JSON kind/vintage/release window，再以不含
+        // key 的 public_url 写入 provenance，避免凭据进入 Artifact source_uri。
         if source != EvidenceSource::Fred {
             return Err(EvidenceAdapterError::SourceMismatch);
         }
@@ -434,6 +456,7 @@ impl AsyncEvidenceAdapter for FredDirectTransport {
         &'a self,
         request: &'a EvidenceRequest,
     ) -> BoxFuture<'a, Result<AcquiredEvidence, EvidenceAdapterError>> {
+        // 只接受 Fred request source，异步调用仍沿用 request_for/acquire_inner 的同一验证链。
         Box::pin(async move {
             if request.source != EvidenceSource::Fred {
                 return Err(EvidenceAdapterError::SourceMismatch);
@@ -444,6 +467,8 @@ impl AsyncEvidenceAdapter for FredDirectTransport {
 }
 
 fn validate_sec_payload(resource: &str, value: &Value) -> Result<(), EvidenceAdapterError> {
+    // companyfacts 和 submissions 使用不同的必需字段集合；shape 不完整就保留为数据质量
+    // 失败，避免后面把任意 JSON 当 SEC 证据。
     let valid = if resource.starts_with("companyfacts:") {
         value.get("cik").and_then(Value::as_u64).is_some()
             && value.get("facts").and_then(Value::as_object).is_some()
@@ -469,6 +494,7 @@ fn validate_sec_payload(resource: &str, value: &Value) -> Result<(), EvidenceAda
 }
 
 fn validate_fred_payload(kind: FredPayloadKind, value: &Value) -> Result<(), EvidenceAdapterError> {
+    // 根据请求 kind 检查 observations/vintage_dates/release_dates 数组存在。
     let field = match kind {
         FredPayloadKind::Observations => "observations",
         FredPayloadKind::Vintages => "vintage_dates",
@@ -487,6 +513,7 @@ fn validate_fred_vintage(
     vintage: chrono::NaiveDate,
     value: &Value,
 ) -> Result<(), EvidenceAdapterError> {
+    // 响应 realtime_start/end 必须与请求 vintage 完全一致，不能用当前值替代历史版本。
     let expected = vintage.to_string();
     if value.get("realtime_start").and_then(Value::as_str) == Some(expected.as_str())
         && value.get("realtime_end").and_then(Value::as_str) == Some(expected.as_str())
@@ -506,6 +533,7 @@ mod tests {
     use chrono::NaiveDate;
 
     async fn assert_direct_client_rejects_redirect(client: Client) {
+        // 测试共享的 no-redirect client：重定向目标只能收到一次请求，响应按 policy 失败。
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -549,6 +577,7 @@ mod tests {
 
     #[tokio::test]
     async fn production_sec_client_rejects_redirect() {
+        // SEC 生产构造器继承禁止重定向策略。
         let transport =
             SecEdgarDirectTransport::new("Akzio offline test test@example.invalid").unwrap();
         assert_direct_client_rejects_redirect(transport.client).await;
@@ -556,12 +585,14 @@ mod tests {
 
     #[tokio::test]
     async fn production_fred_client_rejects_redirect() {
+        // FRED 生产构造器同样不能把 key 跟随重定向泄露到未知 host。
         let transport = FredDirectTransport::new("offline-fixture-key").unwrap();
         assert_direct_client_rejects_redirect(transport.client).await;
     }
 
     #[test]
     fn fred_observation_request_preserves_window_and_vintage() {
+        // 回归验证 series 请求同时保留观察窗口和 vintage query，不能把历史查询变成实时值。
         let (request, public, kind) =
             FredDirectTransport::request_for("series:DFII10:2026-09-01:2026-09-15:2026-08-31")
                 .expect("valid FRED series resource");
@@ -604,6 +635,7 @@ mod tests {
 
     #[test]
     fn fred_release_calendar_request_uses_bounded_dates_endpoint() {
+        // release calendar 只能走有界日期 endpoint，不允许自由路径或无边界查询。
         let (request, public, kind) =
             FredDirectTransport::request_for("release_calendar:2026-09-16:2026-10-30:2026-09-15")
                 .expect("valid FRED release-calendar resource");
@@ -645,6 +677,7 @@ mod tests {
 
     #[test]
     fn fred_payload_and_vintage_validation_reject_wrong_shapes() {
+        // 错误字段形状或 vintage 不匹配必须在 materialization 前失败。
         let observations = serde_json::json!({
             "realtime_start": "2026-08-31",
             "realtime_end": "2026-08-31",
@@ -679,6 +712,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires FRED_API_KEY and live network access"]
     async fn live_fred_observations_are_acquired_and_vintage_checked() {
+        // 该 live test 仅在显式凭据环境运行，用真实 FRED 响应检查当前协议；不是离线 fixture
+        // 或 Paper/学习资格证明。
         let transport = FredDirectTransport::from_env().expect("FRED_API_KEY is configured");
         let resource = "series:DFII10:2026-09-01:2026-09-15:2026-08-31";
         let value = transport

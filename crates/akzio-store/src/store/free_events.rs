@@ -1,3 +1,5 @@
+// 文件导读：这里集中检查 Gate、Tool、Attempt 和 Paper effect 事件的列形状、先后顺序和
+// permit lineage；事件通过不自动提升 Artifact lifecycle，也不替代业务 Gate 的内容判断。
 fn validate_gate_lifecycle_events(
     connection: &Connection,
     run_id: Option<&RunId>,
@@ -117,6 +119,7 @@ fn validate_gate_lifecycle_events(
     Ok(())
 }
 
+// Task 成功前统计 called 与 ToolResult terminal 数，避免未闭合工具调用被发布为 succeeded。
 fn ensure_no_pending_tool_calls(
     connection: &Connection,
     run_id: &RunId,
@@ -164,6 +167,7 @@ fn ensure_no_pending_tool_calls(
     Ok(())
 }
 
+// 只查同 Run/effect 的 settled/recovered terminal，供幂等 effect 写入使用。
 fn paper_effect_terminal_exists(
     transaction: &Transaction<'_>,
     run_id: &RunId,
@@ -182,6 +186,7 @@ fn paper_effect_terminal_exists(
     Ok(found != 0)
 }
 
+// 已成功的 schedule Attempt 只能以相同 Artifact/output index 重放，不能复活旧 permit。
 fn assert_idempotent_outcome_schedule_commit(
     transaction: &Transaction<'_>,
     permit: &TaskWritePermit,
@@ -249,6 +254,7 @@ fn assert_idempotent_outcome_schedule_commit(
     Ok(())
 }
 
+// Artifact origin 必须逐字段等于当前 TaskWritePermit，不能仅凭 Run ID 放行。
 fn assert_origin_matches(
     origin: Option<&ArtifactOrigin>,
     permit: &TaskWritePermit,
@@ -266,6 +272,7 @@ fn assert_origin_matches(
     Ok(())
 }
 
+// 从 Task 行恢复 retry/on_failure，避免 handler 自带策略扩大重试预算。
 fn task_retry_policy(
     transaction: &Transaction<'_>,
     task_id: &TaskId,
@@ -281,6 +288,7 @@ fn task_retry_policy(
     Ok((serde_json::from_str(&retry_json)?, parse_enum(&on_failure)?))
 }
 
+// 普通 commit 只是带 effect=None 的统一事务实现。
 fn commit_attempt_transaction(
     transaction: &Transaction<'_>,
     permit: &TaskWritePermit,
@@ -291,6 +299,7 @@ fn commit_attempt_transaction(
     commit_attempt_transaction_with_effect(transaction, permit, artifacts, status, None, now)
 }
 
+// 插入 Artifact/source closure、artifact events、可选 effect event，再收束 Task/Attempt 状态。
 fn commit_attempt_transaction_with_effect(
     transaction: &Transaction<'_>,
     permit: &TaskWritePermit,

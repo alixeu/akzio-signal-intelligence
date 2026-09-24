@@ -1,3 +1,5 @@
+// 文件导读：历史校验从安装表、activation 链、Policy evaluation/consumption head 重放，
+// 检查每个 immutable predecessor 和 event cursor；它不合并或改写旧 CAS。
 impl Store {
     fn verify_contract_catalogue_history(&self, connection: &Connection) -> StoreResult<()> {
         let installations = connection
@@ -184,6 +186,7 @@ impl Store {
         Ok(())
     }
 
+    // 按 event_cursor 重建每个 subject 的 from/to、consumed pair cursor、Outcome/Experience/Evaluation lineage。
     fn verify_policy_evaluation_history(&self, connection: &Connection) -> StoreResult<()> {
         let evaluation_ids = connection
             .prepare(

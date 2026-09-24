@@ -6,12 +6,14 @@ import SwiftUI
 // latest event, the agent roster and the health snapshot. Every section reveals in
 // the transition's `reveal` phase with a short stagger.
 struct OverviewPage: View {
+    // store 是 Overview 的只读数据入口；页面根据 isLive 在真实摘要和 Mock KPI 间分流。
     let store: ObservatoryStore
 
     @Environment(\.sharedNamespace) private var namespace
     @Environment(\.appLanguage) private var language
 
     var body: some View {
+        // 页面按阶段顺序组合 KPI、Signal Universe 和右侧信息栏，子视图通过闭包回写选择。
         PageScaffold(route: .overview) {
             PageScroll {
                 VStack(alignment: .leading, spacing: AkzioLayout.s4) {
@@ -47,6 +49,7 @@ struct OverviewPage: View {
     }
 
     private var universe: some View {
+        // Canvas 读取 workflow 投影，selectedStageID 和 onSelect 形成选中节点的数据回路。
         SectionCard(
             title: "Signal Universe",
             subtitle: "\(store.displayWorkflow.nodes.count) \(L10n.text("stages", language: language)) · \(L10n.text(store.displayScenarioTitle, language: language))"
@@ -68,6 +71,7 @@ struct OverviewPage: View {
     }
 
     private var rail: some View {
+        // 右栏按事件、Agent、健康指标顺序消费同一 Store 展示快照。
         VStack(alignment: .leading, spacing: AkzioLayout.s3) {
             LatestEventCard(events: store.displayEvents)
             ActiveAgentsList(agents: store.displayAgents, namespace: namespace)
@@ -77,6 +81,7 @@ struct OverviewPage: View {
     }
 
     private func legend(_ label: String, tone: AkzioTone) -> some View {
+        // 图例闭包只把固定标签和色调组合成说明项，不参与状态更新。
         HStack(spacing: 4) {
             Circle().fill(tone.color).frame(width: 5, height: 5)
             Text(L10n.text(label, language: language)).akzioText(.caption)
@@ -85,11 +90,13 @@ struct OverviewPage: View {
 }
 
 private struct LiveKpiStrip: View {
+    // 在线状态只展示 Core 来源和数量等摘要，Portfolio 仍明确显示不可用。
     let store: ObservatoryStore
 
     @Environment(\.appLanguage) private var language
 
     var body: some View {
+        // 实时摘要直接读取 Store 状态，不复用离线曲线 KPI 的数值模型。
         HStack(spacing: AkzioLayout.s3) {
             metric("Source", store.observerState.label, "dot.radiowaves.left.and.right")
             metric("Tasks", String(store.displayWorkflow.nodes.count), "point.3.connected.trianglepath.dotted")
@@ -100,6 +107,7 @@ private struct LiveKpiStrip: View {
     }
 
     private func metric(_ label: String, _ value: String, _ symbol: String) -> some View {
+        // metric 闭包把一个标签、值和图标变成只读卡片，调用方决定数据来源。
         HStack(spacing: AkzioLayout.s3) {
             Image(systemName: symbol)
                 .font(.system(size: 14, weight: .medium))

@@ -1,10 +1,14 @@
 impl ModelClient {
     pub fn fixture_sequence(values: impl IntoIterator<Item = Value>) -> Self {
+        // IntoIterator 只在构造时消费输入；之后 Arc/Mutex 持有的 VecDeque 才是唯一
+        // 共享状态，ModelClient 的 clone 不会得到独立副本。
         // 将输入顺序一次收集进共享 FIFO；并发响应通过 Mutex 串行消耗同一测试序列。
         Self::FixtureSequence(Arc::new(Mutex::new(values.into_iter().collect())))
     }
 
     pub fn fixture_by_purpose(values: BTreeMap<String, Vec<Value>>) -> Self {
+        // 外层 BTreeMap 按 purpose 隔离，内层 VecDeque 按调用顺序消费；锁保护的是
+        // 这些队列的 pop，而不是 fixture JSON 的解析或后续业务校验。
         // 每个 purpose 拥有独立 FIFO，适合验证同一研究角色的重试/多次调用顺序。
         Self::FixtureByPurpose(Arc::new(Mutex::new(
             values
@@ -15,11 +19,15 @@ impl ModelClient {
     }
 
     pub fn fixture_by_purpose_phase(values: BTreeMap<String, [Value; 2]>) -> Self {
+        // [Value; 2] 通过 Arc 共享只读快照；与 FIFO 不同，阶段 fixture 没有消费游标，
+        // 所以它适合按 tool_choice 重复得到同一 Draft/Submit 模板。
         // [0, 1] 固定表示 Draft 与 Submit；模板本身不可变，调用时只 clone 当前格。
         Self::FixtureByPurposePhase(Arc::new(values))
     }
 
     pub fn from_openai_responses_config(config: &OpenAIResponsesConfig) -> Result<Self> {
+        // 这是同步构造，不会发送请求；OpenAIResponsesClient::new 的配置错误经 ? 返回，
+        // 真正的 provider I/O 只发生在后续 async respond/probe 调用。
         // OpenAIResponsesClient::new 负责清理地址并校验凭据、模型和 reasoning；这里
         // 只把已经选择的 route 配置转换为 provider client。
         Ok(Self::OpenAIResponses(OpenAIResponsesClient::new(
@@ -83,6 +91,8 @@ impl ModelClient {
 
     /// Exact provider payload used for an individual turn, excluding auth.
     pub fn request_body(&self, request: &ModelRequest) -> Value {
+        // 返回的是 serde_json::Value 形式的无认证请求快照，不等于请求已发送；真实 client
+        // 与 fixture 都走同一 wire 编译器，差别只在是否真的执行 HTTP/SSE。
         // 调试/审计只拿到不含认证信息的单轮请求；fixture 也使用同一 Responses wire
         // 形状，便于比较输入、工具和 tool_choice，而不产生外部副作用。
         match self {

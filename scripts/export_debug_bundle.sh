@@ -1,8 +1,11 @@
 #!/bin/sh
+# 文件职责：调用 Rust 的只读 debug export，把已脱敏的 bundle 打成不可覆盖的归档。
+# 本脚本只负责参数、临时目录、归档和退出码；业务完整性由 EXPORT_STATUS 决定。
 # POSIX sh entrypoint for a read-only Akzio diagnostic bundle.
 set -eu
 
 usage() {
+    # usage 同时承担帮助和参数错误出口；调用者传入 0 才表示显式请求帮助。
     # usage 同时承担帮助和参数错误出口，调用者传入 0 才表示显式请求帮助。
     echo "usage: $0 --config CONFIG --run-id RUN_ID --out OUTPUT_DIR [--store STORE_ROOT]" >&2
     exit "${1:-1}"

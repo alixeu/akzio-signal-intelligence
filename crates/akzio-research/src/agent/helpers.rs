@@ -1,3 +1,6 @@
+// helpers 只做确定性转换：估算/哈希/错误脱敏、retry 分类、Manifest 引用 Schema
+// 绑定和 kind 回填。它们不新增 Artifact、不扩大权限，也不把 JSON 解析成功提升为
+// 业务验收；引用 kind 缺失时只从本次 immutable ledger 精确回填。
 fn estimate_tokens<T: Serialize>(value: &T) -> ResearchResult<u32> {
     Ok(akzio_domain::estimate_json_tokens(value)?)
 }
@@ -37,6 +40,8 @@ fn capability_snapshot_hash(
 }
 
 fn research_error_detail(error: &ResearchError) -> Value {
+    // 错误 detail 要支持恢复和诊断，同时截断/脱敏 provider 文本；凭据、完整响应和
+    // 未授权请求体不能因为 Debug 错误路径泄漏到普通 CAS。
     match error {
         ResearchError::Model(message)
         | ResearchError::RateLimited(message)
@@ -128,6 +133,8 @@ fn model_error_result(error: &ModelError) -> Value {
 }
 
 fn model_client_error(error: ModelError, trace: Option<ModelCallTrace>) -> ResearchError {
+    // 先保留 timeout/incomplete 的专门 usage 语义，再映射通用 transport/rate-limit/
+    // invalid-output；retry policy 依赖这些分类，不能把 Provider incomplete 当 schema reject。
     let error = match error {
         ModelError::Transport(error) if error.is_timeout() => {
             return ResearchError::ProviderTimeout {
@@ -218,6 +225,8 @@ fn logical_now(start: DateTime<Utc>, elapsed: StdDuration) -> DateTime<Utc> {
 }
 
 fn retryable_model_error(error: &ResearchError, retry: &akzio_domain::RetryPolicy) -> bool {
+    // 是否重试由 Contract RetryPolicy 与错误类别共同决定；预算、拒绝、未知 usage 和
+    // capability 错误不会被宽泛的 transport 分支吞掉。
     match error {
         ResearchError::InvalidOutput(_) | ResearchError::MissingFinalOutput => {
             retry.retry_invalid_output
@@ -264,6 +273,8 @@ fn submission_rejection_feedback(call_id: String, message: String) -> ModelToolO
 }
 
 fn bind_reference_schema(schema: &mut Value, refs: &[Value]) {
+    // 递归把引用 enum 收窄到当前 Manifest，且按允许 kind 过滤。Schema 收窄不改变
+    // 原始模型输出；之后 resolve_reference_kinds 才补齐 wire 中省略的 kind。
     match schema {
         Value::Object(object) => {
             if let Some(properties) = object.get_mut("properties").and_then(Value::as_object_mut) {
@@ -310,6 +321,8 @@ fn bind_reference_schema(schema: &mut Value, refs: &[Value]) {
 }
 
 fn resolve_reference_kinds(value: &mut Value, refs: &[Value]) -> ResearchResult<()> {
+    // 省略 kind 只允许通过精确 artifact_id 在本次 ledger 中解析；显式错误 kind
+    // 不被静默修正。allocation evidence_refs 仅做 canonical 排序，重复项保留给 domain validator。
     match value {
         Value::Object(object) => {
             if let Some(id) = object.get("artifact_id") {

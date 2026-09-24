@@ -2,8 +2,12 @@ import SwiftUI
 
 struct DebugEnvironmentBanner: View {
     let store: ObservatoryStore
+    // identity 是 DebugRun 的可选 Rust projection；缺失字段显示“未确认”，不会猜测模型或
+    // broker 权限已开启。
     private var identity: JSONValue? { store.debugRun?.session.identity }
     var body: some View {
+        // banner 同时展示隔离 Core、Store identity、run purpose、learning scope 和 revision；
+        // 这些是诊断上下文，不是对 Paper 写入或 Outcome 完成的承诺。
         VStack(alignment: .leading, spacing: 4) {
             HStack {
                 Label("隔离检查", systemImage: "ladybug")
@@ -45,6 +49,8 @@ struct DebugEnvironmentBanner: View {
 
 struct DebugWorkflowPanel: View {
     let store: ObservatoryStore
+    // 这些 @State 是 Debug 面板的输入草稿和本地无障碍/渲染环境；真正的 pause/resume、
+    // prepare、step、retry、fork 都必须通过 Store 的 async Core 控制方法执行。
     @State private var sessionDate = String(ISO8601DateFormatter().string(from: Date()).prefix(10))
     @State private var purpose = "paper"
     @State private var experimentReason = ""
@@ -52,13 +58,17 @@ struct DebugWorkflowPanel: View {
     @Environment(\.akzioReduceTransparencyOverride) private var reduceTransparencyOverride
     @Environment(\.akzioHighContrast) private var highContrast
     @Environment(\.akzioRendersOffscreen) private var rendersOffscreen
+    // selected 只按当前 selectedDebugTaskID 从已加载 run 中查找，不主动请求或制造节点。
     private var selected: DebugNodePayload? { store.debugRun?.nodes.first { $0.id == store.selectedDebugTaskID } }
 
     private var usesOpaqueBackdrop: Bool {
+        // 透明度策略只决定背景材质；它不改变 Rust projection、控制权限或加载路径。
         reduceTransparency || reduceTransparencyOverride || highContrast || rendersOffscreen
     }
 
     var body: some View {
+        // 每个 Task 闭包都调用 ObservatoryStore 的主 actor async seam；按钮 disabled 条件
+        // 同时检查连接、busy 和 Core 返回的 allowed_actions，UI 不自行推断可执行性。
         VStack(alignment: .leading, spacing: 16) {
             RuntimeInspectorPanel(store: store)
             HStack {
@@ -177,6 +187,8 @@ struct DebugWorkflowPanel: View {
     }
 
     private func progressSummary(_ run: DebugRunPayload) -> String {
+        // 进度只统计非后续评估阶段的 succeeded 节点，并把 artifacts 交给
+        // OutcomeEvidencePresentation；执行和 Outcome 文案是不同投影，不能互相替代。
         let t0 = run.nodes.filter { WorkflowDisplay.phase($0.role) != 2 }
         let completed = t0.filter { $0.status == "succeeded" }.count
         let artifacts: [(kind: String, payload: JSONValue)] = run.artifacts.compactMap { value in
@@ -188,6 +200,8 @@ struct DebugWorkflowPanel: View {
     }
 
     private func researchPlanSummary(_ run: DebugRunPayload) -> String? {
+        // 仅对 PositionPlan 的 decision_context 提取 research_plan；这里的 target 明确不是
+        // broker position，缺少对应 artifact 时返回 nil 而不是补造计划。
         guard run.session.identity["run_purpose"]?.string == "position_plan",
               let context = run.artifacts.last(where: { $0["artifact"]?["kind"]?.string == "decision_context" }),
               let plan = context["payload"]?["research_plan"]
@@ -198,6 +212,8 @@ struct DebugWorkflowPanel: View {
     }
 
     private func nodeRow(_ node: DebugNodePayload) -> some View {
+        // nodeRow 的检查/单步/重试闭包只提交 task id 给 Store；是否允许由 Rust/Core 的
+        // step_eligible、retry_eligible 和 debugConnected/debugBusy 决定。
         VStack(alignment: .leading, spacing: 5) {
             HStack {
                 Text(node.role).font(.subheadline.weight(.semibold))
@@ -242,15 +258,20 @@ struct DebugWorkflowPanel: View {
     }
 }
 
+// DebugStageInspector 只从当前 DebugRun 的 artifacts 和 selected node 引用筛选内容；它不
+// 重新读取文件或数据库，也不把“有 artifact”解释成业务验收通过。
 // Extends the existing Workflow inspector surface with the same Store-backed
 // artifacts used by CLI inspect; no synthetic success is projected here.
 struct DebugStageInspector: View {
     let run: DebugRunPayload
     let node: DebugNodePayload
+    // 同一 run 内按 artifact.origin.task_id 建立 stage 视图，后续 kind 过滤只改变展示分组。
     private var artifacts: [JSONValue] {
         run.artifacts.filter { $0["artifact"]?["origin"]?["task_id"]?.string == node.id }
     }
     var body: some View {
+        // detail 的 JSONValue? 为 nil 时显示 not recorded/not applicable；这是缺失投影的
+        // 明确提示，不是成功或失败的默认值。
         VStack(alignment: .leading, spacing: 9) {
             Text("\(node.role) \(node.horizon?.uppercased() ?? "")").font(.headline)
             Text(node.id).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
@@ -271,6 +292,7 @@ struct DebugStageInspector: View {
         .akzioGlass(.elevated, radius: AkzioLayout.cardRadius)
     }
     private func title(_ kind: String) -> String {
+        // kind 到中文标题是本地展示映射，未知 kind 仍保留为持久化诊断记录。
         switch kind {
         case "context_manifest": "上下文清单与授权输入"
         case "agent_turn": "模型调用与提交记录"
@@ -281,6 +303,8 @@ struct DebugStageInspector: View {
         }
     }
     private func detail(_ title: String, _ value: JSONValue?) -> some View {
+        // @ViewBuilder 外层只负责折叠 JSON；prettyPrinted 文本保持可选择，避免改变原始
+        // artifact payload。
         DisclosureGroup(title) {
             Text(value?.prettyPrinted ?? "Not recorded / not applicable")
                 .font(.system(size: 10, design: .monospaced)).textSelection(.enabled)
@@ -291,6 +315,8 @@ struct DebugStageInspector: View {
 
 struct DebugAcceptancePanel: View {
     let values: [JSONValue]
+    // checks 是每条 acceptance 记录中 checks 数组的扁平只读统计；业务状态与测试状态在
+    // 文案中并列展示，不能用 PASS 数量推断 Paper/Outcome 完成。
     private var checks: [JSONValue] { values.flatMap { $0["checks"]?.array ?? [] } }
     var body: some View {
         DisclosureGroup {

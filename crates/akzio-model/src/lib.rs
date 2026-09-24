@@ -68,6 +68,9 @@ pub enum ModelError {
     NativeWebLimitExceeded,
 }
 
+// ModelError 是 adapter 层的统一错误边界；`?` 只负责把下层错误向调用方返回，
+// 不会在这里重试请求、写 Store 或把 incomplete/拒答改成成功结果。
+
 pub type Result<T> = std::result::Result<T, ModelError>;
 
 /// Test-fixture placeholder resolved from the current model request's governed context.
@@ -158,6 +161,8 @@ struct OpenAIResponsesConfigWire {
     routes: BTreeMap<String, OpenAIResponsesRouteConfig>,
 }
 
+// 这是 Serde 的 Deserialize trait 实现：先让 wire helper 应用 default/拒绝未知字段，
+// 再执行 provider 兼容性判断；provider 字段不会被保存到运行时配置对象。
 impl<'de> Deserialize<'de> for OpenAIResponsesConfig {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
@@ -189,6 +194,7 @@ impl<'de> Deserialize<'de> for OpenAIResponsesConfig {
 }
 
 impl std::fmt::Debug for OpenAIResponsesConfig {
+    // Debug trait 只改变展示，不改变配置；api_key 在格式化阶段被固定替换为 redacted。
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("OpenAIResponsesConfig")
@@ -311,6 +317,8 @@ pub struct ModelContinuation {
     fixture_input: Option<String>,
 }
 
+// continuation 是 Rust 自己持有的 transcript 快照；Responses 请求使用 store=false，
+// 所以下一轮必须显式携带这些 items，而不是依赖 provider 端的隐藏会话。
 impl ModelContinuation {
     pub fn from_items(items: Vec<Value>) -> Self {
         // continuation 保存 provider transcript；普通 provider 响应不附带 fixture
@@ -356,6 +364,9 @@ pub enum ModelInput {
     },
 }
 
+// Fresh/Continue 只是输入形状；真正的 Responses JSON 会在 adapter 中把 Fresh 编成
+// 字符串，把 Continue 编成 transcript 加 function_call_output 和可选 instruction 的数组。
+
 pub const NATIVE_WEB_SEARCH_TOOL: &str = "web_search";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -386,6 +397,9 @@ pub enum ModelCapabilityBasis {
     StaticDeclared,
     RuntimeNegotiated,
 }
+
+// 能力快照的 Optional 字段用 None 表示“尚未观察到”，不是把缺失信息当成 false；
+// Serde 的 default 只负责旧数据解码兼容，不能把静态 fixture 变成真实握手结果。
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelCapabilitySnapshot {
@@ -564,6 +578,8 @@ pub struct ModelResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelStreamEvent {
+    // 这些事件只描述 reasoning 段的开始、增量和结束；它们不是 Responses 终态，
+    // ModelResponse 仍须等 adapter 接受 completed/incomplete 后才会返回。
     ReasoningStart,
     ReasoningDelta(String),
     ReasoningEnd,
@@ -571,6 +587,8 @@ pub enum ModelStreamEvent {
 
 #[derive(Debug, Clone)]
 pub enum ModelClient {
+    // Clone 对 fixture 变体只复制 Arc 指针：同一 client 的副本仍共享同一个 Mutex FIFO；
+    // 不可变阶段模板则共享 Arc，但没有 Mutex，因为调用只 clone 模板而不消费它。
     OpenAIResponses(OpenAIResponsesClient),
     Fixture(Value),
     FixtureByPurpose(Arc<Mutex<BTreeMap<String, VecDeque<Value>>>>),

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# 文件职责：提供人工参与的本地复现脚本模板；它只采集用户输入，不代表项目业务运行或测试通过。
 # Human-in-the-loop reproduction loop.
 # Copy this file, edit the steps below, and run it.
 # The agent runs the script; the user follows prompts in their terminal.

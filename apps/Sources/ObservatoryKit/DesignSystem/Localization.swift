@@ -1,12 +1,16 @@
 import SwiftUI
 
+// 文件职责：定义 AppLanguage 值类型、Environment 注入和稳定/动态本地化入口。
+// 本地化只把源字符串映射为展示字符串；找不到翻译时保留原文，不改变设置、状态或业务数据。
 public enum AppLanguage: String, CaseIterable, Sendable, Identifiable {
     case system
     case english
     case simplifiedChinese
 
+    // Identifiable 通过 rawValue 提供稳定列表 ID，不额外创建引用型标识。
     public var id: String { rawValue }
 
+    // computed property 把语言枚举映射为设置界面显示名；返回值是新的 String 值。
     public var displayName: String {
         switch self {
         case .system: "System"
@@ -15,6 +19,7 @@ public enum AppLanguage: String, CaseIterable, Sendable, Identifiable {
         }
     }
 
+    // system 只在这里解析一次当前首选语言；显式 english/中文值直接保持自身。
     public var resolved: AppLanguage {
         guard self == .system else { return self }
         return Locale.preferredLanguages.first?.hasPrefix("zh") == true
@@ -22,6 +27,7 @@ public enum AppLanguage: String, CaseIterable, Sendable, Identifiable {
             : .english
     }
 
+    // locale 根据 resolved 生成 Locale 值，供需要区域信息的展示层使用，不改变 language 设置本身。
     public var locale: Locale {
         Locale(identifier: resolved == .simplifiedChinese ? "zh-Hans" : "en")
     }
@@ -32,6 +38,7 @@ private struct AppLanguageKey: EnvironmentKey {
 }
 
 extension EnvironmentValues {
+    // Environment setter 将 system 规范化为 resolved 值；View 读取的是当前层级的语言快照。
     public var appLanguage: AppLanguage {
         get { self[AppLanguageKey.self] }
         set { self[AppLanguageKey.self] = newValue.resolved }
@@ -39,6 +46,7 @@ extension EnvironmentValues {
 }
 
 public enum L10n {
+    // 输入源字符串和语言，输出稳定字典/动态规则翻译，最终回退到 source；不返回 Optional，避免空文案泄露。
     public static func text(_ source: String, language: AppLanguage) -> String {
         // 先查稳定字典，再尝试时间/日期等动态格式；未知文案原样返回，避免把缺翻译显示成空字符串。
         guard language.resolved == .simplifiedChinese else { return source }
@@ -46,9 +54,11 @@ public enum L10n {
     }
 
     private static func dynamicZhHans(_ source: String) -> String? {
+        // 动态函数只对可证明的时间、日期和 vs 结构返回 Some，未知结构返回 nil 交给上层原文回退。
         // 动态规则只处理已知后缀、英文月份和 vs；其它字符串返回 nil 交给原文回退。
         let lower = source.lowercased()
         for (suffix, unit) in [("m ago", "分钟前"), ("h ago", "小时前"), ("d ago", "天前")] {
+            // 该循环只借用固定规则值；guard/Int Optional 确保任意业务字符串不会被误判为相对时间。
             // 只有数值前缀才转换，避免把任意以单位结尾的业务文本误当时间。
             guard lower.hasSuffix(suffix) else { continue }
             let value = lower.dropLast(suffix.count).trimmingCharacters(in: .whitespaces)
@@ -56,6 +66,7 @@ public enum L10n {
         }
 
         let dateParts = source.split(separator: " ")
+        // split 的结果先用月份字典和 Int 共同校验；任一字段缺失就继续尝试下一条规则。
         let months = [
             "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
             "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
@@ -67,6 +78,7 @@ public enum L10n {
             return "\(month)月\(day)日"
         }
 
+        // vs 替换只处理明确的分隔词；没有匹配时用 nil 表示本函数不负责该文案。
         if source.contains(" vs ") {
             return source.replacingOccurrences(of: " vs ", with: " 对比 ")
         }
@@ -76,6 +88,7 @@ public enum L10n {
         return nil
     }
 
+    // 该表是不可变源字符串到简体中文的值字典；动态日期/时间规则保持在 dynamicZhHans 中，避免污染静态条目。
     private static let zhHans: [String: String] = [
         "Sealing has not been confirmed for this horizon": "该期限尚未确认封存",
         "Run Details": "运行详情", "Claim": "研究主张", "Pending": "等待完成",

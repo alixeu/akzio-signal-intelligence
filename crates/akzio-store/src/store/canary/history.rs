@@ -1,3 +1,5 @@
+// 文件导读：这里校验 Canary 的跨 Run 引用和完整历史。允许的跨 Run 边界只有
+// 已登记 Shadow 的冻结 Evidence/Outcome lineage；通过判断不等于授权任意 Context 读取。
 impl Store {
     // 判断 child Artifact 是否可以跨 Run 引用 parent：证据只允许登记 Shadow 复用父 EvidenceGate，
     // Outcome 侧则只允许学习节点引用父 Run 的冻结 OutcomeSchedule/执行 lineage。

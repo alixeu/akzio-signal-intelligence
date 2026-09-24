@@ -1,3 +1,5 @@
+// 文件导读：本文件把 SQL 中的 succeeded Attempt、Run purpose、workflow snapshot
+// 和事件 cursor 恢复为只读领域投影；读取会验证 task/attempt/graph 一致性，但不推进状态。
 impl Store {
     /// Returns the latest succeeded attempt for the task, including only
     /// artifacts committed by that exact attempt. The query is intentionally

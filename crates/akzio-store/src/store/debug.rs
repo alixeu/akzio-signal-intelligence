@@ -1,4 +1,6 @@
 //! Persisted execution authority, shared by every claim path and every client.
+// 文件导读：Debug 控制把隔离身份、CAS session identity、暂停/单步/恢复和 Broker policy
+// 持久化到 Store；inspect 只读投影，claim/settle 才在事务中消费 permit 或推进控制 head。
 use super::trajectory::stored_event_from_row;
 use super::*;
 use akzio_domain::{
@@ -7,6 +9,7 @@ use akzio_domain::{
     DebugSessionIdentity, DebugStatus, StageAcceptance,
 };
 
+// 将控制层阻断原因统一包装为 DebugControl，调用方可区分于 SQL/Integrity 错误。
 fn blocked(reason: impl Into<String>) -> StoreError {
     StoreError::DebugControl(reason.into())
 }
@@ -93,6 +96,7 @@ impl Store {
         Ok(Some(identity))
     }
 
+    // 只读取 metadata 中的隔离 identity，不创建或修复环境标记。
     pub fn debug_environment(&self) -> StoreResult<Option<String>> {
         environment_identity(&*self.connection()?)
     }
@@ -148,6 +152,7 @@ impl Store {
         Ok(session)
     }
 
+    // 从 run_control head 和 session identity Artifact 重建 DebugSession。
     pub fn debug_session(&self, run_id: &RunId) -> StoreResult<Option<DebugSession>> {
         read_session(&*self.connection()?, run_id)
     }
@@ -237,6 +242,7 @@ impl Store {
         assert_broker_write(&*self.connection()?, run_id)
     }
 
+    // 在 broker policy forbidden 时暂停 session、写 acceptance，并保留当前 Attempt permit。
     pub fn block_debug_broker_task(
         &self,
         permit: &TaskWritePermit,
@@ -283,6 +289,7 @@ impl Store {
         Ok(true)
     }
 
+    // 隔离判定来自 Store metadata 或 Run 的 DebugSession learning_scope，不由 caller flag 决定。
     pub fn debug_learning_isolated(&self, run_id: &RunId) -> StoreResult<bool> {
         let connection = self.connection()?;
         Ok(environment_identity(&connection)?.is_some()
@@ -486,6 +493,7 @@ impl Store {
         Ok(())
     }
 
+    // 只接受已存在的 Run/Task/Attempt lineage，并以 Artifact/event 幂等记录验收材料。
     pub fn record_stage_acceptance(
         &self,
         acceptance: &StageAcceptance,
@@ -503,6 +511,7 @@ impl Store {
     }
 }
 
+// 从同一连接读取 debug_environment metadata，供 claim/export/learning boundary 共用。
 pub(super) fn environment_identity(connection: &Connection) -> StoreResult<Option<String>> {
     Ok(connection
         .query_row(
@@ -513,6 +522,7 @@ pub(super) fn environment_identity(connection: &Connection) -> StoreResult<Optio
         .optional()?)
 }
 
+// 新 DebugSession 必须匹配隔离 Store、Run purpose、contract 集合和 runtime identity。
 fn validate_identity(
     tx: &Transaction<'_>,
     identity: &DebugSessionIdentity,
@@ -538,6 +548,7 @@ fn validate_identity(
     Ok(())
 }
 
+// 把 session identity 作为 DebugRecord/CAS 和 run_control head 原子发布，并验证 parent lineage。
 fn insert_session(tx: &Transaction<'_>, identity: &DebugSessionIdentity) -> StoreResult<()> {
     let mut sources = identity.dataset.clone();
     sources.extend(identity.parent_artifacts.iter().cloned());
@@ -593,6 +604,7 @@ fn insert_session(tx: &Transaction<'_>, identity: &DebugSessionIdentity) -> Stor
 }
 
 /// An explicit experiment edge is provenance, never an Agent read grant.
+// 仅为登记的 Debug dataset/parent artifact 或已证明的 WorkflowGraph 放行有限跨 Run provenance。
 pub(super) fn cross_run_reference_allowed(
     connection: &Connection,
     child: &Artifact,
@@ -678,6 +690,7 @@ pub(super) fn cross_run_reference_allowed(
     }
 }
 
+// 读取 control head 指向的 identity Artifact，并核对 runtime_identity/run_id 不分叉。
 pub(super) fn read_session(
     connection: &Connection,
     run_id: &RunId,
@@ -711,6 +724,7 @@ pub(super) fn read_session(
     .transpose()
 }
 
+// 以 revision CAS 更新 control head，再追加 DebugControlChanged Artifact/event。
 fn save_session(
     tx: &Transaction<'_>,
     session: &mut DebugSession,
@@ -746,6 +760,7 @@ fn save_session(
     Ok(())
 }
 
+// 统计 Run 当前 running Task，供 pause/abort/step 状态转换使用。
 fn running_count(connection: &Connection, run_id: &RunId) -> StoreResult<u64> {
     Ok(connection.query_row(
         "SELECT count(*) FROM rebuild_tasks WHERE run_id=?1 AND status='running'",
@@ -754,6 +769,7 @@ fn running_count(connection: &Connection, run_id: &RunId) -> StoreResult<u64> {
     )?)
 }
 
+// 组合 Task status、policy、dependencies、Run status、ready_at 和 cancel request 的首个阻断原因。
 fn task_blocked_reason(
     connection: &Connection,
     run_id: &RunId,
@@ -792,6 +808,7 @@ fn task_blocked_reason(
     Ok(cancelled.then(|| "run_cancel_requested".into()))
 }
 
+// 只有最近 Attempt 状态为 retried/abandoned 才允许 Debug RetryNode。
 fn retry_eligible(connection: &Connection, task_id: &TaskId) -> StoreResult<bool> {
     let last = connection
         .query_row(
@@ -803,6 +820,7 @@ fn retry_eligible(connection: &Connection, task_id: &TaskId) -> StoreResult<bool
     Ok(last.is_some_and(|s| matches!(s.as_str(), "retried" | "abandoned")))
 }
 
+// 优先读取持久 budget observation；否则从 AgentTurn telemetry 累计并保留缺失 usage unknown。
 fn inspect_budget(
     connection: &Connection,
     task: &StoredTaskSnapshot,
@@ -875,6 +893,7 @@ fn inspect_budget(
     )
 }
 
+// 在 Stepping 中消费指定 permit；Continuous 只检查 session 可运行，不额外创建权限记录。
 pub(super) fn consume_claim(
     tx: &Transaction<'_>,
     permit: &TaskWritePermit,
@@ -955,6 +974,7 @@ pub(super) fn settle_attempt(
     Ok(())
 }
 
+// 实际 effect-intent 边界再次检查 Debug Broker policy 和隔离 Store，不能只依赖 UI/预检查。
 pub(super) fn assert_broker_write(connection: &Connection, run_id: &RunId) -> StoreResult<()> {
     let session = read_session(connection, run_id)?;
     if session
@@ -967,6 +987,7 @@ pub(super) fn assert_broker_write(connection: &Connection, run_id: &RunId) -> St
     Ok(())
 }
 
+// Outcome worker 入队后把 Completed Debug session 重新置为 Running/Paused，保留原 control lineage。
 pub(super) fn post_terminal_enqueued(
     tx: &Transaction<'_>,
     run_id: &RunId,
@@ -987,6 +1008,7 @@ pub(super) fn post_terminal_enqueued(
 }
 
 #[allow(clippy::too_many_arguments)]
+// 生成 RunScoped DebugRecord staging payload，调用方再在事务内 insert 并追加 event。
 fn detail_artifact<T: Serialize>(
     connection: &Connection,
     payload: &T,
@@ -1025,6 +1047,7 @@ fn detail_artifact<T: Serialize>(
     )?)
 }
 
+// acceptance 由 checks 的 evidence refs 组成 source closure，并按 Artifact hash 幂等追加事件。
 fn write_acceptance(tx: &Transaction<'_>, value: &StageAcceptance) -> StoreResult<ArtifactRef> {
     if value.version != 1
         || value.stage.is_empty()
@@ -1070,6 +1093,7 @@ fn write_acceptance(tx: &Transaction<'_>, value: &StageAcceptance) -> StoreResul
 
 /// Exact credential field names, independent of token-usage field names.
 #[allow(clippy::collapsible_match)]
+// 递归替换凭据字段/credential-bearing text，保留 token usage 和普通风险说明。
 fn redact(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
@@ -1128,6 +1152,7 @@ fn redact(value: &mut serde_json::Value) {
 mod tests {
     use super::*;
     #[test]
+    // 只脱敏凭据和加密内容，usage/risk prose 必须保留可审计值。
     fn inspect_redacts_credentials_but_retains_usage_and_risk_prose() {
         let mut value = serde_json::json!({"api_key":"secret","nested":{"Authorization":"Bearer secret","input_tokens":321,"output_tokens":12,"encrypted_content":"opaque"},"memo":"risk-aware research","error":"Bearer secret"});
         redact(&mut value);

@@ -1,5 +1,11 @@
 use super::*;
 
+// 文件导读：PaperDispatchRuntime 是“已持久化 Commitment → Broker effect → 对账”的异步
+// 调度层。它先验证 Paper run、debug broker policy、lease、permit 和 freeze，再记录
+// effect intent，之后才允许 execute_commitment；恢复时复用 intent/订单 ID，轮询回执，
+// 对 stale Regular-hours 订单按有界策略创建 reprice/cancel。Extended/Overnight 不因短
+// 轮询超时盲目撤单，pending/partial 只写进度，只有 Reconciliation Complete 才结算 effect。
+
 #[derive(Debug, Clone)]
 pub struct PaperDispatchInput {
     pub lease: DaemonLease,
@@ -68,6 +74,7 @@ pub enum PaperDispatchFailpoint {
 
 impl PaperDispatchFailpoint {
     pub fn from_env() -> Self {
+        // 诊断开关只用于验证“intent 已落盘、首个 broker 请求尚未发生”的崩溃恢复位置。
         Self::from_value(
             std::env::var("AKZIO_DIAGNOSTIC_CRASH_AFTER_EFFECT_INTENT")
                 .ok()
@@ -76,6 +83,7 @@ impl PaperDispatchFailpoint {
     }
 
     fn from_value(value: Option<&str>) -> Self {
+        // 仅接受显式的 1，其他环境值保持关闭，避免配置拼写意外触发进程退出。
         match value {
             Some("1") => Self::ExitAfterEffectIntent,
             _ => Self::Disabled,
@@ -83,6 +91,7 @@ impl PaperDispatchFailpoint {
     }
 
     fn trigger_after_effect_intent(self) {
+        // failpoint 位于 durable effect intent 之后、Broker I/O 之前，正好模拟最危险的未知状态。
         if matches!(self, Self::ExitAfterEffectIntent) {
             eprintln!("[akzio-diagnostic] exiting after durable execution.effect.intent (code 86)");
             std::process::exit(86);
@@ -117,6 +126,8 @@ struct DurableOrderActions {
 
 impl PaperDispatchRuntime {
     pub fn new(store: Store) -> Self {
+        // 初始化默认执行策略、短 settlement 轮询和较长 action grace；这些是调度策略，
+        // 不会改变上游 Decision/ExecutionGate 的风控边界。
         Self {
             store,
             execution_policy: crate::ExecutionPolicy::default(),
@@ -131,11 +142,13 @@ impl PaperDispatchRuntime {
     }
 
     pub fn with_execution_policy(mut self, policy: crate::ExecutionPolicy) -> Self {
+        // builder 通过值接收策略，冻结本次 runtime 使用的执行限制。
         self.execution_policy = policy;
         self
     }
 
     pub fn with_settlement_timeout(mut self, settlement_timeout: std::time::Duration) -> Self {
+        // 只调整等待 broker 终态的观察预算，超时不会把 accepted/partial 改成 filled。
         self.settlement_timeout = settlement_timeout;
         self
     }
@@ -144,11 +157,14 @@ impl PaperDispatchRuntime {
         mut self,
         settlement_action_grace: std::time::Duration,
     ) -> Self {
+        // action grace 决定 Regular 未结订单何时进入有限的 reprice/cancel 处置，不适用于
+        // Extended-hours 订单的长生命周期。
         self.settlement_action_grace = settlement_action_grace;
         self
     }
 
     pub fn with_failpoint(mut self, failpoint: PaperDispatchFailpoint) -> Self {
+        // 仅替换诊断 failpoint，不改变 commitment、订单或 Store 内容。
         self.failpoint = failpoint;
         self
     }
@@ -158,6 +174,9 @@ impl PaperDispatchRuntime {
         broker: &B,
         input: &PaperDispatchInput,
     ) -> PaperDispatchResult<PaperDispatchOutput> {
+        // 主流程：校验权限与 durable plan→记录 effect intent→执行/恢复 broker commitment→
+        // 持续对账→必要时恢复 durable reprice/cancel→生成 Reconciliation。lease 在每个
+        // 可能阻塞或产生副作用的边界重新校验，失败/取消会留下可恢复的 progress。
         self.require_paper_run(&input.permit)?;
         self.store.assert_debug_broker_write(&input.permit.run_id)?;
         let simulated_only = self
@@ -304,6 +323,7 @@ impl PaperDispatchRuntime {
         &self,
         output: &ReconciliationOutput,
     ) -> PaperDispatchResult<bool> {
+        // 只读取 Reconciliation payload 的领域终态；调度层不以“收到响应”代替 Complete。
         let payload: akzio_domain::Reconciliation =
             serde_json::from_slice(&self.store.read_blob(&output.reconciliation.blob)?)?;
         Ok(payload.state == akzio_domain::ReconciliationState::Complete)
@@ -314,6 +334,8 @@ impl PaperDispatchRuntime {
         commitment: &ArtifactRef,
         execution: &PaperExecution,
     ) -> PaperDispatchResult<DurableOrderActions> {
+        // 以 commitment+asset 查询已持久化 action intent，并拒绝 broker 自行返回而未被
+        // Store 记录的 replacement，保持外部副作用与内部 lineage 一一对应。
         let mut actions = DurableOrderActions::default();
         for receipt in &execution.orders {
             let asset = Asset::try_from(receipt.symbol.as_str())?;
@@ -339,6 +361,8 @@ impl PaperDispatchRuntime {
         authorization: &PaperSubmissionAuthorization,
         execution: &mut PaperExecution,
     ) -> PaperDispatchResult<()> {
+        // 每个 reprice/cancel 都先 record effect intent，再调用 Broker，成功后 settle effect；
+        // 已结算 intent 只恢复读取结果，未授权的 replacement 保留 pending 并继续风险降低路径。
         for reference in &actions.reprices {
             let artifact = self.load_expected(reference, ArtifactKind::ExecutionReprice)?;
             let intent: PaperReprice =
@@ -413,6 +437,8 @@ impl PaperDispatchRuntime {
         execution: &PaperExecution,
         input_now: DateTime<Utc>,
     ) -> PaperDispatchResult<bool> {
+        // 把 broker status 映射为可取消集合，再以 broker_updated_at 与 grace 比较；未知状态
+        // 直接报错，不把未知订单当成 stale。
         let wall_now = Utc::now();
         let now = if input_now > wall_now {
             input_now
@@ -447,6 +473,8 @@ impl PaperDispatchRuntime {
         reconciliation: &ReconciliationOutput,
         execution: &mut PaperExecution,
     ) -> PaperDispatchResult<()> {
+        // 从当前 execution 筛出超过 grace 的 Regular 未终态订单，最多创建一次 repricing，
+        // 后续只允许取消或继续对账；reprice 使用冻结 plan price，不追逐市场价格。
         let wall_now = Utc::now();
         let now = if input.now > wall_now {
             input.now
@@ -617,6 +645,7 @@ impl PaperDispatchRuntime {
     }
 
     fn require_paper_run(&self, permit: &TaskWritePermit) -> PaperDispatchResult<()> {
+        // Dispatch 只接受 Paper purpose；PositionPlan 到 Decision 结束，不得借此进入 Broker。
         let purpose = self.store.run_purpose(&permit.run_id)?;
         if purpose != RunPurpose::Paper {
             return Err(PaperDispatchError::NonPaperRun(purpose));
@@ -629,6 +658,8 @@ impl PaperDispatchRuntime {
         permit: &TaskWritePermit,
         plan: &ExecutionPlan,
     ) -> PaperDispatchResult<PaperSubmissionAuthorization> {
+        // 从 permit/run 的冻结决策、approval 与执行快照构造临时发送窗口；窗口缺失时仍可
+        // 读取既有订单，但不会授权新的 effect。
         let read = |reference: &ArtifactRef, kind| -> PaperDispatchResult<Vec<u8>> {
             let artifact = self.load_expected(reference, kind)?;
             Ok(self.store.read_blob(&artifact.blob)?)
@@ -697,6 +728,8 @@ impl PaperDispatchRuntime {
         permit: &TaskWritePermit,
         commitment_reference: &ArtifactRef,
     ) -> PaperDispatchResult<CommittedPlanContext> {
+        // 读取 session slot 指向的唯一 commitment，再沿 ExecutionContext→ExecutionPlan
+        // 闭包验证 run/session/plan hash；不接受调用方仅凭一个 ArtifactRef 拼装计划。
         let commitment_artifact =
             self.load_expected(commitment_reference, ArtifactKind::ExecutionCommitment)?;
         let commitment: PaperCommitment =
@@ -761,6 +794,7 @@ impl PaperDispatchRuntime {
         reference: &ArtifactRef,
         expected: ArtifactKind,
     ) -> PaperDispatchResult<Artifact> {
+        // 所有 dispatch 读取都通过 kind 双重检查，避免把其他 Artifact 当作执行载荷。
         let artifact = self.store.artifact(&reference.artifact_id)?;
         if reference.kind != expected || artifact.kind != expected {
             return Err(PaperDispatchError::WrongArtifactKind {
@@ -772,6 +806,8 @@ impl PaperDispatchRuntime {
     }
 
     fn ensure_unfrozen(&self) -> PaperDispatchResult<()> {
+        // 全局 FreezeState 是发送前的最终 fail-closed 开关；冻结只阻断新副作用，恢复读取
+        // 的语义由各 Broker 查询和对账路径保留。
         let Some(freeze_artifact) = self
             .store
             .latest_artifact_by_kind(ArtifactKind::FreezeState)?
@@ -789,6 +825,7 @@ impl PaperDispatchRuntime {
 }
 
 fn artifact_ref(artifact: &Artifact) -> ArtifactRef {
+    // 从已加载 Artifact 生成不复制 blob 的类型化引用，用于 action/reconciliation lineage。
     ArtifactRef {
         artifact_id: artifact.artifact_id.clone(),
         kind: artifact.kind,
@@ -799,6 +836,8 @@ fn replace_execution_receipt(
     execution: &mut PaperExecution,
     replacement: PaperOrderReceipt,
 ) -> PaperDispatchResult<()> {
+    // 按 symbol 替换内存 execution 中的已知回执；资产必须能映射到 commitment，不能追加
+    // 未声明的订单。
     let asset = Asset::try_from(replacement.symbol.as_str())?;
     let receipt = execution
         .orders
@@ -817,6 +856,8 @@ async fn reconcile_until_settled<B: CommittedPaperBroker + ?Sized>(
     submitted: &PaperExecution,
     settlement_timeout: std::time::Duration,
 ) -> PaperDispatchResult<PaperExecution> {
+    // 在 settlement deadline 内以固定间隔刷新；每轮先校验 daemon lease，超时只返回最新
+    // 观察值，让上层写 progress，而不是合成终态。
     let deadline = tokio::time::Instant::now() + settlement_timeout;
     loop {
         store.validate_daemon_lease(lease, Utc::now())?;
@@ -833,6 +874,8 @@ pub(super) fn execution_is_settled(
     commitment: &PaperCommitment,
     execution: &PaperExecution,
 ) -> PaperDispatchResult<bool> {
+    // 只有所有 commitment 资产各有唯一原/替换回执，且每个状态都是无 successor 的终态，
+    // 才返回 true；缺单、重复、错误 client ID 或 plan hash 都分别保持 false/错误。
     let mut assets = std::collections::BTreeSet::new();
     for receipt in &execution.orders {
         let asset = Asset::try_from(receipt.symbol.as_str())?;
@@ -863,6 +906,8 @@ fn broker_receipt(
     commitment: &PaperCommitment,
     observed_at: DateTime<Utc>,
 ) -> PaperDispatchResult<OrderReceipt> {
+    // 将 adapter receipt 转成领域 OrderReceipt 并绑定 commitment plan hash；状态解析失败
+    // 会阻断对账，而不是默认为 accepted。
     let asset = Asset::try_from(receipt.symbol.as_str())?;
     Ok(OrderReceipt {
         plan_hash: commitment.plan_hash.clone(),
@@ -886,6 +931,7 @@ mod settlement_tests {
 
     #[test]
     fn terminal_subset_does_not_settle_full_commitment() {
+        // 验证“部分订单已终态”仍不能关闭包含其他资产的完整 Commitment。
         let hash = ContentHash::of_bytes(b"commitment plan");
         let commitment = PaperCommitment {
             commitment_id: akzio_domain::PaperCommitmentId::new(),

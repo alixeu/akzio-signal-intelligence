@@ -1,3 +1,5 @@
+// 文件导读：Outcome worker 是 Run 终态后的耐久任务。OutcomeSchedule 先与成功 Attempt
+// 一起落库，再由 Paper/Shadow 专用协议写入 sealed Outcome、Retrospective 和 Shadow pair。
 impl Store {
     /// Commits the terminal `OutcomeSchedule` and installs the scheduler-owned
     /// learning task in the same SQLite transaction. The learning task is not

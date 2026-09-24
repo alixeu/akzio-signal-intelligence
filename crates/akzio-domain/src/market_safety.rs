@@ -1,3 +1,5 @@
+// 文件导读：定义金融内容分类、共识独立性、容量、合规、依赖健康和 PreTradeSafety
+// 的纯领域约束；它们只产出可审计的允许/阻断事实，不推断法律结论或市场真相。
 //! Cross-cycle financial safety contracts.
 //!
 //! These types keep content integrity, consensus independence, capacity,
@@ -34,6 +36,7 @@ pub enum SourceAuthorityClass {
 }
 
 impl SourceAuthorityClass {
+    // 监管方、交易所、发行人和基金发起方才算高影响内容的一手来源。
     pub const fn is_primary_for_high_impact(self) -> bool {
         matches!(
             self,
@@ -71,6 +74,7 @@ pub struct FinancialContentAssessment {
 }
 
 impl FinancialContentAssessment {
+    // 校验来源、联动实体和独立确认簇的基本字段/数量边界。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.source_origin.trim().is_empty()
             || self
@@ -90,6 +94,7 @@ impl FinancialContentAssessment {
         Ok(())
     }
 
+    // 依次拒绝未知/敏感信息、危险内容指示器，以及未达到一手确认阈值的高影响内容。
     pub fn blocks_trading(&self, policy: &FinancialContentPolicy) -> bool {
         if self.validate().is_err() || policy.validate().is_err() {
             return true;
@@ -104,6 +109,7 @@ impl FinancialContentAssessment {
         {
             return true;
         }
+        // any 闭包把四类不可直接用于交易的内容指示器收敛为一个阻断条件。
         if self.indicators.iter().any(|indicator| {
             matches!(
                 indicator,
@@ -129,6 +135,7 @@ pub struct FinancialContentPolicy {
 }
 
 impl FinancialContentPolicy {
+    // 高影响内容至少需要一个且不超过 16 个独立确认簇。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.minimum_high_impact_confirmation_clusters == 0
             || self.minimum_high_impact_confirmation_clusters > 16
@@ -142,6 +149,7 @@ impl FinancialContentPolicy {
 }
 
 impl Default for FinancialContentPolicy {
+    // 默认允许 Licensed，但要求两个高影响确认簇。
     fn default() -> Self {
         Self {
             minimum_high_impact_confirmation_clusters: 2,
@@ -174,6 +182,7 @@ pub struct ConsensusDiversityAssessment {
 }
 
 impl ConsensusDiversityAssessment {
+    // 从 Agent 贡献计算参与者、能力快照、证据簇、最大重叠和独立性结论。
     pub fn from_contributions(
         contributions: &[AgentEvidenceContribution],
         maximum_allowed_overlap_ppm: u32,
@@ -199,6 +208,7 @@ impl ConsensusDiversityAssessment {
             all_clusters.extend(contribution.evidence_clusters.iter().cloned());
         }
 
+        // 两两计算 intersection/union 的 ppm 重叠；没有可除的 union 时保守取满额。
         let mut maximum_overlap = 0_u32;
         for left_index in 0..contributions.len() {
             for right_index in left_index + 1..contributions.len() {
@@ -251,6 +261,7 @@ impl ConsensusDiversityAssessment {
         })
     }
 
+    // 记录原始/有效 confidence，并标记 Rust 是否进行了 cap。
     pub fn record_confidence(
         &mut self,
         raw_confidence_ppm: u32,
@@ -267,6 +278,7 @@ impl ConsensusDiversityAssessment {
         Ok(())
     }
 
+    // 重新从 contributions 推导期望值，拒绝调用方伪造派生字段。
     pub fn validate(&self) -> Result<(), DomainError> {
         let mut expected =
             Self::from_contributions(&self.contributions, self.maximum_allowed_overlap_ppm)?;
@@ -279,6 +291,7 @@ impl ConsensusDiversityAssessment {
         Ok(())
     }
 
+    // 只有多个参与者且满足 independent 条件时，才允许共识 confidence boost。
     pub const fn permits_consensus_confidence_boost(&self) -> bool {
         self.participant_count > 1 && self.independent
     }
@@ -292,6 +305,7 @@ pub struct CapacityPolicy {
 }
 
 impl CapacityPolicy {
+    // 校验参与率、滑点和 impact slope 的 ppm 上限。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.maximum_market_participation_ppm == 0
             || self.maximum_market_participation_ppm > WeightPpm::SCALE
@@ -307,6 +321,7 @@ impl CapacityPolicy {
 }
 
 impl Default for CapacityPolicy {
+    // 提供 5% 参与率、1% 滑点和 20% impact slope 的保守默认值。
     fn default() -> Self {
         Self {
             maximum_market_participation_ppm: 50_000,
@@ -342,6 +357,7 @@ pub fn assess_capacity(
     homogeneous_agent_count: u32,
     average_daily_dollar_volume: &BTreeMap<Asset, MoneyMicros>,
 ) -> Result<CapacityScenario, DomainError> {
+    // 按目标权重和同质 Agent 数计算每项 aggregate notional、ADV 参与率、滑点和填充概率。
     policy.validate()?;
     target.validate_universe()?;
     if account_notional.0 <= 0 || homogeneous_agent_count == 0 {
@@ -350,6 +366,7 @@ pub fn assess_capacity(
         });
     }
     let mut assets = Vec::new();
+    // 只为非零资产生成容量行；缺 ADV 的资产直接返回错误而不猜测流动性。
     for asset in Asset::EXECUTABLE {
         let weight = i128::from(target.weights[&asset].0);
         if weight == 0 {
@@ -463,6 +480,7 @@ pub struct ComplianceActivitySnapshot {
 }
 
 impl ComplianceActivitySnapshot {
+    // 生成 Paper 默认可用的五项基础合规控制集合。
     pub fn paper_baseline() -> Self {
         Self {
             available_controls: ComplianceControl::PAPER_BASELINE.into_iter().collect(),
@@ -484,6 +502,7 @@ pub struct ComplianceActionPolicy {
 }
 
 impl ComplianceActionPolicy {
+    // 校验撤单率上限、restricted/watch list 不重叠及必需控制集合。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.maximum_cancel_ratio_ppm > WeightPpm::SCALE
             || !self.restricted_assets.is_disjoint(&self.watch_list_assets)
@@ -496,6 +515,7 @@ impl ComplianceActionPolicy {
         Ok(())
     }
 
+    // 按资产、信息分类、可用控制和活动快照收集所有合规违规项。
     pub fn assess(
         &self,
         asset: Asset,
@@ -531,6 +551,7 @@ impl ComplianceActionPolicy {
         if activity.self_trade_detected {
             violations.insert(ComplianceViolation::SelfTrade);
         }
+        // submissions 为零时把非零撤单视为满额撤单率；否则用 u64 计算 ppm 后收窄为 u32。
         let cancel_ratio = if activity.recent_submissions == 0 {
             if activity.recent_cancellations == 0 {
                 0
@@ -563,12 +584,14 @@ impl ComplianceActionPolicy {
         Ok(violations)
     }
 
+    // 把合规要求提升为完整八项市场完整性控制。
     pub fn require_full_market_integrity(&mut self) {
         self.required_controls = ComplianceControl::ALL.into_iter().collect();
     }
 }
 
 impl Default for ComplianceActionPolicy {
+    // 默认使用 Paper baseline、无 restricted/watch list，允许 Licensed 信息。
     fn default() -> Self {
         Self {
             restricted_assets: BTreeSet::new(),
@@ -581,6 +604,7 @@ impl Default for ComplianceActionPolicy {
 }
 
 fn paper_required_compliance_controls() -> BTreeSet<ComplianceControl> {
+    // 返回固定的 Paper baseline 控制集合，供 serde 默认值和 Default 共用。
     ComplianceControl::PAPER_BASELINE.into_iter().collect()
 }
 
@@ -613,6 +637,7 @@ impl DependencyKind {
         Self::ComplianceData,
     ];
 
+    // News/Macro/DNS/Identity 可被声明为 NotRequired/NotApplicable，其余依赖不可静默失活。
     const fn may_be_inactive(self) -> bool {
         matches!(
             self,
@@ -680,6 +705,7 @@ pub struct DependencySnapshot {
 }
 
 impl DependencySnapshot {
+    // 校验 provider/service/version、freshness、实际/配置服务和失活状态合法性。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.provider.trim().is_empty()
             || self.service.trim().is_empty()
@@ -709,6 +735,7 @@ impl DependencySnapshot {
         Ok(())
     }
 
+    // 只有配置未切换且依赖健康/未过期（或允许失活）时才允许新增风险。
     pub fn permits_new_risk(&self, now: DateTime<Utc>) -> bool {
         if self.validate().is_err() || self.configured_service != self.actual_service {
             return false;
@@ -738,6 +765,7 @@ pub struct DependencyClosure {
 }
 
 impl DependencyClosure {
+    // 要求十类依赖全部存在，并确认 key/kind 一致且观测不晚于 closure capture。
     pub fn validate(&self) -> Result<(), DomainError> {
         if DependencyKind::ALL
             .iter()
@@ -758,6 +786,7 @@ impl DependencyClosure {
         Ok(())
     }
 
+    // 所有依赖都必须各自允许新增风险。
     pub fn permits_new_risk(&self, now: DateTime<Utc>) -> bool {
         self.validate().is_ok()
             && self
@@ -769,6 +798,7 @@ impl DependencyClosure {
     /// Risk reduction may proceed without a currently healthy model provider,
     /// but never without current market, broker, clock, storage, and compliance
     /// dependencies.
+    // 风险减少只依赖市场、Broker、时钟、存储和合规这五类当前有效依赖。
     pub fn permits_risk_reduction(&self, now: DateTime<Utc>) -> bool {
         self.validate().is_ok()
             && [
@@ -790,6 +820,7 @@ impl DependencyClosure {
     /// as an explicit incident.  `PreTradeSafetySnapshot` persists the source
     /// closure, so callers can reproduce this list without a parallel state
     /// store.
+    // 为每个 stale/switched/非健康依赖生成显式 incident，保留 configured/actual service 差异。
     pub fn incidents(&self, now: DateTime<Utc>) -> Vec<DependencyIncident> {
         let mut incidents = Vec::new();
         for (kind, snapshot) in &self.dependencies {
@@ -808,6 +839,7 @@ impl DependencyClosure {
             {
                 continue;
             }
+            // 优先报告服务切换，其次是 freshness 超时，最后保留 provider 状态的具体解释。
             let reason = if switched {
                 "configured service differs from actual service"
             } else if stale {
@@ -838,6 +870,7 @@ impl DependencyClosure {
 }
 
 const fn dependency_degradation_class(kind: DependencyKind) -> DependencyDegradationClass {
+    // 将依赖类别映射到读、决策、执行、对账或合规影响面。
     match kind {
         DependencyKind::NewsProvider | DependencyKind::MacroData | DependencyKind::Dns => {
             DependencyDegradationClass::Read
@@ -876,6 +909,7 @@ pub struct PreTradeSafetySnapshot {
 }
 
 impl PreTradeSafetySnapshot {
+    // 校验订单资产集合、逐资产信息/合规覆盖，以及 capacity/dependency 派生许可布尔值。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.ordered_assets.is_empty()
             || self
@@ -896,6 +930,7 @@ impl PreTradeSafetySnapshot {
                 field: "pretrade_safety.assets",
             });
         }
+        // 先分别计算合规和容量许可，再按 risk_increasing 选择新增风险或风险减少依赖。
         let compliance_permits = self.missing_information_classifications.is_empty()
             && !self.compliance_violations_by_asset.is_empty()
             && self

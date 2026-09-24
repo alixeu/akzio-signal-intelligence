@@ -1,3 +1,5 @@
+// 文件导读：Doctor 以一个只读连接串联 SQLite quick_check、CAS 解码、事件形状、
+// Artifact/source closure、lease/slot、执行/学习/Canary 历史；它只报告一致性，不修复数据。
 use super::*;
 
 impl Store {

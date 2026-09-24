@@ -1,5 +1,9 @@
 //! Rust-owned fixed workflow compilation for the runtime.
 
+// 本文件定义 Runtime 的共享错误、固定研究角色和 WorkflowRuntime 外壳。Proposal
+// 只能经过 catalogue/compilation 变成图；TaskRuntime 负责 lease/Future/取消，Store
+// 负责 durable state。NodeOutcome 的 Accepted/Committed/Deferred 等观察必须与模型
+// 返回、Task 成功、Paper accepted、fill 和 Outcome 分开报告。
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
@@ -149,6 +153,8 @@ struct ReplayedWorkflow {
 
 #[derive(Debug, Clone)]
 pub struct WorkflowRuntime {
+    // research_settings 与 agent_budgets 在 lower 时冻结进 WorkflowGraph；运行中的
+    // config reload 不会改写已有 node 的预算、retry 或 Contract identity。
     research_settings: akzio_domain::ResearchSettings,
     agent_budgets: BTreeMap<String, TaskBudget>,
     store: Store,
@@ -206,6 +212,8 @@ pub enum RetryCause {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeOutcome {
+    // Outcome 是 TaskRuntime 与业务 handler 的协议值：Succeeded/Committed 只表示本
+    // 阶段已提交或核验，Deferred/Retry 保留后续状态。它们都不等于整个 Run 的业务闭环。
     Succeeded(Vec<Artifact>),
     /// A Rust gate can succeed after forwarding already durable lineage without
     /// manufacturing a duplicate artifact. The task transition remains in the
@@ -236,6 +244,8 @@ fn required_terminal<'a>(
 }
 
 fn leaf_ids(nodes: &[WorkflowNode]) -> Vec<akzio_domain::TaskId> {
+    // 叶节点是没有后继依赖的研究节点；DecisionGate 只接这些叶子，避免把中间
+    // Claim/Critique 完成误当成研究图已经闭合。
     let depended_on = nodes
         .iter()
         .flat_map(|node| node.dependencies.iter().cloned())

@@ -1,5 +1,8 @@
 use super::*;
 
+// WorkflowRuntime 的写入口把已编译 graph/proposal 与 Session reservation 放进 Store
+// 事务边界。重复 session 返回原有 Run/Task identity；配置重载、scheduler restart 或
+// 重新调用函数都不能生成替代 graph。approved proposal 是研究拓扑，不是模型已完成的结论。
 impl WorkflowRuntime {
     pub fn submit(
         &self,
@@ -8,6 +11,8 @@ impl WorkflowRuntime {
         graph: WorkflowGraph,
         now: DateTime<Utc>,
     ) -> RuntimeResult<Artifact> {
+        // prepare 先做 graph/compiled invariants，commit 才让 Run/Task 出现在 durable
+        // journal；返回 graph Artifact 仍只说明提交成功，不代表节点已领取或执行。
         let commit = self.prepare_workflow_commit(run_id, purpose, graph, now)?;
         let graph_artifact = commit.graph.clone();
         self.store.commit_workflow(&commit)?;
@@ -21,6 +26,8 @@ impl WorkflowRuntime {
         graph: WorkflowGraph,
         now: DateTime<Utc>,
     ) -> RuntimeResult<WorkflowCommit> {
+        // 预备阶段不写 Store，只使用当前实例的 staging connection 生成不可变 graph；
+        // 调用方可以把它和 Paper approval/evidence setup 组合进同一事务。
         graph.validate()?;
         self.validate_compiled_graph(purpose, &graph)?;
         let graph_artifact = self.graph_artifact(&graph, vec![], now)?;
@@ -157,6 +164,8 @@ impl WorkflowRuntime {
         binding: Option<(&Artifact, &Artifact)>,
         now: DateTime<Utc>,
     ) -> RuntimeResult<SessionSlotReservation> {
+        // 先查 session slot，重复 scheduler tick 直接返回既有 reservation；新 session
+        // 才编译一次 Paper graph，并在有 approval binding 时由 Store 原子消费审批。
         let session_key = session_key.into();
         if let Some(slot) = self.store.session_slot(&session_key)? {
             return Ok(SessionSlotReservation {
@@ -214,6 +223,8 @@ impl WorkflowRuntime {
         &self,
         topology_id: impl Into<String>,
     ) -> RuntimeResult<akzio_domain::WorkflowDefinition> {
+        // 固定生成 T1/T3/T5 Analyst/Critic、一次共享 supplement、refined pairs 和
+        // 有界 Synthesizer/ProposalReviewer revisions；Outcome worker 不在这条 T0 图里。
         let topology_id = topology_id.into();
         let analyst = self
             .catalogue
@@ -263,6 +274,8 @@ impl WorkflowRuntime {
             ("t3", akzio_domain::DecisionHorizon::T3),
             ("t5", akzio_domain::DecisionHorizon::T5),
         ] {
+            // 每个 horizon 的 Critic 只审对应 Claim；依赖顺序表达 Rust-owned provenance，
+            // 不是让模型动态创建新 Agent。
             let a = format!("analyst_{horizon}");
             let c = format!("critic_{horizon}");
             insert(
@@ -310,6 +323,8 @@ impl WorkflowRuntime {
         }
         let mut previous = None;
         for revision in 0..=self.research_settings.max_proposal_revisions {
+            // 每个 revision 都是预先冻结的 Synthesizer→Reviewer 对；Review 通过后由
+            // 上层选择有效版本，失败/耗尽不会自动激活 Policy。
             let synth = format!("synthesizer_{revision}");
             let review = format!("proposal_review_{revision}");
             let mut dependencies = effective.clone();
@@ -342,6 +357,8 @@ impl WorkflowRuntime {
         proposal: &WorkflowProposal,
         now: DateTime<Utc>,
     ) -> RuntimeResult<Artifact> {
+        // proposal Artifact 仅保存 Rust 编译的研究计划和 EvidenceNeed refs，没有模型
+        // 预测或订单；Paper session 仍需后续 Agent/Decision/Execution/Commit Gate。
         Ok(Artifact::new(
             ArtifactKind::WorkflowProposal,
             // The returned reservation is valid only with this Store's staging connection.
@@ -380,6 +397,8 @@ impl WorkflowRuntime {
         proposal_artifact: Option<&Artifact>,
         now: DateTime<Utc>,
     ) -> RuntimeResult<WorkflowCommit> {
+        // Paper 图复用 approved research proposal，再接正式执行链；PositionPlan 不会
+        // 通过这个 helper 获得 PaperCommit/Reconcile/Evaluate 能力。
         let graph = self.lower(RunPurpose::Paper, proposal)?;
         let graph_artifact = self.graph_artifact(
             &graph,

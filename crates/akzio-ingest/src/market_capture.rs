@@ -12,10 +12,12 @@ const QUOTE_BATCH: usize = 100;
 const MAX_SUPPLEMENTS: usize = 6;
 
 fn invalid(message: &str) -> EvidenceAdapterError {
+    // 适配器发现响应形状或业务字段不可信时统一返回 DataQuality，调用方仍可把请求记录保留在 ledger。
     EvidenceAdapterError::DataQuality(message.to_owned())
 }
 
 fn timestamp(value: &Value) -> Option<DateTime<Utc>> {
+    // Alpaca 的不同组件可能使用 t 或 timestamp；缺字段、非字符串或不可解析时返回 None，不借用采集时间。
     value
         .get("t")
         .or_else(|| value.get("timestamp"))?
@@ -25,10 +27,12 @@ fn timestamp(value: &Value) -> Option<DateTime<Utc>> {
 }
 
 fn positive(value: &Value) -> Option<f64> {
+    // 价格和隐含波动率只接受有限正数；Option 让缺失或非法数值在后续 coverage 中保持未知。
     value.as_f64().filter(|v| v.is_finite() && *v > 0.0)
 }
 
 fn has_quote(snapshot: &Value) -> bool {
+    // 合格 quote 需要 bid、正 ask 和 provider 时间戳；只有结构完整才计入 bid/ask coverage。
     snapshot.get("latestQuote").is_some_and(|q| {
         q.get("bp")
             .and_then(Value::as_f64)
@@ -40,6 +44,7 @@ fn has_quote(snapshot: &Value) -> bool {
 
 /// Component times are independent. Never replace them with retrieval time.
 fn filter_snapshot(value: &mut Value, cutoff: DateTime<Utc>) -> usize {
+    // 每个市场组件按自己的 provider 时间和同一个 cutoff 独立过滤；拒绝任一组件时同步清除依赖它的 Greeks/IV。
     let mut rejected = 0;
     for key in [
         "latestQuote",
@@ -69,6 +74,7 @@ impl AlpacaPaperEvidenceTransport {
         url: Url,
         ledger: &mut Vec<Value>,
     ) -> Result<Value, EvidenceAdapterError> {
+        // 每次 GET 都先记 requested_at，成功或失败都写入原始请求账本；Result 保留 provider 错误给上层分类。
         let requested_at = Utc::now();
         match self.bounded_json(&url).await {
             Ok(value) => {
@@ -96,6 +102,7 @@ impl AlpacaPaperEvidenceTransport {
         cutoff: DateTime<Utc>,
         ledger: &mut Vec<Value>,
     ) -> Result<Value, EvidenceAdapterError> {
+        // 股票证据来自显式选择的 Alpaca feed；先验证资产状态，再采集 clock、calendar 和各市场组件。
         let feed = self
             .market_data_feed
             .ok_or_else(|| invalid("explicit equity feed required"))?
@@ -119,6 +126,7 @@ impl AlpacaPaperEvidenceTransport {
         )
         .map_err(|_| invalid("calendar URL"))?;
         let calendar = self.capture_get(calendar_url, ledger).await?;
+        // 日历 close 决定历史日线何时完整；clock 只描述当前状态，不能替代组件自己的时间戳。
         let closes = super::session_bars::session_closes(&calendar)?;
         let last = closes
             .iter()
@@ -135,6 +143,7 @@ impl AlpacaPaperEvidenceTransport {
             ("quotes/latest", "latest_quote", Some("quote")),
             ("trades/latest", "latest_trade", Some("trade")),
         ] {
+            // snapshot、latest quote、latest trade 走不同 provider 端点；统一在这里按 cutoff 过滤并保留各自错误。
             let url = Url::parse_with_params(
                 &format!("{}/v2/stocks/{symbol}/{path}", self.market_data_url),
                 &[("feed", feed)],
@@ -179,6 +188,7 @@ impl AlpacaPaperEvidenceTransport {
         resource: &str,
         cutoff: DateTime<Utc>,
     ) -> Result<AcquiredEvidence, EvidenceAdapterError> {
+        // 先把字符串资源解析成 typed option chain；解析失败或资源类型不符都在任何网络请求前返回 Result 错误。
         let GovernedResource::AlpacaOptionChain {
             asset,
             expiration_start,
@@ -199,6 +209,7 @@ impl AlpacaPaperEvidenceTransport {
             .ok_or_else(|| {
                 invalid("bounded option strikes require a cutoff-valid underlying trade or bar")
             })?;
+        // 期权到期日最多扩展 30 天，行权价围绕 cutoff-valid 的标的价格限定在 90%--110%。
         let end = expiration_end.min(expiration_start + Duration::days(30));
         let low = price * 0.9;
         let high = price * 1.1;
@@ -221,6 +232,7 @@ impl AlpacaPaperEvidenceTransport {
         let mut cursor: Option<String> = None;
         let mut seen = BTreeSet::new();
         for page_index in 0..MAX_PAGES {
+            // cursor 是 Option：只有 provider 返回非空 page token 才继续分页，并用 seen 防止循环。
             let mut url = contract_url.clone();
             if let Some(ref token) = cursor {
                 url.query_pairs_mut().append_pair("page_token", token);
@@ -294,6 +306,7 @@ impl AlpacaPaperEvidenceTransport {
         let mut errors = Vec::new();
         let mut permission_denied = false;
         for page_index in 0..MAX_PAGES {
+            // 行情链沿用同一个显式 feed；权限拒绝会停止补采并在 coverage 标成 permission_denied。
             let mut url = base.clone();
             if let Some(ref token) = cursor {
                 url.query_pairs_mut().append_pair("page_token", token);
@@ -334,6 +347,7 @@ impl AlpacaPaperEvidenceTransport {
             .filter(|s| !snapshots.get(*s).is_some_and(has_quote))
             .cloned()
             .collect::<Vec<_>>();
+        // 缺 quote 的合约按 provider 批量补采；权限已拒绝时不重试，并且所有补采仍受固定次数上限约束。
         let mut supplemental_requests = 0;
         for batch in missing.chunks(QUOTE_BATCH).take(if permission_denied {
             0
@@ -378,6 +392,7 @@ impl AlpacaPaperEvidenceTransport {
         let mut greeks = 0;
         let mut oi = 0;
         for (symbol, snapshot) in &mut snapshots {
+            // 将 contract 元数据和 provider 时间戳合并到规范化快照；缺少 IV/Greeks 独立时间戳时明确保留 unknown。
             rejected += usize::from(filter_snapshot(snapshot, cutoff) > 0);
             let contract = &contracts[symbol];
             snapshot["expiration_date"] = contract["expiration_date"].clone();
@@ -436,6 +451,7 @@ impl AlpacaPaperEvidenceTransport {
                 else if truncated {"bounded_partial"} else {"available"},
             "iv_greeks_timestamp_status":"unknown; provider supplies no independent timestamps",
             "stale_threshold_seconds":900});
+        // normalized 是受控 Context 投影，raw 只保存完整请求/响应账本；两者都带上分页、权限和截断状态。
         let normalized = serde_json::json!({"snapshots":snapshots,"coverage":coverage,"feed":feed,
             "underlying":stock,"decision_cutoff":cutoff,"pagination_complete":!truncated,
             "bounds":{"expiration_start":expiration_start,"expiration_end":end,"strike_price_gte":low,"strike_price_lte":high,

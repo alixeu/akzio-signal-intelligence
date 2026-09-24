@@ -1,5 +1,10 @@
 //! Research prompt ownership: complete role documents and typed phase builders.
 //! Runtime reads frozen governance/role blobs; these sources install new Contracts.
+
+// 这个 Rust 模块只负责把已登记的 governance/role 文本装进 PromptBundle，并把
+// 阶段协议交给 typed builders；它不把 Markdown 内容变成权限。Contract、预算、
+// ContextManifest 和 submit_result 工具面仍由 Rust Runtime 决定，Outcome 的 Draft
+// 与受控读取也不会因为 role_prompt 返回成功而提前完成。
 use super::*;
 mod phases;
 pub(super) use phases::*;
@@ -8,6 +13,9 @@ pub(super) const SHARED_GOVERNANCE_PROMPT: &str = include_str!("shared.md");
 pub(super) const ANALYST_FRESHNESS_GUIDANCE: &str = "\n\n候选 freshness v21：使用 Rust 的 time_basis.available_at、latest_completed_session 和 decision cutoff 评估内容新鲜度。检索时间本身绝不是新鲜度证明。将过期或缺失的覆盖报告为有范围的 evidence_gaps。\n";
 
 pub(super) fn role_prompt(purpose: &str) -> ResearchResult<String> {
+    // purpose 是安装 Contract 的稳定身份，只能命中当前允许的角色；未知值返回
+    // 错误而不是读取任意路径。include_str! 的 Markdown 字节由 prompt registry 冻结，
+    // 本函数只复制为 owned String 供后续组合，不修改 Prompt 文本。
     let role = match purpose {
         RESEARCH_ANALYST_RECIPE_ID => include_str!("roles/analyst.md"),
         RESEARCH_CRITIC_RECIPE_ID => include_str!("roles/critic.md"),

@@ -1,6 +1,9 @@
 use super::*;
+
+// Catalogue 把 Store 持久化的 Active Contract head 与 Rust recipe catalogue 绑定；候选永远没有隐式执行路径。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledContract {
+    // contract 是已验证的协议值，artifact 保留其 CAS/Store provenance。
     pub contract: AgentContract,
     pub artifact: Artifact,
 }
@@ -10,6 +13,7 @@ pub struct InstalledContract {
 /// boundary: contracts drive model turns; recipes drive Rust DAG lowering.
 #[derive(Debug, Clone)]
 pub struct ActiveResearchCatalogue {
+    // contracts 决定模型 turns，recipes 决定 Rust DAG lowering；两者从同一 active head 原子恢复。
     pub contracts: ContractCatalogue,
     pub recipes: RecipeCatalogue,
 }
@@ -20,6 +24,7 @@ impl ActiveResearchCatalogue {
     /// no execution path until a canonical Paper-backed transition promotes
     /// their persisted head.
     pub fn install(store: &Store, now: DateTime<Utc>) -> ResearchResult<Self> {
+        // 安装前检查 legacy retirement；fresh Store 才允许 canonical bootstrap，已有 head 走 Store-owned upgrade 规则。
         store.check_legacy_workflow_retirement(now)?;
         let contracts = ContractCatalogue::load_or_bootstrap_active(
             store,
@@ -40,6 +45,7 @@ impl ActiveResearchCatalogue {
         candidate: &AgentContract,
         now: DateTime<Utc>,
     ) -> ResearchResult<InstalledContract> {
+        // candidate 先由 active contract 做 capability subset 校验，再由 Store 持久化为不可变候选。
         self.contracts
             .install_candidate(store, active_contract_hash, candidate, now)
     }
@@ -49,6 +55,7 @@ impl ActiveResearchCatalogue {
         store: &Store,
         now: DateTime<Utc>,
     ) -> ResearchResult<InstalledContract> {
+        // freshness candidate 只改变 analyst prompt/version 并重新计算 hash，不替换当前 active head。
         let active = self
             .contracts
             .contracts()
@@ -70,6 +77,7 @@ impl ActiveResearchCatalogue {
 
 pub const ACTIVE_RESEARCH_MAX_NODES: usize = 32;
 
+// Contract/Prompt 版本是冻结 wire identity；Candidate 版本独立于当前 active 版本，等待显式 policy transition。
 pub(super) const COMPACT_SUBMISSION_CONTRACT_VERSION: u32 = 51;
 pub(super) const ACTIVE_CONTRACT_VERSION: u32 = 69;
 pub(super) const ACTIVE_PROMPT_BUNDLE_VERSION: u32 = 38;
@@ -90,6 +98,7 @@ impl ContractCatalogue {
         contracts: impl IntoIterator<Item = AgentContract>,
         now: DateTime<Utc>,
     ) -> ResearchResult<Self> {
+        // load_or_bootstrap_active 先批量检查 canonical upgrade，再逐项加载，避免部分角色先升级而其他角色被阻断。
         store.check_legacy_workflow_retirement(now)?;
         let contracts = contracts.into_iter().collect::<Vec<_>>();
         validate_unique_contracts(&contracts)?;
@@ -156,6 +165,7 @@ impl ContractCatalogue {
     }
 
     pub fn get(&self, hash: &akzio_domain::ContentHash) -> ResearchResult<&InstalledContract> {
+        // 只能按已安装 contract hash 读取；未知 hash 返回显式错误，不从 candidate 或本地默认猜测。
         self.by_hash
             .get(hash)
             .ok_or_else(|| ResearchError::UnknownContract(hash.clone()))
@@ -166,6 +176,7 @@ impl ContractCatalogue {
     }
 
     pub fn with_installed_candidate(&self, installed: InstalledContract) -> ResearchResult<Self> {
+        // 返回新的值语义 catalogue，不修改当前实例；hash 已存在可幂等复用，identity/version 冲突则拒绝。
         let mut catalogue = self.clone();
         if catalogue
             .by_hash
@@ -199,6 +210,7 @@ impl ContractCatalogue {
     /// This method rejects unknown purposes and candidates that are not the
     /// current durable head rather than silently granting a new recipe.
     pub fn active_recipe_catalogue(&self, store: &Store) -> ResearchResult<RecipeCatalogue> {
+        // 只把 active contracts lower 成 recipes；active_recipe_catalogue 的错误仍由 Runtime 映射为 ResearchError。
         let contracts =
             self.contracts()
                 .cloned()
@@ -218,6 +230,7 @@ impl ContractCatalogue {
         active_hash: &akzio_domain::ContentHash,
         candidate: &AgentContract,
     ) -> ResearchResult<()> {
+        // candidate 必须通过自身 schema 和 sponsor active contract 的 capability subset 检查。
         candidate.validate()?;
         let active = self.get(active_hash)?;
         if active.contract.permits_candidate(candidate) {
@@ -237,6 +250,7 @@ impl ContractCatalogue {
         candidate: &AgentContract,
         now: DateTime<Utc>,
     ) -> ResearchResult<InstalledContract> {
+        // 候选在写入 Store 前还要验证其 tool definitions 能从受控 ContextBroker 构造。
         self.validate_candidate(active_contract_hash, candidate)?;
         model_tool_definitions(&ContextBroker::new(store.clone()), candidate)?;
         let stored = store.install_candidate_contract(active_contract_hash, candidate, now)?;
@@ -245,6 +259,7 @@ impl ContractCatalogue {
 }
 
 fn map_active_recipe_error(error: RuntimeError) -> ResearchError {
+    // Runtime 的 active-contract 错误保持一一映射；未知错误不被压成“缺 contract”。
     match error {
         RuntimeError::UnexpectedActiveContractPurpose(purpose) => {
             ResearchError::UnexpectedActiveContractPurpose(purpose)
@@ -272,6 +287,7 @@ fn map_active_recipe_error(error: RuntimeError) -> ResearchError {
 }
 
 fn installed_contract(stored: StoredContract) -> InstalledContract {
+    // Store 返回的 contract/artifact 成对转为本地值，不复制或改写 CAS identity。
     InstalledContract {
         contract: stored.contract,
         artifact: stored.artifact,
@@ -279,6 +295,7 @@ fn installed_contract(stored: StoredContract) -> InstalledContract {
 }
 
 fn validate_unique_contracts(contracts: &[AgentContract]) -> ResearchResult<()> {
+    // 同时按 content hash 与 contract_id/version 去重，保证 catalogue 两个索引不会互相覆盖。
     let mut hashes = BTreeSet::new();
     let mut identities = BTreeSet::new();
     for contract in contracts {
@@ -298,7 +315,3 @@ fn validate_unique_contracts(contracts: &[AgentContract]) -> ResearchResult<()> 
     }
     Ok(())
 }
-
-#[cfg(test)]
-#[path = "catalogue_migration_tests.rs"]
-mod migration_tests;

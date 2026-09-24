@@ -5,9 +5,11 @@ import Foundation
 // A linear congruential generator seeded from the scenario number. No system time,
 // no `Double.random`, so every scenario rebuilds byte-identically.
 public struct SeededGenerator: RandomNumberGenerator {
+    // state 是唯一可变值；实例按值传递，调用方可为不同 fixture 各自保存独立序列。
     private var state: UInt64
 
     public init(seed: UInt64) {
+        // 初始化混合 seed，避免相邻 scenario 直接产生相似的首项。
         // Splitmix-style mixing so small seeds still diverge quickly.
         var s = seed &* 0x9E37_79B9_7F4A_7C15 &+ 0x1234_5678_9ABC_DEF0
         s ^= s >> 30
@@ -17,6 +19,7 @@ public struct SeededGenerator: RandomNumberGenerator {
     }
 
     public mutating func next() -> UInt64 {
+        // next 按固定 LCG 更新 state，并返回经过混合的伪随机 UInt64。
         state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
         var z = state
         z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
@@ -35,6 +38,7 @@ public struct SeededGenerator: RandomNumberGenerator {
     }
 
     public mutating func int(in range: ClosedRange<Int>) -> Int {
+        // 整数采样使用 next 的模运算，所有 fixture 的范围都已由调用方给出。
         let span = range.upperBound - range.lowerBound + 1
         return range.lowerBound + Int(next() % UInt64(max(span, 1)))
     }
@@ -50,6 +54,7 @@ public struct SeededGenerator: RandomNumberGenerator {
     }
 
     public mutating func pick<T>(_ options: [T]) -> T {
+        // pick 闭包只在传入非空候选集上选择一项，保持调用方的枚举顺序。
         options[int(in: 0...(options.count - 1))]
     }
 }
@@ -65,6 +70,7 @@ extension SeededGenerator {
         volatility: Double,
         meanReversion: Double = 0.04
     ) -> [Double] {
+        // walk 在本地数组中累计带均值回归的序列；它不读取系统时间或外部价格。
         var values: [Double] = []
         values.reserveCapacity(count)
         var value = start

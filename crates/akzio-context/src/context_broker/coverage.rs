@@ -1,3 +1,5 @@
+// 文件导读：记录 Context 候选覆盖、Lesson 来源更新和 projection omission 审计。
+// 这些写入是 RunScoped 观察，不会改变 Lesson 生命周期、Policy 或 Decision 授权。
 impl ContextBroker {
     // 将 Context 召回或来源变化记录成当前 Run 的审计 Artifact；这里只记录
     // 观察结果，不改变 Lesson 的生命周期，也不会把观察直接升级为 Policy。
@@ -9,6 +11,7 @@ impl ContextBroker {
         refs: Vec<ArtifactRef>,
         now: DateTime<Utc>,
     ) -> ContextResult<()> {
+        // 先写入 SemanticDetail，再通过同一 permit 提交 ArtifactCommitted 事件。
         // payload 先进入 CAS，再由同一个 TaskWritePermit 提交事件；任一读取、序列化
         // 或 Store 写入错误都会通过 ? 返回，调用方不会得到“部分完成”的成功值。
         let artifact = Artifact::new(
@@ -46,6 +49,7 @@ impl ContextBroker {
         evidence: &[ArtifactRef],
         now: DateTime<Utc>,
     ) -> ContextResult<()> {
+        // 仅比较同 source/resource 的新 NormalizedEvidence，生成可追溯重验建议。
         for selected in learning.iter().filter(|r| r.kind == ArtifactKind::Lesson) {
             // Lesson 没有治理信息时无法判断重验时间，按当前函数的保守边界跳过它。
             let artifact = self.store.artifact(&selected.artifact_id)?;
@@ -102,6 +106,7 @@ impl ContextBroker {
         exclusion_reasons: &std::collections::BTreeMap<ArtifactId, &str>,
         now: DateTime<Utc>,
     ) -> ContextResult<()> {
+        // 固化组装时的候选/选择状态，区分“未选中”与“当时不可用”。
         // candidates 是 Manifest 组装时观察到的集合；selected 只反映本次 Manifest
         // 的实际选择，不能用导出时才出现的 Artifact 倒推历史可用性。
         let selected = manifest
@@ -162,6 +167,7 @@ impl ContextBroker {
 // 判断投影是否丢失原值中的任一结构；NormalizedEvidence 要比较其 value 与
 // value_summary，其他 Artifact 则比较整个文档。这里只做结构包含检查，不改变文档。
 fn projection_omits_material(kind: ArtifactKind, original: &Value, projected: &Value) -> bool {
+    // 递归判断 projected 是否保留 original 的所有结构；只报告 material omission，不改写值。
     fn contains(original: &Value, projected: &Value) -> bool {
         match (original, projected) {
             (Value::Object(left), Value::Object(right)) => left
@@ -184,6 +190,7 @@ fn projection_omits_material(kind: ArtifactKind, original: &Value, projected: &V
 mod coverage_quality_tests {
     use super::*;
     #[test]
+    // 仅重新包裹完整结构不算丢失；压缩 bars 数组则必须标记 omission。
     fn projection_rewrapping_is_not_material_omission() {
         let original = serde_json::json!({"source":"alpaca","resource":"quote:QQQ","value":{"price":100,"bars":[1,2]}});
         let projected =

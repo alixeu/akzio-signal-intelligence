@@ -1,3 +1,5 @@
+// 文件导读：Trajectory 只从事件日志和 AgentTurn/Tool Artifact 生成脱敏投影；
+// unmatched dispatch 保留为 unknown，不能从缺失 terminal 事件推断 provider 失败或零成本。
 use super::*;
 
 /// Pair the serialized dispatch lifecycle without inventing a call identity for
@@ -11,6 +13,7 @@ pub(super) struct AgentTurnPairing {
 }
 
 impl AgentTurnPairing {
+    // 按 Run/Task/Attempt 保存最近未闭合的 started；terminal alias 只消费同一 Artifact。
     pub(super) fn observe(&mut self, event: &StoredEvent) {
         let key = (
             event.run_id.clone(),
@@ -49,6 +52,7 @@ impl AgentTurnPairing {
         }
     }
 
+    // 把仍未闭合或因 retry/recovery 放弃的 started 按 cursor 返回为未知调用。
     pub(super) fn unmatched_starts(self) -> Vec<StoredEvent> {
         let mut starts = self.unmatched;
         starts.extend(self.pending.into_values());
@@ -58,6 +62,7 @@ impl AgentTurnPairing {
 }
 
 impl Store {
+    // 读取状态计数、事件总数和当前 daemon lease 数；now 只用于 lease expiry 过滤。
     pub fn metrics(&self, now: DateTime<Utc>) -> StoreResult<StoreMetrics> {
         let connection = self.connection()?;
         let run_counts = status_counts(&connection, "rebuild_runs")?;
@@ -81,6 +86,7 @@ impl Store {
         })
     }
 
+    // 从 exclusive cursor 之后分页读取事件，并在返回前重跑该 Run 的生命周期校验。
     pub fn events_after(
         &self,
         run_id: &RunId,
@@ -115,6 +121,7 @@ impl Store {
         Ok(events)
     }
 
+    // 获取最近事件后恢复正序，读到的投影仍按事件/Attempt lineage 检查。
     pub fn recent_events(&self, run_id: &RunId, limit: usize) -> StoreResult<Vec<StoredEvent>> {
         let connection = self.connection()?;
         let limit = i64::try_from(limit.clamp(1, 500)).expect("bounded event limit fits i64");
@@ -189,6 +196,7 @@ impl Store {
         self.model_usage_for_tasks(run_id, None)
     }
 
+    // 按可选 Task 闭包去重 AgentTurn Artifact，缺 usage 的调用计入 turns_missing_usage 而不估算 token。
     fn model_usage_for_tasks(
         &self,
         run_id: &RunId,
@@ -345,6 +353,7 @@ impl Store {
     }
 }
 
+// 将 SQL event row 解码为 StoreEvent；时间/hash 解析失败通过 rusqlite 转换错误向上传播。
 pub(super) fn stored_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredEvent> {
     Ok(StoredEvent {
         cursor: row.get(0)?,
@@ -369,6 +378,7 @@ pub(super) fn stored_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result
 mod pairing_tests {
     use super::*;
 
+    // 构造最小事件值，测试只关注配对状态，不依赖真实 SQLite。
     fn event(cursor: i64, attempt: &str, kind: &str, artifact: Option<&str>) -> StoredEvent {
         StoredEvent {
             cursor,
@@ -381,6 +391,7 @@ mod pairing_tests {
         }
     }
 
+    // 运行 pairing helper 并只返回未知 started 的 cursor，便于断言不误配。
     fn unmatched(events: &[StoredEvent]) -> Vec<i64> {
         let mut pairing = AgentTurnPairing::default();
         for event in events {
@@ -394,6 +405,7 @@ mod pairing_tests {
     }
 
     #[test]
+    // 新 started 不能被旧 Attempt 或不同 Attempt 的 terminal 关闭。
     fn pairing_never_closes_new_start_with_old_or_other_attempt_terminal() {
         assert_eq!(
             unmatched(&[
@@ -407,6 +419,7 @@ mod pairing_tests {
     }
 
     #[test]
+    // retry 放弃的 started 保留为未知，而后续 Attempt 可正常完成配对。
     fn pairing_retains_abandoned_start_while_matching_later_attempt_normally() {
         assert_eq!(
             unmatched(&[
@@ -420,6 +433,7 @@ mod pairing_tests {
     }
 
     #[test]
+    // Draft/Submit 两次调用可完整配对，并且同 Artifact 的历史 alias 不重复计费。
     fn pairing_accepts_complete_draft_submit_and_deduplicates_terminal_alias() {
         assert!(unmatched(&[
             event(1, "a", "agent.turn_started", None),

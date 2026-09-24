@@ -5,6 +5,12 @@
 //! active task permit in one Store transaction. The adapter may only receive
 //! a commitment returned from here.
 
+// 文件导读：PaperCommitmentRuntime 是 Decision/Execution 与 Broker 之间的持久化断点。
+// 它只读取并校验 Paper run、Accepted ExecutionVerdict、完整 ExecutionContext/Plan、审批
+// 和 session slot，生成确定性 client_order_id 后在 Store fenced transaction 中提交；
+// 任何错误都发生在网络 I/O 前。重复领取同一 session 时返回已存在且逐项相同的 commitment，
+// 不会新建第二套订单身份。
+
 use akzio_domain::{
     Artifact, ArtifactKind, ArtifactLifecycle, ArtifactRef, Asset, DomainError, ExecutionContext,
     ExecutionVerdict, FreezeState, OrderSide, PaperCommitment, PaperCommitmentId, RunPurpose,
@@ -60,6 +66,8 @@ pub enum PaperCommitmentError {
 pub type PaperCommitmentResult<T> = std::result::Result<T, PaperCommitmentError>;
 
 fn require_current_risk_model(allocation: &crate::ExecutionPlan) -> PaperCommitmentResult<()> {
+    // 旧风险模型只允许历史读取，不能生成新的 Paper side effect；这里把版本边界放在
+    // Commitment 前，而不是让 Broker 或 Reconcile 再猜测风险语义。
     if !allocation.uses_current_factor_exposure_model()? {
         return Err(PaperCommitmentError::LegacyRiskModel);
     }
@@ -88,6 +96,7 @@ pub struct PaperCommitmentRuntime {
 
 impl PaperCommitmentRuntime {
     pub fn new(store: Store) -> Self {
+        // Store 是唯一持久化权威；runtime 本身不缓存 commitment 状态。
         Self { store }
     }
 
@@ -97,6 +106,9 @@ impl PaperCommitmentRuntime {
         &self,
         input: &PaperCommitmentInput,
     ) -> PaperCommitmentResult<PaperCommitmentOutput> {
+        // 输入→确认 Paper purpose/freeze→读取并验证 Verdict/Context/Plan 闭包→核对 approval
+        // 与金额→构造稳定 client IDs→检查 session slot→提交 fenced commitment。成功返回
+        // 的 Artifact 才能被 dispatch 交给 Broker；已有同一 commitment 则走恢复分支。
         let purpose = self.store.run_purpose(&input.permit.run_id)?;
         if purpose != RunPurpose::Paper {
             return Err(PaperCommitmentError::NonPaperRun(purpose));
@@ -272,6 +284,7 @@ impl PaperCommitmentRuntime {
         reference: &ArtifactRef,
         expected: ArtifactKind,
     ) -> PaperCommitmentResult<Artifact> {
+        // ArtifactRef 的声明 kind 与 Store 实际 kind 双重核对，避免只按 hash 读取错误载荷。
         let artifact = self.store.artifact(&reference.artifact_id)?;
         if reference.kind != expected || artifact.kind != expected {
             return Err(PaperCommitmentError::WrongArtifactKind {

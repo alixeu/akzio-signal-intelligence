@@ -1,3 +1,5 @@
+// 文件导读：生命周期辅助函数把 Artifact source closure、embedded BLOB 索引、Task node、
+// permit/daemon lease 和 Paper effect 约束放进调用方事务，保证读取与提交使用同一连接视图。
 fn index_embedded_blob_refs(connection: &Connection, artifact: &Artifact) -> StoreResult<()> {
     for (role, ordinal, blob) in embedded_blob_refs(connection, artifact)? {
         blob::promote_staged_blob(connection, &blob)?;
@@ -16,6 +18,7 @@ fn index_embedded_blob_refs(connection: &Connection, artifact: &Artifact) -> Sto
     Ok(())
 }
 
+// 为历史 NormalizedEvidence 补齐 embedded blob index，写入只在自身 Immediate 事务内发生。
 fn backfill_embedded_blob_refs(connection: &mut Connection) -> StoreResult<()> {
     let artifact_ids = connection
         .prepare(
@@ -58,6 +61,7 @@ fn backfill_embedded_blob_refs(connection: &mut Connection) -> StoreResult<()> {
     Ok(())
 }
 
+// 按 Artifact kind 从 Contract/NormalizedEvidence payload 提取嵌入 BLOB，并逐个验证可读。
 fn embedded_blob_refs(
     connection: &Connection,
     artifact: &Artifact,
@@ -124,6 +128,7 @@ fn embedded_blob_refs(
 /// Inserts a completion batch in source-closure order. A task may create a
 /// RawEvidence artifact and its NormalizedEvidence dependent in the same
 /// atomic attempt; callers need not rely on input ordering for correctness.
+// 对同一 completion batch 做 source-closure 拓扑排序后插入，允许输入顺序与依赖顺序不同。
 fn insert_artifact_batch(transaction: &Transaction<'_>, artifacts: &[Artifact]) -> StoreResult<()> {
     let mut pending = BTreeMap::<ArtifactId, &Artifact>::new();
     for artifact in artifacts {
@@ -165,6 +170,7 @@ fn insert_artifact_batch(transaction: &Transaction<'_>, artifacts: &[Artifact]) 
     Ok(())
 }
 
+// Workflow node 的所有 input Artifact 必须在创建 Run 前可沿 source_refs 递归解析。
 fn assert_workflow_input_artifacts(
     transaction: &Transaction<'_>,
     nodes: &[WorkflowNode],
@@ -176,6 +182,7 @@ fn assert_workflow_input_artifacts(
     Ok(())
 }
 
+// 深度优先检查一个 ArtifactRef 的 kind 和完整 source closure，visited 防止重复扫描。
 fn assert_artifact_reference_closure(
     transaction: &Transaction<'_>,
     reference: &ArtifactRef,
@@ -196,6 +203,7 @@ fn assert_artifact_reference_closure(
     Ok(())
 }
 
+// 把领域 WorkflowNode 序列化进 Task 行，初始状态固定为 queued。
 fn insert_task_node(
     transaction: &Transaction<'_>,
     run_id: &RunId,
@@ -229,6 +237,7 @@ fn insert_task_node(
     Ok(())
 }
 
+// 依赖表只保存 Task ID 边，节点本体仍以 input_artifacts/budget 等列和 JSON 为准。
 fn insert_node_dependencies(transaction: &Transaction<'_>, node: &WorkflowNode) -> StoreResult<()> {
     for dependency in &node.dependencies {
         transaction.execute(
@@ -239,6 +248,7 @@ fn insert_node_dependencies(transaction: &Transaction<'_>, node: &WorkflowNode) 
     Ok(())
 }
 
+// 读取依赖边并按 Task ID 稳定排序，供 snapshot/claim 判断依赖满足。
 fn task_dependencies(connection: &Connection, task_id: &TaskId) -> StoreResult<Vec<TaskId>> {
     let dependencies = connection
         .prepare(
@@ -250,11 +260,13 @@ fn task_dependencies(connection: &Connection, task_id: &TaskId) -> StoreResult<V
     Ok(dependencies)
 }
 
+// 只规范化 dependencies 顺序，用于比较 graph 与 SQL 恢复节点，不改变业务字段。
 fn canonical_workflow_node(mut node: WorkflowNode) -> WorkflowNode {
     node.dependencies.sort();
     node
 }
 
+// 在最终写事务核验 run/status/lease/epoch/attempt/contract 和真实 wall-clock expiry。
 fn assert_permit(transaction: &Transaction<'_>, permit: &TaskWritePermit) -> StoreResult<()> {
     let current = transaction
         .query_row(
@@ -294,6 +306,7 @@ fn assert_permit(transaction: &Transaction<'_>, permit: &TaskWritePermit) -> Sto
     Ok(())
 }
 
+// daemon lease 的 owner+epoch+expiry 必须同时匹配，防止旧 scheduler 在接管后继续写入。
 fn assert_daemon_lease(
     transaction: &Transaction<'_>,
     lease: &DaemonLease,
@@ -362,6 +375,7 @@ fn assert_session_slot_run(
     }
 }
 
+// effect 引用必须指向同一 Paper Run 的 canonical commitment/reprice/cancel Artifact。
 fn assert_paper_effect_artifact(
     transaction: &Transaction<'_>,
     effect: &ArtifactRef,
@@ -387,6 +401,7 @@ fn assert_paper_effect_artifact(
     Ok(())
 }
 
+// 查找 effect intent 事件；它只证明 Rust intent 已持久化，不证明外部 broker 已接受。
 fn paper_effect_intent_exists(
     transaction: &Transaction<'_>,
     run_id: &RunId,
@@ -404,6 +419,7 @@ fn paper_effect_intent_exists(
     Ok(found != 0)
 }
 
+// 按全局 cursor 检查每个 effect 恰有一个 intent 和至多一个 terminal settlement/recovery。
 fn validate_paper_effect_events(
     connection: &Connection,
     run_id: Option<&RunId>,

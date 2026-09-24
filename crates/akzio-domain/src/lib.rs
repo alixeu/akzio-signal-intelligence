@@ -1,8 +1,11 @@
+// 文件导读：集中导出 Akzio 的领域类型、稳定标识符和纯校验辅助函数。
+// 本模块只组织编译期的领域边界，不执行数据库、模型、网络、文件或券商 I/O。
 //! Stable, Rust-owned domain facade for Akzio.
 //!
 //! This crate contains schemas and validation only: no database, model,
 //! network, filesystem, or broker I/O.
 
+// 为各类非内容寻址 ID 生成统一的字符串包装、随机构造、默认值和显示实现。
 macro_rules! id_type {
     ($name:ident) => {
         #[derive(
@@ -20,6 +23,7 @@ macro_rules! id_type {
         pub struct $name(pub String);
 
         impl $name {
+            // 输入无；输出为截取 16 个十六进制字符的新 UUID 标识。
             pub fn new() -> Self {
                 let value = uuid::Uuid::new_v4().simple().to_string();
                 Self(value[..16].to_owned())
@@ -27,12 +31,14 @@ macro_rules! id_type {
         }
 
         impl Default for $name {
+            // 默认构造复用 new，确保所有 ID 类型使用相同生成规则。
             fn default() -> Self {
                 Self::new()
             }
         }
 
         impl std::fmt::Display for $name {
+            // 将包装的字符串直接写入格式化目标，不增加额外编码。
             fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str(&self.0)
             }
@@ -111,10 +117,12 @@ pub const LEARNING_OUTCOME_WORKER_RECIPE_ID: &str = "learning.outcome_worker";
 pub const GOVERNED_EVIDENCE_SOURCE_FAMILIES: [&str; 4] =
     ["alpaca", "sec_edgar", "fred", "news_web"];
 
+// 将字节数按约 4 字节一个 token 向上估算，并保证非空输入至少得到 1。
 pub fn estimate_tokens_from_bytes(bytes: u64) -> u32 {
     u32::try_from(bytes.div_ceil(4).max(1)).unwrap_or(u32::MAX)
 }
 
+// 先把可序列化值编码为 JSON 字节，再复用统一的字节到 token 估算规则。
 pub fn estimate_json_tokens<T: serde::Serialize>(value: &T) -> Result<u32, serde_json::Error> {
     let bytes = serde_json::to_vec(value)?.len() as u64;
     Ok(estimate_tokens_from_bytes(bytes))

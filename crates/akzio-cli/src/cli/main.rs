@@ -1,3 +1,9 @@
+// 文件导读：这里是 CLI 的异步入口。先处理不需要 daemon 配置的离线/本地命令，再把
+// 需要服务端权限的命令交给 dispatch；因此配置解析、模型探测、HTTP 认证和 Store
+// 生命周期都在各自明确的边界内发生，CLI 的 `Ok(())` 不会被解释成业务流水线完成。
+// Rust 机制：`#[tokio::main]` 宏生成 Tokio runtime；`async fn` 返回 Future，`?` 沿
+// `anyhow::Result` 传播错误，`match` 对命令枚举做穷尽分派，避免遗漏某个权限分支。
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();

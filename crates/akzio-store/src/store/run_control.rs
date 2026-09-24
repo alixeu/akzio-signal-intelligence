@@ -1,5 +1,7 @@
 //! Shared scheduling head, durable recovery boundaries and read projections.
 //! Checkpoints reference the event journal; they never replace its authority.
+// 文件导读：RunControl 是 Debug/普通 Run 共用的调度 head，Checkpoint 只是带 graph、
+// event cursor 和 control revision 的可验证边界；真正的任务事实仍以 rebuild_events/Task 为准。
 use super::*;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,16 +66,19 @@ pub(super) fn initialize_control(
     run: &RunId,
     now: DateTime<Utc>,
 ) -> StoreResult<()> {
+    // 新 Run 初始为 continuous/running；Debug session 后续通过 identity_artifact_id 接管。
     tx.execute("INSERT INTO rebuild_run_controls(run_id,revision,status,execution_mode,updated_at) VALUES(?1,0,'running','continuous',?2)", params![run.0, now.to_rfc3339()])?;
     Ok(())
 }
 
 pub(super) fn backfill_history(tx: &Transaction<'_>) -> StoreResult<()> {
+    // 只为缺少 control head 的历史 Run 补一行，不覆盖已经存在的 revision/status。
     tx.execute_batch("INSERT OR IGNORE INTO rebuild_run_controls(run_id,revision,status,execution_mode,updated_at)
         SELECT run_id,0,CASE WHEN status IN ('completed','failed','cancelled') THEN 'completed' ELSE 'running' END,'continuous',created_at FROM rebuild_runs;")?;
     Ok(())
 }
 
+// 从唯一 control head 恢复 CAS identity、permit 指针和更新时间。
 fn read_control(connection: &Connection, run: &RunId) -> StoreResult<RunControlView> {
     let row = connection.query_row("SELECT revision,status,execution_mode,runtime_identity,permitted_task_id,active_attempt_id,identity_artifact_id,updated_at FROM rebuild_run_controls WHERE run_id=?1", params![run.0], |r| Ok((r.get::<_,u64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,Option<String>>(6)?,r.get::<_,String>(7)?))).optional()?.ok_or_else(|| StoreError::MissingRun(run.clone()))?;
     Ok(RunControlView {
@@ -93,6 +98,7 @@ pub(super) fn settle_continuous(
     run: &RunId,
     now: DateTime<Utc>,
 ) -> StoreResult<()> {
+    // 普通 Run 按是否仍有可运行 Task 结算；Debug head 不由此路径覆盖。
     tx.execute("UPDATE rebuild_run_controls SET revision=revision+1,updated_at=?2,status=CASE WHEN EXISTS(SELECT 1 FROM rebuild_tasks WHERE run_id=?1 AND status IN ('queued','leased','running')) THEN 'running' ELSE 'completed' END WHERE run_id=?1 AND identity_artifact_id IS NULL",params![run.0,now.to_rfc3339()])?;
     save_latest_boundary(tx, run, now)
 }
@@ -102,10 +108,12 @@ pub(super) fn wake_continuous(
     run: &RunId,
     now: DateTime<Utc>,
 ) -> StoreResult<()> {
+    // Outcome worker 入队时唤醒已完成的普通 Run control head。
     tx.execute("UPDATE rebuild_run_controls SET status='running',revision=revision+1,updated_at=?2 WHERE run_id=?1 AND identity_artifact_id IS NULL AND status='completed'", params![run.0,now.to_rfc3339()])?;
     Ok(())
 }
 
+// 找到最近非 checkpoint 事件，把它封装成新的可验证 boundary。
 fn save_latest_boundary(tx: &Transaction<'_>, run: &RunId, now: DateTime<Utc>) -> StoreResult<()> {
     let row = tx.query_row("SELECT event_id,event_type,task_id,attempt_id,artifact_id FROM rebuild_events WHERE run_id=?1 AND event_type!='runtime.checkpoint_saved' ORDER BY event_id DESC LIMIT 1",params![run.0],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,Option<String>>(4)?)))?;
     save_checkpoint(
@@ -135,6 +143,7 @@ pub(super) fn checkpoint_boundary(
     source: Option<&ArtifactId>,
     now: DateTime<Utc>,
 ) -> StoreResult<()> {
+    // 只有阶段边界事件生成 checkpoint，普通 Artifact/读取事件不会增加 checkpoint。
     if matches!(
         event,
         LifecycleEventType::WorkflowCreated
@@ -169,6 +178,7 @@ fn save_checkpoint(
     source: Option<&ArtifactId>,
     now: DateTime<Utc>,
 ) -> StoreResult<()> {
+    // checkpoint payload 与 graph/source refs 一起 staging 并写入 RunScoped Artifact/event。
     let control = read_control(tx, run)?;
     let graph_id: String = tx.query_row(
         "SELECT graph_artifact_id FROM rebuild_runs WHERE run_id=?1",
@@ -250,6 +260,7 @@ fn decode_checkpoint(
     id: &ArtifactId,
     saved_cursor: i64,
 ) -> StoreResult<RunCheckpoint> {
+    // 同时核对 checkpoint Artifact、graph revision、原始 event cursor 和 source closure。
     let artifact = read_artifact(connection, id)?;
     let checkpoint: RunCheckpoint = serde_json::from_slice(&blob::read_blob_bytes(
         connection,
@@ -294,6 +305,7 @@ fn decode_checkpoint(
 }
 
 pub(super) fn verify_checkpoints(connection: &Connection) -> StoreResult<()> {
+    // Doctor 逐个重放 checkpoint_saved 事件，验证每个 checkpoint 都仍指向原 journal 边界。
     let mut query = connection.prepare("SELECT run_id,artifact_id,event_id FROM rebuild_events WHERE event_type='runtime.checkpoint_saved'")?;
     for row in query.query_map([], |r| {
         Ok((
@@ -314,6 +326,7 @@ pub(super) fn verify_checkpoints(connection: &Connection) -> StoreResult<()> {
 }
 
 fn latest_checkpoint(connection: &Connection, run: &RunId) -> StoreResult<Option<RunCheckpoint>> {
+    // 只读取指定 Run 最新的 checkpoint event，并以 event cursor 作为保存边界。
     let row=connection.query_row("SELECT artifact_id,event_id FROM rebuild_events WHERE run_id=?1 AND event_type='runtime.checkpoint_saved' ORDER BY event_id DESC LIMIT 1",params![run.0],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?))).optional()?;
     row.map(|(id, cursor)| {
         decode_checkpoint(connection, run, &ArtifactId(ContentHash::new(id)?), cursor)
@@ -324,6 +337,7 @@ fn latest_checkpoint(connection: &Connection, run: &RunId) -> StoreResult<Option
 impl Store {
     /// Read the journal boundary and graph head in one SQLite snapshot.
     pub fn recovery_snapshot(&self, run: &RunId) -> StoreResult<WorkflowSnapshot> {
+        // 在一个 Deferred snapshot 中同时读取 workflow head 与 checkpoint，拒绝 graph 分叉。
         let mut connection = self.connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
         let snapshot = self.workflow_snapshot_with_connection(&tx, run)?;
@@ -341,6 +355,7 @@ impl Store {
     }
 
     pub fn validate_checkpoint_event(&self, event: &StoredEvent) -> StoreResult<RunCheckpoint> {
+        // 外部事件页只能验证无 task/attempt 的 checkpoint_saved 形状，再解析其 CAS payload。
         if event.event_type != "runtime.checkpoint_saved"
             || event.task_id.is_some()
             || event.attempt_id.is_some()
@@ -359,6 +374,7 @@ impl Store {
     }
 
     pub fn inspect_run(&self, run: &RunId) -> StoreResult<RunInspection> {
+        // 公开入口只获取一个 Deferred 连接，具体投影复用 connection-scoped inspect。
         let mut connection = self.connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
         self.inspect_run_with_connection(&tx, run)
@@ -369,6 +385,7 @@ impl Store {
         tx: &Connection,
         run: &RunId,
     ) -> StoreResult<RunInspection> {
+        // 组合 workflow/control/checkpoint/session 的只读视图，并计算允许操作的受限列表。
         let workflow = self.workflow_snapshot_with_connection(tx, run)?;
         let blueprint = workflow.revision.graph.blueprint(workflow.run.purpose)?;
         let control = read_control(tx, run)?;
@@ -438,6 +455,7 @@ impl Store {
         task: Option<&TaskId>,
         attempt: Option<&AttemptId>,
     ) -> StoreResult<RunEventPage> {
+        // 按 cursor+Task/Attempt 条件分页，额外取一行判断 has_more，不写入任何事件。
         let limit = limit.clamp(1, 500);
         let connection = self.connection()?;
         let exists: bool = connection.query_row(

@@ -4,6 +4,8 @@ impl ExecutionRuntime {
         execution_policy: ExecutionPolicy,
         gate_policy: ExecutionGatePolicy,
     ) -> ExecutionGateResult<Self> {
+        // 构造时同时冻结 allocation policy、Gate policy 和 pre-trade policy；任何非法配置
+        // 在真正读取执行快照前失败，避免运行中途出现一半旧限制、一半新限制。
         let allocation = AllocationRuntime::new(execution_policy)
             .map_err(|_| ExecutionGateError::Integrity("execution policy"))?;
         gate_policy.validate()?;
@@ -20,14 +22,19 @@ impl ExecutionRuntime {
     }
 
     pub fn execution_policy(&self) -> &ExecutionPolicy {
+        // 只读暴露订单计算上限，调用方不能通过返回值改变 runtime。
         self.allocation.policy()
     }
 
     pub fn gate_policy(&self) -> &ExecutionGatePolicy {
+        // 只读暴露二次风控策略，Mandate/Capacity/Compliance 仍由 evaluate 统一组合。
         &self.gate_policy
     }
 
     pub fn evaluate(&self, input: &ExecutionGateInput) -> ExecutionGateResult<ExecutionGateOutput> {
+        // 主流程按“输入 Artifact→来源/时效校验→收集 blockers→条件性分配→安全/mandate
+        // 再核验→持久化 context/verdict”推进。即使 blocker 阻断 plan，仍生成完整的
+        // ExecutionContext/NoOrder，保留失败原因和后续 Outcome lineage；这里绝不发单。
         self.validate_input(input)?;
         let purpose = self.store.run_purpose(&input.permit.run_id)?;
         let decision_artifact =
@@ -361,6 +368,8 @@ impl ExecutionRuntime {
         output: &ExecutionGateOutput,
         now: DateTime<Utc>,
     ) -> ExecutionGateResult<()> {
+        // 把可选 plan、context、verdict 与 task 成功状态一次提交；提交是 ExecutionGate 的
+        // durable 边界，之后才可能由独立 Commitment task 继续，而不是在 evaluate 内隐式写 Broker。
         let mut artifacts = Vec::with_capacity(3);
         artifacts.extend(output.execution_plan.clone());
         artifacts.push(output.execution_context.clone());
@@ -371,6 +380,7 @@ impl ExecutionRuntime {
     }
 
     fn validate_input(&self, input: &ExecutionGateInput) -> ExecutionGateResult<()> {
+        // 先做轻量引用 kind 检查，避免用错误类型的 ArtifactRef 进入更深的 Store/JSON 解析。
         if input.decision_context.kind != ArtifactKind::DecisionContext
             || input
                 .account_snapshot

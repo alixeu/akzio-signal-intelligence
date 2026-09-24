@@ -1,3 +1,5 @@
+// 文件导读：Attempt relation 在 claim 新尝试时写成 RunScoped Artifact/event，
+// 用 parent_attempt_id 表达 retry/recovery lineage；该记录不改变任务的最终状态。
 impl Store {
     fn record_attempt_relation_in_transaction(
         &self,

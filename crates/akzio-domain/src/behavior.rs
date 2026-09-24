@@ -1,3 +1,5 @@
+// 文件导读：定义把 Contract、Topology、模型路由、Prompt、Policy 和检索规则
+// 绑定为一个不可变行为候选身份的清单，并负责生成/校验其内容哈希。
 //! Unified Candidate Identity and Behavior Bundle Manifest.
 //!
 //! A behavioral change in an agent trading system encompasses prompts, model
@@ -50,12 +52,14 @@ pub struct BehaviorBundleManifest {
 }
 
 impl BehaviorBundleManifest {
+    // 先用当前字段重算 bundle_hash，再执行完整校验，返回带正确身份哈希的副本。
     pub fn seal(mut self) -> Result<Self, DomainError> {
         self.bundle_hash = self.identity_hash()?;
         self.validate()?;
         Ok(self)
     }
 
+    // 按身份字段构造稳定 JSON；元数据之外的 bundle_hash 本身不参与哈希，避免自引用。
     pub fn identity_hash(&self) -> Result<ContentHash, DomainError> {
         content_hash_json(&serde_json::json!({
             "schema_version": self.schema_version,
@@ -79,6 +83,7 @@ impl BehaviorBundleManifest {
         .map_err(|_| DomainError::InvalidContentHash)
     }
 
+    // 检查 schema、身份哈希、Artifact kind 和创建者，失败时拒绝整个行为清单。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION
             || self.bundle_hash != self.identity_hash()?

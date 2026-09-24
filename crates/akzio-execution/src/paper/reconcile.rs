@@ -1,4 +1,11 @@
+// 文件导读：对账层把 broker receipts、durable reprice/cancel intents 和原始 Commitment
+// 合成为可审计的 OrderReceipt 与 Reconciliation Artifact。它先验证 plan/client ID 闭包，
+// 再合并替换订单的数量与加权成交价，按“所有订单终态且 successor 已观察”决定 Complete；
+// 未完成或部分成交只写进度，不被包装成成交完成。
+
 fn validate_commitment(commitment: &PaperCommitment, plan: &ExecutionPlan) -> Result<()> {
+    // Commitment、plan hash、session、订单数量和每个确定性 client ID 必须逐项一致，防止
+    // 对账把另一份计划的 broker 回执挂到当前 Run。
     commitment
         .validate()
         .map_err(|error| PaperError::InvalidCommitment(error.to_string()))?;
@@ -32,6 +39,8 @@ impl AlpacaPaper {
         order: &OrderIntent,
         authorization: &PaperSubmissionAuthorization,
     ) -> Result<()> {
+        // 在每个尚未提交的订单前重新读取 clock；Closed、session/extended_hours 不匹配或
+        // Overnight 资产资格失败都会阻断新 POST，但不影响已存在订单的只读恢复。
         let clock = self.market_clock().await?;
         if clock.session.kind == akzio_domain::TradingSession::Closed {
             return Err(PaperError::MarketClosed);
@@ -55,6 +64,7 @@ impl AlpacaPaper {
     }
 
     async fn lookup(&self, client_order_id: &str) -> Result<Option<PaperOrderReceipt>> {
+        // 按 durable client ID 查询是幂等恢复的唯一入口；404 表示尚未观察到效果，不能等同取消。
         let url = self.url("/v2/orders:by_client_order_id");
         let response = self
             .authorized(
@@ -97,6 +107,7 @@ impl AlpacaPaper {
         client_order_id: &str,
         reprice_count: u8,
     ) -> Result<PaperOrderReceipt> {
+        // 只在上层完成授权复核后发送一次 POST，并立即把 broker 返回解析成带原始 client ID 的 receipt。
         let url = self.url("/v2/orders");
         let body = order_request(order, client_order_id)?;
         let value = self.post_json(&url, body).await?;
@@ -109,6 +120,7 @@ impl AlpacaPaper {
         client_order_id: &str,
         reprice_count: u8,
     ) -> Result<PaperOrderReceipt> {
+        // 通过 broker order ID 刷新已有订单，保留 client ID 和 repricing 代数供后续闭包校验。
         let value = self
             .get_json(&format!("/v2/orders/{broker_order_id}"))
             .await?;
@@ -116,6 +128,8 @@ impl AlpacaPaper {
     }
 
     async fn cancel_committed_order(&self, intent: &PaperCancel) -> Result<PaperOrderReceipt> {
+        // 取消先查原订单并处理终态/pending_cancel/replaced 分支；只有可取消的 durable 原单
+        // 才执行 DELETE，随后再 GET 确认 broker 状态。
         intent.validate()?;
         let existing = self.lookup(&intent.client_order_id).await?.ok_or_else(|| {
             PaperError::InvalidCommitment(
@@ -165,6 +179,8 @@ impl AlpacaPaper {
         intent: &PaperReprice,
         authorization: &PaperSubmissionAuthorization,
     ) -> Result<PaperOrderReceipt> {
+        // 替换先复用已存在 successor，再两次检查授权与 prior order 状态，最后 PATCH 并用
+        // r1 client ID 解析回执；替换中的不确定状态不会盲目再发。
         intent.validate()?;
         if let Some(existing) = self.lookup(&intent.replacement_client_order_id).await? {
             return Ok(PaperOrderReceipt {

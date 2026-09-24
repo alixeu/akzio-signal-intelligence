@@ -22,6 +22,7 @@ pub(crate) fn assess_financial_content(
     resource: &str,
     now: DateTime<Utc>,
 ) -> EvidenceRuntimeResult<FinancialContentAssessment> {
+    // raw 保留 provider 原始字节，normalized 是准备进入 Context 的投影；两者和 provenance 一起决定本次内容审查的来源边界。
     let raw_text = String::from_utf8_lossy(raw);
     let normalized_text =
         serde_json::to_string(normalized).map_err(|_| EvidenceRuntimeError::InvalidAcquisition)?;
@@ -30,6 +31,7 @@ pub(crate) fn assess_financial_content(
         .and_then(|document| document.get("acquisition_kind"))
         .and_then(Value::as_str)
         == Some("official_direct");
+    // official_direct 只扫描规范化字段，避免发行方页面的展示 HTML 触发误报；其他来源仍合并原文与规范化投影。
     // Issuer product pages often contain benign HTML/typography markers and
     // terms such as "index reconstitution". The raw bytes remain preserved in
     // CAS, but official_direct structured material is assessed from its
@@ -40,6 +42,7 @@ pub(crate) fn assess_financial_content(
         .pointer("/source_document/acquisition_mode")
         .and_then(Value::as_str)
         == Some("model_reviewed");
+    // model_reviewed 的输入协议和 provider 原始响应不是文章正文，只审查 reviewed_facts，原始字节仍留在审计链中。
     let combined = if model_reviewed {
         // Provider request schemas and audit instructions are not article
         // content. Scan the facts exposed to research, retaining all raw
@@ -57,6 +60,7 @@ pub(crate) fn assess_financial_content(
         .ok()
         .and_then(|url| url.host_str().map(str::to_owned))
         .ok_or(EvidenceRuntimeError::InvalidProvenance)?;
+    // provenance URL 必须能解析出 host；Option 的空值会转换为 Result 错误，避免为无来源的内容生成评估。
     let authority = authority_for_host(&source_origin);
     let mut indicators = BTreeSet::new();
     if contains_instruction_like_content(&lower) {
@@ -71,6 +75,7 @@ pub(crate) fn assess_financial_content(
     let high_impact = !official_direct && contains_high_impact_claim(&lower);
     let source_count = source_count(normalized);
     let independent_confirmation_clusters = independent_source_clusters(normalized);
+    // source_count 与 hash cluster 都从 normalized 的来源列表计算，重复转载不能被当成独立确认。
     if independent_confirmation_clusters < source_count {
         indicators.insert(FinancialContentIndicator::SyndicatedDuplicate);
     }
@@ -85,6 +90,7 @@ pub(crate) fn assess_financial_content(
         InformationClassification::Public
     };
     let canonical_entity_ids = canonical_entity_ids(normalized, &canonical_text);
+    // 资源类型决定预期实体；解析失败或实体不匹配通过 Result/indicator 保持 fail closed。
     if entity_identifier_mismatch(source, resource, &canonical_entity_ids)? {
         indicators.insert(FinancialContentIndicator::EntityIdentifierMismatch);
     }
@@ -107,6 +113,7 @@ pub(crate) fn assess_financial_content(
 }
 
 fn canonical_visible_text(text: &str) -> String {
+    // 先做 NFKC，再折叠空白，得到稳定的可见文本供关键词和相似度判断使用。
     text.nfkc()
         .collect::<String>()
         .split_whitespace()
@@ -115,6 +122,7 @@ fn canonical_visible_text(text: &str) -> String {
 }
 
 fn authority_for_host(host: &str) -> SourceAuthorityClass {
+    // host 已由上层 URL 解析得到；去掉 www 后按固定 allowlist 分类，不把未知域名提升为权威来源。
     let host = host.trim_start_matches("www.").to_ascii_lowercase();
     if host.ends_with(".gov") || matches!(host.as_str(), "sec.gov" | "investor.gov" | "finra.org") {
         SourceAuthorityClass::Regulator
@@ -152,6 +160,7 @@ fn authority_for_host(host: &str) -> SourceAuthorityClass {
 }
 
 fn contains_hidden_content(text: &str) -> bool {
+    // 这些模式只标记隐藏/模板内容，不修改原文；调用方将命中项放进不可变的指标集合。
     [
         "display:none",
         "display: none",
@@ -168,6 +177,7 @@ fn contains_hidden_content(text: &str) -> bool {
 }
 
 fn contains_unicode_anomaly(text: &str) -> bool {
+    // 检查零宽、方向控制、混写和 NFKC 变化，识别可能改变人眼与模型阅读结果的文本。
     if text.chars().any(|value| {
         matches!(
             value,
@@ -204,6 +214,7 @@ fn contains_unicode_anomaly(text: &str) -> bool {
 }
 
 fn contains_instruction_like_content(text: &str) -> bool {
+    // 只匹配与内容无关的指令注入词，不执行这些文本中的任何操作。
     [
         "ignore previous",
         "ignore all previous",
@@ -219,6 +230,7 @@ fn contains_instruction_like_content(text: &str) -> bool {
 }
 
 fn contains_high_impact_claim(text: &str) -> bool {
+    // 高影响词会触发更严格的权威性与独立确认要求，但关键词本身不等于事实成立。
     [
         "merger",
         "acquisition",
@@ -238,6 +250,7 @@ fn contains_high_impact_claim(text: &str) -> bool {
 }
 
 fn contains_suspected_mnpi(text: &str) -> bool {
+    // 命中保密/未公开语义时标记疑似 MNPI，保留判断结果供后续 Gate 处理。
     [
         "material nonpublic information",
         "material non-public information",
@@ -251,6 +264,7 @@ fn contains_suspected_mnpi(text: &str) -> bool {
 }
 
 fn source_count(value: &Value) -> u16 {
+    // 缺少来源数组或长度无法转换时使用 1 作为保守的单来源基线，并保证结果至少为 1。
     value
         .get("source_document")
         .and_then(|document| document.get("sources"))
@@ -261,6 +275,7 @@ fn source_count(value: &Value) -> u16 {
 }
 
 fn independent_source_clusters(value: &Value) -> u16 {
+    // 仅按 source content_hash 去重；Option/迭代为空时仍返回一个保守的默认 cluster。
     let clusters = value
         .get("source_document")
         .and_then(|document| document.get("sources"))
@@ -277,6 +292,7 @@ fn independent_source_clusters(value: &Value) -> u16 {
 }
 
 fn content_similarity_cluster(value: &Value, fallback_text: &str) -> ContentHash {
+    // 有 provider hash 时按排序后的 hash 集合生成稳定 cluster；没有 hash 则对规范化文本做回退哈希。
     let hashes = value
         .get("source_document")
         .and_then(|document| document.get("sources"))
@@ -292,6 +308,7 @@ fn content_similarity_cluster(value: &Value, fallback_text: &str) -> ContentHash
 }
 
 fn syndication_parent(value: &Value) -> Option<String> {
+    // syndication_parent 是可选元数据；空字符串被视为缺失，非空值才进入 provenance 评估。
     value
         .get("syndication_parent")
         .and_then(Value::as_str)
@@ -301,6 +318,7 @@ fn syndication_parent(value: &Value) -> Option<String> {
 }
 
 fn canonical_entity_ids(normalized: &Value, text: &str) -> BTreeSet<String> {
+    // 从正文和结构化字段同时收集四个可执行 ETF 及显式 CIK/ticker，统一成可比较的 canonical ID。
     let mut identifiers = ["TQQQ", "QQQ", "SOXX", "SOXL"]
         .into_iter()
         .filter(|symbol| {
@@ -314,6 +332,7 @@ fn canonical_entity_ids(normalized: &Value, text: &str) -> BTreeSet<String> {
 }
 
 fn collect_structured_entity_ids(value: &Value, identifiers: &mut BTreeSet<String>) {
+    // 递归遍历 JSON 对象和数组；只有名称像实体字段的键才尝试转换，其余结构继续递归但不作猜测。
     match value {
         Value::Object(fields) => {
             for (key, value) in fields {
@@ -336,6 +355,7 @@ fn collect_structured_entity_ids(value: &Value, identifiers: &mut BTreeSet<Strin
 }
 
 fn collect_identifier_value(value: &Value, identifiers: &mut BTreeSet<String>) {
+    // 字符串走 ticker/CIK 规范化，数字按 CIK 处理，数组逐项递归；无法规范化的 Value 被忽略。
     match value {
         Value::String(value) => {
             if let Some(identifier) = normalize_entity_identifier(value) {
@@ -357,6 +377,7 @@ fn collect_identifier_value(value: &Value, identifiers: &mut BTreeSet<String>) {
 }
 
 fn normalize_entity_identifier(value: &str) -> Option<String> {
+    // 空值、非数字且含非法字符的标识返回 None；合法数字补齐 CIK，其他合法短字符串转大写 ticker。
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return None;
@@ -378,6 +399,7 @@ fn entity_identifier_mismatch(
     resource: &str,
     identifiers: &BTreeSet<String>,
 ) -> EvidenceRuntimeResult<bool> {
+    // GovernedResource::parse 用 typed resource 推导预期实体；解析返回 Result，未知资源不会被静默当作匹配。
     let expected = match GovernedResource::parse(source, resource)? {
         GovernedResource::NewsWeb { query } => query
             .split(':')

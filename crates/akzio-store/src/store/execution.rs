@@ -1,3 +1,5 @@
+// 文件导读：Execution 写入先把 Accepted plan/context/verdict 绑定到唯一 session slot，
+// 再以 deterministic commitment/reprice/cancel intent 记录 Paper 侧副作用边界；accepted 不等于 fill。
 use super::*;
 
 #[derive(Debug, Clone)]
@@ -7,6 +9,7 @@ pub struct PaperOrderActionCommitResult {
 }
 
 impl Store {
+    // 在 daemon lease+Task permit 下验证 plan/context/verdict/approval，再原子写唯一 commitment slot。
     pub fn commit_execution(
         &self,
         lease: &DaemonLease,
@@ -226,6 +229,7 @@ impl Store {
     /// Return the one durable r0 -> r1 intent for an order in a committed
     /// Paper session. The table is only an immutable-history index; callers
     /// still consume the returned artifact and its provenance.
+    // 通过 immutable index 查找指定 commitment/asset 的唯一 reprice intent。
     pub fn reprice_for(
         &self,
         commitment: &ArtifactRef,
@@ -251,6 +255,7 @@ impl Store {
             .transpose()
     }
 
+    // 通过 immutable index 查找指定 commitment/asset 的唯一 cancel intent。
     pub fn cancel_for(
         &self,
         commitment: &ArtifactRef,
@@ -276,6 +281,7 @@ impl Store {
             .transpose()
     }
 
+    // 解析并验证 Reprice payload，复用通用 order-action intent 持久化/恢复路径。
     pub fn commit_execution_reprice_intent(
         &self,
         lease: &DaemonLease,
@@ -305,6 +311,7 @@ impl Store {
         )
     }
 
+    // 解析并验证 Cancel payload，复用同一 commitment/receipt lineage 和幂等索引。
     pub fn commit_execution_cancel_intent(
         &self,
         lease: &DaemonLease,
@@ -351,6 +358,7 @@ impl Store {
         recovered_event: LifecycleEventType,
         now: DateTime<Utc>,
     ) -> StoreResult<PaperOrderActionCommitResult> {
+        // 先验 lease/permit/receipt lineage，再按动态表名写一次 immutable effect intent。
         artifact.validate()?;
         if artifact.lifecycle != ArtifactLifecycle::Canonical
             || !artifact.source_refs.contains(commitment)
@@ -446,6 +454,7 @@ impl Store {
         broker_order_id: &str,
         run_id: &RunId,
     ) -> StoreResult<()> {
+        // receipt 必须引用同一 commitment、plan hash、asset、client/broker order identity。
         if commitment.kind != ArtifactKind::ExecutionCommitment
             || prior_receipt.kind != ArtifactKind::OrderReceipt
         {
@@ -492,6 +501,7 @@ impl Store {
     /// Atomically records the single Rust-owned Paper effect intent and
     /// terminally completes its task. The broker
     /// adapter may receive only the returned immutable intent afterwards.
+    // 在外部 broker I/O 前写唯一 durable intent；重复 intent 返回 true 而不重复追加。
     pub fn record_paper_effect_intent(
         &self,
         lease: &DaemonLease,
@@ -532,6 +542,7 @@ impl Store {
         Ok(false)
     }
 
+    // 只有已有 intent 才能追加 settled/recovered terminal；重复 terminal 视为幂等成功。
     pub fn settle_paper_effect(
         &self,
         lease: &DaemonLease,
@@ -576,6 +587,7 @@ impl Store {
 
     /// Commit Paper reconciliation artifacts and the effect settlement marker
     /// under the same daemon lease/attempt fence and SQLite transaction.
+    // 将 Reconcile Artifact 和 effect terminal 放入同一 fenced Attempt 事务，避免半提交。
     pub fn commit_fenced_attempt_with_effect(
         &self,
         lease: &DaemonLease,

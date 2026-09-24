@@ -1,3 +1,5 @@
+// 文件导读：Blob 生命周期分为同一 SQLite 连接可见的 TEMP staging 和 durable CAS；
+// promotion 才把逻辑 hash/长度写入 rebuild_blobs，切片/字典只保存可验证的父依赖。
 use super::debug::{environment_identity, read_session};
 use super::*;
 
@@ -1064,6 +1066,7 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
+    // 每个 Blob 测试使用独立 Root，避免 TEMP staging 与 durable CAS 互相污染。
     fn test_store(label: &str) -> Store {
         Store::open(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1079,6 +1082,7 @@ mod tests {
     /// and no poisoning. A staged-but-unpromoted blob is the input that used to
     /// drive `read_blob` into exactly that nested acquisition.
     #[test]
+    // staged payload 的读取必须走同一连接，验证不会因非重入 Mutex 发生嵌套死锁。
     fn read_blob_of_staged_payload_does_not_deadlock() {
         let store = test_store("staged-no-deadlock");
         let staged = store
@@ -1103,6 +1107,7 @@ mod tests {
     /// A staged payload is visible only through the connection that staged it,
     /// so reading it must use that connection rather than a freshly opened one.
     #[test]
+    // staging 在 promotion 前只对当前 Store 连接可见。
     fn staged_payload_is_readable_before_promotion() {
         let store = test_store("staged-before-promotion");
         let staged = store.stage_bytes(b"not-yet-durable", "text/plain").unwrap();
@@ -1112,6 +1117,7 @@ mod tests {
     /// A committed payload stays readable after promotion, and its bytes are
     /// unchanged by the storage representation the Store chose.
     #[test]
+    // durable promotion 后按 logical bytes 读取，编码选择不改变返回内容。
     fn promoted_payload_round_trips() {
         let store = test_store("promoted-round-trip");
         let durable = store.put_bytes(b"durable-payload", "text/plain").unwrap();
@@ -1121,6 +1127,7 @@ mod tests {
     /// A length that disagrees with the stored payload is a corrupt reference,
     /// not a cache miss, and must not be silently tolerated.
     #[test]
+    // 引用声明长度与 CAS 实际长度不一致时按 MissingBlob 拒绝。
     fn blob_length_mismatch_is_rejected() {
         let store = test_store("length-mismatch");
         let mut reference = store.put_bytes(b"exact-length", "text/plain").unwrap();

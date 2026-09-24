@@ -1,3 +1,5 @@
+// 文件导读：DecisionPolicy 的正文仍是 canonical CAS Artifact，安装表只保存不可变身份列，
+// activation/history/head 分开记录显式激活链；写入候选不等于 active policy 可用于 Decision。
 use super::*;
 
 /// Identity columns indexed beside the immutable CAS envelope. The Store does
@@ -15,6 +17,7 @@ pub struct DecisionPolicyDescriptor {
 }
 
 impl DecisionPolicyDescriptor {
+    // 只接受 canonical、无 origin/source_refs 的 policy envelope，descriptor hash 必须等于 CAS。
     fn validate(&self, artifact: &Artifact) -> StoreResult<()> {
         if artifact.kind != ArtifactKind::DecisionPolicy
             || artifact.lifecycle != ArtifactLifecycle::Canonical
@@ -44,6 +47,7 @@ impl Store {
     /// Persist calibration inputs or a built policy without selecting an active
     /// policy. The CLI/execution layer validates typed calibration math; this
     /// seam owns canonical provenance and prohibits isolated Debug promotion.
+    // 写入风险限制/dataset/candidate policy 的 canonical Artifact，但不触碰 active head。
     pub fn write_calibration_artifact(&self, artifact: &Artifact) -> StoreResult<()> {
         artifact.validate()?;
         if self.debug_environment()?.is_some()
@@ -100,6 +104,7 @@ impl Store {
 
     /// Install one validated immutable policy and atomically select it as the
     /// active DecisionGate policy. Re-activating the current hash is idempotent.
+    // 在同一事务中安装 policy、追加 activation 并更新 singleton head；同 hash 重放幂等。
     pub fn activate_decision_policy(
         &self,
         artifact: &Artifact,
@@ -177,6 +182,7 @@ impl Store {
             .ok_or_else(|| StoreError::DecisionPolicyConflict(descriptor.policy_hash.clone()))
     }
 
+    // 只从 active singleton head 读取 descriptor+Artifact，缺 head 返回 None 而非自动选候选。
     pub fn active_decision_policy(&self) -> StoreResult<Option<StoredDecisionPolicy>> {
         let connection = self.connection()?;
         let Some(hash) = decision_policy_head_hash(&connection)? else {
@@ -187,6 +193,7 @@ impl Store {
 
     /// Copy only the selected immutable policy into an isolated Store. No Run,
     /// Outcome, credential or mutable policy state crosses this seam.
+    // 只复制 source 的 active CAS payload 到目标 Store，目标仍需显式 activation。
     pub fn bootstrap_active_decision_policy_from(
         &self,
         source: &Store,
@@ -209,6 +216,7 @@ impl Store {
     }
 }
 
+// 读取 singleton active head 的 policy hash；历史 activation 不由此查询覆盖。
 fn decision_policy_head_hash(connection: &Connection) -> StoreResult<Option<ContentHash>> {
     connection
         .query_row(
@@ -222,6 +230,7 @@ fn decision_policy_head_hash(connection: &Connection) -> StoreResult<Option<Cont
         .map_err(Into::into)
 }
 
+// 由安装表恢复 policy descriptor、Artifact 和 active_at，并重新执行 descriptor 校验。
 fn read_decision_policy(
     connection: &Connection,
     policy_hash: &ContentHash,
@@ -284,6 +293,7 @@ fn read_decision_policy(
     }))
 }
 
+// Doctor 验证每个安装都被 activation 引用，activation previous 链和 singleton head 一致。
 pub(super) fn verify_decision_policy_history(connection: &Connection) -> StoreResult<()> {
     let installed = connection
         .prepare(
@@ -371,6 +381,7 @@ pub(super) fn verify_decision_policy_history(connection: &Connection) -> StoreRe
 mod tests {
     use super::*;
 
+    // 每个策略测试使用独立 Store Root，避免 active head 或 BLOB 在测试间共享。
     fn test_store(label: &str) -> Store {
         Store::open(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -380,6 +391,7 @@ mod tests {
         .unwrap()
     }
 
+    // 构造最小 canonical policy envelope/descriptor，测试只覆盖 Store 身份规则。
     fn policy(
         store: &Store,
         name: &str,
@@ -421,6 +433,7 @@ mod tests {
     }
 
     #[test]
+    // build/write 后 policy 仍 inactive，只有显式 activation 才出现 active head。
     fn built_policy_is_durable_but_inactive_until_explicit_activation() {
         let store = test_store("candidate");
         let now = Utc::now();
@@ -440,6 +453,7 @@ mod tests {
     }
 
     #[test]
+    // activation chain、时间回退拒绝和 isolated bootstrap 都保留同一 policy hash/payload。
     fn activation_history_and_isolated_bootstrap_preserve_exact_policy() {
         let source = test_store("source");
         let now = Utc::now();

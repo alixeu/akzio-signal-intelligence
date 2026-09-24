@@ -1,3 +1,4 @@
+# 文件职责：声明纯领域模型 crate 的序列化、时间、哈希和错误依赖；不引入 I/O 层。
 [package]
 name = "akzio-domain"
 version = "0.2.0"

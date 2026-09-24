@@ -1,3 +1,10 @@
+// 文件导读：workers 文件承载 Paper approval 的完整身份/资格绑定、PositionPlan graph
+// 准备和单步 worker 执行。approval 只持久化 RuntimeManifest/PaperLaunchApproval，不能
+// 越过 Decision/ExecutionGate；`run_one` 只执行一个已 claim 节点，不能等同整个 Run 完成。
+// Rust 机制：异步 approval 借用/拥有 request 后把 manifest closure 移入 StoreExecutor；
+// `Arc` broker 依赖由 bootstrap 注入，`collect`/`map` 闭包构造 setup，`Result` 保留资格
+// 和 Store 写入失败的边界。
+
 use super::*;
 
 impl Daemon {
