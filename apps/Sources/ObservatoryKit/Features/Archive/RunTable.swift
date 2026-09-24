@@ -1,5 +1,8 @@
 import SwiftUI
 
+// 文件导读：表格读取父页已经筛选/排序/分页的 ArchiveRowPresentation；两项排序 Binding
+// 回写 RunArchivePage，选择回调再由父页交给 Store。先读 body、sortable、rowView，注意
+// ViewThatFits 仅切换列密度，右键复制写的是系统剪贴板，不是 Rust Store。
 // MARK: - Run table
 //
 // Fixed row height, monospaced identifiers, eight columns. Sorting rotates the arrow
@@ -7,6 +10,7 @@ import SwiftUI
 public enum RunSortKey: String, CaseIterable, Identifiable, Sendable {
     case started, duration, result, status
 
+    // rawValue 使每个排序键拥有稳定的 SwiftUI 标识。
     public var id: String { rawValue }
     public var title: String {
         switch self {
@@ -19,6 +23,7 @@ public enum RunSortKey: String, CaseIterable, Identifiable, Sendable {
 }
 
 struct RunTable: View {
+    // rows 是父页过滤后的只读结果；排序 Binding 和 onSelect 闭包把交互回传给父页。
     let rows: [ArchiveRowPresentation]
     let selectedID: String?
     let rowHeight: CGFloat
@@ -31,6 +36,7 @@ struct RunTable: View {
     @Environment(\.appLanguage) private var language
 
     var body: some View {
+        // ViewThatFits 只在横向空间不足时切换列集合，不改变行数据或排序语义。
         ViewThatFits(in: .horizontal) {
             table(compact: false).frame(minWidth: 1070)
             table(compact: true)
@@ -38,11 +44,13 @@ struct RunTable: View {
     }
 
     private func table(compact: Bool) -> some View {
+        // 表头与行共享 compact 参数；行数组的变化由动画策略平滑反映。
         VStack(alignment: .leading, spacing: 0) {
             header(compact: compact)
             HairlineDivider()
             VStack(spacing: 0) {
                 ForEach(rows) { row in
+                    // 每行闭包捕获当前 row，使用稳定 ID 保持选择和布局连续。
                     rowView(row, compact: compact).id(row.id)
                 }
             }
@@ -54,6 +62,7 @@ struct RunTable: View {
     // MARK: Header
 
     private func header(compact: Bool) -> some View {
+        // compact 来自 ViewThatFits 选中的布局分支，只隐藏次要列并保留主要排序控件。
         HStack(spacing: AkzioLayout.s2) {
             label("Run ID", width: 78)
             if !compact {
@@ -74,6 +83,7 @@ struct RunTable: View {
     }
 
     private func label(_ title: String, width: CGFloat) -> some View {
+        // 普通列标题无点击动作；固定宽度与行视图列对齐。
         Text(L10n.text(title, language: language))
             .akzioText(.caption)
             .lineLimit(1)
@@ -82,6 +92,7 @@ struct RunTable: View {
     }
 
     private func sortable(_ key: RunSortKey, width: CGFloat) -> some View {
+        // 排序按钮闭包只切换排序 Binding；同一字段再次点击反转方向。
         Button {
             withAnimation(policy.resolve(Motion.control)) {
                 if sortKey == key { ascending.toggle() } else { sortKey = key; ascending = false }
@@ -106,6 +117,7 @@ struct RunTable: View {
     // MARK: Rows
 
     private func rowView(_ row: ArchiveRowPresentation, compact: Bool) -> some View {
+        // 行按钮把稳定行 ID交给父页；右键复制闭包只写入系统粘贴板。
         let isSelected = row.id == selectedID
         return Button { onSelect(row.id) } label: {
             HStack(spacing: AkzioLayout.s2) {
@@ -164,6 +176,7 @@ struct RunTable: View {
     }
 
     private func resultColor(_ row: ArchiveRowPresentation) -> Color {
+        // 缺失结果保持 muted；仅在存在 ppm 值时按正负着色。
         guard let result = row.resultPpm else { return AkzioColor.mutedText }
         return result >= 0 ? AkzioColor.primaryGold : AkzioColor.actionCoral
     }

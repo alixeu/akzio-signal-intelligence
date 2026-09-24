@@ -2,20 +2,29 @@
 
 use super::*;
 
+// 文件导读：本模块把 ModelRequest 编译成 OpenAI Responses wire body，发起有界 HTTP/SSE 请求，
+// SSE 路径先校验 response.completed/incomplete 终态，再转换为 ModelResponse；
+// 离线 fixture 直接调用同一 raw 转换器，不以 HTTP/SSE 终态为前提。它不持有 Store，也不决定
+// Contract、工具授权或业务 Gate；先读 respond_with_events、handle_sse_data 和 openai_response_from_raw。
+// Rust 机制：async 调用先创建 Future，await 才驱动请求；FnMut 回调传递 reasoning 事件，Result 保留协议/传输错误。
+
+// Responses adapter 只负责受控 provider wire/stream 与 ModelResponse 转换；预算、Prompt、工具权限和业务 Gate 由上层拥有。
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 // Hosted reasoning responses can legitimately pause longer than 30 seconds
 // between chunks. This remains a bounded transport timeout; the Agent
-// Contract's 120s total wall-time and phase deadline still govern the call.
+// Contract's frozen Attempt budget and phase deadline still govern the call.
 const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct OpenAIResponsesClient {
+    // client 是可克隆的配置值；api_key 仅用于 bearer auth，Debug 实现会脱敏，stream timeout 只约束单次空闲。
     http: Client,
     pub(super) base_url: String,
     api_key: String,
     pub(super) model: String,
     pub(super) reasoning_effort: String,
     stream_idle_timeout: Duration,
+    audit: Option<Arc<dyn ModelAuditSink>>,
 }
 
 impl std::fmt::Debug for OpenAIResponsesClient {
@@ -37,6 +46,7 @@ impl OpenAIResponsesClient {
         model: impl Into<String>,
         reasoning_effort: impl Into<String>,
     ) -> Result<Self> {
+        // new 使用 bounded 默认 timeout；实际累计墙钟仍由 Agent Contract/phase deadline 控制。
         Self::with_timeouts(
             base_url,
             api_key,
@@ -85,14 +95,44 @@ impl OpenAIResponsesClient {
             model,
             reasoning_effort,
             stream_idle_timeout,
+            audit: None,
         })
     }
 
+    pub fn with_audit(mut self, audit: Arc<dyn ModelAuditSink>) -> Self {
+        self.audit = Some(audit);
+        self
+    }
+
+    fn audit_event(&self, kind: &str, payload: Value) -> Result<()> {
+        let Some(audit) = &self.audit else {
+            return Ok(());
+        };
+        let scope = MODEL_AUDIT_CONTEXT.try_with(Clone::clone).map_err(|_| {
+            ModelError::RunLogUnavailable("model call is missing Run audit context".into())
+        })?;
+        audit
+            .record_model(&scope, kind, payload)
+            .map_err(ModelError::RunLogUnavailable)
+    }
+
+    fn audit_stream_data(&self, data: &[u8]) -> Result<()> {
+        let payload = match std::str::from_utf8(data) {
+            Ok(text) => json!({"data": text}),
+            Err(_) => json!({
+                "invalid_utf8_hex": data.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+            }),
+        };
+        self.audit_event("llm.sse", payload)
+    }
+
     pub fn request_body(&self, request: &ModelRequest) -> Value {
+        // request_body 是纯 wire projection，保留调用方提供的 input/tools/tool_choice，不在 provider 层扩大授权。
         openai_responses_request_body(&self.model, &self.reasoning_effort, request)
     }
 
     pub async fn respond(&self, request: ModelRequest) -> Result<ModelResponse> {
+        // 无事件调用复用同一 stream parser；空闭包表示调用方不订阅 reasoning 生命周期。
         self.respond_with_events(request, |_| {}).await
     }
 
@@ -101,9 +141,74 @@ impl OpenAIResponsesClient {
         request: ModelRequest,
         mut on_event: impl FnMut(ModelStreamEvent),
     ) -> Result<ModelResponse> {
+        let Some(_) = &self.audit else {
+            return self.respond_with_events_inner(request, &mut on_event).await;
+        };
+        let mut context = MODEL_AUDIT_CONTEXT.try_with(Clone::clone).map_err(|_| {
+            ModelError::RunLogUnavailable("model call is missing Run audit context".into())
+        })?;
+        context
+            .call_id
+            .get_or_insert_with(|| uuid::Uuid::new_v4().to_string());
+        MODEL_AUDIT_CONTEXT
+            .scope(context, self.respond_with_audit(request, &mut on_event))
+            .await
+    }
+
+    async fn respond_with_audit(
+        &self,
+        request: ModelRequest,
+        on_event: &mut impl FnMut(ModelStreamEvent),
+    ) -> Result<ModelResponse> {
+        let body = self.request_body(&request);
+        self.audit_event("llm.request", json!({"request": body}))?;
+        let started = std::time::Instant::now();
+        // Dropping the future (deadline, cancellation, process supervision)
+        // cannot be mistaken for a provider terminal. The guard uses the same
+        // synchronous sink and context as the persisted request.
+        let mut inflight = InflightAudit {
+            sink: self
+                .audit
+                .as_ref()
+                .expect("audited call has a sink")
+                .as_ref(),
+            context: MODEL_AUDIT_CONTEXT
+                .try_with(Clone::clone)
+                .map_err(|_| ModelError::RunLogUnavailable("missing Run audit context".into()))?,
+            armed: true,
+        };
+        let result = self.respond_with_events_inner(request, on_event).await;
+        let latency_millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let terminal = match &result {
+            Ok(response) => json!({
+                "request_id": response.provider_request_id,
+                "response": response.raw,
+                "usage": response.usage,
+                "latency_millis": latency_millis
+            }),
+            Err(error) => {
+                json!({
+                    "error_class": model_audit_error_class(error),
+                    "error": error.to_string(),
+                    "latency_millis": latency_millis
+                })
+            }
+        };
+        self.audit_event("llm.terminal", terminal)?;
+        inflight.armed = false;
+        result
+    }
+
+    async fn respond_with_events_inner(
+        &self,
+        request: ModelRequest,
+        on_event: &mut impl FnMut(ModelStreamEvent),
+    ) -> Result<ModelResponse> {
         // 一次请求使用无状态 store=false 的 Responses 调用；函数只返回协议层
         // ModelResponse，持久化、Attempt 状态和业务 Gate 由上层负责。
         let body = self.request_body(&request);
+        // `send()` 产生 HTTP Future，`.await` 才由当前任务驱动到响应头；取消外层 Future
+        // 会停止本地 poll，但不能据此断言 provider 未收到请求。本 crate 不持有 Store。
         let mut response = self
             .http
             .post(format!("{}/responses", self.base_url))
@@ -117,6 +222,10 @@ impl OpenAIResponsesClient {
             .get("x-request-id")
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
+        self.audit_event(
+            "llm.response_headers",
+            json!({"status": status.as_u16(), "request_id": provider_request_id}),
+        )?;
         if !status.is_success() {
             // 非 2xx 在读取完整错误 body 后结束本轮，不进入 SSE 解析或业务重试判断。
             return Err(ModelError::Http {
@@ -131,11 +240,13 @@ impl OpenAIResponsesClient {
         // pending 保存尚未遇到换行的字节，data 聚合同一 SSE event 的连续 data 行；
         // provider 的 response.completed/incomplete 终态一旦校验并保存，就可停止等 EOF。
         'response_stream: loop {
+            // 若任务在下方 chunk Future 等待时被取消，函数不会执行 end_reasoning；
+            // reasoning 事件只是流式观察，不能替代调用方记录的 Started/完成状态。
             let chunk = match response.chunk().await {
                 Ok(Some(chunk)) => chunk,
                 Ok(None) => break,
                 Err(error) => {
-                    end_reasoning(&mut stream, &mut on_event);
+                    end_reasoning(&mut stream, on_event);
                     return Err(if error.is_timeout() {
                         ModelError::StreamIdleTimeout {
                             idle_timeout: self.stream_idle_timeout,
@@ -155,8 +266,9 @@ impl OpenAIResponsesClient {
                 if line.is_empty() {
                     // 空行提交一个完整 SSE event；[DONE] 只会被 handle_sse_data 忽略，
                     // 真正的 Responses 终态仍必须由 response.completed/incomplete 提供。
-                    if let Err(error) = handle_sse_data(&data, &mut stream, &mut on_event) {
-                        end_reasoning(&mut stream, &mut on_event);
+                    self.audit_stream_data(&data)?;
+                    if let Err(error) = handle_sse_data(&data, &mut stream, on_event) {
+                        end_reasoning(&mut stream, on_event);
                         return Err(error);
                     }
                     data.clear();
@@ -186,8 +298,9 @@ impl OpenAIResponsesClient {
                 }
                 data.extend_from_slice(value.strip_prefix(b" ").unwrap_or(value));
             }
-            if let Err(error) = handle_sse_data(&data, &mut stream, &mut on_event) {
-                end_reasoning(&mut stream, &mut on_event);
+            self.audit_stream_data(&data)?;
+            if let Err(error) = handle_sse_data(&data, &mut stream, on_event) {
+                end_reasoning(&mut stream, on_event);
                 return Err(error);
             }
         }
@@ -203,6 +316,34 @@ impl OpenAIResponsesClient {
     }
 }
 
+struct InflightAudit<'a> {
+    sink: &'a dyn ModelAuditSink,
+    context: ModelAuditContext,
+    armed: bool,
+}
+
+impl Drop for InflightAudit<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.sink.record_model(
+                &self.context,
+                "llm.unknown_after_cancel",
+                json!({"outcome":"unknown","reason":"model future ended without a recorded terminal"}),
+            );
+        }
+    }
+}
+
+fn model_audit_error_class(error: &ModelError) -> &'static str {
+    match error {
+        ModelError::RunLogUnavailable(_) => "run_log_unavailable",
+        ModelError::Http { .. } => "http",
+        ModelError::Transport(_) | ModelError::StreamIdleTimeout { .. } => "transport",
+        ModelError::InvalidStream(_) => "invalid_stream",
+        _ => "model_protocol",
+    }
+}
+
 #[derive(Default)]
 struct ReasoningStream {
     started: bool,
@@ -215,6 +356,7 @@ fn handle_sse_data(
     stream: &mut ReasoningStream,
     on_event: &mut impl FnMut(ModelStreamEvent),
 ) -> Result<()> {
+    // SSE parser 通过 FnMut 回调向上层发送 reasoning 事件；终态 response 单独保存在 stream，避免把 delta 当成最终输出。
     // 解析一个已经按空行分隔的 SSE data；空 data/[DONE] 不是终态，未知事件
     // 暂时忽略，以便兼容 provider 增加非业务事件。
     if data.is_empty() || data == b"[DONE]" {
@@ -284,6 +426,7 @@ pub(super) fn openai_responses_request_body(
     reasoning_effort: &str,
     request: &ModelRequest,
 ) -> Value {
+    // 该函数只做请求表达式的确定性编译；Continue transcript 与 tool outputs 都由 Rust 显式拼接。
     // 将 ModelRequest 编译为单轮 Responses wire payload；这里仅序列化请求，不做
     // provider I/O，也不改变 Rust 持有的工具授权和预算。
     let input = match &request.input {
@@ -384,6 +527,8 @@ pub(super) fn openai_responses_request_body(
 }
 
 pub(super) fn openai_response_from_raw(raw: Value, request_body: Value) -> Result<ModelResponse> {
+    // 这里拒绝 incomplete/refusal/空 output；真实 SSE 的终态一致性由调用方先验，
+    // fixture 可直接传入 raw，因此本函数本身不证明 response.completed 事件发生。
     // 把 provider raw 规范化为 ModelResponse，并在协议边界拒绝 incomplete、refusal
     // 和空输出；这里不持久化，也不决定研究提交、Decision 或 Execution 状态。
     if raw.get("status").and_then(Value::as_str) == Some("incomplete") {
@@ -527,8 +672,8 @@ pub fn extract_tool_calls(response: &Value) -> Vec<ModelToolCall> {
 }
 
 pub(super) fn parse_tool_call(value: &Value) -> Option<ModelToolCall> {
-    // 将 function_call/tool_call 的 name、call_id 和 arguments 统一为内部类型；字符串
-    // arguments 若不是 JSON 则保留为 raw 字段，真正 Schema 合法性留给上层判断。
+    // 接受 function_call/tool_call，兼容缺 type 但有 name 的旧形状；其它显式
+    // type 被过滤。arguments 字符串不是 JSON 时保留 raw，Schema 合法性留给上层。
     let kind = value.get("type").and_then(Value::as_str);
     if kind.is_some_and(|kind| kind != "function_call" && kind != "tool_call") {
         return None;
@@ -559,6 +704,7 @@ pub(super) fn parse_tool_call(value: &Value) -> Option<ModelToolCall> {
 
 #[cfg(test)]
 mod transcript_regression {
+    // 测试只验证 stream/continuation/usage 的协议边界，不调用真实 provider 或 Store。
     use super::*;
 
     #[test]
@@ -615,5 +761,354 @@ mod transcript_regression {
 }
 
 #[cfg(test)]
-#[path = "responses_stream_tests.rs"]
-mod stream_terminal_tests;
+mod run_log_audit_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    #[derive(Default)]
+    struct RecordingAudit {
+        records: Mutex<Vec<(String, Value)>>,
+        reject: bool,
+    }
+
+    impl ModelAuditSink for RecordingAudit {
+        fn record_model(
+            &self,
+            _context: &ModelAuditContext,
+            kind: &str,
+            payload: Value,
+        ) -> std::result::Result<(), String> {
+            if self.reject {
+                return Err("simulated audit write failure".into());
+            }
+            self.records.lock().unwrap().push((kind.into(), payload));
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct ScopedAudit {
+        records: Mutex<Vec<(ModelAuditContext, String, Value)>>,
+    }
+
+    impl ModelAuditSink for ScopedAudit {
+        fn record_model(
+            &self,
+            context: &ModelAuditContext,
+            kind: &str,
+            payload: Value,
+        ) -> std::result::Result<(), String> {
+            self.records
+                .lock()
+                .unwrap()
+                .push((context.clone(), kind.into(), payload));
+            Ok(())
+        }
+    }
+
+    fn request() -> ModelRequest {
+        ModelRequest {
+            instructions: "limited local protocol test".into(),
+            input: ModelInput::Fresh {
+                text: "authorized context".into(),
+            },
+            max_output_tokens: 64,
+            reasoning_effort: None,
+            tools: vec![],
+            tool_choice: ModelToolChoice::None,
+            fixture_key: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn failing_audit_prevents_even_the_first_network_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let client = OpenAIResponsesClient::new(
+            format!("http://{}", listener.local_addr().unwrap()),
+            "test-only-key",
+            "test-model",
+            "medium",
+        )
+        .unwrap()
+        .with_audit(Arc::new(RecordingAudit {
+            reject: true,
+            ..Default::default()
+        }));
+        let error = MODEL_AUDIT_CONTEXT
+            .scope(
+                ModelAuditContext::startup("test"),
+                client.respond(request()),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ModelError::RunLogUnavailable(_)));
+        assert!(listener.accept().is_err());
+    }
+
+    #[tokio::test]
+    async fn local_response_records_exact_request_stream_and_terminal_without_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buffer = [0_u8; 8192];
+            let n = socket.read(&mut buffer).unwrap();
+            assert!(String::from_utf8_lossy(&buffer[..n]).starts_with("POST /responses "));
+            let event = json!({
+                "type":"response.completed",
+                "response":{
+                    "id":"response-local",
+                    "status":"completed",
+                    "model":"test-model",
+                    "usage":{"input_tokens":3,"output_tokens":2},
+                    "output":[{"type":"message","role":"assistant",
+                        "content":[{"type":"output_text","text":"test answer"}]}]
+                }
+            });
+            let body = format!("data: {event}\n\n");
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nx-request-id: request-local\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+        });
+        let sink = Arc::new(RecordingAudit::default());
+        let client = OpenAIResponsesClient::new(
+            format!("http://{address}"),
+            "test-only-key",
+            "test-model",
+            "medium",
+        )
+        .unwrap()
+        .with_audit(sink.clone());
+        let response = MODEL_AUDIT_CONTEXT
+            .scope(
+                ModelAuditContext::startup("test"),
+                client.respond(request()),
+            )
+            .await
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(response.output_text, "test answer");
+        let records = sink.records.lock().unwrap();
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[0].0, "llm.request");
+        assert_eq!(records[0].1["request"]["input"], "authorized context");
+        assert!(records[0].1.get("authorization").is_none());
+        assert_eq!(records[1].0, "llm.response_headers");
+        assert_eq!(records[1].1["request_id"], "request-local");
+        assert_eq!(records[2].0, "llm.sse");
+        assert!(records[2].1["data"]
+            .as_str()
+            .unwrap()
+            .contains("response.completed"));
+        assert_eq!(records[3].0, "llm.terminal");
+        assert_eq!(records[3].1["response"]["id"], "response-local");
+        assert_eq!(records[3].1["request_id"], "request-local");
+        assert!(records[3].1["latency_millis"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn cancelled_provider_stream_is_marked_unknown_not_completed() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (accepted, read) = std::sync::mpsc::channel();
+        let (release, close) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buffer = [0_u8; 4096];
+            assert!(socket.read(&mut buffer).unwrap() > 0);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nx-request-id: interrupted-test\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            accepted.send(()).unwrap();
+            let _ = close.recv_timeout(std::time::Duration::from_secs(5));
+        });
+        let sink = Arc::new(RecordingAudit::default());
+        let client = OpenAIResponsesClient::new(
+            format!("http://{address}"),
+            "test-only-key",
+            "test-model",
+            "medium",
+        )
+        .unwrap()
+        .with_audit(sink.clone());
+        let call = tokio::spawn(async move {
+            MODEL_AUDIT_CONTEXT
+                .scope(
+                    ModelAuditContext::startup("test"),
+                    client.respond(request()),
+                )
+                .await
+        });
+        tokio::task::spawn_blocking(move || read.recv_timeout(std::time::Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .unwrap();
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+        release.send(()).unwrap();
+        server.join().unwrap();
+        let records = sink.records.lock().unwrap();
+        assert!(records.iter().any(|(kind, _)| kind == "llm.request"));
+        assert!(records.iter().any(|(kind, value)| {
+            kind == "llm.unknown_after_cancel" && value["outcome"] == "unknown"
+        }));
+        assert!(!records.iter().any(|(kind, _)| kind == "llm.terminal"));
+    }
+
+    #[tokio::test]
+    async fn local_protocol_correlates_startup_research_search_review_outcome_and_retry() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for index in 0..6 {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut buffer = [0_u8; 8192];
+                assert!(socket.read(&mut buffer).unwrap() > 0);
+                if index == 1 {
+                    socket
+                        .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 9\r\nConnection: close\r\n\r\nretryable")
+                        .unwrap();
+                    continue;
+                }
+                let response = json!({
+                    "type":"response.completed",
+                    "response":{
+                        "id":format!("local-response-{index}"),
+                        "status":"completed",
+                        "model":"test-model",
+                        "usage":{"input_tokens":3,"output_tokens":2},
+                        "output":[{"type":"message","role":"assistant",
+                            "content":[{"type":"output_text","text":"model answer"}]}]
+                    }
+                });
+                let body = format!("data: {response}\n\n");
+                socket
+                    .write_all(format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nx-request-id: local-request-{index}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    ).as_bytes())
+                    .unwrap();
+            }
+        });
+        let sink = Arc::new(ScopedAudit::default());
+        let client = OpenAIResponsesClient::new(
+            format!("http://{address}"),
+            "test-only-key",
+            "test-model",
+            "medium",
+        )
+        .unwrap()
+        .with_audit(sink.clone());
+        let mut scopes = vec![ModelAuditContext::startup("local")];
+        for (phase, task, call, retry) in [
+            ("T0", "research.analyst", "analyst-call", 0),
+            ("T0", "research.analyst", "analyst-call", 1),
+            ("T0", "evidence.news_web.search", "search-call", 0),
+            ("T0", "evidence.source_review", "review-call", 0),
+            ("T1", "learning.outcome_worker", "outcome-call", 0),
+        ] {
+            scopes.push(ModelAuditContext {
+                run_id: "run-local".into(),
+                phase: phase.into(),
+                task_id: Some(task.into()),
+                attempt_id: Some("attempt-local".into()),
+                call_id: Some(call.into()),
+                retry_index: Some(retry),
+            });
+        }
+        for (index, scope) in scopes.into_iter().enumerate() {
+            let result = MODEL_AUDIT_CONTEXT
+                .scope(scope, client.respond(request()))
+                .await;
+            if index == 1 {
+                assert!(matches!(result, Err(ModelError::Http { .. })));
+            } else {
+                assert_eq!(result.unwrap().output_text, "model answer");
+            }
+        }
+        server.join().unwrap();
+        let records = sink.records.lock().unwrap();
+        let calls = records
+            .iter()
+            .filter(|(_, kind, _)| kind == "llm.request")
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 6);
+        assert_eq!(calls[0].0.phase, "startup");
+        assert!(calls[0].0.call_id.is_some());
+        assert_eq!(calls[1].0.task_id.as_deref(), Some("research.analyst"));
+        assert_eq!(calls[1].0.retry_index, Some(0));
+        assert_eq!(calls[2].0.retry_index, Some(1));
+        assert_eq!(
+            calls[3].0.task_id.as_deref(),
+            Some("evidence.news_web.search")
+        );
+        assert_eq!(
+            calls[4].0.task_id.as_deref(),
+            Some("evidence.source_review")
+        );
+        assert_eq!(calls[5].0.phase, "T1");
+        assert!(records.iter().any(|(scope, kind, value)| {
+            scope.retry_index == Some(0)
+                && scope.call_id.as_deref() == Some("analyst-call")
+                && kind == "llm.terminal"
+                && value["error_class"] == "http"
+                && value["latency_millis"].as_u64().is_some()
+        }));
+        assert!(records.iter().any(|(scope, kind, value)| {
+            scope.retry_index == Some(1)
+                && scope.call_id.as_deref() == Some("analyst-call")
+                && kind == "llm.terminal"
+                && value["response"]["id"] == "local-response-2"
+        }));
+    }
+
+    #[tokio::test]
+    async fn interrupted_stream_keeps_raw_events_and_an_error_terminal() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buffer = [0_u8; 4096];
+            assert!(socket.read(&mut buffer).unwrap() > 0);
+            let body = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n";
+            socket
+                .write_all(format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nx-request-id: broken-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                ).as_bytes())
+                .unwrap();
+        });
+        let sink = Arc::new(ScopedAudit::default());
+        let client = OpenAIResponsesClient::new(
+            format!("http://{address}"),
+            "test-only-key",
+            "test-model",
+            "medium",
+        )
+        .unwrap()
+        .with_audit(sink.clone());
+        let result = MODEL_AUDIT_CONTEXT
+            .scope(
+                ModelAuditContext::startup("broken"),
+                client.respond(request()),
+            )
+            .await;
+        assert!(result.is_err());
+        server.join().unwrap();
+        let records = sink.records.lock().unwrap();
+        assert!(records.iter().any(|(_, kind, value)| {
+            kind == "llm.sse" && value["data"].as_str().unwrap().contains("partial")
+        }));
+        assert!(records.iter().any(|(_, kind, value)| {
+            kind == "llm.terminal" && value["error_class"] == "invalid_stream"
+        }));
+    }
+}

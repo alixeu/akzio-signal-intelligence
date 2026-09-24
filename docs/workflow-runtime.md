@@ -14,7 +14,7 @@
 
 ## RunControl 与 checkpoint
 
-Store 18 使用唯一的 `rebuild_run_controls` SQL head。普通运行默认为 continuous；原 Debug 的 pause/step/resume/retry/abort 作用于这个 head，保留 revision CAS、精确 task permit、runtime identity 和原有权限。`RunControlStatus` 与旧 `DebugStatus` 保持 wire 兼容。控制状态与业务 WorkflowStatus 分开：控制结束不代表研究成功、Paper 成交或 Outcome 封存。
+Store 18 使用唯一的 `rebuild_run_controls` SQL head。普通运行默认为 continuous；旧 Debug 的 pause/step/resume/retry/abort 历史 head 保留 revision CAS、精确 task permit 与身份以供只读审计，但不再提供创建或控制入口。`RunControlStatus` 与旧 `DebugStatus` 保持 wire 解码兼容。控制状态与业务 WorkflowStatus 分开：控制结束不代表研究成功、Paper 成交或 Outcome 封存。
 
 `RuntimeCheckpoint` 是独立、仅 RunScoped 的 CAS 类型。图创建、任务边界、暂停、重试/延期、取消及 Outcome 入队等事件在同一 SQLite 事务内追加 checkpoint。记录包含 graph 引用、被覆盖的 event cursor、control revision、可用的 runtime identity、task/attempt、触发事件及来源 Artifact。checkpoint 自身通过 `runtime.checkpoint_saved` 进入同一个 journal，不另建状态文件或第二份权威 state。
 
@@ -32,14 +32,14 @@ Provider retry、预算失败、交易时段延期仍按既有语义执行，没
 | `GET /v1/observer/runs/{run_id}/inspection` | 持久化图、Blueprint、控制 head、checkpoint、恢复状态 |
 | `GET /v1/observer/runs/{run_id}/journal?after=0&limit=100` | journal 游标分页；支持 `task_id`、`attempt_id`，上限 500 |
 
-Journal 返回 Artifact 和 source refs，不返回原始模型/工具载荷。原始数据仍通过现有授权导出读取。Observer Run Detail 与 Debug Inspect 携带同一 inspection 投影，SwiftUI Workflow 页可预览定义、检查恢复记录和加载事件来源。
+Journal 返回 Artifact 和 source refs，不返回原始模型/工具载荷。正式运行的私有日志在[阶段 ZIP](run-log.md)；分享安全原始投影仍通过现有授权导出读取。Observer Run Detail 携带 inspection，SwiftUI Workflow 页可预览定义、检查恢复记录和加载事件来源。
 
 ```sh
-akzio --config <隔离配置> workflow blueprint --purpose position_plan --format json
-akzio --config <隔离配置> workflow blueprint --purpose paper --format mermaid
-akzio --config <隔离配置> run inspect <run-id>
-akzio --config <隔离配置> run checkpoint <run-id>
-akzio --config <隔离配置> run journal <run-id> --after 0 --limit 100
+akzio --config <正式配置> workflow blueprint --purpose position_plan --format json
+akzio --config <正式配置> workflow blueprint --purpose paper --format mermaid
+akzio --config <正式配置> run inspect <run-id>
+akzio --config <正式配置> run checkpoint <run-id>
+akzio --config <正式配置> run journal <run-id> --after 0 --limit 100
 ```
 
 `run events` 保留原 SSE 语义，`run journal` 是有限分页查询。Blueprint CLI 读取目标 Core 的已安装定义，需该 Core 已启动及已有 token。

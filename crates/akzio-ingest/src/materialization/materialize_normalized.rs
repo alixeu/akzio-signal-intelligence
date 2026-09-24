@@ -1,3 +1,9 @@
+// 文件导读：标准化 materialization 负责把 acquisition 的 raw bytes、时间基准、污染证书、
+// quant features、financial-content 评估和 provider provenance 合成 NormalizedEvidence。
+// 新闻 snapshot 的 byte binding 会切出 Raw 子 blob；日线按 cutoff 计算特征。基础
+// acquisition/时间验证先于 Raw stage，新闻 binding 与 quant/financial 评估则在
+// Raw Artifact 构造之后；这些中间 stage 不等于已完成任务提交事务。
+
 impl EvidenceRuntime {
     fn materialize_raw(
         &self,
@@ -6,6 +12,9 @@ impl EvidenceRuntime {
         acquired: &AcquiredEvidence,
         now: DateTime<Utc>,
     ) -> EvidenceRuntimeResult<Artifact> {
+        // acquired.raw 是采集适配器保留的原始响应账本；ModelReviewed 新闻可同时
+        // 包含 discovery 与 reviewer 的 provider 响应，它仍不是独立来源快照。
+        // 本层只封存这些 bytes，不把 normalized projection 回写为原始来源。
         Ok(Artifact::new(
             ArtifactKind::RawEvidence,
             self.store
@@ -27,6 +36,7 @@ impl EvidenceRuntime {
     }
 
     fn validate_source_uri(source_uri: &str) -> EvidenceRuntimeResult<()> {
+        // 复用统一 governed URI 规则，拒绝认证信息、敏感 query、fragment 或非可解析 URL。
         if governed_source_uri_is_safe(source_uri) {
             Ok(())
         } else {
@@ -41,6 +51,8 @@ impl EvidenceRuntime {
         raw_blob: &BlobRef,
         citations: &[EvidenceCitation],
     ) -> EvidenceRuntimeResult<()> {
+        // 对新闻 source_document 的 snapshot 元数据做精确 byte/hash/quote binding；任何声明
+        // 与 Raw bundle 不一致都视为 provenance 破坏，不能降级成普通缺少引用。
         let Some(sources) = value
             .get_mut("source_document")
             .and_then(|document| document.get_mut("sources"))
@@ -132,6 +144,8 @@ impl EvidenceRuntime {
         confidence_ppm: u32,
         now: DateTime<Utc>,
     ) -> EvidenceRuntimeResult<EvidenceBundle> {
+        // 先计算 EvidenceTimeBasis 和 contamination certificate，再封 Raw、绑定新闻子 blob、
+        // 按资源类型构造 quant/financial projection，最后创建 NormalizedEvidence 及其 lineage。
         let time_basis = Self::validate_acquired_evidence(request, &acquired, now)?;
         let contamination_certificate =
             EvidenceContaminationCertificate::for_time_basis(&time_basis)?;
@@ -223,6 +237,8 @@ impl EvidenceRuntime {
         acquired: &AcquiredEvidence,
         cutoff: DateTime<Utc>,
     ) -> EvidenceRuntimeResult<EvidenceTimeBasis> {
+        // 给 adapter preflight 和 CAS materialization 共用的只读校验入口，避免两条路径对
+        // freshness/cutoff/provenance 得出不同结论。
         Self::validate_acquisition(acquired, request, cutoff)?;
         Self::time_basis(request, acquired, cutoff)
     }
@@ -232,6 +248,9 @@ impl EvidenceRuntime {
         acquired: &AcquiredEvidence,
         decision_cutoff: DateTime<Utc>,
     ) -> EvidenceRuntimeResult<EvidenceTimeBasis> {
+        // 按 provider/source 选择 event、published/vintage、availability 和 retrieval 时间；
+        // Alpaca bars 必须有 session close/fixture cutoff 证明，Fred 使用 vintage，新闻/SEC
+        // 缺出版时间时不凭检索时间倒推历史可用性。
         let governed = GovernedResource::parse(request.source, &request.resource)?;
         let vintage = match &governed {
             GovernedResource::Fred { vintage, .. } => *vintage,
@@ -253,10 +272,9 @@ impl EvidenceRuntime {
                 .and_then(|date| date.and_hms_opt(23, 59, 59))
                 .map(|value| value.and_utc())
                 .ok_or(EvidenceRuntimeError::MissingAvailability)?,
-            // When a source does not expose a trustworthy publication time,
-            // first verified retrieval is the earliest defensible availability.
-            // Historical replay therefore fails closed because retrieved_at is
-            // later than its historical decision cutoff.
+            // 无 published_at 时以 adapter 的 observed_at 作保守可用时间下界；
+            // ModelReviewed 新闻的搜索/审核并非独立来源验证，不能称“verified retrieval”。
+            // 历史 cutoff 早于这一时刻时，由后续 time_basis 校验阻断回填。
             EvidenceSource::NewsWeb | EvidenceSource::SecEdgar => acquired
                 .provenance
                 .published_at
@@ -306,6 +324,8 @@ impl EvidenceRuntime {
         request: &EvidenceRequest,
         now: DateTime<Utc>,
     ) -> EvidenceRuntimeResult<()> {
+        // 在任何 CAS 写入前检查 raw/media/source URI、provenance/citation、quality 和 max_age。
+        // 下载成功只证明取得了 bytes，不证明时间上可用于当前 Decision。
         if acquired.raw.is_empty()
             || acquired.media_type.trim().is_empty()
             || acquired.source_uri.trim().is_empty()
@@ -325,6 +345,8 @@ impl EvidenceRuntime {
 }
 
 fn latest_rfc3339_timestamp(value: &Value) -> Option<DateTime<Utc>> {
+    // 递归遍历 provider JSON，取 t/timestamp 字段中的最晚 RFC3339 时间供市场 availability
+    // 推导；未识别结构返回 None。
     match value {
         Value::Array(values) => values.iter().filter_map(latest_rfc3339_timestamp).max(),
         Value::Object(values) => values
@@ -346,6 +368,7 @@ fn latest_rfc3339_timestamp(value: &Value) -> Option<DateTime<Utc>> {
 }
 
 fn latest_fred_observation_date(value: &Value) -> Option<DateTime<Utc>> {
+    // 从 FRED observations 的 date 字段取最晚观测日，并转成 UTC 午夜用于时间基准比较。
     value
         .get("observations")?
         .as_array()?
@@ -358,6 +381,7 @@ fn latest_fred_observation_date(value: &Value) -> Option<DateTime<Utc>> {
 }
 
 fn binding_byte(binding: &Value, field: &str) -> EvidenceRuntimeResult<usize> {
+    // 将 JSON binding 的非负字节偏移转换为 usize，缺失/越界即 citation invalid。
     claim_binding_byte(binding, field).ok_or(EvidenceRuntimeError::InvalidCitation)
 }
 
@@ -367,6 +391,8 @@ mod live_snapshot_cutoff_tests {
 
     #[test]
     fn receipt_time_requires_completed_snapshot_and_future_data_stays_blocked() {
+        // 回归：retrieved/available 晚于 decision cutoff 时阻断；cutoff 推迟到可用时间后
+        // 才能通过，event 再次落到未来仍要失败。
         let started = Utc::now();
         let received = started + Duration::milliseconds(10);
         let frozen = received + Duration::milliseconds(10);

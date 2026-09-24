@@ -1,6 +1,10 @@
 import SwiftUI
 
+// 文件导读：RunArchivePage 把选中行及当时的阶段/Outcome 说明冻结成 DetachedRunPayload，
+// 再交给 sheet 或新窗口显示；窗口不持有 ObservatoryStore，也不刷新运行数据。先读 payload
+// 初始化和 body，注意 Codable 值跨窗口传递、语言快照回退，以及关闭只 dismiss 当前窗口。
 public struct DetachedRunPayload: Codable, Hashable, Identifiable {
+    // 这是跨窗口传递的冻结展示模型，不持有 Store，也不会在窗口内重新查询运行记录。
     public let id: String
     public let purpose: String
     public let topology: String
@@ -15,6 +19,7 @@ public struct DetachedRunPayload: Codable, Hashable, Identifiable {
     public let language: String?
 
     public struct Stage: Codable, Hashable, Identifiable {
+        // 阶段只保留窗口需要的字符串和稳定 ID，避免把页面模型的引用带入新窗口。
         public let label: String
         public let status: String
         public let time: String
@@ -22,6 +27,7 @@ public struct DetachedRunPayload: Codable, Hashable, Identifiable {
     }
 
     init(_ row: ArchiveRowPresentation, stages progress: [ArchiveStageProgress]? = nil, outcomeEvidence: OutcomeEvidencePresentation = .unknown, language: AppLanguage? = nil) {
+        // 初始化把行投影和可选阶段快照一次性复制；map 闭包只捕获每个阶段值。
         id = row.runID
         purpose = row.purposeLabel
         topology = row.topology
@@ -42,11 +48,14 @@ public struct DetachedRunPayload: Codable, Hashable, Identifiable {
 struct DetachedRunWindow: View {
     let payload: DetachedRunPayload
 
+    // dismiss 由窗口环境提供；语言优先使用 payload 快照，缺失时回退到父窗口环境。
     @Environment(\.dismiss) private var dismiss
     @Environment(\.appLanguage) private var inheritedLanguage
+    // rawValue 解析失败或快照未带语言时，回退到父窗口沿环境传入的语言。
     private var language: AppLanguage { payload.language.flatMap(AppLanguage.init(rawValue:)) ?? inheritedLanguage }
 
     var body: some View {
+        // 窗口内容只读 payload；关闭按钮通过 dismiss 闭包结束当前窗口，不改动运行状态。
         VStack(alignment: .leading, spacing: AkzioLayout.s4) {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 4) {
@@ -103,6 +112,7 @@ struct DetachedRunWindow: View {
     }
 
     private func field(_ label: String, _ value: String) -> some View {
+        // 字段渲染统一走窗口解析出的语言，value 仍保留为可复制的原始展示文本。
         VStack(alignment: .leading, spacing: 2) {
             Text(L10n.text(label, language: language)).akzioText(.caption)
             Text(L10n.text(value, language: language)).akzioMono(11, color: AkzioColor.primaryText).lineLimit(1).help(value).textSelection(.enabled)

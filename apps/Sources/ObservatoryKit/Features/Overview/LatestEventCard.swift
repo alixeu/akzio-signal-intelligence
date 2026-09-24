@@ -1,20 +1,26 @@
 import SwiftUI
 
+// 文件导读：Overview 右栏按上游顺序展示最新事件和最多四条补充事件，更多记录由本地
+// DisclosureGroup 展开；空数组明确显示 queued 占位。读 body、localizedDetail，关注
+// State 只控制 UI 展开/一次性脉冲，事件内容与严重级别仍来自 EventPresentation。
 // MARK: - Latest event
 //
 // When a new event arrives the border pulses grey → coral → neutral exactly once.
 // It never keeps flashing: a persistent alarm stops being information.
 struct LatestEventCard: View {
+    // events 按最新优先传入；卡片只负责展开最近事件和最多五条补充事件。
     let events: [EventPresentation]
 
     @Environment(\.motionPolicy) private var policy
     @Environment(\.appLanguage) private var language
+    // pulseTick 是一次性动画触发器，expanded 只控制更多历史事件的本地展开。
     @State private var pulseTick = 0
     @State private var expanded = false
 
     private var latest: EventPresentation? { events.first }
 
     var body: some View {
+        // latest 变化触发一次边框脉冲；事件内容本身不通过动画状态重新生成。
         SectionCard(title: "Latest Event", subtitle: latest?.relativeLabel) {
             if let latest {
                 VStack(alignment: .leading, spacing: AkzioLayout.s2) {
@@ -28,6 +34,7 @@ struct LatestEventCard: View {
                     }
                 Text(localizedDetail(latest.detail)).akzioText(.bodySmall)
                     if events.count > 1 {
+                        // events 已按新到旧排序；dropFirst 跳过主卡，prefix(4) 限制次级列表长度。
                         HairlineDivider()
                         VStack(alignment: .leading, spacing: 5) {
                             ForEach(Array(events.dropFirst().prefix(4).enumerated()), id: \.element.id) { index, event in
@@ -45,6 +52,7 @@ struct LatestEventCard: View {
                     }
                 }
                 if events.count > 5 {
+                    // 更多记录不是删除或分页请求，只在本地展开其余事件；expanded 由 DisclosureGroup 的 Binding 更新。
                     DisclosureGroup("更多事件（\(events.count - 5)）", isExpanded: $expanded) {
                         ScrollView {
                             LazyVStack(alignment: .leading, spacing: 10) {
@@ -60,6 +68,7 @@ struct LatestEventCard: View {
                     }.font(.callout)
                 }
             } else {
+                // 空数组表示当前没有已记录事件，不把它解读为失败或后台仍在运行。
                 StatusExplanation(.queued, detail: "No events recorded for this run yet")
             }
         }
@@ -79,6 +88,7 @@ struct LatestEventCard: View {
     }
 
     private func localizedDetail(_ detail: String) -> String {
+        // 任务前缀单独翻译，其余详情交给 L10n；这里不改变事件原文。
         guard detail.hasPrefix("Task ") else {
             return L10n.text(detail, language: language)
         }

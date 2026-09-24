@@ -1,3 +1,6 @@
+// 文件导读：把 Alpaca calendar、真实时钟和 overnight asset flags 映射为可执行的
+// PreMarket/Regular/AfterHours/Overnight/Closed 领域状态；所有时间计算仍是纯函数。
+// calendar 与时钟输入由调用方提供；这里用 America/New_York 转换并返回描述值，不连接 Broker，也不改变 `is_open` 的原始含义。
 /// Provider-calendar-derived session. `is_open` remains the broker's regular-hours flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -12,6 +15,8 @@ pub enum TradingSession {
 /// Trading API currently encodes these flags in `attributes`; accept the
 /// documented boolean fields too. Explicit false and halt always fail closed.
 pub fn alpaca_overnight_asset_available(value: &serde_json::Value, asset: Asset) -> bool {
+    // JSON 只读借用；任一标志缺失、类型不符或显式 halted 都使最终布尔表达式为 false。
+    // 同时兼容顶层布尔字段和 attributes 数组；显式 false、缺失或非字符串都 fail closed。
     let flag = |name: &str| -> Option<bool> {
         if let Some(value) = value.get(name) {
             return value.as_bool();
@@ -30,6 +35,7 @@ pub fn alpaca_overnight_asset_available(value: &serde_json::Value, asset: Asset)
 }
 
 impl TradingSession {
+    // 三个扩展时段允许使用 extended_hours=true，Regular/Closed 不允许。
     pub fn extended_hours(self) -> bool {
         matches!(self, Self::PreMarket | Self::AfterHours | Self::Overnight)
     }
@@ -53,7 +59,9 @@ pub struct ExchangeSession {
 }
 
 impl ExchangeSession {
+    // 将 provider JSON 日历解析为日期和本地时间；字段或时间格式错误统一返回领域错误。
     pub fn from_alpaca(value: &serde_json::Value) -> Result<Vec<Self>, DomainError> {
+        // 顶层非数组或任一行的日期/时间不能解析时，collect 的 Result 收束为整体 Err，不返回部分 calendar。
         let invalid = || DomainError::InvalidBudget {
             field: "trading_session.calendar",
         };
@@ -61,6 +69,7 @@ impl ExchangeSession {
             .as_array()
             .ok_or_else(invalid)?
             .iter()
+            // map 闭包逐行解析 date/open/close，collect 把任一行错误传播为整体失败。
             .map(|row| {
                 let text = |field| {
                     row.get(field)
@@ -86,14 +95,19 @@ impl ExchangeSession {
 }
 
 impl TradingSessionSnapshot {
+    // 用 New York 交易日历和时区转换确定当前时段、交易日、下一个开盘和结束时间。
     pub fn from_calendar(
         now: DateTime<Utc>,
         regular_open: bool,
         calendar: &[ExchangeSession],
     ) -> Result<Self, DomainError> {
+        // `calendar` 是借用切片；遇到扫描到的非法 session 即拒绝，当前时段采用
+        // [start,end) 半开区间并返回首个匹配日。这里不排序或证明日历完整性，
+        // 上游须给出可信且按需覆盖的 provider 日历。
         use chrono::TimeZone;
         let ny = chrono_tz::America::New_York;
         let local_date = now.with_timezone(&ny).date_naive();
+        // from_local_datetime 处理 DST/本地时间歧义；无法得到唯一 UTC 时刻即拒绝。
         let at = |date: chrono::NaiveDate, time| {
             ny.from_local_datetime(&date.and_time(time))
                 .single()
@@ -123,6 +137,7 @@ impl TradingSessionSnapshot {
                     next_open.map_or(overnight_start, |v: DateTime<Utc>| v.min(overnight_start)),
                 );
             }
+            // 按 overnight → pre-market → regular → after-hours 的半开区间判断当前状态。
             let active = if now >= overnight_start && now < pre_start {
                 Some((TradingSession::Overnight, pre_start))
             } else if now >= pre_start && now < open {
@@ -159,6 +174,7 @@ mod session_tests {
     use super::*;
 
     #[test]
+    // 验证 provider calendar 驱动的假日、提前收盘、DST 前后交易日和各时段边界。
     fn provider_calendar_drives_sessions_holidays_early_close_and_trade_date() {
         let calendar = ExchangeSession::from_alpaca(&serde_json::json!([
             {"date":"2026-09-04", "open":"09:30", "close":"16:00"},
@@ -254,6 +270,7 @@ mod session_tests {
     }
 
     #[test]
+    // 旧订单 JSON 没有 extended_hours 时仍保持历史反序列化和序列化形状。
     fn legacy_order_hash_fields_remain_unchanged() {
         let old = serde_json::json!({"asset":"QQQ","side":"buy","notional":1000000,"limit_price":1000000});
         let decoded: OrderIntent = serde_json::from_value(old.clone()).unwrap();
@@ -262,6 +279,7 @@ mod session_tests {
     }
 
     #[test]
+    // overnight 标志支持 attributes/顶层字段，并拒绝 halt、缺字段和错误资产。
     fn overnight_asset_flags_match_actual_trading_api_and_reject_halts() {
         let mut value = serde_json::json!({"symbol":"QQQ","status":"active","tradable":true,
             "attributes":["fractional_eh_enabled","overnight_tradable"]});

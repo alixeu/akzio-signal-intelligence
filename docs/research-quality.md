@@ -13,26 +13,21 @@
 | 重验 | 已引用来源出现同资源、同来源族的新版本时，生成带精确引用的运行内建议。来源更新不是已证明矛盾，不改变 Active 生命周期，不根据单次亏损退役。 |
 | App 与导出 | 同一个 Rust `ResearchAudit` 投影提供给 Observer 与 bundle。Workflow Inspector 显示问题、引用、选择和停止原因；Learning 展示当前运行的召回与重验建议，保留与正式 Outcome 学习的区别。 |
 
-历史 Contract/CAS 不改写。旧 Review 缺少 issues 仍可读取；新规则按版本生效。Domain 10、Store 17 和 Outcome 63/35 保持不变。
+历史 Contract/CAS 不改写。旧 Review 缺少 issues 仍可读取；新规则按版本生效。Domain 10、Store 18 和 Outcome 63/35 保持不变。
 
 ## 固定离线目录
 
-[24 项目录](../config/research-quality-cases.json) 分为 Context、Review、Lesson，各八项，使用稳定 ID 绑定到实际 Rust 测试。执行器保存命令、退出码、完整日志和每项结果；找不到测试、被忽略或失败均不算通过。
+[24 项目录](../config/research-quality-cases.json) 分为 Context、Review、Lesson，各八项，使用稳定 ID 标识对应的 Rust 测试。目录是核对测试名称与范围的清单；验证时以测试输出及退出码为准，被忽略或未运行的测试不算通过。不再由独立 Python 脚本生成逐 ID 报告。
 
 ```bash
-python3 scripts/verify_research_quality.py
+cargo test --locked -p akzio-context -p akzio-domain --lib
 ```
 
 额外回归验证第 25 份关键证据、预算耗尽、完整正式图、无进展停止后直接 DecisionGate 的拒绝，以及模型调用预算在重新打开 Store 后仍有效。固定目录不是整个 workspace 测试的替代品。
 
-## 真实模型实验
+## 历史真实模型实验（入口已退役）
 
-```text
-akzio debug verify-research-quality --out .akzio/<experiment> --phase offline
-akzio --config <config> debug verify-research-quality --out .akzio/<experiment> --phase baseline
-akzio --config <config> debug verify-research-quality --out .akzio/<experiment> --phase candidate
-akzio debug verify-research-quality --out .akzio/<experiment> --phase report
-```
+原 `akzio debug verify-research-quality` 命令随独立 Debug Core 一并退役；以下 baseline/candidate/report 描述仅供历史报告解码，**不能作为当前可运行指令**。当前固定目录和结构化协议回归在 Cargo 测试内完成；如需新的真实模型实验，必须另行设计独立、明确授权且有私有日志的正式接口，而不能恢复隐藏的 Debug Core。
 
 baseline 必须由升级前保存的二进制执行，candidate 使用升级后的二进制。两者使用同一个实验 Store；`--phase baseline` 是实验标签，不会把当前代码切回旧版。report 只读取已有 Store，不读取模型配置或调用 provider。
 

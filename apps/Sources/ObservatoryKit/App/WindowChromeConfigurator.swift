@@ -1,6 +1,9 @@
 import AppKit
 import SwiftUI
 
+// 文件导读：将 SwiftUI 窗口的展示设置桥接到 AppKit 原生 NSWindow，负责标题栏透明、交通灯位置与桌面材质背景。
+// AppShell 用 NSViewRepresentable 插入 ChromeProbeView；SwiftUI 重绘时 updateNSView 更新开关，probe 在窗口挂载后配置原生对象。
+// `WindowChromeLayout.buttonOriginY` 是纯坐标计算；配置器可能修改窗口外观，但不访问 Store、Observer API 或 Core 业务状态。
 public enum WindowChromeLayout {
     public static let trafficLightVerticalOffset: CGFloat = -8
 
@@ -21,12 +24,14 @@ public enum WindowChromeLayout {
 /// Extends SwiftUI content through the native title bar so the traffic lights
 /// sit inside Akzio's status bar instead of reserving a separate strip.
 struct WindowChromeConfigurator: NSViewRepresentable {
+    // 这是 SwiftUI 值类型到 AppKit 引用对象的桥；updateNSView 只把最新值交给已有 NSView，不复制窗口状态。
     let desktopBlurEnabled: Bool
 
     init(desktopBlurEnabled: Bool = true) {
         self.desktopBlurEnabled = desktopBlurEnabled
     }
 
+    // SwiftUI 首次装配 representable 时创建长期 probe；后续值更新走 updateNSView，而非每次重建窗口。
     func makeNSView(context: Context) -> NSView { ChromeProbeView(frame: .zero) }
     func updateNSView(_ nsView: NSView, context: Context) {
         // SwiftUI 更新只把最新开关交给已有 probe；probe 自己负责幂等地重配 NSWindow。
@@ -35,6 +40,7 @@ struct WindowChromeConfigurator: NSViewRepresentable {
 }
 
 private final class ChromeProbeView: NSView {
+    // Probe 的引用身份跨 SwiftUI 重绘保留 effect view；窗口尚未挂载时所有配置都安全地延后。
     private var desktopBlurEnabled = true
     private var desktopEffectView: NSVisualEffectView?
 

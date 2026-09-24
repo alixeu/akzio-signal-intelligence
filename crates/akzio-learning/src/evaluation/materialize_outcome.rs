@@ -1,7 +1,14 @@
+// 文件导读：本模块由 evaluation.rs 通过 include! 编入 Evaluation 模块，负责完整 T+1/T+3/T+5
+// Outcome 的数值物化和窗口组装；它只读受治理观察，不持久化 Artifact，持久化由调用方 fenced Store 路径完成。
+
 /// Deterministically derives all OutcomeWindow metrics from governed facts.
+// 输入只借用；任一 horizon 的行情、Forecast 或校验失败都会使整个 Result 返回 Err，
+// 只有三期窗口齐全并通过 sealed 校验的 Outcome 才交给调用者，函数自身不写 Store。
 pub fn materialize_outcome(
     input: &OutcomeMaterializationInput,
 ) -> EvaluationRuntimeResult<Outcome> {
+    // 完整入口要求 T+1、T+3、T+5 三个窗口都能从同一 schedule/forecast/观察集合得到；
+    // 只有 validate_sealed 通过后，结果才具备进入 canonical learning 的形态。
     input.validate_base()?;
 
     let forecasts = index_forecasts(&input.forecasts)?;
@@ -9,6 +16,8 @@ pub fn materialize_outcome(
     let (execution, full_nav_path) = input.execution_and_nav()?;
 
     let mut windows = Vec::with_capacity(OutcomeHorizon::ALL.len());
+    // 每个 horizon 独立计算收益、forecast score、证据/风险真值比例和路径指标，
+    // 但共用同一执行重建与日频 NAV 路径，避免三个窗口采用不同的执行口径。
     for horizon in OutcomeHorizon::ALL {
         let probabilities_by_asset = forecasts
             .get(&horizon)
@@ -32,7 +41,11 @@ pub fn materialize_outcome(
 }
 
 impl OutcomeMaterializationInput {
+    // 检查全部通用前置数据和 Schedule 引用种类；这一步发生在构建窗口之前，防止无效 baseline
+    // 或越界资产集合进入任何指标计算。
     fn validate_base(&self) -> EvaluationRuntimeResult<()> {
+        // 先验证 schedule、目标组合、成本模型和精确四资产正价格面；这是所有后续
+        // 指标的输入边界，错误会在任何 Outcome Artifact 写入前返回。
         self.schedule.validate()?;
         if self.schedule_artifact.kind != ArtifactKind::OutcomeSchedule {
             return Err(EvaluationError::InvalidMaterialization(
@@ -45,9 +58,13 @@ impl OutcomeMaterializationInput {
         Ok(())
     }
 
+    // observed_execution 为 None 时只生成明确的模型默认/诊断数值；Some 时克隆已观测度量。
+    // build_nav_path 收到冻结目标、价格和成本，不读取未来窗口外状态，错误向 materializer 传播。
     fn execution_and_nav(
         &self,
     ) -> EvaluationRuntimeResult<(ObservedExecutionMetrics, Vec<OutcomeNavPoint>)> {
+        // 没有实际执行度量时使用成本模型的诊断默认值；有真实执行度量时保留 fill-driven
+        // turnover、signed valuation effect 与唯一可扣 slippage，再构造冻结后敞口 NAV。
         let execution = self
             .observed_execution
             .clone()
@@ -69,12 +86,16 @@ impl OutcomeMaterializationInput {
         Ok((execution, full_nav_path))
     }
 
+    // 组装纯数据 Outcome：market_evidence 排序去重，sealed_at 的 Some/None 区分完整封存与部分快照。
+    // 这里不验证或持久化，调用者随后分别执行 validate/Store commit。
     fn outcome_snapshot(
         &self,
         execution: &ObservedExecutionMetrics,
         windows: Vec<OutcomeWindow>,
         sealed_at: Option<DateTime<Utc>>,
     ) -> Outcome {
+        // implementation_effect 的存在区分 frozen_post_execution_exposure 的 v3
+        // 与兼容入口的 v2 口径；market_evidence 去重排序只影响确定性输出，不改变事实。
         let mut market_evidence = self.market_evidence.clone();
         market_evidence.sort();
         market_evidence.dedup();
@@ -102,6 +123,10 @@ fn materialize_outcome_window(
     execution: &ObservedExecutionMetrics,
     full_nav_path: &[OutcomeNavPoint],
 ) -> EvaluationRuntimeResult<OutcomeWindow> {
+    // 每个窗口只消费本期 horizon 的 prices 与截止日 NAV 前缀；Result 错误让整个完整/部分
+    // materializer 失败，而不是以缺指标填 0。数值指标由 Rust 计算，模型 draft 不提供这些值。
+    // utility 是组合收益加估值调整，再扣 QQQ benchmark、交易成本和可扣滑点；
+    // limit shortfall 仅作为 order attribution 诊断，不在这里重复扣除。
     let portfolio_return_ppm = portfolio_return_ppm(
         &input.target,
         &input.baseline_prices,
@@ -122,6 +147,8 @@ fn materialize_outcome_window(
         .copied()
         .filter(|point| point.observed_trading_day <= observation.observed_trading_day)
         .collect::<Vec<_>>();
+    // 当前窗口只看截至 observed_trading_day 的 NAV 前缀；后面的日线不能泄漏到较早
+    // 的 T+1/T+3 指标中。
     let benchmark_attributions =
         outcome_benchmark_attributions(OutcomeBenchmarkAttributionInput {
             target: &input.target,
@@ -139,6 +166,8 @@ fn materialize_outcome_window(
         observation.expected_evidence_count,
         Some(observation.observed_evidence_count),
     );
+    // evidence/risk ratio 保留 expected 与 observed 的计数和 Wilson 下界；缺少外部
+    // RiskGroundTruthAssessment 时 risk_recall 保持 None，不能默认成满分。
     let (risk_recall_counts, risk_ground_truth) = match &observation.risk_recall {
         Some(measurement) => {
             measurement.validate()?;

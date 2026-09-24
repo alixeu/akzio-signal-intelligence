@@ -1,10 +1,15 @@
 import Foundation
 
+// 文件导读：定义截图、预览和 Mock Store 共用的 20 个固定 UI 场景，并从场景枚举派生 seed、路由和业务展示状态。
+// ScenarioLibrary、CaptureCommand 与 ObservatoryStore 是主要调用方；rawValue/code/title 是展示标识，不是 Rust Run ID。
+// 先读 named、routes、purpose、workflowStatus、sealedHorizons：理解 token 解析、场景分流和 nil/空集合的含义。
+// enum 关联/原始值与计算属性只描述 fixture；任何 case 都不会启动模型、Paper 或 Outcome 流程。
 // MARK: - Scenarios
 //
 // Twenty fixed scenarios from the spec. Each one pins a seed and a set of expected
 // states so screenshots and visual regressions are reproducible.
 public enum MockScenario: Int, CaseIterable, Sendable, Identifiable {
+    // 每个 case 是一个可复现的 UI 状态组合，rawValue 同时作为截图和 fixture 的稳定编号。
     case paperRunningSynthesizerActive = 1
     case debugCompleted = 2
     case criticNotTriggered = 3
@@ -33,6 +38,7 @@ public enum MockScenario: Int, CaseIterable, Sendable, Identifiable {
 
     /// Resolve a scenario from a CLI token: either its two-digit code or its title.
     public static func named(_ token: String) -> MockScenario? {
+        // 解析闭包先尝试数字编号，再按标题精确匹配；不会模糊猜测场景。
         if let number = Int(token), let scenario = MockScenario(rawValue: number) {
             return scenario
         }
@@ -40,9 +46,11 @@ public enum MockScenario: Int, CaseIterable, Sendable, Identifiable {
         return allCases.first { $0.title.lowercased() == needle }
     }
 
+    // seed 由场景编号单向派生，所有 fixture 可在各自 salt 上生成互不干扰的序列。
     public var seed: UInt64 { UInt64(rawValue) &* 7_919 }
 
     public var title: String {
+        // 每个固定场景映射到截图和选择器使用的标题；标题不是可执行命令或运行时身份。
         return switch self {
         case .paperRunningSynthesizerActive: "Paper Running — Synthesizer Active"
         case .debugCompleted: "Debug Completed"
@@ -69,6 +77,7 @@ public enum MockScenario: Int, CaseIterable, Sendable, Identifiable {
 
     /// Pages this scenario is meant to exercise, for the capture script.
     public var routes: [AppRoute] {
+        // 路由集合描述截图应覆盖的页面，不会改变 Store 的默认启动路由。
         return switch self {
         case .paperRunningSynthesizerActive: AppRoute.primary
         case .debugCompleted: [.overview, .workflow, .runArchive]
@@ -89,6 +98,7 @@ public enum MockScenario: Int, CaseIterable, Sendable, Identifiable {
     // MARK: Scenario switches
 
     public var purpose: RunPurpose {
+        // purpose 是多个 fixture 的分流开关，决定是否适用 Paper 订单链路。
         switch self {
         case .debugCompleted: .debug
         case .nonPaperPaperCommitNotApplicable: .replay
@@ -98,6 +108,7 @@ public enum MockScenario: Int, CaseIterable, Sendable, Identifiable {
     }
 
     public var workflowStatus: WorkflowStatus {
+        // 场景状态只模拟展示快照的业务阶段，不代表真实 Core 已完成相同阶段。
         switch self {
         case .debugCompleted, .t5Completed, .retrospectiveMixed,
              .policyCandidate, .policyActive, .policyProven, .policyContested,
@@ -110,14 +121,17 @@ public enum MockScenario: Int, CaseIterable, Sendable, Identifiable {
     }
 
     public var criticTriggered: Bool {
+        // Critic 分支同时影响 workflow、事件和 council fixture。
         switch self {
         case .criticTriggeredMaterialConflict, .decisionBlocked: true
         default: false
         }
     }
 
+    // 以下布尔属性是场景 case 的简写；它们只供 fixture builder 分支，不代表已观测到对应业务副作用。
     public var isDecisionBlocked: Bool { self == .decisionBlocked }
     public var hasOrders: Bool {
+        // 订单存在性先受 Paper 资格和阻断状态限制，再由场景枚举决定。
         guard purpose.submitsPaperOrders, !isDecisionBlocked, self != .executionNoOrder else {
             return false
         }
@@ -139,6 +153,7 @@ public enum MockScenario: Int, CaseIterable, Sendable, Identifiable {
     public var reduceMotionPreferred: Bool { self == .settingsReduceMotion }
 
     public var sealedHorizons: Set<OutcomeHorizonKind> {
+        // 只有 canonical purpose 才能给 outcome fixture 提供封存窗口；空集合表示尚未封存。
         guard purpose.isCanonical else { return [] }
         return switch self {
         case .t5Completed: [.t1, .t3, .t5]
@@ -150,10 +165,12 @@ public enum MockScenario: Int, CaseIterable, Sendable, Identifiable {
     }
 
     public var observingHorizon: OutcomeHorizonKind? {
+        // observing 只为混合 horizon 场景提供一个明确的当前窗口。
         self == .horizonsMixed ? .t3 : nil
     }
 
     public var memoryLifecycle: MemoryLifecycle {
+        // learning 页面用该状态选择政策生命周期，其余场景默认展示 active 基线。
         switch self {
         case .policyCandidate: .candidate
         case .policyActive: .active
@@ -164,6 +181,7 @@ public enum MockScenario: Int, CaseIterable, Sendable, Identifiable {
     }
 
     public var candidateState: CandidatePolicyState {
+        // 候选暴露阶段由场景固定，供 Learning fixture 绘制 canary/active 状态。
         switch self {
         case .policyCandidate: .candidate
         case .policyActive: .canary25

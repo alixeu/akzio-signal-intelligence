@@ -1,7 +1,14 @@
+// 文件导读：Lesson 写入保留 source/supersedes/conflicts 的 CAS 闭包，并以独立 head/event
+// 维护生命周期；debug 隔离 Store 不能借此把 Lesson 提升为 canonical Active。
+// 先读 write_lesson 建立 immutable Artifact/head/event，再读 transition_lesson 的 CAS 更新，
+// 最后看 record_lesson_evidence_with_transaction 如何加入外层学习事务而不自行提交。
 impl Store {
     /// Persist an operator or outcome-derived Lesson with its source artifact.
     /// The source and Lesson are inserted atomically and a dedicated immutable
     /// lesson event records the actor without inventing a synthetic Run.
+    // 输入领域 Lesson、其一个主来源 Artifact 和时间；payload staging 与表初始化发生在业务事务外，
+    // 随后的 source/lesson Artifact、head revision=1 和 created event 才共同提交。
+    // 相同 lesson_id+相同 payload 返回 existing；同 ID 不同内容返回 Integrity，不覆盖旧 head。
     pub fn write_lesson(
         &self,
         lesson: &Lesson,
@@ -26,6 +33,7 @@ impl Store {
         }
 
         let blob = self.stage_json(lesson)?;
+        // producer/source_family 按 LessonOrigin 固定映射；source_refs 合并领域来源与 supersedes/conflicts。
         let producer = match lesson.origin {
             LessonOrigin::Operator => "learning.lesson.operator",
             LessonOrigin::OutcomeDerived => "learning.lesson.outcome",
@@ -68,6 +76,7 @@ impl Store {
             .optional()?
             .is_some()
         {
+            // 已有 head 走严格幂等分支，只允许领域 Lesson 完全相等；不更新 actor、时间或 revision。
             let current = self
                 .read_lesson_from_transaction(&transaction, &lesson.lesson_id)?
                 .ok_or_else(|| StoreError::Integrity("lesson head disappeared".to_owned()))?;
@@ -84,6 +93,8 @@ impl Store {
             });
         }
 
+        // 新建时先插 source，再核对所有相关 Lesson refs，然后写新 Artifact/head/event；
+        // 任一 `?` 失败由 Immediate Transaction Drop 回滚这些行。
         insert_artifact(&transaction, source)?;
         self.validate_related_refs(&transaction, lesson)?;
         insert_artifact(&transaction, &artifact)?;
@@ -122,6 +133,9 @@ impl Store {
         records: &[LessonEvidence],
         now: DateTime<Utc>,
     ) -> StoreResult<u64> {
+        // 借用 PolicyEvaluation 的 Transaction 与记录切片；不会开连接或 commit。
+        // 每条记录验证时间、head 与三个 ArtifactRef，按 lesson/context/outcome 唯一键幂等；
+        // 返回新增行数，后续外层 evaluation 失败时本批插入也回滚。
         let mut inserted = 0_u64;
         for record in records {
             record.validate()?;
@@ -159,6 +173,7 @@ impl Store {
             }
 
             let evidence_id = record.identity_hash()?;
+            // metrics_json 只投影按 horizon 的效用/校准数组；完整 identity 留在索引列和 hash 中。
         let metrics_json = serde_json::to_string(&LessonEvidenceMetrics::from(record))?;
         let existing = transaction
             .query_row(
@@ -191,6 +206,8 @@ impl Store {
             recorded_at,
         )) = existing
         {
+            // 同一个 idempotency key 只比较 observation 内容；recorded_at 可以因重放变晚，
+            // 但不覆盖首次记录时间，也不重复计数。
             let existing = lesson_evidence_from_columns(
                 stored_lesson_id,
                 lesson_artifact_id,
@@ -228,6 +245,9 @@ impl Store {
         Ok(inserted)
     }
 
+    // 按 lesson_id 过滤并按 recorded_at/evidence_id 稳定排序；旧表形状无 ledger 时返回空 Vec。
+    // `collect` 先把 Row 借用转成拥有型 String 元组，随后显式 drop statement/connection，
+    // 再解码领域值；`Result` 的 collect 在任一行失败时不返回部分列表。
     pub fn lesson_evidence(&self, lesson_id: &LessonId) -> StoreResult<Vec<LessonEvidence>> {
         let connection = self.connection()?;
         if ensure_lesson_table_set(&connection)? != 3 {
@@ -276,6 +296,7 @@ impl Store {
             .collect()
     }
 
+    // 读单个可选 head；Lesson 表尚未初始化时返回 None，其余从 Deferred 事务读取 Artifact 与 payload。
     pub fn lesson(&self, lesson_id: &LessonId) -> StoreResult<Option<StoredLesson>> {
         let mut connection = self.connection()?;
         if ensure_lesson_table_set(&connection)? == 0 {
@@ -287,6 +308,8 @@ impl Store {
         Ok(value)
     }
 
+    // lifecycle=None 表示不加生命周期筛选，否则 SQL 精确筛 lifecycle；limit 夹到 1..=500。
+    // 先查询有界 ID 列表，再逐个调用 lesson() 重建，故多条 Lesson 不共享一个显式 SQLite snapshot。
     pub fn lessons(
         &self,
         lifecycle: Option<LessonLifecycle>,
@@ -319,6 +342,8 @@ impl Store {
     /// Scan one SQL snapshot in bounded pages before context relevance ranking.
     /// A relevant older lesson must not disappear behind 50 newer mismatches.
     pub fn active_lessons_snapshot(&self) -> StoreResult<Vec<StoredLesson>> {
+        // Deferred 事务中以 lesson_id keyset 每批最多 128 个读取所有 active head；
+        // 整轮都借用同一连接快照，cursor 推进到页尾 ID，避免 OFFSET 漏项/重复。
         let mut connection = self.connection()?;
         if ensure_lesson_table_set(&connection)? == 0 { return Ok(Vec::new()); }
         let tx = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
@@ -341,6 +366,8 @@ impl Store {
         Ok(lessons)
     }
 
+    // Usage 是 Artifact.source_refs 对 Lesson Artifact 的反向计数，ContextManifest 与 DecisionContext
+    // 分两次读取；latest_used_at 取两类已持久 Artifact 的最大 created_at，不代表用户实际查看过。
     pub fn lesson_usage(&self, lesson_id: &LessonId) -> StoreResult<LessonUsage> {
         let lesson = self
             .lesson(lesson_id)?
@@ -373,6 +400,9 @@ impl Store {
         &self,
         now: DateTime<Utc>,
     ) -> StoreResult<LessonRevalidationScan> {
+        // 先取 Active ID 清单，再逐 Lesson 读取 governance/usage；这不是整轮单一事务快照。
+        // 到期或 governance 风险优先标 expired，只有无 validity_due 时才检查 usage 阈值；
+        // 每个转换会在自身事务重查当前 head，故并发改变导致失败时不覆盖新 revision。
         self.ensure_lesson_tables()?;
         let lesson_ids = {
             let connection = self.connection()?;
@@ -425,6 +455,7 @@ impl Store {
                 continue;
             };
 
+            // 只调用生命周期变更入口写 immutable successor；不会调用 verifier、自动重新激活或覆盖旧 CAS。
             self.transition_lesson(
                 &lesson_id,
                 LessonLifecycle::Contested,
@@ -443,6 +474,9 @@ impl Store {
 
     /// Lifecycle changes create a successor artifact; prior revisions remain
     /// immutable and are linked through the Lesson supersedes field.
+    // 输入新 lifecycle、actor/reason/time；先在事务外重建旧版本并生成 successor payload，
+    // Immediate 事务再 CAS 检查 head Artifact ID、引用闭包与 Active 冲突，最后写 Artifact/head/event。
+    // 事务外生成后若 head 已变化则返回 Integrity；旧 Artifact 保留不变。
     pub fn transition_lesson(
         &self,
         lesson_id: &LessonId,
@@ -475,6 +509,7 @@ impl Store {
             return Err(StoreError::InvalidLearningCommit("lesson.retired"));
         }
         let mut next = current.lesson.clone();
+        // 新 revision 以旧 Artifact 加入 supersedes；Active 重新生成治理期限，Contested 记录阻断原因。
         next.lifecycle = lifecycle;
         next.updated_at = now;
         next.supersedes.push(ArtifactRef {
@@ -560,6 +595,7 @@ impl Store {
         }
         self.validate_related_refs(&transaction, &next)?;
         if lifecycle == LessonLifecycle::Active {
+            // Active head 的 conflict refs 逐个解析；同一 Lesson 的自冲突除外，其它 Active 冲突阻止提交。
             for conflict in &next.conflicts_with {
                 let conflict_lesson = self.read_lesson_artifact(&transaction, conflict)?;
                 let active = transaction
@@ -608,6 +644,8 @@ impl Store {
         transaction: &rusqlite::Transaction<'_>,
         lesson_id: &LessonId,
     ) -> StoreResult<Option<StoredLesson>> {
+        // 从 head 表读 ID/revision 后，在同一事务连接解码 Artifact 与 CAS；缺 head 为 None，
+        // Artifact kind、payload identity 或领域校验错误则返回 Err。
         let Some((artifact_id, revision)) = transaction
             .query_row(
                 "SELECT artifact_id, revision FROM rebuild_lesson_heads WHERE lesson_id = ?1",
@@ -653,6 +691,7 @@ impl Store {
         reason: Option<&str>,
         created_at: DateTime<Utc>,
     ) -> StoreResult<()> {
+        // 只在调用方事务内追加 immutable ledger 行；event_type/actor/reason 的允许形状由 Doctor 再核验。
         transaction.execute(
             "INSERT INTO rebuild_lesson_events (lesson_id, artifact_id, event_type, actor, reason, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
@@ -672,6 +711,7 @@ impl Store {
         transaction: &rusqlite::Transaction<'_>,
         reference: &ArtifactRef,
     ) -> StoreResult<StoredLesson> {
+        // 通过显式 ArtifactRef 读取 Lesson，不读取当前 head；revision=0 表示这是关联版本而非 head 快照。
         if reference.kind != ArtifactKind::Lesson {
             return Err(StoreError::InvalidLearningCommit("lesson.related_refs"));
         }
@@ -697,6 +737,7 @@ impl Store {
         transaction: &rusqlite::Transaction<'_>,
         lesson: &Lesson,
     ) -> StoreResult<()> {
+        // 只验证 supersedes/conflicts_with 直接引用存在且 kind 正确；source_refs 另由 write/Doctor 闭包校验。
         for reference in lesson.supersedes.iter().chain(lesson.conflicts_with.iter()) {
             self.read_lesson_artifact(transaction, reference)?;
         }

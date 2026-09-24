@@ -1,3 +1,12 @@
+// 文件导读：Observatory 配置命令只维护本地 TOML 和 UI 可编辑投影，不启动
+// daemon、不创建 Run、不读取 Store active head，也不授予 Paper/Decision/Execution 权限。
+// Get 的 JSON 不脱敏地包含模型和行情 API key/secret 配置值，可能泄露明文；
+// 它不是可公开分享的安全诊断结果。
+// 写回采用临时文件后 rename；配置成功保存与模型能力探测、Paper submission、fill、
+// Outcome 完成是独立事实。
+// Rust 机制：`&Path` 和 `&Command` 让入口只借用输入；serde/toml 的反序列化用
+// `Result` fail closed，`Option` 保留可选凭据，`toml::Value` 的可变借用只修改指定 table。
+
 fn handle_observatory_config(config_path: &Path, command: &ObservatoryConfigCommand) -> Result<()> {
     // 配置入口只负责本地 TOML 的创建、读取和更新；它不启动 daemon、不创建 Run，
     // 也不把编辑后的模型字段视为已经通过 Paper/Decision Gate。
@@ -55,7 +64,8 @@ fn handle_observatory_config(config_path: &Path, command: &ObservatoryConfigComm
             print_json(&serde_json::json!({ "created": true }))
         }
         ObservatoryConfigCommand::Get => {
-            // Get 返回当前可编辑投影，其中包含模型路由和连接配置；读取本身不做运行时探测。
+            // Get 原样返回 llm_api_key/alpaca_api_secret 等配置值，可能是明文凭据；
+            // stdout/调用方必须按敏感数据处理，读取本身不做运行时探测。
             let config = read_config_file(config_path)?;
             print_json(&editable_observatory_configuration(&config)?)
         }
@@ -75,8 +85,8 @@ fn handle_observatory_config(config_path: &Path, command: &ObservatoryConfigComm
 }
 
 fn editable_observatory_configuration(config: &Config) -> Result<ObservatoryEditableConfiguration> {
-    // 将 Config 映射为 UI 可编辑的扁平投影；release/cutoff 等当前模型身份字段不在该
-    // 结构中修改，后续 Set 会从现有配置保留它们。
+    // 将 Config 映射为包含原样凭据字段的 UI 可编辑投影，不能作脱敏分享；
+    // release/cutoff 不在这个结构中，后续 Set 从现有配置保留它们。
     let model = config
         .model
         .as_ref()

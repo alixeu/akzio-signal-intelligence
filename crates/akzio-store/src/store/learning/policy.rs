@@ -1,6 +1,15 @@
+// 文件导读：canonical PolicyEvaluation 把 sealed Outcome、T5 retrospective、Experience、
+// Evaluation、可选 CandidatePolicy 和消费 cursor 放进一个 Immediate 事务；重复 evaluation
+// 仍可在同一事务幂等补写 LessonEvidence，但不会重建 policy transition 或消费另一批 pair。
+// 此处只持久化 learning crate 已计算并验证的候选结论；Store 负责 CAS、来源闭包、fencing、
+// immutable history 和事务提交，不计算投资指标或自动激活 DecisionPolicy。
 impl Store {
     /// Commit canonical learning while fencing an optional daemon worker in
     /// the same SQLite transaction as the policy/evaluation writes.
+    // 输入 complete_task=false 用于分 subject 的 Canary 阶段性持久进度；true 才写正式 attempt output 并结束 Task。
+    // isolated Debug Store 在事务外先拒绝 canonical policy 写入；若传 lease，则事务内再按当前 UTC 校验 scheduler epoch。
+    // lesson 表按需创建在学习事务之前，后续验证/SQL 任一失败不会回滚这项 schema 初始化。
+    // `Option<&DaemonLease>` 是借用的可选 fence；None 只跳过 daemon fence，不跳过 Paper/permit/lineage 检查。
     pub fn record_policy_evaluation_fenced(
         &self,
         lease: Option<&DaemonLease>,
@@ -31,6 +40,7 @@ impl Store {
         if let Some(existing) =
             read_policy_evaluation(&transaction, &commit.evaluation.artifact_id)?
         {
+            // evaluation Artifact ID 已有记录时必须全字段相同；重复提交只允许重建现有结果，不再插历史/迁移状态。
             if !same_policy_evaluation(&existing, commit) {
                 return Err(StoreError::PolicyEvaluationConflict(
                     commit.evaluation.artifact_id.to_string(),
@@ -63,6 +73,7 @@ impl Store {
                 commit.completed_at,
             )?;
             let policy_head = read_policy_head(&transaction, &commit.subject)?;
+            // lesson evidence 仍可幂等补记；已有 evaluation 保留原 cursor/head 并报告 newly_recorded=false。
             transaction.commit()?;
             return Ok(PolicyEvaluationResult {
                 policy_head,
@@ -80,6 +91,8 @@ impl Store {
                 "outcome already evaluated for subject".to_owned(),
             ));
         }
+        // 新 evaluation 必须消费当前有效 permit、Paper Run 和 subject 当前 head；
+        // 不能把同一 Outcome 对同一 subject 重复记入新的 evaluation。
         assert_permit(&transaction, &commit.permit)?;
         assert_paper_run(&transaction, &commit.permit.run_id)?;
         let previous = read_policy_head(&transaction, &commit.subject)?;
@@ -94,6 +107,7 @@ impl Store {
         }
         match &commit.transition {
             Some(transition) => {
+                // 状态变化必须满足允许边且 transition ID 尚不存在；None 只允许 from==to 的 no-op evaluation。
                 if commit.from == commit.to || !is_allowed_policy_transition(commit.from, commit.to)
                 {
                     return Err(StoreError::InvalidLearningCommit("policy_transition.path"));
@@ -111,6 +125,8 @@ impl Store {
             }
             None => {}
         }
+        // CAS 检查 snapshot.after_cursor、through_cursor 与三个 horizon 计数；
+        // 新到达的 pair 不会被悄悄并入这次 evaluation。
         validate_policy_shadow_pair_snapshot(&transaction, &commit.subject, commit.pair_snapshot)?;
 
         let (_, on_failure) = task_retry_policy(&transaction, &commit.permit.task_id)?;
@@ -123,6 +139,8 @@ impl Store {
         .into_iter()
         .chain(commit.candidate_policy.iter())
         {
+            // 同 ID Artifact 若已存在只接受完全相等；缺失时才按当前 permit origin 插入。
+            // 每个 payload Artifact 都追加 event；只有 complete_task 时对应 event 进入正式 output index。
             let existing = match read_artifact(&transaction, &artifact.artifact_id) {
                 Ok(existing) => Some(existing),
                 Err(StoreError::MissingArtifact(_)) => None,
@@ -190,6 +208,7 @@ impl Store {
         )?;
 
         let policy_head = if let Some(transition) = &commit.transition {
+            // Transition/event/subject head 都受此事务保护；revision 由当前 head +1，首次从 1 起。
             let revision = previous
                 .as_ref()
                 .map_or(1, |head| head.revision.saturating_add(1));
@@ -263,9 +282,11 @@ impl Store {
         };
 
         if let Some(transition) = &commit.transition {
+            // Contract subject 的目录 activation/head 与 policy transition 共用事务；其他 subject 是 no-op。
             self.apply_contract_catalogue_transition(&transaction, commit, transition)?;
         }
 
+        // 最后写 evaluation immutable row 和 pair-consumption head；若完整任务则同事务收束 Task/Attempt。
         transaction.execute(
             r#"INSERT INTO rebuild_policy_evaluations
             (evaluation_artifact_id, subject_id, outcome_artifact_id,

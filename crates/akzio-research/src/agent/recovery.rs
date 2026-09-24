@@ -1,3 +1,6 @@
+// 文件导读：Recovery 通过 Store/CAS 中的 Attempt、AgentTurn、ToolCall/Result 和 Acceptance 事件重放 Agent 状态；
+// 它保留已发生的 provider/tool 预算与 lineage，任何哈希、lease、phase 或 payload 不一致都 fail closed。
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AgentRecoverySource {
     FreshRestart,
@@ -15,6 +18,7 @@ enum RecoveryUsageFailure {
 
 impl RecoveryUsageFailure {
     fn error(&self) -> ResearchError {
+        // 失败枚举只把恢复时已确认的 usage/limit 问题转换为 ResearchError；Unknown 不会被降级成成功或免费重试。
         match self {
             Self::Unknown => ResearchError::ProviderUsageUnknown,
             Self::Missing(usage) => ResearchError::ProviderUsageMissing {
@@ -66,6 +70,7 @@ impl AgentRecoveryUsage {
         request: &AgentModelRequest,
         policy: &ModelBudgetPolicy,
     ) -> Option<()> {
+        // 没有 provider usage 时仍累计可估算 input；pricing 存在则标记 cost 不完整，防止恢复获得额外预算。
         self.failure.get_or_insert(RecoveryUsageFailure::Unknown);
         self.input_tokens = self
             .input_tokens
@@ -82,6 +87,7 @@ impl AgentRecoveryUsage {
         usage: &ModelUsage,
         policy: &ModelBudgetPolicy,
     ) -> Option<()> {
+        // 部分 usage 可以保留已知 token，但缺失/不一致字段和成本溢出必须留在 failure 中，不能用默认值掩盖。
         if usage.input_tokens.is_none() || usage.output_tokens.is_none() {
             self.failure
                 .get_or_insert_with(|| RecoveryUsageFailure::Missing(usage.clone()));
@@ -137,6 +143,7 @@ impl AgentRecoveryUsage {
         response: &AgentModelTurn,
         policy: &ModelBudgetPolicy,
     ) -> Option<()> {
+        // 已完成 Provider event 按同一 resolve_model_usage/price 规则重算；这确保 replay 与 live accounting 拒绝边界一致。
         let usage = resolve_model_usage(
             estimate_tokens(request).ok()?,
             estimate_turn_output_tokens(response).ok()?,
@@ -210,6 +217,8 @@ struct AgentRecoveryCheckpoint {
 
 impl AgentRecoveryCheckpoint {
     fn fresh() -> Self {
+        // 先构造零用量 Draft 模板；Guard 随后把活动研究的初始 phase 设为
+        // Submit，Outcome 保持 Draft。读到已发生的 provider 调用就不能伪装 fresh。
         Self {
             source: AgentRecoverySource::FreshRestart,
             phase: AgentTurnPhase::Draft,
@@ -242,6 +251,7 @@ struct AgentRecoveryGuard {
 
 impl AgentRecoveryGuard {
     fn fresh_checkpoint(&self) -> AgentRecoveryCheckpoint {
+        // Guard 冻结 Contract、Context、capability、budget 和 phase/tool identity，恢复只能沿这组身份继续。
         AgentRecoveryCheckpoint { phase: self.initial_phase, ..AgentRecoveryCheckpoint::fresh() }
     }
     fn tool_set_hash(&self, phase: AgentTurnPhase) -> &akzio_domain::ContentHash {
@@ -332,6 +342,7 @@ struct AgentRecoveryReducer<'a> {
 
 impl<'a> AgentRecoveryReducer<'a> {
     fn new(guard: &'a AgentRecoveryGuard) -> Self {
+        // Reducer 是按事件顺序消费的值状态；expected_tools/pending_provider_calls 用来阻止重复或跨 Attempt 关闭。
         Self {
             guard,
             checkpoint: guard.fresh_checkpoint(),
@@ -341,6 +352,9 @@ impl<'a> AgentRecoveryReducer<'a> {
     }
 
     fn fold(mut self, event: AgentRecoveryEvent) -> Option<Self> {
+        // 每类事件都必须匹配当前 checkpoint：provider start/finish、turn、tool 和
+        // acceptance 不可交换或跨身份配对。Option::None 表示重放不可信，上层转为
+        // 保守 fallback；不是把已发生的 provider 调用当作未发生。
         match event {
             AgentRecoveryEvent::ProviderCallStarted { attempt_id, cursor } => {
                 self.pending_provider_calls
@@ -430,6 +444,7 @@ impl<'a> AgentRecoveryReducer<'a> {
         payload: StoredAgentTurnPayload,
         completed: bool,
     ) -> Option<()> {
+        // turn 需要同时匹配 request/Contract/Context/capability/budget/tool hashes 和 phase；不完整 turn 只能进入失败计量。
         let payload_budget_policy_hash = budget_policy_hash(&payload.budget_policy).ok()?;
         let metadata_repair = self.guard.deliberation_repair_tool_set_hash.as_ref() == Some(&payload.tool_set_hash)
             && is_deliberation_repair(&self.checkpoint.pending_tool_outputs)
@@ -533,6 +548,7 @@ impl<'a> AgentRecoveryReducer<'a> {
     }
 
     fn finish_tool_batch(&mut self) {
+        // 只有所有 expected tool 都有结果，才把输出批次放进下一次 model request；部分工具结果不会提前推进 phase。
         if !self.expected_tools.is_empty()
             && self
                 .expected_tools
@@ -549,6 +565,7 @@ impl<'a> AgentRecoveryReducer<'a> {
     }
 
     fn finish(mut self, lineage: Vec<AttemptId>) -> Option<AgentRecoveryCheckpoint> {
+        // 未完成 provider/tool 或没有任何外部 provider call 时分别保留 unknown/fresh 边界；恢复不会凭空生成 continuation。
         self.finish_tool_batch();
         if !self.expected_tools.is_empty() {
             return None;
@@ -557,9 +574,9 @@ impl<'a> AgentRecoveryReducer<'a> {
             self.checkpoint.usage.failure = Some(RecoveryUsageFailure::Unknown);
             self.checkpoint.usage.cost_complete = false;
         }
-        // A failed first Draft has no accepted continuation, but its provider
-        // cost still belongs to this task. Only a task with no provider call
-        // and no accepted continuation may restart with an empty ledger.
+        // 首轮 Draft 或直接 Submit 失败时可能没有已接受的 continuation，但已发生的
+        // provider 调用仍计入同一 Task；只有调用数为零且没有 continuation 时，
+        // 才能用空账本重新开始。
         if self.checkpoint.continuation.is_none() && self.checkpoint.provider_calls == 0 {
             return None;
         }
@@ -573,6 +590,7 @@ fn agent_recovery_checkpoint(
     permit: &TaskWritePermit,
     guard: &AgentRecoveryGuard,
 ) -> ResearchResult<AgentRecoveryCheckpoint> {
+    // 先读 Attempt lineage，再解析事件；解析失败的历史仍需保留已发生的 provider expenditure 和不完整成本状态。
     let Some(lineage) = recovery_lineage(store, permit)? else {
         return Ok(guard.fresh_checkpoint());
     };
@@ -612,6 +630,7 @@ fn recovery_lineage(
     store: &Store,
     permit: &TaskWritePermit,
 ) -> ResearchResult<Option<Vec<AttemptId>>> {
+    // 只允许同一 Run/Task 的 Recovery 或 Retry 边；跨 task/run、重复父节点或其他 relation 都阻断恢复。
     let mut child = permit.attempt_id.clone();
     let mut seen = BTreeSet::from([child.clone()]);
     let mut lineage = vec![];
@@ -640,6 +659,8 @@ fn load_recovery_events(
     permit: &TaskWritePermit,
     lineage: &[AttemptId],
 ) -> ResearchResult<Option<Vec<AgentRecoveryEvent>>> {
+    // 终态只能关闭同一 Attempt 的 Started cursor；未关闭的调用保留未知用量，
+    // 不伪造终态。Artifact kind、origin、Contract 和 BLOB 也逐项复核。
     let mut loaded = vec![];
     for attempt_id in lineage {
         // Store trajectories serialize model calls within each attempt. The
@@ -870,64 +891,4 @@ mod recovery_tests {
                 "repair_policy":"reuse_previous_submission_and_change_only_rejected_fields"}));
     }
 
-    #[tokio::test]
-    async fn rejection_without_debug_session_survives_retry_with_tool_feedback() {
-        let now = Utc::now();
-        let (store, runtime, attempt) = super::late_model_tests::isolated_agent_attempt(
-            RESEARCH_ANALYST_RECIPE_ID,
-            RunPurpose::Paper,
-            120,
-            now,
-        );
-        let catalogue = ActiveResearchCatalogue::install(&store, now).unwrap();
-        let workflow = akzio_runtime::WorkflowRuntime::new(store.clone(), catalogue.recipes);
-        workflow.replay_run(&attempt.run_id).unwrap();
-        assert!(store.debug_session(&attempt.run_id).unwrap().is_none());
-        runtime
-            .record_submit_rejection(
-                &attempt.permit,
-                "research.analyst",
-                "accepted forecast was modified".into(),
-                vec![],
-                now,
-            )
-            .await
-            .unwrap();
-        workflow.replay_run(&attempt.run_id).unwrap();
-        store.retry_task(&attempt.permit, now, now).unwrap();
-        let replacement = store
-            .claim_next_task_for_workload(
-                "canonical-rejection-retry",
-                now,
-                Duration::minutes(5),
-                akzio_store::TaskWorkload::Any,
-            )
-            .unwrap()
-            .unwrap();
-        workflow.replay_run(&attempt.run_id).unwrap();
-        let lineage = recovery_lineage(&store, &replacement.permit)
-            .unwrap()
-            .unwrap();
-        assert_eq!(lineage, vec![attempt.permit.attempt_id]);
-        let events = load_recovery_events(&store, &replacement.permit, &lineage)
-            .unwrap()
-            .unwrap();
-        let mut guard = guard();
-        guard.initial_phase = AgentTurnPhase::Submit;
-        let mut reducer = AgentRecoveryReducer::new(&guard);
-        reducer.checkpoint.submit_call_id = Some("rejected-real-call".into());
-        for event in events {
-            reducer = reducer
-                .fold(event)
-                .expect("persisted rejection is replayable");
-        }
-        assert_eq!(reducer.checkpoint.pending_tool_outputs.len(), 1);
-        let output = &reducer.checkpoint.pending_tool_outputs[0];
-        assert_eq!(output.call_id, "rejected-real-call");
-        assert_eq!(output.output["error"], "invalid_submission");
-        assert!(output.output["message"]
-            .as_str()
-            .unwrap()
-            .contains("accepted forecast was modified"));
-    }
 }

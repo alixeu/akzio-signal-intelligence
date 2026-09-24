@@ -1,3 +1,12 @@
+// 文件导读：PaperExecution 串起 DecisionGate → ExecutionGate → PaperCommitment → Reconcile。
+// Decision 只产出目标与 DecisionContext；ExecutionVerdict 仍可能是 NoOrder；Commitment 是
+// 订单写请求前的确定性幂等记录；ExecutionGate 会只读刷新 Alpaca 账户/报价/Clock，
+// Reconcile 经 Dispatch 才可能写订单并对账，accepted/partially_filled 仍不是最终 fill。
+// PositionPlan、Debug forbidden、缺 Policy 和闭市等待均在对应边界保留。
+// Rust 机制：门面借用 `&Daemon`；async execution/reconcile 返回 Future；BTreeMap/Set 组装
+// 依赖闭包，`Option` 表示快照/approval 缺失，枚举 `ExecutionVerdict`/`OrderSide` 保证
+// 状态分支穷尽，`i128` 中间运算配合 `try_from` 防止金额溢出。
+
 use crate::*;
 use akzio_domain::{
     ComplianceActivitySnapshot, ComplianceControl, DependencyClosure, DependencyHealthStatus,
@@ -98,8 +107,9 @@ impl<'a> PaperExecution<'a> {
                 return Ok(TaskCompletion::DeferredUntil(wake));
             }
         }
-        // 缺少或不合格的执行安全输入由 execution runtime 形成持久化 NoOrder；这里不
-        // 通过 daemon 层补造账户、报价、批准或风险证据。
+        // 可解释的缺失输入由 execution runtime 形成 NoOrder；若这里读到的已有
+        // Artifact 结构/来源损坏，则 `?` 返回 Err，不会伪造持久化 Verdict。
+        // daemon 不补造账户、报价、批准或风险证据。
         let pretrade_safety = self.pretrade_safety_evidence(
             task,
             &decision_context,
@@ -130,8 +140,9 @@ impl<'a> PaperExecution<'a> {
         Ok(TaskCompletion::Committed)
     }
 
-    // 从已持久化的 Decision、执行快照和研究证据构造 PreTradeSafetyEvidence；缺少
-    // Paper approval 或任一必需快照时返回 None，让 ExecutionGate 保持 fail-closed。
+    // 从已持久化的 Decision、执行快照和研究证据构造 PreTradeSafetyEvidence；
+    // 缺必需快照会提前返回 None；缺 Paper approval 在已有输入解析通过后返回 None。
+    // 损坏的已有 payload/来源则是 Err，不被概括为业务 NoOrder。
     fn pretrade_safety_evidence(
         &self,
         task: &ClaimedAttempt,
@@ -410,8 +421,8 @@ impl<'a> PaperExecution<'a> {
             .unwrap_or(observation))
     }
 
-    // 在当前 Run 的 AgentTurn 中寻找最新 Synthesizer capability snapshot，比较配置的
-    // RuntimeManifest 与实际模型身份；找不到 durable snapshot 时明确标为 Unavailable。
+    // 在最近有限的 AgentTurn 中寻找当前 Run 最新 Synthesizer capability snapshot，
+    // 把配置身份与已持久化调用身份分别记录；找不到匹配 turn 时标为 Unavailable。
     fn persisted_model_dependency(
         &self,
         run_id: &RunId,
@@ -480,7 +491,7 @@ impl<'a> PaperExecution<'a> {
                     actual_service,
                 )
             } else {
-                // 没有当前 Run 的真实 AgentTurn 时，依赖仍记录配置身份，但健康状态
+                // 没有符合上述过滤条件的当前 Run AgentTurn 时，仍记录配置身份，但健康状态
                 // 为 Unavailable，供后续 Gate 继续 fail-closed。
                 (
                     manifest.provider_id.clone(),
@@ -651,7 +662,8 @@ impl<'a> PaperExecution<'a> {
                 now,
             })?;
         // 这里的 Committed 是执行承诺已持久化并通过 lease 边界，不表示 Alpaca 已受理
-        // 或已成交；实际外部 Broker I/O 只在后续 Reconcile 阶段发生。
+        // 或已成交；此前 Gate 可只读获取 Broker/行情快照，订单写入和对账才在后续
+        // Reconcile/Dispatch 阶段发生。
         Ok(TaskCompletion::Committed)
     }
 
@@ -678,14 +690,9 @@ impl<'a> PaperExecution<'a> {
         let commitment = self
             .daemon
             .terminal_input(task, ArtifactKind::ExecutionCommitment)?;
-        if self.daemon.store.block_debug_broker_task(
-            &task.permit,
-            &[verdict.clone(), commitment.clone()],
-            now,
-        )? {
-            // Debug 默认禁止 Broker 写入；保持任务可恢复等待，而不是绕过控制策略。
-            return Ok(TaskCompletion::DeferredUntil(now + Duration::seconds(1)));
-        }
+        // The historical isolation marker is a read-only denial, never a
+        // reason to install a new Debug pause/acceptance control head.
+        self.daemon.store.assert_broker_write_policy(&task.run_id)?;
         let broker = self.daemon.paper.paper_broker.as_ref().ok_or_else(|| {
             DaemonError::Unavailable(
                 "Paper reconciliation requires an injected Alpaca Paper broker adapter".to_owned(),
@@ -713,6 +720,49 @@ impl<'a> PaperExecution<'a> {
                 Utc::now() + chrono::Duration::seconds(1),
             ))
         }
+    }
+
+    pub(crate) async fn reconcile_existing_only(
+        &self,
+        task: &ClaimedAttempt,
+        now: DateTime<Utc>,
+    ) -> Result<TaskCompletion> {
+        if self.daemon.store.run_purpose(&task.run_id)? != RunPurpose::Paper {
+            return Ok(TaskCompletion::NoOutput);
+        }
+        let verdict = self
+            .daemon
+            .terminal_input(task, ArtifactKind::ExecutionVerdict)?;
+        let verdict_payload: ExecutionVerdict = self.daemon.read_artifact_payload(&verdict)?;
+        verdict_payload.validate()?;
+        if matches!(verdict_payload, ExecutionVerdict::NoOrder { .. }) {
+            return Ok(TaskCompletion::NoOutput);
+        }
+        let commitment = self
+            .daemon
+            .terminal_input(task, ArtifactKind::ExecutionCommitment)?;
+        let broker = self.daemon.paper.paper_broker.as_ref().ok_or_else(|| {
+            DaemonError::Unavailable("read-only Paper broker is unavailable".into())
+        })?;
+        let lease = self.daemon.paper.scheduler.active_lease(now)?;
+        let output = self
+            .daemon
+            .paper_dispatch_runtime
+            .reconcile_existing_only(
+                broker.as_ref(),
+                &PaperDispatchInput {
+                    lease,
+                    permit: task.permit.clone(),
+                    commitment,
+                    now,
+                },
+            )
+            .await?;
+        Ok(if output.settled {
+            TaskCompletion::Committed
+        } else {
+            TaskCompletion::DeferredUntil(Utc::now() + Duration::seconds(30))
+        })
     }
 }
 
@@ -746,6 +796,8 @@ fn closed_session_wake(
 mod session_wait_tests {
     use super::*;
 
+    // 验证 Closed 仅在 clock 新鲜且 Decision 未过期时等待，并以 validity/next-open 较早者为界；
+    // 过期时钟与 Overnight 都不进入该延期分支。
     #[test]
     fn closed_wait_expires_with_decision_and_rechecks_new_session() {
         let now = "2026-09-05T16:00:00Z".parse::<DateTime<Utc>>().unwrap();
@@ -910,6 +962,8 @@ impl EvidenceDependencyAggregate {
     }
 }
 
+// 统一把配置来源、时间与依赖健康收拢为构造 snapshot 所需的字段，避免各类依赖在
+// 组装时遗漏 freshness 或 fallback 策略。
 struct DependencyDescriptor {
     kind: DependencyKind,
     provider: String,
@@ -1008,7 +1062,8 @@ fn market_data_dependency(
     )
 }
 
-// 记录由当前 Rust/Store/Manifest 直接提供、无需外部网络观察的健康内部依赖。
+// 给当前 Rust/Store/Manifest 派生的内部依赖填 Healthy 投影；这是静态接线标记，
+// 不是单独运行的 Store/身份/合规可用性探针。
 fn internal_healthy_dependency(
     kind: DependencyKind,
     service: &str,
@@ -1077,8 +1132,9 @@ fn alpaca_service_dependency(
     )
 }
 
-// 从成功的网络观察中派生 DNS 依赖；fixture 没有网络 host 时是 NotApplicable，真实
-// 运行没有任何 host 则是 Unavailable。
+// 从已有 provenance URI 中抽取 network host 作为 DNS 依赖投影；有 host 仅表示
+// 已记录网络来源，不代表本函数执行过独立 DNS 探针。fixture 无 host 时 NotApplicable，
+// 其他情况无 host 时 Unavailable。
 fn dns_dependency(
     successful_network_observations: &[PersistedObservation],
     fixture_runtime: bool,

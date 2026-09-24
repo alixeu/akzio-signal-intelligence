@@ -1,3 +1,9 @@
+// 文件导读：ResearchRun 是任务类到研究协议的门面。它按安装 Contract 选择 reviewed
+// bounded loop 或兼容的历史任务路径，先验证候选 Context，再调用 AgentRuntime；Analyst
+// 的补采失败会保留首轮 Claim，不能把 refinement 失败说成证据已补齐或 Decision 已完成。
+// Rust 机制：`&self`/`&ClaimedAttempt` 只读借用 Store/permit；async Future 通过 `await`
+// 串接模型和 adapter；`matches!`/枚举分支表达 purpose，`Vec` 候选可扩展但不改 CAS 原文。
+
 use crate::*;
 
 pub(crate) struct ResearchRun<'a> {
@@ -109,6 +115,7 @@ impl<'a> ResearchRun<'a> {
                 ) {
                     Ok(prepared) => prepared,
                     Err(error) => {
+                        self.daemon.ensure_run_log_ready()?;
                         self.daemon.evidence_acquisition().note_abandoned(
                             task,
                             "supplemental evidence request rejected",
@@ -151,19 +158,25 @@ impl<'a> ResearchRun<'a> {
                                 Ok(refined) => return Ok(TaskCompletion::Succeeded(vec![refined])),
                                 // refinement 失败只记录原因并回退到首轮 Claim；这是一种
                                 // 可审计的部分成功，不把补采失败冒充为方向已修复。
-                                Err(error) => self.daemon.evidence_acquisition().note_abandoned(
-                                    task,
-                                    "supplemental analyst round failed",
-                                    &error,
-                                )?,
+                                Err(error) => {
+                                    self.daemon.ensure_run_log_ready()?;
+                                    self.daemon.evidence_acquisition().note_abandoned(
+                                        task,
+                                        "supplemental analyst round failed",
+                                        &error,
+                                    )?
+                                }
                             }
                         }
                         // 采集异常同样保留首轮输出，补采的失败状态由事件记录而非吞掉。
-                        Err(error) => self.daemon.evidence_acquisition().note_abandoned(
-                            task,
-                            "supplemental evidence collection failed",
-                            &error,
-                        )?,
+                        Err(error) => {
+                            self.daemon.ensure_run_log_ready()?;
+                            self.daemon.evidence_acquisition().note_abandoned(
+                                task,
+                                "supplemental evidence collection failed",
+                                &error,
+                            )?
+                        }
                     }
                 }
             }

@@ -1,6 +1,11 @@
 use super::*;
 
+// Schema 是模型 wire 边界，不是业务验收本身。这里限定字段、数量、枚举和引用形状；
+// Store/Manifest/Contract 之后还会校验引用闭包、Evidence scope、horizon、Review
+// 和 Budget。Envelope 约束研究的一次 Submit 及 Outcome 的 Submit；
+// Outcome Draft 是独立备忘录阶段，不能因这里有只读工具 Schema 就恢复研究 Draft。
 pub(super) fn deliberation_output_schema(result_schema: &Value) -> Value {
+    // result 与 deliberation 必须同次提交；权重守恒和模型评估来源由结构化校验继续确认。
     json!({
         "type": "object",
         "required": ["result", "deliberation"],
@@ -77,6 +82,8 @@ pub(super) fn compare_sources_tool_input_schema() -> Value {
 }
 
 pub(super) fn context_tool_input_schema(name: &str) -> Option<Value> {
+    // 只返回 ContextBroker 支持的参数 Schema；read_artifact 是历史别名，
+    // 此函数不会安装工具，Contract 69 的研究角色仍没有读取工具。
     match name {
         "read_artifact" | "read_document" | "read_claim_evidence" => {
             Some(artifact_id_tool_input_schema())
@@ -89,6 +96,8 @@ pub(super) fn context_tool_input_schema(name: &str) -> Option<Value> {
 }
 
 pub(super) fn evidence_read_tool_specs(store: &Store) -> ResearchResult<Vec<ToolSpec>> {
+    // Outcome 的五个只读工具使用 Store staged JSON Schema，读取前仍需 ReadGrant、
+    // source/kind/Run/lifecycle 校验；Schema 本身不把原文或 SQL 暴露给模型。
     [
         (
             "read_document",
@@ -130,6 +139,8 @@ pub(super) fn evidence_read_tool_specs(store: &Store) -> ResearchResult<Vec<Tool
 }
 
 pub(super) fn retrospective_draft_output_schema() -> Value {
+    // Outcome 只能提交定性复盘、受限 LessonProposal 和来源引用；权威收益率、滑点、
+    // 风险真值与 Policy 决策不在模型输出字段中，而由 Rust 后续阶段计算。
     let reference_kinds = [
         "claim",
         "critique",
@@ -188,6 +199,9 @@ pub(super) fn retrospective_draft_output_schema() -> Value {
 }
 
 pub(super) fn research_intent_output_schema() -> Value {
+    // 这是基础 evidence_gap_schema 的旧 supplemental_needs 形状；活动研究的
+    // reviewed_research_schema 会替换成 supplemental_requests 类型化意图。
+    // 二者都不直接授予采集工具；资源、时间和额度仍由 Rust 绑定冻结 Run。
     json!({
         "type": "object",
         "properties": {
@@ -313,6 +327,8 @@ fn claim_verification_evidence_schema() -> Value {
 }
 
 pub(super) fn resolution_output_schema() -> Value {
+    // 保留历史 Resolution 的 Schema 构造形状供解码/校验；当前活动研究拓扑
+    // 不创建 Planner/Resolution 节点，不能把此函数当作执行入口。
     json!({
         "type": "object",
         "properties": {
@@ -391,6 +407,9 @@ pub(super) fn evidence_gap_schema() -> Value {
 }
 
 pub(super) fn decision_proposal_output_schema() -> Value {
+    // Synthesizer wire 仍是研究提案：12 个 Forecast 和四资产+现金研究分配不等于
+    // Decision target/order。此处是持久化结果 Schema；当前模型 wire 会移除期限
+    // 字段，再由 Rust 日历补回。ProposalReview、DecisionPolicy 与 Gate 独立生效。
     json!({
         "type": "object",
         "properties": {
@@ -528,6 +547,8 @@ pub(super) fn decision_proposal_output_schema() -> Value {
 }
 
 pub(super) fn artifact_ref_schema(kinds: &[&str]) -> Value {
+    // canonical 结果保留 kind；当前提交 wire 经 bind_reference_schema 收窄到
+    // Manifest 的精确 ID 并省略 kind，Rust 从同一 ledger 回填并复验。
     json!({
         "type": "object",
         "properties": {

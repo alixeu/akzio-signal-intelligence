@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
+# 文件职责：对已组装并签名的 bundle 生成新的自用 DMG。
+# 它拒绝覆盖已有磁盘映像，暂存目录只用于 hdiutil 输入，不代表发布或 notarization。
+# 由操作者在 build_app.sh 后调用；本脚本先委托 sign_app.sh，再复制 bundle 到临时挂载布局并输出 DMG。
+# 副作用包括 ad-hoc 重签名、写入目标 DMG 和创建/清理唯一的 dmg-stage 临时目录。
 # Package the signed bundle into a self-use .dmg via hdiutil.
+# 严格模式拒绝未定义变量，并在未被条件结构接住的命令失败时退出；EXIT trap 仅清理 STAGE，不回滚已完成的重签名或目标 DMG 写入。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

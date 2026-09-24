@@ -1,8 +1,12 @@
 import Foundation
 
+// 文件导读：提供 Observer Workflow/Debug 投影所需的排序、阶段识别、状态翻译和 Outcome 证据摘要；
+// LiveProjection 与 ObservatoryStore 读取这些纯展示 helper，结果不会写回 Core DAG、RunControl 或 Store。
+// 先读 ordered/orderedTasks、executionLabel 和 OutcomeEvidencePresentation.from：排序失败回退保留 malformed 节点，完成状态也不能替代封存 Artifact。
 /// Presentation only. These helpers never change Core eligibility or task dependencies.
 enum WorkflowDisplay {
     static func horizon(objective: String) -> String? {
+        // 先读取显式 research_horizon 标记，再按 Claim 文案兜底；这是 UI 解析而非协议修复。
         if let marker = objective.range(of: "[research_horizon="),
            let end = objective[marker.upperBound...].firstIndex(of: "]") {
             return String(objective[marker.upperBound..<end])
@@ -11,35 +15,14 @@ enum WorkflowDisplay {
     }
 
     static func phase(_ role: String) -> Int {
+        // phase 只用于页面排序分层，把角色字符串映射为稳定的视觉层级。
         if role.hasPrefix("learning.") || role.contains("outcome") { return 2 }
         if ["gate.execution", "gate.paper", "gate.reconcile", "gate.evaluate"].contains(role) || role.hasPrefix("execution.") || role.hasPrefix("broker.") { return 1 }
         return 0
     }
 
-    static func ordered(_ nodes: [DebugNodePayload]) -> [DebugNodePayload] {
-        let ids = Set(nodes.map(\.id))
-        var remaining = nodes
-        var result: [DebugNodePayload] = []
-        var placed = Set<String>()
-        while !remaining.isEmpty {
-            let ready = remaining.filter { node in
-                (node.task["node"]?["dependencies"]?.array ?? []).compactMap(\.string)
-                    .allSatisfy { !ids.contains($0) || placed.contains($0) }
-            }
-            // Malformed/cyclic input remains visible; the UI does not repair the graph.
-            let layer = (ready.isEmpty ? remaining : ready).sorted {
-                let lhs = (phase($0.role), $0.horizon ?? "", $0.role, $0.id)
-                let rhs = (phase($1.role), $1.horizon ?? "", $1.role, $1.id)
-                return lhs < rhs
-            }
-            result.append(contentsOf: layer)
-            placed.formUnion(layer.map(\.id))
-            remaining.removeAll { placed.contains($0.id) }
-        }
-        return result
-    }
-
     static func executionLabel(_ artifacts: [(kind: String, payload: JSONValue)], evidence: String?) -> String {
+        // 只有明确的 execution_verdict=no_order 直接显示未下单，其余状态仍等待证据映射。
         if let verdict = artifacts.last(where: { $0.kind == "execution_verdict" })?.payload["verdict"]?.string,
            verdict == "no_order" { return "未下单" }
         // A passed gate or plan alone is not evidence of a fill.
@@ -47,6 +30,7 @@ enum WorkflowDisplay {
     }
 
     static func orderedTasks(_ tasks: [ObserverTaskPayload]) -> [ObserverTaskPayload] {
+        // ObserverTaskPayload 使用 taskID/dependencies 排序，和 DebugNodePayload 保持同一读取边界。
         let ids = Set(tasks.map(\.node.taskID))
         var pending = tasks
         var result: [ObserverTaskPayload] = []
@@ -64,14 +48,8 @@ enum WorkflowDisplay {
         return result
     }
 
-    static func initialSelection(_ nodes: [DebugNodePayload]) -> String? {
-        let ordered = ordered(nodes)
-        return ordered.first { ["running", "leased"].contains($0.status) }?.id
-            ?? ordered.first { $0.status == "failed" || ($0.status != "succeeded" && $0.blocked_reason != nil) }?.id
-            ?? ordered.first?.id
-    }
-
     static func status(_ value: String) -> String {
+        // status 是 Rust/Observer 状态到页面中文文案的单向词典，未知值原样保留。
         switch value {
         case "pause_requested": "正在暂停，等待当前任务结束"
         case "paused": "已暂停"
@@ -84,8 +62,6 @@ enum WorkflowDisplay {
         case "blocked": "已阻断"
         case "dependencies_not_satisfied", "dependencies_not_ready": "等待前置任务完成"
         case "outcome_processing_disabled_or_adapter_unavailable": "等待评估：评估处理未启用或适配器不可用"
-        case "debug_paused": "控制已暂停"
-        case "debug_running": "控制运行中"
         case "task_already_succeeded", "task_succeeded": "任务已完成"
         case "not_scheduled": "尚未安排"
         case "unknown": "未知"
@@ -103,12 +79,14 @@ enum WorkflowDisplay {
 /// Only artifacts belonging to the selected run can establish its sealed horizons.
 /// Workflow completion and NoOrder are deliberately not inputs to this evidence.
 public struct OutcomeEvidencePresentation: Sendable, Hashable {
+    // 该模型只接受所选 run 的 outcome artifact，避免把 workflow 完成误当作封存证据。
     public let sealedHorizons: [String]
     public let scheduled: Bool
 
     static let unknown = OutcomeEvidencePresentation(sealedHorizons: [], scheduled: false)
 
     static func from(_ artifacts: [(kind: String, payload: JSONValue)]) -> Self {
+        // filter/flatMap/compactMap/filter 闭包只抽取合法 horizon；Set 去重后排序保证稳定读取。
         let horizons = artifacts.filter { $0.kind == "outcome" }
             .flatMap { $0.payload["windows"]?.array ?? [] }
             .compactMap { $0["horizon"]?.string }
@@ -118,6 +96,7 @@ public struct OutcomeEvidencePresentation: Sendable, Hashable {
     }
 
     public var caption: String {
+        // caption 只描述已抽取的封存/排程边界，不由页面推测 Outcome 是否完成。
         if !sealedHorizons.isEmpty {
             return "已有封存证据：\(sealedHorizons.map { $0.uppercased() }.joined(separator: " / "))"
         }

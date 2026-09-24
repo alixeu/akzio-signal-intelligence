@@ -1,3 +1,11 @@
+// 文件导读：本文件负责校准 CLI：readiness/inspect/validate 只读既有 Store；
+// preflight 使用可写 Store::open，可能初始化 scratch Store，核对 Contract 时也可能安装
+// catalogue；set-risk-limits/collect/build/bootstrap/activate 分别有明确的写入边界。
+// 成熟 Outcome 不是 active Policy，candidate 也不会由 build 自动激活。
+// Rust 机制：泛型 `persist_calibration_artifact<T: Serialize>` 约束输入可序列化；闭包和
+// 迭代器按 Artifact DAG 聚合样本；`Option`/`Result` 区分 no_schedule、pending、blocked
+// 和真实错误；测试用 cfg(test) 只验证离线 Store 行为。
+
 use akzio_domain::{
     Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle, ArtifactProvenance, ArtifactRef,
     Decision, DecisionContext, DecisionHorizon, MoneyMicros, Outcome, OutcomeHorizon,
@@ -8,19 +16,22 @@ use akzio_execution::{
     HistoricalPriceSeries, OfflineCalibrationInput, OfflineRiskLimits,
     build_offline_decision_policy,
 };
-use akzio_ingest::{EvidenceAdapterError, NormalizedEvidencePayload, parse_daily_bars};
-use chrono::{DateTime, Duration as ChronoDuration};
+use akzio_ingest::{EvidenceSource, NormalizedEvidencePayload, parse_daily_bars};
+use chrono::DateTime;
 
 fn handle_calibration(command: &CalibrationCommand, config_path: &Path) -> Result<()> {
-    // 统一分派校准生命周期：readiness/preflight 只读，collect/build 生成候选
-    // Artifact，activate 才会改变 Store 的 active head；任何候选生成都不会自动激活。
+    // `command: &CalibrationCommand` 只借用解析出的命令；match 的每个分支按各自权限
+    // 打开 Store。Readiness/Inspect/Validate 只读已有库；Preflight 的 Store::open
+    // 可创建或迁移 scratch，Bootstrap 在目标库激活源 Policy，不能归到只读一组。
     match command {
         CalibrationCommand::Readiness { store, min_samples } => {
+            // u32 实现 Copy，`*min_samples` 复制值而不移动借用中的命令。
             calibration_readiness(store, *min_samples, config_path)
         }
         CalibrationCommand::Preflight { scratch } => {
-            // Preflight 只验证临时 Store 中已持久化的 Policy 与当前身份，失败时
-            // 返回可消费的阻断 JSON，不启动模型或执行链。
+            // 不启动模型或执行链；但 open 会初始化/迁移 scratch，若 Policy 已就绪，
+            // decision_policy_preflight 内的 catalogue helper 也可能写入 Contract 安装。
+            // 因此“llm_calls:0”不能被误读成“文件和 Store 完全无副作用”。
             let mut config = read_config_file(config_path)?;
             resolve_model_configuration(&mut config)?;
             let store = Store::open(scratch)?;
@@ -122,8 +133,9 @@ fn handle_calibration(command: &CalibrationCommand, config_path: &Path) -> Resul
             source_store,
             target_store,
         } => {
-            // Bootstrap 只从源 Store 复制已有 active policy；源 Store 没有 active head
-            // 时报告 unconfigured，不会凭空生成或激活默认 Policy。
+            // 源库不存在时 open_existing_or_initialize 会建立空库；目标用可写 open，
+            // 有源 active Policy 时 bootstrap_active_decision_policy_from 会在目标激活
+            // 那份冻结 Policy，而不复制源 Run/Outcome 或制造新校准样本。
             let (source, source_store_created) = Store::open_existing_or_initialize(source_store)?;
             source.verify_integrity()?;
             let target = Store::open(target_store)?;
@@ -165,8 +177,9 @@ fn handle_calibration(command: &CalibrationCommand, config_path: &Path) -> Resul
             )
         }
         CalibrationCommand::Inspect { store, artifact } => {
-            // Inspect 只展示校准相关 Artifact 的元数据和正文；允许的 kind 仍受这里的
-            // canonical 检查限制，展示本身不代表候选已通过激活流程。
+            // Inspect 仅读取元数据/正文并检查三个允许的 kind；这个分支没有再次检查
+            // lifecycle==Canonical，不能把它说成与 calibration_artifact 相同的资格验证。
+            // 展示成功不代表结构已 validate、Policy decision-capable 或已激活。
             let store = Store::open_existing(store)?;
             let stored = store.artifact(&ArtifactId(ContentHash::new(artifact.clone())?))?;
             if !matches!(
@@ -187,8 +200,9 @@ fn handle_calibration(command: &CalibrationCommand, config_path: &Path) -> Resul
 
 /// Identity is checked even for an otherwise decision-capable stored policy.
 fn decision_policy_preflight(loaded: &LoadedDecisionPolicy, store: &Store) -> Result<(bool, Option<bool>)> {
-    // 只有 Policy 能力、输入哈希、Artifact 身份和 persisted status 同时齐全时，
-    // 才比较当前 Synthesizer Contract；返回值仅是资格投影，不改变 Store。
+    // `Option<bool>` 中 None 表示尚未进入 Contract 比较，而不是比较结果 false。
+    // Policy 已就绪时 helper 会调用 ActiveResearchCatalogue::install，可能写入
+    // scratch Store 的 Contract catalogue；返回的布尔值本身不激活 DecisionPolicy。
     let eligible = loaded.policy.decision_capable()
         && loaded.input_hash.is_some()
         && loaded.artifact_id.is_some()
@@ -211,6 +225,8 @@ fn decision_policy_status(policy: &DecisionPolicy) -> &'static str {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
+// Store 中的 Dataset Artifact 保存完整训练输入与报告；两者都按同一 CAS 正文持久化，
+// `report` 便于审计收集时的筛选结果，不是 Policy 激活状态。
 struct StoredCalibrationDataset {
     input: OfflineCalibrationInput,
     report: serde_json::Value,
@@ -233,7 +249,9 @@ fn persist_calibration_artifact<T: serde::Serialize>(
     sources: Vec<ArtifactRef>,
     now: DateTime<Utc>,
 ) -> Result<Artifact> {
-    // 先把不可变正文放入 CAS，再写入校准 Artifact 索引；这里不触碰 active policy head。
+    // 泛型 T: Serialize 只约束 payload 能编码为 JSON。stage_json 先暂存 BLOB；
+    // write_calibration_artifact 的事务才把它提升为 durable CAS 并写 Artifact 索引。
+    // 此 helper 不更新 active Policy head，Bootstrap/Activate 走各自独立路径。
     let artifact = Artifact::new(
         kind,
         store.stage_json(payload)?,
@@ -278,6 +296,7 @@ fn classify_calibration_run(
             "remedy":"Rerun during an open trading session with valid baseline snapshots; do not rewrite historical CAS."
         });
     }
+    // let-else 解包 Option<&OutcomeSchedule>；无 schedule 就提前返回，不编造未来到期日。
     let Some(schedule) = schedule else {
         return serde_json::json!({"status":"no_schedule", "reason":"decision_not_evaluated"});
     };
@@ -510,23 +529,23 @@ mod calibration_readiness_tests {
     use akzio_domain::WeightPpm;
     use akzio_execution::{ForecastCalibrationScope, AssetRiskCalibration, FrozenForecastCalibration, ForecastCalibrationBin, PortfolioRiskModel};
 
+    // Canonical empty Store is not a source of fabricated mature Outcomes.
+    // Historical isolated Store rejection is covered by akzio-store tests;
+    // this CLI must not create a new Debug environment just for its fixture.
     #[test]
-    fn isolated_store_readiness_cannot_recommend_canonical_collection() {
+    fn empty_canonical_store_does_not_report_mature_calibration_samples() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../.akzio/policy-readiness-tests").join(RunId::new().0);
         let store = Store::open(&path).unwrap();
         let canonical = calibration_readiness_report(&path, 30, Path::new("unused.toml")).unwrap();
         assert_eq!(canonical["calibration_eligible"], true);
         assert_eq!(canonical["gap"]["next_step"], "collect_real_outcomes");
-        store.configure_debug_environment(true).unwrap();
-        let report = calibration_readiness_report(&path, 30, Path::new("unused.toml")).unwrap();
-        assert_eq!(report["calibration_eligible"], false);
-        assert_eq!(report["calibration_blocked_reason"], "isolated_debug_store");
-        assert_eq!(report["gap"]["next_step"], "use_canonical_store");
-        assert_eq!(report["gap"]["mature_runs"], 0);
+        assert_eq!(canonical["gap"]["mature_runs"], 0);
+        assert!(store.debug_environment().unwrap().is_none());
         assert!(store.active_decision_policy().unwrap().is_none());
     }
 
+    // 组装仅供身份比较测试的结构有效 Policy；合成数值不会写入或激活 Store。
     fn policy_with_positive_calibration_bin(now: chrono::DateTime<Utc>) -> DecisionPolicy {
         let scope = ForecastCalibrationScope {
             model_id: "test-model".to_owned(),
@@ -616,6 +635,8 @@ mod calibration_readiness_tests {
         }
     }
 
+    // 即使 Policy 本身 decision-capable，Synthesizer Contract 不匹配仍应阻断；
+    // 将测试对象改成当前 hash 后只改变资格投影，不会更新 active head。
     #[test]
     fn old_policy_is_blocked_by_new_synthesizer_contract_without_activation() {
         let store = Store::open(Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -642,6 +663,7 @@ mod calibration_readiness_tests {
         assert!(store.active_decision_policy().unwrap().is_none());
     }
 
+    // 构造只供分类测试使用的 NoOrder schedule，日期是 fixture 标签，不是实际市场数据。
     fn schedule() -> OutcomeSchedule {
         let reference = |kind| ArtifactRef {
             artifact_id: ArtifactId(ContentHash::of_bytes(
@@ -663,6 +685,7 @@ mod calibration_readiness_tests {
         }
     }
 
+    // 固定旧文件入口被拒绝、Outcome 成熟度按已持久化 horizon 统计的回归边界。
     #[test]
     fn legacy_policy_file_configuration_and_file_cli_inputs_are_rejected() {
         let execution = "assets = [\"TQQQ\", \"QQQ\", \"SOXX\", \"SOXL\"]\n";
@@ -711,6 +734,7 @@ mod calibration_readiness_tests {
         );
     }
 
+    // 分别覆盖 pending、blocked、no_schedule、sealed 及统一 12 个槽位的样本计数。
     #[test]
     fn readiness_classifies_maturity_and_frozen_baseline_without_calendar_guessing() {
         let schedule = schedule();
@@ -764,6 +788,9 @@ mod calibration_readiness_tests {
     }
 }
 
+// Collect 中经 Paper Run、Decision/Outcome、价格标签及 AgentTurn 最小模型身份筛选
+// 的单个候选；这里尚未检查 active Policy 是否匹配，model_version_hash 取当前配置。
+// 各字段拥有扫描结果，后续可据此按同一 Contract 合并样本。
 struct CollectedCalibrationCandidate {
     run_id: RunId,
     decision_artifact: akzio_domain::Artifact,
@@ -828,6 +855,8 @@ fn collect_calibration_dataset(
     let requested_end = training_end
         .map(|value| parse_calibration_time(value, "training_end"))
         .transpose()?;
+    // Option<Result<T,E>>::transpose() 得到 Result<Option<T>,E>：未提供边界保留 None，
+    // 提供但解析失败则由 ? 向上返回；zip 只有两端均为 Some 才比较先后。
     if requested_start
         .zip(requested_end)
         .is_some_and(|(start, end)| start > end)
@@ -840,8 +869,10 @@ fn collect_calibration_dataset(
         .context("scan recent Decision artifacts for calibration collect")?;
     let mut skipped = Vec::new();
     let mut candidates = Vec::new();
-    // 每个 Decision 都独立经过 Paper purpose、canonical、结构、Outcome、模型身份和
-    // 市场标签筛选；单个 Run 的缺陷记录在 skipped 中，不会中断其他候选的扫描。
+    // 先从最近最多 500 份 Decision 扫描，再按 Paper/canonical/完整标签筛选；
+    // 一般候选缺陷记 skipped，Store 查询类错误仍由 ? 阻断整个 collect。
+    // 历史 AgentTurn 在下方核 provider/model/Contract，model_version_hash 则由本次
+    // 有效配置生成并写入样本，不等于逐 turn 核实其全部日期和路由字段。
     for decision_artifact in decision_artifacts.iter().cloned() {
         let Some(run_id) = decision_artifact
             .origin
@@ -983,7 +1014,8 @@ fn collect_calibration_dataset(
     }
     candidates.sort_by(|left, right| left.run_id.cmp(&right.run_id));
 
-    // 数据集必须绑定同一 Synthesizer Contract；不一致的候选被排除，而不是混合训练。
+    // 排序后以第一个候选的 Synthesizer Contract 为本次组别，其余排除；不是挑样本
+    // 最多的组，也不是自动选择 Store 当前 active Contract，后续 activate 还会重验。
     let contract_hash = candidates
         .first()
         .map(|candidate| candidate.contract_hash.clone());
@@ -1137,6 +1169,8 @@ fn collect_calibration_dataset(
     });
     collected_runs.sort();
     collected_runs.dedup();
+    // 每只资产各建日期集合，再 reduce 求交集；只有四资产共同有收盘价的日期才进入
+    // 协方差价格面。无集合时 unwrap_or_default 给空集，后面的 enough_prices 会阻断。
     let common_dates = panel
         .values()
         .map(|bars| bars.keys().copied().collect::<BTreeSet<_>>())
@@ -1160,6 +1194,8 @@ fn collect_calibration_dataset(
                 .collect(),
         })
         .collect::<Vec<_>>();
+    // try_from 在极窄 usize 平台上可能失败；这里取 MAX 并饱和相乘，只会让
+    // “足够样本”更难满足，不会整数溢出后错误地放行。
     let required_forecast_samples = usize::try_from(min_samples)
         .unwrap_or(usize::MAX)
         .saturating_mul(Asset::EXECUTABLE.len())
@@ -1306,8 +1342,9 @@ fn session_close_time(date: NaiveDate) -> DateTime<Utc> {
 }
 
 fn relative_return_ppm(base: MoneyMicros, future: MoneyMicros) -> Result<i64> {
-    // 只有正的基准和未来价格才能形成收益标签；整数运算按 ppm 保留并在除法/转换
-    // 可能溢出时显式报错，避免用饱和或默认值掩盖无效样本。
+    // 只有正的基准和未来价格才能形成收益标签；先转 i128 再算 ppm，
+    // 乘法实际用 saturating_mul（对两个 i64 价格的差而言不会接近 i128 极值），
+    // checked_div 与 try_from 分别处理除法无结果及不能放进 i64 的情形。
     if base.0 <= 0 || future.0 <= 0 {
         bail!("calibration label requires positive baseline and future prices");
     }
@@ -1320,6 +1357,7 @@ fn relative_return_ppm(base: MoneyMicros, future: MoneyMicros) -> Result<i64> {
     .context("calibration return does not fit i64")
 }
 
+// 从 Decision 血缘提取的最小模型身份；缺少其中任一字段时调用者不会把 Run 用作训练样本。
 struct SynthesizerIdentity {
     provider_id: String,
     model_id: String,
@@ -1492,155 +1530,4 @@ fn candidate_has_all_labels(
         }
     }
     Ok(())
-}
-
-async fn run_evidence_command(command: &EvidenceCommand, config: &Config) -> Result<()> {
-    // Evidence 子命令与校准/执行分离：MarketAudit 负责显式采集并物化审计资料，
-    // Preflight 只探测 NewsWeb 可用性和质量，二者都不授予 Execution authorization。
-    match command {
-        EvidenceCommand::MarketAudit { output, option_feed } => market_audit(config, output, *option_feed).await,
-        EvidenceCommand::Preflight { resource } => {
-            let model_config = config
-                .model
-                .as_ref()
-                .context("NewsWeb preflight requires [model] configuration")?;
-            let route = if model_config.routes.contains_key("evidence.news_web") { "evidence.news_web" } else { "default" };
-            let adapter = akzio_ingest::configured_news_evidence_transport(model_config)
-                .context("construct governed NewsWeb router")?;
-            let request = EvidenceRequest {
-                source: EvidenceSource::NewsWeb,
-                resource: resource.clone(),
-                max_age: ChronoDuration::days(7),
-                acquisition_mode: akzio_domain::evidence_acquisition_mode(RunPurpose::PositionPlan, &akzio_domain::EvidenceNeed {
-                    schema_version: akzio_domain::DOMAIN_SCHEMA_VERSION,
-                    source_family: "news_web".into(), resource: resource.clone(), max_age_secs: 604800,
-                }),
-            };
-            let acquired = match adapter.acquire(&request).await {
-                Ok(acquired) => acquired,
-                Err(error) => {
-                    // Provider 错误被转换为稳定的 BLOCKED 诊断并立即返回；预检不写 Store
-                    // Artifact，因此这里的成功/失败都不是研究 Run 的 EvidenceGate 结果。
-                    let (diagnostic, detail) = evidence_preflight_error(&error);
-                    return print_json(&serde_json::json!({
-                        "status": "BLOCKED",
-                        "source_family": "news_web",
-                        "resource": resource,
-                        "route": route,
-                        "diagnostic": diagnostic,
-                        "detail": detail,
-                        "artifact_id": serde_json::Value::Null,
-                        "artifact_note": "CLI preflight is read-only and does not write a Store artifact",
-                    }));
-                }
-            };
-            let raw_hash = akzio_domain::ContentHash::of_bytes(&acquired.raw);
-            let normalized_bytes = serde_json::to_vec(&acquired.normalized)
-                .context("encode normalized NewsWeb preflight payload")?;
-            let normalized_hash = akzio_domain::ContentHash::of_bytes(&normalized_bytes);
-            let asset = Asset::EXECUTABLE
-                .into_iter()
-                .find(|asset| resource.contains(asset.symbol()));
-            let usable_at = acquired
-                .provenance
-                .published_at
-                .unwrap_or(acquired.observed_at);
-            let status = acquired.quality.citations_complete;
-            // 即使拿到 payload，引用不完整也只报告 BLOCKED；返回的 hashes 是观测信息，
-            // artifact_id 明确为空，不能被解释为已持久化或已授权的证据。
-            print_json(&serde_json::json!({
-                "status": if status { "available" } else { "BLOCKED" },
-                "source_family": "news_web",
-                "resource": resource,
-                "asset": asset,
-                "route": route,
-                "evidence_domain": if resource.starts_with("news:") { Some("news_event") } else { None },
-                "source_review": acquired.normalized.get("source_review"),
-                "reviewed_facts": acquired.normalized.get("reviewed_facts"),
-                "execution_authorization": "not_granted",
-                "published_at": acquired.provenance.published_at,
-                "retrieved_at": acquired.observed_at,
-                "usable_at": usable_at,
-                "source_uri": acquired.source_uri,
-                "citations": acquired.provenance.citations,
-                "quality": acquired.quality,
-                "raw_hash": raw_hash,
-                "normalized_hash": normalized_hash,
-                "diagnostic": if status { "none" } else { "source_verification_incomplete" },
-                "artifact_id": serde_json::Value::Null,
-                "artifact_note": "CLI preflight is read-only and does not write a Store artifact",
-            }))
-        }
-    }
-}
-
-fn evidence_preflight_error(error: &EvidenceAdapterError) -> (&'static str, &'static str) {
-    // 将 adapter 的具体错误归一为 CLI 诊断类别，同时保留“未写 Artifact”的上层边界。
-    match error {
-        EvidenceAdapterError::NativeWeb { kind, .. } => (kind.as_str(), "native web contract failure"),
-        EvidenceAdapterError::Unauthorized(_) => ("authorization", "provider authorization or entitlement denied"),
-        EvidenceAdapterError::RateLimited { .. } => ("rate_limited", "provider rate limited the request"),
-        EvidenceAdapterError::Pending(_) => ("pending", "provider data is pending"),
-        EvidenceAdapterError::NotConfigured(_) => (
-            "adapter_unavailable",
-            "no authorized provider is configured",
-        ),
-        EvidenceAdapterError::Permanent(_) => ("permanent_provider_error", "provider rejected the request"),
-        EvidenceAdapterError::Transport(_) => ("transport", "provider route or network transport failed"),
-        EvidenceAdapterError::Policy { .. } => ("policy_rejected", "Rust evidence policy rejected the response"),
-        EvidenceAdapterError::DataQuality(_) => ("data_quality", "provider payload failed data quality checks"),
-        EvidenceAdapterError::MissingFixture(_) => ("fixture_missing", "fixture evidence is unavailable"),
-        EvidenceAdapterError::SourceMismatch => ("source_mismatch", "adapter source does not match the request"),
-    }
-}
-
-/// Real adapter audit, independent of model/policy availability. Only evidence tasks are created.
-async fn market_audit(config: &Config, output: &Path, feed: akzio_ingest::AlpacaOptionDataFeed) -> Result<()> {
-    use akzio_ingest::AsyncEvidenceAdapter;
-    // 审计输出目录必须是新的；后续所有原始/规范化文件和 Store 都局限在该目录内，
-    // 报告中的 broker_write_policy=forbidden 与 llm_calls=0 只描述本入口的作用域。
-    if output.exists() { bail!("market audit output must be new"); }
-    fs::create_dir_all(output)?;
-    let store = Store::open(output.join("store"))?;
-    let adapter = akzio_ingest::AlpacaPaperEvidenceTransport::new(
-        "https://paper-api.alpaca.markets",
-        resolve_env_placeholder(&config.credentials.alpaca_api_key, "credentials.alpaca_api_key")?,
-        resolve_env_placeholder(&config.credentials.alpaca_api_secret, "credentials.alpaca_api_secret")?,
-        config.execution.market_data_feed)?.with_option_feed(feed);
-    let cutoff = Utc::now();
-    let day = akzio_ingest::market_session_day(cutoff);
-    let mut reports = Vec::new();
-    // 每个资产分别采集 bars 和 option_chain；单项失败写入报告并继续其他项，
-    // 因此整体报告可能是部分成功，最终完整性只以报告字段为准。
-    for asset in Asset::EXECUTABLE {
-        for resource in [format!("bars:{}:1d:{}:252",asset.symbol(),day-ChronoDuration::days(400)),
-            format!("option_chain:{}:{}:{}",asset.symbol(),day,day+ChronoDuration::days(30))] {
-            let request = EvidenceRequest {source:EvidenceSource::Alpaca,resource:resource.clone(),
-                max_age:ChronoDuration::days(7),acquisition_mode:akzio_domain::EvidenceAcquisitionMode::VerifiedSource};
-            match adapter.acquire_at(&request, cutoff).await {
-                Ok(acquired) => {
-                    let stem = format!("{}-{}",asset.symbol(), if resource.starts_with("bars:") {"stocks"} else {"options"});
-                    fs::write(output.join(format!("{stem}-raw.json")), &acquired.raw)?;
-                    fs::write(output.join(format!("{stem}-normalized.json")),serde_json::to_vec_pretty(&acquired.normalized)?)?;
-                    let validation = akzio_ingest::EvidenceRuntime::validate_acquired_evidence(&request,&acquired,Utc::now())
-                        .map(|_|"passed".to_owned()).unwrap_or_else(|e|e.to_string());
-                    let materialization = akzio_daemon::persist_market_audit_capture(&store, &request, acquired.clone())
-                        .unwrap_or_else(|e|serde_json::json!({"status":"failed","error":e.to_string()}));
-                    reports.push(serde_json::json!({"asset":asset,"resource":resource,"status":"acquired",
-                        "coverage":acquired.normalized.get("coverage"), "bars":acquired.normalized["bars"].as_array().map(Vec::len),
-                        "feed":acquired.normalized["feed"],"latest_completed_session":acquired.normalized["latest_completed_session"],
-                        "provenance":acquired.provenance,"validation":validation,
-                        "raw_hash":ContentHash::of_bytes(&acquired.raw),"materialization":materialization}));
-                }
-                Err(error) => reports.push(serde_json::json!({"asset":asset,"resource":resource,"status":"unavailable","error":error.to_string()})),
-            }
-        }
-    }
-    // Store 完整性检查和报告写入发生在采集循环之后；它们证明审计物化结果可读，
-    // 不证明 Paper Decision、ExecutionVerdict、订单或 Outcome 已产生。
-    let integrity = store.verify_integrity().map(|_|"passed".to_owned()).unwrap_or_else(|e|e.to_string());
-    let report=serde_json::json!({"decision_cutoff":cutoff,"broker_write_policy":"forbidden","auto_paper":false,
-        "llm_calls":0,"reports":reports,"store_integrity":integrity});
-    fs::write(output.join("report.json"),serde_json::to_vec_pretty(&report)?)?;
-    print_json(&report)
 }

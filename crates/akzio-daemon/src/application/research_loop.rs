@@ -1,3 +1,10 @@
+// 文件导读：这里实现有界的 reviewed research loop：按冻结 WorkflowNode 的 horizon/
+// revision 选择 Claim/Critique/Proposal/Review，必要时记录 revision stop，最多复用一次
+// supplemental round 的新事实。模型调用成功只完成研究节点；ProposalReview、DecisionGate
+// 和后续 Execution/Paper/Outcome 仍是独立阶段。
+// Rust 机制：Artifact 借用先转换为轻量 `ArtifactRef`；BTreeMap/Set 形成稳定候选闭包；
+// `AgentRunBudget` 的可变借用跨一次执行传递，`Option`/`Result` 区分跳过、阻断与错误。
+
 use crate::*;
 use akzio_domain::ResearchCritique;
 use akzio_domain::{ProposalReview, SupplementalRound};

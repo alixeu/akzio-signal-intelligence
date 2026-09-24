@@ -1,9 +1,12 @@
+// 文件导读：把 Contract、拓扑、模型、Prompt、Policy、治理与检索规则绑定为不可变候选身份。
+// `seal` 消费 manifest 并返回重算哈希后的新值；`identity_hash` 排除自身哈希字段，`validate` 则借用并复核完整绑定。
 //! Unified Candidate Identity and Behavior Bundle Manifest.
 //!
 //! A behavioral change in an agent trading system encompasses prompts, model
 //! snapshots, provider routes, decision/execution/evaluation policies, regime
 //! detectors, and retrieval rules—not merely Contract and Topology graphs.
-//! Every candidate undergoes verification bound strictly to this immutable identity.
+//! The manifest binds those identities; actual candidate verification remains
+//! a separate governed workflow, not a side effect of this domain type.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -50,12 +53,14 @@ pub struct BehaviorBundleManifest {
 }
 
 impl BehaviorBundleManifest {
+    // 先用当前字段重算 bundle_hash，再执行完整校验，返回带正确身份哈希的副本。
     pub fn seal(mut self) -> Result<Self, DomainError> {
         self.bundle_hash = self.identity_hash()?;
         self.validate()?;
         Ok(self)
     }
 
+    // 按身份字段构造稳定 JSON；元数据之外的 bundle_hash 本身不参与哈希，避免自引用。
     pub fn identity_hash(&self) -> Result<ContentHash, DomainError> {
         content_hash_json(&serde_json::json!({
             "schema_version": self.schema_version,
@@ -79,6 +84,7 @@ impl BehaviorBundleManifest {
         .map_err(|_| DomainError::InvalidContentHash)
     }
 
+    // 检查 schema、身份哈希、Artifact kind 和创建者，失败时拒绝整个行为清单。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION
             || self.bundle_hash != self.identity_hash()?

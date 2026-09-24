@@ -1,5 +1,16 @@
+// 文件导读：这里验证 CandidatePolicy、canonical evaluation、OutcomeSchedule execution lineage
+// 和 Shadow pair sources；只有 typed payload、purpose、source closure 全部匹配才允许进入学习提交。
+// 先读 validate_policy_evaluation_commit_with_connection 理解正式写入前的完整门槛，再读
+// read_outcome_schedule/validate_outcome_schedule_execution_lineage 追溯 NoOrder 与 ReconciledPaper 两支。
+// 所有 connection-scoped 方法借用调用方的事务连接，以便看到同事务内的 staged Artifact/BLOB。
 impl Store {
+    // Doctor 从 CandidatePolicy source_evaluation 和 baseline/candidate Artifact 重建候选历史。
+    // 注意：非空候选集中的 `self.read_artifact_payload` 会在 Doctor 已持有连接时二次取
+    // Store Mutex，存在重入 Integrity 的源码风险；该调用并非 connection-scoped，
+    // 不能据注释推断可顺利扫完，也不把风险写作已复现结果。
     fn verify_candidate_policy_history(&self, connection: &Connection) -> StoreResult<()> {
+        // 按 kind 扫全量候选，要求 canonical、Paper 来源、payload 有效、source refs 精确，
+        // 再与 source evaluation 的 subject/time/artifact ID 交叉核对。
         let artifact_ids = connection
             .prepare(
                 "SELECT artifact_id FROM rebuild_artifacts WHERE kind = ?1 ORDER BY artifact_id",
@@ -50,6 +61,7 @@ impl Store {
                     "candidate policy {artifact_id} disagrees with source evaluation"
                 )));
             }
+            // 最后按 Contract/Topology subject 解码 baseline 与 candidate，检查 capability/hash/purpose 绑定。
             self.validate_candidate_policy_sources(connection, &policy)
                 .map_err(|error| {
                     StoreError::Integrity(format!(
@@ -60,11 +72,14 @@ impl Store {
         Ok(())
     }
 
+    // 在外层 evaluation 事务中验证 sealed Outcome、T5 narrative、Experience/Evaluation 和 candidate policy 闭包。
     fn validate_policy_evaluation_commit_with_connection(
         &self,
         connection: &Connection,
         commit: &PolicyEvaluationCommit,
     ) -> StoreResult<()> {
+        // 输入 commit 由上层准备；先统一验证 Artifact kind/lifecycle/CAS 可读性，再校验 sealed Outcome、
+        // T5 Retrospective、Experience/Evaluation 与 candidate policy 的跨对象关联。
         for (artifact, kind) in [
             (&commit.outcome, ArtifactKind::Outcome),
             (&commit.final_retrospective, ArtifactKind::Retrospective),
@@ -113,6 +128,8 @@ impl Store {
         final_retrospective.validate()?;
         let experience_payload: akzio_domain::Experience =
             self.read_artifact_payload_with_connection(connection, &commit.experience)?;
+        // 对改变策略且非 restriction-only 的 transition，必须有完整、满足资格布尔项的 evaluation_context；
+        // 这不是 Store 重新计算学习指标，而是检查上游 Rust 计算出的证明字段。
         if commit.from != commit.to
             && !commit.from.is_restriction_to(commit.to)
             && experience_payload
@@ -133,6 +150,7 @@ impl Store {
         }
 
         if let Some(context) = &experience_payload.evaluation_context {
+            // producer_workflow Artifact 可为共享 CAS；其 run/revision owner 通过当前 Run 的 revision 行证明。
             let workflow = read_required_artifact(
                 connection,
                 &context.producer_workflow,
@@ -167,6 +185,7 @@ impl Store {
                 "learning_artifact.final_retrospective",
             ));
         }
+        // 复读 typed Experience/Evaluation payload 并校验领域结构后，再比对三者的 source/provenance 闭包。
         let experience: Experience =
             self.read_artifact_payload_with_connection(connection, &commit.experience)?;
         experience.validate()?;
@@ -183,6 +202,7 @@ impl Store {
                 &experience.policy_verdict,
             ])
         {
+            // 这些输入 refs 必须指向声明 kind 且属于 canonical Paper Run；来源不合格阻止整次事务。
             let source = read_artifact(connection, &reference.artifact_id)?;
             if source.kind != reference.kind {
                 return Err(StoreError::InvalidLearningCommit(
@@ -267,6 +287,8 @@ impl Store {
             }
             None => commit.from == commit.to,
         };
+        // 最后一组精确 link 检查把 Outcome、Experience、Evaluation、Retrospective、Policy state 串起来；
+        // source refs 用集合比较并拒绝重复，不按输入顺序产生差异。
         if experience.outcome != outcome_ref
             || evaluation.outcome != outcome_ref
             || evaluation.experience != experience_ref
@@ -318,11 +340,17 @@ impl Store {
         Ok(())
     }
 
+    // 按 subject 区分 Contract 与 Topology candidate，核对 lifecycle、purpose、hash 和 bounded capability。
+    // 本 helper 已收到 Connection，却仍用 `self.read_artifact_payload` 解码 baseline/candidate；
+    // 从写事务或 Doctor 路径调用时存在同线程非重入连接错误的源码风险，
+    // 区别于真正的领域拒绝，尚未据此断言实际故障。
     fn validate_candidate_policy_sources(
         &self,
         connection: &Connection,
         policy: &CandidatePolicy,
     ) -> StoreResult<()> {
+        // 两个 ArtifactRef 先核验其 ID/kind；Contract subject 走 hash/能力子集校验，
+        // Topology subject 走 typed graph、candidate ID 和 Paper/Shadow purpose 校验。
         let baseline =
             read_required_artifact(connection, &policy.baseline, "candidate_policy.baseline")?;
         let candidate =
@@ -372,11 +400,14 @@ impl Store {
         }
     }
 
+    // Shadow pair 必须同时指向 canonical parent、允许的 candidate 和共同 execution context。
     fn assert_shadow_pair_sources_with_connection(
         &self,
         connection: &Connection,
         completion: &ShadowPairCompletion,
     ) -> StoreResult<()> {
+        // 读取 completion 五个 source refs，再分别套 canonical Paper 与可接受 Shadow candidate 约束；
+        // 最后解码两份 sealed Outcome 并要求它们共享同一个冻结 schedule/execution context。
         let parent_decision = read_required_artifact(
             connection,
             &completion.parent_decision,
@@ -439,10 +470,16 @@ impl Store {
         Ok(())
     }
 
+    // 无事务调用方通过 Store 连接读取 durable/staged payload；调用方已持有连接时使用下一个 helper。
+    // T: DeserializeOwned 是“对任意输入生命周期都能反序列化”的拥有型结果边界；
+    // 具体 T 在编译期静态实例化，返回 T 不借用临时 Vec<u8>，JSON/CAS 错误转换为 StoreError。
     fn read_artifact_payload<T: DeserializeOwned>(&self, artifact: &Artifact) -> StoreResult<T> {
         Ok(serde_json::from_slice(&self.read_blob(&artifact.blob)?)?)
     }
 
+    // 复用调用方 Connection，确保事务内可见 staged blob 与未提交 Artifact。
+    // 同样要求 DeserializeOwned 并对具体 T 静态分发，但通过传入连接读取 TEMP staging；
+    // 不会再次获取 mutex 或自行 commit。
     pub(super) fn read_artifact_payload_with_connection<T: DeserializeOwned>(
         &self,
         connection: &Connection,
@@ -457,12 +494,15 @@ impl Store {
         )?)
     }
 
+    // 从 Outcome schedule 引用出发校验 purpose/lifecycle、source refs 和 execution lineage。
     fn read_outcome_schedule_with_connection(
         &self,
         connection: &Connection,
         outcome: &Outcome,
         allowed_purposes: &[RunPurpose],
     ) -> StoreResult<OutcomeSchedule> {
+        // 先确认 ref/kind、Run purpose 与 canonical/RunScoped lifecycle，再借用同一连接解码 schedule，
+        // 精确核对 expected source refs 和每个来源的 purpose。
         if outcome.schedule.kind != ArtifactKind::OutcomeSchedule {
             return Err(StoreError::InvalidLearningCommit("outcome.schedule_kind"));
         }
@@ -516,12 +556,15 @@ impl Store {
         Ok(schedule)
     }
 
+    // NoOrder 与 ReconciledPaper 分支分别验证 verdict/context，或 commitment/reconciliation receipt 链。
     fn validate_outcome_schedule_execution_lineage(
         &self,
         connection: &Connection,
         schedule: &OutcomeSchedule,
         allowed_purposes: &[RunPurpose],
     ) -> StoreResult<()> {
+        // 两个 execution enum 分支共用同一 ExecutionVerdict 读取；NoOrder 只需 verdict 指向冻结 context，
+        // ReconciledPaper 还要逐层验证 Commitment 和 Reconciliation 的 Artifact kind/purpose/source。
         let verdict_ref = match &schedule.execution {
             OutcomeExecutionLineage::NoOrder { execution_verdict }
             | OutcomeExecutionLineage::ReconciledPaper {
@@ -546,6 +589,7 @@ impl Store {
             ) if execution_verdict == verdict_ref
                 && no_order.execution_context == schedule.execution_context =>
             {
+                // NoOrder 路径检查 verdict source refs 含冻结 context；没有 commitment/receipt 要求。
                 if !verdict_artifact
                     .source_refs
                     .iter()
@@ -566,6 +610,7 @@ impl Store {
             ) if execution_verdict == verdict_ref
                 && execution_context == schedule.execution_context =>
             {
+                // Accepted 路径先核对 commitment 的 context/verdict 来源，再核对 reconciliation 对应 commitment。
                 let commitment_artifact = read_artifact(connection, &commitment.artifact_id)?;
                 if commitment_artifact.kind != ArtifactKind::ExecutionCommitment {
                     return Err(StoreError::InvalidLearningCommit(

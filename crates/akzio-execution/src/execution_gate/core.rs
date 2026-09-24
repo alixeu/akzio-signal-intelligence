@@ -1,9 +1,18 @@
+// 文件导读：该文本通过 `include!` 并入 ExecutionRuntime，实现构造、主评估和 fenced commit。
+// 入口 evaluate 从持久化 DecisionContext 与执行快照产生可选 ExecutionPlan、ExecutionContext
+// 和 ExecutionVerdict；快照/Gate blocker 会累积为 NoOrder。此处只 stage 结果，commit 才将
+// Artifact 与 task 终态一起交给 Store；PaperCommitment 只持久化承诺。上游快照可有
+// 只读 Broker/行情 I/O；订单写请求与对账由后续 Dispatch/Reconcile 路径负责。
 impl ExecutionRuntime {
+    // Store 按值移入 runtime 并由其持有；策略也在构造期验证，失败时返回 Gate 错误，
+    // 不会留下半初始化的 runtime 或触发 Store/Broker I/O。
     pub fn new(
         store: Store,
         execution_policy: ExecutionPolicy,
         gate_policy: ExecutionGatePolicy,
     ) -> ExecutionGateResult<Self> {
+        // 构造时同时冻结 allocation policy、Gate policy 和 pre-trade policy；任何非法配置
+        // 在真正读取执行快照前失败，避免运行中途出现一半旧限制、一半新限制。
         let allocation = AllocationRuntime::new(execution_policy)
             .map_err(|_| ExecutionGateError::Integrity("execution policy"))?;
         gate_policy.validate()?;
@@ -19,15 +28,25 @@ impl ExecutionRuntime {
         })
     }
 
+    // 只返回执行限额的共享引用；调用者可读取但不能通过它更改已构造的 runtime 策略。
     pub fn execution_policy(&self) -> &ExecutionPolicy {
+        // 只读暴露订单计算上限，调用方不能通过返回值改变 runtime。
         self.allocation.policy()
     }
 
+    // 二次 Gate 策略同样只读借出，避免评估过程中与配置写入并发。
     pub fn gate_policy(&self) -> &ExecutionGatePolicy {
+        // 只读暴露二次风控策略，Mandate/Capacity/Compliance 仍由 evaluate 统一组合。
         &self.gate_policy
     }
 
     pub fn evaluate(&self, input: &ExecutionGateInput) -> ExecutionGateResult<ExecutionGateOutput> {
+        // 主流程按“输入 Artifact→来源/时效校验→收集 blockers→条件性分配→安全/mandate
+        // 再核验→持久化 context/verdict”推进。即使 blocker 阻断 plan，仍生成完整的
+        // ExecutionContext/NoOrder，保留失败原因和后续 Outcome lineage；这里绝不发单。
+        // `input` 由调用者共享借用，Store 查询和解码都不消费输入引用。这里的 `?`
+        // 将 Store/Domain/JSON 错误返回给当前 task；与可解释的安全 blocker 不同，
+        // 结构损坏或持久化读取失败会中止本次 evaluate，不生成 NoOrder Artifact。
         self.validate_input(input)?;
         let purpose = self.store.run_purpose(&input.permit.run_id)?;
         let decision_artifact =
@@ -47,6 +66,8 @@ impl ExecutionRuntime {
             .as_ref()
             .is_some_and(|validity| validity.is_valid_at(input.now));
 
+        // 从 Decision 自带 blocker 起步，再把“此刻已过期/缺 provenance/有重大冲突”
+        // 作为独立原因加入有序集合；集合去重但保留所有不同阻断原因。
         let mut blockers = decision
             .hard_blockers
             .iter()
@@ -61,6 +82,8 @@ impl ExecutionRuntime {
         if !decision.material_conflicts.is_empty() {
             blockers.insert(HardBlocker::MaterialConflict);
         }
+        // 执行 Gate 只为正式 Paper Run 产生可执行资格。PositionPlan 即使持有 Decision
+        // 也不会进入 Paper 执行；Approval 的身份、资格时间和 mandate hash 均再次核验。
         if purpose != RunPurpose::Paper {
             blockers.insert(HardBlocker::NonCanonicalRun);
         } else if let Some((manifest, approval)) =
@@ -85,6 +108,8 @@ impl ExecutionRuntime {
             blockers.insert(HardBlocker::Frozen);
         }
 
+        // 三种快照分别加载；缺失时 helper 记录 blocker 并返回 None，坏 Artifact/JSON
+        // 则以 Err 提前退出。报价刷新时的解析错误额外保留 InvalidQuote 语义。
         let account = self.load_account(input, &mut blockers)?;
         let quotes =
             self.load_quotes(input, &mut blockers, input.quote_validation_error.is_some())?;
@@ -100,6 +125,9 @@ impl ExecutionRuntime {
             &mut blockers,
         );
 
+        // 只有当前 blocker 集为空才尝试 allocation，因此缺审批、陈旧快照等不会产生 plan。
+        // 后续 Gate 仍可能在 plan 已计算后追加 blocker；此时 plan 会作为审计输入保留，
+        // 但最终 Verdict 是 NoOrder，不会因此直接调用 Broker。
         let mut plan_payload = None;
         let mut mandate_assessment = None;
         let mut pretrade_safety = None;
@@ -113,6 +141,8 @@ impl ExecutionRuntime {
             let (_, clock_payload) = clock
                 .as_ref()
                 .ok_or(ExecutionGateError::Integrity("clock snapshot closure"))?;
+            // Paper 订单额度来自该 Run 绑定的 approval；其他 purpose 不走执行授权，
+            // 这里的分支仅保留非 Paper 的策略上限值，不会覆盖上面的 NonCanonical blocker。
             let maximum_total_notional = if purpose == RunPurpose::Paper {
                 self.store
                     .paper_approval_for_run(&input.permit.run_id)?
@@ -124,6 +154,8 @@ impl ExecutionRuntime {
                 .portfolio_risk
                 .expected_shortfall_ppm
                 .unwrap_or_default();
+            // 将 Store 解出的 payload 克隆到 AllocationInput，避免把读取的 snapshot
+            // 所有权从本函数移走；分配器只产生计划，不写 Store。
             let allocation = self.allocation.allocate_with_limit(
                 &AllocationInput {
                     decision_context_ref: input.decision_context.clone(),
@@ -144,6 +176,8 @@ impl ExecutionRuntime {
             match allocation {
                 Ok(plan) => {
                     plan.validate()?;
+                    // Overnight 除一般报价校验外，还要求 overnight/BOATS feed 与本 session
+                    // 允许的资产范围匹配；这里追加 blocker 而不抹掉 plan 或改写快照。
                     if clock_payload.trading_session() == akzio_domain::TradingSession::Overnight {
                         if !matches!(quote_payload.feed.as_deref(), Some("boats" | "overnight")) {
                             blockers.insert(HardBlocker::InvalidQuote);
@@ -156,6 +190,8 @@ impl ExecutionRuntime {
                             blockers.insert(HardBlocker::MarketClosed);
                         }
                     }
+                    // 分配完成后继续跑独立因子/换手和 mandate Gate；它们决定是否能 Accepted，
+                    // 不会改变已计算的 Decision 目标或把研究提案升级成订单。
                     blockers.extend(
                         self.gate_policy
                             .blockers_for(&plan.factor_exposure, plan.turnover_ppm),
@@ -170,6 +206,8 @@ impl ExecutionRuntime {
                         blockers.insert(HardBlocker::MandateViolation);
                     }
                     mandate_assessment = Some(mandate);
+                    // 安全证据由 Gate 外部采集但仅作为输入值；存在时由 Rust 再计算 capacity、
+                    // classification、compliance、dependency。缺失时明确补齐三个 blocker。
                     if let Some(evidence) = &input.pretrade_safety {
                         let ordered_assets = plan
                             .orders
@@ -219,6 +257,8 @@ impl ExecutionRuntime {
                         {
                             blockers.insert(HardBlocker::DependencyDegraded);
                         }
+                        // 即使 assessment 返回，也只有 permits_execution=true 且全局 blockers
+                        // 最终为空时才会 Accepted；此处仅记录 assessment 和各 Gate 原因。
                         pretrade_safety = Some(assessment);
                     } else {
                         blockers.extend([
@@ -229,10 +269,14 @@ impl ExecutionRuntime {
                     }
                     plan_payload = Some(plan);
                 }
+                // 业务性 allocation 错误被映射为稳定 HardBlocker，仍可输出 NoOrder；
+                // 只有 Store/序列化/领域结构等错误经 `?` 才会中止整个方法。
                 Err(error) => self.allocation_blockers(error, &mut blockers),
             }
         }
 
+        // Artifact 只在本地构造并 stage；`transpose` 把 Option<Result<_>> 转成
+        // Result<Option<_>>，所以 plan 不存在时是 Ok(None)，stage 失败则传播 Err。
         let execution_plan = plan_payload
             .as_ref()
             .map(|plan| {
@@ -264,6 +308,8 @@ impl ExecutionRuntime {
                 .as_ref()
                 .is_some_and(|assessment| assessment.permits_execution)
             && blockers.is_empty();
+        // `and_then` 对 Option 继续计算：任一阶段质量或 mandate 缺失都会得到 None；
+        // closure 中的 `?` 退出 closure（不是 evaluate），结果不会被伪造为 0 分质量。
         let final_process_quality = decision_process_quality.and_then(|quality| {
             let mandate = mandate_assessment.as_ref()?;
             quality.execution_finalized(
@@ -285,6 +331,8 @@ impl ExecutionRuntime {
             )
         });
 
+        // Context 保存输入 ArtifactRef、经 Gate 派生的 plan/exposure 与审查结果；没有
+        // plan 的 NoOrder 仍可带 Decision/snapshot lineage 供后续 Outcome 追踪。
         let execution_context_payload = ExecutionContext {
             schema_version: akzio_domain::DOMAIN_SCHEMA_VERSION,
             run_id: input.permit.run_id.clone(),
@@ -312,6 +360,7 @@ impl ExecutionRuntime {
             execution_context_payload.validate_complete_plan_closure()?;
         }
 
+        // lineage 只引用实际可用的来源；Option::extend(None/Some) 将可选快照展开为 0/1 项。
         let mut context_sources = vec![input.decision_context.clone()];
         context_sources.extend(input.account_snapshot.clone());
         context_sources.extend(input.quote_snapshot.clone());
@@ -326,6 +375,9 @@ impl ExecutionRuntime {
         )?;
         let execution_context_ref = artifact_ref(&execution_context);
 
+        // blockers 被消费为 NoOrder 的稳定列表；只有集合完全为空才表示 Gate 已受理执行
+        // 计划。Accepted 仍不是订单提交或成交；后续先持久化 PaperCommitment，再经
+        // Dispatch/Reconcile 对 Broker 发请求及确认回执。
         let verdict_payload = if blockers.is_empty() {
             ExecutionVerdict::Accepted {
                 execution_context: execution_context_ref.clone(),
@@ -361,6 +413,8 @@ impl ExecutionRuntime {
         output: &ExecutionGateOutput,
         now: DateTime<Utc>,
     ) -> ExecutionGateResult<()> {
+        // 把可选 plan、context、verdict 与 task 成功状态一次提交；提交是 ExecutionGate 的
+        // durable 边界，之后才可能由独立 Commitment task 继续，而不是在 evaluate 内隐式写 Broker。
         let mut artifacts = Vec::with_capacity(3);
         artifacts.extend(output.execution_plan.clone());
         artifacts.push(output.execution_context.clone());
@@ -371,6 +425,8 @@ impl ExecutionRuntime {
     }
 
     fn validate_input(&self, input: &ExecutionGateInput) -> ExecutionGateResult<()> {
+        // 只检查调用方声明的引用 kind；实体存在、实际 kind 与来源 lineage 在加载阶段核实。
+        // 先做轻量引用 kind 检查，避免用错误类型的 ArtifactRef 进入更深的 Store/JSON 解析。
         if input.decision_context.kind != ArtifactKind::DecisionContext
             || input
                 .account_snapshot

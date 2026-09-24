@@ -1,3 +1,6 @@
+# 文件职责：声明 Decision/Execution Gate、Paper transport 和 Commitment crate 的依赖边界。
+# package 继承 workspace 的 Rust 2021 与固定 rust-version；akzio-domain 提供领域 Contract，
+# akzio-store 是唯一持久化层，其余依赖分别服务时间、HTTP、序列化、错误和异步 transport。
 [package]
 name = "akzio-execution"
 version = "0.2.0"

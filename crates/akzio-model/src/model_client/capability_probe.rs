@@ -1,3 +1,7 @@
+// 文件导读：能力探测为默认模型 route 和每个命名 route 分别发起受限 Responses 往返，
+// 检查 required function、无状态 continuation 与独立 native-web 行为。硬性 function/
+// continuation 失败向上传播；web 失败收敛为带脱敏审计的状态。此文件只在显式调用时
+// 创建模型请求，不授予工具或研究权限；固定探测文本来自只读 probe_prompts.rs。
 const CAPABILITY_PROBE_TOOL: &str = "akzio_capability_probe";
 const CAPABILITY_PROBE_COMPLETE_TOOL: &str = "akzio_capability_probe_complete";
 const CAPABILITY_PROBE_SOURCE: &str = "runtime_function_tool_stateless_continuation_probe_v1";
@@ -6,6 +10,8 @@ const NATIVE_WEB_PROBE_SOURCE: &str = "native_web_required_search_probe_v2";
 pub async fn probe_configured_model_capabilities(
     config: &OpenAIResponsesConfig,
 ) -> Result<ModelCapabilityProbeSet> {
+    // 默认 route 完成后逐个探测命名 route，不借用别的 route 的结果；
+    // function/continuation 的硬错误经 ? 返回，web 探测失败则记入状态快照。
     // 默认 route 与每个 purpose route 都独立建 client、独立探测；只有全部快照
     // 与当前配置的模型和 reasoning_effort 对齐后，才返回可供上层使用的集合。
     let default = ModelClient::from_config(config)?
@@ -17,6 +23,29 @@ pub async fn probe_configured_model_capabilities(
         routes.insert(
             purpose.clone(),
             ModelClient::from_config(&route_config)?
+                .probe_capabilities()
+                .await?,
+        );
+    }
+    let probes = ModelCapabilityProbeSet { default, routes };
+    probes.validate_for_config(config)?;
+    Ok(probes)
+}
+
+pub async fn probe_configured_model_capabilities_with_audit(
+    config: &OpenAIResponsesConfig,
+    audit: Arc<dyn ModelAuditSink>,
+) -> Result<ModelCapabilityProbeSet> {
+    let default = ModelClient::from_config(config)?
+        .with_audit(audit.clone())
+        .probe_capabilities()
+        .await?;
+    let mut routes = BTreeMap::new();
+    for (purpose, route) in &config.routes {
+        routes.insert(
+            purpose.clone(),
+            ModelClient::from_config(&config.for_route(route))?
+                .with_audit(audit.clone())
                 .probe_capabilities()
                 .await?,
         );
@@ -54,8 +83,9 @@ impl ModelClient {
     pub async fn probe_capabilities_audited(
         &self,
     ) -> Result<(ModelCapabilitySnapshot, Vec<Value>)> {
-        // audited 结果包含 provider 请求/响应的脱敏摘要，因此只允许真实 provider
-        // 产生；fixture 没有可证明的外部请求，直接拒绝而不是补造审计记录。
+        // audited 结果排除 auth headers、完整 raw 和 continuation，但包含模型
+        // tool_calls/identity；不是任意文本的通用脱敏器。fixture 没有外部请求，
+        // 因此拒绝为其补造 provider 审计。
         match self {
             Self::OpenAIResponses(client) => {
                 probe_openai_responses_capabilities_audited(client).await
@@ -70,6 +100,8 @@ impl ModelClient {
 async fn probe_openai_responses_capabilities_audited(
     client: &OpenAIResponsesClient,
 ) -> Result<(ModelCapabilitySnapshot, Vec<Value>)> {
+    // 前两次 respond 的错误会短路整个 function/continuation 探测；native web 则在
+    // 后面被折叠成状态快照，故 hosted web 失败不会抹掉已经通过的函数能力证据。
     // 两次 required function call 验证工具调用与无状态续传；随后另做一次 required
     // native web probe。所有请求都经过同一个无状态 Responses adapter。
     let started = std::time::Instant::now();
@@ -132,7 +164,7 @@ async fn probe_openai_responses_capabilities_audited(
     // hosted web 能力是独立可失败项：失败原因进入状态和脱敏审计，但不抹掉已经
     // 验证通过的 function/continuation 能力。
     let (native_web_tool, native_web_tool_verified, native_web_status, native_web_audit) =
-        probe_native_web_tool(client).await;
+        probe_native_web_tool(client).await?;
     let mut audit = audit;
     if let Some(native_web_audit) = native_web_audit {
         audit.push(native_web_audit);
@@ -162,7 +194,9 @@ async fn probe_openai_responses_capabilities_audited(
 
 async fn probe_native_web_tool(
     client: &OpenAIResponsesClient,
-) -> (bool, bool, NativeWebCapabilityStatus, Option<Value>) {
+) -> Result<(bool, bool, NativeWebCapabilityStatus, Option<Value>)> {
+    // Web 的 provider/来源错误是可审计的能力状态；日志写入失败不是 provider
+    // 错误，必须立即中止，不能继续探测下一条模型路由。
     // 使用 Required 而非 Auto，确保“未调用”与“模型选择不搜索”可区分；验证同时
     // 要求 hosted action 和可提取、可 allowlist 校验的 citation。
     let policy = NativeWebPolicy::default();
@@ -195,7 +229,7 @@ async fn probe_native_web_tool(
                 Ok(()) => NativeWebCapabilityStatus::Verified,
                 Err(error) => native_web_failure_status(Some(&response.raw), error),
             };
-            (
+            Ok((
                 verified,
                 verified,
                 status,
@@ -209,11 +243,12 @@ async fn probe_native_web_tool(
                     "usage": response.usage,
                     "web_search_calls": response.raw.get("output").and_then(Value::as_array).map(|items| items.iter().filter(|item| item.get("type").and_then(Value::as_str) == Some("web_search_call")).count()),
                 })),
-            )
+            ))
         }
+        Err(error @ ModelError::RunLogUnavailable(_)) => Err(error),
         Err(error) => {
             let status = native_web_failure_status(None, &error);
-            (
+            Ok((
                 false,
                 false,
                 status,
@@ -223,14 +258,15 @@ async fn probe_native_web_tool(
                     "status": status,
                     "error": safe_model_error(&error),
                 })),
-            )
+            ))
         }
     }
 }
 
 fn native_web_failure_status(raw: Option<&Value>, error: &ModelError) -> NativeWebCapabilityStatus {
-    // 若已有 raw response，优先按实际 hosted web_call 轨迹区分未调用、无来源和
-    // 来源校验问题；没有 raw 时再按 HTTP/transport/adapter 错误分类。
+    // 错误诊断优先观察 hosted web_call；这里的 search/action.sources 启发式
+    // 可能把包含 open_page/find_in_page 或 URL annotation 的失败路径归入
+    // 无来源，不能据此断言来源不存在。成功仍以完整 action/citation 校验为准。
     if let Some(raw) = raw {
         let calls = raw
             .get("output")
@@ -360,6 +396,7 @@ fn safe_model_error(error: &ModelError) -> Value {
         | ModelError::EmptyModel
         | ModelError::EmptyReasoningEffort => json!({"kind": "configuration"}),
         ModelError::InvalidStream(_) => json!({"kind": "invalid_stream"}),
+        ModelError::RunLogUnavailable(_) => json!({"kind": "run_log_unavailable"}),
     }
 }
 
@@ -388,6 +425,8 @@ fn capability_probe_request(tool_name: &str, input: ModelInput) -> ModelRequest 
 }
 
 fn continuation_observations(items: &[Value]) -> (Option<bool>, Option<bool>) {
+    // items 是上一轮响应返回的 transcript 借用；观察函数只读它，不修改或重新请求，
+    // 因而无法凭空补出 reasoning/encrypted continuation 能力。
     // 从 provider 返回的 transcript 中观察 reasoning item；没有该 item 时保持未知，
     // 不把“未返回”误判成明确不支持。
     let reasoning = items
@@ -408,7 +447,8 @@ fn continuation_observations(items: &[Value]) -> (Option<bool>, Option<bool>) {
 }
 
 fn capability_response_audit(response: &ModelResponse, elapsed: std::time::Duration) -> Value {
-    // 记录请求/响应身份、usage、延迟和工具声明，故意不放入完整 raw response。
+    // 记录请求/响应身份、usage、延迟和工具调用，不放完整 raw/continuation。
+    // tool_calls 是 provider 内容而非已验证安全文本，导出仍须受日志权限约束。
     json!({
         "provider": OPENAI_RESPONSES_PROVIDER_ID,
         "requested_model": response.request_body.get("model"),
@@ -428,6 +468,88 @@ fn capability_response_audit(response: &ModelResponse, elapsed: std::time::Durat
 #[cfg(test)]
 mod capability_audit_tests {
     use super::*;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+    };
+
+    struct RejectWebAudit;
+
+    impl ModelAuditSink for RejectWebAudit {
+        fn record_model(
+            &self,
+            _context: &ModelAuditContext,
+            kind: &str,
+            payload: Value,
+        ) -> std::result::Result<(), String> {
+            if kind == "llm.request" && payload["request"]["tools"][0]["type"] == "web_search" {
+                Err("injected web-probe audit failure".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_web_probe_audit_failure_aborts_startup_before_the_next_provider_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (done, await_done) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            for (index, name) in [CAPABILITY_PROBE_TOOL, CAPABILITY_PROBE_COMPLETE_TOOL]
+                .into_iter()
+                .enumerate()
+            {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut bytes = [0_u8; 8192];
+                assert!(socket.read(&mut bytes).unwrap() > 0);
+                let event = json!({
+                    "type":"response.completed",
+                    "response":{
+                        "id":format!("probe-{index}"),
+                        "status":"completed",
+                        "model":"local-model",
+                        "usage":{"input_tokens":3,"output_tokens":2},
+                        "output":[{"type":"function_call","call_id":format!("call-{index}"),
+                            "name":name,"arguments":"{}"}]
+                    }
+                });
+                let body = format!("data: {event}\n\n");
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .unwrap();
+            }
+            await_done.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            assert!(
+                listener.accept().is_err(),
+                "the failed audit must prevent the native web POST"
+            );
+        });
+        let client = OpenAIResponsesClient::new(
+            format!("http://{address}"),
+            "test-only-key",
+            "local-model",
+            "low",
+        )
+        .unwrap()
+        .with_audit(Arc::new(RejectWebAudit));
+        let result = MODEL_AUDIT_CONTEXT
+            .scope(
+                ModelAuditContext::startup("web-audit-failure"),
+                probe_openai_responses_capabilities_audited(&client),
+            )
+            .await;
+        done.send(()).unwrap();
+        server.join().unwrap();
+        assert!(matches!(result, Err(ModelError::RunLogUnavailable(_))));
+    }
 
     #[test]
     fn required_web_probe_serializes_as_required_tool_choice() {

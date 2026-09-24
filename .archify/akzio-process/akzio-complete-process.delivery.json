@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "5425020c-7ffd-42bf-b6b9-7da4f299013c",
+  "status": "current",
+  "command": "deliver",
+  "type": "architecture",
+  "input": "/Users/alixeu/project/akzio-signal-intelligence/.archify/akzio-process/candidate.json",
+  "output": "/Users/alixeu/project/akzio-signal-intelligence/.archify/akzio-process/akzio-complete-process.html",
+  "specification": {
+    "sha256": "055f003a6e049cc14eb3e4a20e214c92b5aff121f881fa190d158b87cda118ac",
+    "bytes": 106937
+  },
+  "artifact": {
+    "sha256": "2fd3c873dce44635d4ab9614289e40ccb1e10a6cd9bedaa5ec673e07df489c7d",
+    "bytes": 946199
+  }
+}

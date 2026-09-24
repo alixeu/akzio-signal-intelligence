@@ -1,4 +1,10 @@
+// 文件导读：本文件处理 Task permit 的 heartbeat、事件、Artifact 写入和 Attempt 提交；
+// 每个公开写入口都在最终事务内再次核验 permit，外部副作用不能仅凭预检查获得授权。
+// 先读 write_task_artifact 与 commit_attempt 区分单项 Artifact 和成功 Attempt outputs，
+// 再看 heartbeat/verify_attempt_terminal 的 lease/终态检查；所有持久写操作都复用 Immediate 事务。
 impl Store {
+    // 先确认 Task/Attempt 仍处于 permit 指定状态，再读取持久 lease_until；
+    // 只把 expiry 向后延长，不改 owner、epoch 或 active Attempt，且条件 UPDATE 失败报 StalePermit。
     pub fn heartbeat_task(
         &self,
         permit: &TaskWritePermit,
@@ -38,6 +44,7 @@ impl Store {
     /// creating an artifact or changing task state. External adapters use
     /// this immediately before side effects; final persistence rechecks the
     /// same permit in its own transaction.
+    // 只执行一次 Immediate 事务内 assert_permit；该预检之后的外部动作仍必须由最终提交再次核验。
     pub fn validate_task_permit(&self, permit: &TaskWritePermit) -> StoreResult<()> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -49,6 +56,7 @@ impl Store {
     /// Append a task-scoped lifecycle fact without creating an artifact.
     /// The permit check and event insert share one transaction so a stale
     /// attempt cannot publish an AgentTurnStarted fact after takeover.
+    // 事件形状校验和 AgentTurn 全 Run 生命周期校验都在插入事务内；只有全部通过才 commit。
     pub fn append_task_event(
         &self,
         permit: &TaskWritePermit,
@@ -67,6 +75,8 @@ impl Store {
     /// Verify a handler-owned transaction already closed this exact attempt.
     /// A merely stale permit is insufficient: task and attempt terminal state,
     /// run, lease, epoch, and contract must all still identify the caller.
+    // 用 Deferred 快照查询指定 Attempt，要求 Task 与 Attempt 的 status 都等于传入 terminal status，
+    // 同时 Task active_attempt_id 已清空；始终校验 Tool 生命周期，succeeded 时额外要求无未结 ToolCall。
     pub fn verify_attempt_terminal(
         &self,
         permit: &TaskWritePermit,
@@ -135,12 +145,16 @@ impl Store {
         event_type: LifecycleEventType,
         now: DateTime<Utc>,
     ) -> StoreResult<()> {
+        // 不带 daemon lease 的薄 wrapper；调用方给的 permit 与 Artifact 仍由 fenced 入口核验。
         self.write_task_artifact_fenced(None, permit, artifact, event_type, now)
     }
 
     /// Persist a task artifact while optionally fencing a daemon-owned worker.
     /// The lease check is in the same transaction as the artifact/event write,
     /// so a takeover cannot leave a stale worker's output committed.
+    // Artifact/domain/BLOB 专项预检先发生；Immediate 事务内若提供 daemon lease 则重验 lease，
+    // 再核验 Task permit/lifecycle/origin，插入 Artifact、event 并重跑生命周期校验后提交。
+    // 此单 Artifact API 不把 Artifact 自动登记成 succeeded Attempt output，也不终结 Task。
     pub fn write_task_artifact_fenced(
         &self,
         lease: Option<&DaemonLease>,
@@ -182,6 +196,8 @@ impl Store {
     /// Commit the final artifacts and terminal task state together. A reader
     /// cannot observe a completed attempt without every committed output and
     /// its corresponding durable events.
+    // 先验证非空成功输出、BLOB 和专项 payload；在一笔 Immediate 事务插入整个 Artifact 闭包、
+    // committed events/output index 并终结 Task/Attempt。
     pub fn commit_attempt(
         &self,
         permit: &TaskWritePermit,
@@ -199,6 +215,7 @@ impl Store {
 
     /// Atomically persist broker-visible task outputs only while both the
     /// daemon epoch and task attempt permit remain current.
+    // 与 commit_attempt 相同，但 daemon lease、Attempt permit 和所有 outputs 共用最终事务提交点。
     pub fn commit_fenced_attempt(
         &self,
         lease: &DaemonLease,

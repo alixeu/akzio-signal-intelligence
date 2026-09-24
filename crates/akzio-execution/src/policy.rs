@@ -1,7 +1,13 @@
 //! Rust-owned execution gate policy.
 //!
 //! The model never supplies these limits. They are evaluated against the
-//! typed `ExecutionContext` before a Paper commitment can be created.
+//! planned factor exposure, turnover and account/target state during
+//! ExecutionGate evaluation, before any Paper commitment can be created.
+
+// 文件导读：ExecutionGatePolicy 是模型不能覆盖的二次闸门，负责因子暴露、配对暴露、
+// 换手、mandate、capacity 和 compliance 的组合限制。它只从已构造的账户/目标及外部
+// 证据计算 blocker 或 MandateAssessment，不创建订单、不写 Commitment。策略按值持有
+// Domain snapshot；方法通过共享借用读取，返回新 blocker/assessment 值。
 
 use akzio_domain::{
     AccountSnapshot, Asset, CapacityPolicy, ComplianceActionPolicy, DomainError, FactorExposure,
@@ -20,6 +26,10 @@ pub struct ExecutionGatePolicy {
 
 impl ExecutionGatePolicy {
     pub fn validate(&self) -> Result<(), DomainError> {
+        // 先委托领域策略检查，再验证 ppm 上限；非法配置在运行时构造阶段失败，而不是
+        // 等到某个订单路径才表现为偶发 blocker。
+        // `?` 将每个内嵌领域策略的首个 DomainError 原样向调用者返回；ppm 上限仅在它们
+        // 全部通过后再核对。
         self.factor_limits.validate()?;
         self.mandate.validate()?;
         self.capacity.validate()?;
@@ -33,6 +43,10 @@ impl ExecutionGatePolicy {
     }
 
     pub fn blockers_for(&self, exposure: &FactorExposure, turnover_ppm: u32) -> Vec<HardBlocker> {
+        // 因子/配对/换手是可并列存在的硬阻断，使用 Vec 保留每个独立原因，便于
+        // ExecutionContext 记录完整失败面而不是只留下第一个错误。
+        // 两个参数都是共享借用/Copy 值；每个 if 独立追加原因，所以一次失败可同时留下
+        // 因子、配对和换手 blocker，最终 Vec 由本方法拥有。
         let mut blockers = Vec::new();
         if exposure.leveraged_equity_ppm > self.factor_limits.global_leveraged_equity_ppm
             || exposure.nasdaq_ppm > self.factor_limits.nasdaq_ppm
@@ -58,6 +72,10 @@ impl ExecutionGatePolicy {
         projected_drawdown_ppm: u32,
         turnover_ppm: u32,
     ) -> MandateAssessment {
+        // 从当前账户持仓重建 before portfolio，再交给 mandate 比较 before→target；负
+        // 持仓被截为零只影响评估输入，不会替账户修正或产生平仓订单。
+        // before 是本地重建值，读取账户 positions 而不修改账户；equity 不正时保留零组合，
+        // 正值时以 i128 算 ppm 后裁剪到 WeightPpm::SCALE。
         let mut before = TargetPortfolio::zeroed();
         if account.equity.0 > 0 {
             for asset in Asset::EXECUTABLE {
@@ -82,6 +100,7 @@ impl ExecutionGatePolicy {
 
 impl Default for ExecutionGatePolicy {
     fn default() -> Self {
+        // Default 构造一个 owned 策略快照；值提供 Gate 上限，不含 Paper approval 或发送授权。
         Self {
             factor_limits: FactorLimits {
                 global_leveraged_equity_ppm: 500_000,

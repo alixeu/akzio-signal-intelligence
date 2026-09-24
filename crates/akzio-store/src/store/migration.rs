@@ -1,3 +1,7 @@
+// 文件导读：v13→14 验证旧 JSON/列值并用临时表重建表形状；v14→15 只新增可重建索引。
+// 两步均不移动或重写既有 CAS、Commitment、Artifact identity。
+// initialize 依序调 v13→14、v14→15，再在初始化 DDL 事务中设当前 schema label；
+// 这些历史迁移阶段彼此不是一个共同事务。
 use super::*;
 
 struct LegacyCanaryReservationRow {
@@ -25,7 +29,11 @@ struct LegacyLessonEvidenceRow {
     recorded_at: String,
 }
 
+// 关闭外键仅覆盖旧表重建的必要区间，结束前无论成功失败都尝试恢复 foreign_keys。
 pub(super) fn migrate_v13_to_v14(connection: &mut Connection, root: &Path) -> StoreResult<()> {
+    // PRAGMA foreign_keys 在同一 Connection 的事务外关闭，再运行迁移事务，最后恢复 ON；
+    // SQLite 不允许在事务内部切换该 PRAGMA，不能误认为这里另开了一条连接。
+    // 若迁移与恢复都失败，保留原迁移错误；迁移成功但恢复失败则返回恢复错误。
     connection.pragma_update(None, "foreign_keys", "OFF")?;
     let migration = migrate_v13_to_v14_transaction(connection, root);
     let restore = connection.pragma_update(None, "foreign_keys", "ON");
@@ -37,7 +45,10 @@ pub(super) fn migrate_v13_to_v14(connection: &mut Connection, root: &Path) -> St
     }
 }
 
+// 在 Immediate 事务中校验旧 subject、重建 policy/canary/lesson 表并在最后更新 v14 label。
 fn migrate_v13_to_v14_transaction(connection: &mut Connection, root: &Path) -> StoreResult<()> {
+    // 所有旧数据解码、临时表重建、FK 检查和 version 13→14 更新共用一个 Immediate 事务；
+    // 任一 `?`/冲突导致函数返回时 Transaction Drop 回滚此阶段的 SQL 改动。
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
     for table in [
@@ -47,6 +58,7 @@ fn migrate_v13_to_v14_transaction(connection: &mut Connection, root: &Path) -> S
         "rebuild_policy_heads",
         "rebuild_shadow_pairs",
     ] {
+        // 先确认旧表具有 subject_json 且每行 JSON 与 subject_id typed namespace 一致，之后才重建表。
         if !table_has_column(&transaction, table, "subject_json")? {
             return Err(StoreError::IncompatibleStoreRoot(root.to_path_buf()));
         }
@@ -68,6 +80,7 @@ fn migrate_v13_to_v14_transaction(connection: &mut Connection, root: &Path) -> S
         })
         .optional()?;
     if let Some((table, row_id, parent, foreign_key)) = violation {
+        // PRAGMA foreign_key_check 只读出首个 violation；命中就不更新 schema label。
         return Err(StoreError::Integrity(format!(
             "v14 migration foreign key violation in {table} row {row_id:?} referencing {parent} key {foreign_key}"
         )));
@@ -85,7 +98,9 @@ fn migrate_v13_to_v14_transaction(connection: &mut Connection, root: &Path) -> S
     Ok(())
 }
 
+// 旧 subject_json 必须生成与 subject_id 完全相同的 typed namespace。
 fn validate_legacy_policy_subjects(transaction: &Transaction<'_>, table: &str) -> StoreResult<()> {
+    // table 来自上层硬编码数组；全量读取 subject id/json 并逐行解码，第一处 namespace 不匹配即 Err。
     let mut statement =
         transaction.prepare(&format!("SELECT subject_id, subject_json FROM {table}"))?;
     let rows = statement
@@ -105,7 +120,9 @@ fn validate_legacy_policy_subjects(transaction: &Transaction<'_>, table: &str) -
     Ok(())
 }
 
+// 通过 v14 临时表复制旧 policy/shadow rows，保留所有 Artifact/event/cursor identity。
 fn migrate_policy_tables(transaction: &Transaction<'_>) -> StoreResult<()> {
+    // 先创建新表并按同名列复制，再 drop/rename；Artifact ID、event cursor 与 transition ID原样保留。
     transaction.execute_batch(
         r#"
 CREATE TABLE rebuild_policy_transitions_v14 (
@@ -221,7 +238,10 @@ CREATE INDEX rebuild_shadow_pairs_freshness
     Ok(())
 }
 
+// 将旧 reservation_json 展开为 market_day/regime/index columns，并逐行比较 JSON 与索引列。
 fn migrate_canary_cohort_sessions(transaction: &Transaction<'_>, root: &Path) -> StoreResult<()> {
+    // 先检查旧列并收集 owning rows，再建临时表；每行 JSON 和索引列必须完全一致才允许插入。
+    // DROP/RENAME 留到所有 rows 验证成功后，且仍受调用方 migration transaction 保护。
     if !table_has_column(
         transaction,
         "rebuild_canary_cohort_sessions",
@@ -275,6 +295,7 @@ CREATE TABLE rebuild_canary_cohort_sessions_v14 (
     )?;
 
     for row in rows {
+        // 领域 validate 后逐字段核 campaign/cohort/stage/session、四条 Run ID、epoch 与 reserved_at。
         let reservation: akzio_domain::CanarySessionReservation =
             serde_json::from_str(&row.reservation_json)?;
         reservation.validate()?;
@@ -344,7 +365,9 @@ CREATE TABLE rebuild_canary_cohort_sessions_v14 (
     Ok(())
 }
 
+// 将 LessonEvidence JSON 拆成 metrics_json 列，identity/idempotency key 必须保持不变。
 fn migrate_lesson_evidence(transaction: &Transaction<'_>, root: &Path) -> StoreResult<()> {
+    // 没有旧 evidence 表时 no-op；存在旧 evidence_json 时先读取并在新表里拆分 metrics 列。
     if !table_exists(transaction, "rebuild_lesson_evidence")? {
         return Ok(());
     }
@@ -390,6 +413,7 @@ CREATE TABLE rebuild_lesson_evidence_v14 (
     )?;
 
     for row in rows {
+        // identity hash 与 lesson/context/outcome/attribution/recorded_at 任一列不同都拒绝迁移。
         let evidence: LessonEvidence = serde_json::from_str(&row.evidence_json)?;
         evidence.validate()?;
         let (lesson_id, decision_context_id, outcome_id) = evidence.idempotency_key();
@@ -432,7 +456,9 @@ CREATE TABLE rebuild_lesson_evidence_v14 (
     Ok(())
 }
 
+// 只读探测表是否存在，兼容旧 Store 尚未创建惰性 Lesson/Contract 表的情况。
 pub(super) fn table_exists(connection: &Connection, table: &str) -> StoreResult<bool> {
+    // sqlite_master 按固定表名参数查询；无行返回 false，SQL 失败仍传播 StoreError。
     connection
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -446,7 +472,10 @@ pub(super) fn table_exists(connection: &Connection, table: &str) -> StoreResult<
 
 /// v15 adds a rebuildable origin/kind expression index, never rewrites CAS or
 /// execution commitments. SQLite rebuilds the index directly from metadata.
+// v15 只重建 origin/kind expression index，并在旧 Contract blocker 存在时阻断升级。
 pub(super) fn migrate_v14_to_v15(connection: &mut Connection) -> StoreResult<()> {
+    // v14→15 单独 Immediate 事务：先按冻结的旧 Contract version threshold 找活动 blocker，
+    // 再创建可重建 expression index，并要求 metadata 恰有一行从 14 改到 15。
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     // Reached only from a v13/v14 root. The `< 18` threshold is the historical
     // Contract boundary of the binary that introduced v15 and is kept verbatim:
@@ -463,6 +492,7 @@ pub(super) fn migrate_v14_to_v15(connection: &mut Connection) -> StoreResult<()>
         let hashes = transaction.prepare("SELECT h.contract_hash FROM rebuild_contract_catalogue_heads h JOIN rebuild_contract_installations i ON i.contract_hash=h.contract_hash WHERE i.contract_version < 18 ORDER BY h.purpose")?
             .query_map([], |row| row.get::<_,String>(0))?.collect::<Result<Vec<_>,_>>()?;
         for hash in hashes {
+            // 每个 active 旧 Contract 都查询未完成 Task/session blockers；任一非空就回滚该迁移事务。
             let hash = ContentHash::new(hash)?;
             let blockers = super::workflow::contract_upgrade_blockers(&transaction, &hash)?;
             if !blockers.is_empty() {

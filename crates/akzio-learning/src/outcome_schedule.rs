@@ -15,6 +15,9 @@ use chrono::{DateTime, NaiveDate, Utc};
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 
+// 文件导读：OutcomeSchedule 是 T0 Paper 终态到未来 T+1/T+3/T+5 worker 的不可变桥梁；
+// 本文件只验证并提交 lineage，不读取未来行情、不计算指标，也不提前改变 Policy。
+
 #[derive(Debug, Error)]
 pub enum OutcomeScheduleError {
     #[error(transparent)]
@@ -61,14 +64,20 @@ pub struct OutcomeSchedulingRuntime {
 }
 
 impl OutcomeSchedulingRuntime {
+    // Store 按值交给 runtime 持有；worker 默认关闭，所以 new 只准备配置而不排队任务。
     pub fn new(store: Store) -> Self {
+        // 默认不启用 worker：new 本身不排队任务；schedule 会经 Store stage blob，
+        // 但是否安装 post-terminal worker 只在 commit 时由显式配置决定。
         Self {
             store,
             enqueue_worker: false,
         }
     }
 
+    // self 按值接收，mut 仅允许改动当前 runtime 的 enqueue_worker；返回修改后的所有权，
+    // 调用者需接住返回值才能保留开关设置。
     pub fn with_worker_enabled(mut self, enabled: bool) -> Self {
+        // 该开关只选择两种既有 Store commit 入口，不改变 schedule payload 或 Paper 资格。
         self.enqueue_worker = enabled;
         self
     }
@@ -77,6 +86,11 @@ impl OutcomeSchedulingRuntime {
         &self,
         input: &OutcomeScheduleInput,
     ) -> OutcomeScheduleResult<OutcomeScheduleOutput> {
+        // input 以共享借用提供 permit 和 ArtifactRef；这里先从 Store 读取并校验完整 Paper
+        // 决策/执行 lineage，再 stage 一个 schedule Artifact 返回。OutcomeScheduleOutput
+        // 只是待 commit 的结果，不代表 Artifact、worker 或 Outcome 已正式提交。
+        // schedule 先核验 permit 和 Paper purpose，再从同一 Store/CAS 读取 Decision、Context、
+        // ExecutionContext 与执行终态；任何 lineage 不一致都在写入前返回错误。
         self.store.validate_task_permit(&input.permit)?;
         let purpose = self.store.run_purpose(&input.permit.run_id)?;
         if purpose != RunPurpose::Paper {
@@ -131,6 +145,8 @@ impl OutcomeSchedulingRuntime {
             input.execution_context.clone(),
         ];
         match &input.execution {
+            // NoOrder 只绑定 verdict；真实 Paper lineage 还保留 commitment 与 reconciliation，
+            // 让后续学习能区分 Decision 被接受、订单已提交和已完成对账。
             OutcomeExecutionLineage::NoOrder { execution_verdict } => {
                 source_refs.push(execution_verdict.clone());
             }
@@ -157,6 +173,8 @@ impl OutcomeSchedulingRuntime {
             source_refs,
             input.now,
         )?;
+        // 这里仅 stage payload 并返回 Artifact；尚未 commit，所以调用者丢弃 output 不会留下
+        // 一个看似已创建的 OutcomeSchedule 或未来 worker。
         Ok(OutcomeScheduleOutput { schedule })
     }
 
@@ -166,6 +184,10 @@ impl OutcomeSchedulingRuntime {
         output: &OutcomeScheduleOutput,
         now: DateTime<Utc>,
     ) -> OutcomeScheduleResult<()> {
+        // permit/output 共享借用，commit 选择启用 worker 的原子 Store API 或普通 Attempt API；
+        // Ok 仅表示该提交入口成功，排期尚未等待真实行情，也未生成 sealed Outcome。
+        // 启用 worker 时 Store 把 schedule、成功 Attempt 和 post-terminal worker 放进同一
+        // 事务；否则只按普通 succeeded Attempt 提交 schedule。两条路径都不会密封 Outcome。
         if self.enqueue_worker {
             self.store
                 .commit_outcome_schedule_with_worker(permit, &output.schedule, now)?;
@@ -185,6 +207,12 @@ impl OutcomeSchedulingRuntime {
         lineage: &OutcomeExecutionLineage,
         execution_context: &ArtifactRef,
     ) -> OutcomeScheduleResult<()> {
+        // 按 lineage 的 enum 变体穷尽分支并从 Store 解码对应 CAS：NoOrder 到 verdict 为止；
+        // ReconciledPaper 必须走 Accepted → Commitment → Complete Reconciliation 的来源链。
+        // 每步失败立即 Err，因此后续 schedule 不会被创建。
+        // NoOrder 只需绑定 NoOrder verdict/context；ReconciledPaper 还必须依次绑定 Accepted
+        // verdict、ExecutionCommitment 和 Complete Reconciliation。Complete 仅证明对账终态，
+        // 不把每张订单的 accepted 当成 filled；实际成交仍以 receipt 内容核验。
         match lineage {
             OutcomeExecutionLineage::NoOrder { execution_verdict } => {
                 let verdict =
@@ -253,6 +281,8 @@ impl OutcomeSchedulingRuntime {
         reference: &ArtifactRef,
         expected: ArtifactKind,
     ) -> OutcomeScheduleResult<Artifact> {
+        // 用 Artifact ID 从唯一 Store 读取，再同时比对调用方声明 kind 与持久化 kind；
+        // 只返回真实匹配的 Artifact，不会因为引用字段声明正确就信任底层对象。
         let artifact = self.store.artifact(&reference.artifact_id)?;
         if reference.kind != expected || artifact.kind != expected {
             return Err(OutcomeScheduleError::WrongArtifactKind {
@@ -264,6 +294,8 @@ impl OutcomeSchedulingRuntime {
     }
 
     fn read_payload<T: DeserializeOwned>(&self, artifact: &Artifact) -> OutcomeScheduleResult<T> {
+        // T: DeserializeOwned 表示反序列化出的 T 不借用临时 BLOB 字节；泛型具体类型在调用点确定，
+        // 错误由 JSON/Store 到 OutcomeScheduleError 的 From 转换后传播。
         Ok(serde_json::from_slice(
             &self.store.read_blob(&artifact.blob)?,
         )?)
@@ -271,6 +303,9 @@ impl OutcomeSchedulingRuntime {
 }
 
 fn require_complete_reconciliation(state: ReconciliationState) -> OutcomeScheduleResult<()> {
+    // Complete 才表示该 lineage 可作为已完成执行来源；其他状态返回 InvalidLineage，
+    // 不把 accepted、partial fill 或待处理自动升级为完成。
+    // 只有完整对账才允许建立“已执行” Outcome lineage；部分成交/待成交继续留在执行链。
     if state != ReconciliationState::Complete {
         return Err(OutcomeScheduleError::InvalidLineage(
             "reconciliation_not_complete",

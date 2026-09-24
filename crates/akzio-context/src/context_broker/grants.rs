@@ -1,3 +1,11 @@
+// ContextBroker 的 grant API 区分普通 readable、RawEvidence 和 authority blob。
+// 当前研究 Contract 没有读取工具，即使这里有 read_raw 实现，也不代表模型能调用；
+// Outcome 的受控读取仍不能取得 RawEvidence。
+// `read`/`read_raw` 在每次访问时同时核对内存 grant 与持久化 Manifest，已完成 Attempt 的历史读取走 proof 专用路径。
+// 文件导读：本模块校验父 Attempt 输出血缘、恢复历史 Manifest，并实现普通/Raw/Authority 三条授权读取路径。
+// 先读 validate_parent_output_sources 与 validate_persisted_grant，再读 read/read_raw/read_document；
+// 返回 Artifact/Value/bytes 的范围不同，Store 仍是 CAS 与当前 lease/permit 的权威。
+// Rust 机制：递归 source_refs 用 BTreeSet 防环，借用的 proof/permit 限制调用期，Result 让任一授权或 Store 错误立即返回。
 impl ContextBroker {
     // 验证父 Attempt 产出的 Artifact 是否仍能沿父 Manifest、ReadGrant 和
     // 已授权 raw 闭包回溯。RawEvidence/trace 永远不能直接成为子任务的输出来源。
@@ -174,6 +182,7 @@ impl ContextBroker {
         artifact_id: &ArtifactId,
         now: DateTime<Utc>,
     ) -> ContextResult<Artifact> {
+        // `permit`、`contract`、`grant` 与 ID 都只借用；返回 Artifact 拥有元数据，但不暴露 Blob 字节。
         // 普通读取必须同时满足 Attempt/Contract 身份、Manifest readable 集合和
         // 当前持久化闭包；读到 trace 或 RawEvidence 时仍拒绝，不把 grant 变成 raw 许可。
         if !grant.matches_permit(permit) || grant.contract_hash != contract.contract_hash {
@@ -199,6 +208,7 @@ impl ContextBroker {
         artifact_id: &ArtifactId,
         now: DateTime<Utc>,
     ) -> ContextResult<Artifact> {
+        // 该 helper 只在完整 persisted-closure 校验后调用；仍再次检查 permit/grant，避免内部调用绕过身份或过期时间。
         if !grant.matches_permit(permit) || grant.contract_hash != contract.contract_hash {
             return Err(ContextError::InvalidManifestClosure);
         }
@@ -230,6 +240,7 @@ impl ContextBroker {
         artifact_id: &ArtifactId,
         now: DateTime<Utc>,
     ) -> ContextResult<Artifact> {
+        // 显式 raw 路径仍要求当前 Attempt 身份及 grant 有效；返回原始 Artifact 不会改写普通 readable 集合。
         // RawEvidence 是显式的第二条读取路径：它只能命中 raw_source_closure，且调用者
         // 必须明确使用 read_raw；这不扩大普通 readable 集合，也不改变 Manifest。
         if !grant.matches_permit(permit) || grant.contract_hash != contract.contract_hash {
@@ -284,7 +295,6 @@ pub fn read_raw_document(
         let value = self.document_value(&artifact)?;
     Ok((artifact, value))
 }
-
 pub fn read_authority_document(
     &self,
     contract: &AgentContract,

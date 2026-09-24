@@ -1,8 +1,13 @@
 use super::*;
 
+// 文件导读：Replay 读取 immutable graph/Contract installation 和事件 journal，重建历史状态并
+// 与 Store snapshot 对照。它使用历史安装而不是今天的 active recipe，保留退休任务的
+// 只读审计能力；Replay 通过不代表旧 Planner/ PaperDryRun 又能被领取或执行。
 impl WorkflowRuntime {
     /// History is checked against its immutable installations, never today's active recipes.
     fn validate_historical_graph(&self, graph: &WorkflowGraph) -> RuntimeResult<()> {
+        // 每个带 Contract 的历史 Node 必须和安装时的 purpose/retry/budget/failure 一致；
+        // 当前配置变化不能重写旧 Run 的执行语义。
         graph.validate()?;
         for node in &graph.nodes {
             if let Some(hash) = &node.contract_hash {
@@ -36,6 +41,8 @@ impl WorkflowRuntime {
     }
 
     pub fn replay_run(&self, run_id: &RunId) -> RuntimeResult<WorkflowSnapshot> {
+        // reduce→revision→snapshot 三段都成功才返回；明确的不一致记为
+        // ReplayDiverged，Store/JSON/Domain 读取或校验错误仍可原类型传播。
         let replay = self.reduce_history(run_id)?;
         self.validate_replay_revisions(run_id, &replay)?;
         let snapshot = self.store.workflow_snapshot(run_id)?;
@@ -62,6 +69,8 @@ impl WorkflowRuntime {
     }
 
     pub(super) fn replay_events(&self, run_id: &RunId) -> RuntimeResult<Vec<StoredEvent>> {
+        // 分页请求固定 PAGE_SIZE 且 cursor 单调前进；结果最终收进完整 Vec，
+        // 因此单页有界不等于总内存有界，也不在这里重排跨页事件。
         const PAGE_SIZE: usize = 256;
 
         let mut events = Vec::new();
@@ -90,6 +99,8 @@ impl WorkflowRuntime {
         event: &StoredEvent,
         initial: bool,
     ) -> RuntimeResult<()> {
+        // WorkflowCreated 只能出现一次；WorkflowPatched 只能追加 Task 或更新 pending
+        // Task，不能删除/改写已运行节点，从而保留已产生 Artifact 的来源稳定性。
         if initial && (event.task_id.is_some() || event.attempt_id.is_some()) {
             return Err(Self::replay_error(
                 run_id,
@@ -187,6 +198,8 @@ impl WorkflowRuntime {
         replay: &'a mut ReplayedWorkflow,
         event: &StoredEvent,
     ) -> RuntimeResult<&'a mut ReplayedTask> {
+        // `'a` 只绑定 replay 的可变借用与返回值：拿到 &mut task 时不能同时
+        // 修改 replay 的其他部分；run_id/event 的借用无需延长到返回值的生命周期。
         let task_id = event.task_id.as_ref().ok_or_else(|| {
             Self::replay_error(
                 run_id,
@@ -206,6 +219,8 @@ impl WorkflowRuntime {
         task: &ReplayedTask,
         event: &StoredEvent,
     ) -> RuntimeResult<()> {
+        // Replay 要求事件 AttemptId 匹配 Running 的 active_attempt，拒绝旧尝试的
+        // 事件；实际 lease epoch fencing 由 Store 写入事务执行，不在此独立校验。
         let attempt_id = event.attempt_id.as_ref().ok_or_else(|| {
             Self::replay_error(
                 run_id,
@@ -255,6 +270,8 @@ impl WorkflowRuntime {
         replay: &ReplayedWorkflow,
         snapshot: &WorkflowSnapshot,
     ) -> RuntimeResult<()> {
+        // 最后按 replayed task 状态推导 WorkflowStatus；Outcome worker 被排除在 T0
+        // 终态计算之外，避免后续 T+1/T+3/T+5 任务把 T0 的完成时间线拉长或改写。
         let latest = replay.revisions.last().ok_or_else(|| {
             Self::replay_error(run_id, "workflow snapshot has no reduced graph revision")
         })?;

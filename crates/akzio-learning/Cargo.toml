@@ -1,3 +1,6 @@
+# 文件导读：akzio-learning 是 workspace 内 Outcome 指标、Lesson 与 Policy learning 的实现 crate；
+# domain 提供稳定类型/校验，store 提供唯一 CAS 持久化入口，serde/chrono/thiserror 支撑序列化、
+# 时间与错误类型。edition 和 rust-version 继承根 workspace，本文件不配置运行时权限或写入命令。
 [package]
 name = "akzio-learning"
 version = "0.2.0"

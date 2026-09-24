@@ -1,3 +1,4 @@
+# 文件职责：声明 Agent Contract、Prompt、Context、Submit 和 Review 编排 crate 的依赖。
 [package]
 name = "akzio-research"
 version = "0.2.0"

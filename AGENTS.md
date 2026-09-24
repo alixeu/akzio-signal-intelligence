@@ -18,7 +18,7 @@
 | Rust 模块、领域模型、持久化 | [运行时契约](docs/agent-runtime-contract.md) 第 1、2、4 节及涉及功能的章节；需要术语时查 [CONTEXT.md](CONTEXT.md) |
 | 研究拓扑、Prompt、模型预算、Context、Evidence | 运行时契约第 3、5、6、11、12 节；同步检查实际 Contract、Prompt 消费方及 Rust 校验 |
 | Decision、Execution、Broker、学习与迁移 | 运行时契约第 3、7、8、11、12 节；核验被冻结的来源、版本和现有 Gate |
-| Debug、真实模型、App/Core 联调 | 运行时契约第 12 节；[Debug 基础设施](docs/debug-control.md) 中对应入口与权限 |
+| 正式运行日志、真实模型、App/Core 联调 | 运行时契约第 12 节；[运行日志](docs/run-log.md) 中对应完整性与权限 |
 | 旧研究链路退役、历史兼容 | [研究协议与退役清单](docs/research-protocol-retirement.md)；区分历史读取和活动创建、执行能力 |
 | DecisionPolicy 缺失、校准准备 | [开发 Workflow](docs/development-workflow.md) 的 readiness 与 SQL 校准流程；核对 Store 资格、真实 Outcome、模型身份和显式风险限制 |
 | 测试、CI、打包、交付 | [开发 Workflow](docs/development-workflow.md) 的相关验证分支 |
@@ -33,12 +33,12 @@
 - Rust 是状态、授权、Contract、预算、Gate 和执行策略唯一权威。V2Store 是唯一持久化权威，不绕过 `akzio-store` 写 SQLite，不增加改变语义的并行状态。
 - 运行时研究 Agent 只经 `akzio-context` 获取授权资料；不开放 RawEvidence、任意文件、SQL、联网或交易工具。开发工具可用不改变运行时沙箱。
 - Paper、PositionPlan、Shadow 的新 Analyst/Critic/Synthesizer 使用同一单次结构化提交协议，只接收授权 projections 并调用 `submit_result`。Outcome 保留独立两阶段协议；不得用旧研究 Draft 或 Planner fallback 恢复执行。版本以运行时契约和源码为准。
-- Planner / PaperDryRun 旧研究的创建和执行能力已退役；历史读取、展示、导出与完整性审计保留。遇到 `legacy_workflow_retired` 不恢复旧 recipe、fixture 图或隐藏入口；离线验证使用正式拓扑的 `debug verify-fixture`。
+- Planner / PaperDryRun 和独立 Debug Core 的创建与执行能力已退役；历史读取、展示、导出与完整性审计保留。遇到 `legacy_workflow_retired` 不恢复旧 recipe、fixture 图或隐藏入口；正式拓扑离线验证在 Cargo 测试内运行。
 - T0 研究与历史 T+1/T+3/T+5 评估独立推进；按四资产共同完成的交易 Session 计算。NoOrder 仍须评估，未知风险和缺失校准保持 fail closed。
 - DecisionPolicy 的风险限制、校准 dataset、候选版本和激活记录均以 SQL Store/CAS 为权威。先用只读 readiness 定位缺口，再按既有 collect/build/inspect/validate/activate 流程推进；不伪造样本、模型发布日期或知识截止日期，不以生成候选代替显式激活。
 - Paper 写入须通过原审批和全部 Gate，并先持久化确定性 Commitment。PositionPlan 在 Decision 后结束，没有 ExecutionGate、PaperCommit、Reconcile 或 Evaluate。
-- Debug Core 使用 `.akzio/` 下的新隔离 Store；禁止打开 `~/.akzio/store` 或启用 `auto_paper`，Broker 默认 forbidden，不写 canonical policy 或 Active Lesson。
-- Alpaca Paper 是唯一交易模拟环境；`-fakerOnline` / `--faker-online` 和本地模拟账户、时钟、成交适配器已删除。显式 `--paper` 使用正式 Paper 图和原生 Paper API，仍须原审批与全部 Gate。时段由真实 Clock 与交易日历确定，隔夜使用 BOATS / overnight 行情并检查资产资格；休市延期后刷新快照、重跑 Gate，提交成功不等于成交。隔离运行不能计入正式校准样本，完成或等待 Outcome 不改变 Store 资格。
+- 旧隔离 Debug Store 不得作为正式 Core 打开或改成 canonical；历史身份仅供读取。正式运行完整私有日志写入 `~/.akzio/log/YYYYMMDD/`，阶段归档失败阻止新的模型与订单写入；必要的已提交订单只读对账及受权撤单保留安全路径。
+- Alpaca Paper 是唯一交易模拟环境；`-fakerOnline` / `--faker-online` 和本地模拟账户、时钟、成交适配器已删除。`run_core.sh position-plan|paper` 复用已有正式 Core，或在回环端口明确无服务时启动相同配置的正式 Core；显式 `paper` 使用 canonical Paper 图和原生 Paper API，仍须原审批与全部 Gate。时段由真实 Clock 与交易日历确定，隔夜使用 BOATS / overnight 行情并检查资产资格；休市延期后刷新快照、重跑 Gate，提交成功不等于成交。仅隔离 Debug 运行不能计入正式校准样本，完成或等待 Outcome 不改变其 Store 资格。
 - 不静默改写历史 CAS、Contract、Commitment、哈希或迁移边界；旧任务与有效 lease 的升级阻断仍须合法处理。业务证明与完整 provenance 必须保留。
 - Store、BLOB、socket、生成报告、认证凭据和本地配置覆盖不得提交 Git。
 
@@ -47,6 +47,25 @@
 优先 `rg`、现有 CLI/连接器和仓库脚本，按当前工具实际接口调用。独立只读搜索和检查可并行；依赖动作及有副作用的操作顺序执行，检查每项结果，不重复发起尚未完成的动作。遵循已加载的全局 RTK 原始输出例外。
 
 获准的独立子任务可委派，主任务继续有用的本地工作并负责整合和验证；派发、计划和中间结果不等于完成。外部依赖或审批仅阻塞相关动作；无法验证时交付已证实部分并明确剩余项，不猜测成功。
+
+## 日常运行：与 App 相同的两个模式
+
+先配置真实模型/行情。[scripts/run_core.sh](scripts/run_core.sh) 只提供与 App 按钮相同的两个触发动作，调用同一个 `POST /runs`；已有正式 Core 时复用，端口明确未监听时自动启动、等待 ready 后再提交：
+
+```bash
+# 1. 真实 LLM 生成仓位计划，不提交订单
+bash scripts/run_core.sh position-plan
+# 2. 真实 LLM 生成计划，并在审批与 Gate 通过后提交 Alpaca Paper 订单
+bash scripts/run_core.sh paper
+```
+
+- **冷启动自动判断**：不需要额外选择冷启动、先跑 PositionPlan 或手动执行 readiness。缺 active Policy 时，Core 保留合格研究分配，正式目标全零；Paper 走 `NoOrder`，不绕过审批、不自动激活 Policy。
+- **预测与后续评估分开**：两种模式都生成面向 T1/T3/T5 的预测；只有 Paper 在 T0 链路完成后安排跨交易日 Outcome，`NoOrder` 也可评估。PositionPlan 在 Decision 后结束，没有 Outcome。后续数据/冻结 baseline 必须完整，Core 须继续运行或用同一 Store 恢复；并非运行命令后立刻完成 T+5。
+- **提交不等于完成**：脚本只触发一次并返回 Run ID；同 Paper Session 可复用已有 Run。发生 `unknown_after_post` 时先查原 Run/Session，不直接重发。Paper 可能 NoOrder，不承诺必定有订单或成交。
+- **Core 生命周期**：仅明确的连接拒绝才自动启动，不因端口占用、token/身份错误或超时而启动第二个 Core。正式 Store 与 token 沿用配置，默认位于 `~/.akzio/store`；启动日志与 App 位于同一 Akzio home 的 `logs/` 下，创建私有的 `core-*.log`，不覆盖 App 的 `core.log`，也不再写仓库 `.akzio/`。启动的 Core 在脚本退出后继续运行，以处理待成交与 Outcome；输出 `CORE_STARTED_PID`、`CORE_LOG`。App 当前不附着外部 Core：如果 Core 是脚本启动的，之后不要再让 App 启动另一个；用原生 `akzio --config <同一配置> run replay/detail <RUN_ID>` 检查状态。若配置 `auto_paper=true` 且端口未监听，PositionPlan 拒绝自动启动，以免附带启动 Paper scheduler。
+- **入口保持简单**：默认 `~/.akzio/config.toml`，仅可在模式前用 `--config FILE` 指定其他正式配置（相对路径按调用者目录解析）；无参数或 `--help` 仅显示帮助。使用当前源码的 Rust CLI，不依赖 Python/curl/jq，不改模型/Store/Policy/审批、不自动导出或清理。
+
+构建仍用 [build_app_and_core.sh](scripts/build_app_and_core.sh)；开发检查、校准、诊断与导出使用[开发 Workflow](docs/development-workflow.md)中的原生 Rust 命令，不塞回日常运行脚本。正式 Core 自动记录并压缩阶段日志，Shell 不等待运行完成或负责压缩。保留已删除的 Python 脚本的退役状态，不新增根 `tests/`；Shell 与 HTTP 边界回归由 `akzio-cli` 的 Cargo 测试覆盖。
 
 ## 验证与完成
 

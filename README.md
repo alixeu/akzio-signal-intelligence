@@ -141,7 +141,7 @@ flowchart TD
 
 ### 4.2 研究提交与 Outcome 两阶段协议
 
-Paper、PositionPlan、Shadow 的 Analyst、Critic、Synthesizer、ProposalReviewer 使用 Contract 67 / PromptBundle 37：模型直接调用 `submit_result` 提交 `result + deliberation`，输入只含授权 projections，不提供独立 Draft、读取或搜索工具。Rust 校验引用闭包、方向资格和补采范围，并绑定交易日历。Outcome 保持 Contract 63 / PromptBundle 35 与冻结哈希，继续 Draft → 受控读取 → Submit。
+Paper、PositionPlan、Shadow 的 Analyst、Critic、Synthesizer、ProposalReviewer 使用研究 Contract 69 / PromptBundle 38（freshness candidate 70）：模型直接调用 `submit_result` 提交 `result + deliberation`，输入只含授权 projections，不提供独立 Draft、读取或搜索工具。Rust 校验引用闭包、方向资格和补采范围，并绑定交易日历。Outcome 保持 Contract 63 / PromptBundle 35 与冻结哈希，继续 Draft → 受控读取 → Submit。
 
 Outcome Draft 使用最多一半输出预算与 70% 墙钟时限，必须先保存 Memo 才能提交。读取遵循“持久化 ToolCall → 执行读取 → 持久化 ToolResult”。所有协议共享原有任务预算、调用审计和恢复机制，阶段转换不清零用量。退休范围和历史边界见 [研究协议迁移清单](docs/research-protocol-retirement.md)。
 
@@ -178,7 +178,7 @@ target/debug/akzio calibration readiness --store ~/.akzio/store --min-samples 30
 
 `collect` 只接受 canonical Store 的真实 Decision、密封 Outcome 和四资产共同交易 Session 标签，同时检查模型身份、Contract、训练窗口及价格序列。有效 Synthesizer 路由必须有可核实的 `release_date` 与 `knowledge_cutoff`。缺少样本或条件时保持阻断，不用目标仓位、事后总结或合成样本填充。`activate` 校验模型与当前 Synthesizer Contract 后，原子更新同一 Policy Artifact 的激活历史和 active head。
 
-隔离 Debug 和原生 Alpaca Paper 入口 `python3 scripts/position_plan_run.py --paper` 可以验证正式图，但其运行不能计入正式校准；readiness 明确报告 `isolated_debug_store`，等待 Outcome 不会改变资格。旧 `-fakerOnline` 已删除。Paper 入口按真实交易时段、原审批和全部 Gate 执行；`NoOrder` 可表示流程已完成，不能据此宣称 Policy 已校准或发生 Paper 下单、成交。扩展时段、待成交恢复和归档边界见 [开发 Workflow](docs/development-workflow.md)。
+日常运行只用 `bash scripts/run_core.sh position-plan`（生成计划，不下单）和 `bash scripts/run_core.sh paper`（生成计划并进入 Paper 执行）。已有正式 Core 时复用；没有服务时脚本自动启动同一配置的正式 Core，等待 ready 后才向 App 使用的同一个接口提交，不依赖 Python。自动启动的 Core 会在脚本退出后继续处理后续任务；App 当前不能附着这一外部进程，用同配置的原生 `run replay/detail` 查询。冷启动由 Core 自动判断：缺 Policy 时保留合格研究分配、正式目标归零，Paper 为 NoOrder。两种模式都有 T1/T3/T5 预测，但只有 Paper 安排后续 Outcome；完整成熟的真实市场标签才可能用于校准。原审批及全部 Gate 通过后才可能发单，不保证每次都下单或成交。返回 Run ID 仅确认提交/复用。两种模式说明见 [AGENTS](AGENTS.md)，开发诊断与导出见 [开发 Workflow](docs/development-workflow.md)。
 
 ---
 
@@ -245,7 +245,7 @@ cargo run --locked -p akzio-cli -- observatory-config \
 
 ## 九、CLI 操作与运维指令大全
 
-常驻服务的控制与查询通过认证的回环 HTTP API 完成，通信令牌存放于 Store Root 的 `.daemon-token`（权限 0600）。离线 `debug verify-fixture` 在新隔离 Store 内直接验证正式拓扑：
+常驻服务的控制与查询通过认证的回环 HTTP API 完成，通信令牌存放于 Store Root 的 `.daemon-token`（权限 0600）。离线拓扑验证在 Rust workspace 测试中完成：
 
 ```bash
 # 1. 启动本地守护进程（监听 127.0.0.1:7342）
@@ -254,50 +254,34 @@ cargo run -p akzio-cli -- daemon serve
 # 2. 检查守护进程健康状态与租约
 cargo run -p akzio-cli -- daemon health
 
-# 3. 正式 PositionPlan 九节点离线验证，自动创建 .akzio 下的新 Store
-cargo run --locked -p akzio-cli -- debug verify-fixture
+# 3. 正式图、归档与故障边界的离线回归（不调用真实模型/Broker）
+cargo test --workspace --locked
 
-# 4. 控制接口测试服务；通过 debug prepare 创建正式 Paper / PositionPlan 图
-cargo run --locked -p akzio-cli -- --config config/debug-controller-fixture.toml debug serve-fixture
-
-# 5. 从耐久事件重放并验证指定 Run（只读诊断）
+# 4. 从耐久事件重放并验证指定 Run（只读诊断）
 cargo run -p akzio-cli -- run replay <run-id>
 
-# 6. 监听 Run 的实时生命周期事件流 (SSE)
+# 5. 监听 Run 的实时生命周期事件流 (SSE)
 cargo run -p akzio-cli -- run events <run-id>
 
-# 7. 系统紧急冻结与解冻（安全干预）
+# 6. 系统紧急冻结与解冻（安全干预）
 cargo run -p akzio-cli -- daemon freeze "操作员维护"
 cargo run -p akzio-cli -- daemon unfreeze "恢复运行"
 
-# 8. 本地统一 CAS 数据库完整性巡检
+# 7. 本地统一 CAS 数据库完整性巡检
 cargo run -p akzio-cli -- store doctor
 ```
 
 ---
 
-### 分流程 Debug
+### 私有运行日志与历史 Debug
 
-完整设计、命令与验证边界见 [分流程 Debug 基础设施](docs/debug-control.md)。新入口使用隔离 Core，正式业务 DAG 不变，控制状态持久化在 V2Store。
-
-```bash
-# 仅离线验证控制器，不调用外部模型或券商。保持此 Core 运行。
-cargo run -p akzio-cli -- --config config/debug-controller-fixture.toml debug serve-fixture
-# 另一个终端：创建正式拓扑但保持暂停；加 --fixture-controller 则仅验证旧 CI 控制器。
-cargo run -p akzio-cli -- --config config/debug-controller-fixture.toml debug prepare --session 2026-09-09
-# 查看唯一 Task ID 后执行精确单步；具体运行实例见报告。
-cargo run -p akzio-cli -- --config config/debug-controller-fixture.toml debug --help
-```
-
-真实模型阶段使用新隔离 Store、`debug_control=true`、`auto_paper=false` 和原生产模型配置启动 `daemon serve`。`debug prepare` 默认禁止 Broker 写入。修改代码/Contract/模型路由后不能继续消费旧身份的 permit，应创建新实验。旧 `run retry` 是新 Run，不等于 Debug resume。
-
-App 可通过 `AKZIO_DEBUG_ENDPOINT` 与 `AKZIO_DEBUG_STORE_ROOT` 连接显式选择的隔离 Core；这一模式不启动默认 `~/.akzio/store` Core。演示 Store 位于 `.akzio/debug-controller-store`，不随打包中间产物清理。
+独立 Debug Core、命令组、控制路由和 App 入口均已退役；旧隔离 Store 只能作历史读取，不能转为正式 Core。正式 Core 在 `~/.akzio/log/YYYYMMDD/` 为每个真实 Run 的 T0/T1/T3/T5 分别生成私有 ZIP，包含脱敏 LLM 过程与 Rust 事件；启动模型探测另存独立 ZIP。完整性与日志故障阻断见[运行日志](docs/run-log.md)，历史兼容见[退役说明](docs/debug-control.md)。
 
 ## 十、Observatory 桌面应用
 
 项目包含配套的原生 macOS 管理应用（基于 SwiftUI 构建）：
 
-- **打包构建**：运行 `scripts/update_app_and_submit_debug.sh` 生成已签名的分发包 `apps/dist/akzio.app`，并保留构建产物。已有 Bundle 不会被覆盖；再次构建须通过 `AKZIO_APP_BUNDLE` 指定新路径，示例见 [开发 Workflow](docs/development-workflow.md)。
+- **打包构建**：运行 `bash scripts/build_app_and_core.sh` 编译当前 Swift App 与 release Rust Core，生成新的 ad-hoc 签名 Bundle，并输出 `APP_BUNDLE` 和独立的 `RUST_BINARY` 路径。默认每次选择新的 `apps/dist/akzio-*.app`，不会覆盖旧 Bundle；可通过 `AKZIO_APP_BUNDLE` 指定其他未使用目标，详见 [开发 Workflow](docs/development-workflow.md)。
 - **Core 嵌入机制**：App 启动时会通过 `RustCoreSupervisor` 自动将内嵌的 `akzio-core` 启动为 `daemon serve`，无缝读取 `~/.akzio/config.toml`。
 - **状态监控**：若界面显示 `Paper scheduler waiting: broker market is closed`，表明系统正在正常等待下一个美股开盘窗口。
 
@@ -318,15 +302,15 @@ cargo clippy --workspace --all-targets -- -D warnings
 # 单元测试与集成测试
 cargo test --workspace
 
-# 正式九节点离线验证，包含 Store Doctor 和证据导出；不依赖真实模型配置
-cargo run --locked -p akzio-cli -- debug verify-fixture
+# 正式图、Run 日志和权限回归；不依赖真实模型配置
+cargo test --workspace --locked
 # 独立 store doctor 命令要求对应配置的认证 daemon 正在运行
 cargo run -p akzio-cli -- store doctor
 ```
 
 ### 交付报告分级标准
 - **implemented**：功能代码完成并通过本地语法检查。
-- **offline-verified**：通过全套离线测试与 `debug verify-fixture` 验证。
+- **offline-verified**：通过适用的全套离线测试验证；不代表真实模型或 Paper 成交。
 - **real-Paper-verified**：在真实 Alpaca Paper 环境下完成至少 1 个完整开市周期的报单与对账。
 - **outcome/learning-verified**：完成 T+5 交易日封存并成功生成完整的 Evaluated Experience。
 
@@ -343,8 +327,8 @@ cargo run -p akzio-cli -- store doctor
 - **收益口径**：从初始股数、现金、去重成交和费用重建执行后敞口，再按冻结敞口计算 Outcome。具有原基线报价与成交记录的新观察执行路径标注 `frozen_post_execution_exposure_v3`，分列价格效应、实施差额、初始估值差额和估算费用；旧 V2 与未观察执行的估计路径保留各自语义。实际账户 NAV 为 unavailable，因为没有后续订单与外部现金流完整账本。计价窗口内发现公司行动或无法确认一致价格口径时数值不可用；窗口外行动保留证据并允许早期阶段继续，不用 adjusted bar 猜测收益。
 - **成本与身份**：Decision production cost 从其依赖任务闭包重建，包含该路径失败/重试；Outcome/叙事成本单独累计，生命周期总成本为另一读数。Experience 分开记录原研究 Contract 集、Workflow revision 与 evaluator Contract，原 DecisionContext 保留模型、policy 与 execution lineage。
 - **学习资格**：市场窗口完整、12-slot 研究充分、复盘有效、风险真值已测量是独立条件。Rust-only T5 可以封存数值和 ModelUnavailable 复盘，不能据此晋升。`run repair-narrative <run-id>` 在原 Run 上有界补写叙事 revision，保留原数值 Outcome；重新进入原资格检查和 Evaluation 事务，条件不足保持当前状态。LessonProposal 必须带资产、horizon、排除条件和来源，只生成 Draft/quarantine。
-- **查询与兼容**：`run replay` 返回 execution、各阶段叙事、数值封存、学习状态和成本分项。Store v15 新增按 Run/kind 的 Artifact 索引；v16 增加隔离 Debug 调度 head 和 RunScoped DebugRecord；v17 增加 DecisionPolicy 的不可变安装记录、激活链和 active head，不改变既有 CAS 或 Commitment。Domain schema 保持 10；研究 Contract 67、Prompt bundle 37、freshness candidate 68；Outcome Contract 63、Prompt bundle 35；Outcome metric V3（V2 仍可读取）、evaluation context v1，benchmark definition 仍为 1。旧缺失字段保留 unknown 语义，旧任务不自动换 Contract。升级与旧任务阻断规则见运行时契约。
+- **查询与兼容**：`run replay` 返回 execution、各阶段叙事、数值封存、学习状态和成本分项。当前 Store schema 18；v15 的 Run/kind Artifact 索引、v16 的历史隔离 Debug 调度记录和 v17 的 DecisionPolicy 安装/激活记录仍可读取，但不恢复 Debug 执行能力，也不改既有 CAS 或 Commitment。Domain schema 保持 10；研究 Contract 69、Prompt bundle 38、freshness candidate 70；Outcome Contract 63、Prompt bundle 35；Outcome metric V3（V2 仍可读取）、evaluation context v1，benchmark definition 仍为 1。旧缺失字段保留 unknown 语义，旧任务不自动换 Contract。升级与旧任务阻断规则见运行时契约。
 
 验证结果按每次任务的实际执行范围报告；fixture 检查不构成真实 LLM/Paper、跨交易日学习或生产压力验收。
 
-研究与执行边界：现有 `RunPurpose::PositionPlan` 表示 research + Decision / target position plan，无 ExecutionGate、PaperCommit、Reconcile 或 Evaluate；`RunPurpose::Paper` 使用同一 `approved_research_proposal` 三组 T1/T3/T5 Analyst/Critic 和 Synthesizer，再进入原执行链。没有新增 RunMode。Paper 的 account / positions / open_orders / fills / quotes / clock Need 保留 scheduler identity 与 provenance，前置只记录 Deferred，执行时才刷新。PositionPlan 执行显示 N/A，Debug manual/continuous、Broker policy、learning scope 仍是独立控制维度。补充研究保留冻结 Session 日期及原 future-data/cutoff 校验，不再要求市场当前开放。NewsWeb acquisition purpose mapping 和 policy hash 未改，缺失或未验证的方向证据不得变成有效 grounds。
+研究与执行边界：现有 `RunPurpose::PositionPlan` 表示 research + Decision / target position plan，无 ExecutionGate、PaperCommit、Reconcile 或 Evaluate；`RunPurpose::Paper` 使用同一 `approved_research_proposal` 三组 T1/T3/T5 Analyst/Critic 和 Synthesizer，再进入原执行链。没有新增 RunMode。Paper 的 account / positions / open_orders / fills / quotes / clock Need 保留 scheduler identity 与 provenance，前置只记录 Deferred，执行时才刷新。PositionPlan 执行显示 N/A；历史 Debug manual/continuous、Broker policy 和 learning scope 仅供旧数据解码，不再提供控制入口。补充研究保留冻结 Session 日期及原 future-data/cutoff 校验，不再要求市场当前开放。NewsWeb acquisition purpose mapping 和 policy hash 未改，缺失或未验证的方向证据不得变成有效 grounds。

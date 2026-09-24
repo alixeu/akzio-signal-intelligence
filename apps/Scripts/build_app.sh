@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
+# 文件职责：在 SwiftPM 与 Cargo 都成功后组装新的 macOS .app bundle。
+# 它拒绝覆盖已有 bundle，复制 Rust CLI 作为 Core，并生成版本化 Info.plist；不启动业务。
+# scripts/build_app_and_core.sh 会先调用本脚本再验收可执行文件并签名；手动调用也会写入新的 apps/dist 或指定目标。
+# Swift/Cargo 构建产物留在各自构建目录，只有编译均成功后才开始创建 Bundle；本脚本自身不做 codesign/notarization。
 # Assemble a double-clickable .app from the SwiftPM build product.
 # No Xcode required: pure `swift build` + bundle layout.
+# 严格模式拒绝未定义变量，并让未被条件结构接住的失败命令/管道传播退出；脚本没有回滚 trap，Bundle 创建后失败可能留下部分目录。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -34,6 +39,7 @@ cargo build --manifest-path "$REPO_ROOT/Cargo.toml" --locked --release -p akzio-
 
 echo "==> laying out bundle"
 # 只在两个独立编译步骤成功后创建 bundle 目录，并复制实际可执行文件。
+# 若此后的复制、权限设置或 plist 写入失败，已创建内容会保留；下次运行会按前面的防覆盖检查要求换新目标。
 mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources"
 cp "$BIN_PATH/AkzioObservatory" "$BUNDLE/Contents/MacOS/AkzioObservatory"
 cp "${CARGO_TARGET_DIR:-$REPO_ROOT/target}/release/akzio" "$BUNDLE/Contents/MacOS/akzio-core"

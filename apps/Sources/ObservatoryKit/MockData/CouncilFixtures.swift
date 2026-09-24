@@ -1,9 +1,14 @@
 import Foundation
 
+// 文件导读：为 Intelligence 页生成候选方案、角色卡、依据标签和 Inspector 摘要；
+// 由 ScenarioLibrary 汇总调用，输入只有 MockScenario 与同一组 presentation 节点。
+// 数值由场景 seed 可复现地产生，文案和角色状态是 UI fixture，不是本次真实模型输出或证据审计。
+// 先读 roles 中的局部 card 闭包与 inspector：前者共享并推进 generator，后者消费 WorkflowFixtures 的节点投影。
 // MARK: - Council & inspector fixtures
 
 enum CouncilFixtures {
     static func uncertainties(scenario: MockScenario) -> [UncertaintyPresentation] {
+        // 数据不可用时不返回不确定性权重；正常场景的 label 顺序固定，map 同步捕获并推进本地 generator。
         guard !scenario.dataUnavailable else { return [] }
         var generator = SeededGenerator(seed: scenario.seed &+ 401)
         let labels = [
@@ -18,6 +23,7 @@ enum CouncilFixtures {
     }
 
     static func alternatives(scenario: MockScenario) -> [AlternativePresentation] {
+        // alternatives 是固定的研究分支展示，第三项在数据不可用时保持 nil 匹配度。
         var generator = SeededGenerator(seed: scenario.seed &+ 419)
         return [
             AlternativePresentation(
@@ -39,6 +45,7 @@ enum CouncilFixtures {
     }
 
     static func basisArtifacts(scenario: MockScenario) -> [BasisArtifact] {
+        // 基础材料列表随 stale/critic 场景追加提示，反映上下文来源而不伪造新证据。
         var items = [
             BasisArtifact(label: "12 normalized documents", symbol: "doc.text.magnifyingglass"),
             BasisArtifact(label: "Quote snapshot", symbol: "chart.bar"),
@@ -55,6 +62,7 @@ enum CouncilFixtures {
 
     /// config/akzio.toml sets `low`; the gallery scenarios exercise the other steps.
     static func intensity(scenario: MockScenario) -> ReasoningIntensity {
+        // reasoning intensity 由 scenario 选择展示级别；不改变实际模型配置。
         switch scenario {
         case .criticTriggeredMaterialConflict, .decisionBlocked: .high
         case .policyProven, .policyContested: .medium
@@ -63,6 +71,7 @@ enum CouncilFixtures {
     }
 
     static func roles(scenario: MockScenario) -> [RoleCardPresentation] {
+        // roles 用同一 generator 生成 token/latency 等指标，状态与场景的 workflow 对齐。
         var generator = SeededGenerator(seed: scenario.seed &+ 433)
         let running = scenario.workflowStatus == .running
 
@@ -72,6 +81,8 @@ enum CouncilFixtures {
             status: AkzioStatus,
             hasMetrics: Bool = true
         ) -> RoleCardPresentation {
+            // card 是嵌套函数，捕获外层可变 generator；数组字面量依次调用它，只有 hasMetrics 时才消耗指标随机数。
+            // 缺失角色指标继续为 nil，而不是把“未观测”换成零。
             RoleCardPresentation(
                 role: role,
                 model: model,
@@ -104,6 +115,7 @@ enum CouncilFixtures {
     }
 
     static func council(scenario: MockScenario) -> CouncilPresentation {
+        // council 汇总角色、模型候选、替代方案、不确定性和依据材料，供 Intelligence 页面读取。
         let cards = roles(scenario: scenario)
         let selected: AgentRole = scenario.criticTriggered ? .critic : .synthesizer
         var generator = SeededGenerator(seed: scenario.seed &+ 461)
@@ -125,6 +137,7 @@ enum CouncilFixtures {
     }
 
     static func inspector(scenario: MockScenario, nodes: [WorkflowNodePresentation]) -> StageInspectorPresentation {
+        // inspector 优先选择当前节点，其次选择失败节点，最后回退到节点列表首项。
         let node = nodes.first { $0.isActive } ?? nodes.first { $0.taskStatus == .failed } ?? nodes[0]
         var generator = SeededGenerator(seed: scenario.seed &+ 487)
         return StageInspectorPresentation(

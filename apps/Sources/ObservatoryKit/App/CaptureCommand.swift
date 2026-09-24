@@ -1,6 +1,9 @@
 import AppKit
 import SwiftUI
 
+// 文件导读：实现可执行目标 `main.swift` 委托的离屏截图命令：解析 CLI 参数、构造固定 Mock 的 AppShell、编码并写 PNG。
+// 它调用 `AppShell` 的关闭 Core 自动启动初始化器，因此只生成 UI 图像；错误由 `run` 映射为进程退出码，不进入常驻窗口。
+// 先读 handles/run、parse，再读 render；`Options` 是解析后跨步骤传递的值快照，`throws` 将渲染/文件错误送回命令边界。
 // MARK: - Capture command
 //
 // `AkzioObservatory --capture --scenario 03 --route workflow --out shot.png`
@@ -15,6 +18,7 @@ import SwiftUI
 @MainActor
 public enum CaptureCommand {
     public struct Options: Sendable {
+        // Options 是一次截图请求的值快照；Sendable 让参数可安全地从命令入口传到主 actor 渲染。
         public var scenario: MockScenario
         public var route: AppRoute
         public var output: String
@@ -29,10 +33,12 @@ public enum CaptureCommand {
     /// Returns true when the arguments asked for a capture, so `main` knows not to
     /// open a window. Deliberately not actor-isolated: it only reads the argv array.
     public nonisolated static func handles(_ arguments: [String]) -> Bool {
+        // 这里只做纯数组查询，不触碰 AppKit/SwiftUI 状态，所以可以在任意执行上下文判断入口。
         arguments.contains("--capture")
     }
 
     public static func run(_ arguments: [String]) -> Int32 {
+        // run 把解析、主 actor 渲染和文件写入的 throws 结果压缩成 CLI 约定的退出码。
         // 参数不完整返回 2；渲染/写文件失败返回 1；只有 PNG 已写入才返回 0。
         guard let options = parse(arguments) else {
             FileHandle.standardError.write(Data(usage.utf8))
@@ -54,6 +60,7 @@ public enum CaptureCommand {
         case renderFailed
         case encodeFailed
 
+        // 错误枚举把图像生成失败和 PNG 编码失败分开，run 再将 description 写入 stderr。
         var description: String {
             switch self {
             case .renderFailed: "ImageRenderer produced no image"
@@ -63,6 +70,7 @@ public enum CaptureCommand {
     }
 
     static func render(_ options: Options) throws {
+        // render 只接收已解析的值类型 Options；失败通过 throws 返回给 run，不在 UI 中显示错误。
         // 这里构造的是关闭 Core 自动启动的离屏 AppShell，因此截图不会启动真实任务或网络请求。
         let content = AppShell(
             scenario: options.scenario,
@@ -98,6 +106,7 @@ public enum CaptureCommand {
 
     // MARK: Argument parsing
 
+    // 参数帮助文本由 run 在解析失败时原样写到 stderr；字符串本身与解析逻辑分离。
     static let usage = """
     usage: AkzioObservatory --capture --scenario <NN|name> --route <route> --out <path>
                             [--size WxH] [--scale N] [--settings] [--compact]
@@ -114,10 +123,11 @@ public enum CaptureCommand {
     """
 
     static func parse(_ arguments: [String]) -> Options? {
+        // parse 的 Optional 表示“是否具备最小可渲染输入”；尺寸、scale 等可选字段各自回退默认值。
         var values: [String: String] = [:]
         var flags: Set<String> = []
         var index = 0
-        // 解析器只识别 --key value 和无值 flag；未知 key 保留在字典中，最终由必需字段校验淘汰。
+        // 解析器只识别 --key value 和无值 flag；未知 key 也会进入字典/集合但没有后续读取，因此会被忽略，真正拒绝条件是必需字段缺失。
         while index < arguments.count {
             let argument = arguments[index]
             guard argument.hasPrefix("--") else { index += 1; continue }
@@ -144,6 +154,7 @@ public enum CaptureCommand {
         var height: CGFloat = 982
         // 尺寸非法时保留默认值；scale 同样回退到 2，避免一个坏参数改变渲染目标的可用性。
         if let size = values["size"] {
+            // `compactMap` 对每段数字执行转换并丢弃无法解析的段；只有恰好两项才覆盖默认宽高。
             let parts = size.lowercased().split(separator: "x").compactMap { Double($0) }
             if parts.count == 2 {
                 width = CGFloat(parts[0])

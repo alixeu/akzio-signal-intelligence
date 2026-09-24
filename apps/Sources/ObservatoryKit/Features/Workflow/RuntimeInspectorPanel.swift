@@ -1,8 +1,14 @@
 import SwiftUI
 
+// 该面板只读取 ObservatoryStore 提供的 Rust inspection/Journal projection；preview 和 journal
+// 请求的结果留在本地 @State，错误显示在 UI，不会被解释成运行成功。
 /// Read-only projections. Buttons fetch Core data; none creates or resumes a run.
+// 文件导读：WorkflowPage 的 Runtime Inspector 读取 Store 当前 Run 的 inspection/blueprint/journal；
+// 用户点击后才创建 Task 请求只读 Core 接口，事件 cursor 增量追加且请求错误单独显示。先读 body、definition、journal、preview/loadEvents。
 struct RuntimeInspectorPanel: View {
     let store: ObservatoryStore
+    // blueprint 是当前按钮请求的预览，events 是按 cursor 增量读取的本地页；它们与当前
+    // inspection 的 runID 绑定，切换 Run 时会被清空。
     @State private var blueprint: WorkflowBlueprintPayload?
     @State private var events: [RuntimeJournalPayload.Event] = []
     @State private var cursor: Int64 = 0
@@ -13,6 +19,7 @@ struct RuntimeInspectorPanel: View {
     @State private var selectedTab = "summary"
 
     var body: some View {
+        // onChange 只重置本地读取游标和错误，不自动发请求；用户点击按钮后才启动 Task。
         DisclosureGroup("运行检查器") {
             VStack(alignment: .leading, spacing: 12) {
                 Picker("检查内容", selection: $selectedTab) {
@@ -22,7 +29,7 @@ struct RuntimeInspectorPanel: View {
                 }
                 .pickerStyle(.segmented)
                 if busy { ProgressView().controlSize(.small) }
-                if !store.debugConnected {
+                if !store.coreConnected {
                     Label("尚未连接 Core · 连接后可读取流程定义和运行记录", systemImage: "wifi.slash")
                         .font(.callout).foregroundStyle(.secondary)
                 }
@@ -48,12 +55,14 @@ struct RuntimeInspectorPanel: View {
     }
 
     private var definition: some View {
+        // 预览按钮调用 Core 的 blueprint endpoint；已有 run blueprint 优先作为冻结定义，
+        // blueprint 非 nil 时才显示“当前流程预览”并提供返回原定义的本地操作。
         VStack(alignment: .leading, spacing: 10) {
             HStack {
                 ForEach(["position_plan", "paper"], id: \.self) { purpose in
                     Button(purpose == "paper" ? "预览 Paper 流程" : "预览 PositionPlan 流程") {
                         Task { await preview(purpose) }
-                    }.disabled(busy || !store.debugConnected)
+                    }.disabled(busy || !store.coreConnected)
                 }
             }
             if let graph = blueprint ?? store.runtimeInspection?.blueprint {
@@ -85,6 +94,8 @@ struct RuntimeInspectorPanel: View {
     }
 
     private var journal: some View {
+        // journal 使用 cursor/hasMore 做增量分页；events 只追加服务端返回的事件投影，
+        // 读取到日志不代表 task、Run 或业务流程已经完成。
         VStack(alignment: .leading, spacing: 10) {
             if events.isEmpty {
                 Text(cursor == 0 && hasMore ? "尚未读取事件记录" : "当前没有可显示的事件")
@@ -122,11 +133,13 @@ struct RuntimeInspectorPanel: View {
             }
             Button(events.isEmpty ? "读取事件" : (hasMore ? "加载下一页" : "检查新事件")) {
                 Task { await loadEvents() }
-            }.disabled(busy || !store.debugConnected || store.runtimeInspection?.runID == nil)
+            }.disabled(busy || !store.coreConnected || store.runtimeInspection?.runID == nil)
         }
     }
 
     private func preview(_ purpose: String) async {
+        // Task 中的 async preview 先占用 busy，defer 保证成功、抛错和提前返回都释放它；
+        // 捕获 runID 后再校验，避免旧请求完成时覆盖用户已切换到的新 Run。
         busy = true; defer { busy = false }
         let runID = store.runtimeInspection?.runID
         do {
@@ -140,6 +153,8 @@ struct RuntimeInspectorPanel: View {
     }
 
     private func loadEvents() async {
+        // after=cursor 只请求游标之后的 journal；append/next_cursor/has_more 都来自 Core，
+        // 任何错误只写入 error，不能用空数组伪造“没有事件”。
         guard let runID = store.runtimeInspection?.runID else { return }
         busy = true; defer { busy = false }
         do {
@@ -154,6 +169,8 @@ struct RuntimeInspectorPanel: View {
 
 }
 
+// Summary 只把 inspection 的 control/checkpoint/recovery 字段格式化；recoveryLabel 的
+// default 分支明确表示未知，不把未识别字符串当作 terminal 或成功。
 struct RuntimeInspectionSummary: View {
     let inspection: RuntimeInspectionPayload
     var body: some View {
@@ -170,9 +187,33 @@ struct RuntimeInspectionSummary: View {
             if let runID = inspection.runID {
                 Text("Run: \(runID)").font(.system(.caption, design: .monospaced)).textSelection(.enabled)
             }
+            if let history = inspection.run_log_status, !history.isEmpty {
+                ForEach(history.indices, id: \.self) { index in
+                    let entry = history[index]
+                    let phase = entry["phase"]?.string ?? "未知阶段"
+                    let status = entry["status"]?.string ?? "未知状态"
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("日志 \(phase)：\(status)")
+                        if let result = entry["detail"]?["stage_status"]?.string {
+                            Text("业务片段：\(result) · 完整性：\(entry["detail"]?["integrity_status"]?.string ?? "未知")")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        if let reason = entry["detail"]?["reason"]?.string {
+                            Text("阻断原因：\(reason)").font(.caption).foregroundStyle(.orange)
+                        }
+                        if let path = entry["detail"]?["path"]?.string {
+                            Text(path).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                        }
+                    }
+                }
+            } else {
+                Text("本次运行尚无已确认的阶段归档")
+                    .foregroundStyle(.secondary)
+            }
         }
     }
     private func recoveryLabel(_ value: String) -> String {
+        // Rust 返回的 recovery 枚举以字符串投影到 Swift；只有已知值才显示对应解释。
         switch value {
         case "lease_governed": "恢复方式：由任务租约与既有恢复协议处理"
         case "manual_control": "恢复方式：等待控制操作"

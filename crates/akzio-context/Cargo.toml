@@ -1,3 +1,5 @@
+# 文件职责：声明 Context 沙箱 crate；它依赖领域类型和唯一 Store 读取层，不声明网络或交易能力。
+# `akzio-domain` 提供授权/Contract/Artifact schema，`akzio-store` 是唯一 CAS 读取入口；其余依赖只做时间、编解码和错误传递。
 [package]
 name = "akzio-context"
 version = "0.2.0"
@@ -7,9 +9,12 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+# ContextBroker 只通过这两个 crate 验证 Rust-owned 领域规则并读取持久化 Artifact。
 akzio-domain = { path = "../akzio-domain" }
 akzio-store = { path = "../akzio-store" }
+# ReadGrant 过期时间使用 chrono；Manifest 与材料值使用 serde/JSON 编解码。
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# ContextError 将本 crate 的失败边界保留为可读的错误链。
 thiserror.workspace = true

@@ -1,13 +1,15 @@
-//! Persisted execution authority, shared by every claim path and every client.
+//! Read-only historical Debug identity and inspection; no Debug execution authority.
+// 历史 Debug 身份、控制 head、事件和验收 CAS 仅供解码与只读 inspect；新 Debug
+// Session、step、fork 和控制写入均已退役。正式 task 只使用通用 RunControl。
 use super::trajectory::stored_event_from_row;
 use super::*;
 use akzio_domain::{
-    AcceptanceCategory, AcceptanceCheck, AcceptanceResult, DebugAction, DebugBrokerPolicy,
-    DebugControlRequest, DebugExecutionMode, DebugLearningScope, DebugSession,
-    DebugSessionIdentity, DebugStatus, StageAcceptance,
+    AcceptanceResult, DebugLearningScope, DebugSession, DebugSessionIdentity, StageAcceptance,
 };
 
+// 将控制层阻断原因统一包装为 DebugControl，调用方可区分于 SQL/Integrity 错误。
 fn blocked(reason: impl Into<String>) -> StoreError {
+    // Into<String> 接受静态字面量或已拥有的错误文本；只包装控制层拒绝，不触碰连接或数据库。
     StoreError::DebugControl(reason.into())
 }
 
@@ -55,234 +57,23 @@ pub struct DebugRunView {
 }
 
 impl Store {
-    /// A Store can be marked isolated only before its first Run. The marker is
-    /// permanent: opening this Store as an ordinary Core is subsequently denied.
-    pub fn configure_debug_environment(&self, enabled: bool) -> StoreResult<Option<String>> {
-        if enabled
-            && std::env::var_os("HOME").is_some_and(|home| {
-                let canonical = PathBuf::from(home).join(".akzio/store");
-                self.root.canonicalize().ok() == canonical.canonicalize().ok()
-            })
-        {
-            return Err(blocked(
-                "Debug requires a separate Store, never ~/.akzio/store",
-            ));
-        }
-        let mut connection = self.connection()?;
-        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing = environment_identity(&tx)?;
-        if !enabled {
-            if existing.is_some() {
-                return Err(blocked("isolated Store requires debug_control=true"));
-            }
-            return Ok(None);
-        }
-        if let Some(existing) = existing {
-            return Ok(Some(existing));
-        }
-        let count: u64 = tx.query_row("SELECT count(*) FROM rebuild_runs", [], |r| r.get(0))?;
-        if count != 0 {
-            return Err(blocked("debug_control requires a new isolated Store"));
-        }
-        let identity = format!("debug-store-{}", RunId::new());
-        tx.execute(
-            "INSERT INTO rebuild_metadata(key,value) VALUES('debug_environment',?1)",
-            params![identity],
-        )?;
-        tx.commit()?;
-        Ok(Some(identity))
-    }
-
+    // 只读取 metadata 中的隔离 identity，不创建或修复环境标记；无行是 Ok(None)，SQL 错误仍传播。
     pub fn debug_environment(&self) -> StoreResult<Option<String>> {
         environment_identity(&*self.connection()?)
     }
 
-    /// Publish the frozen business graph and its paused control atomically.
-    /// No worker can observe the new Run without observing its scheduling gate.
-    pub fn reserve_debug_session(
-        &self,
-        lease: &DaemonLease,
-        reservation: &SessionReservation,
-        proposal: &Artifact,
-        identity: &DebugSessionIdentity,
-        approval_binding: Option<(&Artifact, &Artifact)>,
-    ) -> StoreResult<DebugSession> {
-        self.validate_paper_session_reservation(reservation, proposal)?;
-        if let Some((manifest, approval)) = approval_binding {
-            self.validate_paper_approval_binding(manifest, approval)?;
-        }
-        let mut connection = self.connection()?;
-        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        validate_identity(&tx, identity, &reservation.workflow)?;
-        Self::commit_session_slot_transaction(&tx, lease, reservation, proposal, approval_binding)?;
-        insert_session(&tx, identity)?;
-        let session = read_session(&tx, &identity.run_id)?.expect("inserted session");
-        tx.commit()?;
-        Ok(session)
-    }
-
-    /// Noncanonical experiment: new IDs and immutable parent artifact lineage.
-    /// It uses the ordinary non-Paper lowering and never acquires a session slot.
-    pub fn commit_debug_experiment(
-        &self,
-        workflow: &WorkflowCommit,
-        setup: &[Artifact],
-        identity: &DebugSessionIdentity,
-    ) -> StoreResult<DebugSession> {
-        if !matches!(
-            workflow.run.purpose,
-            RunPurpose::Debug | RunPurpose::PositionPlan
-        ) {
-            return Err(blocked("experiment must be noncanonical"));
-        }
-        self.validate_workflow_commit(workflow)?;
-        let mut connection = self.connection()?;
-        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        validate_identity(&tx, identity, workflow)?;
-        insert_artifact_batch(&tx, setup)?;
-        Self::commit_workflow_transaction(&tx, workflow)?;
-        Self::append_run_setup_events(&tx, &workflow.run.run_id, setup, workflow.run.created_at)?;
-        insert_session(&tx, identity)?;
-        let session = read_session(&tx, &identity.run_id)?.expect("inserted session");
-        tx.commit()?;
-        Ok(session)
-    }
-
+    // 从 run_control head 指向的 CAS identity Artifact 重建 DebugSession；只读，不修复过期 head。
     pub fn debug_session(&self, run_id: &RunId) -> StoreResult<Option<DebugSession>> {
         read_session(&*self.connection()?, run_id)
     }
 
-    /// Compare-and-swap is mandatory. A repeated HTTP POST cannot issue a second
-    /// permit, even if the first step has already finished on another worker.
-    pub fn debug_control(
-        &self,
-        run_id: &RunId,
-        request: &DebugControlRequest,
-        runtime_identity: &ContentHash,
-        now: DateTime<Utc>,
-    ) -> StoreResult<DebugSession> {
-        let mut connection = self.connection()?;
-        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        super::workflow::assert_workflow_executable(&tx, run_id)?;
-        let mut session =
-            read_session(&tx, run_id)?.ok_or_else(|| blocked("not a Debug session"))?;
-        if session.revision != request.expected_revision {
-            return Err(blocked("revision_conflict"));
-        }
-        if matches!(session.status, DebugStatus::Aborted) {
-            return Err(blocked("session_aborted"));
-        }
-        if request.action != DebugAction::Pause
-            && request.action != DebugAction::Abort
-            && &session.identity.runtime_identity != runtime_identity
-        {
-            return Err(blocked("runtime_identity_changed: create a new experiment"));
-        }
-        let running = running_count(&tx, run_id)?;
-        match request.action {
-            DebugAction::Pause => {
-                session.permitted_task_id = None;
-                session.execution_mode = DebugExecutionMode::Manual;
-                session.status = if running > 0 {
-                    DebugStatus::PauseRequested
-                } else {
-                    DebugStatus::Paused
-                };
-            }
-            DebugAction::Resume => {
-                if session.status != DebugStatus::Paused {
-                    return Err(blocked("resume_requires_paused"));
-                }
-                session.status = DebugStatus::Running;
-                session.execution_mode = DebugExecutionMode::Continuous;
-                session.permitted_task_id = None;
-            }
-            DebugAction::Step | DebugAction::RetryNode => {
-                if session.status != DebugStatus::Paused || running != 0 {
-                    return Err(blocked("step_requires_paused"));
-                }
-                let task_id = request
-                    .task_id
-                    .as_ref()
-                    .ok_or_else(|| blocked("unique_task_id_required"))?;
-                if let Some(reason) = task_blocked_reason(&tx, run_id, task_id, now)? {
-                    return Err(blocked(reason));
-                }
-                if request.action == DebugAction::RetryNode && !retry_eligible(&tx, task_id)? {
-                    return Err(blocked(
-                        "not_retryable: terminal or exhausted stages require a new experiment",
-                    ));
-                }
-                session.status = DebugStatus::Stepping;
-                session.execution_mode = DebugExecutionMode::Manual;
-                session.permitted_task_id = Some(task_id.clone());
-                session.active_attempt_id = None;
-            }
-            DebugAction::Abort => {
-                // Cooperative debug abort drains active work, never drops futures.
-                if running != 0 {
-                    return Err(blocked("pause_and_drain_before_abort"));
-                }
-                session.status = DebugStatus::Aborted;
-                session.permitted_task_id = None;
-            }
-        }
-        save_session(&tx, &mut session, now)?;
-        tx.commit()?;
-        Ok(session)
-    }
-
     /// Defense at the actual effect-intent boundary, including cancel/reprice.
-    pub fn assert_debug_broker_write(&self, run_id: &RunId) -> StoreResult<()> {
+    // 在实际 Broker effect intent 调用边界重读 Store policy；不是 UI 预检查，也不会发出网络请求。
+    pub fn assert_broker_write_policy(&self, run_id: &RunId) -> StoreResult<()> {
         assert_broker_write(&*self.connection()?, run_id)
     }
 
-    pub fn block_debug_broker_task(
-        &self,
-        permit: &TaskWritePermit,
-        evidence: &[ArtifactRef],
-        now: DateTime<Utc>,
-    ) -> StoreResult<bool> {
-        let mut connection = self.connection()?;
-        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        match assert_broker_write(&tx, &permit.run_id) {
-            Ok(()) => return Ok(false),
-            Err(StoreError::DebugBrokerWriteForbidden) => {}
-            Err(error) => return Err(error),
-        }
-        assert_permit(&tx, permit)?;
-        let mut session =
-            read_session(&tx, &permit.run_id)?.ok_or(StoreError::DebugBrokerWriteForbidden)?;
-        session.status = DebugStatus::PauseRequested;
-        session.permitted_task_id = None;
-        save_session(&tx, &mut session, now)?;
-        write_acceptance(
-            &tx,
-            &StageAcceptance {
-                version: 1,
-                run_id: permit.run_id.clone(),
-                task_id: permit.task_id.clone(),
-                attempt_id: permit.attempt_id.clone(),
-                stage: "broker_dispatch".into(),
-                business_result: "Accepted".into(),
-                test_result: AcceptanceResult::Blocked,
-                checks: vec![AcceptanceCheck {
-                    check_id: "debug.broker_write_policy".into(),
-                    category: AcceptanceCategory::SideEffect,
-                    expected: "explicit paper_allowed policy".into(),
-                    actual: "forbidden".into(),
-                    result: AcceptanceResult::Blocked,
-                    evidence_refs: evidence.to_vec(),
-                    message: "Business prerequisites: PASS; Debug broker write policy: BLOCK"
-                        .into(),
-                }],
-                created_at: now,
-            },
-        )?;
-        tx.commit()?;
-        Ok(true)
-    }
-
+    // 隔离判定读取 Store metadata 或 Run 的 DebugSession.learning_scope；没有调用方布尔参数可伪造身份。
     pub fn debug_learning_isolated(&self, run_id: &RunId) -> StoreResult<bool> {
         let connection = self.connection()?;
         Ok(environment_identity(&connection)?.is_some()
@@ -291,6 +82,8 @@ impl Store {
     }
 
     /// One read transaction, no repairs, no staging, no claim and no network.
+    // 用 Deferred 只读事务构造指定 Run/可选 Task/Attempt 的检查投影；不领取 Task、不写 Artifact、
+    // 不暂存 BLOB、不触发联网。返回的 business_ready 与 step_eligible 是此读事务时点的观察值。
     pub fn debug_inspect(
         &self,
         run_id: &RunId,
@@ -302,7 +95,6 @@ impl Store {
         let tx = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
         let session = read_session(&tx, run_id)?.ok_or_else(|| blocked("not a Debug session"))?;
         let snapshot = self.workflow_snapshot_with_connection(&tx, run_id)?;
-        let retired = super::workflow::legacy_workflow(&tx, run_id)?;
         if let Some(task_id) = task_id {
             if !snapshot.tasks.iter().any(|t| &t.node.task_id == task_id) {
                 return Err(StoreError::MissingTask(task_id.clone()));
@@ -315,6 +107,7 @@ impl Store {
                 return Err(blocked("attempt_not_in_selected_run_and_task"));
             }
         }
+        // 遍历快照中的 task：可选 task_id 过滤只跳过不匹配节点；attempt_id 另用于尝试、事件和预算过滤。
         let mut nodes = Vec::new();
         for task in snapshot.tasks {
             if task_id.is_some_and(|id| id != &task.node.task_id) {
@@ -324,22 +117,16 @@ impl Store {
                 .query_map(params![task.node.task_id.0], |r| Ok(DebugAttemptView {
                     attempt_id: AttemptId(r.get(0)?), status: r.get(1)?, started_at: r.get(2)?, finished_at: r.get(3)?,
                 }))?.collect::<Result<Vec<_>, _>>()?;
-            let reason = if retired {
-                Some("legacy_workflow_retired".into())
-            } else {
-                task_blocked_reason(&tx, run_id, &task.node.task_id, now)?
-            };
-            let retry = retry_eligible(&tx, &task.node.task_id)?;
+            // 输出通过 attempt_outputs→artifacts→attempts 关联并限制到当前 Task；Event 过滤范围则按可选 attempt_id 精确收窄。
             let output_refs = tx.prepare("SELECT a.artifact_id,a.kind FROM rebuild_attempt_outputs o JOIN rebuild_artifacts a ON a.artifact_id=o.artifact_id JOIN rebuild_attempts p ON p.attempt_id=o.attempt_id WHERE p.task_id=?1 ORDER BY o.event_id")?
                 .query_map(params![task.node.task_id.0], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?
                 .collect::<Result<Vec<_>, _>>()?.into_iter().map(|(id,kind)| Ok(ArtifactRef {artifact_id:ArtifactId(ContentHash::new(id)?),kind:parse_enum(&kind)?})).collect::<StoreResult<Vec<_>>>()?;
             let role = task.node.recipe_id.as_str().to_owned();
             let horizon = task.node.execution_spec().horizon_name().map(str::to_owned);
-            let business_ready = reason.is_none();
-            let step_eligible = business_ready && session.status == DebugStatus::Paused;
-            let blocked_reason = reason.or_else(|| {
-                (!step_eligible).then(|| format!("debug_{:?}", session.status).to_lowercase())
-            });
+            let business_ready = false;
+            let step_eligible = false;
+            let blocked_reason = Some("debug_control_retired".to_owned());
+            // 用预算审计快照优先，否则从已持久化 AgentTurn 重建可确认的 token 用量。
             let budget = inspect_budget(&tx, &task, attempt_id)?;
             nodes.push(DebugNodeView {
                 task,
@@ -348,7 +135,7 @@ impl Store {
                 attempts,
                 business_ready,
                 step_eligible,
-                retry_eligible: step_eligible && retry,
+                retry_eligible: false,
                 blocked_reason,
                 output_refs,
                 budget,
@@ -360,6 +147,9 @@ impl Store {
         let mut ids = BTreeSet::new();
         let mut artifacts = Vec::new();
         let mut acceptance = Vec::new();
+        // 事件 Artifact 按 ID 去重后解码；RawEvidence 被完全排除，其它无效 JSON 仅投影为 Null，
+        // 再按已定义的键名/字符串模式递归脱敏（不是任意敏感内容检测）。
+        // SQL/Artifact 读取失败仍会中止 inspect，而不是返回部分 artifacts。
         for id in events.iter().filter_map(|e| e.artifact_id.as_ref()) {
             if !ids.insert(id.clone()) {
                 continue;
@@ -377,17 +167,9 @@ impl Store {
             }
             artifacts.push(DebugArtifactView { artifact, payload });
         }
-        let allowed_actions = match session.status {
-            DebugStatus::Paused => vec!["resume", "step", "retry_node", "abort"],
-            DebugStatus::Running | DebugStatus::Stepping => vec!["pause"],
-            _ => vec![],
-        }
-        .into_iter()
-        .filter(|action| {
-            !retired && (*action != "resume" || !session.identity.research_only_without_policy())
-        })
-        .map(str::to_owned)
-        .collect();
+        // 可用动作先由 session 状态产生，再按 retired/research-only policy 做权限收缩。
+        let allowed_actions = Vec::new();
+        // Execution evidence 是检查投影：PositionPlan 不包含执行阶段；Paper 只据节点与已持久 verdict 区分状态。
         let execution_evidence = if session.identity.run_purpose == RunPurpose::PositionPlan {
             "not_applicable"
         } else if let Some(node) = nodes.iter().find(|n| n.role == "gate.execution") {
@@ -421,6 +203,7 @@ impl Store {
             .iter()
             .flat_map(|n| n.output_refs.iter().map(|r| r.artifact_id.clone()))
             .collect();
+        // 局部 Task/Attempt 查询不声称完整研究进度，research 置 Null；全 Run 才把已提交输出交给共享投影函数。
         let research = if task_id.is_some() || attempt_id.is_some() {
             serde_json::Value::Null
         } else {
@@ -449,49 +232,24 @@ impl Store {
         })
     }
 
-    /// Observation only: Agent recovery continues to use AgentTurn and Tool records.
-    pub fn observe_debug_budget(
-        &self,
-        permit: &TaskWritePermit,
-        snapshot: &serde_json::Value,
-        now: DateTime<Utc>,
-    ) -> StoreResult<()> {
-        let mut connection = self.connection()?;
-        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if read_session(&tx, &permit.run_id)?.is_none() {
-            return Ok(());
-        }
-        assert_permit(&tx, permit)?;
-        let artifact = detail_artifact(
-            &tx,
-            snapshot,
-            "debug.budget_snapshot",
-            &permit.run_id,
-            Some(&permit.task_id),
-            Some(&permit.attempt_id),
-            vec![],
-            now,
-        )?;
-        insert_artifact(&tx, &artifact)?;
-        append_event(
-            &tx,
-            &permit.run_id,
-            Some(&permit.task_id),
-            Some(&permit.attempt_id),
-            LifecycleEventType::DebugBudgetObserved,
-            Some(&artifact.artifact_id),
-            now,
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn record_stage_acceptance(
+    /// Keep the existing frozen SubmitRejected lineage for Agent recovery.
+    /// The former arbitrary Debug acceptance writer is no longer exposed.
+    pub fn record_submit_rejection(
         &self,
         acceptance: &StageAcceptance,
     ) -> StoreResult<ArtifactRef> {
+        if acceptance.business_result != "SubmitRejected"
+            || acceptance.test_result != AcceptanceResult::Fail
+            || acceptance.checks.len() != 1
+            || acceptance.checks[0].check_id != "agent.submit_validation"
+        {
+            return Err(blocked("debug acceptance writes are retired"));
+        }
         let mut connection = self.connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if read_session(&tx, &acceptance.run_id)?.is_some() {
+            return Err(blocked("historical Debug Run cannot write new acceptance"));
+        }
         let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM rebuild_attempts WHERE run_id=?1 AND task_id=?2 AND attempt_id=?3)",
             params![acceptance.run_id.0,acceptance.task_id.0,acceptance.attempt_id.0], |r|r.get(0))?;
         if !exists {
@@ -503,6 +261,8 @@ impl Store {
     }
 }
 
+// 从同一连接读取 debug_environment metadata，供 claim/export/learning boundary 共用。
+// 只有 metadata 行存在时返回 Some(identity)；查询是只读且不自动写默认标记。
 pub(super) fn environment_identity(connection: &Connection) -> StoreResult<Option<String>> {
     Ok(connection
         .query_row(
@@ -513,86 +273,9 @@ pub(super) fn environment_identity(connection: &Connection) -> StoreResult<Optio
         .optional()?)
 }
 
-fn validate_identity(
-    tx: &Transaction<'_>,
-    identity: &DebugSessionIdentity,
-    workflow: &WorkflowCommit,
-) -> StoreResult<()> {
-    if environment_identity(tx)?.as_deref() != Some(identity.store_identity.as_str())
-        || identity.run_id != workflow.run.run_id
-        || identity.run_purpose != workflow.run.purpose
-        || identity.learning_scope != DebugLearningScope::Isolated
-        || identity.version != 1
-        || identity.code_revision.trim().is_empty()
-    {
-        return Err(blocked("invalid_isolated_identity"));
-    }
-    let contracts = workflow
-        .nodes
-        .iter()
-        .filter_map(|n| n.contract_hash.clone())
-        .collect::<BTreeSet<_>>();
-    if contracts != identity.contract_hashes.iter().cloned().collect() {
-        return Err(blocked("contract_identity_mismatch"));
-    }
-    Ok(())
-}
-
-fn insert_session(tx: &Transaction<'_>, identity: &DebugSessionIdentity) -> StoreResult<()> {
-    let mut sources = identity.dataset.clone();
-    sources.extend(identity.parent_artifacts.iter().cloned());
-    sources.sort();
-    sources.dedup();
-    let artifact = detail_artifact(
-        tx,
-        identity,
-        "debug.session_identity",
-        &identity.run_id,
-        None,
-        None,
-        sources,
-        identity.created_at,
-    )?;
-    insert_artifact(tx, &artifact)?;
-    let inserted = tx.execute("INSERT INTO rebuild_run_controls(run_id,identity_artifact_id,runtime_identity,revision,status,execution_mode,updated_at) VALUES(?1,?2,?4,0,'paused','manual',?3) ON CONFLICT(run_id) DO UPDATE SET identity_artifact_id=excluded.identity_artifact_id,runtime_identity=excluded.runtime_identity,status='paused',execution_mode='manual',updated_at=excluded.updated_at WHERE rebuild_run_controls.identity_artifact_id IS NULL AND rebuild_run_controls.revision=0",
-        params![identity.run_id.0,artifact.artifact_id.0.as_str(),identity.created_at.to_rfc3339(),identity.runtime_identity.as_str()])?;
-    if inserted != 1 {
-        return Err(blocked("run_control_already_owned"));
-    }
-    // The same exact lineage rule is used at publication and by Doctor. This
-    // records experiment provenance; it grants no Context access to the parent.
-    for reference in &artifact.source_refs {
-        let parent = read_artifact(tx, &reference.artifact_id)?;
-        if parent.origin.as_ref().and_then(|o| o.run_id.as_ref()) != Some(&identity.run_id)
-            && !cross_run_reference_allowed(tx, &artifact, &parent)?
-        {
-            return Err(blocked("invalid_debug_parent_lineage"));
-        }
-    }
-    for reference in &identity.dataset {
-        let need = read_artifact(tx, &reference.artifact_id)?;
-        for source in &need.source_refs {
-            let parent = read_artifact(tx, &source.artifact_id)?;
-            if parent.origin.as_ref().and_then(|o| o.run_id.as_ref()) != Some(&identity.run_id)
-                && !cross_run_reference_allowed(tx, &need, &parent)?
-            {
-                return Err(blocked("invalid_debug_dataset_lineage"));
-            }
-        }
-    }
-    append_event(
-        tx,
-        &identity.run_id,
-        None,
-        None,
-        LifecycleEventType::DebugControlChanged,
-        Some(&artifact.artifact_id),
-        identity.created_at,
-    )?;
-    Ok(())
-}
-
 /// An explicit experiment edge is provenance, never an Agent read grant.
+// 仅为登记的 Debug dataset/parent artifact 或已证明的 WorkflowGraph 放行有限跨 Run provenance。
+// 返回 bool 而不是抛授权错误：不匹配是 Ok(false)，SQL/Artifact 错误传播为 Err；整个判断只借用连接和对象。
 pub(super) fn cross_run_reference_allowed(
     connection: &Connection,
     child: &Artifact,
@@ -613,6 +296,7 @@ pub(super) fn cross_run_reference_allowed(
     let identity = session.identity;
     // WorkflowGraph CAS is shared and has no origin. Its owning Run is proved
     // by rebuild_runs.graph_artifact_id below, never guessed from content.
+    // parent Run 优先取真实 ArtifactOrigin；只有无 origin 的 WorkflowGraph 才退回 identity 中明确声明的父 Run。
     let parent_run = parent
         .origin
         .as_ref()
@@ -643,6 +327,7 @@ pub(super) fn cross_run_reference_allowed(
         kind: parent.kind,
     };
     if child.kind == ArtifactKind::EvidenceNeed {
+        // 受控 EvidenceNeed 必须同 producer、BLOB、provenance 绑定，且 parent/child 都已列入各自冻结 dataset。
         return Ok(parent.kind == ArtifactKind::EvidenceNeed
             && child.producer == "scheduler.paper_snapshot"
             && parent.producer == child.producer
@@ -668,6 +353,8 @@ pub(super) fn cross_run_reference_allowed(
     if !registered {
         return Ok(false);
     }
+    // parent_task_id 存在时要求该 Artifact 是父 Run/指定 Task 的成功 Attempt output；
+    // None 仅允许用 rebuild_runs.graph_artifact_id 证明父 WorkflowGraph 所属关系。
     match identity.parent_task_id {
         Some(task) => Ok(connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM rebuild_attempt_outputs o JOIN rebuild_attempts a ON a.attempt_id=o.attempt_id JOIN rebuild_tasks t ON t.task_id=a.task_id WHERE a.run_id=?1 AND a.task_id=?2 AND a.status='succeeded' AND t.status='succeeded' AND o.artifact_id=?3)",
@@ -678,6 +365,8 @@ pub(super) fn cross_run_reference_allowed(
     }
 }
 
+// 读取 control head 指向的 identity Artifact，并核对 runtime_identity/run_id 不分叉。
+// SQL 以 run_id 和非空 identity 限定一行；map 闭包将行解码为 Result，transpose 保留无行与损坏两种结果。
 pub(super) fn read_session(
     connection: &Connection,
     run_id: &RunId,
@@ -711,98 +400,8 @@ pub(super) fn read_session(
     .transpose()
 }
 
-fn save_session(
-    tx: &Transaction<'_>,
-    session: &mut DebugSession,
-    now: DateTime<Utc>,
-) -> StoreResult<()> {
-    let old = session.revision;
-    session.revision += 1;
-    session.updated_at = now;
-    let changed=tx.execute("UPDATE rebuild_run_controls SET revision=?1,status=?2,execution_mode=?3,permitted_task_id=?4,active_attempt_id=?5,paused_at_task_id=?6,updated_at=?7 WHERE run_id=?8 AND revision=?9",params![session.revision,enum_name(session.status),enum_name(session.execution_mode),session.permitted_task_id.as_ref().map(|x|x.0.as_str()),session.active_attempt_id.as_ref().map(|x|x.0.as_str()),session.paused_at_task_id.as_ref().map(|x|x.0.as_str()),now.to_rfc3339(),session.identity.run_id.0,old])?;
-    if changed != 1 {
-        return Err(blocked("revision_conflict"));
-    }
-    let artifact = detail_artifact(
-        tx,
-        session,
-        "debug.control",
-        &session.identity.run_id,
-        None,
-        None,
-        vec![],
-        now,
-    )?;
-    insert_artifact(tx, &artifact)?;
-    append_event(
-        tx,
-        &session.identity.run_id,
-        None,
-        None,
-        LifecycleEventType::DebugControlChanged,
-        Some(&artifact.artifact_id),
-        now,
-    )?;
-    Ok(())
-}
-
-fn running_count(connection: &Connection, run_id: &RunId) -> StoreResult<u64> {
-    Ok(connection.query_row(
-        "SELECT count(*) FROM rebuild_tasks WHERE run_id=?1 AND status='running'",
-        params![run_id.0],
-        |r| r.get(0),
-    )?)
-}
-
-fn task_blocked_reason(
-    connection: &Connection,
-    run_id: &RunId,
-    task_id: &TaskId,
-    now: DateTime<Utc>,
-) -> StoreResult<Option<String>> {
-    let row=connection.query_row("SELECT t.status,t.ready_at,r.status,t.recipe_id FROM rebuild_tasks t JOIN rebuild_runs r ON r.run_id=t.run_id WHERE t.run_id=?1 AND t.task_id=?2",params![run_id.0,task_id.0],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()?.ok_or_else(||StoreError::MissingTask(task_id.clone()))?;
-    if row.0 != "queued" {
-        return Ok(Some(format!("task_{}", row.0)));
-    }
-    if row.3 == "gate.decision"
-        && read_session(connection, run_id)?
-            .is_some_and(|session| session.identity.research_only_without_policy())
-    {
-        return Ok(Some(
-            "research_only_incomplete: DecisionPolicy missing; Decision forbidden".into(),
-        ));
-    }
-    let dependencies:u64=connection.query_row("SELECT count(*) FROM rebuild_task_dependencies d JOIN rebuild_tasks p ON p.task_id=d.depends_on_task_id WHERE d.task_id=?1 AND p.status NOT IN ('succeeded','skipped')",params![task_id.0],|r|r.get(0))?;
-    if dependencies > 0 {
-        return Ok(Some("dependencies_not_satisfied".into()));
-    }
-    let run_runnable = matches!(row.2.as_str(), "queued" | "running")
-        || (row.2 == "completed" && row.3 == POST_TERMINAL_WORKER_RECIPE_ID);
-    if !run_runnable {
-        return Ok(Some(format!("run_{}", row.2)));
-    }
-    if parse_time(&row.1)? > now {
-        return Ok(Some(format!("not_due_until:{}", row.1)));
-    }
-    let cancelled: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM rebuild_run_cancellations WHERE run_id=?1)",
-        params![run_id.0],
-        |r| r.get(0),
-    )?;
-    Ok(cancelled.then(|| "run_cancel_requested".into()))
-}
-
-fn retry_eligible(connection: &Connection, task_id: &TaskId) -> StoreResult<bool> {
-    let last = connection
-        .query_row(
-            "SELECT status FROM rebuild_attempts WHERE task_id=?1 ORDER BY epoch DESC LIMIT 1",
-            params![task_id.0],
-            |r| r.get::<_, String>(0),
-        )
-        .optional()?;
-    Ok(last.is_some_and(|s| matches!(s.as_str(), "retried" | "abandoned")))
-}
-
+// 输入已重建 Task 和可选 Attempt ID；优先读最后一条预算观测，否则从该 Task/Attempt 的 AgentTurn
+// telemetry 汇总。缺失类别保持 unknown，不把 task lifetime 计数冒充 Outcome 当前 horizon 的剩余额度。
 fn inspect_budget(
     connection: &Connection,
     task: &StoredTaskSnapshot,
@@ -820,6 +419,8 @@ fn inspect_budget(
             serde_json::json!({"resolved":task.node.budget,"limits":task.node.budget,"last_runtime_observation":payload,"observed_at":artifact.created_at,"attempt":artifact.origin.and_then(|o|o.attempt_id),"authority":"AgentRuntime audit snapshot; recovery still derives from AgentTurn and Tool lifecycle"}),
         );
     }
+    // AgentTurn 结果按 task_id/可选 attempt_id 与结束事件过滤并 DISTINCT；完整性要求 usage 字段齐全，
+    // 且已结束 turn 数与 agent.turn_started 事件数相等。
     let ids=connection.prepare("SELECT DISTINCT artifact_id FROM rebuild_events WHERE task_id=?1 AND (?2 IS NULL OR attempt_id=?2) AND event_type IN ('agent.turn_completed','agent.turn_failed','agent.turn_retryable_failed') AND artifact_id IS NOT NULL")?
         .query_map(params![task.node.task_id.0, attempt_id.map(|id| id.0.as_str())],|r|r.get::<_,String>(0))?.collect::<Result<Vec<_>,_>>()?;
     let mut input = 0u64;
@@ -875,118 +476,28 @@ fn inspect_budget(
     )
 }
 
-pub(super) fn consume_claim(
-    tx: &Transaction<'_>,
-    permit: &TaskWritePermit,
-    now: DateTime<Utc>,
-) -> StoreResult<()> {
-    if let Some(mut session) = read_session(tx, &permit.run_id)? {
-        if session.status == DebugStatus::Stepping {
-            if session.permitted_task_id.as_ref() != Some(&permit.task_id)
-                || session.active_attempt_id.is_some()
-            {
-                return Err(blocked("step_permit_not_available"));
-            }
-            session.permitted_task_id = None;
-            session.active_attempt_id = Some(permit.attempt_id.clone());
-            save_session(tx, &mut session, now)?;
-        } else if session.status != DebugStatus::Running {
-            return Err(blocked("run_is_paused"));
-        }
-    }
-    Ok(())
-}
-
-/// Called in every attempt-closing transaction, including defer and recovery.
-pub(super) fn settle_attempt(
-    tx: &Transaction<'_>,
-    permit: &TaskWritePermit,
-    result: &str,
-    now: DateTime<Utc>,
-) -> StoreResult<()> {
-    let Some(mut session) = read_session(tx, &permit.run_id)? else {
-        return super::run_control::settle_continuous(tx, &permit.run_id, now);
-    };
-    let acceptance = StageAcceptance {
-        version: 1,
-        run_id: permit.run_id.clone(),
-        task_id: permit.task_id.clone(),
-        attempt_id: permit.attempt_id.clone(),
-        stage: tx.query_row(
-            "SELECT recipe_id FROM rebuild_tasks WHERE task_id=?1",
-            params![permit.task_id.0],
-            |r| r.get(0),
-        )?,
-        business_result: result.into(),
-        test_result: AcceptanceResult::NotRun,
-        checks: vec![AcceptanceCheck {
-            check_id: "controller.attempt_boundary".into(),
-            category: AcceptanceCategory::Persistence,
-            expected: "attempt closes within the Store transaction".into(),
-            actual: result.into(),
-            result: AcceptanceResult::Pass,
-            evidence_refs: vec![],
-            message: "Controller boundary verified; business acceptance checks have not been run."
-                .into(),
-        }],
-        created_at: now,
-    };
-    write_acceptance(tx, &acceptance)?;
-    if (session.status == DebugStatus::Stepping
-        && session.active_attempt_id.as_ref() == Some(&permit.attempt_id))
-        || session.status == DebugStatus::PauseRequested && running_count(tx, &permit.run_id)? == 0
-    {
-        session.status = DebugStatus::Paused;
-        session.permitted_task_id = None;
-        session.active_attempt_id = None;
-        session.paused_at_task_id = Some(permit.task_id.clone());
-        save_session(tx, &mut session, now)?;
-    } else if session.status == DebugStatus::Running && running_count(tx, &permit.run_id)? == 0 {
-        let pending: u64 = tx.query_row(
-            "SELECT count(*) FROM rebuild_tasks WHERE run_id=?1 AND status='queued'",
-            params![permit.run_id.0],
-            |r| r.get(0),
-        )?;
-        if pending == 0 {
-            session.status = DebugStatus::Completed;
-            save_session(tx, &mut session, now)?;
-        }
-    }
-    Ok(())
-}
-
+// Historical Debug identity cannot grant Broker write authority, regardless
+// of the old broker_write_policy encoded in that identity.
 pub(super) fn assert_broker_write(connection: &Connection, run_id: &RunId) -> StoreResult<()> {
-    let session = read_session(connection, run_id)?;
-    if session
-        .as_ref()
-        .is_some_and(|s| s.identity.broker_write_policy != DebugBrokerPolicy::PaperAllowed)
-        || environment_identity(connection)?.is_some() && session.is_none()
+    let old_control_identity: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM rebuild_run_controls \
+         WHERE run_id=?1 AND identity_artifact_id IS NOT NULL)",
+        params![run_id.0],
+        |row| row.get(0),
+    )?;
+    if old_control_identity
+        || environment_identity(connection)?.is_some()
+        || run_purpose_from_connection(connection, run_id)? == RunPurpose::Debug
     {
         return Err(StoreError::DebugBrokerWriteForbidden);
     }
     Ok(())
 }
 
-pub(super) fn post_terminal_enqueued(
-    tx: &Transaction<'_>,
-    run_id: &RunId,
-    now: DateTime<Utc>,
-) -> StoreResult<()> {
-    super::run_control::wake_continuous(tx, run_id, now)?;
-    if let Some(mut session) = read_session(tx, run_id)? {
-        if session.status == DebugStatus::Completed {
-            session.status = if session.execution_mode == DebugExecutionMode::Continuous {
-                DebugStatus::Running
-            } else {
-                DebugStatus::Paused
-            };
-            save_session(tx, &mut session, now)?;
-        }
-    }
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
+// 生成 RunScoped DebugRecord staging payload，调用方再在事务内 insert 并追加 event。
+// T: Serialize 由调用方静态提供；payload 借用序列化成 bytes，连接参数用于同事务 TEMP staging，
+// Artifact 的 origin/source_refs 将 provenance 固定到指定 Run/Task/Attempt。
 fn detail_artifact<T: Serialize>(
     connection: &Connection,
     payload: &T,
@@ -1025,6 +536,8 @@ fn detail_artifact<T: Serialize>(
     )?)
 }
 
+// acceptance 由 checks 的 evidence refs 组成去重 source closure，并按 Artifact hash 幂等追加 event；
+// caller 的 Transaction 决定 Artifact、staging promotion 和事件是否一起提交。
 fn write_acceptance(tx: &Transaction<'_>, value: &StageAcceptance) -> StoreResult<ArtifactRef> {
     if value.version != 1
         || value.stage.is_empty()
@@ -1050,6 +563,7 @@ fn write_acceptance(tx: &Transaction<'_>, value: &StageAcceptance) -> StoreResul
         value.created_at,
     )?;
     insert_artifact(tx, &artifact)?;
+    // Artifact 可重复 insert；只有完全相同内容尚无 acceptance event 时才追加一次事件。
     let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM rebuild_events WHERE event_type='debug.acceptance_recorded' AND artifact_id=?1)",params![artifact.artifact_id.0.as_str()],|r|r.get(0))?;
     if !exists {
         append_event(
@@ -1070,11 +584,15 @@ fn write_acceptance(tx: &Transaction<'_>, value: &StageAcceptance) -> StoreResul
 
 /// Exact credential field names, independent of token-usage field names.
 #[allow(clippy::collapsible_match)]
+// 按枚举键名及字符串特征递归替换凭据字段/credential-bearing text，保留 token usage 和普通风险说明；
+// 此模式匹配不保证识别任意形式的凭据，不能单靠该函数定义完整导出授权。
+// 输入 JSON 的可变借用；对象/数组分支递归借用子值，敏感键直接覆写为 marker，标量其他类型原样保留。
 fn redact(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
             for (key, value) in map {
                 let key = key.to_ascii_lowercase();
+                // key 临时转换为小写 String 后匹配精确名称或带下划线前缀的敏感字段。
                 if [
                     "api_key",
                     "apikey",
@@ -1128,6 +646,7 @@ fn redact(value: &mut serde_json::Value) {
 mod tests {
     use super::*;
     #[test]
+    // 只脱敏凭据和加密内容，usage/risk prose 必须保留可审计值。
     fn inspect_redacts_credentials_but_retains_usage_and_risk_prose() {
         let mut value = serde_json::json!({"api_key":"secret","nested":{"Authorization":"Bearer secret","input_tokens":321,"output_tokens":12,"encrypted_content":"opaque"},"memo":"risk-aware research","error":"Bearer secret"});
         redact(&mut value);

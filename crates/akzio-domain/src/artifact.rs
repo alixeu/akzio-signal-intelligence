@@ -1,3 +1,6 @@
+// 文件导读：定义 CAS Artifact 的类型、生命周期、来源血缘和内容身份校验。
+// Artifact 的哈希覆盖元数据与 BLOB 引用，source_refs 还承担各类产物的最小血缘约束。
+// 常见路径是先经 `Artifact::new` 规范化来源并计算 ID，再由 Store 持久化；生命周期/权限策略由上层模块解释。
 //! Immutable, content-addressed artifact vocabulary.
 
 use std::{collections::BTreeSet, fmt};
@@ -13,6 +16,7 @@ use crate::{content_hash_json, BlobRef, ContentHash, DomainError, RunId, TaskId}
 pub struct ArtifactId(pub ContentHash);
 
 impl fmt::Display for ArtifactId {
+    // 直接转发底层 ContentHash 的格式化结果，保持 ID 的文本表示一致。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
     }
@@ -83,6 +87,7 @@ pub enum ArtifactKind {
 }
 
 impl ArtifactKind {
+    // 只有列出的种类允许进入 Canonical 生命周期；运行期临时/调试产物不在集合中。
     pub const fn can_be_canonical(self) -> bool {
         matches!(
             self,
@@ -143,7 +148,8 @@ pub struct ArtifactRef {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactProvenance {
-    /// Rust-owned adapter/source family, never a model-provided URL or provider.
+    /// Expected Rust-owned adapter/source family; this field's local validation
+    /// only checks non-empty text, so callers must enforce source ownership.
     pub source_family: String,
     pub observed_at: Option<DateTime<Utc>>,
     pub retrieved_at: DateTime<Utc>,
@@ -153,6 +159,7 @@ pub struct ArtifactProvenance {
 }
 
 impl ArtifactProvenance {
+    // 校验来源族非空，以及置信度是否仍在 ppm 的 0..=1_000_000 范围内。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.source_family.trim().is_empty() {
             return Err(DomainError::EmptyField {
@@ -177,6 +184,7 @@ pub struct ArtifactOrigin {
 }
 
 impl ArtifactOrigin {
+    // attempt 必须同时带 task，防止把一次尝试伪装成脱离任务的 Artifact 来源。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.attempt_id.is_some() && self.task_id.is_none() {
             return Err(DomainError::AttemptOriginWithoutTask);
@@ -185,9 +193,9 @@ impl ArtifactOrigin {
     }
 }
 
-/// Immutable typed metadata for a CAS blob. The identity covers the metadata and
-/// payload reference, therefore a caller cannot substitute provenance under an
-/// existing artifact ID.
+/// Typed metadata for a CAS blob. The identity covers metadata and payload
+/// reference; `validate` detects substitutions under an existing artifact ID.
+/// The public Rust fields themselves are not physically immutable in memory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Artifact {
     pub schema_version: u32,
@@ -204,6 +212,8 @@ pub struct Artifact {
 
 impl Artifact {
     #[allow(clippy::too_many_arguments)]
+    // 排序 source_refs 后计算 Artifact ID，并在返回前执行完整 schema 校验；
+    // 排序不替调用方去重，重复引用会在 validate_source_refs 中拒绝。
     pub fn new(
         kind: ArtifactKind,
         blob: BlobRef,
@@ -214,6 +224,7 @@ impl Artifact {
         source_refs: Vec<ArtifactRef>,
         created_at: DateTime<Utc>,
     ) -> Result<Self, DomainError> {
+        // `producer.into()` 消费传入的字符串值；source_refs 也被移动进新 Artifact，排序后才参与身份哈希。
         let producer = producer.into();
         let mut source_refs = source_refs;
         source_refs.sort();
@@ -234,7 +245,9 @@ impl Artifact {
         Ok(artifact)
     }
 
+    // 复制并排序元数据，序列化后移除自引用 artifact_id，再计算内容哈希。
     pub fn expected_hash(&self) -> Result<ContentHash, DomainError> {
+        // clone 为排序和移除自引用字段提供局部副本；哈希计算不会改动借用者的原 Artifact。
         let mut canonical = self.clone();
         canonical.source_refs.sort();
         let mut value = serde_json::to_value(canonical).map_err(|_| DomainError::EmptyField {
@@ -249,7 +262,9 @@ impl Artifact {
         })
     }
 
+    // 依次检查 schema、文本/来源、生命周期、类型约束和最终内容身份。
     pub fn validate(&self) -> Result<(), DomainError> {
+        // `?` 按 BlobRef、provenance、origin、来源闭包顺序传播首个领域错误，不会静默修正输入。
         if self.schema_version != SCHEMA_VERSION {
             return Err(DomainError::EmptyField {
                 field: "artifact.schema_version",
@@ -294,6 +309,7 @@ impl Artifact {
         Ok(())
     }
 
+    // 校验 source_refs 严格排序、无重复/自引用，并按 ArtifactKind 应用血缘规则。
     fn validate_source_refs(&self) -> Result<(), DomainError> {
         if self.source_refs.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(DomainError::EmptyField {
@@ -310,6 +326,7 @@ impl Artifact {
             });
         }
 
+        // match 按产物类型收紧最小来源闭包；未特别列出的类型只接受通用检查。
         match self.kind {
             ArtifactKind::RuntimeCheckpoint => {
                 if self.lifecycle != ArtifactLifecycle::RunScoped
@@ -382,6 +399,7 @@ impl Artifact {
                         .source_refs
                         .iter()
                         .all(|reference| reference.kind == ArtifactKind::EvidenceNeed);
+                // 这些迭代器闭包分别识别已有证据和允许的研究审计来源。
                 let has_evidence = self.source_refs.iter().any(|reference| {
                     matches!(
                         reference.kind,

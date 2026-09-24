@@ -3,6 +3,11 @@
 //! Campaign writes are fenced by the daemon lease in the same SQLite
 //! transaction as the state change.  The learning runtime owns verdict
 //! calculation; this module only persists the validated result.
+// 文件导读：Canary 同时保存 campaign head、legacy/paired session 和四条 Run lineage；
+// 本文件只负责把 SQL 列转换为领域 reservation，是否晋级由 learning 侧计算并提交。
+// 先读本文件的 SQL 行解码，再沿 include! 阅读 history/stage/reservation/cohort；这些物理文件
+// 在编译时并入本模块，读写共享 `Connection`/`Transaction` 类型，但 promotion/verdict 仍不在 Store 计算。
+// `Row<'_>` 的生命周期只覆盖 SQLite 回调；转换成拥有型列后才能在回调外继续解析。
 
 use std::collections::BTreeSet;
 
@@ -51,7 +56,8 @@ struct CohortSessionColumns {
     reserved_at: String,
 }
 
-// 按 SQL 列顺序提取 cohort session 原始字段；类型/业务绑定在后续转换函数中统一校验。
+// rusqlite 的 Row 仅在回调期间有效；按 SELECT 列顺序拷贝为拥有 String/i64 的中间值，
+// 让后续领域解析不再借用 SQLite 行。SQL 类型转换错误原样交给 query_row/query_map。
 fn cohort_session_columns(row: &rusqlite::Row<'_>) -> rusqlite::Result<CohortSessionColumns> {
     Ok(CohortSessionColumns {
         cohort_id: row.get(0)?,
@@ -69,8 +75,9 @@ fn cohort_session_columns(row: &rusqlite::Row<'_>) -> rusqlite::Result<CohortSes
     })
 }
 
-// 将 SQL 字段恢复为带 schema、日期、阶段和四条 Run lineage 的 CanarySessionReservation。
-// 数值/时间解析失败或领域校验失败都阻断读取，不返回部分可信的 session。
+// 消费已拥有的列结构并恢复领域 reservation：负 epoch、坏 hash/JSON/日期/时间或 validate 失败
+// 都返回 StoreError；成功结果绑定 campaign、stage、session、market day/regime 与四个 Run ID。
+// struct 字段从 columns 移动到 reservation，转换完成后不再保留第二份原始字符串副本。
 fn stored_cohort_session_from_columns(
     columns: CohortSessionColumns,
 ) -> StoreResult<StoredCanarySession> {

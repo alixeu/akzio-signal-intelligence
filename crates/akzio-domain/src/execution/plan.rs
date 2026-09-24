@@ -1,3 +1,6 @@
+// 文件导读：定义订单意图、带 hash 的 ExecutionPlan 和可逐步构建的 ExecutionContext。
+// 这里只验证引用、风险派生值和 plan closure，不直接提交 Paper 订单。
+// `ExecutionPlan` 的哈希覆盖固定序列化投影；`ExecutionContext` 可先保存部分状态，complete closure 则是独立的更强校验。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OrderSide {
@@ -16,6 +19,7 @@ pub struct OrderIntent {
 }
 
 impl OrderIntent {
+    // 订单名义金额和限价必须为正；资产/side 的业务白名单由上层 Gate 继续处理。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.notional.0 <= 0 || self.limit_price.0 <= 0 {
             return Err(DomainError::InvalidBudget {
@@ -50,6 +54,8 @@ pub struct ExecutionPlan {
 
 #[derive(Serialize)]
 struct ExecutionPlanHashPayload<'a> {
+    // `'a` 让所有引用字段在同一次 hash 投影期间有效；Serialize 只读取借用内容，
+    // 不复制或消费原计划。MoneyMicros/整数等 Copy 字段可直接按值放入投影。
     schema_version: u32,
     decision_context: &'a ArtifactRef,
     account_snapshot: &'a ArtifactRef,
@@ -68,7 +74,10 @@ struct ExecutionPlanHashPayload<'a> {
 }
 
 impl ExecutionPlan {
+    // 按不含 plan_hash 的固定字段投影计算确定性计划哈希。
     pub fn expected_hash(&self) -> Result<ContentHash, DomainError> {
+        // 不把 plan_hash 自己塞入待哈希载荷，避免循环定义；字段及顺序属历史
+        // 序列化身份的一部分，不能为注释整理而重排或增删。
         let payload = ExecutionPlanHashPayload {
             schema_version: self.schema_version,
             decision_context: &self.decision_context,
@@ -90,16 +99,20 @@ impl ExecutionPlan {
         content_hash_json(&value).map_err(|_| DomainError::InvalidContentHash)
     }
 
+    // 重算并写入 plan_hash；调用方随后仍应执行 validate。
     pub fn refresh_hash(&mut self) -> Result<(), DomainError> {
         self.plan_hash = self.expected_hash()?;
         Ok(())
     }
 
+    // 比较保存的 factor_exposure 是否符合当前的 3x same-day 模型。
     pub fn uses_current_factor_exposure_model(&self) -> Result<bool, DomainError> {
         Ok(self.factor_exposure == FactorExposure::from_target(&self.target)?)
     }
 
+    // 校验身份/引用、目标 universe、订单唯一性/买入预算、派生暴露和最终 hash。
     pub fn validate(&self) -> Result<(), DomainError> {
+        // 输入的派生暴露会从 target 重算，买入额度和订单唯一性随后校验；最后才比较持久化 plan_hash。
         if self.schema_version != DOMAIN_SCHEMA_VERSION || self.broker_session.trim().is_empty() {
             return Err(DomainError::EmptyField {
                 field: "execution_plan.identity",
@@ -131,6 +144,7 @@ impl ExecutionPlan {
             });
         }
         self.orders.iter().try_for_each(OrderIntent::validate)?;
+        // 只累计 Buy notional；Sell 是风险减少动作，不消耗 maximum_total_notional。
         let buy_notional = self
             .orders
             .iter()
@@ -156,6 +170,7 @@ impl ExecutionPlan {
                 field: "execution_plan.orders",
             });
         }
+        // 从 target 重新求 gross，拒绝调用方伪造派生 exposure。
         let gross = self
             .target
             .weights
@@ -209,6 +224,7 @@ pub struct ExecutionContext {
 }
 
 impl ExecutionContext {
+    // 校验执行上下文身份、可选快照引用、派生 ppm、风险和最终 process quality。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION || self.run_id.0.trim().is_empty() {
             return Err(DomainError::EmptyField {
@@ -266,7 +282,10 @@ impl ExecutionContext {
         Ok(())
     }
 
+    // 在普通校验之上要求相关 Option 字段齐全且标志可通过；
+    // 只检查本值与引用 kind，不回读快照、审批或计划 Artifact 的真实 CAS 闭包。
     pub fn validate_complete_plan_closure(&self) -> Result<(), DomainError> {
+        // 先复用基础 validate，再要求所有快照/派生值齐全且未 frozen；失败返回 Err，不合成默认快照。
         self.validate()?;
         if self.account_snapshot.is_none()
             || self.quote_snapshot.is_none()

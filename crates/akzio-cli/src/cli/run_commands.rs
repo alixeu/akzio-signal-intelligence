@@ -1,3 +1,11 @@
+// 文件导读：本文件承载 CLI 的配置加载、daemon token、服务启动和关闭信号逻辑。它把
+// 本地配置解析为 daemon 的启动输入，再由 daemon 负责 HTTP、worker、scheduler 和
+// Store 事务；token 可用、服务启动或 scheduler tick 成功，都不能越级说明 Run、订单、
+// fill 或跨交易日 Outcome 已完成。
+// Rust 机制：`#[cfg]` 让 Unix 权限实现与其他平台实现分别编译；`Arc` 共享 daemon，
+// `watch` 广播关闭状态，`tokio::spawn` 拥有后台 Future，`try_join!` 等待并行服务且
+// 任一错误都会传播，避免后台任务静默脱离生命周期。
+
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
@@ -137,6 +145,14 @@ fn enforce_daemon_token_permissions(_path: &std::path::Path) -> Result<()> {
 }
 
 async fn serve(config: &Config, config_path: &Path) -> Result<()> {
+    let run_log = akzio_daemon::RunLogger::open()
+        .context("正式 Core 启动需要私有运行日志目录")?;
+    let recovery_store = Store::open(&config.daemon.store_root)?;
+    if recovery_store.debug_environment()?.is_some() {
+        bail!("正式 Core 拒绝使用旧隔离 Debug Store；未发起模型或交易 I/O");
+    }
+    run_log.recover_orphans(&recovery_store)?;
+    run_log.attach_store(recovery_store)?;
     // 组装并启动 daemon：先读取 SQL active Policy、校验 Debug/Paper 的启动前置，再探测
     // 模型能力和构造 RuntimeIdentity，最后才创建 HTTP/worker/scheduler。启动成功不等于
     // Run、Decision、ExecutionVerdict、PaperCommit 或成交已经完成。
@@ -145,36 +161,41 @@ async fn serve(config: &Config, config_path: &Path) -> Result<()> {
         .model
         .clone()
         .context("missing [model] configuration for daemon serve")?;
+    run_log.register_secret(&model.api_key)?;
     let loaded_policy = load_decision_policy_from_config(config)?;
     let decision_policy = loaded_policy.policy.clone();
-    let (decision_policy_status, decision_policy_input_hash) =
-        decision_policy_audit(&loaded_policy);
-    let uncalibrated_research = !auto_paper
-        && decision_policy_status == "store_active_head_missing"
-        && decision_policy_input_hash.is_none()
-        && loaded_policy.artifact_id.is_none();
-    // 未校准且非 auto_paper 的研究模式允许启动以积累真实标签；真实 Debug Core 和 Paper
-    // 仍要求 decision-capable 的 Store Policy，不能用默认 Policy 绕过校验。
-    if config.daemon.debug_control && !uncalibrated_research && (!decision_policy.decision_capable()
-        || decision_policy_status != "ready_for_current_decision"
-        || decision_policy_input_hash.is_none()
-        || loaded_policy.artifact_id.is_none()) {
-        bail!("real Debug Core requires a decision-capable frozen policy before model capability probes");
-    }
-    if config.daemon.debug_control && !uncalibrated_research {
-        // 即使 Policy 能力足够，也必须与当前 Store 的 Synthesizer Contract 精确匹配。
-        let store = Store::open(&config.daemon.store_root)?;
-        let contract = akzio_daemon::canonical_synthesizer_contract_hash(&store)?;
-        if loaded_policy.contract_hash.as_ref() != Some(&contract) {
-            bail!("real Debug Core frozen policy does not match the Synthesizer Contract");
+    let token = daemon_token(&config.daemon)?;
+    run_log.register_secret(&token)?;
+    for key in ["ALPACA_API_KEY", "ALPACA_API_SECRET", "FRED_API_KEY"] {
+        if let Ok(secret) = std::env::var(key) {
+            run_log.register_secret(&secret)?;
         }
     }
-    let token = daemon_token(&config.daemon)?;
     // Provider capability probe 发生在 Daemon::open 之前；失败则不会启动 worker 或 scheduler。
-    let model_capabilities = probe_configured_model_capabilities(&model)
-        .await
+    let startup_scope = akzio_model::ModelAuditContext::startup(run_log.core_session());
+    run_log.record(&startup_scope, "core.startup", serde_json::json!({"status":"started"}))?;
+    let probe_result = akzio_model::MODEL_AUDIT_CONTEXT
+        .scope(
+            startup_scope.clone(),
+            akzio_model::probe_configured_model_capabilities_with_audit(
+                &model,
+                run_log.clone(),
+            ),
+        )
+        .await;
+    run_log.record(
+        &startup_scope,
+        "core.probe",
+        serde_json::json!({"status":if probe_result.is_ok() {"completed"} else {"failed"}}),
+    )?;
+    if let Some(receipt) =
+        run_log.seal_startup(if probe_result.is_ok() {"completed"} else {"failed"})?
+    {
+        run_log.confirm_startup(&receipt)?;
+    }
+    let model_capabilities = probe_result
         .context("probe configured model capabilities before daemon startup")?;
-    let runtime_identity_hash = if auto_paper || config.daemon.manual_paper || config.daemon.debug_control {
+    let runtime_identity_hash = if auto_paper || config.daemon.manual_paper {
         // 只有会影响 Paper/Debug 身份的模式才绑定完整 RuntimeIdentity；普通研究服务不
         // 通过这个可选字段伪造审批或 Decision 身份。
         Some(
@@ -211,16 +232,6 @@ async fn serve(config: &Config, config_path: &Path) -> Result<()> {
         DaemonConfig {
             agent_budget: config.agent.budget.clone(),
             research_settings: config.agent.research.clone(),
-            debug_control: if config.daemon.debug_control { Some(akzio_daemon::DebugCoreConfig {
-                code_revision: source_revision()?,
-                runtime_identity: runtime_identity_hash.clone().context("Debug runtime identity missing")?,
-                decision_policy_status,
-                decision_policy_input_hash,
-                decision_policy_artifact: loaded_policy.artifact_id.clone().map(|artifact_id| ArtifactRef {
-                    artifact_id,
-                    kind: ArtifactKind::DecisionPolicy,
-                }),
-            }) } else { None },
             outcome_processing: config.daemon.outcome_processing,
             store_root: config.daemon.store_root.clone(),
             http_token: token,
@@ -235,6 +246,7 @@ async fn serve(config: &Config, config_path: &Path) -> Result<()> {
             runtime_identity_hash,
             historical_evaluation_condition,
             model_knowledge_cutoff,
+            run_log: Some(run_log.clone()),
         },
         model,
         model_capabilities,
@@ -248,10 +260,43 @@ async fn serve(config: &Config, config_path: &Path) -> Result<()> {
         }
         let _ = shutdown_tx.send(true);
     });
-    let paper = if auto_paper || config.daemon.manual_paper || config.daemon.debug_control {
+    let paper = if auto_paper || config.daemon.manual_paper {
         // Debug/Paper 模式需要 Paper client 供观察或正式链路使用；普通研究服务不构造
         // Broker 连接，从而保持未授权路径没有外部交易 I/O。
-        Some(AlpacaPaper::from_env().context("construct Alpaca Paper client")?)
+        let guard_log = run_log.clone();
+        let guard = Arc::new(move |kind: PaperWriteKind| {
+            let scope = akzio_model::MODEL_AUDIT_CONTEXT
+                .try_with(Clone::clone)
+                .map_err(|_| PaperError::RunLogUnavailable("broker write has no Run scope".into()))?;
+            if kind != PaperWriteKind::Cancel
+                && guard_log
+                    .run_cancel_requested(&scope.run_id)
+                    .map_err(|error| PaperError::RunLogUnavailable(error.to_string()))?
+            {
+                return Err(PaperError::RunCancelled);
+            }
+            if kind == PaperWriteKind::Cancel
+                && (guard_log.assert_available().is_err()
+                    || guard_log.is_uncertain_run(&scope.run_id))
+            {
+                // The dispatch path must have already persisted the exact
+                // protective cancel intent; audit failure cannot strand it.
+                return Ok(());
+            }
+            let event = match kind {
+                PaperWriteKind::Submit => "rust.broker.submit_http",
+                PaperWriteKind::Replace => "rust.broker.replace_http",
+                PaperWriteKind::Cancel => "rust.broker.cancel_http",
+            };
+            guard_log
+                .record(&scope, event, serde_json::json!({"status":"before_http_io"}))
+                .map_err(|error| PaperError::RunLogUnavailable(error.to_string()))
+        });
+        Some(
+            AlpacaPaper::from_env()
+                .context("construct Alpaca Paper client")?
+                .with_write_guard(guard),
+        )
     } else {
         None
     };
@@ -284,15 +329,19 @@ async fn serve(config: &Config, config_path: &Path) -> Result<()> {
         tokio::try_join!(
             http_daemon.serve_http(config.daemon.http_addr, shutdown_rx.clone()),
             daemon
-                .serve_with_paper_scheduler(clock, &source, Duration::from_secs(30), shutdown_rx,),
+                .serve_with_paper_scheduler(clock, &source, Duration::from_secs(30), shutdown_rx.clone(),),
+            daemon.supervise_run_archives(shutdown_rx),
         )?;
     } else {
         // 非 auto_paper 只提供 HTTP 和普通 worker，不启动交易 Session scheduler。
         tokio::try_join!(
             http_daemon.serve_http(config.daemon.http_addr, shutdown_rx.clone()),
-            http_daemon.serve_workers(shutdown_rx),
+            http_daemon.serve_workers(shutdown_rx.clone()),
+            daemon.supervise_run_archives(shutdown_rx),
         )?;
     }
+    // Workers have joined before the last incomplete stage is sealed.
+    daemon.archive_remaining_after_shutdown()?;
     Ok(())
 }
 
@@ -337,39 +386,6 @@ async fn wait_for_parent_stdin_eof() -> Result<()> {
         != 0
     {}
     Ok(())
-}
-
-fn fixture_daemon(config: &Config) -> Result<Daemon> {
-    // 构造供 debug serve-fixture 使用的确定性 daemon：关闭 auto_paper，使用默认 Policy
-    // 和 fixture model client；它只服务隔离 Debug 控制，不提供真实 Paper 订单能力。
-    Ok(Daemon::with_model(
-        DaemonConfig {
-            agent_budget: config.agent.budget.clone(),
-            research_settings: config.agent.research.clone(),
-            debug_control: if config.daemon.debug_control { Some(akzio_daemon::DebugCoreConfig {
-                code_revision: source_revision()?,
-                runtime_identity: ContentHash::of_bytes(source_revision()?.as_bytes()),
-                decision_policy_status: "fixture_default".into(),
-                decision_policy_input_hash: None,
-                decision_policy_artifact: None,
-            }) } else {None},
-            outcome_processing: config.daemon.outcome_processing,
-            store_root: config.daemon.store_root.clone(),
-            http_token: if config.daemon.debug_control {daemon_token(&config.daemon)?} else {"fixture-only".to_owned()},
-            worker_count: config.daemon.worker_count.unwrap_or(2),
-            auto_paper: false,
-            market_data_feed: config.execution.market_data_feed,
-            outcome_cost_model: OutcomeCostModel {
-                transaction_cost_ppm: config.execution.transaction_cost_ppm,
-                slippage_ppm: config.execution.slippage_ppm,
-            },
-            decision_policy: DecisionPolicy::default(),
-            runtime_identity_hash: None,
-            historical_evaluation_condition: None,
-            model_knowledge_cutoff: None,
-        },
-        fixture_model_client(),
-    )?)
 }
 
 fn print_json<T: Serialize>(response: &T) -> Result<()> {

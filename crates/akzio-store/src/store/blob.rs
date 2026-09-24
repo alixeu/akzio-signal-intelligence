@@ -1,7 +1,12 @@
+// 文件导读：本文件实现 CAS BLOB 从暂存到持久化、压缩/派生编码、读取校验、备份和 Run 导出。
+// 先读 stage_* → promote_staged_blob → read_blob_bytes_recursive 理解负载流转，再读
+// storage_inventory/export_run/backup_to 理解只读盘点与文件副作用。TEMP staging 只属于单一
+// SQLite 连接；Artifact 写事务提升后才进入 durable rebuild_blobs，切片/字典只保存可验证的父依赖。
 use super::debug::{environment_identity, read_session};
 use super::*;
 
-// 创建连接私有的临时 staging 表；表只服务于当前 SQLite 连接，提交 Artifact 时再提升为持久 BLOB。
+// 在传入 Connection 上创建连接私有 TEMP 表；它随 SQLite 连接生命周期存在，不是 Store Root 文件。
+// 后续 staging 查询必须复用该连接，Artifact 事务中 promotion 才写 durable CAS。
 pub(super) fn initialize_staging(connection: &Connection) -> StoreResult<()> {
     connection.execute_batch(
         r#"CREATE TEMP TABLE IF NOT EXISTS akzio_staged_blobs (
@@ -18,8 +23,9 @@ pub(super) fn initialize_staging(connection: &Connection) -> StoreResult<()> {
 }
 
 impl Store {
-    // 只读汇总 Artifact、BLOB、压缩和未引用依赖的数量/字节数，不回收或修复任何存储内容。
-    // 有依赖表时递归计算可达 BLOB；旧 schema 则只按直接 Artifact/嵌入引用判断未引用项。
+    // 无输入过滤条件，返回整个 Store 的 Artifact/BLOB 数量和字节汇总；它只读，不回收或修复数据。
+    // 多条 SELECT 在同一连接上依次执行但没有显式事务，因此并发写入时各计数不保证同一时点快照。
+    // 有依赖表时用递归 CTE 从 Artifact/嵌入引用沿父依赖计算可达 BLOB；旧 schema 只检查直接引用。
     pub fn storage_inventory(&self) -> StoreResult<StorageInventory> {
         let connection = self.connection()?;
         let artifact_count =
@@ -49,6 +55,7 @@ impl Store {
             [],
             |row| row.get::<_, u64>(0),
         )?;
+        // 通过 schema 能力选择两种查询；递归 CTE 的 UNION 同时去重，避免重复依赖重复计数。
         let unreferenced_query = if blob_dependency_table_exists(&connection)? {
             r#"WITH RECURSIVE reachable(blob_hash) AS (
                    SELECT blob_hash FROM rebuild_artifacts
@@ -90,8 +97,11 @@ impl Store {
         })
     }
 
-    // 校验 Store 后导出一个 Run 的工作流、事件、轨迹和 Artifact 闭包到新的 SQLite 目录。
-    // raw model 是否可导出由 Store 内的 Debug 身份决定；导出成功不表示原 Run 或下游 Decision 已完成。
+    // 输入 Run、一个尚不存在的目标目录、以及是否请求 raw model；此入口用 Path::starts_with 与 Store Root 做路径组件比较，
+    // 不 canonicalize target。输出清单和独立 SQLite 导出，后续 payload 写入才在目标库事务中原子提交。
+    // 先校验 Store、workflow 与 Debug 导出能力，再按图/Task/event 起点沿 source_refs 做 Artifact 闭包。
+    // raw model 能力由 Store 内 Debug 身份决定；导出不推进 Run/Decision。目录和 schema 在 payload 事务前创建，
+    // 后续失败不会自动删除目标目录/空 schema；导出库成功也不会注册回原 Store。
     pub fn export_run(
         &self,
         run_id: &RunId,
@@ -100,6 +110,7 @@ impl Store {
     ) -> StoreResult<RunExportManifest> {
         self.verify_integrity()?;
         let workflow = self.workflow_snapshot(run_id)?;
+        // 借用原 Store 连接完成 raw-model 身份核验；显式 drop 让 Mutex 在后续查询前释放。
         let access_connection = self.connection()?;
         if include_raw_model
             && !raw_model_export_allowed(&access_connection, run_id, workflow.run.purpose)
@@ -134,6 +145,7 @@ impl Store {
         let mut visited = BTreeSet::new();
         let mut artifacts = Vec::new();
         let mut payloads = Vec::new();
+        // BTreeSet 同时提供待处理去重与确定性取出顺序；visited 阻止 source_refs 环路重复扩展。
         while let Some(artifact_id) = pending.pop_first() {
             if !visited.insert(artifact_id.clone()) {
                 continue;
@@ -199,6 +211,8 @@ impl Store {
                payload BLOB NOT NULL
              );",
         )?;
+        // 目标库先创建 schema，再以单个立即事务写全部内容 BLOB 与 manifest；任何循环内错误
+        // 退出时 Transaction Drop 回滚该事务，但已创建的文件/表仍保留。
         let transaction = export.transaction_with_behavior(TransactionBehavior::Immediate)?;
         for (blob, bytes) in &payloads {
             // 重新按 CAS 写入并比对 hash/长度，防止导出过程改变负载身份。
@@ -222,8 +236,11 @@ impl Store {
         Ok(manifest)
     }
 
-    // 校验后用 SQLite VACUUM INTO 生成独立快照，并读取快照的哈希和 BLOB 统计。
-    // 目标目录必须在 Store Root 外且不存在；该操作不创建新的业务 Artifact。
+    // `impl AsRef<Path>` 接受具体路径类型并在入口转为拥有型 PathBuf；不通过 dyn Trait 分发。
+    // 输入不存在的目标目录；此入口同样用 Path::starts_with 对传入路径和 Store Root 做词法组件比较，
+    // 不先 canonicalize target。先完整性校验，再由 SQLite VACUUM INTO 生成独立快照，
+    // 最后读取快照哈希、文件字节和 BLOB 统计形成 BackupManifest，不创建业务 Artifact。
+    // 目标目录在 VACUUM 前创建；失败不会由该方法自动删除目录或数据库残留。
     /// Create one self-contained SQLite snapshot. Payloads already live in
     /// `rebuild_blobs`, so no filesystem CAS or sidecar manifest is needed.
     pub fn backup_to(&self, target: impl AsRef<Path>) -> StoreResult<BackupManifest> {
@@ -275,8 +292,11 @@ impl Store {
         })
     }
 
-    // 校验源数据库后复制到一个不存在的新目录，再以 Store 身份重新打开并复核完整性。
-    // restore 复制的是已验证快照，不负责迁移 schema、重建 Policy 或激活任何运行能力。
+    // 输入源文件/备份目录与一个不存在的目标 Root；先只读打开并验证源，再拷贝数据库，
+    // 最后将目标按只读既有 Store 重开并复验。它复制的是已验证快照，不迁移 schema、不建 Policy，
+    // 也不激活运行能力；中途失败可能留下已创建的目标目录/文件。
+    // 与 backup_to/export_run 不同，此入口只检查 target 是否已存在，没有执行 Store Root 路径包含检查；
+    // 调用方必须自行选择预期的独立目标 Root，本批只记录当前边界，不改写行为。
     pub fn restore_from(source: impl AsRef<Path>, target: impl AsRef<Path>) -> StoreResult<Self> {
         let source = source.as_ref().to_path_buf();
         let target = target.as_ref().to_path_buf();
@@ -315,34 +335,37 @@ impl Store {
         Ok(store)
     }
 
-    // 将原始字节按 CAS hash 写入 durable rebuild_blobs，并返回带媒体类型和逻辑长度的引用。
-    // 这是直接持久化入口；Artifact/事件的事务闭包仍由上层提交逻辑负责。
+    // 借用输入字节、取得媒体类型后直接把 CAS BLOB 写进 durable rebuild_blobs，返回逻辑 hash/长度引用。
+    // 本方法不同时写 Artifact 或 event；多对象提交与事务边界由上层 Store 方法负责。
     pub fn put_bytes(&self, bytes: &[u8], media_type: impl Into<String>) -> StoreResult<BlobRef> {
         let connection = self.connection()?;
         put_blob_bytes(&connection, bytes, media_type.into())
     }
 
-    // 先序列化为 JSON，再复用 put_bytes 的 CAS、压缩和完整性校验；不会把 JSON 另存为平铺状态。
+    // 泛型 T 只需实现 Serialize；具体 T 编译期实例化（静态分发），借用 value 编码为 owned JSON Vec，
+    // 再复用 put_bytes 的 CAS/压缩校验。序列化失败经 `?` 转为 StoreError，成功不自动建立 Artifact。
     pub fn put_json<T: Serialize>(&self, value: &T) -> StoreResult<BlobRef> {
         self.put_bytes(&serde_json::to_vec(value)?, "application/json")
     }
 
-    // 在当前连接的临时表中准备 CAS 负载；在引用它的 Artifact 提交前，负载尚未 durable。
-    /// Prepare a CAS payload without making it durable. The returned reference
-    /// is readable only through this `Store` instance until the same connection
-    /// promotes it in the transaction that inserts its referencing Artifact.
+    // 借用原始字节；若 durable CAS 已有相同内容则直接复用，否则暂存到当前连接 TEMP 表。
+    // 后一种情况下同一 Store 副本共享该连接可读，其他独立连接不可见；返回 BlobRef
+    // 本身不保证新负载已 durable，引用它的 Artifact 事务 promotion 后才持久。
+    /// 已有 durable CAS 时直接复用；新内容只暂存，不因返回 `BlobRef` 而持久。
+    /// 未提升的新负载仅能从这条 Store 连接读取，引用它的 Artifact 事务才会提升。
     pub fn stage_bytes(&self, bytes: &[u8], media_type: impl Into<String>) -> StoreResult<BlobRef> {
         let connection = self.connection()?;
         stage_blob_bytes(&connection, bytes, media_type.into())
     }
 
-    // JSON staging 只改变临时连接状态，持久化时仍由同一连接上的 Artifact 事务提升。
+    // 泛型 T: Serialize 对具体 T 静态实例化；value 借用序列化成 owned Vec，编码错误发生在拿连接之前，
+    // 成功只改变临时连接状态，持久化仍由后续 Artifact 事务提升。
     pub fn stage_json<T: Serialize>(&self, value: &T) -> StoreResult<BlobRef> {
         self.stage_bytes(&serde_json::to_vec(value)?, "application/json")
     }
 
-    // 从已有（或同连接已 staging 的）BLOB 取非空字节区间，并记录父 BLOB 与范围依赖。
-    // 返回的引用代表逻辑切片；真正的存储表示由 promotion 阶段决定。
+    // 借用父 BlobRef 和半开区间 [start_byte, end_byte)，先读取父逻辑字节，再要求区间存在且非空；
+    // 成功 staging 子字节并记录父引用/范围。越界、反向或空区间都返回 Integrity，不写 durable CAS。
     /// Stage a logical blob backed by an exact byte range of another blob.
     /// The derived BlobRef keeps the hash and length of the logical slice;
     /// storage representation remains private to the Store.
@@ -373,7 +396,9 @@ impl Store {
         )
     }
 
-    // 先把 JSON 序列化，再校验字典在当前连接可见；promotion 只有在压缩节省达到阈值时才使用字典。
+    // 泛型 T: Serialize 先静态实例化并把借用 value 序列化为 owned Vec，再把字典长度转为 usize
+    // 并校验父 BLOB 在当前连接可读；
+    // 转换/读取失败则不生成派生 BLOB。真正比较字典压缩率在 promotion 阶段进行。
     /// Stage JSON that may use another blob as a zstd dictionary. Promotion
     /// selects this representation only when it beats the normal identity/zstd
     /// representation by the configured minimum saving.
@@ -396,7 +421,7 @@ impl Store {
         )
     }
 
-    // 在 Store 的唯一连接上读取 BLOB；不能在调用方已持有连接时再次获取 Mutex。
+    // 输入 BlobRef，单次获取 Store 唯一连接并返回校验后的逻辑字节；不可在调用方已持连接时重入。
     /// Read one CAS payload on the Store's own connection.
     ///
     /// The connection is acquired exactly once. A second acquisition would
@@ -414,7 +439,9 @@ impl Store {
     }
 }
 
-// 供已持有 Connection/Transaction 的 Store 内部路径读取；优先看连接私有 staging，再读 durable CAS。
+// 供已持有 Connection/Transaction 的内部路径读取；优先看同连接 TEMP staging，再读 durable CAS。
+// 该变体不获取 Mutex，调用方必须保证传入连接仍有效且其事务边界符合当前写入流程。
+// 借用调用方现有连接读取 BlobRef；既保留同连接未提交/staging 可见性，也避免重新获取非重入 Mutex。
 /// Connection-scoped CAS read for callers that already hold the Store
 /// connection or an open transaction. Staged payloads stay visible, so an
 /// Artifact's blob can be read inside the transaction that promotes it.
@@ -433,6 +460,7 @@ pub(super) fn raw_model_export_allowed(
     run_id: &RunId,
     purpose: RunPurpose,
 ) -> bool {
+    // Debug purpose 是旧诊断路径的直接允许分支；其他 purpose 的任一读取/身份错误都 fail closed 为 false。
     if purpose == RunPurpose::Debug {
         return true;
     }
@@ -466,6 +494,8 @@ fn stage_blob_bytes_with_hint(
     encoding_hint: &str,
     dependency: Option<(&BlobRef, usize, usize)>,
 ) -> StoreResult<BlobRef> {
+    // 入参 bytes/media_type 只借用或移动到 BlobRef；依赖是可选父 BlobRef 与逻辑字节范围。
+    // 返回的 hash 始终由未压缩逻辑字节计算，encoding_hint 只决定将来 promotion 的物理表示。
     if media_type.trim().is_empty() {
         return Err(StoreError::Domain(DomainError::EmptyField {
             field: "blob_ref.media_type",
@@ -476,6 +506,7 @@ fn stage_blob_bytes_with_hint(
         media_type,
         bytes: bytes.len() as u64,
     };
+    // 先查 durable CAS：已存在则复用同一内容身份；仅 MissingBlob 表示可以 staging，其他损坏/SQL 错误传播。
     match read_blob_bytes(connection, &blob.hash, blob.bytes) {
         Ok(_) => return Ok(blob),
         Err(StoreError::MissingBlob(_)) => {}
@@ -490,6 +521,7 @@ fn stage_blob_bytes_with_hint(
             )
         })
         .unwrap_or((None, None, None));
+    // `INSERT OR IGNORE` 用内容 hash 作主键，使相同逻辑负载可复用已有 staging 行；随后回读逐字节验身份。
     connection.execute(
         r#"INSERT OR IGNORE INTO temp.akzio_staged_blobs
            (blob_hash, logical_bytes, payload, encoding_hint,
@@ -522,6 +554,7 @@ pub(super) fn read_blob_bytes_including_staged(
     hash: &ContentHash,
     expected_bytes: u64,
 ) -> StoreResult<Vec<u8>> {
+    // Option::Some 表示临时 payload 命中，None 才回退 durable 表；临时行损坏返回 Err，不伪装为缓存未命中。
     if let Some(bytes) = read_staged_blob_bytes(connection, hash, expected_bytes)? {
         return Ok(bytes);
     }
@@ -531,6 +564,8 @@ pub(super) fn read_blob_bytes_including_staged(
 // 将临时 BLOB 按提示提升到 durable CAS，并在删除临时行前确认最终引用仍与原 hash/长度一致。
 // 该函数运行在调用方的 Artifact 事务内，失败会让外层事务回滚而不会留下半成品引用。
 pub(super) fn promote_staged_blob(connection: &Connection, blob: &BlobRef) -> StoreResult<()> {
+    // 由引用它的 Artifact 写事务调用。未 staging 时仅验证 durable 引用；staging 时先解码校验，
+    // 再按提示生成 durable 编码并比对整个 BlobRef，最后才删除 TEMP 行，避免先删后写的丢失窗口。
     let staged = connection
         .query_row(
             r#"SELECT encoding_hint, dependency_blob_hash, start_byte, end_byte
@@ -547,6 +582,7 @@ pub(super) fn promote_staged_blob(connection: &Connection, blob: &BlobRef) -> St
             },
         )
         .optional()?;
+    // let-else 将无 staging 行作为明确早退；SQLite 查询错误由上面的 `?` 返回。
     let Some((encoding_hint, dependency_hash, start_byte, end_byte)) = staged else {
         read_blob_bytes(connection, &blob.hash, blob.bytes)?;
         return Ok(());
@@ -554,6 +590,7 @@ pub(super) fn promote_staged_blob(connection: &Connection, blob: &BlobRef) -> St
     let bytes = read_staged_blob_bytes(connection, &blob.hash, blob.bytes)?
         .ok_or_else(|| StoreError::MissingBlob(blob.hash.clone()))?;
     // 不同提示对应不同的物理编码，但都必须还原到相同的逻辑字节。
+    // match 穷尽本 Store 支持的提示：普通字节直接存，切片与字典先确保父 BLOB durable 后重建依赖。
     let stored = match encoding_hint.as_str() {
         BLOB_ENCODING_IDENTITY => put_blob_bytes(connection, &bytes, blob.media_type.clone())?,
         BLOB_ENCODING_SLICE_V1 => {
@@ -597,7 +634,7 @@ pub(super) fn promote_staged_blob(connection: &Connection, blob: &BlobRef) -> St
             blob.hash
         )));
     }
-    // 只有 durable 负载已经完成 identity 校验后才消费临时 staging 行。
+    // 只有 durable 负载已经完成 identity 校验后才消费临时 staging 行；外层事务失败时此 DELETE 也回滚。
     connection.execute(
         "DELETE FROM temp.akzio_staged_blobs WHERE blob_hash = ?1",
         params![blob.hash.as_str()],
@@ -613,6 +650,8 @@ fn staged_dependency_blob_ref(
     start_byte: Option<u64>,
     end_byte: Option<u64>,
 ) -> StoreResult<BlobRef> {
+    // 输入依赖哈希和可选范围；先查询 durable 父项，若未找到则从本连接 staging 读取并递归提升。
+    // ContentHash::new 失败或两处都没有该哈希都会向上传播，不能构造未验证的依赖引用。
     let hash = ContentHash::new(dependency_hash.ok_or_else(|| {
         StoreError::Integrity("staged derived blob has no dependency".to_owned())
     })?)?;
@@ -662,6 +701,7 @@ fn read_staged_blob_bytes(
     hash: &ContentHash,
     expected_bytes: u64,
 ) -> StoreResult<Option<Vec<u8>>> {
+    // SQL 用 hash 精确查找当前连接临时表；None 是没有行，Some 必须同时匹配声明长度、实际长度和 hash。
     let staged = connection
         .query_row(
             "SELECT logical_bytes, payload FROM temp.akzio_staged_blobs WHERE blob_hash = ?1",
@@ -687,6 +727,7 @@ pub(super) fn put_blob_bytes(
     bytes: &[u8],
     media_type: String,
 ) -> StoreResult<BlobRef> {
+    // 直接入口只验证媒体类型，再计算标准 identity/zstd 表示并插入；是否在事务内由调用方 Connection 决定。
     if media_type.trim().is_empty() {
         return Err(StoreError::Domain(DomainError::EmptyField {
             field: "blob_ref.media_type",
@@ -705,6 +746,7 @@ fn put_blob_slice(
     start_byte: u64,
     end_byte: u64,
 ) -> StoreResult<BlobRef> {
+    // 父 BlobRef 被借用而非消费；先读出并校验父逻辑字节，usize::try_from 防止数据库范围超出本机索引宽度。
     let dependency_bytes = read_blob_bytes(connection, &dependency.hash, dependency.bytes)?;
     let start = usize::try_from(start_byte)
         .map_err(|_| StoreError::MissingBlob(dependency.hash.clone()))?;
@@ -733,6 +775,7 @@ fn put_blob_bytes_with_dictionary(
     media_type: String,
     dictionary: &BlobRef,
 ) -> StoreResult<BlobRef> {
+    // 先计算普通表示；小于阈值立即回退。达到阈值后才读字典并压缩，只有满足 MIN_SAVINGS 才记录字典依赖。
     let (standard_encoding, standard_stored) = standard_blob_storage(bytes)?;
     if bytes.len() < BLOB_COMPRESSION_THRESHOLD {
         return insert_blob_storage(
@@ -782,6 +825,9 @@ fn put_blob_bytes_with_dictionary(
 
 // 对达到阈值的负载尝试 zstd，只有压缩后达到最小节省才采用压缩表示，否则保留原字节。
 fn standard_blob_storage(bytes: &[u8]) -> StoreResult<(&'static str, Vec<u8>)> {
+    // 返回的 encoding 是下列静态字符串字面量之一，因此 `&'static str` 与输入 bytes 生命周期无关。
+    // 依据字节长度决定是否创建压缩结果；只有压缩长度加上最小节省仍严格小于原长才选 zstd。
+    // 此处能确认选择规则，不能仅由代码断言实际运行更快或总分配更少。
     let hash = ContentHash::of_bytes(bytes);
     let compressed = if bytes.len() >= BLOB_COMPRESSION_THRESHOLD {
         Some(zstd::bulk::compress(bytes, 3).map_err(|error| {
@@ -812,6 +858,8 @@ fn insert_blob_storage(
     stored: Vec<u8>,
     dependency: Option<(&str, &BlobRef, u64, u64)>,
 ) -> StoreResult<BlobRef> {
+    // hash 唯一键实现内容去重；新增行才写 dependency，随后无论新旧都递归读回并逐字节核对。
+    // 派生 BLOB 与依赖若由事务连接写入则共同回滚；本函数自身不调用 commit。
     let hash = ContentHash::of_bytes(bytes);
     let inserted = connection.execute(
         r#"INSERT OR IGNORE INTO rebuild_blobs
@@ -861,6 +909,7 @@ pub(super) fn read_blob_bytes(
     hash: &ContentHash,
     expected_bytes: u64,
 ) -> StoreResult<Vec<u8>> {
+    // 新建一次调用专属 visiting 集，再递归解码；结果最后还需符合 BlobRef 声明的长度。
     let mut visiting = BTreeSet::new();
     let bytes = read_blob_bytes_recursive(connection, hash, &mut visiting, 0)?;
     if bytes.len() as u64 != expected_bytes {
@@ -877,6 +926,8 @@ fn read_blob_bytes_recursive(
     visiting: &mut BTreeSet<ContentHash>,
     depth: usize,
 ) -> StoreResult<Vec<u8>> {
+    // Connection 由上层借用，函数不获取连接锁。深度上限与 visiting 集分别阻断过长依赖链和环；
+    // 集合经可变借用传入递归，所有递归读取都属于同一次逻辑读取，任何错误由 `?` 向最外层传播。
     if depth >= BLOB_MAX_DEPENDENCY_DEPTH || !visiting.insert(hash.clone()) {
         return Err(StoreError::Integrity(format!(
             "blob dependency cycle or depth overflow at {hash}"
@@ -903,6 +954,7 @@ fn read_blob_bytes_recursive(
     if stored.len() as u64 != stored_bytes {
         return Err(StoreError::MissingBlob(hash.clone()));
     }
+    // encoding 决定从 payload 直接取值、zstd 解压，或先递归读父 BLOB 再重建切片/字典内容。
     let bytes = match encoding.as_str() {
         BLOB_ENCODING_IDENTITY => stored,
         BLOB_ENCODING_ZSTD => {
@@ -966,12 +1018,14 @@ struct BlobDependency {
     end_byte: u64,
 }
 
+// 派生编码在数据库中的父哈希和半开区间；只由读取器内部构造，不作为独立公共 API。
 // 从依赖表读取某个派生 BLOB 的唯一依赖，并校验 ordinal、类型和范围形状。
 fn read_blob_dependency(
     connection: &Connection,
     hash: &ContentHash,
     expected_kind: &str,
 ) -> StoreResult<BlobDependency> {
+    // 先确认旧 schema 具备依赖表，再按 blob_hash 拉全量依赖行；模式解构要求恰有一个 ordinal=0 记录。
     if !blob_dependency_table_exists(connection)? {
         return Err(StoreError::MissingBlob(hash.clone()));
     }
@@ -1008,6 +1062,8 @@ fn read_blob_dependency(
 // 逐个解码所有 durable BLOB，并额外检查派生编码与依赖类型是否成对匹配。
 // 这是完整性检查，不会清理未引用 BLOB，也不会修改 Artifact 生命周期。
 pub(super) fn verify_blob_storage(connection: &Connection) -> StoreResult<()> {
+    // 读取所有 hash/逻辑长度并逐个完整解码校验；任何一项失败都会中止整个 Doctor 检查。
+    // 本函数不执行删除或修复，尾部 SQL 另核对派生 encoding 与 dependency_kind 的配对关系。
     let blobs = connection
         .prepare("SELECT blob_hash, logical_bytes FROM rebuild_blobs ORDER BY blob_hash")?
         .query_map([], |row| {
@@ -1048,6 +1104,7 @@ pub(super) fn verify_blob_storage(connection: &Connection) -> StoreResult<()> {
 
 // 兼容旧 Store 时探测派生 BLOB 依赖表是否存在，结果只影响读取/校验分支。
 fn blob_dependency_table_exists(connection: &Connection) -> StoreResult<bool> {
+    // sqlite_master 按固定表名判断 schema 能力；无匹配行返回 false，查询错误仍返回 Err。
     Ok(connection
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'rebuild_blob_dependencies'",
@@ -1064,7 +1121,9 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
+    // 每个 Blob 测试使用独立 Root，避免 TEMP staging 与 durable CAS 互相污染。
     fn test_store(label: &str) -> Store {
+        // label 仅用于隔离 target 下的临时测试 Root；RunId::new 生成互不相同的目录后 open 会初始化 Store。
         Store::open(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../target/blob-store-tests")
@@ -1079,6 +1138,7 @@ mod tests {
     /// and no poisoning. A staged-but-unpromoted blob is the input that used to
     /// drive `read_blob` into exactly that nested acquisition.
     #[test]
+    // staged payload 的读取必须走同一连接，验证不会因非重入 Mutex 发生嵌套死锁。
     fn read_blob_of_staged_payload_does_not_deadlock() {
         let store = test_store("staged-no-deadlock");
         let staged = store
@@ -1086,12 +1146,14 @@ mod tests {
             .unwrap();
 
         let (sender, receiver) = mpsc::channel();
+        // move 闭包取得 Store、BlobRef 与 sender 的所有权；新线程调用 Store API 并通过 Channel 发送结果。
         let worker = std::thread::spawn(move || {
             let result = store.read_blob(&staged);
             // Ignore send failures: the receiver has already given up on timeout.
             let _ = sender.send(result.map(|bytes| bytes.len()));
         });
 
+        // recv_timeout 给出明确上限；join 等待线程结束，证明结果路径不会把连接锁永久占住。
         match receiver.recv_timeout(Duration::from_secs(10)) {
             Ok(Ok(len)) => assert_eq!(len, b"staged-payload".len()),
             Ok(Err(error)) => panic!("staged read failed: {error}"),
@@ -1103,6 +1165,7 @@ mod tests {
     /// A staged payload is visible only through the connection that staged it,
     /// so reading it must use that connection rather than a freshly opened one.
     #[test]
+    // staging 在 promotion 前只对当前 Store 连接可见。
     fn staged_payload_is_readable_before_promotion() {
         let store = test_store("staged-before-promotion");
         let staged = store.stage_bytes(b"not-yet-durable", "text/plain").unwrap();
@@ -1112,6 +1175,7 @@ mod tests {
     /// A committed payload stays readable after promotion, and its bytes are
     /// unchanged by the storage representation the Store chose.
     #[test]
+    // durable promotion 后按 logical bytes 读取，编码选择不改变返回内容。
     fn promoted_payload_round_trips() {
         let store = test_store("promoted-round-trip");
         let durable = store.put_bytes(b"durable-payload", "text/plain").unwrap();
@@ -1121,6 +1185,7 @@ mod tests {
     /// A length that disagrees with the stored payload is a corrupt reference,
     /// not a cache miss, and must not be silently tolerated.
     #[test]
+    // 引用声明长度与 CAS 实际长度不一致时按 MissingBlob 拒绝。
     fn blob_length_mismatch_is_rejected() {
         let store = test_store("length-mismatch");
         let mut reference = store.put_bytes(b"exact-length", "text/plain").unwrap();

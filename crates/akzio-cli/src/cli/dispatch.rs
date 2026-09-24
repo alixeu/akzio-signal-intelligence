@@ -1,3 +1,11 @@
+// 文件导读：本文件把 CLI 的高层命令转换为已认证的回环 HTTP 调用，或在明确边界内
+// 启动/查询 Store 控制面。它只负责参数编码、响应解码和输出，不在本地重算 readiness、
+// Gate 或调度状态；daemon 的 HTTP handler 和 Rust runtime 才是状态/权限权威。
+// Rust 机制：命令通过枚举 `match` 穷举；`&Config`/`&Path` 是共享借用，
+// 命令成员从拥有型枚举移入各分支；`await?` 驱动 HTTP 请求并向上传播传输/解码错误。
+
+// `command` 由调用方 move 进来并在 match 中拆出拥有的 ID/字符串；配置和路径只读借用。
+// 每个 `await` 才会驱动对应 HTTP Future；成功只表示该 endpoint 返回并解码了结果。
 async fn dispatch_control(command: Command, config: &Config, config_path: &Path) -> Result<()> {
     // 将需要 daemon 控制面的 Workflow/Run/Canary/Daemon 命令统一转为 HTTP 请求；
     // 本地处理的 ObservatoryConfig、Calibration、Evidence 和 ModelQualification 在这里
@@ -11,7 +19,6 @@ async fn dispatch_control(command: Command, config: &Config, config_path: &Path)
                 client.endpoint(&["v1", "workflows", "blueprint"])).query(&[("purpose", purpose)])).await?;
             if format == "mermaid" { print!("{}", blueprint.mermaid()); Ok(()) } else { print_json(&blueprint) }
         }
-        Command::Debug { command } => dispatch_debug(command, config, config_path).await,
         Command::Daemon { command } => match command {
             DaemonAction::Serve => serve(config, config_path).await,
             DaemonAction::Health => {
@@ -37,6 +44,9 @@ async fn dispatch_control(command: Command, config: &Config, config_path: &Path)
             // 子命令保留服务端返回的完整研究/Decision/Execution 生命周期信息。
             let checkpoint_only = matches!(command, RunCommand::Checkpoint { .. });
             match command {
+                RunCommand::Start { .. } | RunCommand::Detail { .. } | RunCommand::ExportBundle { .. } => {
+                    bail!("formal run client must be dispatched before runtime config loading")
+                }
                 RunCommand::Inspect { run_id } | RunCommand::Checkpoint { run_id } => {
                     let inspection: serde_json::Value = client.json(client.request(Method::GET,
                         client.endpoint(&["v1", "observer", "runs", &run_id, "inspection"]))).await?;
@@ -101,13 +111,11 @@ async fn dispatch_control(command: Command, config: &Config, config_path: &Path)
             // 校准操作直接使用 Store Artifact 生命周期，不能被普通控制面代为激活。
             bail!("calibration commands are handled before config loading")
         }
-        Command::Evidence { .. } => {
-            // Evidence 的本地预检/审计有独立的 provider 和输出边界。
-            bail!("evidence commands are handled by the local CLI")
-        }
     }
 }
 
+// StoreCommand 也按值消费；远端写操作由已认证 daemon 执行，只有 ReleaseEvidence 的
+// 可选本地 target 会在响应成功后写新文件，CLI 不自行创建/更新 canonical Store。
 async fn dispatch_store(command: StoreCommand, config: &Config, config_path: &Path) -> Result<()> {
     // Store 查询和写入请求仍由 daemon 的认证 Store API 执行；CLI 只负责参数转换和
     // 输出，唯一的本地写盘例外是显式 --target 的 release evidence JSON 导出。
@@ -182,9 +190,12 @@ async fn dispatch_store(command: StoreCommand, config: &Config, config_path: &Pa
     }
 }
 
+// 只借用服务端返回的 bundle 与目标路径；先检查文件不存在，再创建父目录写 JSON，
+// 但 exists 检查与 fs::write 不是原子排它创建，并发使用同一路径仍可能互相覆盖。
+// 本地导出失败会返回错误，不会撤销服务端已产生的释放结果。
 fn export_release_evidence_bundle(bundle: &ReleaseEvidenceBundle, target: &Path) -> Result<()> {
-    // 导出拒绝覆盖已有路径，并在父目录创建后一次性写入序列化 bundle；源 Store 和
-    // 服务端 evidence 状态不因该文件导出而改变。
+    // 已存在目标通常会提前报错；fs::write 本身可在写入失败时留下部分文件，
+    // 不是原子 rename，不能把返回错误解释为目标目录完全无副作用。
     if target.exists() {
         bail!(
             "release evidence target already exists: {}",

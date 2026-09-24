@@ -1,3 +1,10 @@
+// 文件导读：bootstrap 负责把配置/模型能力/adapter 注入 Daemon，并构造 WorkflowRuntime、
+// AgentRuntime、Decision/Execution/Outcome runtime 和 PaperScheduler。生产构造不自动写
+// Policy、不启动 worker 或 broker I/O；fixture 构造只提供离线 adapter，不能作为 real
+// LLM/Paper/fill/Outcome 证据。
+// Rust 机制：trait object `Arc<dyn AsyncEvidenceAdapter>`/`Arc<dyn ...Broker>` 做依赖注入；
+// `BTreeMap` 保存 role route；builder 方法按所有权返回 `Self`，`with_*` 链式配置不复制 CAS。
+
 use super::*;
 
 impl Daemon {
@@ -8,7 +15,16 @@ impl Daemon {
         model_config: ModelConfig,
         model_capabilities: ModelCapabilityProbeSet,
     ) -> Result<Self> {
-        let debug = model_config.debug || config.debug_control.is_some();
+        // 参数按值进入以供构造过程移动到多个 runtime；先验证 feed/capability，再构造模型
+        // adapter，失败会在 Store worker/scheduler 启动前返回。
+        let audit = config.run_log.clone().ok_or_else(|| {
+            DaemonError::RunLogUnavailable(RunLogError::Unavailable(
+                "formal Core requires an initialized Run logger".into(),
+            ))
+        })?;
+        let model_with_audit = |client: ModelClient| {
+            client.with_audit(audit.clone() as Arc<dyn akzio_model::ModelAuditSink>)
+        };
         let auto_paper = config.auto_paper;
         let market_data_feed = config.market_data_feed;
         if auto_paper && market_data_feed.is_none() {
@@ -35,30 +51,32 @@ impl Daemon {
                 Ok((
                     purpose.clone(),
                     ModelClientAdapter::with_response_language(
-                        ModelClient::from_config(&route_config)?,
-                        debug,
+                        model_with_audit(ModelClient::from_config(&route_config)?),
+                        false,
                         route_config.response_language,
                     )
                     .with_capability_snapshot(capability_snapshot),
                 ))
             })
             .collect::<std::result::Result<BTreeMap<_, _>, ModelError>>()?;
-        let mut daemon = Self::with_fixture_evidence_debug(
+        let mut daemon = Self::with_fixture_evidence_mode(
             config,
-            model.clone(),
+            model_with_audit(model.clone()),
             FixtureEvidence::new(),
-            debug,
             false,
         )?;
+        // 每条显式 route 都使用匹配的能力快照；模型 client 的构造只配置传输，不在这里
+        // 调用 provider，后续 AgentRuntime 任务才会驱动实际模型 Future。
         daemon.model = ModelClientAdapter::with_response_language(
-            model.clone(),
-            debug,
+            model_with_audit(model.clone()),
+            false,
             model_config.response_language.clone(),
         )
         .with_capability_snapshot(model_capabilities.default.clone());
         daemon.stage_models = Arc::new(stage_models);
         let mut production_evidence: BTreeMap<EvidenceSource, Arc<dyn AsyncEvidenceAdapter>> =
             BTreeMap::new();
+        // Adapter 构造从环境读取凭据/端点；真正的 Alpaca/FRED/SEC/News I/O 延后至采集时。
         if let Ok(alpaca) = AlpacaPaperEvidenceTransport::from_env(market_data_feed) {
             production_evidence.insert(EvidenceSource::Alpaca, Arc::new(alpaca));
         }
@@ -77,8 +95,11 @@ impl Daemon {
         daemon.news_web_status = capability.native_web_status.as_str().to_owned();
         production_evidence.insert(
             EvidenceSource::NewsWeb,
-            akzio_ingest::configured_news_evidence_transport(&model_config)
-                .map_err(akzio_ingest::EvidenceRuntimeError::from)?,
+            akzio_ingest::configured_news_evidence_transport_with_audit(
+                &model_config,
+                audit as Arc<dyn akzio_model::ModelAuditSink>,
+            )
+            .map_err(akzio_ingest::EvidenceRuntimeError::from)?,
         );
         daemon.news_web_route =
             "resource_router:official_direct+native_web_model_review".to_owned();
@@ -95,6 +116,9 @@ impl Daemon {
             ));
         }
         daemon.production_evidence = Arc::new(production_evidence);
+        // 只有配置启用 Outcome 且构造出 Alpaca adapter 才接线 Outcome worker；以下
+        // ensure 仅检查/补齐持久化待办，不代表 adapter 已取得有效市场数据或跨日评估通过。
+        // Store 中任务持久化，不依赖新 T0 Run 再次发现。
         daemon.outcome_processing = outcome_worker_enabled;
         daemon.task_runtime = daemon
             .task_runtime
@@ -112,35 +136,44 @@ impl Daemon {
     /// Injecting a model keeps fixture and production dispatch on the same
     /// Runtime path. It deliberately installs no evidence adapter: a missing
     /// adapter fails evidence work closed.
+    #[cfg(test)]
     pub fn with_model(config: DaemonConfig, model: ModelClient) -> Result<Self> {
+        // 此测试/fixture 构造路径没有生产 evidence adapter；缺失来源会由 EvidenceRuntime
+        // 显式失败，而不是隐式退回真实网络。
         Self::with_fixture_evidence(config, model, FixtureEvidence::new())
     }
 
     /// Install deterministic local fixture evidence for tests and replay only.
     /// This adapter has no HTTP or filesystem capability.
+    #[cfg(test)]
     pub fn with_fixture_evidence(
         config: DaemonConfig,
         model: ModelClient,
         fixture_evidence: FixtureEvidence,
     ) -> Result<Self> {
-        Self::with_fixture_evidence_debug(config, model, fixture_evidence, false, true)
+        // 显式注入 fixture map，并将 fixture_mode 设为 true，使活动 catalogue 不安装
+        // freshness candidate；该实例仍走相同 Workflow/TaskRuntime 入口。
+        Self::with_fixture_evidence_mode(config, model, fixture_evidence, true)
     }
 
-    fn with_fixture_evidence_debug(
+    fn with_fixture_evidence_mode(
         config: DaemonConfig,
         model: ModelClient,
         fixture_evidence: FixtureEvidence,
-        model_debug: bool,
         fixture_mode: bool,
     ) -> Result<Self> {
+        // 初始化顺序是 validate budget → 打开并拒绝旧隔离 Store → 安装 catalogue → 构造
+        // Workflow/Agent/runtime/scheduler；中间 Store 错误向上传播，绝不启动后台任务。
         config.agent_budget.validate()?;
         let store = Store::open(&config.store_root)?;
-        if config.debug_control.is_some() && config.auto_paper {
+        if store.debug_environment()?.is_some() {
             return Err(DaemonError::InvalidInput(
-                "Debug Core requires auto_paper=false".into(),
+                "retired isolated Debug Store cannot start a formal Core".into(),
             ));
         }
-        store.configure_debug_environment(config.debug_control.is_some())?;
+        if let Some(logger) = &config.run_log {
+            logger.attach_store(store.clone())?;
+        }
         let active = ActiveResearchCatalogue::install(&store, Utc::now())?;
         let agent_catalogue = if fixture_mode {
             active.contracts.clone()
@@ -181,24 +214,19 @@ impl Daemon {
         )?
         .with_store_executor(store_executor.clone())
         .with_market_data_feed(config.market_data_feed)
-        .with_runtime_identity_hash(config.runtime_identity_hash.clone());
+        .with_runtime_identity_hash(config.runtime_identity_hash.clone())
+        .with_run_log(config.run_log.clone());
 
         Ok(Self {
-            debug_control: config.debug_control.clone(),
+            run_log: config.run_log.clone(),
             outcome_processing: config.outcome_processing,
             store_executor: store_executor.clone(),
             task_runtime: TaskRuntime::new(store.clone())
                 .with_store_executor(store_executor)
-                .with_outcome_processing(config.outcome_processing)
-                .with_debug_identity(
-                    config
-                        .debug_control
-                        .as_ref()
-                        .map(|d| d.runtime_identity.clone()),
-                ),
+                .with_outcome_processing(config.outcome_processing),
             workflow,
             agents,
-            model: ModelClientAdapter::with_debug(model, model_debug),
+            model: ModelClientAdapter::with_debug(model, false),
             stage_models: Arc::new(BTreeMap::new()),
             news_web_status: fixture_capabilities.native_web_status.as_str().to_owned(),
             news_web_route: "fixture".to_owned(),
@@ -232,6 +260,8 @@ impl Daemon {
     }
 
     pub fn paper_workflow_source(&self) -> StorePaperWorkflowSource {
+        // 每次按同一 StoreExecutor 查找 durable Paper proposal；只有 Store 缺少可用 proposal
+        // 时才允许用当前 Rust workflow 构建受控 bootstrap。
         StorePaperWorkflowSource::new(self.store.clone())
             .with_store_executor(self.store_executor.clone())
             .with_bootstrap(self.workflow.clone(), "active")
@@ -240,11 +270,19 @@ impl Daemon {
     /// Install a broker only through dependency injection. Construction of the
     /// daemon itself never reads credentials or performs network I/O.
     pub fn with_paper_broker(mut self, broker: Arc<dyn CommittedPaperBroker>) -> Self {
-        self.paper.paper_broker = Some(broker);
+        // 调用方转移一个共享 Broker trait object；本方法只注入依赖，不进行 HTTP I/O。
+        self.paper.paper_broker = Some(match &self.run_log {
+            Some(logger) => Arc::new(crate::application::audited_broker::AuditedPaperBroker::new(
+                broker,
+                logger.clone(),
+            )),
+            None => broker,
+        });
         self
     }
 
     pub fn with_paper_observer(mut self, paper: AlpacaPaper) -> Self {
+        // observer 持有 Paper API client，用于读取时钟/账户等受控状态；方法本身不调用接口。
         self.paper.paper_observer = Some(paper);
         self
     }
@@ -258,6 +296,7 @@ impl Daemon {
         proposal: &WorkflowProposal,
         now: DateTime<Utc>,
     ) -> Result<akzio_store::SessionSlotReservation> {
+        // 只委托 lease-fenced reservation；返回已有/新建 slot 都不领取 graph 中的 task。
         Ok(self
             .paper
             .scheduler

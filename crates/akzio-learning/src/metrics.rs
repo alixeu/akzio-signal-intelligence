@@ -1,5 +1,8 @@
 use super::*;
 
+// 文件导读：本模块集中放置 Rust 权威的 ppm 收益、forecast score、NAV 和风险指标；
+// 任何 None 都表示当前证据未测量或不可识别，不会被转成一个看似精确的默认通过值。
+
 /// Index the model's per-asset up-probabilities by horizon.
 ///
 /// Deliberately returns the per-asset probabilities rather than a
@@ -13,6 +16,9 @@ use super::*;
 pub(super) fn index_forecasts(
     forecasts: &[Forecast],
 ) -> EvaluationRuntimeResult<BTreeMap<OutcomeHorizon, BTreeMap<Asset, u32>>> {
+    // 输入只读借用并被 for 循环逐条消费；返回的嵌套有序 Map 把模型边际概率按期限和资产索引。
+    // forecast 按 horizon/asset 去重；单资产 forecast 允许只评估该资产，四资产 forecast
+    // 必须覆盖完整执行全集，不能用 target weight 把 allocation 决策混进边际概率质量。
     let mut by_horizon = BTreeMap::<OutcomeHorizon, BTreeMap<Asset, u32>>::new();
     for forecast in forecasts {
         forecast.validate()?;
@@ -57,6 +63,8 @@ pub(super) fn index_forecasts(
 /// `(p - o)^2` where `o` is 1 when the asset actually rose. Lower is better and
 /// the range is `[0, PPM_ONE]`.
 fn asset_brier_ppm(probability_ppm: u32, realized_positive: bool) -> u32 {
+    // 概率和 bool 结果映射到 ppm 后计算平方误差；中间用 i128 避免乘法溢出，异常转换上限饱和。
+    // Brier 是单资产二元事件的 (p-o)^2；概率和结果都在 0..=1_000_000 ppm，越低越好。
     let outcome_ppm = if realized_positive {
         i64::from(PPM_ONE)
     } else {
@@ -74,6 +82,9 @@ pub(super) fn forecast_score(
     baseline_prices: &BTreeMap<Asset, MoneyMicros>,
     future_prices: &BTreeMap<Asset, MoneyMicros>,
 ) -> EvaluationRuntimeResult<Option<ForecastScore>> {
+    // 两张概率/价格 Map 仅借用读取；无概率返回 Ok(None)，否则按资产累计分箱并校验完整 score。
+    // 一个 horizon 的 ForecastScore 只报告该次事件的 Brier 与 bin 汇总；它不是 calibration，
+    // calibration 要等多个 Outcome 的独立 score 达到策略最小样本数后再聚合。
     if probabilities_by_asset.is_empty() {
         return Ok(None);
     }
@@ -120,6 +131,10 @@ pub(crate) fn aggregate_calibration_report(
     scores: impl IntoIterator<Item = ForecastScore>,
     minimum_samples: u64,
 ) -> Option<CalibrationReport> {
+    // IntoIterator 允许调用方交入任意 score 来源；for 循环会消费它们，按 sample_count 加权，
+    // 最终 Option::None 表示样本不足或无法安全转换，不会伪造校准报告。
+    // 这里按各 score 的 sample_count 加权汇总 Brier，并计算分 bin 的 ECE；样本不足直接
+    // 返回 None，让上层把“未测量”保留为 Defer/不可晋级，而不是把小样本命名为 calibrated。
     let mut sample_count = 0_u64;
     let mut brier_sum_ppm = 0_u128;
     let mut bins = [ForecastCalibrationBin::default(); FORECAST_CALIBRATION_BIN_COUNT];
@@ -166,6 +181,10 @@ pub(super) fn index_observations<'a>(
     schedule: &OutcomeSchedule,
     observations: &'a [GovernedHorizonObservation],
 ) -> EvaluationRuntimeResult<BTreeMap<OutcomeHorizon, &'a GovernedHorizonObservation>> {
+    // `'a` 把返回 Map 内的引用绑定到 observations 切片的借用期，schedule 只在校验时读取；
+    // 不 clone 大型价格表，调用者仍持有原始 observations。
+    // 每个 T+1/T+3/T+5 只能有一条已经 due 且晚于 baseline 的观察；四资产价格面的完整性
+    // 由 validate_prices 再检查，重复或缺窗口都在构造 Outcome 前失败。
     let mut indexed = BTreeMap::new();
     for observation in observations {
         if !observation
@@ -195,6 +214,8 @@ pub(super) fn index_observations<'a>(
 pub(super) fn validate_prices(
     prices: &BTreeMap<Asset, MoneyMicros>,
 ) -> EvaluationRuntimeResult<()> {
+    // 精确资产集合与正价格是整个收益计算的共同前置条件，错误不带部分价格回退。
+    // 价格面必须恰好覆盖四只可执行 ETF 且每个价格为正；多余或缺失资产都不可用于指标。
     if prices.len() != Asset::EXECUTABLE.len()
         || Asset::EXECUTABLE
             .into_iter()
@@ -211,6 +232,7 @@ pub(super) fn price(
     prices: &BTreeMap<Asset, MoneyMicros>,
     asset: Asset,
 ) -> EvaluationRuntimeResult<MoneyMicros> {
+    // 从共享借用的价格面复制一个 MoneyMicros；缺资产转换成 InvalidMaterialization 而非默认价格。
     prices
         .get(&asset)
         .copied()
@@ -223,6 +245,8 @@ pub(super) fn return_ppm(
     baseline: MoneyMicros,
     future: MoneyMicros,
 ) -> EvaluationRuntimeResult<i64> {
+    // baseline/future 以值传入；两者必须为正，差额运算先扩展到 i128 再缩放并尝试转换。
+    // 价格收益按 (future-baseline)/baseline × 1_000_000 计算；用 i128 中间值后再检查 i64。
     if baseline.0 <= 0 || future.0 <= 0 {
         return Err(EvaluationError::InvalidMaterialization(
             "prices must be positive",
@@ -240,6 +264,10 @@ pub(super) fn portfolio_return_ppm(
     baseline: &BTreeMap<Asset, MoneyMicros>,
     future: &BTreeMap<Asset, MoneyMicros>,
 ) -> EvaluationRuntimeResult<i64> {
+    // target 与两期价格均共享借用；try_fold 逐资产计算并累加，任何价格缺失或 checked_add
+    // 溢出都会使整个组合收益失败。
+    // 先算每个资产收益，再按目标 WeightPpm 加权；这是 portfolio return，不是资产概率的
+    // 加权概率，权重总和和资产全集由 TargetPortfolio/domain 校验负责。
     let weighted = target
         .weights
         .iter()
@@ -252,6 +280,7 @@ pub(super) fn portfolio_return_ppm(
 }
 
 pub(super) fn bounded_ratio_ppm(expected: u64, observed: u64) -> u32 {
+    // 把观测数最多截到 expected 后转换为 ppm；expected=0 沿实现约定返回 0，不进行除法。
     if expected == 0 {
         return 0;
     }
@@ -260,6 +289,9 @@ pub(super) fn bounded_ratio_ppm(expected: u64, observed: u64) -> u32 {
 }
 
 pub(super) fn counted_ratio(expected: u64, observed: Option<u64>) -> Option<CountedRatio> {
+    // None/不可能计数/零分母都保留为 None；有效值同时封装原始计数、比例和置信下界。
+    // observed 缺失或超过 expected 时返回 None；有效比例同时保存 Wilson 95% 下界，供
+    // 证据完整度/风险召回的审计使用，而不是只留下一个百分比。
     let observed = observed?;
     if expected == 0 || observed > expected {
         return None;
@@ -274,6 +306,7 @@ pub(super) fn counted_ratio(expected: u64, observed: Option<u64>) -> Option<Coun
 }
 
 fn wilson_lower_bound_ppm(expected: u64, observed: u64) -> Option<u32> {
+    // 仅在至少 5 个且观测数不超预期时计算 Wilson 下界；f64 结果四舍五入为 ppm。
     if expected < 5 || observed > expected {
         return None;
     }
@@ -295,6 +328,11 @@ pub(super) fn build_nav_path(
     slippage_ppm: u32,
     valuation_adjustment_ppm: i64,
 ) -> EvaluationRuntimeResult<Vec<OutcomeNavPoint>> {
+    // 所有输入借用；每条观察都从同一冻结 baseline 重新估值，
+    // previous NAV 只用于相邻两期收益，不在本函数内复利叠加目标权重；非正 NAV
+    // 或任一价格无效时提前返回 Err，不返回部分路径。
+    // NAV 从 1_000_000 ppm 起步，每条观察按 baseline 收益加估值调整再扣成本/滑点；
+    // benchmark 同步用 QQQ 路径，任一 NAV 非正都终止该物化。
     let mut path = Vec::with_capacity(observations.len());
     let mut previous_portfolio_nav = i64::from(PPM_ONE);
     let mut previous_benchmark_nav = i64::from(PPM_ONE);
@@ -333,6 +371,7 @@ pub(super) fn build_nav_path(
 }
 
 fn period_return_ppm(previous: i64, current: i64) -> EvaluationRuntimeResult<i64> {
+    // 以前一 NAV 为分母计算单期百分比；i128 中间值避免先做 i64 差乘造成溢出。
     if previous <= 0 || current <= 0 {
         return Err(EvaluationError::InvalidMaterialization("NAV period return"));
     }
@@ -352,6 +391,9 @@ pub(super) struct PathRiskMetrics {
 }
 
 pub(super) fn path_risk_metrics(path: &[OutcomeNavPoint]) -> PathRiskMetrics {
+    // 空路径保持所有指标 None；非空先计算最大回撤，其他统计指标按各自的最小样本门槛独立填充。
+    // 最大回撤只要有一条路径就可测；tracking error/beta/Sortino 至少需要 5 个日样本，
+    // expected shortfall 另需 20 个样本，样本不足的字段保持 None。
     if path.is_empty() {
         return PathRiskMetrics::default();
     }
@@ -412,6 +454,7 @@ pub(super) fn path_risk_metrics(path: &[OutcomeNavPoint]) -> PathRiskMetrics {
 }
 
 fn standard_deviation_ppm(values: &[f64]) -> Option<u32> {
+    // 样本标准差至少需两个值；返回值截限在 ppm 区间，样本不足明确为 None。
     if values.len() < 2 {
         return None;
     }
@@ -425,6 +468,7 @@ fn standard_deviation_ppm(values: &[f64]) -> Option<u32> {
 }
 
 fn beta_ppm(portfolio: &[f64], benchmark: &[f64]) -> Option<i64> {
+    // 两组收益长度必须一致且至少两个；零 benchmark 方差时 beta 不可识别，返回 None。
     if portfolio.len() != benchmark.len() || portfolio.len() < 2 {
         return None;
     }
@@ -446,6 +490,7 @@ fn beta_ppm(portfolio: &[f64], benchmark: &[f64]) -> Option<i64> {
 }
 
 fn sortino_ratio_ppm(returns: &[f64]) -> Option<i64> {
+    // 以负收益平方构造 downside deviation；没有足够样本或没有可测 downside 时返回 None。
     if returns.len() < 2 {
         return None;
     }
@@ -463,6 +508,9 @@ fn sortino_ratio_ppm(returns: &[f64]) -> Option<i64> {
 }
 
 pub(super) fn execution_verdict(lineage: &OutcomeExecutionLineage) -> &ArtifactRef {
+    // 对两种 lineage 变体都借出原执行 verdict；返回生命周期由 lineage 借用决定，不复制或重推结论。
+    // NoOrder 与 ReconciledPaper 都必须沿用执行阶段已经生成的 verdict 引用，Outcome 不在
+    // 学习层重新推断“是否下单”。
     match lineage {
         OutcomeExecutionLineage::NoOrder { execution_verdict }
         | OutcomeExecutionLineage::ReconciledPaper {
@@ -472,6 +520,8 @@ pub(super) fn execution_verdict(lineage: &OutcomeExecutionLineage) -> &ArtifactR
 }
 
 pub(super) fn require_canonical_purpose(purpose: RunPurpose) -> EvaluationRuntimeResult<()> {
+    // 仅比较传入的 purpose；调用方须先从 Store 获取真实 Run purpose，
+    // 本纯函数不会自行查询 Store，非 Paper 原样进入错误供调用者诊断。
     if purpose.is_canonical_learning() {
         Ok(())
     } else {
@@ -480,6 +530,7 @@ pub(super) fn require_canonical_purpose(purpose: RunPurpose) -> EvaluationRuntim
 }
 
 pub(super) fn reference(artifact: &Artifact) -> ArtifactRef {
+    // 从完整 Artifact 复制稳定 ID 与 kind，形成不携带 BLOB/provenance 正文的轻量引用。
     ArtifactRef {
         artifact_id: artifact.artifact_id.clone(),
         kind: artifact.kind,
@@ -487,10 +538,14 @@ pub(super) fn reference(artifact: &Artifact) -> ArtifactRef {
 }
 
 pub(super) fn stable_id(value: &serde_json::Value) -> EvaluationRuntimeResult<String> {
+    // 内容哈希作为可复现的字符串标识；序列化哈希错误经 DomainError 传播。
     Ok(content_hash_json(value)?.as_str().to_owned())
 }
 
 pub(super) fn marginal_utility(outcome: &Outcome) -> i64 {
+    // 仅从完整 Outcome 的已封存窗口求平均；输入共享借用，i128 求和后将极值夹到 i64 范围。
+    // Evaluation 的 marginal utility 是所有已封存窗口 utility_ppm 的算术平均；窗口集合
+    // 不完整时上游 sealed 校验先失败，这里不用单独窗口冒充 T+5。
     let total = outcome
         .windows
         .iter()
@@ -499,8 +554,8 @@ pub(super) fn marginal_utility(outcome: &Outcome) -> i64 {
     average.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
-/// Promote memory only after a fresh T+1/T+3/T+5 evaluation passes quality
-/// gates; contract/topology promotion remains owned by their canary policy.
+/// Propose the next state from measured quality and fresh T+1/T+3/T+5 pairs.
+/// This helper does not itself authorize contract/topology canary promotion.
 ///
 /// `risk_recall_measured` is a hard precondition for any forward transition.
 /// When risk recall was never measured the subject holds its current state:
@@ -513,6 +568,10 @@ pub(super) fn next_state_with_fresh_pairs(
     fresh_pairs_by_horizon: [u64; 3],
     minimum_fresh_pairs_per_horizon: u64,
 ) -> PolicyState {
+    // 按值匹配 Copy 状态值，先推导候选状态，再用质量、risk recall 和三期新 pair 数量
+    // 限制 forward transition；退化分支可降级，但缺测不会晋级。
+    // 先按 degradation 或目标状态算候选 next，再只允许合法的 forward transition 受资格门
+    // 控制：每个 T+1/T+3/T+5 都有新 pair 且 risk recall 已测量才可晋级，缺失就保持 current。
     use CandidatePolicyState as Candidate;
     use MemoryLifecycle as Memory;
 
@@ -551,6 +610,9 @@ pub(super) fn next_state_with_fresh_pairs(
 }
 
 fn is_forward_transition(from: PolicyState, to: PolicyState) -> bool {
+    // 只分类哪些相邻边需要新 pair/风险测量门；未列出的边返回 false，
+    // next_state_with_fresh_pairs 会直接返回其目标值，而不是在此拒绝它。
+    // 全部状态转换是否合法必须由外层 Store/Policy 流程另行核验。
     use CandidatePolicyState as Candidate;
     use MemoryLifecycle as Memory;
 

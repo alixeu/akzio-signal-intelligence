@@ -1,3 +1,8 @@
+// 文件导读：paired cohort 的 observation 以 session+horizon 为幂等键写入，
+// evaluation 只允许总结同一批已持久化事实；Store 保存 verdict，不替 learning 计算 verdict。
+// 先读 record_canary_observations 的 lease/事务与重复内容分支，再读 summary/evaluation transition；
+// 所有 SQLite 访问是同步的；Transaction 借用连接，在 `commit` 前覆盖校验与写入，
+// 未提交时 Drop 回滚，外层 MutexGuard 离开作用域才释放进程内连接锁。
 impl Store {
     // 在 daemon lease 保护的 Immediate 事务中记录当前阶段的 paired observations。
     // 每条 observation 必须绑定已预约 cohort session；相同 identity 可幂等重放，不同内容一律冲突。
@@ -9,6 +14,8 @@ impl Store {
         observations: &[CanaryPairedObservation],
         now: DateTime<Utc>,
     ) -> StoreResult<Vec<CanaryPairedObservation>> {
+        // 入参 lease 授权 scheduler epoch，campaign/stage 限定当前 cohort，observations 以借用切片逐条校验；
+        // 全批共用 IMMEDIATE 事务，任一项错误会让此前本批 INSERT 随 Drop 一起回滚。
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_daemon_lease(&transaction, lease, now)?;
@@ -69,6 +76,7 @@ impl Store {
                         "canary observation is immutable".to_owned(),
                     ));
                 }
+                // 相同的不可变内容是幂等重放；continue 只跳过当前 observation，不跳过整批或 commit。
                 continue;
             }
             // 新 observation 的 id 由完整内容 hash 决定；写入仍受同一 lease/事务保护。
@@ -86,13 +94,16 @@ impl Store {
                 ],
             )?;
         }
+        // commit 后释放非重入 Mutex，再通过公开读取方法重建返回列表；因此返回表示本批写入已提交，
+        // 不表示 learning 已评估或 campaign 已晋级。
         transaction.commit()?;
         drop(connection);
         // 释放 Store 连接后再重新读取，避免在非可重入 Mutex 上嵌套获取连接。
         self.canary_observations(&cohort.cohort_id)
     }
 
-    // 按 session_key/horizon 顺序读取 cohort 的不可变 observation，并反序列化为领域值。
+    // 输入 cohort 主键，SQL 仅筛选该 cohort 并按 session_key、horizon_json 排序；
+    // 任一 JSON 行无法解析都会使整批读取返回 Err，不返回不完整前缀。
     pub fn canary_observations(
         &self,
         cohort_id: &ContentHash,
@@ -119,6 +130,8 @@ impl Store {
         evaluation: &CanaryCohortEvaluation,
         now: DateTime<Utc>,
     ) -> StoreResult<CanaryCampaignHead> {
+        // evaluation 由 learning 先计算并做领域校验；Store 再以 lease + IMMEDIATE 事务核对 campaign、
+        // 持久 observation 摘要和 immutable evaluation ID，最终只持久化已给定 verdict。
         evaluation.validate()?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -177,6 +190,7 @@ impl Store {
                     "idempotent canary transition requires the original evaluation".to_owned(),
                 ));
             }
+            // 已在预期幂等终点时不再写入 transition；确认原 evaluation 存在后结束只读事务并返回现有 head。
             transaction.commit()?;
             return Ok(idempotent);
         }
@@ -200,6 +214,7 @@ impl Store {
                 ],
             )?;
         }
+        // 评价行与状态/head 在同一事务提交；下游 transition 校验失败时新插入的评价不会残留。
         let updated = transition_campaign_transaction(
             &transaction,
             current,
@@ -218,6 +233,8 @@ fn cohort_observation_summary(
     connection: &Connection,
     cohort_id: &ContentHash,
 ) -> StoreResult<(ContentHash, [u64; 3], u64, BTreeSet<String>)> {
+    // 查询按 cohort_id 限定并稳定排序；JSON/identity hash 任一无效会中止总结，不跳过坏行。
+    // horizon 数组按 T1/T3/T5 固定槽位计数，BTreeSet 对 market day/regime 去重并保持排序。
     let mut statement = connection.prepare(
         "SELECT observation_json FROM rebuild_canary_observations WHERE cohort_id = ?1 ORDER BY session_key, horizon_json",
     )?;
@@ -239,6 +256,7 @@ fn cohort_observation_summary(
         market_days.insert(observation.market_day);
         regimes.insert(observation.regime);
     }
+    // identity hash 再排序后统一 JSON 哈希，因此底层返回顺序不会改变 observation_set_hash。
     hashes.sort();
     let hash = content_hash_json(&serde_json::json!(hashes))?;
     Ok((hash, counts, market_days.len() as u64, regimes))

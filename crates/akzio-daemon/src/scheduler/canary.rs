@@ -1,3 +1,11 @@
+// 文件导读：Canary scheduler 在有效 approval/runtime identity、candidate Contract/Topology、
+// broker account/feed 和当前 active analyst 条件都匹配时，原子准备 parent Paper Run 与
+// 三个 Shadow Run。它只预约比较实验，不把 candidate 变成 active，也不授予 Paper fill 或
+// learning 权限；后续 Outcome/canary evaluation 另行完成。
+// Rust 机制：泛型 clock 借用 trait object 并 await 外部观察；多个 `move` 闭包分别拥有
+// run/proposal/setup 进入 StoreExecutor；`Option`/`Result` 把缺 approval、缺 cohort、身份
+// 漂移转换为等待或 fail closed。
+
 use super::*;
 
 impl PaperScheduler {
@@ -11,6 +19,8 @@ impl PaperScheduler {
     where
         C: BrokerSessionClock + ?Sized,
     {
+        // 先按 campaign 当前级别取 cohort，并用 broker session 日期确定 regime；
+        // cohort 尚未配置或日期不属于任何 regime 时，本轮只等待，不触发写操作。
         let cohort = campaign
             .spec
             .cohort(campaign.status)
@@ -31,6 +41,8 @@ impl PaperScheduler {
             })
             .await??
         {
+            // 相同 campaign/level/session 已有 reservation 时只还原 parent slot；
+            // 不重新构造 Shadow Run，也不把旧 session 换成新的 graph。
             let parent_run_id = existing.reservation.parent_run_id;
             let slot = self
                 .store_executor
@@ -50,6 +62,8 @@ impl PaperScheduler {
         else {
             return Ok(None);
         };
+        // Manifest 是已持久化 approval 的身份来源；之后读取 broker account ID 是真实
+        // 只读网络请求，用于核对审批绑定，不会提交订单。
         let manifest_blob = runtime_manifest.blob.clone();
         let manifest_payload: RuntimeManifest = serde_json::from_slice(
             &self
@@ -76,6 +90,8 @@ impl PaperScheduler {
             return Ok(None);
         }
 
+        // candidate Contract 必须是未激活、基于当前 active Contract 的 canonical 候选；
+        // 不通过 stage/resume 自动激活该候选。
         let candidate_artifact_id = campaign.spec.candidate_contract.artifact_id.clone();
         let (candidate_artifact, candidate, candidate_installation) = self
             .store_executor
@@ -102,6 +118,7 @@ impl PaperScheduler {
             return Err(SchedulerError::WorkflowUnavailable);
         }
 
+        // candidate Topology 只从已存 CAS 读取，并与 campaign cohort 的冻结 topology ID 核对。
         let candidate_topology_id = campaign.spec.candidate_topology.artifact_id.clone();
         let (candidate_topology_artifact, candidate_topology) = self
             .store_executor
@@ -128,6 +145,8 @@ impl PaperScheduler {
             return Err(SchedulerError::WorkflowUnavailable);
         }
 
+        // 到此才取得 scheduler lease 并准备 parent 与三个 Shadow graph；prepare_* 仅在共享
+        // Store 连接暂存未 durable 的 Artifact/commit，不发布 workflow/session 状态。
         let lease = self.acquire_or_renew_async().await?;
         let parent_run_id = RunId::new();
         let scheduler = self.clone();
@@ -171,6 +190,8 @@ impl PaperScheduler {
                 )
             })
             .await??;
+        // Shadow 共享 parent 已绑定的冻结 evidence snapshot 引用，但各自有新的 RunId 与
+        // Shadow purpose；lower 失败时尚未发布 canary session/slot。
         let snapshot_refs = parent_reservation
             .workflow
             .nodes
@@ -249,6 +270,8 @@ impl PaperScheduler {
             })
             .await??;
 
+        // Store 在一个事务中再次检查 lease epoch、approval、parent、三个 Shadow workflow，
+        // 并原子提交 session slot/workflow/campaign reservation；事务失败不会留下部分 Run。
         let canary_reservation = CanarySessionReservation {
             schema_version: DOMAIN_SCHEMA_VERSION,
             campaign_id: campaign.spec.campaign_id.clone(),

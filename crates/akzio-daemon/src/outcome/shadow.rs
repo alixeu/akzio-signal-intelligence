@@ -1,3 +1,10 @@
+// 文件导读：Shadow outcome 读取父 Run 的冻结 schedule/execution context，采集相同真实
+// 市场窗口，再以 candidate Decision 建立新的 RunScoped OutcomeSchedule/Outcome。父风险
+// assessment 不会复制到 candidate；该结果只供 Canary paired evaluation，不改变 active
+// Contract/Topology，也不是 Paper fill 或正式 calibration 样本。
+// Rust 机制：lease guard 绑定 Drop 释放；`Option` 表示父 schedule/窗口尚未可用；枚举
+// `OutcomeExecutionLineage` 保留 NoOrder/已对账路径，迭代器合并 source_refs 后排序去重。
+
 use super::*;
 
 impl Daemon {
@@ -6,6 +13,8 @@ impl Daemon {
         task: &ClaimedAttempt,
         now: DateTime<Utc>,
     ) -> Result<TaskCompletion> {
+        // Shadow 先确认没有已有 candidate Outcome，再等待 parent schedule；取得 outcome lease
+        // 后才采集同一窗口并提交 candidate schedule/outcome，任何中断都可由 lease 恢复。
         if self.store.outcome_for_run(&task.run_id)?.is_some() {
             return Ok(TaskCompletion::Committed);
         }

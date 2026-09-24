@@ -1,4 +1,10 @@
+// 文件导读：Lesson 表按需创建，Doctor 再用 head、event、payload 和 evidence ledger
+// 逐层复核；惰性表不存在时只返回空历史，不把缺表误报为 Lesson 已完成。
+// ensure_lesson_tables 是显式写 DDL 入口；Doctor 的 verify_* 只借用传入连接读取，
+// 先读 verify_lesson_history 的 head/event 整体关系，再读 evidence/payload 两个闭包检查。
 impl Store {
+    // 只有被调用方明确选择该入口时才创建三张 Lesson 表；DDL 使用 IF NOT EXISTS，
+    // 本方法不插入 Lesson/head/event，也不自行开启跨多个步骤的事务。
     pub(super) fn ensure_lesson_tables(&self) -> StoreResult<()> {
         self.connection()?.execute_batch(
             r#"
@@ -34,6 +40,8 @@ impl Store {
         Ok(())
     }
 
+    // 全历史只读扫描：表集不完整时 fail closed，完全没有表时允许旧 Store 返回 Ok；
+    // 各查询沿当前 Connection 执行，不在本方法内建立一致性快照事务，首个不变量错误即停止。
     pub(super) fn verify_lesson_history(&self, connection: &Connection) -> StoreResult<()> {
         if ensure_lesson_table_set(connection)? == 0 {
             return Ok(());
@@ -57,6 +65,7 @@ impl Store {
 
         let mut head_ids = BTreeSet::new();
         for (lesson_id, artifact_id, lifecycle, revision, updated_at) in heads {
+            // head 必须指向 canonical CAS Lesson，且 payload identity/lifecycle/time 与索引列一致。
             let lesson_id = LessonId(lesson_id);
             if !head_ids.insert(lesson_id.clone()) {
                 return Err(StoreError::Integrity(format!(
@@ -123,6 +132,8 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?;
         for (event_id, lesson_id, artifact_id, event_type, actor, reason, created_at) in event_rows
         {
+            // event 的 lesson_id 必须仍有 head；事件引用的 Artifact 可以是历史版本，
+            // 并非要求事件直接指向当前 head。随后核对该版本 kind/lifecycle/元数据形状。
             let lesson_id = LessonId(lesson_id);
             if !head_ids.contains(&lesson_id) {
                 return Err(StoreError::Integrity(format!(
@@ -165,6 +176,7 @@ impl Store {
             }
             self.verify_lesson_payload(connection, &artifact, &payload)?;
         }
+        // evidence ledger 是独立账本；逐行检查完成后才把整个 Lesson history 判为完整。
         self.verify_lesson_evidence(connection, &head_ids)?;
         Ok(())
     }
@@ -178,6 +190,8 @@ impl Store {
         connection: &Connection,
         head_ids: &BTreeSet<LessonId>,
     ) -> StoreResult<()> {
+        // 旧 schema 没有 evidence 表时不制造数据；存在时逐条核对 key 列、identity hash、已登记 head
+        // 以及三类 ArtifactRef 的真实 kind。任一坏行使整次 Doctor 返回 Err，不跳过部分历史。
         if !lesson_evidence_table_exists(connection)? {
             return Ok(());
         }
@@ -275,6 +289,9 @@ impl Store {
         artifact: &Artifact,
         lesson: &Lesson,
     ) -> StoreResult<()> {
+        // 将 Lesson payload 中 source/supersedes/conflicts 的并集与 Artifact.source_refs 比较；
+        // 对直接引用的 Lesson payload 做一次领域 validate，不沿其引用无限递归；
+        // 非 Lesson 来源必须是 canonical。
         let mut expected_refs = BTreeSet::new();
         for reference in lesson
             .source_refs

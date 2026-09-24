@@ -1,3 +1,8 @@
+// 文件导读：Policy/Shadow 的读 helper 恢复消费 head、transition、pair 和 Run purpose，
+// 并核对 cursor 边界；它们只读取 immutable history，不把候选或孤立 Artifact 变成 influence。
+// 这些实现由 store.rs include! 到父模块：Store 写事务和 Doctor 都可借用同一个 Connection，
+// 也因此无需在 helper 内另开锁或事务。先读 pair consumption cursor，再读 transition/pair 重建。
+// 从 subject 派生稳定 SQL key 后读取消费 head；expected_subject 用于防止 subject_id 映射歧义。
 fn read_policy_consumption_head(
     connection: &Connection,
     expected_subject: &PolicySubject,
@@ -43,6 +48,8 @@ fn read_policy_consumption_head(
     }))
 }
 
+// 读取 subject 最新 pair event cursor，作为下一次 evaluation snapshot 的上界候选。
+// MAX 限定同一 subject；COALESCE 把“尚无 pair”表示为 cursor 0，而不是 Option。
 fn max_shadow_pair_cursor(connection: &Connection, subject: &PolicySubject) -> StoreResult<i64> {
     connection
         .query_row(
@@ -53,6 +60,8 @@ fn max_shadow_pair_cursor(connection: &Connection, subject: &PolicySubject) -> S
         .map_err(Into::into)
 }
 
+// 按 frozen cursor 半开区间统计三个 horizon，避免 evaluation 漏算或重复消费 pair。
+// after_cursor 不含、through_cursor 包含；固定 OutcomeHorizon::ALL 顺序映射到 [T1,T3,T5]。
 fn shadow_pair_counts_between(
     connection: &Connection,
     subject: &PolicySubject,
@@ -82,6 +91,9 @@ fn shadow_pair_counts_between(
     Ok(counts)
 }
 
+// 提交 evaluation 前重新比较 after/through/counts，阻止 stale snapshot 越过新 pair。
+// caller 在提交事务内调用：依次核对当前消费 head、合法上界及边界 pair 存在，再重算计数；
+// 任何一项变化都会拒绝旧快照，而不是自动扩展 evaluation 的样本窗口。
 fn validate_policy_shadow_pair_snapshot(
     connection: &Connection,
     subject: &PolicySubject,
@@ -130,6 +142,8 @@ fn validate_policy_shadow_pair_snapshot(
     Ok(())
 }
 
+// Outcome/Experience/Evaluation/CandidatePolicy 必须走 atomic learning commit，不能走通用 Task Artifact API。
+// 这是基于 kind 的 fail-closed guard；其它 Artifact 返回 Ok(())，本函数自身不查询或修改 Store。
 fn reject_generic_learning_artifact(artifact: &Artifact) -> StoreResult<()> {
     if matches!(
         artifact.kind,
@@ -145,6 +159,8 @@ fn reject_generic_learning_artifact(artifact: &Artifact) -> StoreResult<()> {
     Ok(())
 }
 
+// 幂等重放比较完整 typed identity、Run、transition、cursor 和完成时间。
+// 比较已存 evaluation 与新 commit；完全相同才返回 true，lesson evidence 的单独去重由调用方处理。
 fn same_policy_evaluation(
     existing: &StoredPolicyEvaluation,
     commit: &PolicyEvaluationCommit,
@@ -170,6 +186,8 @@ fn same_policy_evaluation(
         && existing.completed_at == commit.completed_at
 }
 
+// 从 subject_id 恢复当前 head，并确认 SQL key 解出的 subject 与调用方一致。
+// row 缺失返回 None；字段 JSON/hash/time 错误返回 Err，不创建初始 head。
 fn read_policy_head(
     connection: &Connection,
     expected_subject: &PolicySubject,
@@ -210,6 +228,8 @@ fn read_policy_head(
     }))
 }
 
+// 读取单条 immutable transition 及其存储的 event cursor；此 helper 未单独追查对应事件行，
+// 那是 Doctor 历史校验的职责。transition_id 为唯一条件，坏 JSON/subject/time 会传播错误。
 fn read_policy_transition(
     connection: &Connection,
     transition_id: &PolicyTransitionId,
@@ -267,6 +287,8 @@ fn read_policy_transition(
     }))
 }
 
+// 按 revision 升序恢复一个 subject 的完整 transition history。
+// subject_id 绑定 WHERE 查询，revision 稳定升序；先收集 owning String 行，再用 collect<Result<Vec<_>>> 全量解码。
 fn read_policy_transitions(
     connection: &Connection,
     expected_subject: &PolicySubject,
@@ -320,6 +342,8 @@ fn read_policy_transitions(
         .collect()
 }
 
+// 从 pair_key 恢复候选/父决策、Outcome 和 horizon；payload closure 由上层继续验证。
+// 主键缺失为 None；这里重建 typed refs/subject/time，不在本 helper 内读取 Outcome payload 或重算 pair hash。
 fn read_shadow_pair(
     connection: &Connection,
     pair_key: &ContentHash,
@@ -398,6 +422,9 @@ fn read_shadow_pair(
     }))
 }
 
+// pair 幂等比较故意忽略 completed_at，但仍比较两份 Outcome refs，
+// 以拒绝“同一 key、不同 Outcome”的重放；key 自身不包含这些 Outcome refs。
+// 该纯值比较用于恢复重放；hash key 也排除时间，调用方据此保留首次完成时间。
 fn same_shadow_pair(left: &ShadowPairCompletion, right: &ShadowPairCompletion) -> bool {
     left.subject == right.subject
         && left.parent_decision == right.parent_decision
@@ -410,6 +437,8 @@ fn same_shadow_pair(left: &ShadowPairCompletion, right: &ShadowPairCompletion) -
         && left.candidate_outcome == right.candidate_outcome
 }
 
+// purpose 从 rebuild_runs 读取，不接受调用方传入的替代标签。
+// run_id 为精确主键；无 Run 报 MissingRun，未知 purpose 不降级为默认值。
 fn run_purpose_from_connection(connection: &Connection, run_id: &RunId) -> StoreResult<RunPurpose> {
     let purpose = connection
         .query_row(
@@ -422,6 +451,8 @@ fn run_purpose_from_connection(connection: &Connection, run_id: &RunId) -> Store
     parse_enum(&purpose)
 }
 
+// Run purpose 决定 Task Artifact 可用 lifecycle：Ephemeral 禁止，Canonical 仅 Paper。
+// 同一事务连接读 purpose，再按 Artifact.lifecycle 返回允许/拒绝；不插入 Artifact，也不调用 commit。
 fn assert_task_artifact_lifecycle(
     transaction: &Transaction<'_>,
     run_id: &RunId,

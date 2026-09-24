@@ -1,3 +1,6 @@
+// 文件导读：组合 Outcome、风险真值和 DecisionPolicy 的学习领域类型。
+// 具体实现拆在同目录文件中，由 include! 在此模块作用域内合并，保持共享导入和公开 API。
+// 被 include 的文件不是独立 crate 模块：其中类型共享本文件导入，并按此处的顺序进入同一个 Rust 模块命名空间。
 //! Outcome-backed learning vocabulary.
 
 use chrono::{DateTime, NaiveDate, Utc};

@@ -1,3 +1,7 @@
+// 文件导读：事件生命周期验证按 Tool/AgentTurn/Context 三类状态机扫描 cursor 顺序，
+// 只接受可闭合的 started/terminal 关系；process crash 的未闭合调用保留为可审计未知。
+// 本文件由 store.rs include! 并入父模块；commit 与 Doctor 在外层事务/连接内调用这些只读校验，
+// 错误会阻止当前提交，但 helper 不自行补写 terminal event。
 struct LifecycleRow {
     cursor: i64,
     run_id: RunId,
@@ -7,7 +11,10 @@ struct LifecycleRow {
     artifact_id: Option<ArtifactId>,
 }
 
+// 将 SQL 固定列位置解析为 owning LifecycleRow；坏 event enum/hash 转为 rusqlite 行解码错误。
+// 此查询不读取 created_at，因此这里并未校验事件时间列；需要时间时由其它读取入口解析。
 fn decode_lifecycle_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LifecycleRow> {
+    // 从 SQL 的有序列位置解码成拥有型事件；enum/hash/time 格式错误映射为 rusqlite 行解码失败。
     Ok(LifecycleRow {
         cursor: row.get(0)?,
         run_id: RunId(row.get(1)?),
@@ -28,10 +35,13 @@ fn decode_lifecycle_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LifecycleRo
     })
 }
 
+// 输入可选 Run 范围，按 cursor 重放 tool.called→tool.completed/failed→task.succeeded 状态机。
 fn validate_tool_lifecycle_events(
     connection: &Connection,
     run_id: Option<&RunId>,
 ) -> StoreResult<()> {
+    // 依 Run 可选过滤并按 event cursor 升序扫描 Called/Completed/Failed/TaskSucceeded。
+    // BTreeMap 记录 call 的 first cursor/lineage，pending_by_task 跟踪未闭合 call，terminal_by_call 防重复结束。
     let mut statement = connection.prepare(
         r#"SELECT event_id, run_id, task_id, attempt_id, event_type, artifact_id
            FROM rebuild_events
@@ -87,6 +97,7 @@ fn validate_tool_lifecycle_events(
         let task_key = (event_run_id.clone(), task_id.clone(), attempt_id.clone());
         match event_type {
             LifecycleEventType::TaskSucceeded => {
+                // 一个 Attempt 不能重复出现 TaskSucceeded，且成功终态前必须清空该 Task 的所有 pending ToolCall。
                 if pending_by_task
                     .get(&task_key)
                     .is_some_and(|pending| !pending.is_empty())
@@ -118,6 +129,7 @@ fn validate_tool_lifecycle_events(
                     attempt_id.clone(),
                     artifact_id.clone(),
                 );
+                // ToolCalled Artifact 必须为 ToolCall，同一 run/task/attempt/Artifact 只能开始一次。
                 let artifact = read_artifact(connection, &artifact_id)?;
                 if artifact.kind != ArtifactKind::ToolCall {
                     return Err(StoreError::Integrity(format!(
@@ -192,6 +204,7 @@ fn validate_tool_lifecycle_events(
                         call_artifact_id.0
                     )));
                 };
+                // terminal 必须晚于同 lineage 的 ToolCalled；完成后从 pending 集合移除该 call。
                 if called.cursor >= cursor
                     || called.run_id != event_run_id
                     || called.task_id != task_id
@@ -230,10 +243,13 @@ fn validate_tool_lifecycle_events(
     Ok(())
 }
 
+// 输入可选 Run 范围，按 Attempt 状态核验 AgentTurn started/terminal 与 defer/recovery/task terminal 闭合顺序。
 fn validate_agent_turn_lifecycle_events(
     connection: &Connection,
     run_id: Option<&RunId>,
 ) -> StoreResult<()> {
+    // 状态按 Run/Task/Attempt 独立累计：pending_start 表示有已持久化 started 尚未有 terminal，
+    // terminal_artifacts 去重别名，last_terminal 用于唯一兼容的 capability-preflight retry 分支。
     let mut statement = connection.prepare(
         r#"SELECT event_id, run_id, task_id, attempt_id, event_type, artifact_id
            FROM rebuild_events
@@ -380,6 +396,7 @@ fn validate_agent_turn_lifecycle_events(
             LifecycleEventType::TaskSucceeded
             | LifecycleEventType::TaskFailed
             | LifecycleEventType::TaskSkipped => {
+                // Task 终态不能截断仍 pending 的 AgentTurn；取消/恢复类事件已在前面明确关闭它。
                 if state.pending_start {
                     return Err(StoreError::Integrity(format!(
                         "{} cursor {cursor} closes a task with a pending AgentTurn",
@@ -393,10 +410,13 @@ fn validate_agent_turn_lifecycle_events(
     Ok(())
 }
 
+// 输入可选 Run 范围，检查 Context manifest/repaired event 的唯一性、Artifact kind 和来源 Run。
 fn validate_context_lifecycle_events(
     connection: &Connection,
     run_id: Option<&RunId>,
 ) -> StoreResult<()> {
+    // 只扫描 ContextManifestCreated/ChildManifestCreated/ContextRepaired；
+    // seen Artifact ID 防止同一清单被生命周期事件重复登记。
     let mut statement = connection.prepare(
         r#"SELECT event_id, run_id, task_id, attempt_id, event_type, artifact_id
            FROM rebuild_events
@@ -479,6 +499,7 @@ fn validate_context_lifecycle_events(
             )));
         }
         if event_type == LifecycleEventType::ContextChildManifestCreated {
+            // child 清单必须精确带一个同 Run parent ContextManifest source ref。
             let parents = artifact
                 .source_refs
                 .iter()

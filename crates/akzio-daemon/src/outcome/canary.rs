@@ -1,3 +1,10 @@
+// 文件导读：Canary completion 汇总父 Outcome 与 contract/topology/bundle 三个 Shadow
+// Outcome，建立 paired observations，按 promotion policy 记录 evaluation 并推进 campaign
+// verdict。它只影响 candidate 的 policy subject/Canary 状态，不能直接激活 Contract、拓扑、
+// Lesson 或 Paper 权限；缺 narrative/Shadow outcome 会保留等待。
+// Rust 机制：数组/迭代器按固定 subject 顺序配对；闭包 `metrics` 借用 Daemon 并返回
+// `Result`；`Option` 区分 process quality unknown，lease/permit 通过 Store fencing 保证原子写入。
+
 use super::*;
 
 impl Daemon {
@@ -10,6 +17,8 @@ impl Daemon {
         materialization: Option<&OutcomeMaterializationInput>,
         retrospective_draft: Option<&RetrospectiveDraft>,
     ) -> Result<bool> {
+        // 先锁定 campaign/session level，再读取三个 Shadow sealed Outcome；任何 candidate
+        // identity、cohort、process-quality 或 paired metric 不一致都阻断 promotion。
         let campaign = self
             .store
             .canary_campaign(&session.reservation.campaign_id)?
@@ -19,6 +28,8 @@ impl Daemon {
         if campaign.status != session.reservation.level || retrospective_draft.is_none() {
             // No narrative cannot populate process eligibility. A repair can retry
             // the same frozen cohort later while it remains active.
+            // 这里仅关闭当前 Attempt 并返回完成，不写 paired observation/evaluation；
+            // campaign 的候选 verdict 仍未因此推进。
             self.store.finish_task(
                 &task.permit,
                 akzio_domain::TaskStatus::Succeeded,
@@ -35,6 +46,8 @@ impl Daemon {
         ];
         let mut shadow_outcomes = Vec::with_capacity(shadow_run_ids.len());
         for run_id in shadow_run_ids {
+            // 三个 Shadow outcome 任一尚未封存时返回 false；调用方将当前 Attempt 延期，
+            // 不用部分 cohort 指标提前裁决。
             let Some(artifact) = self.store.outcome_for_run(run_id)? else {
                 return Ok(false);
             };
@@ -74,6 +87,8 @@ impl Daemon {
             ));
         }
 
+        // 再核验 topology 与 active analyst Contract；campaign 中的 Artifact ID 不是充分
+        // 身份证明，还要检查对象 kind/lifecycle 和 topology identity。
         let candidate_topology_artifact = self
             .store
             .artifact(&campaign.spec.candidate_topology.artifact_id)?;
@@ -121,6 +136,8 @@ impl Daemon {
                 .max()
                 .expect("canary policy has three horizons"),
         };
+        // EvaluationRuntime 负责 outcome/evaluation 的持久化 Gate；Promotion policy 参数
+        // 在此仅转成评估阈值，不会把 candidate Contract/Topology 安装为 active。
         let evaluation = EvaluationRuntime::new(self.store.clone(), evaluation_policy.clone())?;
 
         let pair_subjects = [
@@ -128,6 +145,8 @@ impl Daemon {
             (&topology_subject, 1_usize),
             (&bundle_subject, 2_usize),
         ];
+        // 对每个 subject × horizon 写 ShadowPair：contract 组固定父 topology，topology 组
+        // 固定 active Contract，bundle 组同时看 candidate 两者，便于隔离比较目标。
         for (subject, index) in pair_subjects {
             let candidate_schedule = &shadow_outcomes[index].2;
             let candidate_outcome = &shadow_outcomes[index].1;
@@ -185,6 +204,8 @@ impl Daemon {
             })?;
         let metrics =
             |outcome: &Outcome, schedule: &OutcomeSchedule, horizon: OutcomeHorizon| -> Result<_> {
+                // 数值来自 Rust seal 的 Outcome window；缺 narrative 时 process quality 保持
+                // None，不能把模型输出或父级质量指标借给 candidate。
                 let execution_context: akzio_domain::ExecutionContext =
                     self.read_artifact_payload(&schedule.execution_context)?;
                 execution_context.validate()?;
@@ -256,6 +277,8 @@ impl Daemon {
                 }
             }
         }
+        // 先通过 lease-fenced Store 写入 paired observations，再计算 cohort verdict；
+        // 这里的 observation 记录与后续 campaign 状态转换分开，失败时已提交事实保留。
         let observations = self.store.record_canary_observations(
             lease,
             &session.reservation.campaign_id,
@@ -272,6 +295,8 @@ impl Daemon {
                 .min(evaluation_policy.minimum_risk_recall_ppm),
         )?;
         let verdict = cohort_evaluation.verdict;
+        // 三类 subject 的 evaluation 都复用 parent 的 sealed Outcome 与原 narrative draft；
+        // Candidate 身份只在 subject/policy 字段出现，不伪装成 parent Decision 的 producer。
         // These evaluations materialize the parent Outcome. Candidate identity
         // lives in subject/CandidatePolicy/ShadowPair, never in producer fields.
         let producer_usage = self
@@ -396,6 +421,8 @@ impl Daemon {
             &cohort_evaluation,
             completed_at,
         )?;
+        // 只有三组 fenced evaluation 和 cohort policy 更新均成功，才将当前 workflow task
+        // 标为 Succeeded；该终态仍只是 Canary comparison，不是 active policy 激活。
         self.store.finish_task(
             &task.permit,
             akzio_domain::TaskStatus::Succeeded,

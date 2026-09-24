@@ -2,6 +2,10 @@
 
 use super::*;
 
+// 文件导读：NativeWebPolicy 把 Rust 的 host/数量限制编译成 provider 工具定义，并校验
+// 返回的 hosted action 与 citation。它只接受/提取来源身份，不发起网页请求、不验证文章
+// 事实，也不授予 Context、Store 或交易权限。ModelReviewed 路径的网页读取
+// 发生在 provider hosted search/reviewer 调用中，不能等同 Rust 独立网页快照。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeWebPolicy {
     pub tool_name: String,
@@ -11,6 +15,8 @@ pub struct NativeWebPolicy {
     pub max_citations: usize,
 }
 
+// Default trait 只提供 adapter 的静态 policy；Serialize/Deserialize 让 policy 能作为
+// 配置或审计数据往返，均不会触发网络访问，也不会替代 Store 的来源核验。
 impl Default for NativeWebPolicy {
     fn default() -> Self {
         // 默认 allowlist 和数量上限只描述 model adapter 可接受的来源范围；实际
@@ -39,6 +45,8 @@ pub struct NativeWebQuery {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeWebCitation {
+    // 缺失的 provider 元数据由 Serde 保持为 None；adapter 不会用 URL、标题或当前时间
+    // 推造 published_at、revision 或 document_id。
     pub uri: String,
     pub title: Option<String>,
     pub excerpt: Option<String>,
@@ -52,8 +60,9 @@ pub struct NativeWebCitation {
 
 impl NativeWebPolicy {
     pub fn tool_definition(&self) -> ModelToolDefinition {
-        // 将 Rust policy 编译为 provider 工具 Schema。allowlist 为空时 domains
-        // 可省略，否则要求模型显式回传受限域名；该定义不直接执行网络请求。
+        // 将 Rust policy 编译为本地工具 Schema：显式 function call 有 allowlist 时
+        // 必须带 domains；hosted web 在请求 wire 上另映射为 filters.allowed_domains，
+        // 其 response.action 不必回传 domains。本函数不执行网络请求。
         let domains_schema = json!({
             "type": "array",
             "minItems": usize::from(!self.allowed_hosts.is_empty()),
@@ -237,6 +246,8 @@ impl NativeWebPolicy {
     }
 
     pub fn extract_citations(&self, raw: &Value) -> Result<Vec<NativeWebCitation>> {
+        // BTreeMap 以 URI 去重并按 URI 排序；因此返回顺序是规范化后的稳定顺序，
+        // 不承诺等同于 provider 原始嵌套数组的出现顺序。
         // 递归收集 provider raw 中的 url/uri 及其常见元数据，按 URI 合并重复项；
         // 返回前统一执行非空、数量和 HTTPS/host allowlist 校验。
         let mut citations = Vec::new();
@@ -263,7 +274,9 @@ impl NativeWebPolicy {
 
     fn validate_uri(&self, uri: &str) -> Result<()> {
         // 来源必须是 HTTPS 且不带用户信息、端口；host 只能精确匹配 allowlist 或
-        // 其合法子域名，避免 attacker.example 这类后缀伪装。
+        // 其合法子域名，避免 attacker.example 这类后缀伪装。这里未检查 fragment/
+        // 敏感 query；ingest 的 governed URI 检查须在独立抓取前再做。错误枚举会携带
+        // 原 URI，调用方不得不经审计边界就公开其 Display 文本。
         let parsed = reqwest::Url::parse(uri).map_err(|_| ModelError::NativeWebUnsafeCitation {
             uri: uri.to_owned(),
             reason: "invalid URL".to_owned(),

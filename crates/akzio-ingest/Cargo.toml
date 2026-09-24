@@ -1,3 +1,4 @@
+# 文件职责：声明外部证据采集、解析、市场会话和材料化 crate 的 adapter 依赖。
 [package]
 name = "akzio-ingest"
 version = "0.2.0"

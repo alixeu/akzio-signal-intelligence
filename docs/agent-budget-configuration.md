@@ -49,14 +49,14 @@ output 为 `1..=1000000` 的整数；input/timeout 保留既有 `1..=4294967295`
 
 ## Inspect
 
-连接已经运行的隔离 Debug Core，使用它的配置文件：
+在正式 Core 的只读 inspection/journal 与 AgentTurn 记录核对预算；旧隔离 Debug Core 控制入口已退役：
 
 ```bash
-cargo run -p akzio-cli -- --config config/debug-controller-fixture.toml debug inspect RUN_ID
-cargo run -p akzio-cli -- --config config/debug-controller-fixture.toml debug inspect RUN_ID --task TASK_ID --attempt ATTEMPT_ID
+cargo run --locked -p akzio-cli -- --config "$HOME/.akzio/config.toml" run inspect RUN_ID
+cargo run --locked -p akzio-cli -- --config "$HOME/.akzio/config.toml" run journal RUN_ID
 ```
 
-输出 `nodes[].budget.resolved`（保留兼容字段 `limits`）为持久化任务实际预算；有 Runtime 观察时，`last_runtime_observation` 包含：
+持久化 Workflow Task budget 与 AgentTurn 的 `resolved_budget` 为真实预算依据。旧 Debug inspector 曾输出 `nodes[].budget.resolved`、`last_runtime_observation`（只对旧快照适用），包含：
 
 - `resolved`：Runtime 实际采用的四项上限。
 - `input_tokens_used` / `input_tokens_remaining`。
@@ -67,4 +67,4 @@ cargo run -p akzio-cli -- --config config/debug-controller-fixture.toml debug in
 
 不限制工具次数时，`resolved.max_tool_calls` 显示 `"unlimited"`，`tool_calls_remaining` 与派生的 `model_calls_remaining` 为 `null`；`tool_calls_used` 继续累计。这时 `null` 表示无次数上限，可通过 resolved 值与未知用量区分。
 
-观察带有时间戳和 Attempt ID，表示最后一个已持久化执行边界的用量，不是连续计时器。`--attempt` 筛选相应 Attempt 的观察记录。尚未开始时使用零用量与完整剩余额度；若只有历史调用记录但缺乏精确的当前阶段观察，不猜测剩余额度，保留 `null`。AgentTurn payload 的 `resolved_budget` 可用于核对调用 provenance。
+历史观察带有时间戳和 Attempt ID，表示最后一个已持久化执行边界的用量，不是连续计时器。新运行以 AgentTurn payload 的 `resolved_budget` 核对调用 provenance；未知用量不猜测或清零。

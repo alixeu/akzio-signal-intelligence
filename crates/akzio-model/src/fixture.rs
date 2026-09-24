@@ -2,7 +2,12 @@
 
 use super::*;
 
+// 文件导读：此模块只为离线 ModelClient fixture 解析受控 Context 标记，并按当前请求
+// Schema 物化阶段模板；它不模拟 HTTP/SSE，也不提供业务授权。读 `materialize_fixture`
+// 可先理解兼容占位符，读 `materialize_phase_fixture` 可看 Submit Schema 如何约束模板。
 pub(super) fn materialize_fixture(mut raw: Value, request: &ModelRequest) -> Value {
+    // raw 仍是 fixture 提供的 Responses 风格 JSON；这里仅做离线占位符物化，
+    // 不模拟 HTTP/SSE，也不把物化结果提升为 provider 或业务层的证明。
     // 仅离线 fixture 会走这里：从本次请求携带的受控 Context 中取出稳定
     // Artifact ID，替换 fixture 占位符；没有可绑定的 ID 时保持原响应不变。
     let input = fixture_input(request).unwrap_or_default();
@@ -119,6 +124,8 @@ pub(super) fn materialize_fixture_value(
 /// Fixture-only placeholders are resolved from this request's immutable input
 /// and bound wire schema. Real provider responses never enter this function.
 pub(super) fn materialize_phase_fixture(mut raw: Value, request: &ModelRequest) -> Result<Value> {
+    // 阶段 fixture 的 JSON 解析和重新序列化失败都传播为 MissingOutput；它只处理
+    // 已找到的 function-call arguments，其余 raw 字段不会被这个函数自动修复。
     // 阶段 fixture 只改 output 中函数 arguments（canonical fixture 预期为
     // submit_result），并把 schema 依赖的占位符解析为当前请求的受控范围；它不是
     // provider 输出的通用修复器。
@@ -289,6 +296,8 @@ fn materialize_phase_value(value: &mut Value, request: &ModelRequest) -> Result<
 // schema fields for an arbitrary reference. Branch order remains deterministic.
 // 空 pointer 返回当前节点；路径不存在时返回空集合。
 fn fixture_schema_locations<'a>(schema: &'a Value, pointer: &str) -> Vec<&'a Value> {
+    // 这是对 serde_json::Value 树的只读递归查找：返回的是借用的 Schema 节点，
+    // 不复制、不修改请求，也不把 anyOf 分支以外的字段当作引用来源。
     if pointer.is_empty() {
         return vec![schema];
     }

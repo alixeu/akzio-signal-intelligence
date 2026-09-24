@@ -1,3 +1,6 @@
+// 文件导读：维护四个可执行 ETF 的静态属性，并按交易 Session 确定性生成
+// InstrumentEvidenceRequirement、缺口 blocker 和资源到证据类别的反向映射。
+// `instrument_evidence_requirements_for_session` 是正向权威清单；blocker/key 函数从同一清单或受支持 resource 语法推导审计视图。
 //! Versioned, Rust-owned instrument and evidence requirement registry.
 
 use std::collections::BTreeSet;
@@ -26,6 +29,7 @@ pub struct InstrumentEvidenceProfile {
 }
 
 impl InstrumentEvidenceProfile {
+    // 只有每日重置杠杆 ETF（TQQQ/SOXL）需要 leveraged_etf_terms 证据。
     pub const fn daily_reset(self) -> bool {
         matches!(self.kind, InstrumentKind::DailyResetLeveragedEtf)
     }
@@ -76,6 +80,7 @@ pub enum InstrumentEvidenceCategory {
 }
 
 impl InstrumentEvidenceCategory {
+    // 将证据类别编码为资源路径中使用的稳定 snake_case 名称。
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::EtfHoldings => "etf_holdings",
@@ -111,7 +116,9 @@ pub struct InstrumentEvidenceBlocker {
     pub expected_resource: String,
 }
 
+// 无输入，输出静态注册表版本与全部 Profile 字段的 SHA-256 身份；Profile 数组按声明顺序参与哈希。
 pub fn instrument_evidence_registry_hash() -> ContentHash {
+    // 按注册表顺序拼接静态属性后哈希；任何注册表字段变化都会改变身份。
     let identity = INSTRUMENT_EVIDENCE_REGISTRY
         .iter()
         .map(|profile| {
@@ -135,10 +142,13 @@ pub fn instrument_evidence_registry_hash() -> ContentHash {
     )
 }
 
+// 输入交易日字符串借用，输出拥有的 Requirement 列表；日期不可解析时相对窗口保留原字符串，不推测替代日。
 pub fn instrument_evidence_requirements_for_session(
     session_key: &str,
 ) -> Vec<InstrumentEvidenceRequirement> {
+    // 解析日期失败时沿用原 session_key，保证生成路径仍确定但不会伪造日期。
     let session = NaiveDate::parse_from_str(session_key, "%Y-%m-%d").ok();
+    // 闭包把相对日期计算统一为“可计算则格式化，否则保留原输入”。
     let shifted = |days: i64| {
         session
             .and_then(|date| date.checked_add_signed(Duration::days(days)))
@@ -151,6 +161,7 @@ pub fn instrument_evidence_requirements_for_session(
     let macro_vintage = shifted(-1);
 
     let mut requirements = Vec::new();
+    // 每个资产先加入通用研究项，再按杠杆属性追加条款，最后补一项共享宏观日历。
     for profile in INSTRUMENT_EVIDENCE_REGISTRY {
         let symbol = profile.asset.symbol();
         for category in [
@@ -207,7 +218,9 @@ pub fn instrument_evidence_requirements_for_session(
     requirements
 }
 
+// 输入 session key 借用，输出按 BTreeSet 对完整 EvidenceNeed 去重并排序；只有全部字段相等的 Need 才会合并。
 pub fn instrument_evidence_needs_for_session(session_key: &str) -> Vec<EvidenceNeed> {
+    // 去重后按 BTreeSet 顺序输出，避免同一 resource 因重复需求产生不稳定列表。
     instrument_evidence_requirements_for_session(session_key)
         .into_iter()
         .map(|requirement| requirement.need)
@@ -216,9 +229,11 @@ pub fn instrument_evidence_needs_for_session(session_key: &str) -> Vec<EvidenceN
         .collect()
 }
 
+// 输入一个可执行 Asset，输出其静态必需类别集合，并额外包含共享宏观日历 key。
 pub fn instrument_evidence_required_keys_for_asset(
     asset: Asset,
 ) -> BTreeSet<InstrumentEvidenceKey> {
+    // 依据注册表确认该资产是否每日重置，再确定是否需要杠杆条款类别。
     let daily_reset = INSTRUMENT_EVIDENCE_REGISTRY
         .iter()
         .find(|profile| profile.asset == asset)
@@ -248,10 +263,12 @@ pub fn instrument_evidence_required_keys_for_asset(
     keys
 }
 
+// `'a` 约束迭代器中的资源字符串只被本次调用借用；输出缺少 Need 的 blocker，不取得或保存这些字符串引用。
 pub fn instrument_evidence_blockers_for_session<'a>(
     session_key: &str,
     resources: impl IntoIterator<Item = &'a str>,
 ) -> Vec<InstrumentEvidenceBlocker> {
+    // 先把实际 resource 收成集合，再筛出注册表中缺失的 requirement。
     let actual = resources.into_iter().collect::<BTreeSet<_>>();
     instrument_evidence_requirements_for_session(session_key)
         .into_iter()
@@ -265,7 +282,11 @@ pub fn instrument_evidence_blockers_for_session<'a>(
         .collect()
 }
 
+// 输入资源语法借用，输出可识别的资产/类别 key；大多数未知格式映射为空集合。
+// 特例：release_calendar 只检查前缀、paper.quotes 检查精确文本；
+// 这是类别识别器，不是 EvidenceNeed 资源的完整语法/来源授权验证。
 pub fn instrument_evidence_keys_for_resource(resource: &str) -> BTreeSet<InstrumentEvidenceKey> {
+    // 处理共享 quotes/release_calendar 特殊资源，其余路径按分段解析资产和类别。
     if resource == "paper.quotes" {
         return Asset::EXECUTABLE
             .into_iter()
@@ -288,6 +309,7 @@ pub fn instrument_evidence_keys_for_resource(resource: &str) -> BTreeSet<Instrum
         ["option_chain", symbol, _, _] => ("implied_volatility_term_structure", *symbol),
         _ => return BTreeSet::new(),
     };
+    // let-else 在解析失败时立即返回空集合，不把未知代码映射到任何资产。
     let Ok(asset) = Asset::try_from(symbol) else {
         return BTreeSet::new();
     };
@@ -315,6 +337,8 @@ fn requirement(
     resource: String,
     max_age_secs: u64,
 ) -> InstrumentEvidenceRequirement {
+    // 输入 resource String 被移动进 EvidenceNeed，来源名从借用的静态表复制；返回值拥有全部字段。
+    // 组装统一 schema 版本、来源族、资源路径和最大新鲜度的 EvidenceNeed。
     InstrumentEvidenceRequirement {
         registry_version: INSTRUMENT_EVIDENCE_REGISTRY_VERSION,
         key: InstrumentEvidenceKey { asset, category },

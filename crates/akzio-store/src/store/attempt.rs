@@ -1,8 +1,11 @@
+// 文件导读：本文件提供 Attempt 关系、补采额度和 Attempt 事件的只读查询；
+// 这些查询验证持久化 lineage，但不会凭读取结果发布输出或改变任务状态。
 use super::*;
 
 impl Store {
-    // 只检查同一 Run/Task 是否已经记录过补采创建或放弃事件；事件存在表示额度已消费，
-    // 不表示 provider 已成功返回事实，也不直接推进 Attempt 或 Decision 状态。
+    // 输入是精确 Run/Task 主键；SQL 只在这两列范围内检查两种补采事件是否存在并返回 bool。
+    // 事件存在表示额度已消费，不表示 provider 已成功返回事实，也不直接推进 Attempt 或 Decision 状态。
+    // `?` 将 rusqlite 错误转换为 StoreError 后返回；Mutex guard 随临时连接借用结束而释放。
     /// A supplemental round is spent before provider I/O, across attempt recovery.
     pub fn task_has_supplemental_round(
         &self,
@@ -14,7 +17,8 @@ impl Store {
             params![run_id.0, task_id.0], |row|row.get(0))?)
     }
 
-    // 从 child Attempt 的关系事件读取唯一的 AttemptRelation，并复核 Artifact 类型、生命周期和 lineage。
+    // 输入 child Attempt ID，按其关系事件读取至多两条 Artifact ID，再解码唯一的 AttemptRelation。
+    // SQL 以 attempt_id + event_type 精确过滤并按 event_id 升序；复核 Artifact 类型、生命周期和 lineage。
     // 没有关系事件返回 None；同一 child 出现多个关系事件属于 Store 完整性错误而不是任意选择其一。
     pub fn attempt_relation(
         &self,
@@ -54,7 +58,8 @@ impl Store {
             }
         };
 
-        // 关系 Artifact 必须是 RunScoped 的 AttemptRelation；之后同时校验负载自身和来源绑定。
+        // 上方代码块结束即 Drop 连接 guard；`artifact` 是拥有型值，之后再取连接读 payload。
+        // 这两次读取没有共同 SQL 快照；关系 Artifact 必须是 RunScoped，再校验负载和来源绑定。
         if artifact.kind != ArtifactKind::AttemptRelation
             || artifact.lifecycle != ArtifactLifecycle::RunScoped
         {
@@ -82,7 +87,8 @@ impl Store {
         Ok(Some(relation))
     }
 
-    // 按 Run、Task、Attempt 的精确范围读取追加事件，并对每个事件重新检查可选字段形状。
+    // 输入 Run/Task/Attempt 三个主键，按 event_id 升序返回该 Attempt 的追加事件；
+    // 查询不读取别的 Run/Task，也不对历史执行写操作。逐行解码或形状校验失败会使整次读取返回 Err。
     // 该方法只读历史；事件列表不会把 Attempt 标记为成功，也不会发布正式输出。
     pub fn attempt_events(
         &self,

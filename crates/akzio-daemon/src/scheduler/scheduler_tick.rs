@@ -1,3 +1,10 @@
+// 文件导读：每次 tick 先问真实 broker session，再检查已有 slot、Canary 状态、冷启动
+// Policy/approval、runtime identity 和 proposal，最后在同一 Store executor 下预约新 Run。
+// Closed/缺 proposal/身份不匹配是等待，不会伪造 slot；reservation 返回成功也只说明
+// T0 graph 已发布，后续 research/Decision/Execution/Paper/Outcome 仍未完成。
+// Rust 机制：async trait Future 按阶段 await；`move` 闭包拥有 session/setup 进入 executor；
+// `BTreeSet` 比较资源集合，`Option` 表示无 session/无 approval，枚举状态保持 fail closed。
+
 use super::*;
 
 impl PaperScheduler {
@@ -11,6 +18,9 @@ impl PaperScheduler {
         C: BrokerSessionClock + ?Sized,
         P: PaperWorkflowSource + ?Sized,
     {
+        // tick 的每个早退都是明确的等待/复用语义：闭市、已有 slot、staged canary、缺
+        // approval/proposal 或 identity 不匹配均不创建新 Run，也不发送 broker 写请求。
+        self.require_run_log()?;
         let Some(session_key) = clock.open_session_key().await? else {
             eprintln!("Paper scheduler waiting: broker market is closed");
             return Ok(None);
@@ -111,6 +121,7 @@ impl PaperScheduler {
             Err(error) => return Err(error),
         };
         let lease = self.acquire_or_renew_async().await?;
+        self.require_run_log()?;
         let run_id = RunId::new();
         let mut setup_artifacts = Vec::new();
         let mut proposal = proposal;
@@ -201,30 +212,47 @@ impl PaperScheduler {
         }
 
         let workflow = self.workflow.clone();
-        Ok(Some(
-            self.store_executor
-                .execute(move |_| match binding {
-                    Some((runtime_manifest, approval)) => workflow
-                        .reserve_paper_session_with_inputs_for_run_approved(
-                            &lease,
-                            run_id,
-                            &session_key,
-                            &proposal,
-                            &setup_artifacts,
-                            &runtime_manifest,
-                            &approval,
-                            now,
-                        ),
-                    None => workflow.reserve_paper_session_with_inputs_for_run(
+        let reservation = self
+            .store_executor
+            .execute(move |_| match binding {
+                Some((runtime_manifest, approval)) => workflow
+                    .reserve_paper_session_with_inputs_for_run_approved(
                         &lease,
                         run_id,
                         &session_key,
                         &proposal,
                         &setup_artifacts,
+                        &runtime_manifest,
+                        &approval,
                         now,
                     ),
-                })
-                .await??,
-        ))
+                None => workflow.reserve_paper_session_with_inputs_for_run(
+                    &lease,
+                    run_id,
+                    &session_key,
+                    &proposal,
+                    &setup_artifacts,
+                    now,
+                ),
+            })
+            .await??;
+        if reservation.newly_reserved {
+            if let Some(logger) = &self.run_log {
+                logger.record(
+                    &akzio_model::ModelAuditContext {
+                        run_id: reservation.slot.workflow.run.run_id.0.clone(),
+                        phase: "T0".into(),
+                        task_id: None,
+                        attempt_id: None,
+                        call_id: None,
+                        retry_index: None,
+                    },
+                    "rust.run.submitted",
+                    serde_json::json!({"purpose":"paper","source":"scheduler",
+                        "session_key":reservation.slot.session_key}),
+                )?;
+            }
+        }
+        Ok(Some(reservation))
     }
 }

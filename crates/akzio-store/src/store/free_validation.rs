@@ -1,4 +1,13 @@
+// 文件导读：本文件包含 Store Root 权限、schema 初始化/升级、v18 DDL、Contract catalogue
+// 和 Artifact 插入校验；当前初始化 DDL 与 schema label 同一事务提交，但 metadata 表探测/创建及历史 v13/v14
+// 迁移在该事务外分阶段完成，迁移不重写既有 CAS/历史 hash。
+// 仅可写 `Store::open` 从 schema.rs 调入 initialize；`open_existing` 不迁移 schema。
+// 读本文件时先看 initialize 的旧版本分支，
+// 再看 insert_artifact 的 CAS promotion/source refs，最后查看文件权限和 Contract helper。
+// `cfg(unix)` 只启用 Unix 权限 API；Store SQL 仍通过 rusqlite 连接执行，不建立第二份持久化状态。
+// 对已写入的文件调用 sync_all；它只提供文件落盘检查，不是 SQLite 事务提交证明。
 fn sync_file(path: &Path) -> StoreResult<()> {
+    // Path 按值借用，打开已有文件并请求 fsync；I/O 错误带上路径返回，不改变数据库事务状态。
     let file = fs::File::open(path).map_err(|source| StoreError::Io {
         path: path.to_path_buf(),
         source,
@@ -10,7 +19,9 @@ fn sync_file(path: &Path) -> StoreResult<()> {
     Ok(())
 }
 
+// Unix 下把 Store Root/导出目录权限收紧为 owner-only；非 Unix 平台保持文件系统默认行为。
 fn secure_directory(path: &Path) -> StoreResult<()> {
+    // cfg(unix) 条件编译使 PermissionsExt 只在 Unix 构建；其他目标编译为空操作并仍返回 Ok。
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -30,7 +41,9 @@ fn secure_directory(path: &Path) -> StoreResult<()> {
     Ok(())
 }
 
+// Unix 下把 SQLite/导出文件权限设为 0600，不涉及数据库内容或 schema。
 fn secure_file(path: &Path) -> StoreResult<()> {
+    // 仅在 Unix 改权限位，不改文件字节；文件系统拒绝读取/设置权限时向调用方返回 Io。
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -57,9 +70,11 @@ fn secure_file(path: &Path) -> StoreResult<()> {
 /// batch further down, and a raw `no such table` here would mask the real
 /// upgrade decision.
 ///
-/// The claimable states match `workflow::contract_upgrade_blockers`: a task that
-/// is queued or leased is owned by the old worker just as much as a running one,
-/// and letting it through would strand it after the version changes.
+/// 与 `workflow::contract_upgrade_blockers` 一样，queued/leased/running Task
+/// 都是升级阻断；此处还独立检查未过期 daemon lease，不能把两种检查视作完全同一查询。
+// 迁移前只读取 queued/leased/running Task 和未过期 daemon lease，旧 worker 活跃时 fail closed。
+// 表不存在视为尚无 active work；先查 Task，若已阻断则不再查 daemon lease。
+// expires_at 以本机当前 UTC 时间筛选，返回 Err 表示调用方不得继续旧 Store schema 升级。
 fn assert_no_active_work_before_upgrade(connection: &Connection) -> StoreResult<()> {
     let mut blocked = false;
     if migration::table_exists(connection, "rebuild_tasks")? {
@@ -84,7 +99,11 @@ fn assert_no_active_work_before_upgrade(connection: &Connection) -> StoreResult<
     Ok(())
 }
 
+// 为新建/升级 Store 创建或校验 rebuild_* 表、索引，并在 Immediate 事务中写入当前 metadata.schema_version。
+// metadata anchor 表先于此事务确保存在；v13/v14 的两段历史迁移则由上方分阶段完成。
 fn initialize(connection: &mut Connection, root: &Path) -> StoreResult<()> {
+    // 先在事务外确保 metadata 表并读取旧 version，拒绝结构标签不相容或仍有旧 worker 的 Store；
+    // 13/14 的历史迁移先单独提交到 v15，再进入下方 DDL Immediate 事务。
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS rebuild_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
     )?;
@@ -127,6 +146,7 @@ fn initialize(connection: &mut Connection, root: &Path) -> StoreResult<()> {
         migration::migrate_v14_to_v15(connection)?;
     }
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // 旧 Task 表可能缺 node_spec_json，只在列缺失时 ALTER；随后批量 CREATE IF NOT EXISTS 保持既有行不重写。
     if migration::table_exists(&transaction, "rebuild_tasks")? && !table_has_column(&transaction, "rebuild_tasks", "node_spec_json")? {
         transaction.execute_batch("ALTER TABLE rebuild_tasks ADD COLUMN node_spec_json TEXT;")?;
     }
@@ -488,8 +508,10 @@ CREATE INDEX IF NOT EXISTS rebuild_artifacts_run_kind
     ON rebuild_artifacts (json_extract(origin_json, '$.run_id'), kind, created_at, artifact_id);",
     )?;
     if migration::table_exists(&transaction, "rebuild_debug_sessions")? {
+        // 兼容旧 Debug head 表时在同一 DDL 事务内搬到统一 run_controls 后删除旧表。
         transaction.execute_batch("INSERT INTO rebuild_run_controls SELECT * FROM rebuild_debug_sessions; DROP TABLE rebuild_debug_sessions;")?;
     }
+    // 为历史 Run 补 control head 后确认 required column；任一检查失败不提交 schema label。
     run_control::backfill_history(&transaction)?;
     if !table_has_column(
         &transaction,
@@ -521,15 +543,18 @@ CREATE INDEX IF NOT EXISTS rebuild_artifacts_run_kind
             )?;
         }
     }
+    // schema DDL 与当前 label 同一事务提交；迁移前的 v13/v14 步骤不与这段 DDL 共用该事务。
     transaction.commit()?;
     Ok(())
 }
 
+// 用 PRAGMA table_info 探测历史列，供兼容迁移选择分支。
 fn table_has_column(
     connection: &Connection,
     table: &str,
     required_column: &str,
 ) -> StoreResult<bool> {
+    // table 来自 crate 内部固定迁移常量，required_column 是比较值；PRAGMA 结果通过 collect 全量拥有化。
     let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
     let columns = statement
         .query_map([], |row| row.get::<_, String>(1))?
@@ -537,10 +562,12 @@ fn table_has_column(
     Ok(columns.iter().any(|column| column == required_column))
 }
 
+// 读取 purpose 当前 head 及 activation id；head 只是 immutable activation history 的游标。
 fn contract_catalogue_head(
     connection: &Connection,
     purpose: &ContractPurpose,
 ) -> StoreResult<Option<(ContentHash, i64)>> {
+    // purpose 是唯一过滤键；无 head 返回 None，内容 hash 解码失败仍为 Err。
     let row = connection
         .query_row(
             "SELECT contract_hash, activation_id FROM rebuild_contract_catalogue_heads WHERE purpose = ?1",
@@ -552,10 +579,12 @@ fn contract_catalogue_head(
         .transpose()
 }
 
+// contract_id+version 是安装表唯一身份，重复版本直接拒绝而不是覆盖旧 Artifact。
 fn assert_contract_identity_available(
     connection: &Connection,
     contract: &AgentContract,
 ) -> StoreResult<()> {
+    // 单条只读查询探测已安装版本；只要存在任意 hash 就返回 DuplicateContractVersion。
     let existing = connection
         .query_row(
             "SELECT contract_hash FROM rebuild_contract_installations WHERE contract_id = ?1 AND contract_version = ?2",
@@ -572,6 +601,7 @@ fn assert_contract_identity_available(
     Ok(())
 }
 
+// 写入不可变 Contract installation 元数据，payload/Artifact 已由调用方同一事务准备。
 fn insert_contract_installation(
     transaction: &Transaction<'_>,
     contract: &AgentContract,
@@ -579,6 +609,7 @@ fn insert_contract_installation(
     baseline_contract_hash: Option<&ContentHash>,
     installed_at: DateTime<Utc>,
 ) -> StoreResult<()> {
+    // 所有值来自调用方已验证的 Contract/Artifact；此 helper 借用外层事务，不创建 CAS、不 commit。
     transaction.execute(
         r#"INSERT INTO rebuild_contract_installations
            (contract_hash, contract_artifact_id, contract_id, contract_version, purpose,
@@ -597,6 +628,7 @@ fn insert_contract_installation(
     Ok(())
 }
 
+// 追加 activation history 行并返回 SQLite rowid，后续 head 更新引用该 immutable event。
 fn append_contract_activation(
     transaction: &Transaction<'_>,
     purpose: &ContractPurpose,
@@ -605,6 +637,7 @@ fn append_contract_activation(
     policy_transition_id: Option<&PolicyTransitionId>,
     activated_at: DateTime<Utc>,
 ) -> StoreResult<i64> {
+    // 插入 append-only history 后返回当前事务的 last_insert_rowid；head 更新仍由调用方在同一事务完成。
     transaction.execute(
         r#"INSERT INTO rebuild_contract_activations
            (purpose, previous_contract_hash, contract_hash, policy_transition_id, activated_at)
@@ -620,12 +653,14 @@ fn append_contract_activation(
     Ok(transaction.last_insert_rowid())
 }
 
+// 以 purpose 单例 head 指向刚追加的 activation，不删除或改写既有 activation。
 fn set_contract_catalogue_head(
     transaction: &Transaction<'_>,
     purpose: &ContractPurpose,
     contract_hash: &ContentHash,
     activation_id: i64,
 ) -> StoreResult<()> {
+    // 单 purpose 主键 UPSERT 只移动可重建游标；原 activation history 行不会被覆盖或删除。
     transaction.execute(
         r#"INSERT INTO rebuild_contract_catalogue_heads (purpose, contract_hash, activation_id)
            VALUES (?1, ?2, ?3)
@@ -637,7 +672,9 @@ fn set_contract_catalogue_head(
     Ok(())
 }
 
+// 只做 capability subset 判断：候选不能扩大 output kind、depth、child tasks 或证据要求。
 fn candidate_is_bounded(active: &AgentContract, candidate: &AgentContract) -> bool {
+    // 首先委托领域 capability 比较，再附加 purpose/output/termination 限制；纯布尔函数不访问 Store。
     active.permits_candidate(candidate)
         && active.purpose == candidate.purpose
         && active.output.artifact_kind == candidate.output.artifact_kind
@@ -646,7 +683,10 @@ fn candidate_is_bounded(active: &AgentContract, candidate: &AgentContract) -> bo
         && candidate.termination.max_depth <= active.termination.max_depth
 }
 
+// Artifact 插入前提升 staged BLOB、检查 source rows；同 ArtifactId 重放只接受完全相同的 immutable 内容。
 fn insert_artifact(transaction: &Transaction<'_>, artifact: &Artifact) -> StoreResult<()> {
+    // 调用方必须持有事务；先校验领域对象与提升 CAS，再确认每条 source_ref 已存在且 kind 相符。
+    // INSERT OR IGNORE 遇到同 ID 时会重读并比较完整 Artifact；只有首次插入才追加 refs/embedded index。
     artifact.validate()?;
     blob::promote_staged_blob(transaction, &artifact.blob)?;
     for source in &artifact.source_refs {

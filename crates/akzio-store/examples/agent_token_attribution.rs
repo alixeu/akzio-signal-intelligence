@@ -1,15 +1,21 @@
-//! Read-only size attribution. Never prints prompts, evidence, or opaque reasoning.
+//! 既有 Store 的只读请求大小归因；输出结构化计数，不主动打印 request/prompt/证据正文。
+// 文件导读：示例只通过 open_existing 读取 AgentTurn 与 Contract CAS，按 JSON 结构计算
+// 大小归因；它不写 Store、不解密 continuation，也不把指标解释成研究/Decision 完成。
+// `provider_usage` 会原样带出持久化 telemetry；此本地示例不是通用的分享安全脱敏导出器。
 use akzio_domain::{ArtifactId, ArtifactKind, ContentHash, RunId};
 use akzio_store::Store;
 use serde_json::{json, Value};
 
 // 统计一个已经解析的 JSON 值的紧凑序列化字节数，用于请求分项归因。
+// `expect` 把 serde 序列化错误转为 panic；这里输入已是内存 JSON Value，示例选择让异常终止而不是返回部分统计。
 fn bytes(v: &Value) -> usize {
     serde_json::to_vec(v).expect("JSON").len()
 }
 
 // 从既有 Store 读取 AgentTurn，并把请求、上下文、历史续接和工具负载拆成只读大小指标。
 // `--run` 只负责按 Run 找到 AgentTurn；本示例不改变任何 Artifact、BLOB 或运行状态。
+// 返回 `Box<dyn Error>` 用一个堆上 trait object 统一承接 CLI 解析、Store 与 JSON 的不同错误类型；
+// `?` 通过各错误类型到 Box<dyn Error> 的 From 转换逐层提前返回。
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let root = args
@@ -19,8 +25,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rows = Vec::new();
     let mut ids = args.collect::<Vec<_>>();
 
-    // `--run` 要求唯一的 Run ID，并从 Store 的事件/Artifact 索引中取 AgentTurn。
-    // 这里得到的仍是历史 Artifact 列表，不代表 Run 已完成或 Decision 已获准。
+    // `--run` 要求唯一的 Run ID，并按 Artifact.origin.run_id/kind 索引读取 AgentTurn；
+    // 不依赖成功 Attempt output 索引，也不从事件推断调用已成功或 Run 已完成。
     if ids.first().is_some_and(|id| id == "--run") {
         if ids.len() != 2 {
             return Err("usage: agent_token_attribution STORE --run RUN_ID".into());
@@ -38,6 +44,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("expected AgentTurn".into());
         }
         let v: Value = serde_json::from_slice(&store.read_blob(&a.blob)?)?;
+        // serde_json 的 `[]` 索引在字段缺失时返回 Null；此工具不把缺失请求校验为错误，
+        // 后续 `bytes`/估算会计算 Null 的 JSON 大小，不能视作完整 provider 请求。
         let r = &v["request"];
         let mut context = r["context"].clone();
         let mut history = 0;
@@ -45,8 +53,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut opaque = 0;
         if let Some(items) = r.pointer("/continuation/items").and_then(Value::as_array) {
             for item in items {
-                // function_call_output 是重放给后续请求的工具结果；带原始 context 的 user
-                // 项恢复首次上下文，其余项才计入对话历史。加密内容只能按字节计数，不能解密或输出。
+                // function_call_output 计入工具结果；带 JSON context 的 user 项会更新 context，
+                // 如果出现多项则以最后命中的为准，不能称为“必然恢复首次上下文”。
+                // 其余项计入历史；这些是紧凑 JSON 字节分类，不是 provider 实际计费 token。
                 if item["type"] == "function_call_output" {
                     replay += bytes(item);
                 } else if item["role"] == "user"
@@ -59,10 +68,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     history += bytes(item);
                 }
+                // 只统计每项顶层 encrypted_content 字符串的 UTF-8 字节数；它可能已包含在
+                // history/replay 的 JSON 字节中，不可把这些栏目直接相加当作独立总量。
                 opaque += item["encrypted_content"].as_str().map_or(0, str::len);
             }
         }
-        // Contract 由 AgentTurn 的哈希绑定；缺失安装时停止，避免把治理源大小归因到未知版本。
+        // 从 AgentTurn payload 的 contract_hash 查询安装记录；缺失/无效 hash 或安装均返回 Err。
+        // 此处没有额外比较 Artifact.origin 的 contract_hash，不能单凭查询称为完整来源绑定证明。
         let hash: ContentHash = serde_json::from_value(v["contract_hash"].clone())?;
         let contract = store
             .contract_installation(&hash)?
@@ -81,7 +93,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 facts += bytes(&d["value"]);
             }
         }
-        // 输出的是可审计的大小/telemetry 指标，不包含 prompt、证据正文或不透明推理内容。
+        // 输出的是 JSON 字节数与约每 4 字节一个 token 的估算，不是 provider 实际 usage；
+        // governance/role 取 BLOB 逻辑长度，telemetry 原样回显但不主动输出 prompt/证据正文。
         rows.push(json!({"artifact_id":a.artifact_id,"origin":a.origin,"turn":v["turn"],
             "whole_request_json_bytes":bytes(r),"runtime_request_estimate_tokens":akzio_domain::estimate_json_tokens(r)?,
             "prompt_json_bytes":bytes(&r["prompt"]),

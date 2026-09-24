@@ -19,12 +19,12 @@ use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-#[cfg(test)]
-#[path = "context_broker/lesson_quality_tests.rs"]
-mod lesson_quality_tests;
-
+// 文件导读：ContextBroker 将 Store 的 CAS Artifact、ContextPolicy 和当前 Attempt 的
+// ReadGrant 组合为 Agent 唯一受控资料入口。下方 include! 在编译时共享本模块的
+// 类型和私有方法；public 读取 API 的存在不等于研究 Contract 向模型授予读取工具。
 #[derive(Debug, Error)]
 pub enum ContextError {
+    // 错误枚举区分 Store/Domain/JSON、grant/closure、预算和读取类型错误，调用方不能用 UI fallback 绕过权限失败。
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
@@ -73,11 +73,13 @@ pub type ContextResult<T> = Result<T, ContextError>;
 
 #[derive(Debug, Clone)]
 pub struct ContextBroker {
+    // Broker 只持有 Store handle；权限和 provenance 每次由持久化数据重新验证，不依赖进程内可变缓存。
     store: Store,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextManifest {
+    // Manifest、payload 和 ReadGrant 作为不可变值一起返回，后续读取必须继续满足同一 Attempt/Contract 身份。
     pub artifact: Artifact,
     pub payload: ContextManifestPayload,
     pub grant: ReadGrant,
@@ -85,6 +87,7 @@ pub struct ContextManifest {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ContextDocumentMetadata {
+    // metadata 是受控投影 ledger，不暴露任意 raw blob；read_grant_identity 让 materialization 可审计。
     pub document_id: ArtifactId,
     pub kind: ArtifactKind,
     pub source: String,
@@ -99,6 +102,7 @@ pub struct ContextDocumentMetadata {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ContextMustReadDocument {
+    // must_read 同时携带 class、metadata 和已授权 Value，不能由调用方再扩展来源集合。
     pub class: String,
     pub metadata: ContextDocumentMetadata,
     pub value: Value,
@@ -106,6 +110,7 @@ pub struct ContextMustReadDocument {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ContextMaterialization {
+    // materialization 固定 manifest/grant/task contract 与读取 ledger，作为模型 Context 的值语义快照。
     pub manifest_artifact_id: ArtifactId,
     pub read_grant_identity: ContentHash,
     pub materialization_identity: ContentHash,
@@ -116,11 +121,13 @@ pub struct ContextMaterialization {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContextReadResult {
+    // 同时返回实际读取的 Artifact 血缘和模型可见的 Value；两者不是来源真实性证明。
     pub artifacts: Vec<Artifact>,
     pub value: Value,
 }
 
 struct ParentContextProof<'a> {
+    // 父证明把 Manifest、readable/raw closure、写 permit 和 Contract 绑定，子 Attempt 不能只凭单个 source ref 继承权限。
     manifest: &'a ArtifactRef,
     readable: &'a BTreeSet<ArtifactRef>,
     raw_closure: &'a BTreeSet<ArtifactId>,
@@ -128,6 +135,8 @@ struct ParentContextProof<'a> {
     contract: &'a AgentContract,
 }
 
+// 以下 include 是 Broker 的实现分区：manifest/selection 负责选择，grants/reads 负责授权，materialization 负责受控输出。
+// `include!` 将片段放入当前模块作用域，所以它们共享上方类型/导入，而不会形成独立对外 API。
 include!("context_broker/manifest.rs");
 include!("context_broker/coverage.rs");
 include!("context_broker/selection.rs");

@@ -1,5 +1,9 @@
 use super::*;
 
+// WorkflowRuntime 的写入口把已编译 graph/proposal 与 Session reservation 放进 Store
+// 事务边界。重复的 Paper session reservation 返回原有 Run/Task identity；
+// 单独重新 prepare/lower 仍会分配新 TaskId，只有 Store slot 事务保证重复调度不替换旧图。
+// approved proposal 是研究拓扑，不是模型已完成的结论。
 impl WorkflowRuntime {
     pub fn submit(
         &self,
@@ -8,6 +12,8 @@ impl WorkflowRuntime {
         graph: WorkflowGraph,
         now: DateTime<Utc>,
     ) -> RuntimeResult<Artifact> {
+        // prepare 先做 graph/compiled invariants，commit 才让 Run/Task 出现在 durable
+        // journal；返回 graph Artifact 仍只说明提交成功，不代表节点已领取或执行。
         let commit = self.prepare_workflow_commit(run_id, purpose, graph, now)?;
         let graph_artifact = commit.graph.clone();
         self.store.commit_workflow(&commit)?;
@@ -21,6 +27,9 @@ impl WorkflowRuntime {
         graph: WorkflowGraph,
         now: DateTime<Utc>,
     ) -> RuntimeResult<WorkflowCommit> {
+        // prepare 不发布 Run/Task，但 graph_artifact 会通过 Store staging 写入 blob；
+        // 只有后续 commit_workflow/Session reservation 才建立可见的工作流状态。
+        // `?` 遇到校验或 staging 失败立即返回，不会构造半份 WorkflowCommit。
         graph.validate()?;
         self.validate_compiled_graph(purpose, &graph)?;
         let graph_artifact = self.graph_artifact(&graph, vec![], now)?;
@@ -37,8 +46,6 @@ impl WorkflowRuntime {
         })
     }
 
-    /// Load the exact durable graph/task state for crash recovery. Recovery
-    /// never re-lowers a proposal or allocates replacement task IDs.
     /// Freeze one fully compiled Paper workflow into its broker-session slot.
     /// A duplicate session returns the already durable graph and task IDs; it
     /// never regenerates a replacement graph after a scheduler restart.
@@ -63,6 +70,8 @@ impl WorkflowRuntime {
         setup_artifacts: &[Artifact],
         now: DateTime<Utc>,
     ) -> RuntimeResult<SessionSlotReservation> {
+        // `impl Into<String>` 让调用方传 &str 或 String，所有权在下游转换后归 reservation；
+        // `&[Artifact]` 只借用 setup 输入，真正的持久化仍在 Store 的 reservation 事务。
         self.reserve_paper_session_with_inputs_for_run(
             lease,
             RunId::new(),
@@ -119,9 +128,9 @@ impl WorkflowRuntime {
         )
     }
 
-    /// Prepare an approved Paper session without publishing it. The caller
-    /// may combine the returned immutable reservation with other workflow
-    /// commits in one Store transaction.
+    /// Prepare a Paper session for an approved-path transaction without
+    /// publishing it. This method itself has no approval argument and grants
+    /// no broker permission; the caller must bind approval in the Store commit.
     #[allow(clippy::too_many_arguments)]
     pub fn prepare_approved_paper_session_with_inputs_for_run(
         &self,
@@ -157,6 +166,8 @@ impl WorkflowRuntime {
         binding: Option<(&Artifact, &Artifact)>,
         now: DateTime<Utc>,
     ) -> RuntimeResult<SessionSlotReservation> {
+        // 先查 session slot，重复 scheduler tick 直接返回既有 reservation；新 session
+        // 才编译一次 Paper graph，并在有 approval binding 时由 Store 原子消费审批。
         let session_key = session_key.into();
         if let Some(slot) = self.store.session_slot(&session_key)? {
             return Ok(SessionSlotReservation {
@@ -165,6 +176,8 @@ impl WorkflowRuntime {
             });
         }
 
+        // `Option<(&Artifact, &Artifact)>` 是可选绑定，两个引用都不把审批 Artifact
+        // 所有权交给 Runtime；无 binding 的冷启动不会虚构一个批准的 proposal Artifact。
         let proposal_artifact = if binding.is_some() {
             Some(self.paper_proposal_artifact(&run_id, proposal, now)?)
         } else {
@@ -178,6 +191,8 @@ impl WorkflowRuntime {
             setup_artifacts: setup_artifacts.to_vec(),
             reserved_at: now,
         };
+        // 同时匹配两个 Option：只有审批和 proposal Artifact 均存在才消费审批；
+        // 否则仅预留 session，后续 Gate 仍按缺少审批 fail closed。
         Ok(match (binding, proposal_artifact.as_ref()) {
             (Some((runtime_manifest, approval)), Some(proposal_artifact)) => {
                 self.store.reserve_paper_session_with_approval(
@@ -214,6 +229,8 @@ impl WorkflowRuntime {
         &self,
         topology_id: impl Into<String>,
     ) -> RuntimeResult<akzio_domain::WorkflowDefinition> {
+        // 固定生成 T1/T3/T5 Analyst/Critic、一次共享 supplement、refined pairs 和
+        // 有界 Synthesizer/ProposalReviewer revisions；Outcome worker 不在这条 T0 图里。
         let topology_id = topology_id.into();
         let analyst = self
             .catalogue
@@ -263,6 +280,8 @@ impl WorkflowRuntime {
             ("t3", akzio_domain::DecisionHorizon::T3),
             ("t5", akzio_domain::DecisionHorizon::T5),
         ] {
+            // 每个 horizon 的 Critic 只审对应 Claim；依赖顺序表达 Rust-owned provenance，
+            // 不是让模型动态创建新 Agent。
             let a = format!("analyst_{horizon}");
             let c = format!("critic_{horizon}");
             insert(
@@ -310,6 +329,8 @@ impl WorkflowRuntime {
         }
         let mut previous = None;
         for revision in 0..=self.research_settings.max_proposal_revisions {
+            // 每个 revision 都是预先冻结的 Synthesizer→Reviewer 对；Review 通过后由
+            // 上层选择有效版本，失败/耗尽不会自动激活 Policy。
             let synth = format!("synthesizer_{revision}");
             let review = format!("proposal_review_{revision}");
             let mut dependencies = effective.clone();
@@ -342,6 +363,8 @@ impl WorkflowRuntime {
         proposal: &WorkflowProposal,
         now: DateTime<Utc>,
     ) -> RuntimeResult<Artifact> {
+        // proposal Artifact 仅保存 Rust 编译的研究计划和 EvidenceNeed refs，没有模型
+        // 预测或订单；Paper session 仍需后续 Agent/Decision/Execution/Commit Gate。
         Ok(Artifact::new(
             ArtifactKind::WorkflowProposal,
             // The returned reservation is valid only with this Store's staging connection.
@@ -380,6 +403,8 @@ impl WorkflowRuntime {
         proposal_artifact: Option<&Artifact>,
         now: DateTime<Utc>,
     ) -> RuntimeResult<WorkflowCommit> {
+        // Paper 图复用 approved research proposal，再接正式执行链；PositionPlan 不会
+        // 通过这个 helper 获得 PaperCommit/Reconcile/Evaluate 能力。
         let graph = self.lower(RunPurpose::Paper, proposal)?;
         let graph_artifact = self.graph_artifact(
             &graph,

@@ -1,5 +1,9 @@
 import Foundation
 
+// 文件导读：作为 Mock 场景下所有页面共用的不可变根快照，由 ScenarioLibrary.build 创建，
+// ObservatoryStore 在初始化或切换场景时持有；Live 模式改由 LiveProjection 提供对应投影。
+// 子模型以 Swift struct/数组值语义传递；冻结 anchor 让截图时间可复现，anchorLabel/elapsedLabel 只格式化已有值。
+// Sendable 是编译期的并发传递约束，不会给快照加锁；Identifiable 的 id 只供 SwiftUI 稳定识别列表项。
 // MARK: - Snapshot
 //
 // One immutable value that every page reads. Built by `ScenarioLibrary` from a
@@ -8,6 +12,7 @@ import Foundation
 // `anchor` is a frozen instant rather than `Date()`, so screenshots, count-ups and
 // elapsed clocks reproduce exactly between runs.
 public struct ObservatorySnapshot: Sendable, Equatable {
+    // Snapshot 是所有页面共享的不可变根投影；各子模型按领域拆分但共同来自同一 anchor。
     /// 2026-08-19 09:30 America/New_York (13:30 UTC) — a market open, frozen.
     public static let anchor = Date(timeIntervalSince1970: 1_787_146_200)
 
@@ -42,6 +47,7 @@ public struct ObservatorySnapshot: Sendable, Equatable {
         agents: [AgentRailItem],
         health: [HealthMetric]
     ) {
+        // 初始化只组装已生成的展示模型，不在快照层重新查询 Observer 或修改任何子值。
         self.scenarioID = scenarioID
         self.scenarioTitle = scenarioTitle
         self.anchor = anchor
@@ -59,6 +65,7 @@ public struct ObservatorySnapshot: Sendable, Equatable {
 
     /// The frozen anchor rendered in the broker's time zone, for Settings to show.
     public static var anchorLabel: String {
+        // anchorLabel 只格式化冻结静态 anchor，避免设置页读取墙上时钟造成漂移。
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = TimeZone(identifier: "America/New_York")
@@ -68,6 +75,7 @@ public struct ObservatorySnapshot: Sendable, Equatable {
 
     /// Elapsed seconds are stored, never derived from the wall clock.
     public var elapsedLabel: String {
+        // elapsedLabel 由 RunPresentation 的存储秒数派生，页面不会自行计算当前 elapsed。
         PpmFormatter.elapsed(seconds: run.elapsedSeconds)
     }
 }

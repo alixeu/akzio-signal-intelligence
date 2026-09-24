@@ -1,8 +1,13 @@
 //! Typed DecisionGate.
 //!
-//! The model produces only a schema-bounded `DecisionDraft`. Rust reloads the
-//! persisted manifest closure, binds the draft to the run, and atomically
-//! commits the resulting `DecisionContext` and `Decision`.
+//! The research Synthesizer submits a bounded proposal payload; Rust reloads
+//! its persisted manifest closure and commits the resulting Decision artifacts.
+
+// 文件导读：DecisionGate 是研究提案进入正式 Decision 的 Rust 权威层。它重新读取并校验
+// proposal、ContextManifest、Claim/Critique、Evidence 和学习引用的完整 CAS 闭包，检查
+// 研究证据、终稿 Review、horizon 冲突、校准资格与风险模型，再分别保留 research_plan
+// 的 raw/validated 建议和执行 target。没有 active/完整校准时目标会 fail closed 为零，
+// 但研究分配/阻断状态仍保留；这里既不检查实时账户，也不创建 ExecutionPlan、Commitment 或订单。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -81,12 +86,8 @@ pub struct DecisionGateOutput {
     pub decision: Artifact,
 }
 
-/// Rust-owned conversion from schema-bounded forecasts to execution exposure.
-///
-/// The synthesizer may now supply a separately audited research composition,
-/// but this policy remains the authority for calibrated execution-side target
-/// weights. A research recommendation can therefore survive when this policy
-/// is not execution-capable.
+/// 校准查找的模型版本与 regime 键；`Ord` 派生供有序集合确定性比较，
+/// 不表示此 scope 已激活或已具备足够样本。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ForecastCalibrationScope {
     pub model_id: String,
@@ -96,6 +97,7 @@ pub struct ForecastCalibrationScope {
 
 impl ForecastCalibrationScope {
     fn validate(&self) -> Result<(), DomainError> {
+        // 模型身份和 regime 是校准查找键，空值会使同一份 bins 无法证明适用范围。
         if self.model_id.trim().is_empty() || self.regime.trim().is_empty() {
             return Err(DomainError::InvalidBudget {
                 field: "forecast_calibration.scope",
@@ -129,6 +131,8 @@ pub struct FrozenForecastCalibration {
 
 impl FrozenForecastCalibration {
     fn validate(&self) -> Result<(), DomainError> {
+        // 先校验冻结时间/样本与 bin 范围，再检查 0..=1_000_000 的连续覆盖和样本守恒；
+        // 这样 calibrated 只会从一个封闭、可追溯的概率区间取值。
         self.scope.validate()?;
         if self.sample_count == 0
             || self.mean_brier_score_ppm > WeightPpm::SCALE
@@ -140,6 +144,8 @@ impl FrozenForecastCalibration {
             });
         }
 
+        // `next_lower` 强制 bins 无重叠、无空洞且从 0 开始；`total_samples` 累加后还要
+        // 与冻结对象的总样本数完全一致，不能用不完整区间推断未观察概率。
         let mut next_lower = 0_u32;
         let mut total_samples = 0_u64;
         for bin in &self.bins {
@@ -167,6 +173,9 @@ impl FrozenForecastCalibration {
     }
 
     fn calibrated(&self, raw_probability_ppm: u32) -> Option<(u32, i64, u32)> {
+        // 用区间迭代器查找原始概率所属 bin，并返回校准概率、alpha 和该 bin 样本数；找不到
+        // 时保持 None，调用方会把资产排除而不是猜测邻近 bin。
+        // `find` 的闭包只借用每个 bin；`map` 再复制三个整数返回，不把 bin 的所有权交给调用方。
         self.bins
             .iter()
             .find(|bin| {
@@ -198,6 +207,8 @@ pub struct AssetRiskCalibration {
 
 impl AssetRiskCalibration {
     fn validate(&self) -> Result<(), DomainError> {
+        // 整数 ppm 字段约束波动率、beta、尾部损失、权重上限和杠杆衰减的范围；
+        // 对要求正值的指标拒绝零，此处没有浮点 NaN/无穷判断。
         if self.brier_score_ppm > WeightPpm::SCALE
             || self.annualized_volatility_ppm == 0
             || self.annualized_volatility_ppm > 3 * WeightPpm::SCALE
@@ -219,8 +230,8 @@ impl AssetRiskCalibration {
     }
 }
 
-/// Immutable, point-in-time portfolio-risk snapshot. Covariance entries use
-/// ppm-squared units and must be symmetric for every calibrated asset pair.
+/// 策略中携带的风险模型值；冻结性需由外层 SQL/CAS 身份保证，本结构字段本身可构造。
+/// 协方差以 ppm 平方计，`validate` 核对每个已校准资产对的对称性。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortfolioRiskModel {
     pub version: String,
@@ -236,6 +247,8 @@ impl PortfolioRiskModel {
         &self,
         calibrations: &BTreeMap<Asset, AssetRiskCalibration>,
     ) -> Result<(), DomainError> {
+        // 对每个已校准资产对逐格检查 covariance 对称性、幅度上限和对角线正值；没有资产
+        // 校准时保留默认空模型，等待明确 Policy 安装，而不是自动生成风险数据。
         if calibrations.is_empty() {
             return Ok(());
         }
@@ -251,6 +264,8 @@ impl PortfolioRiskModel {
                 field: "portfolio_risk_model",
             });
         }
+        // 对全体校准资产做笛卡尔积，正反两个位置都必须存在且相等；对角协方差还必须
+        // 为正，单侧/缺格矩阵不能通过。
         for (left, left_calibration) in calibrations {
             for (right, right_calibration) in calibrations {
                 let covariance = self
@@ -285,11 +300,15 @@ impl PortfolioRiskModel {
     }
 
     fn identity_hash(&self) -> Result<akzio_domain::ContentHash, DomainError> {
+        // 风险矩阵序列化后的内容 hash 被写入 PortfolioRiskAssessment，绑定本次 Decision 的
+        // 风险计算版本。
         let value = serde_json::to_value(self).map_err(|_| DomainError::InvalidContentHash)?;
         akzio_domain::content_hash_json(&value).map_err(|_| DomainError::InvalidContentHash)
     }
 }
 
+/// Rust 拥有的预测校准与执行目标转换策略；模型研究分配可单独保留，
+/// `decision_capable` 只检查校准面是否齐备，不授予 Execution/Paper 权限。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecisionPolicy {
     pub min_confidence_ppm: u32,
@@ -314,6 +333,10 @@ impl DecisionPolicy {
     /// This is a readiness predicate, not a guarantee that a particular
     /// forecast will pass evidence, confidence, edge, or risk gates.
     pub fn decision_capable(&self) -> bool {
+        // 这是 readiness 谓词：要求四资产、三 horizon 的校准与风险矩阵齐备；它不替代
+        // 某次 forecast 的证据、置信度、alpha 或执行 Gate 检查。
+        // 没有 active scope 时立即返回 false；每个 `let-else` 同样把缺资产或缺 horizon
+        // 校准解释为不具备资格，而不是默认概率或默认风险值。
         let Some(scope) = &self.active_forecast_calibration else {
             return false;
         };
@@ -333,6 +356,8 @@ impl DecisionPolicy {
                 return false;
             }
             for horizon in DecisionHorizon::ALL {
+                // `iter().find` 只借出匹配记录；判断的是校准面完整度，不代表当前预测通过
+                // 方向、证据、置信度或 alpha 门槛。
                 let Some(forecast) = self.forecast_calibrations.iter().find(|value| {
                     &value.scope == scope
                         && value.asset == asset
@@ -351,6 +376,10 @@ impl DecisionPolicy {
     }
 
     pub fn validate(&self) -> Result<(), DomainError> {
+        // 先检查全局预算/horizon 权重守恒，再检查每个 calibration key 唯一、资产风险和
+        // covariance；默认 policy 因缺校准而合法但不具备 decision_capable 资格。
+        // horizon 权重和用 `try_fold` 做 checked_add；溢出得到 None，与总和不等于
+        // 1_000_000 一样进入配置错误分支。
         if self.min_confidence_ppm > WeightPpm::SCALE
             || self.max_gross_weight.0 > WeightPpm::SCALE
             || self.maximum_execution_delay_ms == 0
@@ -387,6 +416,7 @@ impl DecisionPolicy {
         if let Some(scope) = &self.active_forecast_calibration {
             scope.validate()?;
         }
+        // BTreeSet 只用于检查 (scope, asset, horizon) 的唯一键，不重排或修改原 calibration Vec。
         let mut calibration_keys = BTreeSet::new();
         for calibration in &self.forecast_calibrations {
             calibration.validate()?;
@@ -401,6 +431,8 @@ impl DecisionPolicy {
             }
         }
 
+        // `try_for_each` 对每项风险校准执行同一验证，任一 DomainError 由 `?` 传播；
+        // 随后的单独循环施加 TQQQ/SOXL 才允许非零 daily reset decay 的资产规则。
         self.asset_calibrations
             .values()
             .try_for_each(AssetRiskCalibration::validate)?;
@@ -425,6 +457,7 @@ impl DecisionPolicy {
     }
 
     pub fn policy_hash(&self) -> Result<akzio_domain::ContentHash, DomainError> {
+        // 校验通过后才对完整策略做内容寻址，供 DecisionContext 和 ExecutionPlan 绑定。
         self.validate()?;
         content_hash_json(&serde_json::to_value(self).map_err(|_| DomainError::InvalidContentHash)?)
             .map_err(|_| DomainError::InvalidContentHash)
@@ -437,6 +470,8 @@ impl DecisionPolicy {
     ) -> Option<(u32, i64)> {
         // Neutral is an explicit abstention emitted by research. It is not a
         // probability sample that the allocation policy may reinterpret.
+        // 中性 forecast 是研究方主动弃权，返回 None；后续 Option `?` 表示缺 active scope、
+        // 匹配校准或合格 bin 时也拒绝给该预测补造值。
         if forecast.is_neutral() {
             return None;
         }
@@ -446,6 +481,7 @@ impl DecisionPolicy {
                 && calibration.asset == forecast.asset
                 && calibration.horizon == forecast.horizon
         })?;
+        // 按 point-in-time 规则排除决策时刻之后才冻结的数据，并同时检查样本数与 Brier 上限。
         if calibration.frozen_at > decision_at
             || calibration.sample_count < self.min_calibration_samples
             || calibration.mean_brier_score_ppm > self.max_brier_score_ppm
@@ -464,6 +500,7 @@ impl DecisionPolicy {
         confidence_ppm: u32,
         forecasts: &[Forecast],
     ) -> Result<TargetPortfolio, DomainError> {
+        // 仅返回 target 的便捷入口；风险评估仍由统一 traced 路径计算，避免两个入口漂移。
         self.target_with_risk(decision_at, confidence_ppm, forecasts)
             .map(|(target, _)| target)
     }
@@ -474,6 +511,7 @@ impl DecisionPolicy {
         confidence_ppm: u32,
         forecasts: &[Forecast],
     ) -> Result<(TargetPortfolio, PortfolioRiskAssessment), DomainError> {
+        // 丢弃 trace 的兼容入口；target 与 risk 必须来自同一批校准和裁剪结果。
         self.target_with_risk_traced(decision_at, confidence_ppm, forecasts)
             .map(|(target, risk, _)| (target, risk))
     }
@@ -491,6 +529,11 @@ impl DecisionPolicy {
         ),
         DomainError,
     > {
+        // 按置信度→horizon conflict→资产校准/方向→波动率、beta、流动性和 gross cap 的顺序
+        // 计算目标，并把每个首个归零原因写入 trace。中性 forecast 是显式 abstention，不能
+        // 被正向校准 bin 重新解释为可执行多头；所有权重最终仍以整数 ppm 守恒。
+        // `forecasts` 是只读切片，返回的 target/risk/trace 是本函数新建的值；这里的
+        // `?` 表示无效 policy 或 horizon 结构错误会返回 DomainError，而低资格是合法零目标。
         self.validate()?;
         let mut trace = DecisionEvaluationTrace {
             version: 1,
@@ -500,6 +543,7 @@ impl DecisionPolicy {
             return Err(DomainError::InvalidDecisionConfidence);
         }
         if confidence_ppm < self.min_confidence_ppm {
+            // 此分支先于 forecast 校准和资产遍历，故低置信度时 trace 只记录首个全局归零原因。
             trace.first_zeroing_branch = Some("decision.confidence.minimum".to_owned());
             trace.rules.push(rule(
                 "decision.confidence.minimum",
@@ -520,6 +564,7 @@ impl DecisionPolicy {
         }
 
         let horizon_trace = self.horizon_trace(decision_at, forecasts)?;
+        // 冲突只按资产去重成集合；每个冲突的更细 horizon 信息仍保留在 horizon_trace 中。
         let conflicted_assets = horizon_trace
             .conflicts
             .iter()
@@ -527,6 +572,8 @@ impl DecisionPolicy {
             .collect::<BTreeSet<_>>();
         let mut eligible = BTreeMap::new();
         for asset in Asset::EXECUTABLE {
+            // 冲突、缺资产风险校准或校准质量不足都会 `continue` 到下一个资产；
+            // 这些是逐资产拒绝，不会让其他资产的有效信号一起失败。
             if conflicted_assets.contains(&asset) {
                 trace_asset_exclusion(&mut trace, asset, "decision.horizon.conflict");
                 continue;
@@ -549,6 +596,8 @@ impl DecisionPolicy {
                 .iter()
                 .any(|forecast| forecast.asset == asset && forecast.is_neutral());
             let mut calibration_complete = true;
+            // 过滤器只借用当前 forecast，并保留该资产的非中性 horizon；对日重置资产，
+            // 超过风险模型持有天数的预测被排除。进入 for 后才逐个计算校准值。
             for forecast in forecasts.iter().filter(|forecast| {
                 forecast.asset == asset
                     && !forecast.is_neutral()
@@ -560,6 +609,8 @@ impl DecisionPolicy {
                 let Some((calibrated_probability, calibrated_expected_alpha)) =
                     self.calibrated_forecast(decision_at, forecast)
                 else {
+                    // 只要参与计算的 horizon 缺校准，就将该资产视为不完整并停止该资产循环；
+                    // 不使用其余 horizon 的部分信号填补缺口。
                     calibration_complete = false;
                     trace_asset_exclusion(
                         &mut trace,
@@ -581,6 +632,8 @@ impl DecisionPolicy {
                 );
             }
             if included_weight_ppm > 0 {
+                // 可用 horizon 权重不足全量时按已包含权重归一化；若为零则保留 0，
+                // 后面的 saw_forecast/edge 门槛会排除资产。
                 probability_edge = probability_edge.saturating_mul(i128::from(WeightPpm::SCALE))
                     / included_weight_ppm;
                 expected_alpha = expected_alpha.saturating_mul(i128::from(WeightPpm::SCALE))
@@ -591,6 +644,8 @@ impl DecisionPolicy {
                 && probability_edge >= i128::from(self.min_probability_edge_ppm)
                 && expected_alpha > i128::from(calibration.daily_reset_decay_ppm)
             {
+                // signal_strength 组合概率优势与扣除杠杆日重置衰减后的 alpha，并裁剪到
+                // [0, 1_000_000]；成功后按资产保存借用的 calibration 和数值强度。
                 let signal_strength_ppm = probability_edge
                     .saturating_mul(2)
                     .saturating_add(
@@ -601,6 +656,8 @@ impl DecisionPolicy {
                     as u32;
                 eligible.insert(asset, (calibration, signal_strength_ppm));
             } else {
+                // 分支只选一个可审计首因，优先报告校准不全，再区分显式弃权、缺 forecast、
+                // 概率优势不足和 alpha 不足；不改变 forecast 自身数据。
                 let reason = if !calibration_complete {
                     "decision.forecast_calibration.incomplete"
                 } else if !saw_forecast {
@@ -618,6 +675,7 @@ impl DecisionPolicy {
             }
         }
         if eligible.is_empty() {
+            // 所有资产均被逐项排除时返回结构合法的零组合；这不是函数错误，也不代表订单清仓。
             trace.first_zeroing_branch = Some("decision.eligible_set.empty".to_owned());
             trace.rules.push(rule(
                 "decision.eligible_set.non_empty",
@@ -642,6 +700,8 @@ impl DecisionPolicy {
         let volatility_budget = u64::from(self.target_annualized_volatility_ppm);
         let beta_budget = u64::from(self.max_portfolio_beta_ppm);
         for (asset, (calibration, signal_strength_ppm)) in eligible {
+            // 三种硬上限先取最小值，再与流动性上限取最小，最后乘 signal strength；
+            // 记录 liquidity_binding_assets 仅表示流动性确实比其他上限更紧。
             let volatility_cap = volatility_budget.saturating_mul(u64::from(WeightPpm::SCALE))
                 / u64::from(calibration.annualized_volatility_ppm);
             let beta_cap = beta_budget.saturating_mul(u64::from(WeightPpm::SCALE))
@@ -661,6 +721,8 @@ impl DecisionPolicy {
         scale_target_to_limit(&mut target, gross, self.max_gross_weight.0)?;
 
         let first = self.assess_target(&target, liquidity_binding_assets.clone())?;
+        // 各项风险只有在测量值超过限制时才生成缩放比例；`filter_map` 丢弃 None，
+        // `min` 取最严格比例，无超限时默认 1_000_000，故不会扩大目标。
         let scale_numerator = [
             (
                 self.target_annualized_volatility_ppm,
@@ -685,6 +747,8 @@ impl DecisionPolicy {
         .min()
         .unwrap_or(u64::from(WeightPpm::SCALE));
         if scale_numerator < u64::from(WeightPpm::SCALE) {
+            // 对每个权重做同一整数比例缩放以保持组合相对结构；随后重新校验资产全集、
+            // 并用最终权重再次计算风险快照，而非沿用缩放前 assessment。
             for weight in target.weights.values_mut() {
                 weight.0 = (u64::from(weight.0).saturating_mul(scale_numerator)
                     / u64::from(WeightPpm::SCALE)) as u32;
@@ -693,6 +757,7 @@ impl DecisionPolicy {
         target.validate_universe()?;
         let assessment = self.assess_target(&target, liquidity_binding_assets)?;
         if target.weights.values().all(|weight| weight.0 == 0) {
+            // 数值缩放可能把小权重向下取整为零；trace 把这与早期资格排除分开记录。
             trace.first_zeroing_branch = Some("decision.post_scale.zero".to_owned());
             trace.rules.push(rule(
                 "decision.post_scale.non_zero",
@@ -714,6 +779,10 @@ impl DecisionPolicy {
         decision_at: DateTime<Utc>,
         forecasts: &[Forecast],
     ) -> Result<HorizonDecisionTrace, DomainError> {
+        // 为每个 forecast 记录方向与校准值，再按资产比较 T1/T3/T5 的相反信号；冲突资产的
+        // 所有 horizon 都从 target 排除，但 trace 保留冲突事实供 Decision 审计。
+        // 每个 forecast 由调用方共享借用；领域校验失败用 `?` 返回，而缺少 thesis 是结构错误，
+        // 不是可静默忽略的预测。无校准的非中性项仍会记录为 Uncalibrated。
         self.validate()?;
         let mut sleeves = Vec::with_capacity(forecasts.len());
         for forecast in forecasts {
@@ -721,9 +790,12 @@ impl DecisionPolicy {
             let thesis = forecast.thesis.clone().ok_or(DomainError::EmptyField {
                 field: "decision_policy.forecast_thesis",
             })?;
+            // `bool::then` 仅在非中性时调用闭包，避免为明确弃权预测查找校准；`flatten`
+            // 将 Option<Option<_>> 收成 Option，None 同时表达中性或无可用校准。
             let calibrated = (!forecast.is_neutral())
                 .then(|| self.calibrated_forecast(decision_at, forecast))
                 .flatten();
+            // 方向只由校准概率相对中点和 edge 门槛决定；中性与未校准分别保留独立枚举值。
             let direction = if forecast.is_neutral() {
                 HorizonSignalDirection::Neutral
             } else {
@@ -752,6 +824,8 @@ impl DecisionPolicy {
 
         let mut conflicts = Vec::new();
         for asset in Asset::EXECUTABLE {
+            // 只比较同一资产的 sleeves；`skip(index + 1)` 避免同一 pair 重复检查，
+            // 只有 Bullish/Bearish 相反方向才记录冲突，中性/未校准不构成冲突。
             let asset_sleeves = sleeves
                 .iter()
                 .filter(|sleeve| sleeve.asset == asset)
@@ -783,6 +857,8 @@ impl DecisionPolicy {
                 }
             }
         }
+        // 冲突按资产去重后，将该资产的所有 horizon 标记为不进入 target；sleeve 和冲突本身
+        // 仍留在返回 trace，后续 DecisionContext 可以完整审计原始方向。
         if !conflicts.is_empty() {
             let assets = conflicts
                 .iter()
@@ -802,6 +878,10 @@ impl DecisionPolicy {
         target: &TargetPortfolio,
         mut liquidity_binding_assets: Vec<Asset>,
     ) -> Result<PortfolioRiskAssessment, DomainError> {
+        // 用 ppm 权重和 covariance 计算组合方差，再聚合 beta/shortfall/gap，并保留流动性
+        // 绑定资产；这是事前风险快照，不是成交后 Outcome。
+        // 两层循环实现 wᵀΣw；零权重项跳过以免要求其无关协方差单元，非零项缺矩阵格会
+        // 返回 DomainError，而负方差也会在开方前拒绝。
         let mut variance = 0_i128;
         for left in Asset::EXECUTABLE {
             let left_weight = i128::from(target.weights[&left].0);
@@ -835,6 +915,8 @@ impl DecisionPolicy {
                 field: "portfolio_risk_model.variance",
             });
         }
+        // 这个闭包借用 target 与 self，并由传入的字段选择器汇总 beta/shortfall/gap；
+        // `try_fold` 遇到缺失的非零资产 calibration 时中止并保留 DomainError。
         let aggregate = |selector: fn(&AssetRiskCalibration) -> u32| {
             Asset::EXECUTABLE
                 .into_iter()
@@ -851,6 +933,7 @@ impl DecisionPolicy {
                     Ok::<_, DomainError>(sum.saturating_add(weight.saturating_mul(value)))
                 })
         };
+        // 汇总值除以 ppm scale 后窄化为 u32；超范围明确返回错误，不静默截断。
         let scaled = |value: u128| {
             u32::try_from(value / u128::from(WeightPpm::SCALE)).map_err(|_| {
                 DomainError::InvalidBudget {
@@ -858,6 +941,7 @@ impl DecisionPolicy {
                 }
             })
         };
+        // 风险计算可能从多处收集同一资产，排序并去重后再写入快照，确保审计值稳定。
         liquidity_binding_assets.sort();
         liquidity_binding_assets.dedup();
         Ok(PortfolioRiskAssessment {
@@ -882,6 +966,8 @@ impl DecisionPolicy {
 
 impl Default for DecisionPolicy {
     fn default() -> Self {
+        // 默认策略故意没有 active calibration 和资产风险面，因此可通过结构校验、
+        // 但 decision_capable 为 false；Decision 仍可保存研究建议，执行目标归零。
         Self {
             min_confidence_ppm: 250_000,
             max_gross_weight: WeightPpm(500_000),
@@ -917,10 +1003,12 @@ impl Default for DecisionPolicy {
 }
 
 fn is_daily_reset(asset: Asset) -> bool {
+    // 只有杠杆 ETF 需要用最大持有天数限制跨 horizon 复利/每日重置风险。
     matches!(asset, Asset::Tqqq | Asset::Soxl)
 }
 
 fn horizon_days(horizon: DecisionHorizon) -> u8 {
+    // 把三类研究 horizon 映射到 risk model 的交易日上限。
     match horizon {
         DecisionHorizon::T1 => 1,
         DecisionHorizon::T3 => 3,
@@ -929,6 +1017,7 @@ fn horizon_days(horizon: DecisionHorizon) -> u8 {
 }
 
 fn gross_weight_ppm(target: &TargetPortfolio) -> Result<u32, DomainError> {
+    // 以 checked fold 汇总总敞口，溢出按策略错误处理而不是饱和成合法值。
     target
         .weights
         .values()
@@ -943,6 +1032,7 @@ fn scale_target_to_limit(
     measured: u32,
     limit: u32,
 ) -> Result<(), DomainError> {
+    // 在整数 ppm 中按比例缩放全组合，保持各资产相对权重并把 gross exposure 压到上限。
     if measured <= limit || measured == 0 {
         return Ok(());
     }
@@ -958,6 +1048,7 @@ fn scale_target_to_limit(
 }
 
 fn integer_sqrt(value: u128) -> u128 {
+    // 用二分搜索计算整数平方根，避免组合风险报告引入浮点舍入或溢出。
     if value < 2 {
         return value;
     }
@@ -992,6 +1083,7 @@ fn rule(
     asset: Option<Asset>,
     horizon: Option<DecisionHorizon>,
 ) -> DecisionRuleEvaluation {
+    // 统一构造可审计 rule 记录；它只描述已发生的决策分支，不改变策略计算。
     DecisionRuleEvaluation {
         rule_id: rule_id.to_owned(),
         rule_version: "1".to_owned(),
@@ -1018,6 +1110,8 @@ fn rule(
 }
 
 fn trace_asset_exclusion(trace: &mut DecisionEvaluationTrace, asset: Asset, rule_id: &str) {
+    // 只记录每个资产的首个排除规则，并把短路事实写入 trace，便于区分缺校准、冲突和
+    // 后续风险缩放归零。
     trace
         .asset_first_exclusion
         .entry(asset)
@@ -1045,11 +1139,14 @@ include!("decision_gate/validate.rs");
 include!("decision_gate/commit.rs");
 include!("decision_gate/helpers.rs");
 
+// 仅在测试编译时启用：用本地构造的完整校准面验证 DecisionPolicy 的零目标、资格和弃权语义；
+// 测试数据不进入 Store，也不代表真实校准样本。
 #[cfg(test)]
 mod decision_trace_tests {
     use super::*;
 
     fn policy_with_positive_calibration_bin(now: DateTime<Utc>) -> DecisionPolicy {
+        // 测试构造一个完整但最小的正向校准面，用来验证中性 forecast 仍保持 abstention。
         let scope = ForecastCalibrationScope {
             model_id: "test-model".to_owned(),
             model_version_hash: ContentHash::of_bytes(b"test-model-version"),
@@ -1081,6 +1178,8 @@ mod decision_trace_tests {
             }
             covariance_ppm_squared.insert(left, row);
         }
+        // 外层 flat_map 消费资产数组并为每个资产构造 horizon 迭代器；内层 map 的 move
+        // 闭包持有当前 asset、时间值和这轮克隆的 scope，随后立即被 collect 消费。
         let forecast_calibrations = Asset::EXECUTABLE
             .into_iter()
             .flat_map(|asset| {
@@ -1139,6 +1238,9 @@ mod decision_trace_tests {
     }
 
     fn neutral_forecasts(valid_until: DateTime<Utc>) -> Vec<Forecast> {
+        // 为四资产三 horizon 生成显式中性 thesis，测试校准策略不会越权复活研究弃权。
+        // flat_map/map 延迟构造十二项 Forecast，最后由 collect 实际遍历；move 闭包复制
+        // 当前资产、horizon 和可复制时间值，不借用随后离开函数的局部变量。
         Asset::EXECUTABLE
             .into_iter()
             .flat_map(|asset| {
@@ -1162,6 +1264,7 @@ mod decision_trace_tests {
 
     #[test]
     fn confidence_below_min_records_first_zeroing_branch() {
+        // 置信度不足应在需要模型校准前直接记录全局归零原因。
         let policy = DecisionPolicy::default();
         let (target, risk, trace) = policy
             .target_with_risk_traced(Utc::now(), 0, &[])
@@ -1177,6 +1280,7 @@ mod decision_trace_tests {
 
     #[test]
     fn empty_eligible_set_records_a_distinct_zeroing_branch() {
+        // 没有任何资产通过实际资格筛选时，trace 必须区别于置信度分支。
         let policy = DecisionPolicy::default();
         let (target, _, trace) = policy
             .target_with_risk_traced(Utc::now(), 900_000, &[])
@@ -1194,6 +1298,7 @@ mod decision_trace_tests {
 
     #[test]
     fn default_policy_is_not_decision_capable() {
+        // 默认 fail-closed policy 可以产出合法零目标，但绝不能冒充可执行校准。
         let policy = DecisionPolicy::default();
         assert!(!policy.decision_capable());
         let now = Utc::now();
@@ -1211,6 +1316,7 @@ mod decision_trace_tests {
 
     #[test]
     fn neutral_forecast_is_not_resurrected_by_positive_calibration_bin() {
+        // 正向 calibration bin 不能覆盖研究层明确的中性 abstention。
         let now = Utc::now();
         let policy = policy_with_positive_calibration_bin(now);
         let forecasts = neutral_forecasts(now + chrono::Duration::days(1));

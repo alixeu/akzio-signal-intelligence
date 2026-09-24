@@ -1,4 +1,9 @@
+// 文件导读：Contract 安装记录不可变，catalogue head 只是当前选择的重建游标；
+// 初次安装、canonical bounded upgrade、candidate 安装和激活分别对应不同授权路径。
+// active_contract/contract_installation 是只读恢复口；三种 install 入口不可互换：
+// 初装建立首个 head，canonical upgrade 走 Rust 受限迁移，candidate install 只保存候选供后续 Policy transition。
 impl Store {
+    // 按 purpose 查 current catalogue head；没有安装 head 返回 None，有 hash 则复用 connection-scoped 解码。
     pub fn active_contract(
         &self,
         purpose: &ContractPurpose,
@@ -12,6 +17,7 @@ impl Store {
 
     /// Return an installed Contract, whether it is an active head or a bounded
     /// candidate awaiting Paper-backed promotion.
+    // 按不可变 contract_hash 查询安装表；是否 active 由 activated_at 呈现，候选也可成功返回。
     pub fn contract_installation(
         &self,
         contract_hash: &ContentHash,
@@ -21,8 +27,10 @@ impl Store {
     }
 
     /// Install the first Rust-defined active Contract for a purpose. A later
-    /// version must enter through `install_candidate_contract` and a canonical
-    /// policy transition; this prevents a restart from silently replacing it.
+    /// 后续版本须走显式受限 canonical upgrade，或先安装候选再由 canonical
+    /// PolicyTransition 激活；重启不会隐式替换当前 head。
+    // 首次安装须在事务内确认同 hash 幂等、contract_id+version 未占用且 purpose head 为空；
+    // Artifact、installation、activation 和 head 同事务提交，之后重读返回 StoredContract。
     pub fn install_active_contract(
         &self,
         contract: &AgentContract,
@@ -36,6 +44,7 @@ impl Store {
         if let Some(existing) =
             self.stored_contract_with_connection(&transaction, &contract.contract_hash)?
         {
+            // 已存在 hash 只接受完全相同且已激活的首装记录；不改写安装时间或追加重复 activation。
             if existing.contract != *contract || existing.activated_at.is_none() {
                 return Err(StoreError::ContractActivationConflict(
                     contract.purpose.clone(),
@@ -75,6 +84,8 @@ impl Store {
     /// Activate an explicitly versioned Rust canonical Contract upgrade without
     /// mutating the prior installation. Capability expansion remains forbidden,
     /// and the activation history records no learning PolicyTransition.
+    // 输入 expected active hash 与新 Contract；在 Immediate 事务复核 active head 和 bounded capability，
+    // 保留旧安装行并追加一条无 PolicyTransition 的 activation。
     pub fn install_canonical_contract_upgrade(
         &self,
         active_contract_hash: &ContentHash,
@@ -130,6 +141,8 @@ impl Store {
     }
 
     /// Retirement is read-only: unfinished work and live leases require an explicit operator resolution.
+    // 用 now 查 queued/leased/running 或 lease_until>now 的 Task，只对 legacy workflow 收集 blocker 文本；
+    // 返回 Ok 只表示扫描时没有 blocker，不会停止 worker、释放 lease 或迁移 Store。
     pub fn check_legacy_workflow_retirement(&self, now: DateTime<Utc>) -> StoreResult<()> {
         let connection = self.connection()?;
         let mut statement = connection.prepare("SELECT DISTINCT run_id FROM rebuild_tasks WHERE status IN ('queued','leased','running') OR lease_until > ?1")?;
@@ -144,11 +157,13 @@ impl Store {
         if blockers.is_empty() { Ok(()) } else { Err(StoreError::DebugControl(format!("legacy_workflow_retired: upgrade blocked: {}",blockers.join(", ")))) }
     }
 
+    // 复用同连接 helper 做旧 Workflow retirement 检查；不修改 Run/Task。
     pub fn assert_workflow_executable(&self, run: &RunId) -> StoreResult<()> {
         assert_workflow_executable(&*self.connection()?, run)
     }
 
     /// Read-only release preflight, before any catalogue head is changed.
+    // 对候选 Contract 做领域校验并只读检查 active hash、版本身份、能力上限和 unfinished-work blockers。
     pub fn check_canonical_contract_upgrade(
         &self,
         active_contract_hash: &ContentHash,
@@ -165,6 +180,8 @@ impl Store {
         active_contract_hash: &ContentHash,
         contract: &AgentContract,
     ) -> StoreResult<()> {
+        // active hash 必须仍是 purpose 当前 head；要求相同 contract_id/purpose、更高 version，
+        // capability 不扩张且旧 Contract 没有未完成 Task/未提交 Paper session。
         let active = self
             .stored_contract_with_connection(connection, active_contract_hash)?
             .ok_or_else(|| StoreError::MissingContractInstallation(active_contract_hash.clone()))?;
@@ -200,6 +217,7 @@ impl Store {
     /// Persist a candidate relative to the current active Contract. This is an
     /// immutable install only: activation is coupled atomically to the
     /// candidate's canonical PolicyTransition in `record_policy_evaluation`.
+    // 只插入 canonical candidate Artifact/installation 并冻结 baseline hash；不追加 activation/history head。
     pub fn install_candidate_contract(
         &self,
         active_contract_hash: &ContentHash,
@@ -222,6 +240,7 @@ impl Store {
         if let Some(existing) =
             self.stored_contract_with_connection(&transaction, &candidate.contract_hash)?
         {
+            // 相同未激活 candidate 可幂等返回；任何 baseline/内容不同都冲突，不覆盖已有候选。
             if existing.contract == *candidate
                 && existing.baseline_contract_hash.as_ref() == Some(active_contract_hash)
                 && existing.activated_at.is_none()
@@ -249,6 +268,7 @@ impl Store {
     }
 
     /// Atomically publish bounded research inputs and a non-executing PositionPlan.
+    // 仅接受 PositionPlan purpose；setup Artifacts、workflow 图和 Run 事件在同一个 Immediate 事务提交。
     pub fn commit_position_plan(&self, workflow: &WorkflowCommit, setup: &[Artifact]) -> StoreResult<()> {
         if workflow.run.purpose != RunPurpose::PositionPlan { return Err(StoreError::PermitOriginMismatch); }
         self.validate_workflow_commit(workflow)?;
@@ -262,6 +282,7 @@ impl Store {
     }
 
     pub fn commit_workflow(&self, commit: &WorkflowCommit) -> StoreResult<()> {
+        // 通用图提交先事务外检查 retirement/graph payload，再只在一笔 Immediate 事务内写 workflow。
         self.validate_workflow_commit(commit)?;
 
         let mut connection = self.connection()?;
@@ -277,6 +298,8 @@ impl Store {
 /// Explicit release migration envelope. Candidate policy promotion continues
 /// to use the unchanged subset test. Keep the explicit v18 envelope readable
 /// for its historical activation records; v20 adds only the Outcome grant cap.
+// 这是历史 release migration 的窄兼容谓词：只认可固定版本对/输出上限和不扩张的 budgets/tools，
+// 再临时扩展旧 capability envelope 调用通用子集检查；纯内存计算，不写 Store。
 pub(super) fn canonical_context_repair_is_bounded(active: &AgentContract, next: &AgentContract) -> bool {
     if !matches!((next.version, next.prompt.version), (18, 13) | (20, 14))
         || active.version >= next.version

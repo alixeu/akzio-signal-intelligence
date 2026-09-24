@@ -1,0 +1,2360 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Akzio v2｜全流程 × DecisionPolicy：冷启动、校准与 Paper 边界",
+    "locale": "zh-CN",
+    "output": ".archify/akzio-process/akzio-complete-process.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/alixeu/akzio-signal-intelligence.git",
+      "provider": "github",
+      "link_mode": "local-only",
+      "revision": "e4292f09acf5b3798bf16de26718ceb85046a190"
+    },
+    "views": [
+      {
+        "id": "t0_research",
+        "label": "① T0 入口与研究",
+        "focus": [
+          "app",
+          "core",
+          "debug",
+          "http",
+          "scheduler",
+          "position_plan",
+          "paper_graph",
+          "providers",
+          "evidence",
+          "context",
+          "analyst",
+          "critic",
+          "supplement",
+          "synth",
+          "reviewer"
+        ],
+        "note": "真实 Session 和资料门；研究提案／精确审查都不授予 Paper 写入。"
+      },
+      {
+        "id": "cold_outcome",
+        "label": "② 冷启动与历史 Outcome",
+        "focus": [
+          "policy_snapshot",
+          "default_policy",
+          "reviewer",
+          "decision",
+          "position_end",
+          "execution",
+          "no_order",
+          "evaluate",
+          "outcome_worker",
+          "truth_labels"
+        ],
+        "note": "无 active 时正式目标归零；canonical NoOrder 仍可能排期，四资产共同 Session 的旧 Run 独立评估。"
+      },
+      {
+        "id": "policy_production",
+        "label": "③ SQL 校准与激活",
+        "focus": [
+          "outcome_worker",
+          "truth_labels",
+          "store",
+          "readiness",
+          "operator_limits",
+          "collect",
+          "dataset",
+          "bins",
+          "risk_fit",
+          "candidate_policy",
+          "insufficient",
+          "activation",
+          "active_head"
+        ],
+        "note": "readiness→显式限制→真实标签 collect→12×10 bin＋风险→候选→复核／显式激活。"
+      },
+      {
+        "id": "new_t0_target",
+        "label": "④ 下一次 T0 仓位",
+        "focus": [
+          "active_head",
+          "policy_snapshot",
+          "synth",
+          "reviewer",
+          "bin_lookup",
+          "conflict",
+          "horizon_signal",
+          "risk_cap",
+          "decision",
+          "execution",
+          "no_order"
+        ],
+        "note": "运行进程的 Policy 快照＋新 Forecast：精确 bin→冲突→E/A 信号→风险裁剪；目标不是订单。"
+      },
+      {
+        "id": "paper_observation",
+        "label": "⑤ Paper、学习与观测",
+        "focus": [
+          "decision",
+          "execution",
+          "no_order",
+          "commitment",
+          "dispatch",
+          "paper_api",
+          "reconcile",
+          "evaluate",
+          "outcome_worker",
+          "metrics",
+          "lessons",
+          "shadow",
+          "store",
+          "observatory"
+        ],
+        "note": "Accepted、Commitment、Broker 回执／成交、对账、Outcome、学习是彼此不同的事实。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "app",
+      "type": "frontend",
+      "label": "App / CLI",
+      "sublabel": "入口与展示；不是授权者",
+      "pos": [
+        20,
+        185
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "apps/Sources/ObservatoryKit/App/RunStatusBar.swift",
+          "label": "Native Run 入口"
+        },
+        {
+          "path": "crates/akzio-cli/src/cli/run_commands.rs",
+          "label": "CLI serve"
+        }
+      ]
+    },
+    {
+      "id": "core",
+      "type": "backend",
+      "label": "Core 控制面",
+      "sublabel": "Rust 编图、许可、状态与调度",
+      "pos": [
+        320,
+        185
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-daemon/src/orchestration/bootstrap.rs",
+          "label": "生产装配"
+        },
+        {
+          "path": "crates/akzio-daemon/src/dispatch.rs",
+          "label": "任务分派"
+        }
+      ]
+    },
+    {
+      "id": "debug",
+      "type": "security",
+      "label": "隔离 Debug Core",
+      "sublabel": "独立 Store；Broker 默认 Forbidden",
+      "pos": [
+        20,
+        25
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-daemon/src/debug.rs",
+          "label": "隔离实验"
+        },
+        {
+          "path": "crates/akzio-store/src/store/debug.rs",
+          "label": "Broker 写边界"
+        }
+      ],
+      "tag": "非正式样本"
+    },
+    {
+      "id": "http",
+      "type": "security",
+      "label": "HTTP 日常入口",
+      "sublabel": "认证后仅 PositionPlan / Paper",
+      "pos": [
+        320,
+        390
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-daemon/src/http_launch.rs",
+          "label": "POST /runs"
+        },
+        {
+          "path": "crates/akzio-daemon/src/http_launch.rs",
+          "label": "Paper 手动请求经 Scheduler"
+        }
+      ],
+      "tag": "RunId ≠ 完成"
+    },
+    {
+      "id": "scheduler",
+      "type": "backend",
+      "label": "Paper Scheduler",
+      "sublabel": "真实 Session、唯一 slot、lease",
+      "pos": [
+        625,
+        185
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-daemon/src/scheduler/scheduler_tick.rs",
+          "label": "tick 前置"
+        },
+        {
+          "path": "crates/akzio-daemon/src/scheduler/scheduler_tick.rs",
+          "label": "预约图"
+        }
+      ]
+    },
+    {
+      "id": "position_plan",
+      "type": "backend",
+      "label": "PositionPlan 图",
+      "sublabel": "34 研究 Need；Decision 后止",
+      "pos": [
+        625,
+        390
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-runtime/src/runtime/compilation/evidence.rs",
+          "label": "purpose 截止"
+        },
+        {
+          "path": "crates/akzio-daemon/src/http_launch.rs",
+          "label": "正式入口"
+        }
+      ],
+      "tag": "不占 Paper slot"
+    },
+    {
+      "id": "paper_graph",
+      "type": "backend",
+      "label": "正式 Paper 图",
+      "sublabel": "40 Need；含执行和 Evaluate",
+      "pos": [
+        930,
+        185
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-runtime/src/runtime/workflow.rs",
+          "label": "冻结研究骨架"
+        },
+        {
+          "path": "crates/akzio-runtime/src/runtime/compilation/evidence.rs",
+          "label": "终端依赖"
+        }
+      ]
+    },
+    {
+      "id": "providers",
+      "type": "external",
+      "label": "受控资料源",
+      "sublabel": "Alpaca / FRED / 官方 / News",
+      "pos": [
+        625,
+        555
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-daemon/src/orchestration/bootstrap.rs",
+          "label": "Adapter 注册"
+        },
+        {
+          "path": "crates/akzio-ingest/src/news.rs",
+          "label": "News 路由"
+        },
+        {
+          "path": "crates/akzio-ingest/src/paper_session.rs",
+          "label": "Paper 市场读取"
+        }
+      ]
+    },
+    {
+      "id": "evidence",
+      "type": "backend",
+      "label": "EvidenceGate",
+      "sublabel": "Need → Raw → Normalized / 状态",
+      "pos": [
+        930,
+        390
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-domain/src/workflow.rs",
+          "label": "基础 Need"
+        },
+        {
+          "path": "crates/akzio-domain/src/instrument_evidence.rs",
+          "label": "扩展 Need"
+        },
+        {
+          "path": "crates/akzio-daemon/src/evidence.rs",
+          "label": "采集与刷新"
+        }
+      ]
+    },
+    {
+      "id": "context",
+      "type": "security",
+      "label": "ContextBroker",
+      "sublabel": "Manifest → ReadGrant → 投影",
+      "pos": [
+        930,
+        700
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-context/src/context_broker/manifest.rs",
+          "label": "授予与重验"
+        },
+        {
+          "path": "crates/akzio-context/src/context_broker/manifest.rs",
+          "label": "选择预算"
+        },
+        {
+          "path": "crates/akzio-context/src/context_broker/materialization.rs",
+          "label": "模型投影"
+        }
+      ]
+    },
+    {
+      "id": "analyst",
+      "type": "backend",
+      "label": "Analyst ×3",
+      "sublabel": "T1 / T3 / T5；各交一 Claim",
+      "pos": [
+        625,
+        700
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-runtime/src/runtime/workflow.rs",
+          "label": "三期限 Analyst"
+        },
+        {
+          "path": "crates/akzio-research/src/agent/runtime_run.rs",
+          "label": "模型上下文"
+        }
+      ]
+    },
+    {
+      "id": "critic",
+      "type": "backend",
+      "label": "Critic ×3",
+      "sublabel": "对应 Claim 的证据核验与缺口",
+      "pos": [
+        320,
+        700
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-runtime/src/runtime/workflow.rs",
+          "label": "对应期限依赖"
+        },
+        {
+          "path": "crates/akzio-domain/src/research.rs",
+          "label": "Claim / Critique 结构"
+        }
+      ]
+    },
+    {
+      "id": "supplement",
+      "type": "backend",
+      "label": "共享补采",
+      "sublabel": "单轮；最多 8 个去重资源",
+      "pos": [
+        320,
+        865
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-runtime/src/runtime/workflow.rs",
+          "label": "预建补采/重跑"
+        },
+        {
+          "path": "crates/akzio-daemon/src/application/research_supplement.rs",
+          "label": "审计与新事实"
+        }
+      ]
+    },
+    {
+      "id": "synth",
+      "type": "backend",
+      "label": "Synthesizer",
+      "sublabel": "12 forecasts + 四资产 / 现金",
+      "pos": [
+        20,
+        700
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-runtime/src/runtime/workflow.rs",
+          "label": "提案修订图"
+        },
+        {
+          "path": "crates/akzio-domain/src/research_review.rs",
+          "label": "数值依据范围"
+        }
+      ]
+    },
+    {
+      "id": "reviewer",
+      "type": "security",
+      "label": "ProposalReviewer",
+      "sublabel": "只审精确 Proposal；不授交易权",
+      "pos": [
+        20,
+        970
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-domain/src/research_review.rs",
+          "label": "审查语义"
+        },
+        {
+          "path": "crates/akzio-runtime/src/runtime/workflow.rs",
+          "label": "修订依赖"
+        }
+      ]
+    },
+    {
+      "id": "decision",
+      "type": "security",
+      "label": "DecisionGate",
+      "sublabel": "Rust 产正式 target / Context",
+      "pos": [
+        320,
+        1330
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-execution/src/decision_gate/decide.rs",
+          "label": "前置校验"
+        },
+        {
+          "path": "crates/akzio-execution/src/decision_gate/decide.rs",
+          "label": "正式产物"
+        }
+      ]
+    },
+    {
+      "id": "position_end",
+      "type": "backend",
+      "label": "研究到此结束",
+      "sublabel": "PositionPlan：无执行和 Outcome",
+      "pos": [
+        20,
+        1490
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-runtime/src/runtime/compilation/evidence.rs",
+          "label": "PositionPlan return"
+        }
+      ]
+    },
+    {
+      "id": "execution",
+      "type": "security",
+      "label": "ExecutionGate",
+      "sublabel": "fresh snapshots + approval + 风控",
+      "pos": [
+        625,
+        1330
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-execution/src/execution_gate/core.rs",
+          "label": "前置与 allocation"
+        },
+        {
+          "path": "crates/akzio-execution/src/execution_gate/core.rs",
+          "label": "Verdict 提交"
+        }
+      ]
+    },
+    {
+      "id": "no_order",
+      "type": "backend",
+      "label": "NoOrder",
+      "sublabel": "持久业务结果；后续节点短路",
+      "pos": [
+        625,
+        1490
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-domain/src/execution/effects.rs",
+          "label": "类型化 verdict"
+        },
+        {
+          "path": "crates/akzio-daemon/src/application/paper_execution.rs",
+          "label": "两节点短路"
+        }
+      ]
+    },
+    {
+      "id": "commitment",
+      "type": "database",
+      "label": "PaperCommit",
+      "sublabel": "Accepted 落库；NoOrder NoOutput",
+      "pos": [
+        930,
+        1330
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-daemon/src/application/paper_execution.rs",
+          "label": "Accepted 才承诺"
+        },
+        {
+          "path": "crates/akzio-store/src/store/execution.rs",
+          "label": "原子持久化"
+        }
+      ]
+    },
+    {
+      "id": "dispatch",
+      "type": "security",
+      "label": "Paper Dispatch",
+      "sublabel": "effect intent → 同 ID 查单 / 发单",
+      "pos": [
+        930,
+        1490
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-execution/src/paper_dispatch.rs",
+          "label": "请求前意图"
+        },
+        {
+          "path": "crates/akzio-execution/src/paper/execute.rs",
+          "label": "先查再 POST"
+        }
+      ]
+    },
+    {
+      "id": "paper_api",
+      "type": "external",
+      "label": "Alpaca Paper API",
+      "sublabel": "唯一模拟交易端点；没有 Live",
+      "pos": [
+        930,
+        1660
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-execution/src/paper.rs",
+          "label": "端点硬拒绝"
+        },
+        {
+          "path": "crates/akzio-execution/src/paper/transport.rs",
+          "label": "HTTP 写与回执"
+        }
+      ]
+    },
+    {
+      "id": "reconcile",
+      "type": "backend",
+      "label": "Reconcile",
+      "sublabel": "Accepted 对账；NoOrder NoOutput",
+      "pos": [
+        625,
+        1660
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-daemon/src/application/paper_execution.rs",
+          "label": "延期/完成"
+        },
+        {
+          "path": "crates/akzio-execution/src/reconciliation.rs",
+          "label": "完整闭包"
+        },
+        {
+          "path": "crates/akzio-store/src/store/execution.rs",
+          "label": "终态原子提交"
+        }
+      ]
+    },
+    {
+      "id": "evaluate",
+      "type": "backend",
+      "label": "Evaluate",
+      "sublabel": "两类血缘 → OutcomeSchedule",
+      "pos": [
+        320,
+        1660
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-daemon/src/application/outcome_sealing.rs",
+          "label": "排期入口"
+        },
+        {
+          "path": "crates/akzio-learning/src/outcome_schedule.rs",
+          "label": "冻结日与入队"
+        }
+      ]
+    },
+    {
+      "id": "outcome_worker",
+      "type": "backend",
+      "label": "Outcome Worker",
+      "sublabel": "T+1 / T+3 / T+5 交易 Session",
+      "pos": [
+        320,
+        1850
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-daemon/src/outcome/worker.rs",
+          "label": "post-terminal worker"
+        },
+        {
+          "path": "crates/akzio-learning/src/evaluation.rs",
+          "label": "数量 / 现金路径"
+        },
+        {
+          "path": "crates/akzio-store/src/store/learning/outcome.rs",
+          "label": "数值封存"
+        }
+      ]
+    },
+    {
+      "id": "metrics",
+      "type": "backend",
+      "label": "Rust 指标",
+      "sublabel": "预测、benchmark、风险真值",
+      "pos": [
+        20,
+        1850
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-learning/src/metrics.rs",
+          "label": "预测 score"
+        },
+        {
+          "path": "crates/akzio-learning/src/metrics.rs",
+          "label": "路径指标"
+        }
+      ]
+    },
+    {
+      "id": "lessons",
+      "type": "backend",
+      "label": "Lesson / Experience",
+      "sublabel": "治理候选、隔离资格与复核",
+      "pos": [
+        20,
+        2020
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-domain/src/lesson.rs",
+          "label": "使用治理"
+        },
+        {
+          "path": "crates/akzio-context/src/context_broker/manifest.rs",
+          "label": "受控召回"
+        },
+        {
+          "path": "crates/akzio-context/src/context_broker/materialization.rs",
+          "label": "实际投影边界"
+        }
+      ]
+    },
+    {
+      "id": "shadow",
+      "type": "backend",
+      "label": "Canary Shadow ×3",
+      "sublabel": "候选对照；非候选真实成交",
+      "pos": [
+        625,
+        1850
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-learning/src/campaign.rs",
+          "label": "三主题九组报告"
+        },
+        {
+          "path": "crates/akzio-learning/src/campaign.rs",
+          "label": "样本门槛"
+        }
+      ]
+    },
+    {
+      "id": "store",
+      "type": "database",
+      "label": "V2Store / CAS",
+      "sublabel": "唯一持久化权威；任务与副作用",
+      "pos": [
+        625,
+        2020
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-store/src/store/blob.rs",
+          "label": "TEMP staging"
+        },
+        {
+          "path": "crates/akzio-store/src/store/workflow/commits.rs",
+          "label": "Claim 事务"
+        },
+        {
+          "path": "crates/akzio-store/src/store/execution.rs",
+          "label": "执行承诺"
+        }
+      ]
+    },
+    {
+      "id": "observatory",
+      "type": "frontend",
+      "label": "Observatory",
+      "sublabel": "Store/Observer 有界只读投影",
+      "pos": [
+        930,
+        2020
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-daemon/src/observer.rs",
+          "label": "Available / Pending / Unavailable"
+        },
+        {
+          "path": "apps/Sources/ObservatoryKit/LiveData/ObserverClient.swift",
+          "label": "Snapshot / Journal"
+        },
+        {
+          "path": "apps/Sources/ObservatoryKit/LiveData/LivePortfolioProjection.swift",
+          "label": "UI 状态映射"
+        }
+      ]
+    },
+    {
+      "id": "policy_snapshot",
+      "type": "backend",
+      "label": "Policy 启动快照",
+      "sublabel": "SQL active 或 Default；非热更新",
+      "pos": [
+        320,
+        970
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-store/src/store/decision_policy.rs",
+          "label": "只读 active"
+        },
+        {
+          "path": "crates/akzio-cli/src/cli/run_commands.rs",
+          "label": "启动拷贝"
+        },
+        {
+          "path": "crates/akzio-daemon/src/orchestration/bootstrap.rs",
+          "label": "Runtime 构造"
+        }
+      ]
+    },
+    {
+      "id": "default_policy",
+      "type": "security",
+      "label": "缺 head：Default",
+      "sublabel": "结构合法、正式目标归零",
+      "pos": [
+        320,
+        1130
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-execution/src/decision_gate.rs",
+          "label": "默认 Policy"
+        },
+        {
+          "path": "crates/akzio-execution/src/decision_gate.rs",
+          "label": "能力谓词"
+        }
+      ]
+    },
+    {
+      "id": "bin_lookup",
+      "type": "backend",
+      "label": "逐格校准",
+      "sublabel": "Decision 内用已审 12 预测",
+      "pos": [
+        625,
+        970
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-execution/src/decision_gate.rs",
+          "label": "精确校准"
+        },
+        {
+          "path": "crates/akzio-execution/src/decision_gate.rs",
+          "label": "sleeve 记录"
+        }
+      ]
+    },
+    {
+      "id": "conflict",
+      "type": "security",
+      "label": "期限方向冲突",
+      "sublabel": "相反→资产排除＋全局 blocker",
+      "pos": [
+        930,
+        970
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-execution/src/decision_gate.rs",
+          "label": "冲突判定"
+        },
+        {
+          "path": "crates/akzio-execution/src/decision_gate/decide.rs",
+          "label": "全局 blocker"
+        }
+      ]
+    },
+    {
+      "id": "horizon_signal",
+      "type": "backend",
+      "label": "E / A 三期限信号",
+      "sublabel": "杠杆持有期过滤；整数权重",
+      "pos": [
+        930,
+        1130
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-execution/src/decision_gate.rs",
+          "label": "参与/归一/信号"
+        },
+        {
+          "path": "crates/akzio-execution/src/decision_gate.rs",
+          "label": "杠杆期限"
+        }
+      ]
+    },
+    {
+      "id": "risk_cap",
+      "type": "security",
+      "label": "资产／组合裁剪",
+      "sublabel": "vol、beta、ES、gap、gross",
+      "pos": [
+        625,
+        1130
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-execution/src/decision_gate.rs",
+          "label": "限额与缩放"
+        },
+        {
+          "path": "crates/akzio-execution/src/decision_gate.rs",
+          "label": "风险快照"
+        }
+      ]
+    },
+    {
+      "id": "truth_labels",
+      "type": "backend",
+      "label": "12 个真实价格标签",
+      "sublabel": "四资产×T1/T3/T5；非成交收益",
+      "pos": [
+        320,
+        2210
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-cli/src/cli/calibration.rs",
+          "label": "预测标签"
+        },
+        {
+          "path": "crates/akzio-cli/src/cli/calibration.rs",
+          "label": "价格收益"
+        }
+      ]
+    },
+    {
+      "id": "readiness",
+      "type": "backend",
+      "label": "Readiness（只读）",
+      "sublabel": "Store 资格、成熟数与缺口",
+      "pos": [
+        625,
+        2210
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-cli/src/cli/calibration.rs",
+          "label": "只读缺口"
+        },
+        {
+          "path": "crates/akzio-cli/src/cli/calibration.rs",
+          "label": "Run 分类"
+        }
+      ]
+    },
+    {
+      "id": "operator_limits",
+      "type": "security",
+      "label": "14 项显式风险限制",
+      "sublabel": "operator 定值，不是训练结果",
+      "pos": [
+        930,
+        2210
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-execution/src/calibration.rs",
+          "label": "14项与校验"
+        },
+        {
+          "path": "crates/akzio-cli/src/cli/calibration.rs",
+          "label": "SQL 保存"
+        }
+      ]
+    },
+    {
+      "id": "collect",
+      "type": "backend",
+      "label": "Collect",
+      "sublabel": "筛 canonical Outcome／身份／窗口",
+      "pos": [
+        930,
+        2410
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-cli/src/cli/calibration.rs",
+          "label": "前置筛选"
+        },
+        {
+          "path": "crates/akzio-cli/src/cli/calibration.rs",
+          "label": "预测历史组"
+        },
+        {
+          "path": "crates/akzio-cli/src/cli/calibration.rs",
+          "label": "样本/持久化"
+        }
+      ]
+    },
+    {
+      "id": "dataset",
+      "type": "database",
+      "label": "SQL CalibrationDataset",
+      "sublabel": "12 槽＋共同日期价格面",
+      "pos": [
+        625,
+        2410
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-cli/src/cli/calibration.rs",
+          "label": "Dataset Artifact"
+        },
+        {
+          "path": "crates/akzio-execution/src/calibration.rs",
+          "label": "输入结构"
+        }
+      ]
+    },
+    {
+      "id": "bins",
+      "type": "backend",
+      "label": "12 面 × 10 bins",
+      "sublabel": "raw p → 正例率／收益均值",
+      "pos": [
+        320,
+        2630
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-execution/src/calibration.rs",
+          "label": "概率校准"
+        },
+        {
+          "path": "crates/akzio-execution/src/decision_gate.rs",
+          "label": "冻结 bin"
+        }
+      ]
+    },
+    {
+      "id": "risk_fit",
+      "type": "backend",
+      "label": "四资产风险模型",
+      "sublabel": "共同日收益、QQQ beta／协方差",
+      "pos": [
+        930,
+        2630
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-execution/src/calibration.rs",
+          "label": "风险拟合"
+        },
+        {
+          "path": "crates/akzio-execution/src/calibration.rs",
+          "label": "共同价格面"
+        }
+      ]
+    },
+    {
+      "id": "candidate_policy",
+      "type": "database",
+      "label": "候选 DecisionPolicy",
+      "sublabel": "同一对象：12 校准＋4 风险",
+      "pos": [
+        625,
+        2850
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-execution/src/calibration.rs",
+          "label": "离线候选"
+        },
+        {
+          "path": "crates/akzio-cli/src/cli/calibration.rs",
+          "label": "build 非激活"
+        }
+      ]
+    },
+    {
+      "id": "insufficient",
+      "type": "security",
+      "label": "不可激活候选",
+      "sublabel": "结构 valid 不等于 capable",
+      "pos": [
+        320,
+        2850
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-execution/src/decision_gate.rs",
+          "label": "valid/capable 分别判断"
+        },
+        {
+          "path": "crates/akzio-cli/src/cli/identity.rs",
+          "label": "拒绝 incapable"
+        }
+      ]
+    },
+    {
+      "id": "activation",
+      "type": "security",
+      "label": "Inspect／Validate／Activate",
+      "sublabel": "复核模型、Contract、capable",
+      "pos": [
+        930,
+        2850
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-cli/src/cli/calibration.rs",
+          "label": "身份/Contract"
+        },
+        {
+          "path": "crates/akzio-cli/src/cli/identity.rs",
+          "label": "能力复核"
+        }
+      ]
+    },
+    {
+      "id": "active_head",
+      "type": "database",
+      "label": "SQL active head",
+      "sublabel": "单例 head＋激活历史",
+      "pos": [
+        930,
+        3070
+      ],
+      "size": [
+        205,
+        72
+      ],
+      "sources": [
+        {
+          "path": "crates/akzio-store/src/store/decision_policy.rs",
+          "label": "历史与 head"
+        },
+        {
+          "path": "crates/akzio-cli/src/cli/identity.rs",
+          "label": "只取 active"
+        }
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "app-core",
+      "from": "app",
+      "to": "core",
+      "label": "受控连接",
+      "variant": "emphasis"
+    },
+    {
+      "id": "app-debug",
+      "from": "app",
+      "to": "debug",
+      "label": "另连隔离 Core",
+      "variant": "dashed"
+    },
+    {
+      "id": "core-http",
+      "from": "core",
+      "to": "http",
+      "label": "认证入口",
+      "variant": "security"
+    },
+    {
+      "id": "core-scheduler",
+      "from": "core",
+      "to": "scheduler",
+      "label": "自动 / 手动 tick"
+    },
+    {
+      "id": "http-position",
+      "from": "http",
+      "to": "position_plan",
+      "label": "正式请求"
+    },
+    {
+      "id": "http-paper-tick",
+      "from": "http",
+      "to": "scheduler",
+      "label": "手动 Paper → tick",
+      "variant": "dashed"
+    },
+    {
+      "id": "scheduler-paper",
+      "from": "scheduler",
+      "to": "paper_graph",
+      "label": "唯一 session slot",
+      "variant": "emphasis"
+    },
+    {
+      "id": "position-evidence",
+      "from": "position_plan",
+      "to": "evidence",
+      "label": "34 项研究 Need",
+      "variant": "dashed"
+    },
+    {
+      "id": "paper-evidence",
+      "from": "paper_graph",
+      "to": "evidence",
+      "label": "40 项 Need",
+      "variant": "emphasis"
+    },
+    {
+      "id": "providers-evidence",
+      "from": "providers",
+      "to": "evidence",
+      "label": "有界采集",
+      "variant": "dashed"
+    },
+    {
+      "id": "evidence-context",
+      "from": "evidence",
+      "to": "context",
+      "label": "规范化＋状态"
+    },
+    {
+      "id": "context-analyst",
+      "from": "context",
+      "to": "analyst",
+      "label": "受权投影",
+      "variant": "security"
+    },
+    {
+      "id": "analyst-critic",
+      "from": "analyst",
+      "to": "critic",
+      "label": "逐期限 Claim"
+    },
+    {
+      "id": "critic-synth",
+      "from": "critic",
+      "to": "synth",
+      "label": "有效研究闭包"
+    },
+    {
+      "id": "critic-supplement",
+      "from": "critic",
+      "to": "supplement",
+      "label": "有缺口时",
+      "variant": "dashed"
+    },
+    {
+      "id": "supplement-synth",
+      "from": "supplement",
+      "to": "synth",
+      "label": "新增合格事实 / 跳过",
+      "variant": "dashed"
+    },
+    {
+      "id": "synth-reviewer",
+      "from": "synth",
+      "to": "reviewer",
+      "label": "精确提案"
+    },
+    {
+      "id": "reviewer-decision",
+      "from": "reviewer",
+      "to": "decision",
+      "label": "已审提案／12 预测",
+      "variant": "security"
+    },
+    {
+      "id": "decision-position-end",
+      "from": "decision",
+      "to": "position_end",
+      "label": "PositionPlan 止步",
+      "variant": "dashed"
+    },
+    {
+      "id": "decision-execution",
+      "from": "decision",
+      "to": "execution",
+      "label": "仅 Paper 进入",
+      "variant": "emphasis"
+    },
+    {
+      "id": "execution-noorder",
+      "from": "execution",
+      "to": "no_order",
+      "label": "业务阻断",
+      "variant": "dashed"
+    },
+    {
+      "id": "noorder-commit-nooutput",
+      "from": "no_order",
+      "to": "commitment",
+      "label": "NoOutput",
+      "variant": "dashed"
+    },
+    {
+      "id": "execution-commit",
+      "from": "execution",
+      "to": "commitment",
+      "label": "Accepted＋闭包",
+      "variant": "security"
+    },
+    {
+      "id": "commit-dispatch",
+      "from": "commitment",
+      "to": "dispatch",
+      "label": "订单写入前已持久化",
+      "variant": "security"
+    },
+    {
+      "id": "commit-reconcile-nooutput",
+      "from": "commitment",
+      "to": "reconcile",
+      "label": "NoOrder：NoOutput",
+      "variant": "dashed",
+      "fromSide": "left",
+      "toSide": "right"
+    },
+    {
+      "id": "dispatch-paper",
+      "from": "dispatch",
+      "to": "paper_api",
+      "label": "仅合法窗口可 POST",
+      "variant": "security"
+    },
+    {
+      "id": "dispatch-reconcile",
+      "from": "dispatch",
+      "to": "reconcile",
+      "label": "回执与恢复"
+    },
+    {
+      "id": "paper-reconcile",
+      "from": "paper_api",
+      "to": "reconcile",
+      "label": "查单 / 状态",
+      "variant": "dashed"
+    },
+    {
+      "id": "reconcile-evaluate",
+      "from": "reconcile",
+      "to": "evaluate",
+      "label": "完成／短路",
+      "variant": "emphasis"
+    },
+    {
+      "id": "evaluate-outcome",
+      "from": "evaluate",
+      "to": "outcome_worker",
+      "label": "排期，不是即时结果"
+    },
+    {
+      "id": "outcome-metrics",
+      "from": "outcome_worker",
+      "to": "metrics",
+      "label": "数值与真值"
+    },
+    {
+      "id": "metrics-lessons",
+      "from": "metrics",
+      "to": "lessons",
+      "label": "有资格才学习",
+      "variant": "dashed"
+    },
+    {
+      "id": "outcome-shadow",
+      "from": "outcome_worker",
+      "to": "shadow",
+      "label": "父结果后配对比较",
+      "variant": "dashed"
+    },
+    {
+      "id": "outcome-store",
+      "from": "outcome_worker",
+      "to": "store",
+      "label": "耐久进度 / 封存"
+    },
+    {
+      "id": "store-observatory",
+      "from": "store",
+      "to": "observatory",
+      "label": "有界读投影",
+      "variant": "dashed"
+    },
+    {
+      "id": "outcome-labels",
+      "from": "outcome_worker",
+      "to": "truth_labels",
+      "label": "T5 sealed 后才够完整",
+      "variant": "dashed"
+    },
+    {
+      "id": "store-readiness",
+      "from": "store",
+      "to": "readiness",
+      "label": "只读历史",
+      "variant": "dashed"
+    },
+    {
+      "id": "labels-readiness",
+      "from": "truth_labels",
+      "to": "readiness",
+      "label": "真实成熟度"
+    },
+    {
+      "id": "readiness-limits",
+      "from": "readiness",
+      "to": "operator_limits",
+      "label": "看到缺口后显式设限",
+      "variant": "dashed"
+    },
+    {
+      "id": "limits-collect",
+      "from": "operator_limits",
+      "to": "collect",
+      "label": "风险 Artifact ID"
+    },
+    {
+      "id": "collect-dataset",
+      "from": "collect",
+      "to": "dataset",
+      "label": "合格才保存"
+    },
+    {
+      "id": "dataset-bins",
+      "from": "dataset",
+      "to": "bins",
+      "label": "12 个槽位"
+    },
+    {
+      "id": "dataset-risk",
+      "from": "dataset",
+      "to": "risk_fit",
+      "label": "共同价格面"
+    },
+    {
+      "id": "bins-candidate",
+      "from": "bins",
+      "to": "candidate_policy",
+      "label": "冻结校准"
+    },
+    {
+      "id": "risk-candidate",
+      "from": "risk_fit",
+      "to": "candidate_policy",
+      "label": "风险矩阵"
+    },
+    {
+      "id": "candidate-insufficient",
+      "from": "candidate_policy",
+      "to": "insufficient",
+      "label": "不具备资格",
+      "variant": "dashed"
+    },
+    {
+      "id": "candidate-activate",
+      "from": "candidate_policy",
+      "to": "activation",
+      "label": "capable＋显式操作"
+    },
+    {
+      "id": "activation-head",
+      "from": "activation",
+      "to": "active_head",
+      "label": "安装并切 head"
+    },
+    {
+      "id": "head-next-start",
+      "from": "active_head",
+      "to": "policy_snapshot",
+      "label": "下一次 Core 启动读",
+      "variant": "dashed",
+      "fromSide": "right",
+      "toSide": "top",
+      "via": [
+        [
+          1148,
+          3106
+        ],
+        [
+          1148,
+          950
+        ],
+        [
+          422.5,
+          950
+        ]
+      ]
+    },
+    {
+      "id": "snapshot-default",
+      "from": "policy_snapshot",
+      "to": "default_policy",
+      "label": "缺 active head",
+      "variant": "dashed"
+    },
+    {
+      "id": "snapshot-bins",
+      "from": "policy_snapshot",
+      "to": "bin_lookup",
+      "label": "active 的冻结校准"
+    },
+    {
+      "id": "bins-conflict",
+      "from": "bin_lookup",
+      "to": "conflict",
+      "label": "逐期限方向"
+    },
+    {
+      "id": "conflict-signal",
+      "from": "conflict",
+      "to": "horizon_signal",
+      "label": "无冲突才合成"
+    },
+    {
+      "id": "signal-caps",
+      "from": "horizon_signal",
+      "to": "risk_cap",
+      "label": "E／A／signal"
+    },
+    {
+      "id": "caps-decision",
+      "from": "risk_cap",
+      "to": "decision",
+      "label": "整数正式目标"
+    },
+    {
+      "id": "default-decision",
+      "from": "default_policy",
+      "to": "decision",
+      "label": "零正式目标",
+      "variant": "dashed"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "00｜如何阅读这份离线可观测地图",
+      "items": [
+        "这是 2026-09-29 的 Akzio v2 合并源码图：同一 HTML 用五个视图和说明卡解释 T0 全链、历史 Outcome、SQL DecisionPolicy 及下一次 T0 仓位；可搜索节点、检查箭头和固定源码引用。",
+        "箭头表示固定提交定义的控制／数据依赖或有条件的下一阶段，不表示某个真实 Run 已到达；虚线标示手动触发、NoOrder 节点短路、归零分支或后续启动读 head，不代表直接绕过冻结依赖。",
+        "所有源码链接锚定提交 e4292f09acf5b3798bf16de26718ceb85046a190，采用 local-only；当前工作树有大量未提交改动，图不声称代表这些修改、已启动 Core 或实时 Store。",
+        "长报告：docs/reports/Akzio-v2-complete-process-2026-09-29.md 与 docs/reports/08-decisionpolicy-t1-t3-t5.md；前者还读了未提交工作树，与本图的提交证据范围不同。",
+        "未启动 Core、模型、Broker 或 Outcome；未打开 canonical／Debug Store、凭据或账户；无真实 Policy 样本、订单提交／成交或跨日验收声明。"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "01｜绝对业务边界与五个独立结论",
+      "items": [
+        "仅维护 v2、Alpaca Paper；可执行资产仅 TQQQ、QQQ、SOXX、SOXL；非 Paper endpoint 在 HTTP I/O 前拒绝，Live Trading 不实现。",
+        "研究 Proposal、正式 Decision target、ExecutionVerdict、Paper order submitted/accepted、实际 filled、Outcome 是六层不同事实；订单 accepted 不等于成交。",
+        "Rust 是 Contract、预算、授权、状态、目标、Gate 和执行策略权威；模型是受限研究单位；V2Store 是唯一持久化权威。",
+        "run purpose、RunControl 暂停/单步、Debug Broker 写策略、Paper 审批、Store 的学习/校准资格彼此独立；Paper purpose 或成功 HTTP 不能替代其他维度。",
+        "NoOrder 可是完整 T0 Paper 流程的合法业务结果，并能继续产生 OutcomeSchedule；PositionPlan 即使有 Decision 也没有执行/Outcome 图节点。"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "02｜App、CLI、Core：谁执行、谁只是展示",
+      "items": [
+        "macOS RunStatusBar 传递 purpose 与 Run 动作，Core 未就绪先启动/验证；状态随后从 Observer 刷新，不由 Swift 决策或下单。",
+        "认证的手动 Paper POST /runs 不在 HTTP handler 下单，而是调用同一 Paper Scheduler.tick 取得真实 Session slot；auto_paper 周期触发与手动入口是不同触发方式。固定提交见 http_launch.rs 的 Paper 分支。",
+        "正式 POST /runs 先验本地认证和 native-client 头，拒绝浏览器来源与隔离 Debug Core；PositionPlan 提交正式图，Paper 调用受控 scheduler tick；2xx 只返回 RunId。",
+        "serve 读取配置、SQL active DecisionPolicy 和 token，模型 route capability probe 可能产生启动期 provider 请求，再装配 Store/Contract/Workflow/Agent/Decision/Execution/Evidence/WorkerPool。",
+        "auto_paper 只有显式启用才轮询，生产轮询默认 30 秒；手动 Paper 请求不代表 auto_paper 已开启，且仍依赖真实 session 与原审批。",
+        "CLI 生产未设 worker_count 用 4；WorkerPoolConfig::default 自身为 2；Task/PaperScheduler lease 默认 30 秒、心跳/恢复约 10 秒。这是不同层的默认。"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "03｜三种活动图、冻结拓扑与节点数",
+      "items": [
+        "Rust 预建三组 Analyst→Critic（T1/T3/T5）、一轮共享 supplement、三组可跳过 refined Analyst→Critic，以及 revision 0..N 的 Synthesizer→ProposalReviewer 对；默认最多两次业务修订 N=2。",
+        "研究节点数 15+2N；PositionPlan 加 Evidence/Decision 为 17+2N＝21；Paper 再加四个执行终端节点为 21+2N＝25；当前 Shadow 为 20+2N＝24。图存在不等于每节点都调用模型。",
+        "EvidenceGate 聚合 Need；Decision 等研究有效叶节点。PositionPlan 在 Decision 后 return；Paper 才串联 ExecutionGate→PaperCommit→Reconcile→Evaluate；Shadow 有执行评估对照但无 PaperCommit。",
+        "每节点冻结 NodeSpec.key/horizon/round/revision、recipe、Contract hash、依赖、预算、retry、on_failure；objective 是说明文字而非权限。无模型动态增生任务或旧 Planner fallback。",
+        "编译器拒绝非法 terminal gate、重复/环/缺依赖、越界图、研究绕过 EvidenceGate、PositionPlan 混执行和非 Paper 的 PaperCommit；旧历史图只读适配不回写 CAS。"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "04｜Worker 领取、延期、失败与下游读取",
+      "items": [
+        "Task claim 是 SQL 事务：queued 且 ready_at≤now、依赖 succeeded/skipped、RunControl/隔离身份/workload 合法；排序 ready_at ASC→priority DESC→task_id ASC。",
+        "领取生成 AttemptId、LeaseId 和新 epoch；handler、心跳/取消监视和 Attempt timeout 并行；写时重验 permit 与 daemon fencing，旧 worker 不能继续提交。",
+        "EvidenceGate 六项执行 Need 在研究阶段记 deferred_to_execution；研究项可并发采集并留下 available/unavailable 及部分成功。门面任务 Succeeded 不等于全部来源已有合格事实。",
+        "NoOutput 是成功但不制造 Artifact；Committed 表示专门事务已提交须核对；Skipped 沿祖先保留来源；DeferredUntil 重新排队不吃失败预算；Retry/Failed/Cancelled 各有不同语义。",
+        "下游只沿依赖 DAG 读取 succeeded Attempt 的正式 attempt_outputs；skipped 继续沿祖先。阶段证据、未完成/失败 Attempt 的材料不是合法正式输入。",
+        "FailRun/FailTask/SkipTask 是不同传播策略；post-terminal Outcome 失败不倒改已结束 T0。Reconcile 默认一次 Attempt，崩溃恢复不保证自动再调度。"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "05｜CAS、事务、Checkpoint、Replay",
+      "items": [
+        "BlobRef.hash 是逻辑未压缩字节 SHA-256；ArtifactId 还绑定 kind、producer、lifecycle、origin、source_refs、时间等元数据，相同正文不等于同一业务 Artifact。",
+        "stage_json/stage_bytes 先入连接私有 TEMP；Artifact 事务 promotion 后才 durable。成功 Attempt 的 Artifact、血缘、journal cursor、attempt_outputs 和任务终态同事务提交；中途阶段写入不自动宣称成功。",
+        "Store 保存 runs/tasks/attempts/dependencies/events、daemon leases/session slots、RunControl、审批消费、Commitment/Effect/Receipt、Contract/Policy heads、Lesson/Canary 等；不是旁路 JSON/日志第二权威。",
+        "Checkpoint 冻结 Run/graph/event cursor/control revision/身份/边界来源，支持重启一致性检查，但不序列化 await Future 或给 Broker exactly-once 保证。Replay 重读事件而非重跑模型/订单；Doctor 查结构/血缘，不证明预测正确。",
+        "Store 18；open_existing 只读且要求 schema 精确；可写 open/迁移要检查活动任务和 lease，不静默改旧 CAS、Commitment 或 Contract。"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "06｜40 / 34 项 Need：计数与日期变量",
+      "items": [
+        "以冻结 Session S 为基准：B=S−400自然日；N=S−14日；M=S−366日；V=S−1日；O=S+120日；C=S+45日。Need 去重按完整 schema/source/resource/max_age，不按被多少 registry requirement 引用计数。",
+        "Paper：6 个 ExecutionSafety + 34 个 DirectionalResearch＝40；PositionPlan 仅 34。基础 17＝6 执行+4日线+4新闻+3宏观，registry 再加 24 唯一项、与 paper.quotes 重合 1 项 →40。",
+        "下列四张卡按业务分组列完整模板；源码实际 BTreeSet 排序，不意味着此处编号是采集顺序。PositionPlan 去掉六项执行 Need，不等于其研究适配器从不访问 Alpaca 只读 clock/quote。",
+        "Need 的 max_age 只是采集要求；可用状态、内容事实资格、独立来源验证、Context 被选中/可读和 Execution 快照年龄是五个不同门。"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "07｜Need #1–#6：仅 Paper 执行安全",
+      "items": [
+        "#1 alpaca paper.account；#2 alpaca paper.positions；#3 alpaca paper.open_orders；#4 alpaca paper.fills:S；#5 alpaca paper.quotes；#6 alpaca paper.clock，六项均 max_age_secs=300。",
+        "paper.quotes 同时服务四个 LiquiditySpread requirement，但只有一个唯一 Need；ExecutionGate 时仍会重新采六项，形成 Account/Quote/Clock 三类 typed snapshot。",
+        "Research 的市场 capture 可能读取 clock/calendar/quote，却不因此把旧研究 Artifact 当成执行时最新快照。"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "08｜Need #7–#17：日线、近期新闻、FRED",
+      "items": [
+        "#7–#10 alpaca bars:{TQQQ,QQQ,SOXX,SOXL}:1d:B:252；每项 max_age_secs=604800。",
+        "#11–#14 news_web news:{TQQQ,QQQ,SOXX,SOXL}:N:S:market；每项 max_age_secs=604800。",
+        "#15–#17 fred series:{DFF,DFII10,VIXCLS}:M:S:V；每项 max_age_secs=604800；V 是前日 vintage，不是 T0 同日修订。"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "09｜Need #18–#31：官方资料与事件",
+      "items": [
+        "#18–#21 news_web research:etf_holdings:{TQQQ,QQQ,SOXX,SOXL}:S；#22–#25 research:index_metadata:{同四资产}:S；#26–#29 research:earnings_event_calendar:{同四资产}:S；以上均 max_age_secs=86400。",
+        "#30–#31 news_web research:leveraged_etf_terms:{TQQQ,SOXL}:S；max_age_secs=604800。",
+        "当前 official 适配器的 SOXL index_metadata 与 SOXL leveraged_etf_terms 返回 NotConfigured；registry 要求不是已经取得这些事实。"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "10｜Need #32–#40：行动、期权与发布日历",
+      "items": [
+        "#32–#35 alpaca corporate_actions:{TQQQ,QQQ,SOXX,SOXL}:M:S；max_age_secs=86400。",
+        "#36–#39 alpaca option_chain:{TQQQ,QQQ,SOXX,SOXL}:S:O；max_age_secs=300；Need 声明到 S+120，实际 capture 结束又被截到起点+30日。",
+        "#40 fred release_calendar:S:C:V；max_age_secs=86400；它是宏观未来发布计划，不是未来观测值。"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "11｜EvidenceGate：可用材料不是合格投资事实",
+      "items": [
+        "Rust 先约束 source/resource/日期/预算，再由对应 adapter 采 Raw、Normalize、逐项状态；EvidenceGate 可以记录部分成功、缺口、过期和 provider 错误，不把缺证据填成零。",
+        "available 表示有规范化材料，不保证包含合格事实；quality 字段不能越级当来源真值；observed_at / retrieved_at / available_at / decision cutoff 各有不同含义。",
+        "新闻 discovery 的 provider web action/citation 证明来源路由确实发生，不等于来源正文已独立下载核验；默认 ModelReviewed 后 source_verified 仍 false。",
+        "执行时六项 Need 重取；account/clock 缺失和结构/网络错误可 Err，只有明确坏 bid/ask 的 quote_error 可进入持久 InvalidQuote→NoOrder 处理。"
+      ]
+    },
+    {
+      "dot": "orange",
+      "title": "12｜News：三层来源身份与现实缺口",
+      "items": [
+        "近期 news 默认先 native web discovery，再独立模型 source review；最多选排序后 8 个 URL 进行 review，review 可分类 supported/contradicted/unverifiable/irrelevant。Prompt 的“最多三篇”不是 Rust 3 条硬上限。",
+        "必须有 completed web_search_call 与受控 hosted action；被审模型接受的事实进入 reviewed_facts，但默认始终 source_verified=false、verified_source_count=0、human_review=not_performed。",
+        "合法事实可与 validation_failures 并存；有可用事实时 status=model_reviewed，citations_complete 只说明存在可用引用，不证明报道真实、事实正确或收益方向。",
+        "仅显式 VerifiedSource 模式才 Rust 独立 fetch、限制正文≤2MiB 并逐字核对 16–4096 bytes 摘录；仍仅证明快照/引文闭包，不证明投资结论。",
+        "新研究协议中未 source_verified 的 news 仅可描述，assets=[]/domain=null，不得作为 directional supporting_ref；默认 news 补采的新描述性事实也不能自动当合格新事实重跑。"
+      ]
+    },
+    {
+      "dot": "orange",
+      "title": "13｜其他资料族：研究和真实时点",
+      "items": [
+        "日线最多取最近 252 根已完成 session，最近完成日需 close+20min≤cutoff；特征含1/3/5/20/60收益、波动、ATR、回撤等。252日收益需253根，因此固定252根时该字段为 None。",
+        "FRED DFF/DFII10/VIXCLS 请求 vintage=S−1；release_calendar 读[S,S+45]已公布计划后本地过滤，无分页完整性证明，也不能当未来宏观数值。",
+        "期权 contracts 与 snapshot 各至多4页×128、512合约；缺 quote 才分批补最多6次；IV/Greeks 无 provider 时间戳必须标 unknown，不拿抓取时刻充当。Need 的300s与诊断 stale 900s不是一回事。",
+        "官方 QQQ/TQQQ/SOXX/SOXL 持仓、指数身份和每日重置条款分别有来源解析；静态 registry 的3倍杠杆/指数注册不是外部当前条款事实；SOXL 两种资料仍 NotConfigured。"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "14｜Context：候选、Manifest、ReadGrant 不可混同",
+      "items": [
+        "assemble 只接受调用方明确候选和 Contract 允许的学习候选；检查 kind、source、producer、同 Run/受控跨 Run，隔离高风险金融内容和 instruction-like 字符串。quarantined 只留索引与原因，不进入 readable。",
+        "Critic/Synthesizer/Reviewer 的 Claim/Critique、grounds、proposal refs 等必需闭包逐项补齐；必需输入超预算报错。Analyst 的 balanced bundle 尽量覆盖而非强制四资产/全部新闻宏观。",
+        "Manifest 固化有序 selections、quarantine、总/投影字节、估算 token、Contract/input hash；随后才 mint 与 Run/Task/Attempt/lease/epoch/Contract/expiry 绑定的内存 ReadGrant。每次读重载并核 Manifest，不因同 Store 存在就允许读取。",
+        "研究无 RawEvidence、任意文件、SQL、联网、交易或任意工具；库中 read_raw 接口存在不等于活动 Contract 授权。普通 Analyst/Critic/Synth/Reviewer 只见授权投影与一次 submit_result。"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "15｜Context 容量、投影与 read-tool 精度",
+      "items": [
+        "所有活动角色最多24顶层件；Analyst/Critic/Reviewer/Outcome 投影≤128KiB、source≤512KiB；Synthesizer 投影≤192KiB、source≤768KiB。单件估算 token≈ceil(bytes/4)，不是 provider tokenizer；总请求另受 TaskBudget。",
+        "Normalized 通用投影只给精简元数据/quality/features/摘要，bars 等通常只保留末5行并显示 original_count；holdings 最多按发行人权重取前12；超过600字符的长字符串明确截断，数字不改。",
+        "期权语义投影汇总已采链并显式缺项和两个非代表样例；预算里的小投影不授权读取原始 full chain。可选资料跳过不等于来源不存在，collection status 的 available 也不是 ReadGrant。",
+        "Outcome 保留五类受限只读工具：read_document、read_range（≤32KiB/UTF-8边界）、search_context（≤16命中）、read_claim_evidence、compare_sources（2–4条）；研究角色新协议 read_tools=[]。"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "16｜冻结 Contract、模型路由与有效预算",
+      "items": [
+        "当前 active research Contract 69 / PromptBundle 38；freshness candidate 70 不自动激活。Outcome 有独立 63 / 35 协议；历史 Contract 按冻结安装版本读取，不用今天版本回写。",
+        "治理/角色 Prompt 由 include_str! 编译并 stage 至 Contract CAS，运行时读安装 Blob；模型 route 是配置选择而非角色名硬编码。正式 ProposalReviewer 映射 critic route，不应以文档目标模型表冒充当前进程实际 route。",
+        "Contract 内角色预算与新 Run 的 resolved TaskBudget 是两层：研究 Contract 基线 input 48k、wall120s；新 Run 默认有效累计 input/output 各1M、Attempt wall180s；Outcome Contract 12k/4k/180s，新 Run input1M/output4k/180s。实际 provider cap、成本和配置覆盖仍可再收紧。",
+        "累计 input/output 横跨 provider retries、schema/deliberation repair 和 Retry/Recovery；新修订节点各有自己的冻结预算。read-tool 次数 unlimited 不新增研究读工具，也不取消墙钟/token边界。"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "17｜单次结构化提交：Provider strict ≠ Rust 合格",
+      "items": [
+        "活动 Analyst/Critic/Synthesizer/Reviewer 经受控投影构建单次 structured request，终端 RequiredFunction(\"submit_result\")；模型返回不直接写成 Decision 或订单。",
+        "Wire ArtifactRef 只传 artifact_id，Rust 从当前 Manifest 按允许 kind 回填；错误ID、重复、越权引用由本地 schema/闭包校验拒绝，不“自动修复证据”。",
+        "Provider strict schema 被适配器移除了部分数值/长度/数组数等限制，因此 strict=true 不能替代 Rust 的 bound schema、role validator、ground/cutoff/usage 校验。",
+        "重试、schema repair、只修 deliberation 的冻结结果修复、业务 proposal revision 是四种不同机会；用量超额 fail closed，不能凭模型“再说一次”放宽预算或改变旧事实。"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "18｜Analyst 与 Critic：单 Claim 的方向资格",
+      "items": [
+        "每个期限一位 Analyst 为四资产提出一个 Claim，显式 stance、grounds、Scoped EvidenceGap、confidence/uncertainty；不是每个资产一个自由 Agent。",
+        "Analyst 结构化 wire 有 1–12 个 grounds、最多2个 scoped gaps；中性且低 materiality 的 Critic 可能按受控规则 Skipped，不能将图节点等同每次真实模型调用。",
+        "Critic 只审本期限当前 Claim：Supported 要 supporting_refs 不空、无 conflicting_refs、当前权威核验且 blocker/gap 作用域合法；不能拼别的 Claim 或 Critic 新发现材料冒充 Analyst 正式 ground。",
+        "非中性预测须有同一 Claim、同一 Supported Critique，PriceMarketStructure 和 Macro 各自有同资产 Directional ground，并在同一 Critique 中精确核对证据/role/domain；只看“有新闻”不够。",
+        "current-authoritative 在代码中为 authority 非 Unrated 且 temporal_validity=ValidAtDecisionCutoff；这是枚举/时间资格，不是事实真伪、预测正确或 Paper 安全的证明。"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "19｜共享补采：有界且不移动旧 cutoff",
+      "items": [
+        "一轮 shared supplement 等待首轮全部 Analyst/Critic；模型只提 typed intent（news/price/macro、资产或宏观序列和目的），Rust 将之绑定到已冻结 Need/受支持序列，最多8个 distinct resources。",
+        "started 先持久化；done 可复用；started 后崩溃而无 done 标 unknown_after_crash，不在重启时无界重发，也不重置全 Run 预算。",
+        "补采按原 Normalized 的最早 decision_cutoff，只有 citations_complete、时间不晚于原 cutoff、同资源确有不同事实才准有效重跑；news 额外须 source_verified=true。",
+        "默认新闻 ModelReviewed 仍 source_verified=false，所以文字更新不自动成为 directional 新事实；无新合格事实时 refined 角色可明确跳过，不把旧 Claim 静默改写。"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "20｜Synthesizer 与终稿 Reviewer 的职责边界",
+      "items": [
+        "Synthesizer 恰好给四资产×T1/T3/T5＝12个 forecast，并给四资产+cash 权重和=1,000,000ppm的研究配置；17个 numeric_basis 分别覆盖12个 forecast、4个 allocation和cash。",
+        "numeric_basis 要输入、单位、方法、假设、不确定性；这是说明和引用闭包，不是代数证明、事实正确率、独立样本校准或交易授权。",
+        "ProposalReviewer 绑定精确 Proposal ArtifactRef+blob hash，核每预测/配置、证据/数值/不确定性/重叠/cash 理由；拒绝要结构化1–3 issues，接受项 issues为空。",
+        "最多两次业务修订；前一轮 Review 通过才选择有效版本，拒绝/重复拒绝/耗尽按受控停止处理。Reviewer 通过只准这个提案进入 DecisionGate，不批准 execution 或保证预测。",
+        "拒绝后的已通过 Forecast 与 numeric_basis 在修订中被 typed 锁住（Rust 绑定的时间字段例外），allocation/cash 不是同样锁定；下一轮仍完整审17项，连续相同拒绝条件可提前 research.revision.stop。"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "21｜Decision：先拒非法 Proposal，再独立产目标",
+      "items": [
+        "DecisionGate 验 task permit、Proposal origin/producer/Contract、唯一 Synth Manifest、精确 selected/quarantined/ancestor 闭包、12 slots、Claim/Critique 方向资格、17 numeric_basis 和当前版本终稿 Review。",
+        "非法 provenance、缺 slot、错 ground、未通过 Review 等返回 Err，尚未生成正式 Decision；不是写一个零 target 的成功 Decision。",
+        "研究 research_plan.raw/validated 独立保存：非零行需支持；validated 可滤期限并受 gross cap 裁剪；research status/ execution_status 只是研究与待执行提示，不是 ExecutionVerdict。",
+        "正式 targets 由 Rust DecisionPolicy 根据 forecasts、有效置信度、校准 bins、风险模型计算，函数不把 allocation 权重作为数值上限；研究非零可以 target 全零，显式 cash 也不能简单当作正式目标 veto。",
+        "Context 保留 blockers、冲突、provenance、policy/risk hash、eligibility/trace、validity；Decision.targets 与 Context.target 一致并原子提交；成功仍不等于执行放行。"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "22｜Execution 前重采：六项、三快照与市场时间",
+      "items": [
+        "ExecutionGate 时重新读取六项执行 Need，Raw→Normalized→Account/Quote/Clock typed snapshot；单项可持久化，不是六项一个事务。Account 取账户/持仓/挂单/fills最早观测时刻，Quote 对每订单再核真实 quote 时间。",
+        "默认 Account/Quote/Clock 最大年龄各5秒，未来 skew各15秒、三快照间最大差15秒；Research旧快照不能续命。bad quote 有受控 InvalidQuote 分支，账户/clock/完整性错误可能 Err。",
+        "按 America/New_York 与真实 calendar/DST 判断 Overnight、PreMarket、Regular、AfterHours、Closed；Overnight 前夜20:00起，使用 BOATS/overnight 且检查每个订单资产 active/tradable/overnight 资格，POST前重新查 Clock。",
+        "新鲜 Closed 且 Decision 仍有效时 Deferred；唤醒后重采所有快照、重跑 Gate，不直接复用旧交易授权。过期 Decision 不会补单。"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "23｜ExecutionGate：输入错误、业务阻断、Accepted",
+      "items": [
+        "先验 Decision/Context/provenance/purpose/时效；继承 hard_blockers 与冲突，复核该 Run 绑定的 approval、qualification、mandate、FreezeState，校验三快照、账户、报价、Session。坏 Artifact/闭包等返回 Err，不等于 NoOrder。",
+        "无前置 blocker 才计算 Allocation；之后仍验 factor/paired index、gross/turnover、Mandate、Capacity、Compliance、Dependency。后置失败可保留 Plan 供审计，但最终 NoOrder。",
+        "关键阻断族：StaleDecision、InvalidProvenance、MaterialConflict、NonCanonicalRun、UnqualifiedRuntime、Frozen、Missing/Stale Account/Quote/Clock、ExternalPosition、UnmanagedOpenOrder、MarketClosed、UnsupportedUniverse、NoExecutableOrder、Factor/Turnover/Capacity/Compliance/Dependency。",
+        "有 Buy 时 Capacity 要20日ADV/参与率/滑点估计；纯 Sell 不跳过合规和关键依赖；依赖涉及模型、新闻、市场、宏观、Broker、DNS、Clock、Storage、Identity、ComplianceData。IEX/indicative overnight 当前可被标 Degraded。",
+        "只有 blocker 全空且 ExecutionContext 的完整计划/快照/mandate/pretrade closure 有效才 Accepted；Accepted 是交易方案许可，不是 Commitment、HTTP accepted 或成交。"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "24｜Allocation：当前持仓差额，不是照抄研究仓位",
+      "items": [
+        "对每资产 target_value=floor(account.equity×Decision.target_ppm/1e6)，delta=target_value−current_position.market_value；零差额无单，delta正买负卖，先全部Sell再Buy，资产顺序固定。",
+        "买 limit=floor_to_cent(ask×1.001)，卖 limit=ceil_to_cent(bid×0.999)，仅 limit/day；bid/ask/spread（默认≤20bps）、quote时间和账户购买力逐项检。",
+        "买入总金额不超 min(approval.max_notional,buying_power)，缩放后不预借卖出所得；day turnover 算已有换手＋本次 buy/sell。冻结 Plan.target 是假设最终名义金额，不是真实持仓/NAV。",
+        "Wire qty=floor(notional/limit) 到六位小数；当前 Sell 生成未在同处用 position.quantity_micros 封顶，可能出现请求股数超过现有持仓的静态风险，未做 Broker 运行复现。",
+        "默认 $20,000 新增名义上限、gross 100%、allocation turnover100%，Gate/Mandate 有更紧上限；这些是源码默认，不是此机器实际审批/账户额度。"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "25｜原审批、Session 消费、冻结与身份",
+      "items": [
+        "approve_paper 要当前 RuntimeIdentity、资格链 replay/adversarial/execution_simulation/shadow/canary、零关键回归、真实账户ID/feed、操作员理由/期限/金额；从不以 research 或 App 按钮代替。",
+        "批准 session reservation 时就事务性消费 approval，按 approval_id 和 session_key 唯一；不是到 PaperCommit/POST 才消耗，后续 NoOrder 也不自动退回。",
+        "ExecutionGate 复查该 Run 的 binding、mandate 和资格窗；Commitment、Dispatch 还分别检查 lease、permit、FreezeState、policy hash、有效时段，但并非每个边界都重做全部启动 identity。",
+        "FreezeState 是 Store 历史最新值；写 freeze 不自动取消 Broker 已在途 HTTP；不能把冻结解读为撤销已经 accepted/filled 的订单。"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "26｜PaperCommit：先存承诺、再谈外部副作用",
+      "items": [
+        "NoOrder 在 PaperCommit 先 NoOutput，不取执行 lease、不造 Commitment；仅 Accepted 完整 closure 才重验 purpose/session/approval/plan hash/金额/冻结与 task/daemon fencing。",
+        "SQLite IMMEDIATE 事务把 Commitment Artifact、session slot、成功 Attempt output、ExecutionCommitted event 和 Task终态一同发布；事务完成之前不可进入对外 Broker 发单。",
+        "每笔 client_order_id 由 session+plan_hash+排序后 order_index 得固定 r0，受控 r1 仅替后缀；Commitment UUID/created_at 不声称是确定性导出。重复 slot 必须精确复用，否则拒绝不覆盖历史。",
+        "Commitment 不发 HTTP；SQLite 提交与远端 Broker 网络请求不属于同一个跨系统事务，防重依赖原计划、意图记录、固定 client ID 和查询恢复。"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "27｜Dispatch：意图先落库、同 ID 先查后发",
+      "items": [
+        "Alpaca base URL 只允许 HTTPS paper-api.alpaca.markets 根路径、无显式端口/凭据/query/fragment；非 Paper 在 HTTP I/O 前拒绝，无 Live fallback。",
+        "Reconcile task 的 Accepted 分支先确认 Debug Broker policy/租约/permit/冻结/原 Plan，持久写 effect intent；之后 Broker Future 才开始，崩溃时 intent 留存。",
+        "提交窗口取 Decision、approval/manifest/qualification、session 与快照/逐订单 quote 有效区间的交集；窗口到期仍可在合适权限下 GET 已知订单，但不能 POST/PATCH 新风险；旧 Plan 不靠 Dispatch 重采账户/quote 续命。",
+        "对每订单首发/恢复都先查 r1，再查 r0；仅查不到、窗口仍有效且最新 Clock/overnight 资格满足才 POST。Sell 先发但不等待 Sell filled 再发 Buy。",
+        "传输层不自动重试写请求；Broker 可见性时序和远端 exactly-once 不能由本地 SQL 事务证明。部分已发、未发单窗口过期会留下不确定/未完成进度。"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "28｜Reconcile：Complete 不等于全数 Filled",
+      "items": [
+        "new/accepted/pending_new 等映射 Accepted；partially_filled 为 Partial；filled 要数量守恒/正均价；canceled/expired/rejected/failed 可作为无后继终态，未知状态报错不猜。",
+        "全 commitment 资产均有完整回执、r1 successor 已观测且全部无后继终态时可 Complete；若全部取消/拒绝也可 Complete，不能当成全成交。Pending/Partial 仅写进度并延期，成功 output 只在 Complete 时提交。",
+        "非 extended_hours Plan 且 Broker 更新≥60秒才考虑一次受控 r1 reprice 或 cancel；reprice 仍需原短窗口并复用冻结限价，常会因窗口已过而落入 cancel；扩展时段不走 Regular60s。",
+        "cancel 是风险减少但仍是 Broker 写入；完整 dispatch 在授权尚有效时可能补发，不能统称纯只读恢复。单独 replay 或 GET 已知订单才是相应只读层。",
+        "默认 Reconcile RetryPolicy::none()=一次 Attempt、wall30秒；崩溃/网络错误可能使 task Failed，原 intent 可供同ID查询不等于调度保证再次执行。"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "29｜NoOrder 与 Evaluate：两条不同血缘",
+      "items": [
+        "ExecutionVerdict::NoOrder 必须含 ExecutionContext 与至少一个 blocker，是成功 Gate 的业务拒绝，不是技术失败，也不是“零目标已清仓”。",
+        "NoOrder 时 PaperCommit 和 Reconcile 节点仍在冻结图中，分别以 NoOutput 成功短路；Evaluate 从其依赖完成和 NoOrder verdict lineage 建 OutcomeSchedule。没有 Commitment、订单、fill 或假回执，不能把图拓扑简写为从 ExecutionGate 直接跳过两个节点。",
+        "Accepted lineage 要原 Commitment 与 Complete Reconciliation 才能 Evaluate；Complete 仅说明回执/后继闭合，不保证每笔 Filled。",
+        "OutcomeSchedule 冻结 scheduler session_key 对应 baseline_trading_day、Decision/Execution 来源与未来窗口；它是评估排期，不是 T+1/T+3/T+5 已成熟。"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "30｜Outcome Worker：T+1/T+3/T+5 与两条时间轴",
+      "items": [
+        "Evaluate 结束 T0 后另建 post-terminal Outcome Worker；Core 可同时推进新 T0 与旧 T+1/T+3/T+5，不把 Outcome 队列塞回研究图。",
+        "T+n 用四资产共同已完成的交易 Session，非日历 n 天；迟到补跑按每一期冻结时间窗，不能让 T1 读到 T3/T5 未来资料。",
+        "Outcome worker 有独立 lease、延期/失败退避和 durable stage 事件；processing 未开启时未来任务仍入库，开启有 Alpaca adapter 后才处理已有排队。",
+        "公司行动/价格缺口不猜调整系数；NoOrder 仍检预测标签，但不将现有仓位清零。Outcome 真实成熟要检查四资产共同 bars、各期数据、Store封存，不凭当前日期推定。",
+        "日线在实际收盘后至少20分钟才被视作完成；共同日期严格晚于 baseline，最前 1/3/5 个共同 Session 成窗口，标准路径最终只取前五个共同日期。"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "31｜Outcome v3：冻结执行后敞口 ≠ 未来账户 NAV",
+      "items": [
+        "Rust 从冻结 AccountSnapshot 的原 equity/现金/持仓、完整终态 receipts 与实际 filled quantity/price 重建执行后数量+现金；按同一初始 equity 分母评价未来四资产价格。",
+        "v3 冻结 post-execution exposure 的 net return 分解为价格变化和执行差额/已知费用等可归因项；不是未来真实 Broker 账户总 NAV，不包括随后外部入出金/交易。",
+        "forecast 真值逐资产×期限比较价格方向/回报，benchmark 和路径风险另算；未知损失、缺价格或独立风险真值不可填成0或让 Outcome 模型自评安全。",
+        "NoOrder 的 forecast 仍可评估，但订单/成交指标不能伪造；Execution/Outcome 的不同目标、回执与净收益口径须分别展示。",
+        "净收益分解可记为 N(h)=冻结敞口价格收益 G(h)+成交相对中点效应 I+初始估值桥接 V−估算费用 F；utility=N(h)−同期 QQQ 回报。式中 I 是 signed effect，不再重复扣同一限价差。"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "32｜Outcome 两阶段、数字封存与叙事修复",
+      "items": [
+        "Outcome 采用独立 Draft→Submit 两阶段协议，可读授权的 Outcome Context 工具；其模型写解释、归因和反思，数值 Outcome 由 Rust 根据冻结来源计算并密封。",
+        "T+1/T+3 可写未封存的 RunScoped Partial Outcome 和 Retrospective；T+5 收齐三期限才能 sealed。即使模型 Draft 不可用，Rust-only 数值也可能封存为 ModelUnavailable，但不由此自动创建合格 Experience/Evaluation。",
+        "数字 sealed 与模型 narrative、Experience、Evaluation、Lesson/Canary 推进是不同状态；模型拒绝、超预算或叙事修复失败不会把历史数值改写成新预测/收益。",
+        "当前 worker 创建 Outcome/repair 调用时临时替换 objective，而 AgentRuntime 比较调用节点与冻结 node，静态源码存在 NodePolicyMismatch 可能；本次未实际运行复现。",
+        "独立 risk assessment 有记录接口，但自动 producer 未见完整接线，Canary/学习必须保留 unknown risk，不得因为缺值给 Pass。"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "33｜学习：Experience、Evaluation 与 Lesson 各有门槛",
+      "items": [
+        "只有 canonical、合格来源、sealed 数值/必要叙事与适用评估门通过才可形成有资格 Experience/Evaluation；producer、evaluator 与被评估 PolicySubject 不是同一角色。",
+        "学习资格另查完整研究覆盖、hard blockers、IncompleteEvidence、每期限 evidence/risk 测量；默认质量下限 900,000ppm。risk_recall=None 不等于0分或安全通过，前向 Memory 迁移还需每期限至少3个 fresh paired outcomes。",
+        "DecisionPolicy 的 SQL 风险/概率校准与学习 PolicySubject/MemoryLifecycle 是两个不同 head；候选学习或 Memory Proven 不等于资金配置 Policy 已激活。",
+        "Lesson 新建先是受治理 Draft/Quarantined 路径；Active、争议、退役/forgetting 走显式 Store lifecycle，不从模型一句总结直接晋升。",
+        "Context 最多召回4条受限 Lesson（冲突连通组整体容量处理），Experience另有最多4条；scope 从 NodeSpec/资产/期限与授权候选构造，隔离 Debug 或过期/负面观察不自动混入。",
+        "默认 Lesson/Experience 在普通 materialize 路径只进 metadata ledger，研究角色又无读工具，不能声称其正文已被当前 Synthesizer 消费；这是静态数据流限制，非运行事故。"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "34｜Canary：三份 Shadow 不是三笔 Paper 订单",
+      "items": [
+        "候选研究/记忆/拓扑按三个受控 subject 做 Shadow 对照，父 T0 evidence 复用需同 Run、同来源/Contract/cutoff 完整绑定；Shadow 无 PaperCommit，不发候选真实交易单。",
+        "Shadow candidate schedule 换候选 Decision/forecast/target，执行上下文与 observed_execution 仍沿父 Paper 血缘；风险召回清为 None，不能把父成交与费用说成候选独立成交。",
+        "三 subject×T1/T3/T5 形成九组 horizon 报告；配对后按数值、风险与关键退化规则分别给 Pass/Defer/Reject，不把对照描述当真实账户实绩。",
+        "unknown/missing 独立风险真值导致 Defer 而非安全通过；普通五交易日路径不足以自然积攒所需20个 ES 样本，不能宣称五天自动晋升。",
+        "candidate Contract 安装、Shadow 对照结果、Canary level 状态与 canonical active 切换是不同事务/权限；资格阶段 receipt 不替代风险校准或 Paper approval。",
+        "Canary 先看已测退化/治理失败而 Rollback，再看样本、regime、confidence、风险/尾部测量或证书缺失而 Defer；指标齐备但效用不足 Hold，全过才 Advance。"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "35｜Observatory：看到的是有界投影",
+      "items": [
+        "Observer 对 Store/CAS、Run lifecycle、Paper只读快照和学习 Artifact 构 Snapshot、Run Detail、Journal 游标/SSE；section 区分 Available/Pending/Unavailable，不领取任务也不改 Gate。",
+        "有界默认如 recent runs 20、events 100、trajectory 200、learning 100；UI 按自身页面窗口/缓存更新，不能以图表曲线或 HTTP 200 判断订单 filled、未来真实 NAV、Policy 激活或 Outcome 完成。",
+        "PositionPlan 的 validated research allocation 在 UI 中展示为研究目标，Paper 的 execution plan 又是另一层；RunId/Target/Accepted/Receipt/Complete 等应核相应持久 Artifact。",
+        "静态显示不对称：Rust ExecutionVerdict 的 wire 是 {\"verdict\":\"accepted\"}，Swift 部分投影按字符串 \"accepted\" 判断，可能漏认已 Accepted；这是源码比较结论，未验证本机实际页面表现。",
+        "全局 SSE 的 invalidate 是游标水位提示，reasoning 广播可 lag；Snapshot 与其 cursor 不承诺同一个数据库瞬间。精确重放需按单 Run 持久 journal/事件查证，不把 SSE 当无损审计账本。"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "36｜隔离 Debug、Fixture 和历史入口边界",
+      "items": [
+        "Debug Core 使用 .akzio 下独立 Store，不打开 ~/.akzio/store；Broker 默认 Forbidden、learning_scope Isolated，不能通过等 Outcome 或复制 Policy 把隔离样本变正式校准。",
+        "Debug PositionPlan 不占 Paper slot；Debug Paper 只有显式 paper_allowed 才解除额外 broker-write 禁令，仍需正式 Approval/Policy/Gate/时段/endpoint，不是单独下单许可证。",
+        "debug verify-fixture 走正式拓扑的离线确定性 adapter，不能标真实模型、Paper成交或正式学习样本。旧 Planner/PaperDryRun 的活动创建执行已退役；保留历史读取/展示/导出/完整性审计。",
+        "run_core.py 当前工作树与 HEAD 不同，本图不拿提交版旧脚本参数证明当前脚本新行为；本次不读取 credential/真实 Store，也不调用 Debug、模型或 Broker。",
+        "Debug prepare 冻结身份但不执行首节点；pause/step/resume/retry-node 用同一 RunControl revision CAS。pause 不杀已经在途 Future；step/retry 精确指定 Task 并需满足受控状态。"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "37｜静态实现限制：必须在真运行里逐项核对",
+      "items": [
+        "Outcome worker 临时改 objective 与 AgentRuntime 冻结 node 比较，可能 NodePolicyMismatch；不能宣称本次已导致 Outcome 失败。",
+        "Reconcile 同ID lookup/intent 可提供恢复机制，但默认一次 Attempt 使崩溃后自动重调度无保证；不能宣称远端 exactly-once。",
+        "Lesson 默认召回可留下审计/metadata，但普通研究无读取正文工具；不能从 selected 直接推断学习已进入模型决策。",
+        "Canary 缺独立风险真值时 Defer，普通五日路径不足20 ES样本；SQL active Policy 载入与当前 Contract/历史模型时间身份仍有不对称校验。",
+        "Swift \"accepted\" 字符串与 Rust tagged verdict 对不上；Sell qty 未用冻结持仓股数封顶；SOXL 两项官方来源缺口。这些均是源码推导/限制，不是已观察的订单事故。",
+        "条件性 Shadow 静态接线风险：若父 Run 已有独立 risk assessment，复用父 schedule 的 collection 可能因 assessment origin.run_id 与 shadow task.run_id 不同而拒绝；未实际运行此分支。"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "38｜真实验收应分开采哪些证据",
+      "items": [
+        "源码图只能标 source-reviewed；离线 fixture 须另标 offline-verified；真实 Paper 要分别取得原审批、RuntimeIdentity、session slot、DecisionContext/target、ExecutionVerdict、Commitment、HTTP/receipt、filled quantity 与 Reconciliation。",
+        "T+1/T+3/T+5 应查持久 OutcomeSchedule、共同完成 Session、三期 market evidence、sealed Outcome、叙事/风险真值和学习资格；日历过了、订单 accepted 或只读行情返回均不能替代。",
+        "readiness 样本数、collect 实际组/skip、dataset、candidate validate/capable、显式 activate 历史与已运行 Core 内存 Policy hash 要分别核，不能用 build 成功替代激活。",
+        "交付的 HTML 浏览器/布局自动检查只证明图本身可打开且 provenance 绑定；不证明任何交易、收益、校准或模型事实。"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "39｜Outcome 数值、预测评分与独立风险真值",
+      "items": [
+        "每资产上涨概率按该资产相对 baseline 的实现方向算二元 Brier，收益=0 算非正；一个四资产期限通常贡献4个 binary samples。单份 Outcome 的 calibration_ppm 不等于统计上的完整校准曲线。",
+        "跨 Outcome 的 ECE/Brier 聚合至少需30个二元样本，非30个交易日或订单；tracking/beta/Sortino 需至少5个日样本，ES 至少20个。标准 Outcome 仅五个共同 Session，ES 常为 None，不能显示为零尾部风险。",
+        "RiskGroundTruthAssessment 需独立于 Decision producer 的 reviewer/verifier 身份、受控来源与时间有效性；Store 接口保存/核验外部输入，不自行生成真实风险标签。",
+        "本轮 evidence_completeness 只数治理采集/Normalized 四资产证据，不证明 T0 研究所有资料充分；forecast calibration report 与资金配置 DecisionPolicy SQL activation 是两种不同治理对象。"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "40｜阶段性结果、叙事修复与事务范围",
+      "items": [
+        "Outcome worker 优先选最早缺 Retrospective 的期限；阶段 packet 把观察和路径截到该阶段，标 rust 数值权威、market_cutoff_session 与 actual_account_nav 不可用。原始大来源在 CAS 保留但不默认成为模型顶层可读全文。",
+        "baseline 后若存在未完整建账的 split/dividend 等公司行动，不猜 adjustment 因子；价格或事件不完整时数值物化可失败/等待。",
+        "T+5 数值、Retrospective、合格 Experience/Evaluation/Policy 与治理观察可在带 fencing 的事务中提交；新的 Lesson proposal 是之后逐条写，不在该同一原子事务里。",
+        "narrative repair 只围绕已 sealed Outcome 补叙事、不取新价格，单 Run 有界最多两个 repair task；不能修改已密封历史数值。"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "41｜最重要的结论：一份 Policy，不是三个 Policy",
+      "items": [
+        "T1/T3/T5 是三个预测期限：1、3、5 个交易 Session。每次 T0 的 Synthesizer 必须形成四资产×三期限＝12个预测。",
+        "只有完整且 decision-capable 的一份 DecisionPolicy 才应持有 horizon_weights 的3个键、匹配 (模型版本/regime,资产,期限) 的12份 FrozenForecastCalibration、四资产风险校准及一份组合协方差模型；缺 active 的 Default 没有这些训练面。",
+        "离线 build 没有学习三个 horizon_weights：它沿用 Default 的 T1=333333、T3=333333、T5=333334 ppm；操作员当前14项风险限制也不包括更改这三个权重的 CLI 字段。",
+        "每期限产生的历史 Outcome 是训练某资产×期限校准面的标签；T0 生成仓位时再把当前三期限的校准概率与 bin 回报按权重合成。研究分配 allocation 另存，不是权重公式的输入。"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "42｜缺 active head：默认值的意义",
+      "items": [
+        "SQL active head 不存在时 loader 返回 Default Policy、status=store_active_head_missing；不自动寻找最新 candidate，也不自动创建训练数据。",
+        "Default 可结构 validate，却没有 active_forecast_calibration、没有 forecast/asset 校准，组合风险样本数为0；min_calibration_samples=u32::MAX 是 fail-closed 哨兵，不是30个已观测样本。",
+        "默认三期限权重近似各三分之一；同时默认 max_gross=50%、min_confidence=25%、edge=50000ppm、风险波动目标150000ppm、beta上限500000ppm，但这些数字不是被批准的校准风险限制。",
+        "target_with_risk_traced 若有效置信度先低于最低门槛，记录 confidence.minimum 全局零目标；否则 Default 因缺逐资产校准可走 eligible_set.empty。两条都返回零正式目标，不意味着卖单。"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "43｜两条冷启动入口别互相套用",
+      "items": [
+        "正式 PositionPlan 允许合格研究 proposal 的 research_plan.validated 非零，同时 Decision.targets 四资产归零；图在 Decision 结束，没有 ExecutionGate、OutcomeSchedule，也不能贡献正式校准样本。",
+        "正式 canonical Paper 在 SQL 无 active head 时 scheduler 不绑定旧 Paper approval；若证据/研究/技术任务仍能成功、市场 Session 可运行，ExecutionGate 因缺 approval 加 UnqualifiedRuntime→NoOrder。",
+        "NoOrder 的 PaperCommit/Reconcile 短路；Evaluate 仍冻 OutcomeSchedule，未来评估12个价格预测标签。这里“零”是新交易写入零，不是 Store/行情/模型请求都为零。",
+        "隔离 Debug PositionPlan 的缺 Policy 情形不能照搬正式 PositionPlan：它可手动研究，但控制层阻止到 Decision。缺少真实 baseline、有效模型、到期行情也不能因运行目的叫 Paper 就自动产生可用标签。"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "44｜T+1/T+3/T+5 的真实时间轴",
+      "items": [
+        "OutcomeSchedule.baseline_trading_day 来自冻结 Paper session；T+1/T+3/T+5 对应四资产严格晚于该基线的第1/3/5个共同完成交易 Session，不是自然日、也不是三笔订单。",
+        "日线只有交易所实际 close 再过20分钟才可用；T+1/T+3 是阶段性 Partial，T+5 三窗口具备后才可能 sealed。NoOrder 也可以评估预测，订单收益并未凭空出现。",
+        "T3/T5 的收益与预测标签都从同一个 T0 baseline 计到第3/第5个共同 Session；不是 T1→T3、T3→T5 的增量标签。",
+        "readiness 依 Store 已持久化 schedule/windows/bars 分类 sealed/pending/no_schedule/blocked；自然日过去不会补写缺失的冻结账户/报价 baseline，隔离 Debug Store 不具正式资格。"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "45｜Collect 的12个“标签”是什么",
+      "items": [
+        "每个合格 Run 的原 Decision 包含12个 raw positive_return_probability_ppm 与 raw expected_return_ppm；collect 为四资产×三期限逐格找已 sealed Outcome 的窗口。",
+        "对某资产/期限，realized_return_ppm=(future_close−baseline_close)×1e6/baseline_close，价格来自 Outcome 关联的 Alpaca 日线、同资产同日冲突会拒绝。它是价格标签，不是实际成交收益、组合 NAV 或学习评分。",
+        "模型作预测时的 forecast_at 必须早于训练标签 realized_at；collect 用窗口交易日的 23:59:59 UTC 作日级 realized_at，不能误称交易所实际 close 时分秒。",
+        "完整 Run 需四资产三期限12格及足够共同价格；NoOrder 可提供预测价格标签，但其实际没有成交。PositionPlan 与 isolated Debug 不能靠等 T+5 改变样本资格。"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "46｜Readiness 与 collect 样本数并非同一个量",
+      "items": [
+        "readiness 只读已存在 Store、按持久化事实估成熟 Run 缺口；示例 CLI min-samples=30 是收集门槛，不是 Default Policy 的 u32::MAX，也不表明30次订单成交。",
+        "若30个同模型/Contract合格 Paper Run 各有12标签，理论最少360条 forecast 样本、每资产×期限至少30条；另需四资产≥31个共同价格点，才能得到≥30个日收益样本。",
+        "readiness 可先扫描最近最多500个 Decision 再做资格过滤；collect 还会因为模型身份、Contract分组、价格面、风险限制等缩小可用样本。readiness 显示足量不保证 collect 成功。",
+        "即使每个槽位总样本≥30，概率被分散到十个 bin 后，本次 raw p 命中的 bin 仍可能小于30；capable 不检查当前 bin，运行时逐 forecast 又会排除。"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "47｜14项风险限制：operator 明确输入，不是模型训练输出",
+      "items": [
+        "必须显式保存：min-confidence、max-gross、maximum-execution-delay、minimum-process-quality、min-probability-edge、max-brier、target-vol、max-portfolio-beta。",
+        "还须 max-expected-shortfall、max-gap-loss、max-capital-weight、liquidity-weight-cap、max-leveraged-holding-days（1..5）、daily-reset-decay；共14项，不提供投资建议数值。",
+        "CLI set-risk-limits 在 canonical Store 保存 CalibrationRiskLimits Artifact；它只保存风控约束，不拟合、不中途激活、不批准 Paper。",
+        "risk limits 里的 liquidity_weight_cap 是静态 operator 额度，不是 DecisionGate 每次量测的实时订单簿；后续 ExecutionGate 仍需报价/账户/容量与原审批。"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "48｜Collect：谁能进入训练、哪些身份没有自动证明",
+      "items": [
+        "需 canonical Store、显式 RiskLimits Artifact、当前 Synthesizer 有真实 release_date/knowledge_cutoff 的配置；不能编造日期或把隔离样本搬入正式训练。",
+        "沿 Decision→Context→OutcomeSchedule→sealed Outcome 找同 Run 与完整12标签；历史 AgentTurn 检查 provider/model/Contract，训练组按选中候选的 Contract，不会随意混多 Contract。",
+        "collect 的 model_version_hash 用当前配置计算并赋给样本；历史 turn 并没有对配置日期等全部字段逐项复核。builder 只校验传入 provenance 字段自洽，不做原始历史材料重新查询。",
+        "不足时报 BLOCKED/counts/skipped，不写 Dataset；通过后 SQL CAS 保存 OfflineCalibrationInput、risk limits 与 Decision/Outcome 的来源 DAG。"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "49｜Dataset 到 12 份 forecast calibration",
+      "items": [
+        "输入固定四资产×T1/T3/T5；缺任一槽位 min_samples 就整体构建失败，不能只拟合某个资产/期限并把其他格补中性。",
+        "每格10个连续 raw p 区间：0–99999、...、900000–1000000；bin 中 calibrated_p=正实现收益个数×1e6/count，alpha=该 bin realized_return_ppm 算术均值。",
+        "收益恰为0按非正计；空 bin 保存 p=500000、alpha=0、count=0，是“未测得”，不是凭空造出30份中性样本。全槽 mean Brier 仍用原始 p 对二元正收益计算，不是独立 holdout 的拟合后成绩。",
+        "Policy 查找按 model_id/version_hash/regime（当前收集写 all）＋asset＋horizon，并用当前 raw p 选一格；字段名 alpha 是实现收益均值，没有减去 QQQ benchmark。"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "50｜Dataset 到四资产风险模型",
+      "items": [
+        "四资产价格取共同日期相邻 close→ppm 日收益；至少 min_samples＋1 个共同价点；波动率为样本 std×√252，beta=abs(cov(asset,QQQ)/var(QQQ))×1e6。",
+        "expected_shortfall 是最差 ceil(共同日收益数×5%) 个负收益幅度均值；gap_loss 是最差 close-to-close 单日损失，不是实测 overnight gap。无负收益尾部、QQQ零方差、非正波动/beta 等使风险不可用。",
+        "四资产×四资产的年化 covariance 对称矩阵与 per-asset vol/beta/ES/gap 独立于模型配置权重训练；capital/liquidity/decay 直接取 operator 风险限制。",
+        "Builder 不计算组合的独立未来尾部场景，也不证明矩阵正半定；负组合方差在 Decision 风险评估处返回错误。"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "51｜候选、结构合法、capable、active 四级",
+      "items": [
+        "build 只输出带 policy/input/risk hashes 的 immutable Policy Artifact，activated=false；它把三期限权重保留为默认等分，不以12份样本学习新的期限权重。",
+        "validate 检查 envelope/字段范围、每份已存在校准的 bin 连续覆盖与样本守恒、协方差对称等；它不要求12面全部齐备。decision_capable 才要求 active scope、四资产风险与协方差、12份总样本/Brier 达标；仍不检查本次 raw p 命中的 bin。",
+        "inspect 只是读 Artifact；CLI validate 输出 capable 布尔，不自动切 active head。activate 重新检查当前模型身份、已安装 Synthesizer Contract、capable、Store scope，再在 SQL 事务写安装/激活历史/单例 head。",
+        "候选可在 build 成功后因 Brier 不合格或缺完整风险面不能 activate；即使 active 且 capable，本次方向、bin 样本、置信度、alpha 或执行 Gate 仍可归零/NoOrder。"
+      ]
+    },
+    {
+      "dot": "orange",
+      "title": "52｜已激活 ≠ 正在运行的 Core 已切换",
+      "items": [
+        "serve 在启动时读 SQL active Policy，按值 clone 到 Daemon/DecisionRuntime；scheduler 却每个 tick 查 SQL active head 判断 cold_start。",
+        "activate 更新 SQL 不会自动替换已经运行的 DecisionRuntime 内存 Policy；新的 approved RuntimeIdentity/资格与 Paper approval 也不能从老实例或旧 approval 自行推断。",
+        "正确观测需分别核 SQL active head、CLI loader status、当前 Core runtime policy hash、DecisionContext.decision_policy_hash 及该 Run 的 approval binding；必要时经原正式启动与授权流程切换，不绕 Gate。",
+        "静态接线差异：普通 canonical serve 的 loader核当前模型身份，activate核当前 Synth Contract，但当前普通 serve/decide 未显式再比 active Policy Contract 与此刻 Synth Contract；不能把文档强表述当已做的每次运行校验。"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "53｜T0：模型 12 个预测、17 个说明，不是三张仓单",
+      "items": [
+        "三个 Analyst/Critic 期限对应研究 Claim；Synthesizer 的 4资产×3期限 Forecast 有 raw p、raw expected_return、thesis；Rust 校验非中性方向 Claim/Critique、ground/Review 与17 numeric_basis。",
+        "numeric_basis 说明模型估计的输入/单位/方法/不确定性，不是每个 p 或回报由 Rust 重新证明的真值，也不是历史校准。",
+        "research_allocation 显式四资产＋现金，和=1e6；Rust 另存 raw/validated 与 blocker。Policy.target_with_risk_traced 的输入是 forecasts＋effective_confidence＋decision_at，不传 allocation 权重。",
+        "故“研究建议50% TQQQ”不表示正式TQQQ上限50%；“研究显式现金”也不自动否决一个经独立校准得到的正目标。资产用途最终受原执行 Gate。"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "54｜精确命中本次三个期限的校准条件",
+      "items": [
+        "Neutral 精确定义为 expected_return_ppm=0 且 raw_p=500000；它直接弃权，不会被历史正 bin 复活。非中性才找 active (scope,asset,horizon) 面。",
+        "必须该面 frozen_at≤Decision时刻、总 sample_count≥min、mean_brier≤max；raw p 所在 bin 本身 count≥min。任何参与 horizon 缺合格校准，就排除该资产，而非仅忽略坏期限。",
+        "若只有中性或杠杆持有期过滤掉全部期限，资产因 abstention/missing/edge 路径排除；留下的参与期限权重会重新按其权重和归一。",
+        "decision_capable 只证明十二面总结构和总样本足，不保证这一笔 p 所落 bin 样本数；这里才是“已激活但当前资产为零”的常见结构性原因。"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "55｜三期限相反方向：先判冲突，再谈杠杆过滤",
+      "items": [
+        "每格方向来自校准 p：p≥500000+edge 为 Bullish；p+edge≤500000 为 Bearish；之间 Neutral；缺校准 Uncalibrated；原始 Neutral 始终 Neutral。",
+        "同资产任两期限出现 Bullish/Bearish 相反时，horizon_trace 记录冲突，该资产所有 sleeves 不进 target；DecisionGate 还加全局 HorizonConflict hard_blocker。",
+        "全局 blocker 会被 Paper ExecutionGate 继承：即使其他资产目标可能非零，也不能把“只剔除冲突资产”解释成剩余资产可直接下单。",
+        "关键顺序：horizon_trace 在 TQQQ/SOXL 的 max_leveraged_holding_days 过滤之前计算，因此一个随后不参与 T0 仓位计算的 T5 仍可能与 T1 形成冲突并阻断。"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "56｜正式权重数学：E、A、signal",
+      "items": [
+        "对单资产每个参与期限 h 取校准 p_h、bin 平均实现回报 A_h、固定 horizon 权重 w_h；先逐项整数算 (p_h−500000)×w_h/1e6 与 A_h×w_h/1e6，求和后乘1e6/Σ参与w_h 得 E、A。",
+        "资格要求至少一项参与 forecast、校准完整、E≥min_probability_edge_ppm 且 A>daily_reset_decay_ppm。signal=clamp(2E+A−decay,0,1e6)。",
+        "有效置信度低于 min_confidence 直接全零；达到门槛后代码没有再连续乘置信度缩仓。raw expected_return 决定研究方向/中性和支持资格，但真正 A 来自历史 bin realized return。",
+        "只有 TQQQ/SOXL 限制 horizon_days≤operator max_leveraged_holding_days；QQQ/SOXX 不因该字段过滤。若某些期限中性/被持有期过滤，E/A 按实际参与权重重新归一。"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "57｜四资产各自额度与组合风险二次缩放",
+      "items": [
+        "单资产 vol_cap=floor(target_annualized_volatility×1e6/asset_vol)，beta_cap=floor(max_portfolio_beta×1e6/asset_beta)；cap=min(vol_cap,beta_cap,max_capital_weight,liquidity_weight_cap)。",
+        "初权重=floor(cap×signal/1e6)。四资产 gross 超 max_gross 时等比例整数缩放；现金在 TargetPortfolio 中隐含为未分配 equity，不是研究显式 cash_weight 字段。",
+        "以冻结 covariance 求 wᵀΣw 的整数平方根作为组合波动，并线性汇总 beta、ES、gap；任一超上限取最紧的 limit×1e6/measured，统一缩小，再计算最终风险评估。",
+        "如果全资产不合格→decision.eligible_set.empty；若先有 eligible 却被额度/整数缩放到0→decision.post_scale.zero。结果保留 policy/risk hash 与排除 trace，绝非成交/未来收益保证。"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "58｜只为理解公式的假设代入：QQQ 12.4198%",
+      "items": [
+        "假设一份已经合法激活、当前 bin 均≥30样本且未过期的 Policy；仅举 QQQ：T1/T3/T5 校准 p=[800000,700000,600000]，bin 回报均值=[20000,14000,8000]ppm，权重=[333333,333333,333334]ppm。不是实际 Store 数据。",
+        "Rust 整数逐项先除后加：E=199998ppm，A=13998ppm，decay=0，则 signal=413994ppm。若目标波动上限150000/资产波动300000→vol cap500000；beta上限500000/资产beta1000000→beta cap500000。",
+        "再假设 operator capital cap400000、liquidity cap300000，故单资产 cap300000，初始 QQQ target=floor(300000×413994/1e6)=124198ppm＝12.4198%。后续组合 gross/vol/beta/ES/gap 若超限，还会进一步降低。",
+        "这不是运行配置建议，也不代表 Outcome 回报或会产生 QQQ 买单；若有 hard blocker、无 Paper approval、当前已持相同市值或快照失效，仍可 NoOrder。"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "59｜正式 Decision 与 Execution 分界",
+      "items": [
+        "DecisionGate 先拒不合法 proposal/Manifest/Review；合法后才计算正式 target，并把研究 raw/validated、12 sleeves、policy_hash、portfolio risk、首个归零原因和 hard blockers 写入 DecisionContext。",
+        "HorizonConflict/过程质量 hard blocker 可与某些资产非零 target 并存；Context.accepted 只看 hard_blockers/material_conflicts 空，target 非零不是获准执行。",
+        "Decision.targets 与 Context.target 同值，DecisionGate 成功只提交两个 Artifact；有效期=min(Policy 最大执行延迟,12个 thesis 最早有效期)。",
+        "PositionPlan 至此结束；只有 Paper 进入 ExecutionGate，后者重采账户/报价/时钟、核原 approval/资格/freeze、流动性/因子/turnover/合规/依赖。"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "60｜目标仓位如何变成“可能的订单”",
+      "items": [
+        "Execution Allocator 不是照抄 research allocation 或把 target 百分比直接当股数；target_value=floor(account.equity×target_ppm/1e6)，delta=target_value−当前该资产 market_value。",
+        "delta>0 为 Buy，delta<0 为 Sell，等于0无单；有 target=0 且当前多头也只有在原审批与所有 Gate 通过后才可能产生减仓 Sell。无审批冷启动不会自动清仓。",
+        "ExecutionVerdict::NoOrder 是业务阻断，Accepted 也只证明计划闭包；Accepted 后 PaperCommit 先持久化确定性 client_order_id 与 Commitment，Broker accepted、filled 和 Reconciliation 再分别观察。",
+        "运行中同一 Policy 不自动随新 Outcome 重新拟合；新的成熟数据若要改 Policy，仍重新 collect/build/inspect/validate/显式 activate，核 Core 实际内存 hash 与新审批身份。"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "61｜四个常见结果矩阵",
+      "items": [
+        "无 active head：Default 无校准→四资产正式目标0；正式 PositionPlan 保留研究但到此止；正式 Paper 可研究→NoOrder→Schedule，前提是技术/模型/证据链成立。",
+        "Policy 已 active/capable 时，各面总样本和总 Brier 已过能力谓词；但本次 raw p 命中的 bin 仍可样本不足，或某面 frozen_at 晚于 Decision 时刻，于是该资产排除；不从邻 bin 插值。",
+        "T1 看多、T5 校准看空：该资产排除且全局 HorizonConflict blocker；即便杠杆持有期计划只用 T1，冲突先发生。",
+        "Policy 有效、某资产有正 target、没有 Decision hard blocker：仍需实时审批/快照/风险 Gate；可能 Accepted、NoExecutableOrder 或其他 NoOrder。Accepted 之后也可能未成交。"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "62｜观测哪个字段才能定位问题",
+      "items": [
+        "校准前看 readiness.store_scope/calibration_eligible、sealed/pending/blocked/no_schedule 与 12 槽 counts；collect 的 selected/skipped、训练组和 dataset ID 要另查，不能只拿成熟数。",
+        "Policy 阶段分看 RiskLimits Artifact ID、Dataset ID、candidate output_hash/decision_capable、activation history/head 与已运行 Core policy identity；build 返回 activated=false。",
+        "当前 Decision 看 original Forecast.raw p/expected_return、Review、policy_hash、horizon_trace.sleeves（校准 p/alpha/方向）、conflicts、runtime_trace.first_zeroing_branch、每资产理由、risk assessment 和正式 targets；sleeve.included_in_target 只是初步资格，不等于最终非零权重。",
+        "Execution 看 Context.accepted、原 Paper approval、fresh snapshots、Verdict、Plan/Commitment、Broker receipt/fill。不要用 Observer 的单个 badge、ResearchPlanStatus 或 HTTP 2xx 替代持久事实。"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "63｜证据范围与静态实现限制",
+      "items": [
+        "本图复用固定提交的源码引用；生成期间没有打开 canonical／Debug Store、模型配置／凭据、真实样本或 Paper 账户，也未运行 collect／build／activate、真实模型或跨日 Outcome。不能报告本机现存 active Policy、样本数或目标仓位。",
+        "collect 的模型版本时间身份和 canonical 当前 Contract 比较在源码中有不对称接线；不能以已安装或历史结果推断这台机器每一步都已核对。",
+        "Policy.validate 的 covariance 对称/幅度界限不证明矩阵正半定；组合缩放重算指标不等于独立实证风险保证。Asset eligibility 诊断摘要的 News 条件与真正 price+macro slot 谓词还有静态不一致。",
+        "上面“正常运行”指具备有效校准/身份且通过当次 Gate 的可达路径，不保证自动盈利、每次非零仓位、订单提交或成交。"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "64｜观测操作手册：不要跨级归因",
+      "items": [
+        "入口：先核 purpose、RunId、session slot、当前 daemon/RunControl identity；HTTP 2xx 不是 worker 完成。研究：看 Need disposition、CollectionStatus、Manifest/ReadGrant、正式 Attempt output 与 ProposalReview，不用“available”代替 grounds。",
+        "决策：看 Proposal 精确 hash、Review、DecisionContext.policy_hash/hard_blockers/risk trace、Decision.targets；研究配置、正式 target 和判定资格分别记录。",
+        "执行：看六项刷新时间、Approval binding、ExecutionVerdict、Plan/Commitment、effect intent、Broker client ID/receipt、filled qty、Reconciliation；NoOrder 与 Complete 都不能自动推断成交。",
+        "Outcome：看 OutcomeSchedule.baseline_trading_day、实际四资产共同 Session、三期窗口/market evidence、v3 数值 sealed、叙事与 risk truth；学习：另看 Experience/Evaluation/Lesson/Canary 资格和 SQL Policy activation。",
+        "本 HTML 自身的交互、卡片、源码引用仅帮助查这些位置；不是 live telemetry。"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "65｜文档与静态实现不能替代运行验收",
+      "items": [
+        "固定提交源码 Store 18、active research Contract 69、PromptBundle 38、freshness candidate 70；CONTEXT/部分 README 旧版本和“九节点”“开市时一次”等语句可能滞后，应按实际消费者与冻结历史身份区分。",
+        "普通 canonical Core 的 active Policy 在启动时装入内存；部分当前 Synth Contract 对比只在 activate/readiness/Debug preflight 有显式校验，不能从文档推出每次 canonical Decision 必然重新比对。",
+        "calibration preflight 实际调用可写 Store::open(scratch) 且可安装 Contract，不宜一概称严格只读；readiness 采用 open_existing 并避免该 helper。",
+        "Collect 的历史模型版本 hash 有当前配置赋值环节，真实发布日期/知识截止需可核来源，不能虚构元数据以满足训练资格。",
+        "此处一切风险项均标“静态源码推导、未运行复现”；需要真实 Run 日志、Store Artifact、Broker 状态和测试/跨日样本才能升级证据等级。"
+      ]
+    }
+  ]
+}

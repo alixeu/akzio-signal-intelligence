@@ -1,6 +1,11 @@
 //! Unified source inventory; each feature owns its text and typed builders.
 //! Includes both prose documents and Rust-owned short guidance. No runtime loading.
 
+// 这里是 Prompt 的静态所有权登记，不是运行时的任意文件读取入口。每个 source
+// 同时保存稳定 ID、物理路径和编译期字节，供组件哈希选择；PromptBundle 的
+// governance/role 另由安装路径 stage 到 CAS，Contract 还绑定 Schema/预算等。
+// Outcome 63 仍可按活动 Contract 执行两阶段，本登记本身既不
+// 安装 Contract，也不改变冻结正文或扩大工具权限。注释也属于编译期字节身份。
 pub(crate) struct PromptSource {
     pub id: &'static str,
     pub path: &'static str,
@@ -110,6 +115,8 @@ pub(crate) const SOURCES: &[PromptSource] = &[
 pub(crate) fn components(
     contract_only: bool,
 ) -> impl Iterator<Item = (&'static str, &'static [u8])> {
+    // 将 ownership ID 与物理路径分别作为哈希组件，防止只换路径或只换拥有者
+    // 却保持字节不变时悄悄复用旧 Contract 身份。
     SOURCES
         .iter()
         .filter(move |source| !contract_only || source.contract)
@@ -128,6 +135,7 @@ mod tests {
     use std::{collections::BTreeSet, path::Path};
 
     fn documents(path: &Path, root: &Path, paths: &mut BTreeSet<String>) {
+        // 测试递归扫描 Prompt 目录，只比较登记覆盖范围；它不把目录扫描开放给 Agent。
         for entry in std::fs::read_dir(path).unwrap() {
             let path = entry.unwrap().path();
             if path.is_dir() {

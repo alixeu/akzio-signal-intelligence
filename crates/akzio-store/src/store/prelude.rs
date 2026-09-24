@@ -1,3 +1,6 @@
+// 文件导读：prelude 统一提供 Store 实现共享的领域类型、SQLite/serde 错误、schema 常量和
+// 只读投影结构；这里的类型定义描述持久化边界，不是额外的内存状态权威。阅读顺序建议从
+// StoreError/Store 开始，再看 Stored* 投影和 RunModelUsage；rusqlite 操作仍由各 Store 方法完成。
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -37,6 +40,9 @@ use rusqlite::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
+// `#[derive(...)]` 是 derive procedural macro：编译期为这些类型生成 Clone/Debug/serde 等 trait 实现；
+// 后续 CAS JSON 编解码调用的是这些生成的 impl，不会自动创建 SQL 表或验证业务资格。
+// 数据库文件名、schema 版本和 Blob 编码标识必须与初始化/迁移/读取路径保持一致。
 const DATABASE_FILE: &str = "akzio.sqlite3";
 const EXPORT_DATABASE_FILE: &str = "akzio-export.sqlite3";
 const POST_TERMINAL_WORKER_RECIPE_ID: &str = akzio_domain::LEARNING_OUTCOME_WORKER_RECIPE_ID;
@@ -51,6 +57,8 @@ const BLOB_COMPRESSION_THRESHOLD: usize = 1_024;
 const BLOB_COMPRESSION_MIN_SAVINGS: usize = 64;
 const BLOB_MAX_DEPENDENCY_DEPTH: usize = 32;
 
+// `#[derive(Error)]` / `#[from]` 由 thiserror 宏生成 Display/Error 与底层 SQL、领域、JSON 错误转换；
+// 这使实现中的 `?` 能在 StoreResult 边界传播错误，而不会把失败改写成成功/默认值。
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("debug control: {0}")]
@@ -187,6 +195,9 @@ pub enum StoreError {
 
 pub type StoreResult<T> = Result<T, StoreError>;
 
+// Clone 只克隆两个 Arc 句柄：同一 Store 的副本仍共享 PathBuf 与同一个 Mutex<Connection>，
+// 并不会另开连接；ConnectionGuard 离开其作用域或因 `?` 提前返回时由 RAII 释放锁。
+// SQLite 事务的原子范围仍由具体 Transaction 决定，进程内 Mutex 不提供跨进程互斥。
 #[derive(Debug, Clone)]
 pub struct Store {
     root: Arc<PathBuf>,
@@ -418,6 +429,7 @@ pub struct RunModelUsage {
 }
 
 impl RunModelUsage {
+    // 借用 `self` 只读取各类 provider token 数；饱和加法在 u64 上限处封顶，避免溢出回绕。
     /// Every token the provider charged for, cached input included: a cached
     /// prompt is cheaper, not free, and dropping it would understate a
     /// context-heavy arm.
@@ -428,12 +440,14 @@ impl RunModelUsage {
             .saturating_add(self.reasoning_tokens)
     }
 
+    // `turns > 0` 防止“没有任何调用”被误报为完整；缺失计数必须为零才允许使用总量。
     /// True only when at least one turn was seen and every one of them reported
     /// usage.
     pub const fn is_complete(&self) -> bool {
         self.turns > 0 && self.turns_missing_usage == 0
     }
 
+    // 返回 Option 是显式表示是否有完整观测：不完整时舍弃部分和，避免下游误当总账。
     /// The token basis, or `None` when it would be a partial sum.
     ///
     /// A run with unreported turns must report *no* cost rather than an
@@ -448,6 +462,8 @@ impl RunModelUsage {
         }
     }
 
+    // 延迟总量沿用 token usage 的完整性判据；当前未逐条要求 latency_millis 非空，
+    // 所以此 Option 为 Some 也不证明每次调用都报告了真实延迟。
     pub const fn latency_millis_if_complete(&self) -> Option<u64> {
         if self.is_complete() {
             Some(self.latency_millis)
@@ -495,9 +511,12 @@ struct StoredTrajectoryTelemetry {
 }
 
 impl StoredTrajectoryTelemetry {
+    // `Option::is_some` 仅判断是否至少报告过一个 token 类别；聚合器实际用 unwrap_or_default
+    // 将同一 turn 的其它缺失类别计为 0。所有类别都 None 才会被记作 usage unknown；
+    // 这描述当前持久化统计规则，不独立证明 provider 对缺失类别收费为零。
     /// A turn with no token field at all was never accounted for; a turn that
-    /// reported any category is accounted for, with the absent categories read as
-    /// zero because the provider did not charge for them.
+    /// reported any category is counted by this Store projection.
+    /// 缺失类别在当前聚合实现中按零读取；这不能证明 provider 对该类别实际收费为零。
     fn reported_usage(&self) -> bool {
         self.input_tokens.is_some()
             || self.cached_input_tokens.is_some()
@@ -520,6 +539,7 @@ struct StoredTrajectoryToolArtifact {
 }
 
 impl StoredEvent {
+    // 把数据库中的原始事件字符串解析为领域枚举；未知事件不被静默忽略，错误交给调用方处理。
     pub fn lifecycle_kind(&self) -> Result<LifecycleEventType, DomainError> {
         LifecycleEventType::parse(&self.event_type)
     }
@@ -549,6 +569,7 @@ pub struct StoreAlert {
 }
 
 impl StoreMetrics {
+    // 从已有计数构造告警投影；这里只报告 failed 状态中的正数，不修改 metrics 或数据库。
     pub fn alerts(&self) -> Vec<StoreAlert> {
         let mut alerts = Vec::new();
         push_alert(

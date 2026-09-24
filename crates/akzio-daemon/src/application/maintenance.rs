@@ -1,3 +1,9 @@
+// 文件导读：Maintenance 把 Doctor/backup/restore 等维护操作送入专用 StoreExecutor 通道，
+// 避免和普通 Store 操作、task lease 或 scheduler heartbeat 交叉写入。维护返回成功只说明
+// 该维护事务完成，不改变研究/Decision/Paper/Outcome 的业务语义。
+// Rust 机制：`FnOnce + Send + 'static` 让闭包拥有工作并安全跨线程进入 executor；`T: Send`
+// 约束结果可离开后台线程，`Clone` 只复制 executor 句柄而不复制 Store 数据库。
+
 use akzio_runtime::{RuntimeError, StoreExecutor, StoreMaintenanceKind};
 use akzio_store::{Store, StoreError};
 

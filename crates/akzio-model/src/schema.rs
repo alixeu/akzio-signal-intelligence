@@ -2,10 +2,15 @@
 
 use super::*;
 
+// 文件导读：provider_schema 将本地工具 Schema 投影成 Responses API 可发送的形状，
+// 由 `openai_responses_request_body` 在请求序列化时调用。它返回新 Value，不修改 Rust
+// 本地持有的原始 Schema；最终参数合法性仍由 AgentRuntime/Context 工具校验。
 pub(super) fn provider_schema(value: &Value) -> Value {
+    // 这是对 serde_json::Value 的纯转换：输入 Schema 不被原地修改，返回的新树才是
+    // provider wire 用的参数 Schema；Rust 本地校验仍使用调用方持有的原始树。
     // 递归生成 provider 可接受的参数 Schema：移除仅供本地校验的长度、数值和
-    // 属性约束；带 properties 的对象再由当前属性集合重建 required，保持 wire
-    // payload 与 Rust 侧实际字段边界一致。
+    // 属性约束；带 properties 的对象会把全部字段列为 provider 的 required。
+    // 这比本地可选字段更严格，Rust 仍需按原 Schema 验证响应，不能只信 provider。
     match value {
         Value::Object(object) => {
             let properties = object.get("properties").and_then(Value::as_object);
@@ -48,7 +53,8 @@ pub(super) fn provider_schema(value: &Value) -> Value {
             }
             if let Some(properties) = properties {
                 // 发送给 provider 的对象 Schema 在这里将全部 properties 列入 required；
-                // 这样不会让本地可选字段与 wire Schema 不一致。
+                // 本地可选字段在 wire 上也必须显式出现（通常用 null 分支表达）；
+                // 这是 provider 结构化输出约束，不会改变 Rust 侧原 Schema。
                 sanitized.insert(
                     "required".to_owned(),
                     Value::Array(properties.keys().cloned().map(Value::String).collect()),
