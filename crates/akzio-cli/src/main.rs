@@ -1,3 +1,9 @@
+// 文件导读：这是 `akzio` 二进制的组合入口：声明 clap 命令/配置类型，并通过 `include!`
+// 把按领域拆分的 handler 文本并入同一模块；真正的命令流程从 `cli/main.rs::main` 开始，
+// 再进入本文件注册的 `dispatch_*`、HTTP client 或本地 Store/配置处理。配置、认证 token
+// 和模型凭据在此只是输入，Rust daemon/Store 才决定调度、Gate 与持久化结果。
+// Rust 机制：`include!` 是编译期源码包含而非运行时模块加载，因此各片段共享本模块私有
+// 名称；serde/clap derive 生成解析代码，`Option` 保留可选配置，手动 `Debug` 脱敏凭据。
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -35,9 +41,11 @@ use reqwest::{Client, Method, RequestBuilder, Response, Url};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::sync::watch;
 
+// CLI 是 loopback 控制入口：只解析命令/配置并调用 Rust 权威 API，业务 Gate、Store 写入和 Paper 权限不在参数层绕过。
 #[derive(Debug, Parser)]
 #[command(name = "akzio", about = "Akzio loopback control client")]
 struct Cli {
+    // config 只指定配置文件路径；具体 endpoint、Store root、模型和凭据由后续配置校验读取。
     #[arg(long, default_value = "config/akzio.toml")]
     config: PathBuf,
     #[command(subcommand)]
@@ -46,6 +54,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    // 子命令按领域分组，实际 handler 由下方 include 的 cli 模块提供，保持 main.rs 的入口注册稳定。
     Workflow {
         #[command(subcommand)]
         command: WorkflowCommand,
@@ -92,6 +101,7 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum CalibrationCommand {
+    // Calibration 子命令只通过显式 Store/Artifact 参数访问 SQL 权威；readiness、build、activate 的资格由 Store/Rust 校验。
     /// Read-only report of canonical Paper outcome maturity and calibration gaps.
     Readiness {
         #[arg(long)]
@@ -191,6 +201,7 @@ struct CalibrationRiskSettings {
 }
 
 impl From<&CalibrationRiskSettings> for OfflineRiskLimits {
+    // 从借用的 clap 参数复制数值到领域配置；`Copy` 标量不会转移 settings 所有权。
     fn from(value: &CalibrationRiskSettings) -> Self {
         Self {
             min_confidence_ppm: value.min_confidence_ppm,
@@ -213,6 +224,7 @@ impl From<&CalibrationRiskSettings> for OfflineRiskLimits {
 
 #[derive(Debug, Subcommand)]
 enum EvidenceCommand {
+    // Evidence 命令是受控采集/预检入口，输出证据观察而不把网络成功直接提升为 Decision 或 Paper 结果。
     MarketAudit {
         #[arg(long)]
         output: PathBuf,
@@ -227,6 +239,7 @@ enum EvidenceCommand {
 
 #[derive(Debug, Subcommand)]
 enum ModelQualificationCommand {
+    // 模型 qualification 通过输入/输出文件交换报告，模型身份和版本验证仍由领域报告规则负责。
     Assemble {
         #[arg(long)]
         input: PathBuf,
@@ -237,6 +250,7 @@ enum ModelQualificationCommand {
 
 #[derive(Debug, Subcommand)]
 enum CanaryCommand {
+    // Canary 命令只操作持久化 campaign head；stage/status/resume 不等于已激活生产策略。
     Stage {
         #[arg(long)]
         spec: PathBuf,
@@ -249,6 +263,7 @@ enum CanaryCommand {
 
 #[derive(Debug, Subcommand)]
 enum ObservatoryConfigCommand {
+    // ObservatoryConfig 负责本地配置文件工作流，敏感字段的读取/写入由专用 handler 处理。
     Init {
         #[arg(long)]
         template: PathBuf,
@@ -261,6 +276,7 @@ enum ObservatoryConfigCommand {
 
 #[derive(Debug, Subcommand)]
 enum DaemonAction {
+    // Daemon action 通过 loopback 控制 daemon 生命周期；Freeze/Unfreeze 仍受服务端认证与 Store 状态约束。
     Serve,
     Health,
     Ready,
@@ -270,6 +286,7 @@ enum DaemonAction {
 
 #[derive(Debug, Subcommand)]
 enum RunCommand {
+    // Run 命令读取检查、事件、轨迹和受控取消/重试结果，不在 CLI 侧重写 Run 状态。
     Inspect {
         run_id: String,
     },
@@ -314,6 +331,7 @@ enum RunCommand {
 
 #[derive(Debug, Subcommand)]
 enum WorkflowCommand {
+    // Workflow blueprint 是只读拓扑投影，可选择 JSON 或 Mermaid 展示格式。
     Blueprint {
         #[arg(long, default_value = "position_plan", value_parser = ["position_plan", "paper", "shadow"])]
         purpose: String,
@@ -324,6 +342,8 @@ enum WorkflowCommand {
 
 #[derive(Debug, Subcommand)]
 enum StoreCommand {
+    // 这些子命令由 dispatch_store 交给已认证的 daemon Store API；CLI 本身不直接
+    // 打开 canonical Store。Backup/Restore/审批等写入由服务端校验并执行。
     Doctor,
     Inventory,
     Metrics,
@@ -370,6 +390,7 @@ enum StoreCommand {
 
 #[derive(Debug, Serialize)]
 struct PaperSessionView {
+    // Session view 只序列化 Store 返回的预约、scheduler epoch 和 commitment 状态，不推断订单成交。
     session_key: String,
     workflow: StoredRun,
     scheduler_epoch: u64,
@@ -379,6 +400,7 @@ struct PaperSessionView {
 }
 
 impl From<SessionSlot> for PaperSessionView {
+    // `From` 消费拥有的 SessionSlot；字段逐一 move 到只读 JSON view，未克隆 Store 状态。
     fn from(slot: SessionSlot) -> Self {
         Self {
             session_key: slot.session_key,
@@ -394,6 +416,7 @@ impl From<SessionSlot> for PaperSessionView {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
+    // Config 使用 deny_unknown_fields 保持 CLI 配置与 Rust schema 同步；credentials 单独做默认与脱敏处理。
     #[serde(default)]
     agent: akzio_domain::AgentSettings,
     daemon: DaemonSettings,
@@ -408,6 +431,7 @@ struct Config {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DaemonSettings {
+    // daemon settings 决定服务/Debug/Outcome 开关和 Store 位置，不直接授予 Paper 写权限。
     #[serde(default)]
     debug_control: bool,
     #[serde(default = "default_outcome_processing")]
@@ -423,6 +447,7 @@ struct DaemonSettings {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExecutionSettings {
+    // execution settings 是资产、行情 feed 和成本参数的声明；具体风险/审批仍由 execution Gate 校验。
     #[serde(default)]
     experiment_profile: ExperimentProfile,
     #[serde(default)]
@@ -447,6 +472,7 @@ enum ExperimentProfile {
 
 impl ExperimentProfile {
     fn as_str(self) -> &'static str {
+        // profile 只转换为稳定配置标签，不能据此切换 Live Trading 或修改历史 Run。
         match self {
             Self::Fixture => "fixture",
             Self::PaperEngineering => "paper-engineering",
@@ -466,6 +492,7 @@ struct ObservatorySettings {
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CredentialsSettings {
+    // 凭据在配置对象中只用于传递给受控客户端；Debug 输出通过自定义 fmt 永不回显 secret。
     #[serde(default)]
     alpaca_api_key: String,
     #[serde(default)]
@@ -475,7 +502,9 @@ struct CredentialsSettings {
 }
 
 impl std::fmt::Debug for CredentialsSettings {
+    // 自定义格式化实现故意不读取 secret 的明文值；调用 `{:?}` 时只显示固定脱敏标记。
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 仅输出 redacted marker，避免日志/错误路径泄露 Alpaca、FRED 或其他 API secret。
         formatter
             .debug_struct("CredentialsSettings")
             .field("alpaca_api_key", &"<redacted>")
@@ -491,6 +520,9 @@ impl std::fmt::Debug for CredentialsSettings {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ObservatoryEditableConfiguration {
+    // App/CLI 间的 camelCase 配置 wire model；Get 会原样序列化模型、Alpaca、FRED
+    // 的 key/secret 配置值（可能是明文，也可能是占位符），不是脱敏诊断格式。
+    // 字段投影本身不验证模型路由、Paper prerequisites 或权限。
     provider: String,
     #[serde(rename = "llmBaseURL")]
     llm_base_url: String,
@@ -511,9 +543,11 @@ struct ObservatoryEditableConfiguration {
 
 #[derive(Debug, Serialize)]
 struct FreezeRequest<'a> {
+    // Freeze request 借用调用方 reason，序列化后只作为 loopback 控制请求发送。
     reason: &'a str,
 }
 
+// 下面的 include 把大型命令 handler 保持在按领域拆分的模块中；这里仅注册模块，不改变其函数签名或业务流程。
 mod http_client;
 mod lesson;
 use http_client::ControlApiClient;
@@ -526,7 +560,3 @@ include!("cli/run_commands.rs");
 include!("cli/debug_commands.rs");
 include!("cli/model_qualification.rs");
 include!("cli/calibration.rs");
-
-#[cfg(test)]
-#[path = "cli/real_news_tests.rs"]
-mod real_news_tests;

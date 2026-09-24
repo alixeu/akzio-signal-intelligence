@@ -2,6 +2,9 @@ import AppKit
 import Combine
 import SwiftUI
 
+// 文件导读：AppShell 是 SwiftUI 根窗口，把 Observable Store、侧栏、运行状态栏、当前页面和 Settings 覆盖层组合起来。
+// 主入口由 ObservatoryLauncher 创建；`body.task` 请求 Store 启动/连接 Core，Observer 快照再经 Store 投影给 RouteHost 和各页面。
+// `@State` 在 View 值重建之间保留同一个 Store 引用，`@Environment` 向子 View 传播展示策略；先读 init、body、shell 和 RouteHost。
 // MARK: - Shell
 //
 // Sidebar on the left, status bar above the active route on the right, and
@@ -9,10 +12,13 @@ import SwiftUI
 // A single `Namespace` is created here and injected into the environment so every
 // shared-element handoff in the app matches against the same geometry space.
 public struct AppShell: View {
+    // Store 是 AppShell 的唯一状态入口；页面导航、展示投影与 Core 生命周期都从这里读写。
+    // `@State` 让 SwiftUI 在重新求值这个值类型 View 时继续持有同一 Store，而不是每次创建新连接状态。
     @State private var store: ObservatoryStore
     @State private var sidebarVisible = true
     @Namespace private var shared
 
+    // 这些 Environment 值来自系统或根视图策略，用来决定窗口活动、动效和透明度，不写回 Mock 数据。
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorSchemeContrast) private var colorSchemeContrast
@@ -20,6 +26,7 @@ public struct AppShell: View {
     @Environment(\.akzioRendersOffscreen) private var rendersOffscreen
 
     public init(scenario: MockScenario = .paperRunningSynthesizerActive) {
+        // 普通启动保留 Store 的自动连接行为，scenario 只决定离线初始展示数据。
         _store = State(initialValue: ObservatoryStore(scenario: scenario))
     }
 
@@ -32,6 +39,7 @@ public struct AppShell: View {
         compactLayout: Bool = false,
         language: AppLanguage = .system
     ) {
+        // 捕获入口关闭自动启动，先把路由和设置写成稳定状态，供离屏截图直接读取。
         let store = ObservatoryStore(scenario: scenario, autoStartsCore: false)
         store.openDirectly(route)
         store.settingsPresented = settingsPresented
@@ -42,6 +50,7 @@ public struct AppShell: View {
     }
 
     public var body: some View {
+        // `task` 闭包捕获当前 Store，只负责异步启动 Core；连接后的状态更新仍由 Store 汇总。
         shell
             .modifier(WindowTitlebarInsetModifier(enabled: !rendersOffscreen))
             .background(windowActivityObservers)
@@ -51,6 +60,7 @@ public struct AppShell: View {
     }
 
     private var desktopBlurEnabled: Bool {
+        // 离屏、无障碍透明度偏好或高对比度任一条件成立时，都关闭依赖桌面背景的模糊层。
         !rendersOffscreen
             && !reduceTransparency
             && !store.settings.reduceTransparencyOverride
@@ -61,10 +71,12 @@ public struct AppShell: View {
         // The AppKit material performs the Gaussian blur. This scrim only lowers
         // luminance so the blurred desktop reads as atmosphere, like macOS's
         // dark translucent capsules, instead of a readable bright window.
+        // 透明度被夹在 0.42–0.56；它只影响背景遮罩，不会改写用户保存的透明度值。
         min(0.56, max(0.42, 0.42 + (1 - store.settings.glassTransparency) * 0.20))
     }
 
     private var mainContent: some View {
+        // `some View` 是不暴露具体组合类型的返回方式；每次求值都读取 Store 当前状态，按钮动作再通过闭包交回 Store。
                     VStack(spacing: 0) {
                         if !store.isLive {
                             HStack(spacing: 8) {
@@ -73,6 +85,7 @@ public struct AppShell: View {
                                 Text("\(store.displayScenarioTitle) · 数值与运行状态均为界面样例")
                                 Spacer(minLength: 0)
                                 Button("返回真实数据") {
+                                    // 返回动作创建一次异步重连任务，按钮本身不等待或复制连接状态。
                                     Task { await store.reconnectCore() }
                                 }
                             }
@@ -99,6 +112,7 @@ public struct AppShell: View {
                             runInFlight: store.runInFlight,
                             runMessage: store.runMessage,
                             onSelectRunPurpose: store.selectRunPurpose,
+                            // 回调闭包捕获 Store，把状态栏的用户动作转成异步运行请求。
                             onRun: { Task { await store.runSelectedPurpose() } },
                             leadingPadding: sidebarVisible
                                 ? AkzioLayout.s4
@@ -135,6 +149,8 @@ public struct AppShell: View {
     }
 
     private var shell: some View {
+        // GeometryReader 的尺寸只用于根布局；设置层覆盖页面，侧栏和路由仍共享同一 Store。
+        // GeometryReader 的闭包接收父容器尺寸 proxy；下面把它用于铺满窗口，而不是创建第二份布局状态。
         GeometryReader { proxy in
             ZStack(alignment: .topLeading) {
                 // AppKit backdrop 负责模糊，这层只降低亮度；离屏截图或无障碍设置会跳过它。
@@ -210,6 +226,7 @@ public struct AppShell: View {
         .onChange(of: scenePhase) { _, phase in
             // `.background` covers minimise and hide; `.inactive` covers losing key.
             // 这是场景级信号，窗口遮挡则由下面的 AppKit 通知补充。
+            // `onChange` 闭包在系统值改变后执行；它仅同步活跃状态，不发起网络或 Core 请求。
             store.windowActive = phase == .active
         }
         .preferredColorScheme(.dark)
@@ -217,11 +234,13 @@ public struct AppShell: View {
 
     @ViewBuilder
     private var shellContent: some View {
+        // 侧栏与主内容保持同级，侧栏隐藏时只改变可见布局，不改变当前路由。
         HStack(alignment: .top, spacing: 0) {
             if sidebarVisible {
                 PageSidebar(
                     route: store.route,
                     theme: store.settings.theme,
+                    // 导航闭包捕获 Store，统一经过路由协调器处理转场。
                     onSelect: { store.navigate(to: $0) },
                     onOpenSettings: store.toggleSettings,
                     onToggleSidebar: toggleSidebar
@@ -307,6 +326,7 @@ private struct WindowTitlebarInsetModifier: ViewModifier {
 
     @ViewBuilder
     func body(content: Content) -> some View {
+        // 这是纯布局修饰器；是否避让标题栏由离屏渲染标志决定，不触碰业务状态。
         // 离屏渲染不需要避让原生标题栏；真实窗口才忽略顶部安全区。
         if enabled {
             content.ignoresSafeArea(.container, edges: .top)
@@ -322,6 +342,7 @@ private struct WindowTitlebarInsetModifier: ViewModifier {
 /// screen, and the coordinator's phase drives its staged reveal — no second copy of
 /// the outgoing page is kept alive.
 struct RouteHost: View {
+    // RouteHost 只持有 Store 的只读引用；具体页面自行读取展示投影并维护页面局部状态。
     let store: ObservatoryStore
 
     @Environment(\.motionPolicy) private var policy
@@ -340,6 +361,7 @@ struct RouteHost: View {
 
     @ViewBuilder
     private var page: some View {
+        // 当前只构造一个 route 对应页面；不可用数据由页面占位表达，不在这里补造数据。
         // 每次只构造当前 route 的页面；数据不可用时由页面级占位明确表达“无数据”，不伪装成完成。
         switch store.route {
         case .overview: OverviewPage(store: store)
@@ -377,6 +399,7 @@ extension View {
         perform action: @escaping () -> Void
     ) -> some View {
         // Publisher 的回调在主 actor 上更新 Store，View 层只负责把通知转换成无参闭包。
+        // `@escaping` 表示 `action` 会在本方法返回后由通知流稍后调用；闭包捕获的 Store 因而要遵守主 actor 隔离。
         onReceive(NotificationCenter.default.publisher(for: name)) { _ in action() }
     }
 }

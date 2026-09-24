@@ -1,7 +1,16 @@
+// 文件导读：lease helper 只负责 scheduler daemon lease 的取得、heartbeat、失效重取和
+// StoreExecutor 异步排队。它保护唯一 scheduler owner，不代表 session 已产生或 Paper
+// 订单已提交；测试还验证维护窗口延长 lease 时 heartbeat 不会回退截止时间。
+// Rust 机制：`Mutex` guard 的借用范围覆盖同步 heartbeat，poison 转为显式错误；异步方法
+// clone scheduler 后把闭包 move 进 executor，避免持有 MutexGuard 跨 await；Drop/过期恢复
+// 由 Store 的 durable lease 逻辑负责。
+
 use super::*;
 
 impl PaperScheduler {
     pub(super) fn acquire_or_renew(&self, now: DateTime<Utc>) -> SchedulerResult<DaemonLease> {
+        // 先在 Mutex 内尝试 heartbeat 现有 owner/epoch；durable heartbeat 返回 false 时清空
+        // 本地缓存，再原子 acquire 新 epoch，避免使用过期 lease 写入 Paper 状态。
         let expires_at = now + self.lease_duration;
         let mut held = self
             .lease
@@ -31,6 +40,8 @@ impl PaperScheduler {
     }
 
     pub(super) async fn acquire_or_renew_async(&self) -> SchedulerResult<DaemonLease> {
+        // 取得 lease 的同步 Store 操作排到共享 executor 后才开始计算有效期，队列等待不
+        // 消耗新 lease 的有效窗口。
         let scheduler = self.clone();
         self.store_executor
             .execute(move |_| scheduler.acquire_or_renew(Utc::now()))
@@ -42,6 +53,7 @@ impl PaperScheduler {
 mod tests {
     use super::*;
 
+    // 为 lease 测试创建独立 Store 与正式 recipe catalogue；测试不会启动长期 scheduler。
     fn scheduler() -> PaperScheduler {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../.akzio/audit-20260919/followup-20260920/tests/scheduler")
@@ -61,11 +73,13 @@ mod tests {
         open: bool,
     }
     impl BrokerSessionClock for ColdStartClock {
+        // 以固定值模拟 broker 的开/闭市回答，不读取机器本地日期或调用 Alpaca。
         fn open_session_key<'a>(
             &'a self,
         ) -> Pin<Box<dyn Future<Output = SchedulerResult<Option<String>>> + Send + 'a>> {
             Box::pin(async move { Ok(self.open.then(|| "2026-09-22".into())) })
         }
+        // 冷启动无 active policy 时不应为了不存在的 approval 去读取账户身份。
         fn paper_account_id<'a>(
             &'a self,
         ) -> Pin<Box<dyn Future<Output = SchedulerResult<String>> + Send + 'a>> {
@@ -75,6 +89,8 @@ mod tests {
         }
     }
 
+    // 验证 cold start 不绑定旧 approval、闭市不创建 slot，而开市时可持久化 canonical Paper
+    // Run 与 40 项 Need；重复 tick 返回同一 Run，不创建第二个 slot。
     #[tokio::test]
     async fn cold_start_scheduler_reserves_canonical_paper_without_approval() {
         let scheduler = scheduler();
@@ -121,6 +137,7 @@ mod tests {
         scheduler.store.verify_integrity().unwrap();
     }
 
+    // 人为阻塞 StoreExecutor，确认 lease 有效期从队列操作真正开始时计算，而非排队时。
     #[tokio::test]
     async fn queued_scheduler_lease_starts_when_store_work_can_execute() {
         let scheduler = scheduler();
@@ -165,6 +182,7 @@ mod tests {
         }
     }
 
+    // 验证 maintenance 已延长的持久化 deadline 不会被本地 heartbeat 缩短。
     #[test]
     fn daemon_heartbeat_preserves_maintenance_extended_deadline() {
         let scheduler = scheduler();

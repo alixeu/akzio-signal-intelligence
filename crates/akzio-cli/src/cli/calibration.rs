@@ -1,3 +1,11 @@
+// 文件导读：本文件负责校准 CLI：readiness/inspect/validate 只读既有 Store；
+// preflight 使用可写 Store::open，可能初始化 scratch Store，核对 Contract 时也可能安装
+// catalogue；set-risk-limits/collect/build/bootstrap/activate 分别有明确的写入边界。
+// 成熟 Outcome 不是 active Policy，candidate 也不会由 build 自动激活。
+// Rust 机制：泛型 `persist_calibration_artifact<T: Serialize>` 约束输入可序列化；闭包和
+// 迭代器按 Artifact DAG 聚合样本；`Option`/`Result` 区分 no_schedule、pending、blocked
+// 和真实错误；测试用 cfg(test) 只验证离线 Store 行为。
+
 use akzio_domain::{
     Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle, ArtifactProvenance, ArtifactRef,
     Decision, DecisionContext, DecisionHorizon, MoneyMicros, Outcome, OutcomeHorizon,
@@ -12,15 +20,18 @@ use akzio_ingest::{EvidenceAdapterError, NormalizedEvidencePayload, parse_daily_
 use chrono::{DateTime, Duration as ChronoDuration};
 
 fn handle_calibration(command: &CalibrationCommand, config_path: &Path) -> Result<()> {
-    // 统一分派校准生命周期：readiness/preflight 只读，collect/build 生成候选
-    // Artifact，activate 才会改变 Store 的 active head；任何候选生成都不会自动激活。
+    // `command: &CalibrationCommand` 只借用解析出的命令；match 的每个分支按各自权限
+    // 打开 Store。Readiness/Inspect/Validate 只读已有库；Preflight 的 Store::open
+    // 可创建或迁移 scratch，Bootstrap 在目标库激活源 Policy，不能归到只读一组。
     match command {
         CalibrationCommand::Readiness { store, min_samples } => {
+            // u32 实现 Copy，`*min_samples` 复制值而不移动借用中的命令。
             calibration_readiness(store, *min_samples, config_path)
         }
         CalibrationCommand::Preflight { scratch } => {
-            // Preflight 只验证临时 Store 中已持久化的 Policy 与当前身份，失败时
-            // 返回可消费的阻断 JSON，不启动模型或执行链。
+            // 不启动模型或执行链；但 open 会初始化/迁移 scratch，若 Policy 已就绪，
+            // decision_policy_preflight 内的 catalogue helper 也可能写入 Contract 安装。
+            // 因此“llm_calls:0”不能被误读成“文件和 Store 完全无副作用”。
             let mut config = read_config_file(config_path)?;
             resolve_model_configuration(&mut config)?;
             let store = Store::open(scratch)?;
@@ -122,8 +133,9 @@ fn handle_calibration(command: &CalibrationCommand, config_path: &Path) -> Resul
             source_store,
             target_store,
         } => {
-            // Bootstrap 只从源 Store 复制已有 active policy；源 Store 没有 active head
-            // 时报告 unconfigured，不会凭空生成或激活默认 Policy。
+            // 源库不存在时 open_existing_or_initialize 会建立空库；目标用可写 open，
+            // 有源 active Policy 时 bootstrap_active_decision_policy_from 会在目标激活
+            // 那份冻结 Policy，而不复制源 Run/Outcome 或制造新校准样本。
             let (source, source_store_created) = Store::open_existing_or_initialize(source_store)?;
             source.verify_integrity()?;
             let target = Store::open(target_store)?;
@@ -165,8 +177,9 @@ fn handle_calibration(command: &CalibrationCommand, config_path: &Path) -> Resul
             )
         }
         CalibrationCommand::Inspect { store, artifact } => {
-            // Inspect 只展示校准相关 Artifact 的元数据和正文；允许的 kind 仍受这里的
-            // canonical 检查限制，展示本身不代表候选已通过激活流程。
+            // Inspect 仅读取元数据/正文并检查三个允许的 kind；这个分支没有再次检查
+            // lifecycle==Canonical，不能把它说成与 calibration_artifact 相同的资格验证。
+            // 展示成功不代表结构已 validate、Policy decision-capable 或已激活。
             let store = Store::open_existing(store)?;
             let stored = store.artifact(&ArtifactId(ContentHash::new(artifact.clone())?))?;
             if !matches!(
@@ -187,8 +200,9 @@ fn handle_calibration(command: &CalibrationCommand, config_path: &Path) -> Resul
 
 /// Identity is checked even for an otherwise decision-capable stored policy.
 fn decision_policy_preflight(loaded: &LoadedDecisionPolicy, store: &Store) -> Result<(bool, Option<bool>)> {
-    // 只有 Policy 能力、输入哈希、Artifact 身份和 persisted status 同时齐全时，
-    // 才比较当前 Synthesizer Contract；返回值仅是资格投影，不改变 Store。
+    // `Option<bool>` 中 None 表示尚未进入 Contract 比较，而不是比较结果 false。
+    // Policy 已就绪时 helper 会调用 ActiveResearchCatalogue::install，可能写入
+    // scratch Store 的 Contract catalogue；返回的布尔值本身不激活 DecisionPolicy。
     let eligible = loaded.policy.decision_capable()
         && loaded.input_hash.is_some()
         && loaded.artifact_id.is_some()
@@ -211,6 +225,8 @@ fn decision_policy_status(policy: &DecisionPolicy) -> &'static str {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
+// Store 中的 Dataset Artifact 保存完整训练输入与报告；两者都按同一 CAS 正文持久化，
+// `report` 便于审计收集时的筛选结果，不是 Policy 激活状态。
 struct StoredCalibrationDataset {
     input: OfflineCalibrationInput,
     report: serde_json::Value,
@@ -233,7 +249,9 @@ fn persist_calibration_artifact<T: serde::Serialize>(
     sources: Vec<ArtifactRef>,
     now: DateTime<Utc>,
 ) -> Result<Artifact> {
-    // 先把不可变正文放入 CAS，再写入校准 Artifact 索引；这里不触碰 active policy head。
+    // 泛型 T: Serialize 只约束 payload 能编码为 JSON。stage_json 先暂存 BLOB；
+    // write_calibration_artifact 的事务才把它提升为 durable CAS 并写 Artifact 索引。
+    // 此 helper 不更新 active Policy head，Bootstrap/Activate 走各自独立路径。
     let artifact = Artifact::new(
         kind,
         store.stage_json(payload)?,
@@ -278,6 +296,7 @@ fn classify_calibration_run(
             "remedy":"Rerun during an open trading session with valid baseline snapshots; do not rewrite historical CAS."
         });
     }
+    // let-else 解包 Option<&OutcomeSchedule>；无 schedule 就提前返回，不编造未来到期日。
     let Some(schedule) = schedule else {
         return serde_json::json!({"status":"no_schedule", "reason":"decision_not_evaluated"});
     };
@@ -510,6 +529,7 @@ mod calibration_readiness_tests {
     use akzio_domain::WeightPpm;
     use akzio_execution::{ForecastCalibrationScope, AssetRiskCalibration, FrozenForecastCalibration, ForecastCalibrationBin, PortfolioRiskModel};
 
+    // 在隔离 Store 标记切换前后检查 readiness 是否将其排除出 canonical 样本资格。
     #[test]
     fn isolated_store_readiness_cannot_recommend_canonical_collection() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -527,6 +547,7 @@ mod calibration_readiness_tests {
         assert!(store.active_decision_policy().unwrap().is_none());
     }
 
+    // 组装仅供身份比较测试的结构有效 Policy；合成数值不会写入或激活 Store。
     fn policy_with_positive_calibration_bin(now: chrono::DateTime<Utc>) -> DecisionPolicy {
         let scope = ForecastCalibrationScope {
             model_id: "test-model".to_owned(),
@@ -616,6 +637,8 @@ mod calibration_readiness_tests {
         }
     }
 
+    // 即使 Policy 本身 decision-capable，Synthesizer Contract 不匹配仍应阻断；
+    // 将测试对象改成当前 hash 后只改变资格投影，不会更新 active head。
     #[test]
     fn old_policy_is_blocked_by_new_synthesizer_contract_without_activation() {
         let store = Store::open(Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -642,6 +665,7 @@ mod calibration_readiness_tests {
         assert!(store.active_decision_policy().unwrap().is_none());
     }
 
+    // 构造只供分类测试使用的 NoOrder schedule，日期是 fixture 标签，不是实际市场数据。
     fn schedule() -> OutcomeSchedule {
         let reference = |kind| ArtifactRef {
             artifact_id: ArtifactId(ContentHash::of_bytes(
@@ -663,6 +687,7 @@ mod calibration_readiness_tests {
         }
     }
 
+    // 固定旧文件入口被拒绝、Outcome 成熟度按已持久化 horizon 统计的回归边界。
     #[test]
     fn legacy_policy_file_configuration_and_file_cli_inputs_are_rejected() {
         let execution = "assets = [\"TQQQ\", \"QQQ\", \"SOXX\", \"SOXL\"]\n";
@@ -711,6 +736,7 @@ mod calibration_readiness_tests {
         );
     }
 
+    // 分别覆盖 pending、blocked、no_schedule、sealed 及统一 12 个槽位的样本计数。
     #[test]
     fn readiness_classifies_maturity_and_frozen_baseline_without_calendar_guessing() {
         let schedule = schedule();
@@ -764,6 +790,9 @@ mod calibration_readiness_tests {
     }
 }
 
+// Collect 中经 Paper Run、Decision/Outcome、价格标签及 AgentTurn 最小模型身份筛选
+// 的单个候选；这里尚未检查 active Policy 是否匹配，model_version_hash 取当前配置。
+// 各字段拥有扫描结果，后续可据此按同一 Contract 合并样本。
 struct CollectedCalibrationCandidate {
     run_id: RunId,
     decision_artifact: akzio_domain::Artifact,
@@ -828,6 +857,8 @@ fn collect_calibration_dataset(
     let requested_end = training_end
         .map(|value| parse_calibration_time(value, "training_end"))
         .transpose()?;
+    // Option<Result<T,E>>::transpose() 得到 Result<Option<T>,E>：未提供边界保留 None，
+    // 提供但解析失败则由 ? 向上返回；zip 只有两端均为 Some 才比较先后。
     if requested_start
         .zip(requested_end)
         .is_some_and(|(start, end)| start > end)
@@ -840,8 +871,10 @@ fn collect_calibration_dataset(
         .context("scan recent Decision artifacts for calibration collect")?;
     let mut skipped = Vec::new();
     let mut candidates = Vec::new();
-    // 每个 Decision 都独立经过 Paper purpose、canonical、结构、Outcome、模型身份和
-    // 市场标签筛选；单个 Run 的缺陷记录在 skipped 中，不会中断其他候选的扫描。
+    // 先从最近最多 500 份 Decision 扫描，再按 Paper/canonical/完整标签筛选；
+    // 一般候选缺陷记 skipped，Store 查询类错误仍由 ? 阻断整个 collect。
+    // 历史 AgentTurn 在下方核 provider/model/Contract，model_version_hash 则由本次
+    // 有效配置生成并写入样本，不等于逐 turn 核实其全部日期和路由字段。
     for decision_artifact in decision_artifacts.iter().cloned() {
         let Some(run_id) = decision_artifact
             .origin
@@ -983,7 +1016,8 @@ fn collect_calibration_dataset(
     }
     candidates.sort_by(|left, right| left.run_id.cmp(&right.run_id));
 
-    // 数据集必须绑定同一 Synthesizer Contract；不一致的候选被排除，而不是混合训练。
+    // 排序后以第一个候选的 Synthesizer Contract 为本次组别，其余排除；不是挑样本
+    // 最多的组，也不是自动选择 Store 当前 active Contract，后续 activate 还会重验。
     let contract_hash = candidates
         .first()
         .map(|candidate| candidate.contract_hash.clone());
@@ -1137,6 +1171,8 @@ fn collect_calibration_dataset(
     });
     collected_runs.sort();
     collected_runs.dedup();
+    // 每只资产各建日期集合，再 reduce 求交集；只有四资产共同有收盘价的日期才进入
+    // 协方差价格面。无集合时 unwrap_or_default 给空集，后面的 enough_prices 会阻断。
     let common_dates = panel
         .values()
         .map(|bars| bars.keys().copied().collect::<BTreeSet<_>>())
@@ -1160,6 +1196,8 @@ fn collect_calibration_dataset(
                 .collect(),
         })
         .collect::<Vec<_>>();
+    // try_from 在极窄 usize 平台上可能失败；这里取 MAX 并饱和相乘，只会让
+    // “足够样本”更难满足，不会整数溢出后错误地放行。
     let required_forecast_samples = usize::try_from(min_samples)
         .unwrap_or(usize::MAX)
         .saturating_mul(Asset::EXECUTABLE.len())
@@ -1306,8 +1344,9 @@ fn session_close_time(date: NaiveDate) -> DateTime<Utc> {
 }
 
 fn relative_return_ppm(base: MoneyMicros, future: MoneyMicros) -> Result<i64> {
-    // 只有正的基准和未来价格才能形成收益标签；整数运算按 ppm 保留并在除法/转换
-    // 可能溢出时显式报错，避免用饱和或默认值掩盖无效样本。
+    // 只有正的基准和未来价格才能形成收益标签；先转 i128 再算 ppm，
+    // 乘法实际用 saturating_mul（对两个 i64 价格的差而言不会接近 i128 极值），
+    // checked_div 与 try_from 分别处理除法无结果及不能放进 i64 的情形。
     if base.0 <= 0 || future.0 <= 0 {
         bail!("calibration label requires positive baseline and future prices");
     }
@@ -1320,6 +1359,7 @@ fn relative_return_ppm(base: MoneyMicros, future: MoneyMicros) -> Result<i64> {
     .context("calibration return does not fit i64")
 }
 
+// 从 Decision 血缘提取的最小模型身份；缺少其中任一字段时调用者不会把 Run 用作训练样本。
 struct SynthesizerIdentity {
     provider_id: String,
     model_id: String,

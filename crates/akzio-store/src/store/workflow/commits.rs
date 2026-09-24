@@ -1,4 +1,9 @@
+// 文件导读：本文件处理取消、defer/retry 和 claim。Task 状态、Attempt lease、Run 状态、
+// 生命周期事件与 Debug control 必须在同一事务内收束，读取到的 retry 次数来自 durable rows。
+// 写路径由 Scheduler/Worker 调用；先看 cancel/defer/retry 的终态边界，再读 claim_next_task... 的
+// SQL 选择条件、epoch permit 构造和 Attempt/Task/event 一次提交。
 impl Store {
+    // 从 Task 的持久事件统计当前 Outcome stage 的失败尝试数；handler 不传自报计数。
     pub fn failure_attempts_for_current_stage(&self, task_id: &TaskId) -> StoreResult<u64> {
         let connection = self.connection()?;
         task_failure_attempt_count(&connection, task_id)
@@ -13,6 +18,8 @@ impl Store {
         reason: &str,
         now: DateTime<Utc>,
     ) -> StoreResult<bool> {
+        // reason 必须非空；Immediate 事务确认 Run 存在后 INSERT OR IGNORE cancellation。
+        // 首次插入会同事务追加 RunCancelRequested、取消 queued Task 并刷新 Run/control；重复请求返回 false。
         if reason.trim().is_empty() {
             return Err(StoreError::Domain(DomainError::EmptyField {
                 field: "run_cancel.reason",
@@ -56,6 +63,7 @@ impl Store {
     }
 
     pub fn run_cancel_requested(&self, run_id: &RunId) -> StoreResult<bool> {
+        // 按 run_id 查询取消 marker；存在为 true，不存在为 false，不触碰 Task 或 Run 状态。
         let connection = self.connection()?;
         Ok(connection
             .query_row(
@@ -67,17 +75,16 @@ impl Store {
             .is_some())
     }
 
-    /// Close the active attempt as retried or terminal. The policy and
-    /// attempt count are read from the durable task record, so a handler
-    /// cannot make itself retryable or extend its retry budget.
-    /// Durably defers a claimed task without consuming its failure retry
-    /// budget. The attempt is closed and replay records the queued transition.
+    /// 将持有 permit 的 Task 延期到未来 `ready_at`；Attempt 记为 deferred，
+    /// 不读取也不消费失败重试次数。它既不是 retry，也不是任务终态。
     pub fn defer_task(
         &self,
         permit: &TaskWritePermit,
         ready_at: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> StoreResult<()> {
+        // defer 的 ready_at 必须晚于 now；事务内断言 permit 后把 Task 重新排队、关闭当前 Attempt 为 deferred，
+        // 追加 event 并结算 Debug control。此路径不读取 retry budget，也不消费失败重试次数。
         if ready_at <= now {
             return Err(StoreError::InvalidTaskDeferral(permit.task_id.clone()));
         }
@@ -115,6 +122,8 @@ impl Store {
         retry_at: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> StoreResult<RetryTaskResult> {
+        // retry_at 由调用者给定；真正的可重试额度从 Task policy 与 durable Attempt rows 重算。
+        // 仍有额度时 requeue 并返回 Requeued；耗尽时写 exhausted event、按 on_failure 收束并返回 Terminal。
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_workflow_executable(&transaction, &permit.run_id)?;
@@ -175,6 +184,7 @@ impl Store {
         lease_for: Duration,
         workload: TaskWorkload,
     ) -> StoreResult<Option<ClaimedAttempt>> {
+        // 普通入口不提供 runtime_identity，统一委派到更完整入口；Debug task 会因 identity 不匹配而不可领取。
         self.claim_next_task_for_workload_with_identity(worker_id,now,lease_for,workload,None)
     }
 
@@ -182,6 +192,11 @@ impl Store {
         &self, worker_id:&str, now:DateTime<Utc>, lease_for:Duration,
         workload:TaskWorkload, runtime_identity:Option<&ContentHash>,
     ) -> StoreResult<Option<ClaimedAttempt>> {
+        // worker_id 必须非空；IMMEDIATE 事务按 workload、ready_at、Debug identity/status、Run 状态、
+        // cancellation 和依赖未完成条件选择一条 queued Task：先按 ready_at 升序，
+        // 同时刻再按 priority 降序及 task_id 排序，并非跨不同 ready_at 的全局最高优先级。
+        // 无候选时提交只读事务并返回 None；命中时以 lease_epoch+1 和新 Attempt/Lease ID 构造 permit，
+        // 条件 UPDATE、Attempt insert、Run/event/AttemptRelation、Debug permit consumption 共同提交。
         if worker_id.trim().is_empty() {
             return Err(StoreError::Domain(DomainError::EmptyField {
                 field: "worker_id",
@@ -243,6 +258,7 @@ impl Store {
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?;
+        // 只在仍为 queued 的 WHERE 下领取；并发条件不成立即 TaskNotRunnable，不返回半成品 permit。
         let updated = transaction.execute(
             r#"UPDATE rebuild_tasks
                SET status = 'running', lease_id = ?1, lease_epoch = ?2, active_attempt_id = ?3,
@@ -288,6 +304,7 @@ impl Store {
             now,
         )?;
         if let Some((parent_attempt_id, parent_status)) = previous_attempt {
+            // 上一 Attempt 为 abandoned 记 Recovery，其它终态记 Retry；关系 Artifact/event 仍在 claim 事务内。
             let relation = if parent_status == "abandoned" {
                 AttemptRelationKind::Recovery
             } else {
@@ -302,6 +319,7 @@ impl Store {
             )?;
         }
         debug::consume_claim(&transaction, &permit, now)?;
+        // permit 只有在事务成功 commit 后才交给 worker；失败时 Task 与 Attempt 行一并回滚。
         transaction.commit()?;
         Ok(Some(ClaimedAttempt {
             run_id,

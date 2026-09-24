@@ -1,5 +1,11 @@
+// 文件导读：本文件提供 Outcome/Retrospective、Policy head/transition 和消费 cursor 的
+// 只读历史查询；每个返回值都来自 canonical evaluation 或明确的 Run artifact lineage。
+// 阅读顺序可从 outcome/retrospective 的 Run-scoped 查询开始，再看 lifecycle health，
+// 最后看 policy subject head/snapshot/influence/transition；这些查询不激活候选。
 impl Store {
     /// Authoritative once-per-subject Outcome consumption lookup.
+    // subject 与 Outcome Artifact ID 组成 SQL 过滤条件；event_cursor 升序选最早 evaluation，
+    // 无行 None，有行后再从 CAS 重建 evaluation Artifact。
     pub fn policy_evaluation_for_outcome(
         &self,
         subject: &PolicySubject,
@@ -13,8 +19,10 @@ impl Store {
             .transpose()
     }
 
-    /// Returns the accepted retrospective for one run/outcome/horizon identity.
-    /// The integrity gate guarantees that at most one artifact can match.
+    /// 读取指定 Run/Outcome/期限的复盘：允许一条原版，或一条原版加一条
+    /// 符合 `valid_retrospective_repair` 的修订；其它重复形状报完整性错误。
+    // Run+kind 索引先筛候选，再以 Artifact.origin 的 run_id 与 payload outcome_id/horizon 做精确过滤；
+    // 恰有两条时只接受 valid_retrospective_repair 指定方向并返回修复后的新版本。
     pub fn retrospective_for(
         &self,
         run_id: &RunId,
@@ -56,6 +64,9 @@ impl Store {
 
     /// Explicit, bounded narrative-only retry. It never changes a session slot,
     /// broker commitment, original contract, or numeric Outcome.
+    // 从已密封 Outcome 与其 T5 Retrospective 读取事实；事务内检查 Paper Run、已有 worker/repair 数量，
+    // 复制冻结的 Outcome worker node 并只增加两个 Artifact 输入，不重写价格或 execution lineage。
+    // 最多允许两条 repair Task；已有 queued/running repair 时直接返回该 Task ID、不新建 Task。
     pub fn request_outcome_narrative_repair(
         &self,
         run_id: &RunId,
@@ -69,6 +80,7 @@ impl Store {
             .retrospective_for(run_id, &payload.outcome_id, OutcomeHorizon::T5)?
             .ok_or(StoreError::InvalidLearningCommit("retrospective_missing"))?;
         let retrospective: Retrospective = self.read_artifact_payload(&previous)?;
+        // 仅 ModelUnavailable/Complete 可请求叙事修复；其它状态不允许用新调用覆盖已有结论。
         if !matches!(
             retrospective.status,
             RetrospectiveStatus::ModelUnavailable | RetrospectiveStatus::Complete
@@ -95,6 +107,7 @@ impl Store {
             .iter()
             .find(|(_, status)| status == "queued" || status == "running")
         {
+            // 此早退不写数据库；事务 guard 随 return Drop 释放。
             return Ok(TaskId(id.clone()));
         }
         let active_worker: bool = transaction.query_row(
@@ -119,6 +132,7 @@ impl Store {
         let installed = self
             .stored_contract_with_connection(&transaction, &hash)?
             .ok_or_else(|| StoreError::MissingContractInstallation(hash.clone()))?;
+        // Contract 来自当前 catalogue head；图里若冻结了 Outcome worker budget，优先继续沿用该 budget。
         node.task_id = TaskId::new();
         node.contract_hash = Some(hash);
         node.budget = snapshot.revision.graph.agent_budgets.get(POST_TERMINAL_WORKER_RECIPE_ID).cloned().unwrap_or(installed.contract.budget);
@@ -139,6 +153,7 @@ impl Store {
         ]);
         node.input_artifacts.sort();
         node.input_artifacts.dedup();
+        // 新 Task 无 dependencies/parent_task_id，通过已密封 Outcome 和旧 T5 Retrospective 输入建立修复上下文。
         insert_task_node(&transaction, run_id, &node, now)?;
         append_event(
             &transaction,
@@ -158,11 +173,14 @@ impl Store {
         run_id: &RunId,
         kind: ArtifactKind,
     ) -> StoreResult<Vec<Artifact>> {
+        // 按 run_id+kind 的 Artifact 索引读取；不额外筛 lifecycle，也不解码 payload。
         let connection = self.connection()?;
         read_run_kind_artifacts(&connection, run_id, kind)
     }
 
     pub fn run_lifecycle_health(&self, run_id: &RunId) -> StoreResult<RunLifecycleHealth> {
+        // 组合 workflow、schedule/outcome、retrospective、evaluation 与 token usage 多次只读查询；
+        // 没有共同 SQL transaction，因此并发新写入可能发生在不同子查询之间。
         let snapshot = self.workflow_snapshot(run_id)?;
         let schedule = self.outcome_schedule_for_run(run_id)?;
         let schedule_payload = schedule
@@ -171,6 +189,8 @@ impl Store {
             .transpose()?;
         let mut retrospective_status = BTreeMap::new();
         for horizon in OutcomeHorizon::ALL {
+            // 每个 horizon 分开查询；Complete 显示 valid，其他已存 Retrospective 显示 unavailable，
+            // 无 schedule 为 not_scheduled，有 schedule 无 Retrospective 为 pending。
             let status = if let Some(schedule) = &schedule_payload {
                 match self.retrospective_for(run_id, &schedule.outcome_id, horizon)? {
                     Some(artifact) => {
@@ -225,6 +245,8 @@ impl Store {
 
     /// Returns the accepted outcome for one run/outcome identity.
     /// Repeated evaluation attempts reuse this immutable materialization.
+    // 按 Run kind 索引筛 origin、canonical lifecycle、sealed 和 outcome_id；零项 None、一项返回，
+    // 多项身份冲突时报 Integrity，不随意选“最新”覆盖。
     pub fn outcome_for(
         &self,
         run_id: &RunId,
@@ -256,8 +278,9 @@ impl Store {
         }
     }
 
-    /// Reads the current policy head without exposing mutable storage to
-    /// callers. Previous policy versions remain in `rebuild_policy_transitions`.
+    /// 只读恢复本 Run 唯一 canonical OutcomeSchedule，验证 payload；
+    /// 这里不查询 Policy head，更不推进 Outcome 阶段。
+    // 本实现实际读取指定 Run 的 Canonical OutcomeSchedule，不读取 Policy head；解码并 validate 后只接受唯一项。
     pub fn outcome_schedule_for_run(&self, run_id: &RunId) -> StoreResult<Option<Artifact>> {
         let connection = self.connection()?;
         let mut matching =
@@ -286,6 +309,7 @@ impl Store {
         }
     }
 
+    // 查找该 Run 唯一 sealed Outcome，接受 Canonical 或 RunScoped 生命周期；多条 sealed 记录视为完整性错误。
     pub fn outcome_for_run(&self, run_id: &RunId) -> StoreResult<Option<Artifact>> {
         let connection = self.connection()?;
         let mut matching = Vec::new();
@@ -318,6 +342,7 @@ impl Store {
         }
     }
 
+    // 领域 validate subject 后按 subject_id 重建当前 policy head；无 transition head 返回 None。
     pub fn policy_head(&self, subject: &PolicySubject) -> StoreResult<Option<PolicyHead>> {
         subject.validate()?;
         let connection = self.connection()?;
@@ -327,6 +352,8 @@ impl Store {
     /// Captures one durable freshness window for all horizons. The returned
     /// cutoff is later committed verbatim; pairs completed after it remain
     /// fresh even if they arrive before evaluation persistence.
+    // 一份 Deferred 事务里同时抓 after/through cursor 和 horizon counts；evaluation 后续必须原样重验，
+    // 新到达的 pair 不会被悄悄并入已开始的样本窗口。
     pub fn policy_shadow_pair_snapshot(
         &self,
         subject: &PolicySubject,
@@ -350,6 +377,8 @@ impl Store {
     /// Resolves only policy influences that were durably committed by a
     /// canonical evaluation. Arbitrary Experience/CandidatePolicy artifacts
     /// therefore cannot enter Context or Execution provenance.
+    // SQL UNION 仅查 evaluation ledger 登记过的 Experience/CandidatePolicy；再核 Artifact kind，
+    // 并要求所有匹配行解析成同一个 typed PolicySubject。
     pub fn recorded_policy_influence_subject(
         &self,
         artifact_id: &ArtifactId,
@@ -397,6 +426,7 @@ impl Store {
     /// Replays immutable policy transitions in revision order. Consumers use
     /// this for audit/replay; mutations remain limited to
     /// `record_policy_evaluation`.
+    // 先校验 typed subject，再按 revision 升序重放其 immutable history，不移动当前 policy head。
     pub fn policy_transitions(
         &self,
         subject: &PolicySubject,

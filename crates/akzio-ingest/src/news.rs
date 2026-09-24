@@ -1,5 +1,9 @@
 //! News discovery and an independent source-reading model call. Neither is an
 //! execution approval or a proof of an investment prediction.
+// 文件导读：NewsRouter 按 GovernedResource 与 acquisition_mode 分流发行方直连、native
+// discovery 和独立 reviewer。reviewer 只把有 citation、日期与 URL 绑定的事实放进
+// Context 投影；provider/reviewer 原文留在 RawEvidence，模型审查结果始终不等于 source_verified。
+// 本模块返回采集结果，不创建 Decision、订单或 Store 状态。
 use std::{collections::BTreeSet, sync::Arc};
 
 use akzio_domain::ContentHash;
@@ -22,6 +26,7 @@ use crate::{
 pub fn configured_news_evidence_transport(
     config: &ModelConfig,
 ) -> Result<Arc<dyn AsyncEvidenceAdapter>, EvidenceAdapterError> {
+    // discovery 和 reviewer 分别解析既有 route 配置；返回的 Arc trait object 让 daemon 与测试共用同一适配器拓扑。
     let discovery = config
         .routes
         .get("evidence.news_web")
@@ -33,6 +38,7 @@ pub fn configured_news_evidence_transport(
         .map(|r| config.for_route(r))
         .unwrap_or_else(|| config.clone());
     let client = |c: &ModelConfig| {
+        // ModelClient 构造失败保留为 EvidenceAdapterError::Transport，调用方不会得到半配置的新闻适配器。
         ModelClient::from_config(c).map_err(|e| EvidenceAdapterError::Transport(e.to_string()))
     };
     Ok(Arc::new(NewsRouter {
@@ -52,6 +58,7 @@ struct NewsRouter {
 }
 
 fn is_official(resource: &GovernedResource) -> bool {
+    // 只有发行方持仓、指数元数据和杠杆条款走 official；最近新闻与 earnings 日历仍走 native/reviewed 路径。
     matches!(
         resource,
         GovernedResource::OfficialFundHoldings { .. }
@@ -64,9 +71,10 @@ fn is_official(resource: &GovernedResource) -> bool {
 /// first complete value. Observed real failure: a well-formed
 /// `{"sources":[...]}` followed by one stray `}`, which made `from_str` discard
 /// five fully reviewed sources. Only bytes after a complete value are ignored —
-/// truncated or malformed JSON still fails, and the envelope's own schema is
-/// unchanged, so no unverified fact is admitted.
+/// 截断或首个完整 JSON 值内部的格式/字段错误仍失败；完整值之后的任意
+/// 尾随字节则被忽略。后续事实仍需逐项 URL、citation、日期校验。
 fn parse_review_envelope(text: &str) -> Result<Review, serde_json::Error> {
+    // 用流式 Deserializer 读取第一个完整 JSON；尾随字节可容忍，但截断或 schema 错误仍通过 Result 拒绝。
     let mut stream = serde_json::Deserializer::from_str(text).into_iter::<Review>();
     match stream.next() {
         Some(result) => result,
@@ -124,6 +132,7 @@ impl Review {
         request: &EvidenceRequest,
         now: DateTime<Utc>,
     ) -> Result<(), String> {
+        // review 必须逐一覆盖 discovery 的 URL；supported 事实还要有 provider citation、非空字段和 cutoff 内日期。
         let returned = self
             .sources
             .iter()
@@ -147,6 +156,7 @@ impl Review {
                 return Err("review reason is missing".into());
             }
             if source.status == SourceStatus::Supported {
+                // url_identity 只消除已知 tracking 参数；它不跟随 redirect，也不把不同 host/path 合并成同一来源。
                 if !observed
                     .iter()
                     .any(|url| url_identity(url) == url_identity(&source.url))
@@ -189,6 +199,7 @@ impl Review {
 // Only known tracking parameters are removed. Host, path and semantic query
 // parameters remain part of identity; this does not infer redirects.
 fn url_identity(value: &str) -> String {
+    // URL 解析失败时保留原字符串；成功时只移除固定 utm 参数，语义 query、host 和 path 都继续参与身份比较。
     let Ok(mut url) = reqwest::Url::parse(value) else {
         return value.to_owned();
     };
@@ -217,6 +228,7 @@ impl Review {
         request: &EvidenceRequest,
         now: DateTime<Utc>,
     ) -> (Vec<Value>, Vec<Value>) {
+        // 按 source/fact 独立分区：合法事实进入 accepted，任何缺 citation、过期或来源问题进入 failures，不相互覆盖。
         let mut accepted = Vec::new();
         let mut failures = Vec::new();
         for requested in urls {
@@ -242,6 +254,7 @@ impl Review {
             // Check each fact independently, retaining source-level failures even
             // for empty or unsupported sources. Never upgrade model review.
             let facts: Vec<Option<&Fact>> = if source.facts.is_empty() {
+                // None 表示该来源没有事实；这仍会经过 source-level 校验，不能把空 review 当成支持。
                 vec![None]
             } else {
                 source.facts.iter().map(Some).collect()
@@ -281,6 +294,7 @@ impl NewsRouter {
         &self,
         request: &EvidenceRequest,
     ) -> Result<AcquiredEvidence, EvidenceAdapterError> {
+        // reviewed 先通过 native adapter 做 discovery，再用独立 reviewer 读取候选来源；两次异步调用都保留各自的 Result 边界。
         let mut discovery_request = request.clone();
         discovery_request.acquisition_mode = EvidenceAcquisitionMode::DiscoveryOnly;
         let mut acquired = self
@@ -295,6 +309,7 @@ impl NewsRouter {
             })?;
         let mut policy = NativeWebPolicy::default();
         // Read the source restriction used by the actual discovery request.
+        // allowed_domains 从实际 provider request 回读，避免 reviewer 使用一套更宽的来源权限。
         let domains = acquired
             .normalized
             .pointer("/provider_request/tools/0/filters/allowed_domains")
@@ -320,6 +335,10 @@ impl NewsRouter {
             .take(8)
             .map(str::to_owned)
             .collect::<BTreeSet<_>>();
+        // 候选 URL 最多取八个；BTreeSet 同时去重并为审计输出提供稳定顺序。
+        // 下方 include_str! 在编译时把只读 source_verifier.md 嵌入请求；该 Prompt 是运行时输入，
+        // 本文件只消费它，不在这里改写正文。respond 返回 Future，await 才等待 reviewer；
+        // 取消只终止本地处理，不能证明 provider 未收到请求，本函数本身不持久化结果。
         let response = self.reviewer.respond(ModelRequest {
             instructions: include_str!("prompts/source_verifier.md").into(),
             input: ModelInput::Fresh { text: json!({"resource":request.resource,"source_urls":urls,"candidate_summary":acquired.normalized.get("output_text")}).to_string() },
@@ -331,6 +350,7 @@ impl NewsRouter {
         }).await;
         let now = Utc::now();
         let mut accepted = Vec::new();
+        // reviewer 的 provider response 必须通过 policy 校验、citation 提取和 JSON envelope 解析，任一步失败都不接受事实。
         let (review_audit, review_error) = match response {
             Ok(response) => {
                 let result = (|| -> Result<(Review, BTreeSet<String>), String> {
@@ -381,6 +401,7 @@ impl NewsRouter {
         };
         let usable = !accepted.is_empty();
         let mut value = acquired.normalized.clone();
+        // normalized 只保留 accepted facts 作为 Context 投影；discovery 原文和完整审核响应仍只进入 RawEvidence。
         value["discovery_output_text"] = value["output_text"].clone();
         value["output_text"] = json!(accepted
             .iter()
@@ -431,6 +452,7 @@ impl NewsRouter {
         // the same raw envelope; no independent source snapshot is invented.
         let review_bytes = serde_json::to_vec(&value["source_review"])
             .map_err(|e| EvidenceAdapterError::Transport(e.to_string()))?;
+        // 将审核记录追加到原始 NDJSON envelope 并重新计算 provenance hash，不伪造独立的 source snapshot。
         acquired.raw.extend_from_slice(b"\n");
         acquired.raw.extend_from_slice(&review_bytes);
         acquired.media_type = "application/x-ndjson".into();
@@ -487,6 +509,7 @@ impl NewsRouter {
                 None
             };
         acquired.normalized = value;
+        // 返回的 Result 只表示适配器完成了这次受控转换；model_reviewed 仍不是 source_verified 或投资结论。
         Ok(acquired)
     }
 }
@@ -499,6 +522,7 @@ impl AsyncEvidenceAdapter for NewsRouter {
         &'a self,
         request: &'a EvidenceRequest,
     ) -> BoxFuture<'a, Result<AcquiredEvidence, EvidenceAdapterError>> {
+        // trait 方法返回 BoxFuture 以统一异步对象；先核对 source，再按 typed resource 和 acquisition_mode 路由。
         Box::pin(async move {
             if request.source != self.source() {
                 return Err(EvidenceAdapterError::SourceMismatch);
@@ -643,6 +667,8 @@ mod tests {
 }
 
 fn news_review_status(usable: bool, error: Option<&str>) -> &'static str {
+    // 只要已有至少一项可接纳事实，整包状态就为 model_reviewed；其它事实的
+    // 失败原因仍留在 validation_failures。没有事实才按错误前缀分类。
     if usable {
         return "model_reviewed";
     }

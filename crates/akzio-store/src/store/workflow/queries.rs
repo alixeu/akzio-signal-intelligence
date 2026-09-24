@@ -1,8 +1,15 @@
+// 文件导读：本文件把 SQL 中的 succeeded Attempt、Run purpose、workflow snapshot
+// 和事件 cursor 恢复为只读领域投影；读取会验证 task/attempt/graph 一致性，但不推进状态。
+// current_succeeded_attempt 用 Deferred 事务组合多个关联读；其它查询依赖单条连接读取，必要时调用
+// workflow_snapshot_with_connection 重新校验图与行数据。
 impl Store {
     /// Returns the latest succeeded attempt for the task, including only
     /// artifacts committed by that exact attempt. The query is intentionally
     /// task-level and attempt-level in one read so an older parent attempt
     /// cannot be projected after a later retry succeeds.
+    // 一个 Deferred 事务内选最新成功 Attempt、其正式 outputs 和最近 ContextManifest event；
+    // 不把旧 Attempt 或仅有普通 event 的中间 Artifact 当作 proof。
+    // `Option::map(...).transpose()?` 将“没有 manifest”保留为 None，坏 hash 则传播错误。
     pub fn current_succeeded_attempt(
         &self,
         run_id: &RunId,
@@ -75,6 +82,7 @@ impl Store {
 
     /// Returns the durable purpose recorded with a run. Learning uses this
     /// instead of accepting a caller-provided purpose flag.
+    // run_id 精确查询持久化 purpose；未知 enum 不回退为默认值。
     pub fn run_purpose(&self, run_id: &RunId) -> StoreResult<RunPurpose> {
         let connection = self.connection()?;
         let purpose = connection
@@ -93,11 +101,13 @@ impl Store {
         run_id: &RunId,
         revision: u64,
     ) -> StoreResult<WorkflowRevision> {
+        // 精确查 Run+revision 并复用 graph CAS 解码器；缺版本或 graph 校验失败均为 Err。
         let connection = self.connection()?;
         self.workflow_revision_with_connection(&connection, run_id, revision)
     }
 
     pub fn workflow_snapshot(&self, run_id: &RunId) -> StoreResult<WorkflowSnapshot> {
+        // 同步取 Store 连接并恢复当前 graph head 与 SQL Task 状态；此包装入口本身未显式开启事务。
         let connection = self.connection()?;
         self.workflow_snapshot_with_connection(&connection, run_id)
     }
@@ -105,6 +115,8 @@ impl Store {
     /// Returns newest workflow snapshots for read-only observer clients.
     /// The Store remains the sole authority and bounds the query even when a
     /// caller supplies an excessive limit.
+    // limit 夹到 1..=100；先倒序读取 Run IDs，再在同一连接内重建每份 snapshot。
+    // 这些 SELECT 没有外层 Deferred 事务，跨 Store/process 的并发写入不保证一个共同快照。
     pub fn recent_workflows(&self, limit: usize) -> StoreResult<Vec<WorkflowSnapshot>> {
         let connection = self.connection()?;
         let limit = i64::try_from(limit.clamp(1, 100)).expect("bounded observer limit fits i64");
@@ -126,6 +138,7 @@ impl Store {
     }
 
     /// Monotonic cursor used by observer SSE as an invalidation signal.
+    // 返回全局 MAX(event_id)，空表用 0；它只用于观察端失效通知，不代表业务完成。
     pub fn event_cursor(&self) -> StoreResult<i64> {
         let connection = self.connection()?;
         connection

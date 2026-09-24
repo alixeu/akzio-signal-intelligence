@@ -1,3 +1,7 @@
+// 文件导读：收集一次 Paper/Replay 发布验收所需的运行时、Workflow、Broker、Outcome、
+// 学习和人工审批证据，并从证据确定性推导 E0..E4 等级及可发布状态。
+// `materialize` 先拒绝结构错误，再计算派生等级/问题/哈希；不回读 Store 或核实传入
+// Broker/Outcome 证据的真实性，Approvable 只是包内一致性结论，不会发起发布或 Paper 操作。
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, NaiveDate, Utc};
@@ -264,6 +268,7 @@ pub struct ReleaseEvidenceBundle {
 }
 
 impl ReleaseEvidenceBundle {
+    // 先验证证据正文，再推导等级/状态/问题并计算 bundle_hash，最后复核整包。
     pub fn materialize(body: ReleaseEvidenceBody) -> Result<Self, DomainError> {
         validate_release_body(&body)?;
         let evidence_tier = derive_evidence_tier(&body);
@@ -282,6 +287,7 @@ impl ReleaseEvidenceBundle {
         Ok(bundle)
     }
 
+    // 重新推导正文对应的所有派生字段，拒绝任何状态、问题或哈希漂移。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION
             || self.bundle_version != RELEASE_EVIDENCE_BUNDLE_VERSION
@@ -303,6 +309,7 @@ impl ReleaseEvidenceBundle {
 }
 
 fn validate_release_body(body: &ReleaseEvidenceBody) -> Result<(), DomainError> {
+    // 只做结构和引用 kind 校验；是否足够发布由 derive_release_state 单独判定。
     if let Some(runtime) = &body.runtime {
         if runtime.repository_commit.trim().is_empty()
             || runtime.rust_toolchain.trim().is_empty()
@@ -325,6 +332,7 @@ fn validate_release_body(body: &ReleaseEvidenceBody) -> Result<(), DomainError> 
             return Err(DomainError::InvalidContentHash);
         }
     }
+    // 集合迭代器一次检查所有 provider/source 文本，空项直接拒绝正文。
     if body.provider_routes.iter().any(|route| {
         route.provider_id.trim().is_empty()
             || route.model_id.trim().is_empty()
@@ -416,6 +424,7 @@ fn release_bundle_hash(
     issues: &BTreeSet<ReleaseEvidenceIssue>,
     body: &ReleaseEvidenceBody,
 ) -> Result<ContentHash, DomainError> {
+    // 哈希覆盖 schema/version、派生等级/状态/问题以及完整正文。
     content_hash_json(&serde_json::json!({
         "schema_version": DOMAIN_SCHEMA_VERSION,
         "bundle_version": RELEASE_EVIDENCE_BUNDLE_VERSION,
@@ -428,6 +437,7 @@ fn release_bundle_hash(
 }
 
 fn derive_evidence_tier(body: &ReleaseEvidenceBody) -> ReleaseEvidenceTier {
+    // 先处理离线/历史语义，再按 Paper 的前向 Outcome 和 robustness 证据逐级提升。
     match (body.environment, body.purpose) {
         (ReleaseEvidenceEnvironment::OfflineFixture, _) => ReleaseEvidenceTier::E0Fixture,
         (_, RunPurpose::Replay | RunPurpose::Shadow) => ReleaseEvidenceTier::E1HistoricalReplay,
@@ -449,6 +459,8 @@ fn derive_evidence_tier(body: &ReleaseEvidenceBody) -> ReleaseEvidenceTier {
 }
 
 fn has_complete_forward_outcomes(body: &ReleaseEvidenceBody) -> bool {
+    // 只看调用方标记 RealBroker、给出 reconciliation/receipt 引用及三个 Outcome key；
+    // 本领域 helper 不读回 CAS，也不证明订单已成交或窗口事实确属真实前向观察。
     body.broker
         .as_ref()
         .is_some_and(|broker| broker.trust == ReleaseBrokerEvidenceTrust::RealBroker)
@@ -461,6 +473,7 @@ fn has_complete_forward_outcomes(body: &ReleaseEvidenceBody) -> bool {
 }
 
 fn has_completed_robustness_evidence(body: &ReleaseEvidenceBody) -> bool {
+    // 在前向完整之上要求 learning、已完成 Canary、后 Outcome 审批和四项完整性检查。
     has_complete_forward_outcomes(body)
         && body.learning.is_some()
         && body
@@ -485,6 +498,7 @@ fn has_completed_robustness_evidence(body: &ReleaseEvidenceBody) -> bool {
 fn derive_release_state(
     body: &ReleaseEvidenceBody,
 ) -> (ReleaseEvidenceStatus, BTreeSet<ReleaseEvidenceIssue>) {
+    // 收集所有缺口；硬失败决定 NotApprovable，单纯缺资料则为 Incomplete。
     let mut issues = BTreeSet::new();
     if body.purpose != RunPurpose::Paper {
         issues.insert(ReleaseEvidenceIssue::NonCanonicalRun {
@@ -601,6 +615,7 @@ fn derive_release_state(
         issues.insert(ReleaseEvidenceIssue::StaleDaemonEpoch);
     }
 
+    // any 闭包把不可通过的环境/身份/完整性问题与可补齐的缺项区分开。
     let hard_failure = issues.iter().any(|issue| {
         matches!(
             issue,

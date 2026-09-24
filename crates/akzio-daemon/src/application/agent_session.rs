@@ -1,3 +1,11 @@
+// 文件导读：AgentSession 把已 claim 的 Attempt、候选 Artifact、daemon 选择的 stage model
+// 和同一 Attempt 的累计预算交给 AgentRuntime。它只产生 Claim/Critique/Proposal 等研究
+// Artifact；ContextManifest/ReadGrant、Prompt Contract 和输出校验仍在 research/context
+// runtime，研究输出不自动成为 Decision 或执行许可。
+// Rust 机制：结构体持有 `&Daemon` 借用，避免复制运行时状态；`&mut AgentRunBudget` 明确
+// 跨调用共享预算；BTreeMap 按 ArtifactId 去重，闭包只捕获受控引用，Result 保留 kind
+// 漂移/依赖未完成等错误。
+
 use crate::*;
 
 /// Model-mediated session execution with daemon-owned routing and budget.
@@ -220,6 +228,8 @@ fn should_expand_research_sources(recipe_id: &str) -> bool {
 mod tests {
     use super::*;
 
+    // Critique 来源闭包只含允许的 Claim/Critique/NormalizedEvidence/SemanticDetail，
+    // 这个测试确认 Claim 与语义投影都会进入候选。
     #[test]
     fn research_output_candidates_include_their_context_source_closure() {
         let source = ArtifactRef {
@@ -238,6 +248,7 @@ mod tests {
         assert!(refs.contains(&source));
     }
 
+    // 只有 Critic 和 Synthesizer 会展开研究来源闭包，其他角色保持较窄的输入边界。
     #[test]
     fn critics_and_synthesizers_expand_research_output_sources() {
         assert!(should_expand_research_sources(

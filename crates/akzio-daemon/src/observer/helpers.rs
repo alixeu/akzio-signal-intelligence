@@ -1,6 +1,15 @@
+// 文件导读：observer helper 解析账户/仓位/portfolio history、计算 telemetry，并把 provider
+// payload 转成展示层的整数微单位。它不写 Store、不生成 Decision/Execution 或 Outcome，
+// 任何字段缺失都保持 unavailable，而不是填零制造业务完成假象。
+// Rust 机制：迭代器闭包和 `collect::<Result<Vec<_>>>()` 让单条解析错误传播；泛型/trait
+// `IntoIterator` 接受不同来源；借用 `&Value` 避免复制 JSON，Option 保留 provider 可选字段。
+
 use super::*;
 
 pub(super) fn observer_run_telemetry(trajectory: &[TrajectoryEntry]) -> ObserverRunTelemetry {
+    // 从轨迹中取最新 model/latency，只累计已有的 token 字段并用 checked_add 防溢出。
+    // `filter_map` 会跳过缺失字段，全部缺失时 `try_fold` 返回 Some(0)：此值不是已核实的
+    // 完整模型调用成本，UI 不应把它当完整账单。
     ObserverRunTelemetry {
         model_id: trajectory
             .iter()
@@ -30,6 +39,7 @@ pub(super) fn observer_run_telemetry(trajectory: &[TrajectoryEntry]) -> Observer
 }
 
 pub(super) fn observer_broker_order_ids(run: &ObserverRunDetail) -> BTreeSet<String> {
+    // 只收集该 Run 已展示的 OrderReceipt broker ID，后续 fill 过滤不读取其他 Run 的活动。
     run.artifacts
         .iter()
         .filter(|artifact| artifact.kind == ArtifactKind::OrderReceipt)
@@ -49,6 +59,8 @@ pub(super) fn parse_portfolio(
     broker_session: &str,
     market_open: bool,
 ) -> Result<ObserverPortfolio> {
+    // 账户/仓位 payload 先做字段和正数解析，再生成 pending analytics/fills section；任何
+    // 结构错误返回 unavailable 上层，不把 provider 缺字段转成空仓或零收益。
     let equity = provider_money(account, "equity")?.0;
     let buying_power = provider_money(account, "buying_power")?.0;
     let last_equity = account
@@ -111,6 +123,9 @@ pub(super) fn parse_portfolio_history(
     range: ObserverPortfolioRange,
     value: &Value,
 ) -> Result<ObserverPortfolioHistory> {
+    // Alpaca history 的 timestamp/equity 数组按两者最短长度配对（不会拒绝长度不等）；
+    // 可选 P&L 缺失保留 None，
+    // 不用数组长度或当前值推导 Outcome。
     let timestamps = value
         .get("timestamp")
         .and_then(Value::as_array)
@@ -163,6 +178,7 @@ pub(super) fn parse_portfolio_history(
 }
 
 pub(super) fn outcome_average_utility(outcome: &Outcome) -> i64 {
+    // 仅平均已有窗口 utility；空窗口返回 0 是展示聚合的中性值，不表示收益为零已被测量。
     if outcome.windows.is_empty() {
         return 0;
     }
@@ -179,6 +195,7 @@ pub(super) fn outcome_average_utility(outcome: &Outcome) -> i64 {
 }
 
 pub(super) fn observer_number_micros(value: &Value, field: &str) -> Result<i64> {
+    // 必需 provider 数值必须能解析为 MoneyMicros，否则让调用方保留 unavailable 状态。
     value
         .get(field)
         .and_then(parse_money_micros)
@@ -187,6 +204,7 @@ pub(super) fn observer_number_micros(value: &Value, field: &str) -> Result<i64> 
 }
 
 pub(super) fn observer_optional_micros(value: &Value, field: &str) -> Option<i64> {
+    // 可选字段解析失败/缺失均返回 None，避免 observer 用默认数值覆盖未知事实。
     value
         .get(field)
         .and_then(parse_money_micros)

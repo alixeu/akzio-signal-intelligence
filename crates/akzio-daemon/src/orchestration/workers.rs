@@ -1,3 +1,10 @@
+// 文件导读：workers 文件承载 Paper approval 的完整身份/资格绑定、PositionPlan graph
+// 准备和单步 worker 执行。approval 只持久化 RuntimeManifest/PaperLaunchApproval，不能
+// 越过 Decision/ExecutionGate；`run_one` 只执行一个已 claim 节点，不能等同整个 Run 完成。
+// Rust 机制：异步 approval 借用/拥有 request 后把 manifest closure 移入 StoreExecutor；
+// `Arc` broker 依赖由 bootstrap 注入，`collect`/`map` 闭包构造 setup，`Result` 保留资格
+// 和 Store 写入失败的边界。
+
 use super::*;
 
 impl Daemon {
@@ -5,6 +12,8 @@ impl Daemon {
         &self,
         request: PaperApprovalRequest,
     ) -> Result<PaperApprovalResponse> {
+        // request 由 HTTP handler 所有并在 await 前完成身份/资格/范围校验；只有通过后才
+        // 构造 Paper client 并执行 account GET，未通过的请求不会访问 Broker。
         request.identity.validate()?;
         if !(self.paper.auto_paper
             || self.debug_enabled()
@@ -40,6 +49,8 @@ impl Daemon {
             ));
         }
         for reference in qualification.evidence.references() {
+            // qualification 的每个引用都必须已存在于同一 Store 且 kind/Artifact 自检通过；
+            // 报告 JSON 不能仅凭自身声明成为有效审核证据。
             let artifact = self.store.artifact(&reference.artifact_id).map_err(|_| {
                 DaemonError::InvalidInput(
                     "Paper approval model qualification evidence is not persisted".to_owned(),
@@ -83,6 +94,8 @@ impl Daemon {
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| DaemonError::InvalidInput("Paper account id missing".to_owned()))?
             .to_owned();
+        // RuntimeManifest 固化当前配置/模型/Policy 与真实 account ID；后续 closure 拥有
+        // request 中的审批字段，在同一 StoreExecutor 工作单元内写 Manifest/Approval 绑定。
         let now = Utc::now();
         let identity = request.identity;
         let manifest_payload = RuntimeManifest {
@@ -190,6 +203,8 @@ impl Daemon {
         session_key: &str,
         now: DateTime<Utc>,
     ) -> Result<(akzio_store::WorkflowCommit, Vec<Artifact>)> {
+        // 准备四十项 session Need 后按 criticality 保留研究侧 34 项，过滤 ExecutionSafety；
+        // 这些 Artifact 与 graph 暂时只作为返回值，调用方再用 Store commit 一起发布。
         let run_id = RunId::new();
         let setup = self
             .paper
@@ -222,6 +237,8 @@ impl Daemon {
             .values_mut()
             .filter(|t| t.recipe_id.as_str() == akzio_domain::RESEARCH_ANALYST_RECIPE_ID)
         {
+            // Analyst 的 EvidenceNeed 输入来自本次 session 集合；其他 recipe 输入保持
+            // compiler 原设定，proposal lowering 不代表 Agent 已读取材料。
             task.evidence_needs = dataset.clone();
         }
         let graph = self.workflow.lower(RunPurpose::PositionPlan, &proposal)?;
@@ -233,6 +250,8 @@ impl Daemon {
     }
 
     pub async fn run_one(&self, worker_id: &str) -> Result<bool> {
+        // 让 TaskRuntime 最多领取并驱动一个 ready attempt；true 表示有节点被处理，不保证
+        // completion 为 Succeeded，具体状态由持久化 Attempt/Task 记录。
         Ok(self
             .task_runtime
             .execute_ready_node(worker_id, akzio_store::TaskWorkload::Any, self)

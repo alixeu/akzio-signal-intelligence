@@ -1,3 +1,11 @@
+// 文件导读：本文件承载 CLI 的配置加载、daemon token、服务启动和关闭信号逻辑。它把
+// 本地配置解析为 daemon 的启动输入，再由 daemon 负责 HTTP、worker、scheduler 和
+// Store 事务；token 可用、服务启动或 scheduler tick 成功，都不能越级说明 Run、订单、
+// fill 或跨交易日 Outcome 已完成。
+// Rust 机制：`#[cfg]` 让 Unix 权限实现与其他平台实现分别编译；`Arc` 共享 daemon，
+// `watch` 广播关闭状态，`tokio::spawn` 拥有后台 Future，`try_join!` 等待并行服务且
+// 任一错误都会传播，避免后台任务静默脱离生命周期。
+
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
@@ -153,8 +161,9 @@ async fn serve(config: &Config, config_path: &Path) -> Result<()> {
         && decision_policy_status == "store_active_head_missing"
         && decision_policy_input_hash.is_none()
         && loaded_policy.artifact_id.is_none();
-    // 未校准且非 auto_paper 的研究模式允许启动以积累真实标签；真实 Debug Core 和 Paper
-    // 仍要求 decision-capable 的 Store Policy，不能用默认 Policy 绕过校验。
+    // 此布尔量仅用于决定下方 Debug 启动前的 Policy 检查：无 active head 且未开启
+    // auto_paper 时进入受限研究冷启动分支，不等于已获 Paper 审批或可交易。
+    // 正式 Paper 的 NoOrder/Outcome 路径及 Debug 的 Decision 阻断由 daemon/Gate 决定。
     if config.daemon.debug_control && !uncalibrated_research && (!decision_policy.decision_capable()
         || decision_policy_status != "ready_for_current_decision"
         || decision_policy_input_hash.is_none()

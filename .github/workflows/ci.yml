@@ -1,3 +1,5 @@
+# 文件导读：GitHub Actions 的 CI 入口；rust job 做离线检查，audit/sbom 独立生成安全与依赖产物。
+# 这里只配置自动化任务，不启动仓库本地的 Daemon、Paper 或学习 worker。
 name: ci
 
 on:
@@ -17,11 +19,45 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: bash scripts/check_markdown_links.sh
+      - name: Check Markdown local links
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+
+          root = Path.cwd()
+          git_root = Path(subprocess.check_output(
+              ["git", "rev-parse", "--show-toplevel"], text=True,
+          ).strip()).resolve()
+          if git_root != root.resolve():
+              sys.exit("Markdown check requires the repository Git inventory")
+          inventory = subprocess.check_output(
+              ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", "*.md"]
+          )
+          broken = []
+          for filename in filter(None, inventory.split(b"\0")):
+              markdown = root / os.fsdecode(filename)
+              if not markdown.is_file():
+                  continue
+              for target in re.findall(r"\[[^][]+\]\(([^)]+)\)", markdown.read_text(errors="replace")):
+                  target = target.split("#", 1)[0]
+                  if not target or target.startswith(("http://", "https://", "mailto:", "codex://")):
+                      continue
+                  if target.startswith("/"):
+                      broken.append(f"absolute local markdown link: {markdown} -> {target}")
+                  elif not (markdown.parent / target).exists():
+                      broken.append(f"broken markdown link: {markdown} -> {target}")
+          if broken:
+              sys.exit("\n".join(broken))
+          PY
       - run: cargo fmt --all -- --check
       - run: cargo check --workspace --locked
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo test --workspace --locked
+      - run: python3 -m unittest discover -s scripts -p 'test_run_core.py'
 
   audit:
     runs-on: ubuntu-latest

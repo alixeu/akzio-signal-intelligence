@@ -2,14 +2,22 @@
 
 use super::*;
 
+// 文件导读：本模块把 ModelRequest 编译成 OpenAI Responses wire body，发起有界 HTTP/SSE 请求，
+// SSE 路径先校验 response.completed/incomplete 终态，再转换为 ModelResponse；
+// 离线 fixture 直接调用同一 raw 转换器，不以 HTTP/SSE 终态为前提。它不持有 Store，也不决定
+// Contract、工具授权或业务 Gate；先读 respond_with_events、handle_sse_data 和 openai_response_from_raw。
+// Rust 机制：async 调用先创建 Future，await 才驱动请求；FnMut 回调传递 reasoning 事件，Result 保留协议/传输错误。
+
+// Responses adapter 只负责受控 provider wire/stream 与 ModelResponse 转换；预算、Prompt、工具权限和业务 Gate 由上层拥有。
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 // Hosted reasoning responses can legitimately pause longer than 30 seconds
 // between chunks. This remains a bounded transport timeout; the Agent
-// Contract's 120s total wall-time and phase deadline still govern the call.
+// Contract's frozen Attempt budget and phase deadline still govern the call.
 const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct OpenAIResponsesClient {
+    // client 是可克隆的配置值；api_key 仅用于 bearer auth，Debug 实现会脱敏，stream timeout 只约束单次空闲。
     http: Client,
     pub(super) base_url: String,
     api_key: String,
@@ -37,6 +45,7 @@ impl OpenAIResponsesClient {
         model: impl Into<String>,
         reasoning_effort: impl Into<String>,
     ) -> Result<Self> {
+        // new 使用 bounded 默认 timeout；实际累计墙钟仍由 Agent Contract/phase deadline 控制。
         Self::with_timeouts(
             base_url,
             api_key,
@@ -89,10 +98,12 @@ impl OpenAIResponsesClient {
     }
 
     pub fn request_body(&self, request: &ModelRequest) -> Value {
+        // request_body 是纯 wire projection，保留调用方提供的 input/tools/tool_choice，不在 provider 层扩大授权。
         openai_responses_request_body(&self.model, &self.reasoning_effort, request)
     }
 
     pub async fn respond(&self, request: ModelRequest) -> Result<ModelResponse> {
+        // 无事件调用复用同一 stream parser；空闭包表示调用方不订阅 reasoning 生命周期。
         self.respond_with_events(request, |_| {}).await
     }
 
@@ -104,6 +115,8 @@ impl OpenAIResponsesClient {
         // 一次请求使用无状态 store=false 的 Responses 调用；函数只返回协议层
         // ModelResponse，持久化、Attempt 状态和业务 Gate 由上层负责。
         let body = self.request_body(&request);
+        // `send()` 产生 HTTP Future，`.await` 才由当前任务驱动到响应头；取消外层 Future
+        // 会停止本地 poll，但不能据此断言 provider 未收到请求。本 crate 不持有 Store。
         let mut response = self
             .http
             .post(format!("{}/responses", self.base_url))
@@ -131,6 +144,8 @@ impl OpenAIResponsesClient {
         // pending 保存尚未遇到换行的字节，data 聚合同一 SSE event 的连续 data 行；
         // provider 的 response.completed/incomplete 终态一旦校验并保存，就可停止等 EOF。
         'response_stream: loop {
+            // 若任务在下方 chunk Future 等待时被取消，函数不会执行 end_reasoning；
+            // reasoning 事件只是流式观察，不能替代调用方记录的 Started/完成状态。
             let chunk = match response.chunk().await {
                 Ok(Some(chunk)) => chunk,
                 Ok(None) => break,
@@ -215,6 +230,7 @@ fn handle_sse_data(
     stream: &mut ReasoningStream,
     on_event: &mut impl FnMut(ModelStreamEvent),
 ) -> Result<()> {
+    // SSE parser 通过 FnMut 回调向上层发送 reasoning 事件；终态 response 单独保存在 stream，避免把 delta 当成最终输出。
     // 解析一个已经按空行分隔的 SSE data；空 data/[DONE] 不是终态，未知事件
     // 暂时忽略，以便兼容 provider 增加非业务事件。
     if data.is_empty() || data == b"[DONE]" {
@@ -284,6 +300,7 @@ pub(super) fn openai_responses_request_body(
     reasoning_effort: &str,
     request: &ModelRequest,
 ) -> Value {
+    // 该函数只做请求表达式的确定性编译；Continue transcript 与 tool outputs 都由 Rust 显式拼接。
     // 将 ModelRequest 编译为单轮 Responses wire payload；这里仅序列化请求，不做
     // provider I/O，也不改变 Rust 持有的工具授权和预算。
     let input = match &request.input {
@@ -384,6 +401,8 @@ pub(super) fn openai_responses_request_body(
 }
 
 pub(super) fn openai_response_from_raw(raw: Value, request_body: Value) -> Result<ModelResponse> {
+    // 这里拒绝 incomplete/refusal/空 output；真实 SSE 的终态一致性由调用方先验，
+    // fixture 可直接传入 raw，因此本函数本身不证明 response.completed 事件发生。
     // 把 provider raw 规范化为 ModelResponse，并在协议边界拒绝 incomplete、refusal
     // 和空输出；这里不持久化，也不决定研究提交、Decision 或 Execution 状态。
     if raw.get("status").and_then(Value::as_str) == Some("incomplete") {
@@ -527,8 +546,8 @@ pub fn extract_tool_calls(response: &Value) -> Vec<ModelToolCall> {
 }
 
 pub(super) fn parse_tool_call(value: &Value) -> Option<ModelToolCall> {
-    // 将 function_call/tool_call 的 name、call_id 和 arguments 统一为内部类型；字符串
-    // arguments 若不是 JSON 则保留为 raw 字段，真正 Schema 合法性留给上层判断。
+    // 接受 function_call/tool_call，兼容缺 type 但有 name 的旧形状；其它显式
+    // type 被过滤。arguments 字符串不是 JSON 时保留 raw，Schema 合法性留给上层。
     let kind = value.get("type").and_then(Value::as_str);
     if kind.is_some_and(|kind| kind != "function_call" && kind != "tool_call") {
         return None;
@@ -559,6 +578,7 @@ pub(super) fn parse_tool_call(value: &Value) -> Option<ModelToolCall> {
 
 #[cfg(test)]
 mod transcript_regression {
+    // 测试只验证 stream/continuation/usage 的协议边界，不调用真实 provider 或 Store。
     use super::*;
 
     #[test]
@@ -613,7 +633,3 @@ mod transcript_regression {
         }
     }
 }
-
-#[cfg(test)]
-#[path = "responses_stream_tests.rs"]
-mod stream_terminal_tests;

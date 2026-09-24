@@ -1,5 +1,10 @@
 //! Model-free conversion from a typed decision and broker snapshots to orders.
 
+// 文件导读：这里是 Decision 到 ExecutionPlan 的纯 Rust 转换层。输入必须是已接受的
+// DecisionContext，并且账户、报价、市场时钟属于同一 broker session；随后按目标权重
+// 计算资产差额、验证报价和购买力、缩放买单、统计换手，最后把快照 Artifact 引用与
+// 重新计算的 plan hash 一起返回。它不写 Store，也不调用 Broker。
+
 use akzio_domain::{
     AccountSnapshot, ArtifactRef, Asset, ContentHash, DecisionContext, DomainError, ExecutionPlan,
     FactorExposure, MarketClockSnapshot, MoneyMicros, OrderIntent, OrderSide, QuoteSnapshot,
@@ -48,16 +53,22 @@ pub struct AllocationRuntime {
 }
 
 impl AllocationRuntime {
+    // `policy` 按值传入：校验通过后由 runtime 持有，调用者不再能通过原变量改写这份策略。
     pub fn new(policy: ExecutionPolicy) -> AllocationResult<Self> {
+        // 分配器创建时就冻结并校验执行策略，后续每次分配不会临时接受模型提供的限制。
         policy.validate()?;
         Ok(Self { policy })
     }
 
+    // `&self` 只借用 runtime；返回的引用跟随该借用有效，调用方不能借此修改策略。
     pub fn policy(&self) -> &ExecutionPolicy {
+        // 暴露只读策略引用，供 Gate 读取上限而不取得修改执行参数的所有权。
         &self.policy
     }
 
+    // 输入以共享借用传递，`allocate_with_limit` 完成全部检查后返回新拥有的 plan。
     pub fn allocate(&self, input: &AllocationInput) -> AllocationResult<ExecutionPlan> {
+        // 常规入口使用策略内的单次最大名义金额；需要审批上限时由 Gate 调用带 limit 的入口。
         self.allocate_with_limit(input, self.policy.max_new_notional)
     }
 
@@ -66,6 +77,10 @@ impl AllocationRuntime {
         input: &AllocationInput,
         maximum_total_notional: MoneyMicros,
     ) -> AllocationResult<ExecutionPlan> {
+        // 这里先做领域校验、Decision 接受状态和 session 对齐，再进入订单计算；因此
+        // 关闭市场或混合快照不会被后面的金额计算掩盖成可执行计划。
+        // 下方每个 `?` 把领域错误经 `From` 转为 AllocationError，并在此函数返回；
+        // 这些校验只读取借来的 input，不消费或修改原始快照。
         input.decision_context.validate()?;
         input.account.validate()?;
         input.quotes.validate()?;
@@ -94,6 +109,11 @@ fn build_execution_plan(
     input: &AllocationInput,
     maximum_total_notional: MoneyMicros,
 ) -> std::result::Result<ExecutionPlan, ExecutionError> {
+    // 逐资产把 target weight 映射为当前市值差额：先验证资产全集和 gross exposure，
+    // 再只为非零差额生成限价单。订单生成完成后才统一处理买入上限、购买力、换手和
+    // achieved target，避免把“计划目标”误写成“已成交结果”。
+    // 参数全是共享借用；`target.weights[&asset]` 复制 ppm 数值，`quotes` 中取出的 Quote
+    // 也是 Copy 值，因此不会从 input 的集合中移走任何快照数据。
     let target = &input.decision_context.target;
     let account = &input.account;
     let quotes = &input.quotes;
@@ -106,6 +126,8 @@ fn build_execution_plan(
     target
         .validate_universe()
         .map_err(|_| ExecutionError::InvalidPolicy)?;
+    // `iter()` 逐项借出有序 map 项，`try_fold` 立即消费迭代器；闭包遇到非法资产、
+    // 超范围权重或整数溢出就以 Err 停止，而不是只构造一个延迟执行的处理链。
     let gross = target
         .weights
         .iter()
@@ -129,6 +151,7 @@ fn build_execution_plan(
 
     let mut orders = Vec::new();
     for asset in Asset::EXECUTABLE {
+        // `map_or` 在无持仓时用零作为当前市值；delta 为零时不生成空订单。
         let target_value = scaled_weight(account.equity, target.weights[&asset]);
         let current_value = account
             .positions
@@ -145,6 +168,8 @@ fn build_execution_plan(
             .quotes
             .get(&asset)
             .ok_or(ExecutionError::MissingQuote(asset))?;
+        // `get` 先产生对快照内 Quote 的借用，解引用复制 Quote 后传给验证器；
+        // 失效报价直接传播为错误，本轮不会留下可返回的部分 plan。
         validate_quote(
             policy.max_quote_age_secs,
             policy.max_future_skew_secs,
@@ -171,6 +196,7 @@ fn build_execution_plan(
     }
 
     let buy_limit = MoneyMicros(maximum_total_notional.0.min(account.buying_power.0));
+    // 缩放只发生在本地可变 Vec 上；任何后续 Gate 失败都会丢弃这份尚未提交的 plan。
     scale_buy_orders_to_limit(&mut orders, buy_limit)?;
     if orders.is_empty() {
         return Err(ExecutionError::NoExecutableOrder);
@@ -224,6 +250,7 @@ fn build_execution_plan(
         created_at: now,
         plan_hash: ContentHash::of_bytes(b"pending execution plan hash"),
     };
+    // plan 先以占位 hash 构造，再根据其最终字段刷新哈希；失败时只返回错误，不触碰 Store。
     plan.refresh_hash()
         .map_err(|_| ExecutionError::InvalidPolicy)?;
     Ok(plan)
@@ -233,6 +260,8 @@ fn scale_buy_orders_to_limit(
     orders: &mut Vec<OrderIntent>,
     maximum_buy_notional: MoneyMicros,
 ) -> std::result::Result<(), ExecutionError> {
+    // 只按比例压缩买单，卖单保持原值；整数余数按固定 Asset 顺序分配，保证相同输入
+    // 仍得到相同的订单顺序和 plan hash。
     if maximum_buy_notional.0 < 0 {
         return Err(ExecutionError::NewNotionalExceeded);
     }
@@ -243,6 +272,8 @@ fn scale_buy_orders_to_limit(
     }
 
     let mut remainder = limit;
+    // `iter_mut` 暂时独占借用每个买单，只在循环体内更新名义金额；`filter` 的闭包
+    // 仅检查 side，不捕获 orders 的第二个可变借用，因此不会与迭代器的借用冲突。
     for order in orders
         .iter_mut()
         .filter(|order| order.side == OrderSide::Buy)
@@ -258,8 +289,9 @@ fn scale_buy_orders_to_limit(
             .ok_or(ExecutionError::NewNotionalExceeded)?;
     }
 
-    // Orders are created in Asset::EXECUTABLE order. Keep remainder allocation
-    // stable so equivalent inputs produce the same plan hash.
+    // 前一轮对各买单分别做整数除法，余数合计可能超过 1 个微美元；按固定资产序
+    // 把余数逐资产各加 1，
+    // `break` 只结束这层资产循环，确保等价输入得到稳定的 plan hash。
     for asset in Asset::EXECUTABLE {
         if remainder == 0 {
             break;
@@ -278,6 +310,7 @@ fn scale_buy_orders_to_limit(
             remainder -= 1;
         }
     }
+    // `retain` 原地移除缩放为零的订单；它不改变卖单金额，只改变本地 Vec 的成员。
     orders.retain(|order| order.notional.0 > 0);
     Ok(())
 }
@@ -292,8 +325,12 @@ struct OrderNotionals {
 }
 
 fn order_notionals(orders: &[OrderIntent]) -> std::result::Result<OrderNotionals, ExecutionError> {
+    // 用迭代器输入逐单累加买、卖、换手和净现金需求，并在每次 checked_add 时阻断溢出。
+    // risk_increasing 只代表买入侧，不把尚未成交的卖出所得提前算进购买力。
     let mut gross_buy = 0_i128;
     let mut gross_sell = 0_i128;
+    // `&[OrderIntent]` 是只读切片，循环内 `order` 是元素引用；仅把 Copy 的金额转成
+    // i128 累加，所以调用方仍拥有并可继续使用原订单集合。
     for order in orders {
         let notional = i128::from(order.notional.0);
         match order.side {
@@ -325,6 +362,9 @@ fn target_after_orders(
     account: &AccountSnapshot,
     orders: &[OrderIntent],
 ) -> std::result::Result<TargetPortfolio, ExecutionError> {
+    // 按订单的名义金额推导“订单执行后假设目标”，用于风控和审计，不是 Broker 回报的
+    // 实际持仓；负市值和超过 ppm 范围都在这里拒绝。
+    // 结果从零组合开始并按四个允许资产重建；输入账户和订单均只借用，不会被“模拟成交”修改。
     let mut achieved = TargetPortfolio::zeroed();
     for asset in Asset::EXECUTABLE {
         let mut market_value = i128::from(

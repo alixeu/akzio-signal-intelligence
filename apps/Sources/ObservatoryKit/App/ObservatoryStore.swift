@@ -1,5 +1,9 @@
 import SwiftUI
 
+// 文件导读：ObservatoryStore 是 UI 的 @MainActor/@Observable 状态枢纽，维护 Mock/Live 模式、路由选择、Core 连接、Observer 快照及页面投影。
+// Rust Core/V2Store 才是 Run、授权和业务状态权威；此类只请求启动/调试操作、解码只读 Observer 结果并整理展示状态。
+// 主要链路：bootstrapCore → RustCoreSupervisor/ObserverClient → apply(LiveProjection) → display* → AppShell/页面；
+// 启动请求仅取得受理的 Run ID，SSE invalidate 后再拉快照，不能把 UI 更新或 HTTP 成功当成 Run/订单/Outcome 完成。
 // MARK: - Store
 //
 // One observable source of truth for the shell: which scenario is loaded, which
@@ -8,6 +12,8 @@ import SwiftUI
 @MainActor
 @Observable
 public final class ObservatoryStore {
+    // Store 是主 actor 上的引用类型单一数据源：View 读取可观察属性，异步请求完成后只在这里回填状态。
+    // `@Observable` 宏为被观察的属性生成变更追踪；SwiftUI 可在 Store 引用不变时因属性写入重算依赖 View。
     // Data
     public private(set) var scenario: MockScenario
     public private(set) var snapshot: ObservatorySnapshot
@@ -46,6 +52,7 @@ public final class ObservatoryStore {
     private(set) var externalDebugCore = false
     var selectedDebugRunID: String?
     var selectedDebugTaskID: String?
+    // 这是 UI 是否进入 Debug 面板的展示条件；Control action 仍需 Core 返回的 allowed_actions 和 CAS revision。
     var debugEnabled: Bool { isLive && (externalDebugCore || debugListing?.enabled == true) }
     var debugEndpoint: String { observerEndpoint }
     var debugConnected: Bool { if case .connected = observerState { return true }; return false }
@@ -78,6 +85,7 @@ public final class ObservatoryStore {
     public var selectedPosition: TradableAsset?
 
     // Appearance / motion, all display-only
+    // `didSet` 只把真实启动模式下用户改过的 language 写入 UserDefaults；其余外观设置留在 Store 展示状态中。
     public var settings: SettingsPresentation {
         didSet {
             guard autoStartsCore, oldValue.language != settings.language else { return }
@@ -101,6 +109,7 @@ public final class ObservatoryStore {
         autoStartsCore: Bool = true,
         languageDefaults: UserDefaults = .standard
     ) {
+        // 初始化先建立完整 mock 快照，再根据 autoStartsCore 选择 live/connecting；不会因创建 Store 自动提交 Run。
         // Mock 和 live 共用同一套 Store 字段；只由 autoStartsCore 决定数据源与初始连接状态。
         self.autoStartsCore = autoStartsCore
         self.languageDefaults = languageDefaults
@@ -135,6 +144,7 @@ public final class ObservatoryStore {
     }
 
     public var canvasPolicy: CanvasRenderPolicy {
+        // 路由转场或窗口不可见时暂停环境画布；这只是渲染策略，不影响后台 Rust 任务。
         CanvasRenderPolicy(
             quality: settings.renderQuality,
             allowsAmbient: motionPolicy.allowsAmbient,
@@ -157,6 +167,7 @@ public final class ObservatoryStore {
     public var coreState: RustCoreState { coreSupervisor.state }
     public var coreStorePath: String { coreSupervisor.storePath }
     public var coreApprovalStatus: String { livePayload?.core.approval.status ?? "unknown" }
+    // 以下 display* 统一在 Mock fixture 与 live projection 间选择；页面不直接拼接 Observer 原始 JSON。
     public func hasLiveData(for route: AppRoute) -> Bool {
         // Mock 始终有 fixture；live 仅对 Portfolio 检查快照中的 portfolio 数据，其他页面由各自投影表达缺失。
         guard isLive else { return true }
@@ -192,6 +203,7 @@ public final class ObservatoryStore {
         isLive ? (liveProjection?.council ?? LiveProjection.unavailableCouncil) : snapshot.council
     }
     public var displayPortfolio: PortfolioPresentation {
+        // displayPortfolio 只组合服务端投影与本地曲线缓存；缓存缺失时保留服务端字段，不用 UI 推算业务事实。
         guard isLive else { return snapshot.portfolio }
         let base = liveProjection?.portfolio ?? LiveProjection.unavailablePortfolio
         // 先用当前投影作为基线；只有选定区间已有完整曲线缓存时才替换 curve，其余字段保持服务端快照。
@@ -250,16 +262,19 @@ public final class ObservatoryStore {
     }
 
     public func toggleSettings() {
+        // 设置层显隐是本地 UI 状态翻转，不调用 Core 或写用户配置。
         settingsPresented.toggle()
     }
 
     private func openSettings(_ category: SettingsPresentation.Category) {
+        // 启动配置缺失时可直接选择 Core 分类，避免用户还要先经过 Appearance 默认页。
         settingsCategory = category
         settingsPresented = true
     }
 
 
     public func revealRunInArchive(_ runID: String) {
+        // 只在当前 archive 投影中查找匹配行；无匹配时保留 nil 选择，但仍导航到归档页面。
         selectedArchiveRowID = displayArchive.rows.first { $0.runID == runID }?.id
         navigate(to: .runArchive)
     }
@@ -269,6 +284,7 @@ public final class ObservatoryStore {
     public var coreConfigurationPath: String { CoreRuntimePaths.configurationLocation().path }
 
     public func reconnectCore() async {
+        // 取消旧的观察循环后复用 bootstrapCore 的统一分支；取消本地 SSE Task 不等于取消 Core Run。
         observerTask?.cancel()
         observerTask = nil
         observerClient = nil
@@ -276,6 +292,7 @@ public final class ObservatoryStore {
     }
 
     public func bootstrapCore() async {
+        // 该 async 方法把“外部隔离 Core”与“本地受管 Core”分成两个生命周期分支，二者都必须先通过认证/身份检查。
         // 启动先进入 connecting；环境变量分支只连接外部隔离 Debug Core，否则启动受管的本地 Core。
         guard autoStartsCore else { return }
         dataMode = .live
@@ -343,6 +360,7 @@ public final class ObservatoryStore {
         let purpose = selectedRunPurpose
         runInFlight = true
         runMessage = "Starting Rust Core…"
+        // defer 在正常返回、guard 提前退出或 catch 后都会执行，确保按钮的请求中状态复位。
         defer { runInFlight = false }
         if coreSupervisor.state != .ready {
             // Core 尚未 ready 时先启动并连接；连接失败提前返回，不发送提交请求。
@@ -386,6 +404,7 @@ public final class ObservatoryStore {
     }
 
     private func connectObserver() {
+        // observerTask 是观察循环的唯一所有者；重连先取消旧 Task，避免两个 SSE 流同时改写同一份投影。
         // 新观察循环会取消旧 Task；每轮先取快照，再订阅其后的 SSE 事件，避免遗漏游标之前的数据。
         observerTask?.cancel()
         dataMode = .live
@@ -396,6 +415,8 @@ public final class ObservatoryStore {
         }
         let token = controlToken
         observerTask = Task { [weak self] in
+            // 弱捕获避免任务创建时立即捕获 Store；guard 后 self 在循环期间被强持有，而 Store 又保存 Task 句柄，
+            // 因此两者形成的保活关系要靠显式 cancel（重连、切换数据源或清凭据）结束，不能指望仅释放 View 自动停流。
             guard let self else { return }
             do {
                 let client = try ObserverClient(endpoint: endpoint, token: token)
@@ -462,6 +483,7 @@ public final class ObservatoryStore {
     }
 
     private func apply(_ payload: ObserverSnapshotPayload) {
+        // payload 是一次不可变 Codable 快照；LiveProjection 在主 actor 内由它重建，View 不直接持有解码字典。
         // 只保留属于当前 Run 的 reasoning；随后从新 payload 和剩余记录重建不可变投影。
         let runID = payload.currentRun?.workflow.run.runID
         liveReasoningRecords = liveReasoningRecords.filter { $0.value.runID == runID }
@@ -481,6 +503,7 @@ public final class ObservatoryStore {
         }
         if firstSnapshot { selectedArchiveRowID = projection.archive.selectedRowID }
         if let detail = payload.currentRun, detail.workflow.run.runID == selectedArchiveRowID {
+            // 只有快照中的当前 Run 与选中归档 ID 相同才复用 detail；其它归档详情需走单独的按 ID 查询。
             selectedArchiveDetail = detail
         }
     }
@@ -489,6 +512,7 @@ public final class ObservatoryStore {
         _ event: ObserverReasoningEventPayload,
         receivedAt: Date
     ) {
+        // reasoning 事件是可丢弃/可重复的增量输入；按 run/task/attempt/turn 组成键后再生成新的值投影。
         // 推送事件必须属于当前 Run；不匹配的事件直接丢弃，避免旧连接污染当前页面。
         guard event.runID == livePayload?.currentRun?.workflow.run.runID else { return }
         let id = "reasoning-\(event.runID)-\(event.taskID)-\(event.attemptID)-\(event.turn)"
@@ -577,15 +601,18 @@ public final class ObservatoryStore {
     }
 
     public var activeStage: WorkflowNodePresentation? {
+        // 用户选择优先；选择已失效时才回退到投影标记的 active 节点。
         guard let selectedStageID else { return displayWorkflow.nodes.first(where: \.isActive) }
         return displayWorkflow.node(id: selectedStageID)
     }
 
     public var selectedStageInspector: StageInspectorPresentation {
+        // Inspector 由当前选择或 Workflow active stage 决定，所有内容仍来自 displayWorkflow 投影。
         displayWorkflow.inspector(for: selectedStageID ?? displayWorkflow.activeStageID)
     }
 
     public var selectedArchiveRow: ArchiveRowPresentation? {
+        // 若没有显式选择则显示列表首行；返回值是页面投影，不触发按 Run ID 拉取 detail。
         guard let selectedArchiveRowID else { return displayArchive.rows.first }
         return displayArchive.rows.first { $0.id == selectedArchiveRowID }
     }
@@ -607,18 +634,20 @@ public final class ObservatoryStore {
     }
 
     public var selectedArchiveOutcomeEvidence: OutcomeEvidencePresentation {
+        // 仅使用已加载 detail 与当前 archive row 的 Run ID 匹配；未匹配时返回 unknown。
         guard let detail = selectedArchiveDetail, detail.workflow.run.runID == selectedArchiveRow?.runID else { return .unknown }
         return .from(detail.artifacts.map { (kind: $0.kind, payload: $0.payload) })
     }
 
     public func selectArchiveRun(_ id: String) {
-        // 再次点击同一行取消选择；异步详情返回前若用户换行，runID 守卫会丢弃过期响应。
+        // 详情请求返回的是 Optional 异步结果，只有选择仍等于请求 id 才能写回，防止旧响应覆盖新选择。
+        // 再次点击同一行取消选择；请求 Task 不被保留或取消，若用户换行，runID 守卫只丢弃过期响应写回。
         let next = selectedArchiveRowID == id ? nil : id
         selectedArchiveRowID = next
         selectedArchiveDetail = nil
         guard let next, isLive, let observerClient else { return }
         Task { [weak self] in
-            // 弱捕获避免详情请求反向持有 Store；Task 只在 Store 仍存在且选择未改变时写回。
+            // 弱捕获不形成永久捕获；guard 成功后局部 self 会在 await 请求期间强持有 Store，返回时再核对选择是否仍一致。
             guard let self else { return }
             do {
                 let detail = try await observerClient.fetchRun(next)
@@ -632,6 +661,7 @@ public final class ObservatoryStore {
     }
 
     private static func timeLabel(_ date: Date) -> String {
+        // 归档阶段时间只格式化 Observer 给出的 Date，不参与排序或状态判断。
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "HH:mm:ss"

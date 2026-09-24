@@ -1,3 +1,7 @@
+# 文件导读：声明 SQLite/CAS 唯一持久化 crate 的构建边界；workspace 中其他 crate
+# 通过 akzio-store 访问 durable state，而不是自行写 SQLite。akzio-domain 提供持久化对象
+# 与校验规则，rusqlite 承担同步 SQL，serde/serde_json 编解码 CAS 负载，thiserror 汇总错误，
+# zstd 编解码压缩 BLOB；chrono 提供共享时间类型。版本由根 workspace 集中锁定，本清单不改变运行时协议。
 [package]
 name = "akzio-store"
 version = "0.2.0"

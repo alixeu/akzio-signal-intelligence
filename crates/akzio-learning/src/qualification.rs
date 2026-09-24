@@ -16,6 +16,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+// 文件导读：qualification 是纯离线、确定性的 sealed 结果组装；它不运行模型、不采集
+// 证据、不访问 Broker、不写 Store，结果也不能替代真实 Paper 或 T+1/T+3/T+5 验收。
+// 输入经 validate_input 校验后，run_offline_model_qualification 排序场景、汇总阶段引用并计算
+// fingerprint；学习 Policy 的资格判断另在 evaluation 路径中进行，不能把本报告当作 Policy 激活。
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QualificationScenarioObservation {
     pub scenario_id: String,
@@ -66,9 +71,13 @@ pub enum QualificationRunError {
     InvalidReport,
 }
 
+// 输入只被共享借用；返回 Result 把无效身份/缺阶段等作为可处理错误交还调用方，不 panic。
+// clone 仅在这里为本次确定性排序与结果组装复制数据，不改变传入的冻结输入。
 pub fn run_offline_model_qualification(
     input: &OfflineModelQualificationInput,
 ) -> Result<OfflineModelQualificationResult, QualificationRunError> {
+    // 先完成输入/证据闭包校验，再按 stage/scenario 排序，保证 fingerprint 和 report 的
+    // 内容不受调用者传入顺序影响。
     validate_input(input)?;
 
     let mut scenarios = input.scenarios.clone();
@@ -83,6 +92,8 @@ pub fn run_offline_model_qualification(
         rollback_snapshot: input.rollback_snapshot.clone(),
         rollback_verified: input.rollback_snapshot == input.observed_rollback_snapshot,
         required_scenarios: input.required_scenarios.clone(),
+        // map 闭包为每个冻结 scenario 找关联 receipt；缺 receipt 时 measured metrics 保持空，
+        // 但场景已有的 challenger verdict 仍照原观察记录，不能从 champion 数值推造 challenger。
         scenarios: scenarios
             .iter()
             .map(|scenario| {
@@ -115,6 +126,8 @@ pub fn run_offline_model_qualification(
             })
             .collect(),
     };
+    // receipt 只把输入中的 measured_metrics 绑定到 challenger；本纯函数不查 Store，
+    // 不能证明该 receipt 已提交。没有 receipt 的场景保留默认空指标。
     capability_retention
         .validate()
         .map_err(|_| QualificationRunError::InvalidInput("capability_retention"))?;
@@ -134,13 +147,19 @@ pub fn run_offline_model_qualification(
     .map_err(|_| QualificationRunError::InvalidInput("behavior_fingerprint"))?;
     let critical_regressions = scenarios
         .iter()
+        // 只统计 critical 且 champion 原本通过、challenger 失败的场景；count 消费 filter 迭代器。
         .filter(|scenario| {
             scenario.critical && scenario.champion_passed && !scenario.challenger_passed
         })
         .count()
         .try_into()
         .map_err(|_| QualificationRunError::InvalidInput("critical_regressions"))?;
+    // 闭包共享借用已排序的 scenarios；调用时逐场景判断该 stage 是否全部通过。
+    // Iterator 的 filter/all 在此处被立即消费，空阶段本会 all=true，因此前面的 validate_input
+    // 先强制每个阶段至少有场景，避免空集合造成虚假通过。
     let stage_passed = |stage| {
+        // 每个阶段要求该阶段所有场景的 challenger_passed；Canary 还必须通过 capability
+        // retention，避免单一成功场景掩盖关键回归或 rollback 失败。
         scenarios
             .iter()
             .filter(|scenario| scenario.stage == stage)
@@ -174,7 +193,11 @@ pub fn run_offline_model_qualification(
     })
 }
 
+// 借用输入逐项拒绝无效窗口、重复或缺失场景、阶段和 receipt 身份不闭合；
+// 每个 `?` 将领域校验错误映射为 QualificationRunError 后向纯计算入口传播。
 fn validate_input(input: &OfflineModelQualificationInput) -> Result<(), QualificationRunError> {
+    // 必需 scenario、五个有序 stage evaluation、receipt identity 和观察 verdict 必须闭合；
+    // 缺一个就返回明确错误，不能用“阶段没有场景所以 all=true”伪造通过。
     input
         .key
         .validate()
@@ -189,6 +212,7 @@ fn validate_input(input: &OfflineModelQualificationInput) -> Result<(), Qualific
         || input
             .required_scenarios
             .iter()
+            // any 在找到第一个空白 ID 时短路；required scenario 集合必须至少有一个非空身份。
             .any(|scenario| scenario.trim().is_empty())
     {
         return Err(QualificationRunError::InvalidInput("required_scenarios"));
@@ -214,6 +238,7 @@ fn validate_input(input: &OfflineModelQualificationInput) -> Result<(), Qualific
         return Err(QualificationRunError::MissingRequiredScenario(missing));
     }
     for stage in QualificationStage::ORDERED {
+        // any 检查该 stage 至少对应一个 scenario；缺场景或缺 evaluation ArtifactRef 都阻断。
         if !input
             .scenarios
             .iter()
@@ -227,6 +252,8 @@ fn validate_input(input: &OfflineModelQualificationInput) -> Result<(), Qualific
         return Err(QualificationRunError::InvalidEvidenceClosure);
     }
     for receipt in &input.receipts {
+        // receipt 的 qualification key、双 snapshot 和 frozen manifest 必须与本次输入相同；
+        // deterministic verdict 若与 scenario 不同，也属于证据闭包错误。
         receipt
             .validate()
             .map_err(|_| QualificationRunError::InvalidEvidenceClosure)?;
@@ -240,6 +267,7 @@ fn validate_input(input: &OfflineModelQualificationInput) -> Result<(), Qualific
         if let Some(matching_obs) = input
             .scenarios
             .iter()
+            // 只有 scenario ID 与 stage 同时相同才可将 receipt verdict 与 observation 对照。
             .find(|sc| sc.scenario_id == receipt.scenario_id && sc.stage == receipt.stage)
         {
             if matching_obs.challenger_passed != receipt.deterministic_verdict.is_pass() {
@@ -251,9 +279,13 @@ fn validate_input(input: &OfflineModelQualificationInput) -> Result<(), Qualific
     Ok(())
 }
 
+// 只从已校验的 stage_evaluations 取五个阶段的 ArtifactRef，并组装 ModelQualificationEvidence；
+// get 闭包捕获 input 的共享借用，缺阶段以 MissingStage 返回，整个函数不读 BLOB 或写 Store。
 fn stage_evidence(
     input: &OfflineModelQualificationInput,
 ) -> Result<ModelQualificationEvidence, QualificationRunError> {
+    // 五个 ArtifactRef 均来自调用方的阶段映射，检查 kind 与引用去重；
+    // 不读取 BLOB，也不证明它们实际共享一个 Store lineage。
     let get = |stage| {
         input
             .stage_evaluations

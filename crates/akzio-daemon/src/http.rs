@@ -1,5 +1,14 @@
 //! Authenticated loopback HTTP transport.
 
+// 文件导读：HTTP transport 是 CLI/Observatory 到 daemon 的回环入口。handler 普遍做
+// token 校验，只有特定运行/Debug 控制入口另查 native-client/隔离边界；部分外部
+// observer 与审批请求不是 StoreExecutor 内的纯 Store 查询。SSE 发送
+// reasoning/event invalidation。HTTP 200、SSE event 或 Store maintenance 完成只证明该
+// transport 操作有界结束，不证明研究/Decision/Execution、Paper submission/fill 或 Outcome。
+// Rust 机制：Axum extractor/Router 宏把 Path/Query/Json/State 组合成 handler；SSE 用
+// `async_stream::stream!` 生成 Stream，`select!` 同时监听 broadcast、poll 和 shutdown；
+// generic `run_store_operation<T, F>` 以 `Send + 'static` 闭包跨 StoreExecutor 线程。
+
 use super::*;
 include!("http_debug.rs");
 include!("http_runtime.rs");
@@ -10,27 +19,33 @@ use crate::observer::{
 };
 
 #[derive(Debug, Deserialize)]
+// Observer query 只选择已支持的历史区间；值由 serde 反序列化为强类型枚举。
 struct ObserverPortfolioHistoryQuery {
     range: ObserverPortfolioRange,
 }
 
 #[derive(Debug, Deserialize)]
+// 只绑定 campaign 内容哈希；未启用 deny_unknown_fields，serde 默认忽略未映射字段，handler
+// 实际只读取 campaign_id。
 struct CanaryResumeRequest {
     campaign_id: ContentHash,
 }
 
 #[derive(Debug, Deserialize)]
+// 备份只接收服务端要写入的目标路径，实际文件副作用由维护 executor 执行。
 struct StoreBackupRequest {
     target: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
+// Restore 明确区分源数据库与目标路径；extractor 只解析参数，不在路由阶段复制 Store。
 struct StoreRestoreRequest {
     source: PathBuf,
     target: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
+// Run export 将目标路径和是否包含受限 raw model 数据一并交给 Store 导出边界。
 struct StoreExportRunRequest {
     run_id: String,
     target: PathBuf,
@@ -38,6 +53,7 @@ struct StoreExportRunRequest {
 }
 
 #[derive(Debug, Deserialize)]
+// Debug bundle 只需 Run ID 与新输出目录；脱敏和实际写盘在 Store 导出逻辑完成。
 struct StoreExportDebugBundleRequest {
     run_id: String,
     target: PathBuf,
@@ -63,6 +79,8 @@ struct StoreLessonTransitionRequest {
 }
 
 impl Daemon {
+    // Router 只注册控制面路径；状态权限在每个 handler 的 authorize 和 runtime/Store
+    // 调用中再次校验，路由存在本身不代表任何业务动作已授权。
     pub fn router(&self) -> Router {
         Router::new()
             .route(
@@ -125,6 +143,10 @@ impl Daemon {
             .route("/control/store/restore", post(http_store_restore))
             .route("/control/store/export-run", post(http_store_export_run))
             .route(
+                "/control/store/export-run-bundle",
+                post(http_store_export_run_bundle),
+            )
+            .route(
                 "/control/store/export-debug-bundle",
                 post(http_store_export_debug_bundle),
             )
@@ -148,6 +170,8 @@ impl Daemon {
         address: SocketAddr,
         shutdown: watch::Receiver<bool>,
     ) -> Result<()> {
+        // 入口先限制 loopback，再绑定 listener；bind 成功只代表传输层监听成功，不启动
+        // Paper scheduler，也不创建 Run。
         if !address.ip().is_loopback() {
             return Err(DaemonError::InvalidInput(
                 "daemon HTTP control API must bind a loopback address".to_owned(),
@@ -162,6 +186,8 @@ impl Daemon {
         listener: TcpListener,
         shutdown: watch::Receiver<bool>,
     ) -> Result<()> {
+        // listener 复查 loopback 后交给 Axum；graceful shutdown 只结束连接服务，正在执行
+        // 的 task 状态仍由 TaskRuntime/Store 恢复。
         let address = listener.local_addr()?;
         if !address.ip().is_loopback() {
             return Err(DaemonError::InvalidInput(
@@ -179,6 +205,7 @@ impl Daemon {
 }
 
 async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
+    // watch receiver 只观察 supervisor 的停止值；通道关闭也结束等待，不撤销 durable 状态。
     if *shutdown.borrow() {
         return;
     }
@@ -191,6 +218,8 @@ async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
 
 // Close transport streams on graceful shutdown without cancelling task futures.
 async fn wait_for_stream_shutdown(shutdown: &Option<axum::Extension<watch::Receiver<bool>>>) {
+    // SSE stream 使用可选 Extension：测试/独立 router 没有 shutdown 时保持 pending，正式
+    // server 则在 watch=true 后关闭 stream，避免长连接阻塞 HTTP graceful shutdown。
     match shutdown {
         Some(receiver) => wait_for_shutdown(receiver.0.clone()).await,
         None => std::future::pending::<()>().await,
@@ -201,6 +230,8 @@ async fn http_health(
     State(daemon): State<Arc<Daemon>>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<DaemonHealth>, StatusCode> {
+    // Health 是认证只读投影；StoreExecutor 保证读取与维护/heartbeat 的串行边界，health
+    // 中的 scheduler/Policy 状态不是某个 Run 的完成证明。
     authorize(&daemon, &headers)?;
     let operation = daemon.clone();
     run_daemon_store_operation(daemon.store_executor.clone(), move || operation.health())
@@ -213,6 +244,8 @@ async fn http_ready(
     State(daemon): State<Arc<Daemon>>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<DaemonHealth>, StatusCode> {
+    // Ready 在 health 之外检查 Paper broker 注入；SERVICE_UNAVAILABLE 只说明服务当前不可
+    // 运行，不把某次 readiness 变成 Paper approval 或 execution authorization。
     authorize(&daemon, &headers)?;
     let operation = daemon.clone();
     run_daemon_store_operation(daemon.store_executor.clone(), move || operation.ready())
@@ -228,6 +261,7 @@ async fn http_observer_snapshot(
     State(daemon): State<Arc<Daemon>>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<ObserverSnapshot>, StatusCode> {
+    // Snapshot 合并 durable observer 与有界外部观察；失败返回 500，不用空 JSON 掩盖未知。
     authorize(&daemon, &headers)?;
     daemon.observer_snapshot().await.map(Json).map_err(|error| {
         eprintln!("observer snapshot failed: {error}");
@@ -240,6 +274,7 @@ async fn http_observer_run(
     Path(run_id): Path<String>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<ObserverRunDetail>, StatusCode> {
+    // Run detail 是只读审计投影，MissingRun 映射 404；它不 claim task、不重跑模型。
     authorize(&daemon, &headers)?;
     let run_id = RunId(run_id);
     let operation = daemon.clone();
@@ -263,6 +298,8 @@ async fn http_observer_portfolio_history(
     Query(query): Query<ObserverPortfolioHistoryQuery>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<ObserverSection<ObserverPortfolioHistory>>, StatusCode> {
+    // Portfolio history 只读取 Paper provider 并标记 section 状态；图表/点数不是后续账户
+    // NAV 完整账本或 fill 证明。
     authorize(&daemon, &headers)?;
     Ok(Json(daemon.observer_portfolio_history(query.range).await))
 }
@@ -276,11 +313,15 @@ async fn http_observer_events(
     Sse<impl futures::Stream<Item = std::result::Result<Event, Infallible>>>,
     StatusCode,
 > {
+    // 全局 SSE 同时监听 reasoning broadcast 与 Store event cursor；cursor 只用于增量观察，
+    // Lagged/Closed 被显式写成 error/结束，不伪造丢失事件。
     authorize(&daemon, &headers)?;
     let mut cursor = query.after.unwrap_or(0);
     let mut reasoning_events = daemon.reasoning_events.subscribe();
     let mut poll = tokio::time::interval(std::time::Duration::from_millis(500));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // stream! 返回惰性事件流；客户端持续拉取时 select 才轮询 Store cursor/接收广播，
+    // cursor 在该连接局部递增，不建立跨连接确认或消费语义。
     let stream = stream! {
         loop {
             tokio::select! {
@@ -340,12 +381,16 @@ async fn http_events(
     Sse<impl futures::Stream<Item = std::result::Result<Event, Infallible>>>,
     StatusCode,
 > {
+    // Run SSE 过滤同一 run_id 的 reasoning/event；poll 与 stream shutdown 并发竞争，连接
+    // 关闭不会取消或回滚已经持久化的 task/commitment。
     authorize(&daemon, &headers)?;
     let run_id = RunId(run_id);
     let mut cursor = query.after.unwrap_or(0);
     let mut reasoning_events = daemon.reasoning_events.subscribe();
     let mut poll = tokio::time::interval(std::time::Duration::from_millis(200));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // 每轮 poll 将 run_id 的 clone move 到 StoreExecutor，主 stream 保留原 ID 以过滤
+    // reasoning 广播；连接取消只 drop 观察 Future，不回滚 Store 中已提交的事件。
     let stream = stream! {
         loop {
             tokio::select! {
@@ -407,6 +452,8 @@ async fn http_replay(
     Path(run_id): Path<String>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<ReplayReport>, StatusCode> {
+    // Replay 读取 workflow/lifecycle/cursor 事实；terminal_task_count 只表示 task 状态，
+    // 不跨越到 Paper fill 或 Outcome seal。
     authorize(&daemon, &headers)?;
     let operation = daemon.clone();
     run_daemon_store_operation(daemon.store_executor.clone(), move || {
@@ -422,6 +469,7 @@ async fn http_trajectory(
     Path(run_id): Path<String>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<Vec<TrajectoryEntry>>, StatusCode> {
+    // 按 Run 读取已持久化的 trajectory；executor/Store 错误映射为 500。
     authorize(&daemon, &headers)?;
     let operation = daemon.clone();
     run_daemon_store_operation(daemon.store_executor.clone(), move || {
@@ -437,6 +485,8 @@ async fn http_retrospectives(
     Path(run_id): Path<String>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<Vec<RetrospectiveView>>, StatusCode> {
+    // 返回 daemon 对 Paper purpose 校验后的叙事集合；PositionPlan 等目的会按 daemon 规则
+    // 返回空集合而不是触发 Outcome 处理。
     authorize(&daemon, &headers)?;
     let operation = daemon.clone();
     run_daemon_store_operation(daemon.store_executor.clone(), move || {
@@ -452,6 +502,8 @@ async fn http_cancel(
     Path(run_id): Path<String>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<RunCancellationResponse>, StatusCode> {
+    // Cancel 只请求 TaskRuntime 按取消规则关闭可取消任务；已完成 Artifact/订单/Outcome
+    // 不被 HTTP handler 删除或改写。
     authorize(&daemon, &headers)?;
     let run_id = RunId(run_id);
     daemon
@@ -471,6 +523,8 @@ async fn http_retry(
     Path(run_id): Path<String>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<RunRetryResponse>, StatusCode> {
+    // Retry 的可执行 purpose、terminal status 和 Debug/Paper 限制由 daemon 检查；返回新
+    // RunId 表示新研究图已发布，不是旧 Run 重新完成。
     authorize(&daemon, &headers)?;
     let source_run_id = RunId(run_id);
     let operation = daemon.clone();
@@ -489,6 +543,7 @@ async fn http_retry(
 }
 
 fn invalid_input_or_internal(error: DaemonError) -> StatusCode {
+    // 只把明确的 InvalidInput 映射为 400，其余 runtime/store/provider 错误保守返回 500。
     if matches!(error, DaemonError::InvalidInput(_)) {
         StatusCode::BAD_REQUEST
     } else {
@@ -497,6 +552,7 @@ fn invalid_input_or_internal(error: DaemonError) -> StatusCode {
 }
 
 fn invalid_input_or_conflict(error: DaemonError) -> StatusCode {
+    // 控制请求的非输入错误统一为冲突，提示调用方重新 inspect，而不是重试/猜测状态。
     if matches!(error, DaemonError::InvalidInput(_)) {
         StatusCode::BAD_REQUEST
     } else {
@@ -509,6 +565,8 @@ async fn http_freeze(
     headers: HeaderMap,
     Json(request): Json<FreezeRequest>,
 ) -> std::result::Result<Json<DaemonHealth>, StatusCode> {
+    // Freeze/unfreeze 写入 durable FreezeState 后再返回 health；冻结是调度控制，不等于
+    // 取消已有 Paper order 或改变已 sealed Outcome。
     authorize(&daemon, &headers)?;
     let operation = daemon.clone();
     run_daemon_store_operation(daemon.store_executor.clone(), move || {
@@ -524,6 +582,7 @@ async fn http_unfreeze(
     headers: HeaderMap,
     Json(request): Json<FreezeRequest>,
 ) -> std::result::Result<Json<DaemonHealth>, StatusCode> {
+    // 解冻与 freeze 共用持久化状态写入；这里只传递操作意图，不撤回此前的 task/订单副作用。
     authorize(&daemon, &headers)?;
     let operation = daemon.clone();
     run_daemon_store_operation(daemon.store_executor.clone(), move || {
@@ -539,6 +598,8 @@ async fn http_paper_approval(
     headers: HeaderMap,
     Json(request): Json<PaperApprovalRequest>,
 ) -> std::result::Result<Json<PaperApprovalResponse>, StatusCode> {
+    // approval handler 只调用身份、资格、账户和 manifest 持久化流程；approval accepted
+    // 仍必须经过 Decision/ExecutionGate，不能直接触发 Paper submission。
     authorize(&daemon, &headers)?;
     daemon
         .approve_paper(request)
@@ -552,6 +613,7 @@ async fn http_canary_stage(
     headers: HeaderMap,
     Json(spec): Json<akzio_domain::CanaryCampaignSpec>,
 ) -> std::result::Result<Json<akzio_store::CanaryCampaignHead>, StatusCode> {
+    // Canary stage 只写入 campaign manifest/lease 绑定，candidate 仍不能绕过 active policy。
     authorize(&daemon, &headers)?;
     let operation = daemon.clone();
     run_daemon_store_operation(daemon.store_executor.clone(), move || {
@@ -566,6 +628,7 @@ async fn http_canary_status(
     State(daemon): State<Arc<Daemon>>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<Option<akzio_store::CanaryCampaignHead>>, StatusCode> {
+    // Status 是只读 projection；None 表示没有 active campaign，不代表可以直接执行 candidate。
     authorize(&daemon, &headers)?;
     let operation = daemon.clone();
     run_daemon_store_operation(daemon.store_executor.clone(), move || {
@@ -581,6 +644,8 @@ async fn http_canary_resume(
     headers: HeaderMap,
     Json(request): Json<CanaryResumeRequest>,
 ) -> std::result::Result<Json<akzio_store::CanaryCampaignHead>, StatusCode> {
+    // Resume 由 scheduler lease 和 campaign identity fencing；返回 head 不是 paired Outcome
+    // 已完成，也不是 candidate 已晋升。
     authorize(&daemon, &headers)?;
     let operation = daemon.clone();
     run_daemon_store_operation(daemon.store_executor.clone(), move || {
@@ -595,6 +660,7 @@ async fn http_store_doctor(
     State(daemon): State<Arc<Daemon>>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
+    // Doctor 走 maintenance 通道，独立于普通 task queue；完整性通过只说明 CAS/索引可读。
     authorize(&daemon, &headers)?;
     run_store_maintenance(
         daemon.maintenance(),
@@ -609,6 +675,7 @@ async fn http_store_inventory(
     State(daemon): State<Arc<Daemon>>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
+    // Inventory 是只读 Store 统计，禁止客户端把返回数量当成有效样本或 Policy readiness。
     authorize(&daemon, &headers)?;
     store_json(Ok(run_store_operation(
         daemon.store_executor.clone(),
@@ -622,6 +689,7 @@ async fn http_store_metrics(
     State(daemon): State<Arc<Daemon>>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
+    // Metrics 读取队列/lease/告警观察，不修改状态。
     authorize(&daemon, &headers)?;
     store_json(Ok(run_store_operation(
         daemon.store_executor.clone(),
@@ -635,6 +703,7 @@ async fn http_store_executor(
     State(daemon): State<Arc<Daemon>>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
+    // Executor telemetry 展示队列和维护状态；queued/completed operation 不等同业务完成。
     authorize(&daemon, &headers)?;
     Ok(Json(store_executor_json(&daemon.store_executor)))
 }
@@ -643,6 +712,7 @@ async fn http_store_alerts(
     State(daemon): State<Arc<Daemon>>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
+    // Alerts 从同一 Store metrics 读取，保留 fail-closed 诊断而不清除历史事件。
     authorize(&daemon, &headers)?;
     let metrics = run_store_operation(daemon.store_executor.clone(), "store.alerts", |store| {
         store.metrics(Utc::now())
@@ -656,6 +726,7 @@ async fn http_store_session(
     Path(session_key): Path<String>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<Option<akzio_store::SessionSlot>>, StatusCode> {
+    // Session 查询返回 reservation/commitment 投影；None 不能被 CLI 当成可直接下单。
     authorize(&daemon, &headers)?;
     run_store_operation(
         daemon.store_executor.clone(),
@@ -671,6 +742,7 @@ async fn http_store_release_evidence(
     headers: HeaderMap,
     Path(run_id): Path<String>,
 ) -> std::result::Result<Json<akzio_domain::ReleaseEvidenceBundle>, StatusCode> {
+    // Release evidence 生成脱敏 bundle/hash；导出完整性与 Run/订单/Outcome 业务状态分开。
     authorize(&daemon, &headers)?;
     run_store_operation(
         daemon.store_executor.clone(),
@@ -691,6 +763,7 @@ async fn http_store_backup(
     headers: HeaderMap,
     Json(request): Json<StoreBackupRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
+    // Backup 是显式 maintenance 写入外部 target 的操作，完成只说明备份事务返回成功。
     authorize(&daemon, &headers)?;
     store_json(Ok(run_store_maintenance(
         daemon.maintenance(),
@@ -705,6 +778,8 @@ async fn http_store_restore(
     headers: HeaderMap,
     Json(request): Json<StoreRestoreRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
+    // Restore 同样串行经过 maintenance；目标数据库的完整性由结果/Doctor 验证，不在 handler
+    // 中推断原 Run 或 Policy 已恢复可执行。
     authorize(&daemon, &headers)?;
     store_json(Ok(run_store_maintenance(
         daemon.maintenance(),
@@ -722,6 +797,7 @@ async fn http_store_export_run(
     headers: HeaderMap,
     Json(request): Json<StoreExportRunRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
+    // Run export 只读已有 Artifact，并由 Store 脱敏策略控制 raw model；导出成功不是运行成功。
     authorize(&daemon, &headers)?;
     store_json(Ok(run_store_operation(
         daemon.store_executor.clone(),
@@ -742,6 +818,7 @@ async fn http_store_export_debug_bundle(
     headers: HeaderMap,
     Json(request): Json<StoreExportDebugBundleRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
+    // Debug bundle 是分享用诊断投影，不重跑节点、不调用模型、不发送 broker 请求。
     authorize(&daemon, &headers)?;
     store_json(Ok(run_store_operation(
         daemon.store_executor.clone(),
@@ -751,11 +828,31 @@ async fn http_store_export_debug_bundle(
     .await?))
 }
 
+async fn http_store_export_run_bundle(
+    State(daemon): State<Arc<Daemon>>,
+    headers: HeaderMap,
+    Json(request): Json<StoreExportDebugBundleRequest>,
+) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
+    // The ordinary Run exporter is read-only and share-safe. Its Store guard
+    // rejects isolated/Debug identity even when the HTTP caller is authorized.
+    authorize(&daemon, &headers)?;
+    if daemon.debug_enabled() {
+        return Err(StatusCode::CONFLICT);
+    }
+    store_json(Ok(run_store_operation(
+        daemon.store_executor.clone(),
+        "store.export_run_bundle",
+        move |store| store.export_run_bundle(&RunId(request.run_id), request.target),
+    )
+    .await?))
+}
+
 async fn http_store_lessons(
     State(daemon): State<Arc<Daemon>>,
     Query(query): Query<StoreLessonListQuery>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<Vec<serde_json::Value>>, StatusCode> {
+    // Lesson list 只过滤/展示 Store 生命周期；limit 是读取边界，不创建或激活 Lesson。
     authorize(&daemon, &headers)?;
     let lifecycle = query
         .lifecycle
@@ -783,11 +880,15 @@ async fn http_store_lesson_add(
     headers: HeaderMap,
     Json(input): Json<LessonInput>,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
+    // Add 先把原始 operator input 作为 source Artifact，再由 Store 写 Lesson Draft，保证
+    // source_refs/provenance 完整；Draft 不等于 Active、Policy 或执行规则。
     authorize(&daemon, &headers)?;
     if input.authored_by.trim().is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
     let now = Utc::now();
+    // 先把原始 JSON 输入放入当前 Store 连接的 staged BLOB；后续 write_lesson 会在一个
+    // Immediate 事务内提升 source 与 Lesson Artifact 并写 head/event，前面失败不发布 Draft。
     let stored_input = serde_json::to_vec(&input).map_err(|_| StatusCode::BAD_REQUEST)?;
     let source_blob = run_store_operation(
         daemon.store_executor.clone(),
@@ -868,6 +969,7 @@ async fn http_store_lesson(
     Path(lesson_id): Path<String>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
+    // Lesson detail 是只读的 artifact/revision 投影。
     authorize(&daemon, &headers)?;
     let lesson = run_store_operation(
         daemon.store_executor.clone(),
@@ -884,6 +986,7 @@ async fn http_store_lesson_usage(
     Path(lesson_id): Path<String>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<LessonUsage>, StatusCode> {
+    // Usage 读取 lesson 的预算/引用事实，不消耗或刷新使用次数。
     authorize(&daemon, &headers)?;
     run_store_operation(
         daemon.store_executor.clone(),
@@ -900,6 +1003,8 @@ async fn http_store_lesson_transition(
     headers: HeaderMap,
     Json(request): Json<StoreLessonTransitionRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
+    // Transition 把 actor/reason 送入 Store lifecycle gate；HTTP 成功只表示该状态转移已
+    // 通过持久化校验，不代表它已影响 Decision/Execution。
     authorize(&daemon, &headers)?;
     let lesson = run_store_operation(
         daemon.store_executor.clone(),
@@ -920,6 +1025,7 @@ async fn http_store_lesson_transition(
 }
 
 fn parse_lesson_horizon(value: &str) -> std::result::Result<DecisionHorizon, ()> {
+    // UI 字符串只允许三个明确 horizon，未知输入不默认到 T5。
     match value.trim().to_ascii_lowercase().as_str() {
         "t1" => Ok(DecisionHorizon::T1),
         "t3" => Ok(DecisionHorizon::T3),
@@ -929,6 +1035,7 @@ fn parse_lesson_horizon(value: &str) -> std::result::Result<DecisionHorizon, ()>
 }
 
 fn parse_lesson_refs_http(values: &[String]) -> std::result::Result<Vec<ArtifactRef>, StatusCode> {
+    // 把外部文本解析成 Lesson ArtifactRef；只建引用，不读取或复制目标 Artifact。
     values
         .iter()
         .map(|value| {
@@ -943,6 +1050,7 @@ fn parse_lesson_refs_http(values: &[String]) -> std::result::Result<Vec<Artifact
 }
 
 fn lesson_view_json(value: &StoredLesson) -> std::result::Result<serde_json::Value, StatusCode> {
+    // 将 Store 结构转成稳定 JSON view；serde 失败保持内部错误，不返回半截对象。
     serde_json::to_value(serde_json::json!({
         "artifact": &value.artifact,
         "lesson": &value.lesson,
@@ -952,6 +1060,8 @@ fn lesson_view_json(value: &StoredLesson) -> std::result::Result<serde_json::Val
 }
 
 fn store_executor_json(executor: &StoreExecutor) -> serde_json::Value {
+    // 读取 executor telemetry 的 snapshot；MaintenanceState 的 Completed 只代表维护任务
+    // 结束，不重置或掩盖 lease deferral。
     let telemetry = executor.telemetry();
     let maintenance = match telemetry.maintenance {
         StoreMaintenanceState::Idle => serde_json::json!({ "state": "idle" }),
@@ -987,6 +1097,7 @@ fn store_executor_json(executor: &StoreExecutor) -> serde_json::Value {
 fn store_json<T: Serialize>(
     result: std::result::Result<T, StoreError>,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
+    // 泛型输出统一经过 serde Value；Store error 与序列化 error 都 fail closed。
     result
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
         .and_then(|value| {
@@ -1005,6 +1116,8 @@ where
     T: Send + 'static,
     F: FnOnce(Store) -> std::result::Result<T, StoreError> + Send + 'static,
 {
+    // `F: FnOnce + Send + 'static` 让一次 Store 操作拥有捕获值并进入串行 executor；外层
+    // executor error 与内层 StoreError 分开记录，调用方只收到 HTTP status。
     executor
         .execute(work)
         .await
@@ -1026,6 +1139,8 @@ where
     T: Send + 'static,
     F: FnOnce() -> std::result::Result<T, DaemonError> + Send + 'static,
 {
+    // daemon closure 在 StoreExecutor 线程执行，但不把 Store handle 暴露给 HTTP caller；
+    // 两层 Result 用 `?` 保留 executor/runtime 错误。
     executor.execute(move |_| work()).await?
 }
 
@@ -1037,6 +1152,8 @@ pub(super) async fn run_store_maintenance<T>(
 where
     T: Send + 'static,
 {
+    // 维护操作走独立 Maintenance executor，避免 backup/restore/doctor 与普通 mutation 互相
+    // 穿插；返回值仍只描述该操作。
     maintenance.run(kind, work).await.map_err(|error| {
         tracing::error!(
             operation = kind.as_str(),
@@ -1048,6 +1165,7 @@ where
 }
 
 fn authorize(daemon: &Daemon, headers: &HeaderMap) -> std::result::Result<(), StatusCode> {
+    // 认证只接受精确 header 值；失败不泄露 token 对比细节，也不触发 Store/模型 I/O。
     headers
         .get("x-akzio-token")
         .and_then(|value| value.to_str().ok())
@@ -1062,6 +1180,7 @@ async fn http_store_events(
     Query(query): Query<StoreEventsQuery>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<Vec<StoreEventView>>, StatusCode> {
+    // Store events 是分页只读查询，after/limit 只限制投影，不推进 cursor。
     authorize(&daemon, &headers)?;
     run_store_operation(
         daemon.store_executor.clone(),
@@ -1093,6 +1212,8 @@ async fn http_repair_narrative(
     Path(run_id): Path<String>,
     headers: HeaderMap,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
+    // Repair handler 只入队 sealed T5 narrative repair task；返回 task_id 不是 repair 已执行
+    // 或 learning 已通过的证明。
     authorize(&daemon, &headers)?;
     let operation = daemon.clone();
     run_daemon_store_operation(daemon.store_executor.clone(), move || {

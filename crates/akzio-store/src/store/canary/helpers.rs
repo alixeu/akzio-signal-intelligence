@@ -1,9 +1,16 @@
-// 从 campaign 表读取一个可选的 immutable head，并把 JSON、revision、时间恢复为领域对象。
+// 文件导读：这些 helper 只从 campaign/session 表恢复 immutable head 和 reservation，
+// 同时兼容旧 level 编码；它们不会产生新的 session，也不会改变 active 标志。
+// 查询统一借用调用方连接，不开新连接、不获取 Store 锁；read_* 返回 Option 表示行是否存在，
+// 解析/完整性失败保持 Err，validate_* 只做内存校验。
+// 从 campaign 表读取可变的当前 head 投影，并把 JSON、revision、时间恢复为领域对象；
+// 状态转换另写历史评价，不能把 head 本身当作不可变证据。
 // campaign 不存在返回 None；负 revision 或坏 JSON/时间属于 Store 完整性错误。
 fn read_campaign(
     connection: &Connection,
     campaign_id: &ContentHash,
 ) -> StoreResult<Option<CanaryCampaignHead>> {
+    // campaign_id 是唯一过滤键；OptionalExtension 将 QueryReturnedNoRows 转成 None，
+    // 而 SQL/serde/时间错误仍为 Err。负 revision 明确视为 Store 损坏。
     let row: Option<(String, String, Option<String>, i64, String)> = connection
         .query_row(
             "SELECT spec_json, status_json, last_verdict_json, revision, updated_at FROM rebuild_canary_campaigns WHERE campaign_id = ?1",
@@ -19,6 +26,7 @@ fn read_campaign(
             },
         )
         .optional()?;
+    // let-else 把“未创建 campaign”与“行存在但内容无效”分开：前者 None，后者继续验证。
     let Some((spec_json, status_json, verdict_json, revision, updated_at)) = row else {
         return Ok(None);
     };
@@ -37,8 +45,8 @@ fn read_campaign(
     }))
 }
 
-// 按当前阶段读取旧式单 session 表，同时兼容历史 canary10/25/50 的 level 序列化名称。
-// 该路径只恢复 legacy session；cohort 绑定字段由 paired cohort 表单独保存。
+// 输入 campaign_id 和当前领域阶段；SQL 按 campaign + 当前/旧序列化 level 取 legacy session。
+// 该路径只恢复 legacy session，cohort/market_day/regime 保持 None，paired cohort 表另存绑定字段。
 fn read_session(
     connection: &Connection,
     campaign_id: &ContentHash,
@@ -98,6 +106,8 @@ fn read_cohort_session_by_key(
     cohort_id: &ContentHash,
     session_key: &str,
 ) -> StoreResult<Option<StoredCanarySession>> {
+    // 两个键精确定位一条 paired session；闭包将借用 Row 转成拥有列值的结构，再在 map 中校验领域字段。
+    // Option::map + transpose 保留“无行为 None、转换失败为 Err”的双层语义。
     let columns = connection
         .query_row(
             "SELECT cohort_id, campaign_id, stage_json, session_key, market_day, regime, parent_run_id, contract_shadow_run_id, topology_shadow_run_id, bundle_shadow_run_id, scheduler_epoch, reserved_at FROM rebuild_canary_cohort_sessions WHERE cohort_id = ?1 AND session_key = ?2",
@@ -115,6 +125,8 @@ fn read_cohort_sessions(
     connection: &Connection,
     cohort_id: &ContentHash,
 ) -> StoreResult<Vec<StoredCanarySession>> {
+    // cohort_id 过滤全组 session 并按 session_key 排序；先 collect SQLite 行，再逐项转换，
+    // `collect::<StoreResult<Vec<_>>>()` 只在全部 session 合法时成功。
     let mut statement = connection.prepare(
         "SELECT cohort_id, campaign_id, stage_json, session_key, market_day, regime, parent_run_id, contract_shadow_run_id, topology_shadow_run_id, bundle_shadow_run_id, scheduler_epoch, reserved_at FROM rebuild_canary_cohort_sessions WHERE cohort_id = ?1 ORDER BY session_key",
     )?;
@@ -126,8 +138,8 @@ fn read_cohort_sessions(
         .collect()
 }
 
-// 根据 campaign 当前阶段判断 reservation 是否必须绑定 cohort、market day 和 regime，
-// 或者必须保持 legacy session 的三个字段为空；这里不修改 reservation。
+// 输入 campaign head 与待写 reservation 的借用，按阶段判断是否必须有 cohort/market_day/regime，
+// 或必须保持 legacy 字段为空；失败阻止调用方事务写入，本函数本身不修改 reservation。
 fn validate_session_cohort(
     campaign: &CanaryCampaignHead,
     reservation: &CanarySessionReservation,

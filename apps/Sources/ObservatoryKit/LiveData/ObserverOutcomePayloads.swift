@@ -1,6 +1,10 @@
 import Foundation
 
+// 文件导读：描述 Observer 的账户/成交/风险、Outcome horizon/窗口/比较曲线、portfolio history 与 policy metric JSON DTO。
+// HTTP 解码由 ObserverClient 完成；LivePortfolioProjection、LiveOutcomeProjection 和 LiveLearningProjection 消费这些快照生成展示值。
+// 这里的只读 Codable 结构保留 Rust 的 Optional 与整数单位；缺窗口、缺 fill 或缺统计字段都不由客户端推断为零或完成。
 struct ObserverPolicyMetricPayload: Decodable, Sendable {
+    // policy metric 的 subject/state 保留 JSONValue，样本和 Ppm 指标按 Rust schema 解码，Optional 表示未提供。
     let subject: JSONValue
     let state: JSONValue
     let sampleCount: Int
@@ -21,6 +25,7 @@ struct ObserverPolicyMetricPayload: Decodable, Sendable {
 }
 
 struct ObserverPortfolioPayload: Decodable, Sendable {
+    // portfolio 是 live 账户快照；fills/analytics 可缺失，positions 和账户金额仍保持 provider 的值语义。
     let brokerSession: String
     let marketOpen: Bool
     let status: String
@@ -53,6 +58,7 @@ struct ObserverPortfolioPayload: Decodable, Sendable {
 }
 
 struct ObserverPositionPayload: Decodable, Sendable {
+    // position 的价格/P&L/sparkline 字段可为空；UI 投影据此区分未观测与真实零值。
     let symbol: String
     let quantityMicros: Int64
     let marketValueMicros: Int64
@@ -73,6 +79,7 @@ struct ObserverPositionPayload: Decodable, Sendable {
 }
 
 struct ObserverBrokerFillPayload: Decodable, Sendable {
+    // fill 保留 broker activity/order identity、交易时间和 venue；source 不在客户端重新推断。
     let activityID: String
     let brokerOrderID: String
     let symbol: String
@@ -97,6 +104,7 @@ struct ObserverBrokerFillPayload: Decodable, Sendable {
 }
 
 struct ObserverPortfolioAnalyticsPayload: Decodable, Sendable {
+    // analytics 记录 benchmark/lookback/sample 以及风险统计；beta 可缺失，其余字段按 Core 类型传递。
     let benchmarkSymbol: String
     let lookback: String
     let sampleCount: Int
@@ -117,6 +125,7 @@ struct ObserverPortfolioAnalyticsPayload: Decodable, Sendable {
 }
 
 struct ObserverOutcomePayload: Decodable, Sendable {
+    // outcome 以 outcomeID、已完成交易 session 数和各 horizon 组成不可变快照。
     let outcomeID: String
     let completedTradingSessions: UInt8
     let horizons: [ObserverOutcomeHorizonPayload]
@@ -129,6 +138,7 @@ struct ObserverOutcomePayload: Decodable, Sendable {
 }
 
 struct ObserverOutcomeHorizonPayload: Decodable, Sendable {
+    // horizon 同时承载 progress、可选 sealed window、统计指标和 comparison；缺 window 不等于已完成。
     let horizon: String
     let progressPpm: UInt32
     let window: ObserverOutcomeWindowPayload?
@@ -153,6 +163,7 @@ struct ObserverOutcomeHorizonPayload: Decodable, Sendable {
 }
 
 struct ObserverOutcomeWindowPayload: Decodable, Sendable {
+    // sealed window 的核心收益/成本字段为非 Optional，校准和风险 recall 则保留可能缺失的边界。
     let horizon: String
     let observedTradingDay: String
     let portfolioReturnPpm: Int64
@@ -183,6 +194,7 @@ struct ObserverOutcomeWindowPayload: Decodable, Sendable {
 }
 
 struct ObserverOutcomeComparisonPointPayload: Decodable, Sendable {
+    // comparison point 只保存 trading day 和两条 Ppm 路径，绘图坐标由 helper 另行生成。
     let tradingDay: String
     let portfolioPpm: Int64
     let benchmarkPpm: Int64
@@ -195,6 +207,7 @@ struct ObserverOutcomeComparisonPointPayload: Decodable, Sendable {
 }
 
 struct ObserverPortfolioHistoryPayload: Decodable, Sendable {
+    // history 是按 range 返回的账户曲线；benchmarkSymbol 可缺失，points 仍保持 provider 顺序。
     let range: String
     let benchmarkSymbol: String?
     let points: [ObserverPortfolioHistoryPointPayload]
@@ -207,6 +220,7 @@ struct ObserverPortfolioHistoryPayload: Decodable, Sendable {
 }
 
 struct ObserverPortfolioHistoryPointPayload: Decodable, Sendable {
+    // history point 的 timestamp/equity 必须存在，P&L 和 benchmark equity 可选以保留观测缺口。
     let timestamp: Date
     let equityMicros: Int64
     let profitLossMicros: Int64?
@@ -223,6 +237,7 @@ struct ObserverPortfolioHistoryPointPayload: Decodable, Sendable {
 }
 
 struct ObserverWorkflowPayload: Decodable, Sendable {
+    // workflow 将 Run、状态、任务和 event cursor 绑定在同一 Core 记录，finishedAt 可为空表示仍在运行。
     let run: ObserverRunPayload
     let status: String
     let finishedAt: Date?
@@ -239,6 +254,7 @@ struct ObserverWorkflowPayload: Decodable, Sendable {
 }
 
 struct ObserverRunPayload: Decodable, Sendable {
+    // run identity 由 runID/purpose/topologyID/createdAt 构成，CodingKeys 把协议 snake_case 映射到 Swift 字段。
     let runID: String
     let purpose: String
     let topologyID: String
@@ -253,6 +269,7 @@ struct ObserverRunPayload: Decodable, Sendable {
 }
 
 struct ObserverTaskPayload: Decodable, Sendable {
+    // task 保存 node、状态、ready/finished 时间和 attempt 计数；finishedAt 缺失不被解释为失败。
     let node: ObserverNodePayload
     let taskStatus: String
     let readyAt: Date
@@ -269,6 +286,7 @@ struct ObserverTaskPayload: Decodable, Sendable {
 }
 
 struct ObserverNodePayload: Decodable, Sendable {
+    // node 的 spec 优先提供 horizon；旧 payload 没有 spec 时由 objective 做兼容性读取，不回写 payload。
     let spec: NodeSpecPayload?
     var horizon: String? { spec != nil ? spec?.horizon : WorkflowDisplay.horizon(objective: objective) }
     let taskID: String
@@ -286,10 +304,12 @@ struct ObserverNodePayload: Decodable, Sendable {
 }
 
 struct ObserverInvalidationPayload: Decodable {
+    // invalidation 只携带需要重新同步的 cursor，不声明新的业务状态。
     let cursor: Int64
 }
 
 struct ObserverReasoningEventPayload: Decodable, Sendable {
+    // reasoning event 关联 Run/task/attempt/turn，delta 可缺失以表示没有增量文本。
     let type: String
     let runID: String
     let taskID: String

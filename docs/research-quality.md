@@ -17,10 +17,10 @@
 
 ## 固定离线目录
 
-[24 项目录](../config/research-quality-cases.json) 分为 Context、Review、Lesson，各八项，使用稳定 ID 绑定到实际 Rust 测试。执行器保存命令、退出码、完整日志和每项结果；找不到测试、被忽略或失败均不算通过。
+[24 项目录](../config/research-quality-cases.json) 分为 Context、Review、Lesson，各八项，使用稳定 ID 标识对应的 Rust 测试。目录是核对测试名称与范围的清单；验证时以测试输出及退出码为准，被忽略或未运行的测试不算通过。不再由独立 Python 脚本生成逐 ID 报告。
 
 ```bash
-python3 scripts/verify_research_quality.py
+cargo test --locked -p akzio-context -p akzio-domain --lib
 ```
 
 额外回归验证第 25 份关键证据、预算耗尽、完整正式图、无进展停止后直接 DecisionGate 的拒绝，以及模型调用预算在重新打开 Store 后仍有效。固定目录不是整个 workspace 测试的替代品。

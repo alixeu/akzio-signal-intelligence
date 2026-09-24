@@ -1,5 +1,11 @@
 //! Rust-owned Paper execution policy and deterministic order planning.
 
+// 文件导读：本 crate 把研究产出的 DecisionContext 转成受 Rust 约束的目标、订单、
+// ExecutionVerdict 和 Paper Commitment。DecisionGate 只决定目标与研究状态，
+// ExecutionGate 重新核验账户/报价/时钟及风控；PaperCommitment 仅将确定性承诺写入
+// Store；Gate 上游可只读刷新 Broker/行情快照，Dispatch/Reconcile 才可能发出订单
+// 写请求并对账。NoOrder 仍可形成评估来源，不需要订单。
+
 pub mod allocation;
 pub mod calibration;
 pub mod decision_gate;
@@ -60,6 +66,8 @@ pub(crate) fn trusted_execution_provenance(
     permit: &TaskWritePermit,
     now: DateTime<Utc>,
 ) -> ArtifactProvenance {
+    // 执行侧产物统一继承当前 task permit 的 Contract 身份；这只构造 provenance，
+    // 不负责提交 Artifact，提交仍由各阶段自己的 fenced Store 事务完成。
     ArtifactProvenance {
         source_family: "akzio.execution".to_owned(),
         observed_at: Some(now),
@@ -123,6 +131,8 @@ pub struct ExecutionPolicy {
 
 impl ExecutionPolicy {
     pub fn validate(&self) -> Result<()> {
+        // 先锁定四个允许执行的 ETF 和所有时间/金额上限，避免调用方用一个“看似
+        // 合法”的自定义资产集合绕过 Paper 执行边界。
         let executable_assets = Asset::EXECUTABLE.into_iter().collect::<BTreeSet<_>>();
         if self.assets != executable_assets
             || self.max_gross_weight.0 > WeightPpm::SCALE
@@ -142,6 +152,7 @@ impl ExecutionPolicy {
     }
 
     pub fn policy_hash(&self) -> Result<ContentHash> {
+        // 只有通过同一套校验的策略才参与哈希，后续 ExecutionPlan 会用它绑定风控版本。
         self.validate()?;
         let value = serde_json::to_value(self).map_err(|_| ExecutionError::InvalidPolicy)?;
         content_hash_json(&value).map_err(|_| ExecutionError::InvalidPolicy)
@@ -150,6 +161,8 @@ impl ExecutionPolicy {
 
 impl Default for ExecutionPolicy {
     fn default() -> Self {
+        // 默认值是 Paper 的保守运行上限，不代表审批或校准已经就绪；DecisionPolicy
+        // 的 fail-closed 状态仍由上层单独判断。
         Self {
             assets: Asset::EXECUTABLE.into_iter().collect(),
             max_gross_weight: WeightPpm(1_000_000),
@@ -167,6 +180,8 @@ impl Default for ExecutionPolicy {
 }
 
 fn scaled_weight(equity: MoneyMicros, weight: WeightPpm) -> MoneyMicros {
+    // 将 ppm 权重按账户权益缩放为微美元；中间计算转 i128 并饱和防溢出，
+    // 最终若超出 i64 可表示范围则取 i64::MAX，避免窄化转换发生截断。
     let value = i128::from(equity.0).saturating_mul(i128::from(weight.0)) / WEIGHT_SCALE;
     MoneyMicros(i64::try_from(value).unwrap_or(i64::MAX))
 }
@@ -179,6 +194,8 @@ pub(crate) fn validate_quote(
     quote: Quote,
     now: DateTime<Utc>,
 ) -> Result<()> {
+    // 报价同时检查新鲜度、未来偏移、正 bid/ask 和价差；任一项失败都在订单生成前
+    // 返回，卖单收益不会被当作买单购买力的先验保证。
     let age = now.signed_duration_since(quote.observed_at);
     if age > chrono::Duration::seconds(max_age_secs)
         || age < -chrono::Duration::seconds(max_future_skew_secs)
@@ -201,6 +218,8 @@ pub(crate) fn protected_limit_price(
     side: OrderSide,
     protection_bps: u32,
 ) -> MoneyMicros {
+    // 用报价一侧加/减固定保护幅度，并按 Paper 价格 tick 做方向一致的舍入，确保
+    // 订单 wire 值仍由 Rust 从已验证 Quote 确定地产生。
     let protection = i64::from(protection_bps);
     let raw = match side {
         OrderSide::Buy => quote.ask.0.saturating_mul(BPS_SCALE + protection) / BPS_SCALE,

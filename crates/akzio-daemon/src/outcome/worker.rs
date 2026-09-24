@@ -1,3 +1,11 @@
+// 文件导读：Outcome worker 以每个 Run/outcome_id 独立 daemon lease 处理最早未完成的
+// horizon，先持久化证据和 Rust stage packet，再运行一次有界 AgentRuntime 会话
+// （Outcome 自身仍遵守 Draft→Submit 两阶段协议），最后由 EvaluationRuntime 记录
+// Partial 或 sealed T5。Late catch-up 只看当前 cutoff；model error
+// 可退化为 Rust-only diagnostic，但不能伪造 narrative、fill、NAV 或 learning qualification。
+// Rust 机制：`Drop` guard 覆盖错误/取消；`Option` 表示 draft/父 canary/成熟窗口缺失；
+// `Vec::retain` 截断事实到 horizon，async AgentRuntime Future 与 fenced Store write 顺序明确。
+
 use super::*;
 
 impl Daemon {
@@ -6,6 +14,8 @@ impl Daemon {
         task: &ClaimedAttempt,
         now: DateTime<Utc>,
     ) -> Result<TaskCompletion> {
+        // 一个 task 只推进当前最早 pending horizon；先做 purpose/schedule/narrative repair
+        // 分流，再取得独立 outcome lease，保证 Session T0 与历史 Outcome 不互相阻塞。
         if self.store.run_purpose(&task.run_id)? != RunPurpose::Paper {
             return Ok(TaskCompletion::NoOutput);
         }
@@ -45,6 +55,8 @@ impl Daemon {
         else {
             return Ok(TaskCompletion::DeferredUntil(now + Duration::seconds(30)));
         };
+        // lease 名含 Run 与 outcome_id；guard 拥有 lease 副本，任何 `?`、return 或 Future
+        // 取消都会尝试释放它，失败时仍由 durable expiry/recovery 决定何时可重新领取。
         let _lease_guard = OutcomeLeaseGuard {
             store: self.store.clone(),
             lease: outcome_lease.clone(),
@@ -93,6 +105,8 @@ impl Daemon {
         else {
             return Ok(TaskCompletion::DeferredUntil(next_outcome_check_at(now)?));
         };
+        // 不按自然日推测已完成窗口；只从 collection 返回的实际共同 Session 中挑最早
+        // 尚无 Retrospective 的 horizon。
         let mut pending = Vec::new();
         for observation in &collected.materialization.observations {
             if self
@@ -128,6 +142,8 @@ impl Daemon {
             .materialization
             .daily_observations
             .retain(|o| o.observed_trading_day <= stage_day);
+        // 证据 Artifact 按 permit 与 outcome lease 逐个写入，之后才校验价格 cutoff；若后续
+        // 校验或模型失败，已持久化 evidence 保留用于审计，不会被当作 sealed Outcome。
         for artifact in &collected.evidence_artifacts {
             self.store.write_task_artifact_fenced(
                 Some(&outcome_lease),
@@ -197,6 +213,8 @@ impl Daemon {
                 "soft_warnings": decision_context.soft_warnings},
             "instruction": "Review only this horizon. Earlier-stage unavailable narratives are unknown, never successful learning. Do not recompute or replace Rust numeric facts."
         });
+        // 只把 Rust 计算的该阶段 packet 作为顶层模型候选；完整 market evidence 只经
+        // source_refs 保留 provenance，不因此扩大 Agent 的读取授权。
         let stage_artifact = Artifact::new(
             ArtifactKind::SemanticDetail,
             self.store.stage_json(&packet)?,
@@ -235,6 +253,8 @@ impl Daemon {
             stage_day
         );
         let (retrospective_draft, diagnostic) = if task.node.contract_hash.is_some() {
+            // AgentRuntime 的 Future 被当前 worker await；两阶段提交完成且 draft 身份与
+            // 冻结 horizon/outcome 匹配才写入 Attempt，模型失败按类别记诊断而不改数值 facts。
             match self
                 .agents
                 .run(
@@ -282,6 +302,8 @@ impl Daemon {
         };
         let evaluation = EvaluationRuntime::new(self.store.clone(), EvaluationPolicy::default())?;
         if horizon != OutcomeHorizon::T5 {
+            // T1/T3 只写 Partial retrospective/窗口，再延期等待下一个真实共同交易 Session；
+            // 即使没有 narrative draft，也保留 diagnostic，不会 seal 或进入学习评估。
             evaluation.record_partial_retrospective_with_diagnostic_fenced(
                 &outcome_lease,
                 &task.permit,
@@ -299,6 +321,8 @@ impl Daemon {
             }));
         }
         if self.store.debug_learning_isolated(&task.run_id)? {
+            // Debug Store 可以封存隔离 Outcome，但分支不创建 canonical Evaluation/Lesson，
+            // 不能把隔离数据转成正式校准样本。
             evaluation.seal_outcome_with_retrospective_fenced(
                 &outcome_lease,
                 &task.permit,
@@ -310,6 +334,8 @@ impl Daemon {
             return Ok(TaskCompletion::Committed);
         }
         if let Some(session) = self.store.canary_session_for_run(&task.run_id)? {
+            // Canary 先密封父 Outcome，再等待三份 Shadow Outcome/narrative 齐备后比较；
+            // 完成 Canary comparison 不激活 candidate Contract 或 Topology。
             let materialization = collected.materialization;
             let (parent_outcome, _) = evaluation.seal_outcome_for_evaluation_fenced(
                 &outcome_lease,
@@ -355,6 +381,8 @@ impl Daemon {
             token_cost: decision_usage.billable_tokens_if_complete(),
             latency_millis: decision_usage.latency_millis_if_complete(),
         };
+        // 普通 canonical Paper 在 T5 才走 evaluation：有有效 draft 则一并评估；没有 draft
+        // 仍只封存 Rust 数值和 Rust-only retrospective，资格由 EvaluationRuntime 决定。
         if let Some(draft) = retrospective_draft.as_ref() {
             evaluation.evaluate_with_lease_and_retrospective(Some(&outcome_lease), input, draft)?;
         } else {
@@ -371,6 +399,8 @@ impl Daemon {
 }
 
 fn outcome_failure_category(error: &akzio_research::ResearchError) -> &'static str {
+    // 只把 ResearchError 归一为诊断类别，不把错误正文或 provider 响应注入 Outcome；类别
+    // 供 Rust-only retrospective 记录，不能改变数值 Outcome 的 authoritative 来源。
     use akzio_research::ResearchError;
     match error {
         ResearchError::Context(_) => "context_rejected",

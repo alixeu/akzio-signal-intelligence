@@ -1,3 +1,10 @@
+// 文件导读：narrative repair 只在 sealed T5 Outcome 上补写可追溯 Retrospective narrative，
+// 复用原数值 Outcome、Decision/Context 和历史复盘，受独立 lease/Contract 约束。修复
+// 成功不是重算收益、改变 fill、激活 Lesson 或自动取得 learning eligibility；资格仍由
+// EvaluationRuntime 重新检查。
+// Rust 机制：`Option` 检查 canary/已有 evaluation，`Drop` guard 释放 Outcome lease；
+// `async` AgentRuntime Future 与 fenced Store 写入分离，借用 candidates 只传 ArtifactRef。
+
 use super::*;
 
 impl Daemon {
@@ -7,6 +14,8 @@ impl Daemon {
         schedule: &OutcomeSchedule,
         now: DateTime<Utc>,
     ) -> Result<TaskCompletion> {
+        // 入口先要求 sealed Outcome 和既有 T5 retrospective，再取得同一 outcome_id lease；
+        // 这样 repair 不会在数值结果尚未冻结时抢先生成叙事。
         let outcome_artifact = self
             .store
             .outcome_for(&task.run_id, &schedule.outcome_id)?

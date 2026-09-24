@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# 文件职责：批量调用确定性 Swift capture 入口，生成 UI 回归截图矩阵。
+# 该脚本只构建并渲染离屏页面，不连接 Core、不启动 Paper，也不把截图当作业务证明。
+# CaptureCommand 解析本脚本传入的 scenario/route，再用 Mock Scenario 写 PNG；本脚本会构建 executable 并在 OUT_DIR 留下截图文件。
+# 固定 ROUTES 与 MATRIX 是截图覆盖表，不从 Rust workflow 或市场 Session 动态发现页面/场景。
 # Batch screenshot evidence for Akzio Observatory.
 #
 # Renders every page for the default scenario, plus the scenarios that exercise the
@@ -8,6 +12,7 @@
 # Usage:
 #   Scripts/capture_screens.sh              # release binary, default matrix
 #   SIZE=1280x800 Scripts/capture_screens.sh  # the narrow, compact-layout pass
+# 严格模式使这里未被条件结构接住的 build/capture 失败即停止；之前已写入的 PNG 不会自动删除，便于保留部分失败证据。
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -26,8 +31,10 @@ mkdir -p "$OUT_DIR"
 ROUTES=(overview workflow intelligence portfolio outcome learning runArchive)
 
 capture() {
+  # 本函数只拼接场景/路由参数并调用单帧 capture CLI；失败由严格模式中止整批，成功后打印文件名。
   local scenario="$1" route="$2"
   local name="${scenario}-${route}"
+  # 参数只决定截图身份；真正的场景/路由校验由 Swift capture 入口完成。
   # 每个场景/路由只负责生成一张确定性截图；底层进程退出非零时由 set -e 使整批失败。
   "$BIN" --capture \
     --scenario "$scenario" \
@@ -66,6 +73,7 @@ declare -a MATRIX=(
   "20 runArchive"
 )
 for pair in "${MATRIX[@]}"; do
+  # MATRIX 每项固定是两个无空格 token，因此这里有意拆成 scenario 与 route 两个位置参数。
   capture ${pair}
 done
 

@@ -1,3 +1,6 @@
+# 文件导读：macOS Observatory 初始化用户配置时使用的 Paper-engineering 模板；启动器将本文件
+# 派生成用户配置，再由 Core 读取 daemon、execution、model、credential 与 UI 偏好各节。
+# App 复制并替换环境占位符；它不代表已经通过审批、校准或 Paper Gate。
 [daemon]
 # Overridden at launch with AKZIO_STORE_ROOT so Finder launches never depend
 # on the current working directory.
@@ -13,6 +16,7 @@ auto_paper = false
 manual_paper = true
 
 [execution]
+# 这里只声明运行 profile、资产白名单与计价假设，不代表目标仓位、订单或成交。
 experiment_profile = "paper-engineering"
 assets = ["TQQQ", "QQQ", "SOXX", "SOXL"]
 market_data_feed = "iex"
@@ -20,6 +24,7 @@ transaction_cost_ppm = 100
 slippage_ppm = 50
 
 [model]
+# 环境占位符解析后才得到实际端点与凭据；读取配置不等于已经完成 provider capability probe。
 provider = "openai_responses"
 base_url = "$LLM_GATEWAY_BASE_URL"
 model = "gpt-5.6-luna"
@@ -31,8 +36,10 @@ debug = false
 # App initialization copies this template to ~/.akzio/config.toml, replaces
 # environment placeholders, and enforces owner-only file permissions.
 [credentials]
+# 初始化时由环境变量替换或由用户在 Settings 中配置；空字符串表示尚未填写。
 alpaca_api_key = ""
 alpaca_api_secret = ""
 fred_api_key = ""
 
 [observatory]
+# 以下是 App 的呈现偏好，与 Core 的交易/研究状态相互独立。

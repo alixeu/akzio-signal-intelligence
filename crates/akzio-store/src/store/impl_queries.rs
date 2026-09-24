@@ -1,9 +1,17 @@
+// 文件导读：查询 impl 把 Artifact、WorkflowRevision/Snapshot、Trajectory 和 OutcomeSchedule
+// 恢复成只读投影；SQL 结果会继续校验 graph/task/attempt/source lineage，而不是只信列值。
+// 调用方主要是 Runtime/Context/Observer 和 Store Doctor；先读 workflow_snapshot_with_connection
+// 理解 SQL→领域图恢复，再读 trajectory_entry 与 verify_outcome_schedule_history。
 impl Store {
+    // 按 Artifact ID 重建 Artifact 元数据与 source refs；不读取 payload BLOB，也不修改状态。
     pub fn artifact(&self, artifact_id: &ArtifactId) -> StoreResult<Artifact> {
         let connection = self.connection()?;
         read_artifact(&connection, artifact_id)
     }
 
+    // 先运行 Contract/Policy history 校验，再按 source_artifact_id/kind 查询引用者。
+    // kind=None 返回所有直接引用该 Artifact 的对象；kind=Some 在 SQL 侧限制引用者 Artifact.kind。
+    // 两份 history 校验使用同一 Connection 但本方法不建显式事务。
     pub fn artifacts_referencing(
         &self,
         source_artifact_id: &ArtifactId,
@@ -32,9 +40,10 @@ impl Store {
             .collect()
     }
 
-    /// Return the newest immutable artifact of a kind. Mutable state such as
-    /// execution freeze is represented as an append-only artifact history;
-    /// callers never receive a writable row handle.
+    /// 按生命周期优先级选取某 kind 的 Artifact：canonical 总在其它
+    /// lifecycle 之前，同一优先级内才按创建时间倒序；并非全局最新一条。
+    // SQL 先将 canonical 排在其他 lifecycle 前，再按 created_at/artifact_id 倒序选一个；
+    // 零行 None，选中 ID 后在同一连接中重建 Artifact。
     pub fn latest_artifact_by_kind(&self, kind: ArtifactKind) -> StoreResult<Option<Artifact>> {
         let connection = self.connection()?;
         let artifact_id = connection
@@ -54,6 +63,7 @@ impl Store {
 
     /// Return newest immutable artifacts of one kind, newest first.
     /// Observer callers cannot request an unbounded Store scan.
+    // 按 kind 查询最近 limit 条并倒序返回；limit 直接作为 SQL LIMIT 参数，不修改数据或生命周期。
     pub fn recent_artifacts_by_kind(
         &self,
         kind: ArtifactKind,
@@ -74,6 +84,8 @@ impl Store {
             .collect()
     }
 
+    // 使用调用方连接恢复指定 revision，避免事务内再次获取 Store Mutex。
+    // run_id+revision 是 SQL 双键；缺少 revision 返回结构化 MissingWorkflowRevision。
     fn workflow_revision_with_connection(
         &self,
         connection: &Connection,
@@ -102,6 +114,9 @@ impl Store {
         self.hydrate_workflow_revision(connection, row)
     }
 
+    // 在同一连接中读取 Run、最新 revision、Task active Attempt、dependencies 和 cancel 标志。
+    // 此 helper 不开连接/事务；调用者可传 Deferred Transaction 取得多行一致快照，也可传普通 Connection。
+    // 它从 SQL node 列与独立 dependency 表重建 Task，再与 graph nodes 做双向比对。
     fn workflow_snapshot_with_connection(
         &self,
         connection: &Connection,
@@ -184,6 +199,7 @@ impl Store {
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
+        // 先把 Row 解码为 owning 中间元组，结束 statement borrow 后逐个恢复 active Attempt 和依赖边。
         let mut tasks = Vec::with_capacity(raw_tasks.len());
         for (
             (task_run_id, mut node),
@@ -207,6 +223,7 @@ impl Store {
                 (Some(lease_id), Some(attempt_id), Some(lease_until), Some(worker_id))
                     if task_status == TaskStatus::Running =>
                 {
+                    // Running 必须具备完整 lease 字段，且 active Attempt 所有者/epoch/status 与 Task 精确一致。
                     let attempt = connection
                         .query_row(
                             r#"SELECT run_id, task_id, lease_id, epoch, worker_id, status, started_at
@@ -258,6 +275,7 @@ impl Store {
                 }
                 (None, None, None, None) if task_status != TaskStatus::Running => None,
                 _ => {
+                    // Running 缺任一 active 字段，或非 running Task 仍带 active 字段，都按持久状态损坏拒绝。
                     return Err(StoreError::Integrity(format!(
                         "task {} has partial active attempt state",
                         node.task_id
@@ -296,6 +314,8 @@ impl Store {
         if graph_nodes != stored_nodes {
             return Err(StoreError::WorkflowGraphMismatch);
         }
+        // 冻结 graph 之外只允许 scheduler 后加的 Outcome worker；如 Outcome node 原本就在 Debug graph，
+        // 它仍必须与冻结 node 完全匹配。
         let event_cursor = connection.query_row(
             "SELECT COALESCE(MAX(event_id), 0) FROM rebuild_events WHERE run_id = ?1",
             params![run_id.0],
@@ -320,11 +340,13 @@ impl Store {
         })
     }
 
+    // 从 graph Artifact/CAS payload 恢复 typed WorkflowRevision，并确认 kind/时间有效。
     fn hydrate_workflow_revision(
         &self,
         connection: &Connection,
         row: (i64, String, String),
     ) -> StoreResult<WorkflowRevision> {
+        // row revision 的有符号 SQLite INTEGER 转 u64，负值拒绝；graph CAS 读回后领域 validate。
         let revision = u64::try_from(row.0)
             .map_err(|_| StoreError::Integrity(format!("invalid workflow revision {}", row.0)))?;
         let graph_artifact = read_artifact(connection, &ArtifactId(ContentHash::new(row.1)?))?;
@@ -341,11 +363,14 @@ impl Store {
         })
     }
 
+    // 按 revision 0..head 重放 graph predecessor、budget 和 proposal source closure。
     fn verify_workflow_history(
         &self,
         connection: &Connection,
         snapshot: &WorkflowSnapshot,
     ) -> StoreResult<()> {
+        // 顺序回放所有 revision（含 head），每个后继必须保持 topology/budget，时间不倒退，
+        // 且恰有 predecessor graph 与 WorkflowProposal source；最后读回必须等于 snapshot head。
         let mut previous: Option<WorkflowRevision> = None;
         for revision_number in 0..=snapshot.revision.revision {
             let revision = self.workflow_revision_with_connection(
@@ -381,8 +406,14 @@ impl Store {
         Ok(())
     }
 
+    // 将单个 lifecycle event 转为脱敏 trajectory entry；JSON 反序列化失败可保留基础元数据，
+    // 但 `read_blob` 的 CAS/SQL 错误仍由 `?` 传播，不能笼统说任何 payload 失败都降级。
     fn trajectory_entry(&self, event: &StoredEvent) -> StoreResult<Option<TrajectoryEntry>> {
+        // 闭包 base 借用 event 生成共享列；不同 event kind 只解码允许的 artifact payload，
+        // 不把原始 request/tool arguments 拷进 trajectory。
         let lifecycle = event.lifecycle_kind()?;
+        // `base` 捕获 event 的共享借用，只克隆 ID/字符串字段形成基础投影；它不取得 event 所有权，
+        // 因此后续 match 分支仍可访问原始 event 并按需读取 Artifact。
         let base = |artifact: Option<&Artifact>| TrajectoryEntry {
             cursor: event.cursor,
             task_id: event.task_id.clone(),
@@ -423,6 +454,7 @@ impl Store {
                         Ok(payload) => payload,
                         Err(_) => return Ok(Some(base(Some(&artifact)))),
                     };
+                // malformed JSON 仍保留 event cursor/Artifact kind 的基础记录；usage/model 字段解码失败则不伪造。
                 let mut model = payload.capability_snapshot.unwrap_or_default();
                 model.contract_hash = payload.contract_hash;
                 model.request_hash = payload.request_hash;
@@ -467,6 +499,7 @@ impl Store {
                         Ok(payload) => payload,
                         Err(_) => return Ok(Some(base(Some(&artifact)))),
                     };
+                // call_id/name 优先取扁平字段，再退回嵌套 call；只输出有限 metadata 和生命周期。
                 let call_id = payload
                     .call_id
                     .or_else(|| payload.call.as_ref().and_then(|call| call.call_id.clone()));
@@ -515,7 +548,10 @@ impl Store {
         }
     }
 
+    // Doctor 逐个验证 OutcomeSchedule 的 purpose/lifecycle/source closure 和 execution lineage。
     fn verify_outcome_schedule_history(&self, connection: &Connection) -> StoreResult<()> {
+        // 扫描所有 OutcomeSchedule Artifact；Paper 必须 Canonical，Shadow 必须 RunScoped，
+        // JSON/schedule 校验及精确 source refs 后再调用 execution lineage 验证器。
         let artifact_ids = connection
             .prepare(
                 "SELECT artifact_id FROM rebuild_artifacts WHERE kind = ?1 ORDER BY artifact_id",
@@ -563,6 +599,7 @@ impl Store {
                 )));
             }
             for reference in &expected_sources {
+                // 每个冻结来源的真实 kind 与允许的 Paper/Shadow purpose 都要在当前连接复核。
                 let source = read_artifact(connection, &reference.artifact_id)?;
                 if source.kind != reference.kind {
                     return Err(StoreError::Integrity(format!(

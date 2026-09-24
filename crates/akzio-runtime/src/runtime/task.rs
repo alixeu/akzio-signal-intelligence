@@ -1,5 +1,8 @@
 use super::*;
 
+// 文件导读：TaskRuntime 是 durable Task 与异步 handler 之间的调度层：claim 得到带 epoch 的
+// permit，handler Future 与 heartbeat/cancel monitor 并行 poll，最终只允许 Store 按
+// permit 写入状态。Future 取消不等于同步 Store 工作取消，Retry/Deferred 也不等于失败。
 #[derive(Debug, Clone)]
 pub struct TaskRuntime {
     store_executor: StoreExecutor,
@@ -42,6 +45,7 @@ impl TaskRuntime {
     }
 
     pub async fn recover_expired_tasks(&self, now: DateTime<Utc>) -> RuntimeResult<u64> {
+        // 过期 lease 的回收是 supervisor 入口；worker 数量不会各自扫描并重复恢复同一任务。
         Ok(self
             .store_executor
             .execute(move |store| store.recover_expired_tasks(now))
@@ -77,6 +81,8 @@ impl TaskRuntime {
     }
 
     async fn heartbeat(&self, permit: &TaskWritePermit) -> RuntimeResult<()> {
+        // heartbeat 延长的是当前 epoch 的 lease；若 permit 已被 fencing，Store 会拒绝，
+        // 不能靠本地 Future 继续写入旧 Attempt。
         let permit = permit.clone();
         let lease_duration = self.lease_duration;
         Ok(self
@@ -106,6 +112,8 @@ impl TaskRuntime {
         F: FnOnce(ClaimedAttempt) -> Fut,
         Fut: Future<Output = TaskCompletion>,
     {
+        // outcome_processing=false 时直接不领取 Outcome；否则根据配置把 workload
+        // 映射到 Session/Outcome，保持双时间轴可独立推进。
         if !self.outcome_processing && workload == akzio_store::TaskWorkload::Outcome {
             return Ok(false);
         }
@@ -117,6 +125,8 @@ impl TaskRuntime {
         let worker_id = worker_id.to_owned();
         let lease_duration = self.lease_duration;
         let identity = self.debug_identity.clone();
+        // `let Some(task) = ... else` 将“无可领取任务”和 Store 错误分开：
+        // None 正常返回 Ok(false)，两层 `?` 分别传播 executor 与 Store 的 Result。
         let Some(task) = self
             .store_executor
             .execute(move |store| {
@@ -139,6 +149,10 @@ impl TaskRuntime {
         }
 
         let completion = {
+            // handler、heartbeat/cancel monitor 和硬 wall-time Future 共享一个 select。
+            // 正常选出 completion 后先 drop 所有 Future，再进行终态 Store 写入；
+            // 若 monitor 的 Store 操作报错，`?` 可提前返回而不调用 finish，租约仍由
+            // supervisor 的过期恢复处理，不能宣称本地已持久化终态。
             let mut heartbeat = tokio::time::interval(self.recovery_interval()?);
             heartbeat.tick().await;
             let mut handler = Box::pin(handle(task.clone()));
@@ -154,6 +168,7 @@ impl TaskRuntime {
                     self.heartbeat(&task.permit).await?;
                 }
             };
+            // 宏将栈上的 async Future 固定住；select 以 &mut 轮询，不消费或复制它。
             tokio::pin!(monitor);
             let timeout = tokio::time::sleep(StdDuration::from_secs(u64::from(
                 task.node.budget.max_wall_time_secs,
@@ -175,6 +190,9 @@ impl TaskRuntime {
         completion: TaskCompletion,
         now: DateTime<Utc>,
     ) -> RuntimeResult<()> {
+        // Retry 先计算是否获准以及下一次时间；随后在 StoreExecutor 的串行队列里
+        // 调用对应 Store commit/finish/requeue/defer API。SQL 原子范围由具体 Store
+        // 方法定义，handler 返回值不会绕过 task permit。
         let retry_at = match &completion {
             TaskCompletion::RetryAfter(cause, requested) if self.retry_allowed(task, *cause) => {
                 Some((*requested).max(now))
@@ -218,6 +236,8 @@ impl TaskRuntime {
                         store.finish_task(&task.permit, TaskStatus::Cancelled, now)?
                     }
                     TaskCompletion::DeferredUntil(ready_at) => {
+                        // Deferred 是可恢复的等待，不计失败预算；至少推迟一秒，避免
+                        // handler 与 Store 延迟造成忙循环。
                         // A short wait can elapse while the handler or Store
                         // executor is running. It is still a deferral, not a
                         // failed task or a reason to stop the worker pool.
@@ -235,6 +255,8 @@ impl TaskRuntime {
     }
 
     pub(super) fn retry_allowed(&self, task: &ClaimedAttempt, cause: RetryCause) -> bool {
+        // RetryCause 是 Copy，match 只选择冻结在 node.retry 中的对应开关；
+        // 是否超出尝试上限仍由后续 Store retry_task 的持久化计数决定。
         match cause {
             RetryCause::Transport | RetryCause::Timeout => task.node.retry.retry_transport,
             RetryCause::RateLimited => task.node.retry.retry_rate_limited,
@@ -254,6 +276,8 @@ impl TaskRuntime {
         task: &ClaimedAttempt,
         now: DateTime<Utc>,
     ) -> RuntimeResult<DateTime<Utc>> {
+        // 退避次数读取当前 stage 的持久化失败计数；Outcome 至少 30s、上限 5min，
+        // 失败计数跨 Attempt 保留而不是由本次 worker 的内存状态决定。
         let task_id = task.node.task_id.clone();
         let attempts = self
             .store_executor

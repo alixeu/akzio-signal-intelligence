@@ -4,6 +4,16 @@
 //! while the Store and runtimes own durable state, contracts, context
 //! grants, task attempts, and workflow transitions.
 
+// 文件导读：本文件是 daemon 的组合根。它组装 StoreExecutor、WorkflowRuntime、AgentRuntime、
+// Paper scheduler、worker、HTTP/SSE、observer 和 Outcome worker，但不把 Policy、Contract、
+// Gate 或 CAS 规则下沉成调度层的私有真相。控制/只读查询不领取 Task permit；任务处理
+// 才沿 Store claim/permit → runtime 校验与提交推进。研究、Decision、ExecutionVerdict、
+// Paper commitment、订单回执及其成交核对、Outcome 和 learning 有分离的产物/事件边界；
+// Broker accepted 不能被当作最终 fill。
+// Rust 机制：`Daemon` 持有 `Arc`、trait object 和 runtime 句柄；`Result`/thiserror 把各 crate
+// 错误保留为类型；`broadcast`/`watch` 分别承担观察事件与关闭信号，`async` Future 的 Send
+// 边界由 Tokio 任务和 StoreExecutor 共同约束。
+
 mod application;
 mod debug;
 mod dispatch;
@@ -169,6 +179,8 @@ pub enum DaemonError {
 
 impl From<PaperDecodeError> for DaemonError {
     fn from(error: PaperDecodeError) -> Self {
+        // Provider decode 的四类结果映射到 daemon 的稳定错误边界；Unavailable/InvalidInput
+        // 保持 fail-closed，Json/Domain 保留原始类型，避免把坏 payload 变成成功快照。
         match error {
             PaperDecodeError::Unavailable(message) => Self::Unavailable(message),
             PaperDecodeError::InvalidInput(message) => Self::InvalidInput(message),
@@ -190,10 +202,14 @@ pub struct RuntimePolicyIdentity {
     pub minimum_fresh_pairs_per_horizon: u64,
 }
 
+// 用默认 fail-closed DecisionPolicy 计算一份可审计的运行时策略身份；返回哈希只是身份
+// 投影，不加载 Store active head，也不授权任何订单。
 pub fn default_runtime_policy_identity() -> Result<RuntimePolicyIdentity> {
     runtime_policy_identity(&DecisionPolicy::default())
 }
 
+// 校验执行侧默认 Policy，再把 Decision、Execution、Dispatch 和 Outcome 评估规则分别哈希；
+// `decision_policy` 只借用输入，失败经 DaemonError 向启动/审批调用方传播。
 pub fn runtime_policy_identity(decision_policy: &DecisionPolicy) -> Result<RuntimePolicyIdentity> {
     let evaluation_policy = EvaluationPolicy::default();
     let execution_policy = ExecutionPolicy::default();
@@ -234,6 +250,7 @@ pub struct RuntimeGovernanceIdentity {
     pub bundle_hash: ContentHash,
 }
 
+// 以默认策略构造治理身份；调用委托给下方显式策略版本，未写入 Store 或模型服务。
 pub fn default_runtime_governance_identity(
     cost_model: &OutcomeCostModel,
 ) -> Result<RuntimeGovernanceIdentity> {
@@ -241,6 +258,8 @@ pub fn default_runtime_governance_identity(
     runtime_governance_identity(cost_model, &policy)
 }
 
+// 把成本模型和前述策略哈希汇总成 component/bundle identity；这里的 JSON 仅参与哈希，
+// 并不把运行时 Gate 逻辑交由配置或模型控制。
 pub fn runtime_governance_identity(
     cost_model: &OutcomeCostModel,
     policy: &RuntimePolicyIdentity,
@@ -429,6 +448,8 @@ pub struct DebugCoreConfig {
 
 impl Daemon {
     fn model_for(&self, purpose: &str) -> &ModelClientAdapter {
+        // ProposalReviewer 复用 Critic route；返回借用保证调用方不能替换 stage model，
+        // 真实调用仍由 AgentRuntime 绑定 Contract、预算和 capability snapshot。
         let purpose = if purpose == akzio_domain::RESEARCH_PROPOSAL_REVIEWER_RECIPE_ID {
             akzio_domain::RESEARCH_CRITIC_RECIPE_ID
         } else {
@@ -441,6 +462,12 @@ impl Daemon {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonHealth {
     pub status: String,
+    /// The Store's permanent isolation marker, not a caller-selected mode.
+    #[serde(default)]
+    pub store_scope: String,
+    /// Native clients require this before submitting a Run they intend to export.
+    #[serde(default)]
+    pub formal_run_bundle_supported: bool,
     pub frozen: bool,
     pub decision_policy_status: String,
     pub decision_policy_hash: ContentHash,
@@ -507,6 +534,7 @@ pub struct LessonInput {
 }
 
 fn default_lesson_confidence() -> u32 {
+    // serde default 只补齐 Lesson 草稿的初始置信度；它不是审核通过或学习权重。
     500_000
 }
 
@@ -578,6 +606,8 @@ pub struct PaperApprovalResponse {
 
 mod orchestration;
 fn retry_cause_for_daemon_error(error: &DaemonError) -> Option<RetryCause> {
+    // 仅把明确可重试的研究 transport/adapter 错误映射为 RetryCause；未知/internal 错误
+    // 留给 runtime 的 Failed 语义，避免扩大重试预算。
     match error {
         DaemonError::Research(error) => error.retry_cause(),
         DaemonError::Evidence(EvidenceRuntimeError::Adapter(
@@ -592,6 +622,8 @@ fn debug_fixture_evidence(
     resource: &str,
     now: DateTime<Utc>,
 ) -> AcquiredEvidence {
+    // 生成完全离线、可重复的 fixture payload；其中 synthetic weekday/bar/news 只用于
+    // 正式拓扑验证，绝不冒充交易所 calendar、真实模型或 Paper provider。
     let source_uri = if source == EvidenceSource::Alpaca && resource.starts_with("bars:") {
         format!(
             "fixture://{}/{resource}?adjustment=all&feed=iex",
@@ -698,6 +730,7 @@ fn debug_fixture_evidence(
 }
 
 fn evidence_source(source_family: &str) -> Result<EvidenceSource> {
+    // 资源的 source_family 必须命中受支持的 adapter 枚举；未知字符串不被猜测为默认源。
     match source_family {
         "alpaca" => Ok(EvidenceSource::Alpaca),
         "sec_edgar" => Ok(EvidenceSource::SecEdgar),
@@ -711,6 +744,7 @@ fn evidence_source(source_family: &str) -> Result<EvidenceSource> {
 
 impl From<StoredEvent> for EventView {
     fn from(event: StoredEvent) -> Self {
+        // 事件投影只保留 observer 所需的 cursor/type/task/time；它是只读视图，不回写事件。
         Self {
             cursor: event.cursor,
             event_type: event.event_type,
@@ -722,6 +756,8 @@ impl From<StoredEvent> for EventView {
 
 /// Resolve the canonical installed Synthesizer identity in an isolated scratch Store.
 pub fn canonical_synthesizer_contract_hash(store: &Store) -> Result<ContentHash> {
+    // 该 helper 安装/读取当前研究 catalogue 以获得 canonical Synthesizer Contract hash；
+    // 调用方用于身份比对，不由此激活 Policy 或修改已有 Run 的 Contract。
     let catalogue = akzio_research::ActiveResearchCatalogue::install(store, Utc::now())?;
     let hash = catalogue
         .contracts

@@ -38,7 +38,7 @@
 - DecisionPolicy 的风险限制、校准 dataset、候选版本和激活记录均以 SQL Store/CAS 为权威。先用只读 readiness 定位缺口，再按既有 collect/build/inspect/validate/activate 流程推进；不伪造样本、模型发布日期或知识截止日期，不以生成候选代替显式激活。
 - Paper 写入须通过原审批和全部 Gate，并先持久化确定性 Commitment。PositionPlan 在 Decision 后结束，没有 ExecutionGate、PaperCommit、Reconcile 或 Evaluate。
 - Debug Core 使用 `.akzio/` 下的新隔离 Store；禁止打开 `~/.akzio/store` 或启用 `auto_paper`，Broker 默认 forbidden，不写 canonical policy 或 Active Lesson。
-- Alpaca Paper 是唯一交易模拟环境；`-fakerOnline` / `--faker-online` 和本地模拟账户、时钟、成交适配器已删除。显式 `--paper` 使用正式 Paper 图和原生 Paper API，仍须原审批与全部 Gate。时段由真实 Clock 与交易日历确定，隔夜使用 BOATS / overnight 行情并检查资产资格；休市延期后刷新快照、重跑 Gate，提交成功不等于成交。隔离运行不能计入正式校准样本，完成或等待 Outcome 不改变 Store 资格。
+- Alpaca Paper 是唯一交易模拟环境；`-fakerOnline` / `--faker-online` 和本地模拟账户、时钟、成交适配器已删除。`run_core.py` 只连接已有正式 Core；显式 `--mode paper` 使用 canonical Paper 图和原生 Paper API，仍须原审批与全部 Gate。时段由真实 Clock 与交易日历确定，隔夜使用 BOATS / overnight 行情并检查资产资格；休市延期后刷新快照、重跑 Gate，提交成功不等于成交。仅隔离 Debug 运行不能计入正式校准样本，完成或等待 Outcome 不改变其 Store 资格。
 - 不静默改写历史 CAS、Contract、Commitment、哈希或迁移边界；旧任务与有效 lease 的升级阻断仍须合法处理。业务证明与完整 provenance 必须保留。
 - Store、BLOB、socket、生成报告、认证凭据和本地配置覆盖不得提交 Git。
 

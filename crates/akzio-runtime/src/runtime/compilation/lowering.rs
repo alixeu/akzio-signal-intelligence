@@ -1,12 +1,18 @@
+// 文件导读：lowering 只接受当前三种活动 RunPurpose，并把 Rust terminal chain 附加到研究图。
+// Shadow 可以替换 Analyst candidate contract，但仍需未激活、能力不扩张且 recipe
+// 参数一致；这不是把 candidate 自动升级为 canonical active Contract。
 impl WorkflowRuntime {
     /// Compile a model proposal into a graph plus Rust-owned terminal gates. The
-    /// proposal cannot name any gate recipe, create a contract, or omit final
-    /// audit/evaluation transitions.
+    /// proposal cannot name gate recipes or create a contract. The Rust terminal
+    /// chain depends on purpose: PositionPlan ends at Decision; Paper/Shadow
+    /// retain their separately validated later stages.
     pub fn lower(
         &self,
         purpose: RunPurpose,
         proposal: &WorkflowProposal,
     ) -> RuntimeResult<WorkflowGraph> {
+        // 先拒绝退休 purpose 和 proposal 中的非法节点，再由 with_terminal_gates
+        // 补全固定业务链；图构造成功只说明编译结果可检查。
         if !matches!(purpose,RunPurpose::Paper|RunPurpose::PositionPlan|RunPurpose::Shadow) { return Err(RuntimeError::LegacyWorkflowRetired); }
         let nodes = self.lower_research_nodes(proposal)?;
         self.with_terminal_gates(purpose, proposal.topology_id.clone(), nodes)
@@ -17,6 +23,8 @@ impl WorkflowRuntime {
         proposal: &WorkflowProposal,
         candidate_contract_hash: Option<&ContentHash>,
     ) -> RuntimeResult<WorkflowGraph> {
+        // Option<&ContentHash> 的 Some 只替换 Shadow Analyst 节点的冻结 Contract 引用；
+        // 候选安装、baseline 和预算资格留给 validate_compiled_graph 再查 Store。
         let mut graph = self.lower(RunPurpose::Shadow, proposal)?;
         if let Some(candidate_contract_hash) = candidate_contract_hash {
             for node in graph
@@ -38,7 +46,11 @@ impl WorkflowRuntime {
         evidence_inputs: &[ArtifactRef],
         analyst_contract_hash: Option<&ContentHash>,
     ) -> RuntimeResult<WorkflowGraph> {
+        // Shadow fork 重新分配全部 TaskId、重写依赖引用并替换输入 EvidenceNeed，避免
+        // 与父 Run 共用可写 Attempt；历史 Artifact 只通过 reference 保留 provenance。
         candidate.validate()?;
+        // `&[ArtifactRef]` 不取得父图输入所有权；克隆后排序去重，
+        // 防止后续重写节点 input_artifacts 时改变调用方原始 slice。
         let mut evidence_inputs = evidence_inputs.to_vec();
         evidence_inputs.sort();
         evidence_inputs.dedup();

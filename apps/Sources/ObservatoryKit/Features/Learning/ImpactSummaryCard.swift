@@ -1,16 +1,23 @@
 import SwiftUI
 
+// 文件导读：LearningPage 的 Impact tab 将已构造的 ImpactSummaryPresentation 映射成总影响、
+// Lessons/Policies 计数和影响区域；本 View 不从 Outcome 原始数据重算学习资格。
+// 先读 body 与 headline，特别注意 Optional 金额显示 unavailable，而 count-up 的零回退仅用于动画输入。
 // MARK: - Impact
 //
 // What the learning loop actually produced: money, lessons, evolved policies and the
 // areas they touched. Counts are real counts, so zero is a legitimate value here.
 struct ImpactSummaryCard: View {
+    // impact 是 sealed outcome 归因后的展示模型；zero count 是合法结果，不能用空态替代。
     let impact: ImpactSummaryPresentation
 
+    // policy 只控制 count-up，language 负责标题本地化，不参与 impact 数值计算。
     @Environment(\.motionPolicy) private var policy
     @Environment(\.appLanguage) private var language
 
     var body: some View {
+        // totalImpactMicros 的 map/?? 把可选金额转换成展示字符串和动画数值；缺失时保持 Unavailable。
+        // numeric 参数缺值时以 0 作为动画输入，但文字仍是 Unavailable，不报告为零影响。
         SectionCard(title: "Impact", subtitle: "Attributed to sealed outcomes") {
             VStack(alignment: .leading, spacing: AkzioLayout.s3) {
                 HStack(spacing: AkzioLayout.s4) {
@@ -40,6 +47,8 @@ struct ImpactSummaryCard: View {
                 HairlineDivider()
             Text(L10n.text("Top Impact Areas", language: language)).akzioText(.caption)
                 ForEach(Array(impact.areas.enumerated()), id: \.element.id) { index, area in
+                    // area 的 impactPpm 只决定比例条和正负 tone，label 与数值仍来自同一 Rust 投影。
+                    // 绝对 ppm 按 20,000 缩放并封顶为 1；这只是卡片条长的视觉比例。
                     HStack(spacing: AkzioLayout.s2) {
                         Text(area.label).akzioText(.bodySmall).frame(width: 96, alignment: .leading)
                         RatioBar(
@@ -64,6 +73,7 @@ struct ImpactSummaryCard: View {
         tone: AkzioTone,
         delta: Int? = nil
     ) -> some View {
+        // delta 是可选窗口比较值；nil 不渲染变化行，0 明确显示 No change 而不是伪造增量。
         VStack(alignment: .leading, spacing: 3) {
             Text(L10n.text(label, language: language)).akzioText(.caption)
             Text(value)

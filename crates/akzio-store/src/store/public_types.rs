@@ -1,3 +1,9 @@
+// 文件导读：本文件定义 Store 对外返回的 lease、Paper slot、Policy/Shadow、生命周期和
+// model usage 投影；这些值是从 SQL/CAS 重建的快照或提交结果，不提供可变数据库句柄。
+// 这些结构体是 API 数据形状，实际写入仍由 Store 方法在 SQLite 事务内验证与提交；阅读时
+// 可先区分输入命令式提交记录（如 PolicyEvaluationCommit）和查询重建的结果（如 PolicyHead）。
+// 普通 helper 只把已有 metrics 计数映射成告警，不承担额外状态维护。
+// 只在给定状态计数为正数时追加告警；入参借用现有 Vec/Map，不取得其所有权。
 fn push_alert(
     alerts: &mut Vec<StoreAlert>,
     code: &str,
@@ -127,6 +133,7 @@ pub struct PolicyShadowPairSnapshot {
 }
 
 impl PolicyShadowPairSnapshot {
+    // 按穷尽匹配把三个 horizon 映射到固定数组槽位；self 按 Copy 值传入，不消耗调用者快照。
     pub const fn count(self, horizon: OutcomeHorizon) -> u64 {
         self.counts_by_horizon[match horizon {
             OutcomeHorizon::T1 => 0,
@@ -195,6 +202,9 @@ pub struct ShadowPairCompletion {
 }
 
 impl ShadowPairCompletion {
+    // key 仅包括 subject、两份 Decision、共同 context、候选 Contract/Topology 和 horizon；
+    // Outcome refs 与 completed_at 不参与 hash，后续幂等比较仍会核对 Outcome refs。
+    // `serde_json::json!` 先构造拥有型 JSON 值，哈希失败由 `?` 保留为 StoreError。
     pub fn pair_key(&self) -> StoreResult<ContentHash> {
         let key = serde_json::json!({
             "subject": &self.subject,
@@ -208,6 +218,7 @@ impl ShadowPairCompletion {
         Ok(akzio_domain::content_hash_json(&key)?)
     }
 
+    // 先校验 subject 与候选身份一致，再检查五个引用的 ArtifactKind；返回错误会阻止外围事务写入。
     fn validate(&self) -> StoreResult<()> {
         self.subject.validate()?;
         if self.candidate_topology_id.trim().is_empty() {
@@ -262,6 +273,7 @@ pub enum TaskWorkload {
     Outcome,
 }
 impl TaskWorkload {
+    // 把 Rust 枚举映射成 SQL 查询使用的稳定数字筛选码；Any/Session/Outcome 必须与查询条件同步。
     pub(crate) const fn query_code(self) -> u8 {
         match self {
             Self::Any => 0,

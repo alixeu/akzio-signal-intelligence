@@ -11,10 +11,17 @@ mod qualification;
 use akzio_domain::{ArtifactProvenance, TaskWritePermit};
 use chrono::{DateTime, Utc};
 
+// 文件导读：公开面只导出类型化的 Outcome、评估、调度和离线 qualification 入口；
+// 持久化细节继续由 EvaluationRuntime/Store 控制，调用者不能从 crate 侧绕过 CAS。
+// 初读可先沿 OutcomeSchedulingRuntime 理解 T0 lineage 如何排期，再读 EvaluationRuntime 如何
+// 将未来观察物化为 Outcome 并经过资格检查；run_offline_model_qualification 是不写 Store 的独立报告路径。
+
 pub(crate) fn trusted_learning_provenance(
     permit: &TaskWritePermit,
     now: DateTime<Utc>,
 ) -> ArtifactProvenance {
+    // provenance 的 contract hash 来自当前 TaskWritePermit，时间由本次写入传入；
+    // 该 helper 只构造元数据，不代表 Artifact 已经写入 Store。
     ArtifactProvenance {
         source_family: "akzio-learning".to_owned(),
         observed_at: Some(now),

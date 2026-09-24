@@ -1,7 +1,14 @@
+// 文件导读：这里集中检查 Gate 事件、Paper effect 的先后顺序和 Attempt 提交的
+// permit lineage；Tool/AgentTurn 事件顺序由 free_trajectory.rs 的校验器负责。
+// 通用提交从 commit_attempt_transaction_with_effect 进入；Doctor 与提交路径复用相应校验器，
+// 因而理解 SQL event cursor、Artifact source refs 与 permit 绑定时可从这些 helper 顺序阅读。
+// 按可选 Run 范围扫描固定 execution gate 事件，并校验 Artifact kind、origin 与 source closure。
 fn validate_gate_lifecycle_events(
     connection: &Connection,
     run_id: Option<&RunId>,
 ) -> StoreResult<()> {
+    // run_id=None 扫 Store 全史，Some(run) 只筛该 Run；按 event_id 升序检查每个固定 Gate event 的
+    // task/attempt/artifact 三元组、预期 ArtifactKind、origin 和 source kind。
     let mut statement = connection.prepare(
         r#"SELECT event_id, run_id, task_id, attempt_id, event_type, artifact_id
            FROM rebuild_events
@@ -70,6 +77,8 @@ fn validate_gate_lifecycle_events(
             | LifecycleEventType::ExecutionRepriceRecovered => ArtifactKind::ExecutionReprice,
             _ => unreachable!("gate lifecycle query emits fixed event types"),
         };
+        // recovered 事件允许恢复来源 Attempt 与当前 Attempt 不同，但仍须同 Run/Task；
+        // 非 recovered event 则要求 Artifact.origin 精确包含当前 attempt_id。
         let artifact = read_artifact(connection, &artifact_id)?;
         artifact.validate()?;
         if artifact.kind != expected_kind {
@@ -117,12 +126,15 @@ fn validate_gate_lifecycle_events(
     Ok(())
 }
 
+// Task 成功前统计 called 与 ToolResult terminal 数，避免未闭合工具调用被发布为 succeeded。
 fn ensure_no_pending_tool_calls(
     connection: &Connection,
     run_id: &RunId,
     task_id: &TaskId,
     attempt_id: &akzio_domain::AttemptId,
 ) -> StoreResult<()> {
+    // 两条 COUNT 都精确限制 Run/Task/Attempt；terminal 仅统计引用 ToolCall 的 Completed/Failed 结果。
+    // 此处只判 called>terminal，逐 call 的先后与一对一对应由 validate_tool_lifecycle_events 负责。
     let called = connection.query_row(
         r#"SELECT COUNT(*)
                FROM rebuild_events
@@ -164,11 +176,13 @@ fn ensure_no_pending_tool_calls(
     Ok(())
 }
 
+// 只查同 Run/effect 的 settled/recovered terminal，供幂等 effect 写入使用。
 fn paper_effect_terminal_exists(
     transaction: &Transaction<'_>,
     run_id: &RunId,
     effect_id: &ArtifactId,
 ) -> StoreResult<bool> {
+    // EXISTS 按 run_id+artifact_id 和两种 terminal 类型精确查询，SQL 故障返回 Err。
     let found = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM rebuild_events WHERE run_id = ?1 AND artifact_id = ?2 AND event_type IN (?3, ?4))",
         params![
@@ -182,11 +196,14 @@ fn paper_effect_terminal_exists(
     Ok(found != 0)
 }
 
+// 已成功的 schedule Attempt 只能以相同 Artifact/output index 重放，不能复活旧 permit。
 fn assert_idempotent_outcome_schedule_commit(
     transaction: &Transaction<'_>,
     permit: &TaskWritePermit,
     schedule: &Artifact,
 ) -> StoreResult<()> {
+    // 只读校验成功 Attempt 与 Task 的 Run/Task/lease/epoch/Contract，再确认 Artifact 完全相等，
+    // 且它恰有一条对应的 attempt_outputs 行；不会更新状态或重新授予 permit。
     let attempt = transaction
         .query_row(
             r#"SELECT a.run_id, a.task_id, a.lease_id, a.epoch, a.status,
@@ -249,10 +266,12 @@ fn assert_idempotent_outcome_schedule_commit(
     Ok(())
 }
 
+// Artifact origin 必须逐字段等于当前 TaskWritePermit，不能仅凭 Run ID 放行。
 fn assert_origin_matches(
     origin: Option<&ArtifactOrigin>,
     permit: &TaskWritePermit,
 ) -> StoreResult<()> {
+    // None origin 立即拒绝；否则 Run/Task/Attempt/Contract 四字段必须与当前 permit 同值。
     let Some(origin) = origin else {
         return Err(StoreError::PermitOriginMismatch);
     };
@@ -266,10 +285,12 @@ fn assert_origin_matches(
     Ok(())
 }
 
+// 从 Task 行恢复 retry/on_failure，避免 handler 自带策略扩大重试预算。
 fn task_retry_policy(
     transaction: &Transaction<'_>,
     task_id: &TaskId,
 ) -> StoreResult<(RetryPolicy, FailureDisposition)> {
+    // task_id 是唯一过滤键；JSON retry policy 与 enum on_failure 解码失败传播为 Err，不使用调用方自报值。
     let (retry_json, on_failure) = transaction
         .query_row(
             "SELECT retry_json, on_failure FROM rebuild_tasks WHERE task_id = ?1",
@@ -281,6 +302,7 @@ fn task_retry_policy(
     Ok((serde_json::from_str(&retry_json)?, parse_enum(&on_failure)?))
 }
 
+// 普通 commit 只是带 effect=None 的统一事务实现。
 fn commit_attempt_transaction(
     transaction: &Transaction<'_>,
     permit: &TaskWritePermit,
@@ -288,9 +310,11 @@ fn commit_attempt_transaction(
     status: TaskStatus,
     now: DateTime<Utc>,
 ) -> StoreResult<()> {
+    // 该 wrapper 不创建事务；把“无 effect event”交给下一 helper，调用方负责最终 commit。
     commit_attempt_transaction_with_effect(transaction, permit, artifacts, status, None, now)
 }
 
+// 插入 Artifact/source closure、artifact events、可选 effect event，再收束 Task/Attempt 状态。
 fn commit_attempt_transaction_with_effect(
     transaction: &Transaction<'_>,
     permit: &TaskWritePermit,
@@ -299,6 +323,8 @@ fn commit_attempt_transaction_with_effect(
     effect_event: Option<(&ArtifactRef, LifecycleEventType)>,
     now: DateTime<Utc>,
 ) -> StoreResult<()> {
+    // 所有步骤借用同一个外层 Transaction：先重新核验 permit/lifecycle/on_failure/origin，
+    // 再按 source closure 插入 Artifact 并追加 commit events；任意 Err 都阻止调用方提交整批变更。
     assert_permit(transaction, permit)?;
     for artifact in artifacts {
         assert_task_artifact_lifecycle(transaction, &permit.run_id, artifact)?;
@@ -311,6 +337,7 @@ fn commit_attempt_transaction_with_effect(
         insert_artifact_batch(transaction, artifacts)?;
     }
     for artifact in artifacts {
+        // artifact.committed 每行有自己的 event cursor；只有最终 Task status 为 Succeeded 才建正式 output index。
         let event_id = append_event(
             transaction,
             &permit.run_id,

@@ -1,4 +1,6 @@
+# 文件职责：锁定 workspace 使用的 Rust 编译器与开发组件版本，避免不同工具链改变校验结果。
 [toolchain]
+# 版本由根 Cargo.toml 的 rust-version 同步约束；这里选择的组件只提供格式化与静态检查工具。
 channel = "1.96.0"
 components = ["rustfmt", "clippy"]
 profile = "minimal"

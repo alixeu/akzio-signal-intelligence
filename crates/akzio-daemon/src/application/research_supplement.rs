@@ -1,3 +1,11 @@
+// 文件导读：shared supplemental 只从冻结 EvidenceNeed 和 Claim/Critique gap 展开受治理
+// 资源，按稳定顺序、每轮最多 8 个 distinct resource、先持久化 started 再做外部 I/O。
+// disposition 的 accepted/deduplicated/unknown_after_crash/no_new_facts 只决定受影响
+// horizon 是否允许一次 rerun，不改旧 Claim/Critique，也不直接生成 Proposal/Decision。
+// Rust 机制：泛型 `supplement_record<T: Serialize>` 统一写 CAS；闭包排序/过滤借用行，
+// BTreeMap/Set 保证去重与恢复稳定；当前实现按稳定顺序逐资源 `await` 采集（非
+// `join_all` 并发），所有输出仍用 permit 写入。
+
 use crate::*;
 use akzio_domain::ResearchCritique;
 use akzio_domain::{
@@ -454,6 +462,8 @@ impl Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 四资产新闻意图必须分别绑定四个已冻结单资产资源；任一资源缺失即拒绝整组展开。
     #[test]
     fn four_asset_news_expands_only_to_frozen_single_asset_resources() {
         let frozen = Asset::EXECUTABLE
@@ -474,6 +484,8 @@ mod tests {
         assert_eq!(expand_intent(&intent, &frozen).unwrap(), frozen);
         assert!(expand_intent(&intent, &frozen[..3]).is_err());
     }
+
+    // 比较只取事实字段，retrieved_at/provider wrapper 改变不构成新事实，bar 内容改变才算。
     #[test]
     fn repeated_retrieval_is_not_a_new_fact() {
         let a = json!({"resource":"bars:QQQ:x","value":{"bars":[{"close":123}],"retrieved_at":"a","provider_result":{"id":"1"}}});

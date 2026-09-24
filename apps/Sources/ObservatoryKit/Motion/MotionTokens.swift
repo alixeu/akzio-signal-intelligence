@@ -1,11 +1,14 @@
 import SwiftUI
 
+// 文件职责：集中保存动画参数，并把系统/用户的 Reduce Motion、强度和转场力度解析成统一策略。
+// ObservatoryStore 派生 MotionPolicy 后由 AppShell 注入 Environment；此文件提供配置值，不自行启动动画任务。
 // MARK: - Motion tokens
 //
 // Thought of as damping + response, not duration. Default is critically damped
 // (no overshoot); bounce is reserved for motion that carried momentum.
 // `easeIn` is never used: it stalls exactly when the user is watching hardest.
 public enum Motion {
+    // 下面的常量按交互、表面、数据和设置层分类，调用方只选择语义而不自行写数值。
     // Interaction
     public static let hover = Animation.spring(response: 0.20, dampingFraction: 1.0)
     public static let selection = Animation.spring(response: 0.28, dampingFraction: 1.0)
@@ -49,6 +52,7 @@ public enum Motion {
 
     /// Stagger step for list reveals (35–80ms depending on row count).
     public static func stagger(_ index: Int, step: Double = 0.045, cap: Double = 0.36) -> Double {
+        // 输入列表序号、间隔和总上限，输出有限延迟秒数；实际是否使用由调用方的 MotionPolicy 决定。
         min(Double(index) * step, cap)
     }
 }
@@ -63,6 +67,7 @@ public struct MotionPolicy: Sendable, Equatable {
         case reduced
     }
 
+    // level 决定是否 reduced；intensity 影响距离和粒子数量，routeStrength 只影响跨页编排。
     public var level: Level
     /// 0…1 user-facing intensity from Settings; scales travel distance and particle count.
     public var intensity: Double
@@ -70,6 +75,8 @@ public struct MotionPolicy: Sendable, Equatable {
     public var routeStrength: Double
 
     public init(level: Level = .full, intensity: Double = 1.0, routeStrength: Double = 1.0) {
+        // 策略保留调用方提供的设置值，具体动画解析时再按 level 和范围计算。
+        // intensity 由 allowsAmbient/travel 消费，routeStrength 在 sharedElementStrength 中夹紧；init 不提前改写输入值。
         self.level = level
         self.intensity = intensity
         self.routeStrength = routeStrength
@@ -78,36 +85,44 @@ public struct MotionPolicy: Sendable, Equatable {
     public static let full = MotionPolicy()
     public static let reduced = MotionPolicy(level: .reduced, intensity: 0, routeStrength: 0)
 
+    // computed property 只判断策略档位；它不检查系统设置，系统与 App 设置已由 ObservatoryStore 汇总。
     public var isReduced: Bool { level == .reduced }
 
     /// Reduced motion keeps comprehension cues (opacity, colour) and drops travel.
     public func resolve(_ animation: Animation) -> Animation {
+        // 所有局部动画都经这里收敛；reduced 保留短淡出提示但去掉原始弹簧运动。
         isReduced ? .easeOut(duration: 0.22) : animation
     }
 
     /// Continuous ambient loops (orbits, particles, breathing) stop entirely.
+    // continuous ambient motion 必须同时满足非 reduced 和有效强度。
     public var allowsAmbient: Bool { !isReduced && intensity > 0.01 }
 
     /// Travel distance for entrances; reduced motion clamps to a 6pt hint.
     public func travel(_ points: CGFloat) -> CGFloat {
+        // reduced 只保留最多 6pt 的空间提示；完整模式按用户强度缩放位移。
         isReduced ? min(points, 6) : points * CGFloat(max(intensity, 0.2))
     }
 
     /// Shared-element choreography strength; 0 means a plain crossfade handoff.
     public var sharedElementStrength: Double {
+        // 跨页共享元素在 reduced 下退化为普通 crossfade，其余情况受 routeStrength 限制。
         isReduced ? 0 : max(0, min(routeStrength, 1))
     }
 
     public func stagger(_ index: Int) -> Double {
+        // reduced 取消列表错峰，完整模式复用全局 stagger token。
         isReduced ? 0 : Motion.stagger(index)
     }
 }
 
 private struct MotionPolicyKey: EnvironmentKey {
+    // 独立组件没有注入策略时使用完整动效，行为与普通窗口保持一致。
     static let defaultValue = MotionPolicy.full
 }
 
 extension EnvironmentValues {
+    // 该访问器让 SwiftUI 子树读取 AppShell 注入的 MotionPolicy；未注入时使用上方 full 默认策略。
     public var motionPolicy: MotionPolicy {
         get { self[MotionPolicyKey.self] }
         set { self[MotionPolicyKey.self] = newValue }

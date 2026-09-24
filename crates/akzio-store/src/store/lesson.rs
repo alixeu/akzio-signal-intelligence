@@ -1,3 +1,7 @@
+// 文件导读：Lesson 采用独立的惰性表和 canonical CAS Artifact；证据账本只记录
+// 已封存 Outcome 对 Lesson 的观察关联，和 Policy 激活、Paper 执行不是同一状态。
+// 数据写入/生命周期迁移由 write.rs 执行，queries_verify.rs 负责读取与 Doctor 校验，
+// helpers.rs 只探测表形状；先读 LessonEvidenceMetrics 转换，再看 Store API。
 use super::*;
 
 use akzio_domain::{
@@ -12,6 +16,9 @@ pub(super) struct LessonEvidenceMetrics {
 }
 
 impl From<&LessonEvidence> for LessonEvidenceMetrics {
+    // `From<&LessonEvidence>` 实现标准转换 trait：调用方可用 `LessonEvidenceMetrics::from(&evidence)`；
+    // 输入只借用完整 LessonEvidence，复制固定长度 metrics 数组到 SQL 列投影；
+    // lesson/context/outcome identity 仍存于单独索引列，不在 metrics_json 中重复编码。
     fn from(evidence: &LessonEvidence) -> Self {
         Self {
             utility_ppm_by_horizon: evidence.utility_ppm_by_horizon,
@@ -20,6 +27,8 @@ impl From<&LessonEvidence> for LessonEvidenceMetrics {
     }
 }
 
+// 将 SQL identity/attribution/metrics/time 列重建成领域 LessonEvidence；未知 attribution、
+// 非法 hash、JSON、时间或 validate 错误都会阻止该行返回，不套用默认值。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn lesson_evidence_from_columns(
     lesson_id: String,

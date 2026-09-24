@@ -1,4 +1,9 @@
 //! Read-only provider captures for execution sessions and the matching quote venue.
+
+// 文件导读：执行市场采集把 Paper clock、calendar、Overnight 资产资格和报价 feed 放在同一
+// raw ledger 中。Regular 时段使用显式 IEX/SIP，Overnight 映射到 overnight/BOATS，不回退到
+// IEX；返回的 normalized 时间仍由 provider payload/领域 session 解码，不能把抓取成功当作
+// 报价 freshness 或订单授权。
 use super::*;
 use akzio_domain::{Asset, ExchangeSession, TradingSession, TradingSessionSnapshot};
 
@@ -7,6 +12,8 @@ impl AlpacaPaperEvidenceTransport {
         &self,
         resource: &str,
     ) -> Result<AcquiredEvidence, EvidenceAdapterError> {
+        // 先读取 clock/calendar 建立真实 TradingSession；clock 请求若进入 Overnight，再逐
+        // 资产检查 overnight_tradable/halted，最后按资源选择 clock 或 quotes 并保留完整 ledger。
         let invalid = |message: &str| EvidenceAdapterError::DataQuality(message.into());
         let url = |base: &str, path: &str| {
             Url::parse(&format!("{base}{path}")).map_err(|_| invalid("invalid session URL"))
@@ -115,6 +122,8 @@ mod tests {
 
     #[tokio::test]
     async fn execution_capture_keeps_clock_and_quote_times_and_uses_overnight_venue() {
+        // 回归覆盖 IEX/SIP 到 overnight/BOATS 的映射、下一交易日 trade_date、资产资格和
+        // provider quote timestamp；不得出现 feed=iex 的夜盘回退。
         for (configured, expected) in [
             (AlpacaMarketDataFeed::Iex, "overnight"),
             (AlpacaMarketDataFeed::Sip, "boats"),

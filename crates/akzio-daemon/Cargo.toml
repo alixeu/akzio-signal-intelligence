@@ -1,3 +1,4 @@
+# 文件职责：声明常驻 Daemon、HTTP/SSE、调度和 worker 分发 crate 的依赖边界。
 [package]
 name = "akzio-daemon"
 version = "0.2.0"
@@ -6,6 +7,8 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+# 通过 workspace crate 依赖调用 Domain/Store/Runtime/Execution 等权威实现；Axum/Tokio
+# 提供传输和任务驱动，daemon 本身不取代这些 crate 的 Contract/Gate/持久化边界。
 [dependencies]
 akzio-domain = { path = "../akzio-domain" }
 akzio-execution = { path = "../akzio-execution" }
@@ -28,4 +31,5 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# 测试使用独立 HTTP client 访问本地 handler，不加入 daemon 的生产依赖。
 reqwest.workspace = true

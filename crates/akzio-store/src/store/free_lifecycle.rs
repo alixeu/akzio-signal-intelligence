@@ -1,4 +1,11 @@
+// 文件导读：生命周期辅助函数把 Artifact source closure、embedded BLOB 索引、Task node、
+// permit/daemon lease 和 Paper effect 约束放进调用方事务，保证读取与提交使用同一连接视图。
+// 写入从 insert_artifact_batch/insert_task_node 接到调用方事务；读取与 lease 校验函数只借用现有
+// Connection/Transaction，不获取 Store Mutex，也不会自行 commit。
+// 输入已构造 Artifact 与调用方连接；提升嵌入 BLOB 并写索引行，不插 Artifact 主行。
 fn index_embedded_blob_refs(connection: &Connection, artifact: &Artifact) -> StoreResult<()> {
+    // 每个嵌入 BLOB 先 promotion 到 durable CAS，再写 artifact+role+ordinal 索引；
+    // 调用方传入 Transaction 时，两者与 Artifact 一起提交或回滚。
     for (role, ordinal, blob) in embedded_blob_refs(connection, artifact)? {
         blob::promote_staged_blob(connection, &blob)?;
         connection.execute(
@@ -16,7 +23,10 @@ fn index_embedded_blob_refs(connection: &Connection, artifact: &Artifact) -> Sto
     Ok(())
 }
 
+// 为历史 NormalizedEvidence 补齐 embedded blob index，写入只在自身 Immediate 事务内发生。
 fn backfill_embedded_blob_refs(connection: &mut Connection) -> StoreResult<()> {
+    // 先在事务外取缺索引 Artifact ID；空集不创建写事务。非空时一个 Immediate 事务内逐个重读并 INSERT OR IGNORE。
+    // 初始 ID 列表与后续写事务不是同一读取快照；已存在索引的行不覆盖。
     let artifact_ids = connection
         .prepare(
             r#"SELECT artifact_id
@@ -58,10 +68,13 @@ fn backfill_embedded_blob_refs(connection: &mut Connection) -> StoreResult<()> {
     Ok(())
 }
 
+// 按 Artifact kind 从 Contract/NormalizedEvidence payload 提取嵌入 BLOB，并逐个验证可读。
 fn embedded_blob_refs(
     connection: &Connection,
     artifact: &Artifact,
 ) -> StoreResult<Vec<(String, u64, BlobRef)>> {
+    // 先读取 Artifact 自身 CAS；Contract 走强类型校验并移动 tool_specs 收集 schema，
+    // NormalizedEvidence 尝试 JSON path 提取 source_document.sources[].blob。
     let payload = blob::read_blob_bytes(connection, &artifact.blob.hash, artifact.blob.bytes)?;
     let refs = match artifact.kind {
         ArtifactKind::Contract => {
@@ -92,6 +105,7 @@ fn embedded_blob_refs(
             refs
         }
         ArtifactKind::NormalizedEvidence => {
+            // 该 kind 的 payload 若不是 JSON，当前 helper 明确返回空嵌入引用；后续完整性检查仍会校验 Artifact 主 BLOB。
             let Ok(value) = serde_json::from_slice::<serde_json::Value>(&payload) else {
                 return Ok(Vec::new());
             };
@@ -116,6 +130,7 @@ fn embedded_blob_refs(
         _ => Vec::new(),
     };
     for (_, _, blob) in &refs {
+        // 发现的嵌入引用必须在 durable 或同连接 TEMP staging 中可还原，不能只索引未存在的 hash。
         blob::read_blob_bytes_including_staged(connection, &blob.hash, blob.bytes)?;
     }
     Ok(refs)
@@ -124,6 +139,9 @@ fn embedded_blob_refs(
 /// Inserts a completion batch in source-closure order. A task may create a
 /// RawEvidence artifact and its NormalizedEvidence dependent in the same
 /// atomic attempt; callers need not rely on input ordering for correctness.
+// 对同一 completion batch 做 source-closure 拓扑排序后插入，允许输入顺序与依赖顺序不同。
+// 输入切片被借用；pending 用 ArtifactId 做去重/排序，每次只移除 source refs 已不在 pending 的节点。
+// 若存在闭环或外部引用顺序无法满足，本 helper 返回 InvalidArtifactClosure；不负责外层事务提交。
 fn insert_artifact_batch(transaction: &Transaction<'_>, artifacts: &[Artifact]) -> StoreResult<()> {
     let mut pending = BTreeMap::<ArtifactId, &Artifact>::new();
     for artifact in artifacts {
@@ -139,6 +157,8 @@ fn insert_artifact_batch(transaction: &Transaction<'_>, artifacts: &[Artifact]) 
     }
 
     while !pending.is_empty() {
+        // BTreeMap 迭代按 ID 稳定选第一个可写 Artifact；值是借用的 `&Artifact`，
+        // `remove` 只移出该引用，底层 Artifact 仍归输入切片所有。
         let ready = pending
             .iter()
             .find(|(_, artifact)| {
@@ -165,10 +185,12 @@ fn insert_artifact_batch(transaction: &Transaction<'_>, artifacts: &[Artifact]) 
     Ok(())
 }
 
+// Workflow node 的所有 input Artifact 必须在创建 Run 前可沿 source_refs 递归解析。
 fn assert_workflow_input_artifacts(
     transaction: &Transaction<'_>,
     nodes: &[WorkflowNode],
 ) -> StoreResult<()> {
+    // 所有节点的输入 refs 共用 visited 集，重复父 Artifact 只检查一次；调用方事务内完成整个校验。
     let mut visited = BTreeSet::new();
     for reference in nodes.iter().flat_map(|node| &node.input_artifacts) {
         assert_artifact_reference_closure(transaction, reference, &mut visited)?;
@@ -176,11 +198,13 @@ fn assert_workflow_input_artifacts(
     Ok(())
 }
 
+// 深度优先检查一个 ArtifactRef 的 kind 和完整 source closure，visited 防止重复扫描。
 fn assert_artifact_reference_closure(
     transaction: &Transaction<'_>,
     reference: &ArtifactRef,
     visited: &mut BTreeSet<ArtifactId>,
 ) -> StoreResult<()> {
+    // 每层都先检查期望 kind，再以 artifact_id 去重并递归其 source_refs；缺 Artifact/坏 kind 立即 Err。
     let artifact = read_artifact(transaction, &reference.artifact_id)?;
     if artifact.kind != reference.kind {
         return Err(StoreError::InvalidArtifactClosure(
@@ -196,12 +220,14 @@ fn assert_artifact_reference_closure(
     Ok(())
 }
 
+// 把领域 WorkflowNode 序列化进 Task 行，初始状态固定为 queued。
 fn insert_task_node(
     transaction: &Transaction<'_>,
     run_id: &RunId,
     node: &WorkflowNode,
     created_at: DateTime<Utc>,
 ) -> StoreResult<()> {
+    // 领域预算/retry/spec 编码到 SQL JSON 列；Task ID 主键冲突或未插入恰一行时返回 DuplicateTask。
     let inserted = transaction.execute(
         r#"INSERT INTO rebuild_tasks
  (task_id, run_id, recipe_id, objective, contract_hash, priority, budget_json, retry_json, on_failure,
@@ -229,7 +255,9 @@ fn insert_task_node(
     Ok(())
 }
 
+// 依赖表只保存 Task ID 边，节点本体仍以 input_artifacts/budget 等列和 JSON 为准。
 fn insert_node_dependencies(transaction: &Transaction<'_>, node: &WorkflowNode) -> StoreResult<()> {
+    // 对每条 dependency 插入 child task_id→depends_on_task_id；外键/唯一键错误由事务传播，不在这里排序或提交。
     for dependency in &node.dependencies {
         transaction.execute(
             "INSERT INTO rebuild_task_dependencies (task_id, depends_on_task_id) VALUES (?1, ?2)",
@@ -239,7 +267,9 @@ fn insert_node_dependencies(transaction: &Transaction<'_>, node: &WorkflowNode) 
     Ok(())
 }
 
+// 读取依赖边并按 Task ID 稳定排序，供 snapshot/claim 判断依赖满足。
 fn task_dependencies(connection: &Connection, task_id: &TaskId) -> StoreResult<Vec<TaskId>> {
+    // task_id 是 SQL 精确筛选键；query_map/collect 在任一行解码失败时不返回部分依赖列表。
     let dependencies = connection
         .prepare(
             "SELECT depends_on_task_id FROM rebuild_task_dependencies \
@@ -250,12 +280,17 @@ fn task_dependencies(connection: &Connection, task_id: &TaskId) -> StoreResult<V
     Ok(dependencies)
 }
 
+// 只规范化 dependencies 顺序，用于比较 graph 与 SQL 恢复节点，不改变业务字段。
 fn canonical_workflow_node(mut node: WorkflowNode) -> WorkflowNode {
+    // 按值取得 node 的所有权，只对 dependencies 排序后把同一 node 移出返回；其它字段保持原值。
     node.dependencies.sort();
     node
 }
 
+// 在最终写事务核验 run/status/lease/epoch/attempt/contract 和真实 wall-clock expiry。
 fn assert_permit(transaction: &Transaction<'_>, permit: &TaskWritePermit) -> StoreResult<()> {
+    // permit 是由 claim 发放的能力值；SQL 以 task_id 查一行并逐字段比较 run/lease/epoch/attempt/contract。
+    // 最后用实际 Utc::now() 检查数据库 lease_until，不依赖 Artifact 的历史时间或调用者给定时间。
     let current = transaction
         .query_row(
             r#"SELECT run_id, status, lease_id, lease_epoch, active_attempt_id, contract_hash, lease_until
@@ -294,11 +329,14 @@ fn assert_permit(transaction: &Transaction<'_>, permit: &TaskWritePermit) -> Sto
     Ok(())
 }
 
+// daemon lease 的 owner+epoch+expiry 必须同时匹配，防止旧 scheduler 在接管后继续写入。
 fn assert_daemon_lease(
     transaction: &Transaction<'_>,
     lease: &DaemonLease,
     now: DateTime<Utc>,
 ) -> StoreResult<()> {
+    // lease_name 定位 SQL row；owner/epoch 不同或 persisted expiry<=now 都是 SchedulerFenced。
+    // 只读核验，不更新 heartbeat/expiry，锁和事务由调用者拥有。
     let current = transaction
         .query_row(
             "SELECT owner_id, epoch, expires_at FROM rebuild_daemon_leases WHERE lease_name = ?1",
@@ -335,6 +373,7 @@ fn assert_session_slot_run(
     session_key: &str,
     run_id: &RunId,
 ) -> StoreResult<()> {
+    // 第一条查询确保 Run 存在；第二条检查 run_id 唯一性假设，只允许无 slot 或相同 session_key。
     let invalid = || StoreError::InvalidSessionSlot(session_key.to_owned());
     let run_exists = transaction
         .query_row(
@@ -362,11 +401,13 @@ fn assert_session_slot_run(
     }
 }
 
+// effect 引用必须指向同一 Paper Run 的 canonical commitment/reprice/cancel Artifact。
 fn assert_paper_effect_artifact(
     transaction: &Transaction<'_>,
     effect: &ArtifactRef,
     run_id: &RunId,
 ) -> StoreResult<()> {
+    // caller 传入的 Ref.kind 必须匹配读回 Artifact kind，且三种合法 kind 都需 canonical、origin.run_id 相同。
     let artifact = read_artifact(transaction, &effect.artifact_id)?;
     if effect.kind != artifact.kind
         || !matches!(
@@ -387,11 +428,13 @@ fn assert_paper_effect_artifact(
     Ok(())
 }
 
+// 查找 effect intent 事件；它只证明 Rust intent 已持久化，不证明外部 broker 已接受。
 fn paper_effect_intent_exists(
     transaction: &Transaction<'_>,
     run_id: &RunId,
     effect_id: &ArtifactId,
 ) -> StoreResult<bool> {
+    // EXISTS 精确限制 Run、ExecutionEffectIntent 类型和 effect Artifact ID；true 仅证明 intent event 存在。
     let found = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM rebuild_events WHERE run_id = ?1 AND event_type = ?2 AND artifact_id = ?3)",
         params![
@@ -404,10 +447,13 @@ fn paper_effect_intent_exists(
     Ok(found != 0)
 }
 
+// 按全局 cursor 检查每个 effect 恰有一个 intent 和至多一个 terminal settlement/recovery。
 fn validate_paper_effect_events(
     connection: &Connection,
     run_id: Option<&RunId>,
 ) -> StoreResult<()> {
+    // run_id=None 校验全表，Some(run) 限制到一个 Run；依 cursor 重放 intent/terminal 两张 Map。
+    // terminal 必须晚于唯一 intent，重复 intent、先 terminal 或重复 terminal 都中止验证。
     let mut statement = connection.prepare(
         r#"SELECT event_id, run_id, event_type, artifact_id
            FROM rebuild_events

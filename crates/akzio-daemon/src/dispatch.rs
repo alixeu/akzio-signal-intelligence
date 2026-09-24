@@ -1,8 +1,18 @@
 //! Exhaustive runtime task dispatch.
 
+// 文件导读：任务 dispatch 是 workflow recipe 到应用门面的唯一选择点。它先让
+// `NodeExecutor` 接住 Store 已 claim 的 permit，再按 task class 进入 research/evidence/
+// decision/execution/paper/reconcile/evaluate；错误由 runtime 转成 Deferred/Retry/Failed，
+// 不把 handler 的 `Ok` 解释成业务完成。
+// Rust 机制：`NodeExecutor` 返回带生命周期的 `Pin<Box<dyn Future + Send>>`，使 trait
+// 可以在 Tokio worker 中执行；迭代器闭包收集祖先输出，`BTreeMap/BTreeSet` 保证去重和稳定
+// 顺序，借用 `&ClaimedAttempt` 防止 handler 越权取得 permit 所有权。
+
 use super::*;
 
 impl Daemon {
+    // 消费一个 Store 已 claim 的 Attempt，并把开始时间封装为 NodeContext 交给 Runtime trait；
+    // Future 在 worker 调用处被 await，Attempt lease 的提交/失败仍由 TaskRuntime 持有。
     pub(crate) async fn execute_task(&self, task: ClaimedAttempt) -> TaskCompletion {
         akzio_runtime::NodeExecutor::execute(
             self,
@@ -19,6 +29,8 @@ impl Daemon {
         task: ClaimedAttempt,
         now: DateTime<Utc>,
     ) -> TaskCompletion {
+        // 运行具体 handler 后，将可延期/限流错误映射为持久化调度结果；其他错误在 Debug
+        // 可额外记录验收诊断，最终按 retry_cause 变为 Retry 或 Failed。
         match self.execute_task_inner(&task, now).await {
             Ok(completion) => completion,
             Err(error) => {
@@ -89,6 +101,8 @@ impl Daemon {
         task: &ClaimedAttempt,
         now: DateTime<Utc>,
     ) -> Result<TaskCompletion> {
+        // Outcome recipe 先走独立两阶段 worker；其余任务按冻结 recipe 的 task_class 穷举路由，
+        // 任何未接入的类都由 recipe/runtime 错误阻断，不回退到 Planner 或默认处理器。
         if task.node.recipe_id.as_str() == akzio_domain::LEARNING_OUTCOME_WORKER_RECIPE_ID {
             return self.execute_outcome_worker(task, now).await;
         }
@@ -107,11 +121,9 @@ impl Daemon {
         }
     }
 
-    /// Build agent input strictly from its declared inputs and the Store's
-    /// semantic committed-output query for declared, successful dependencies.
-    /// This never scans a run's artifact set or exposes raw evidence;
-    /// `AgentRuntime` then creates the task-bound ContextManifest and
-    /// ReadGrant.
+    /// 从成功依赖的正式输出选取唯一类型化终态输入，供 Gate/Outcome 使用。
+    /// Agent 的 ContextManifest/ReadGrant 由独立的 AgentRuntime 路径创建；
+    /// 此方法不建立模型可读授权。
     pub(super) fn terminal_input(
         &self,
         task: &ClaimedAttempt,
@@ -141,9 +153,9 @@ impl Daemon {
         }
     }
 
-    /// Execution snapshots are produced only by the evidence gate from the
-    /// scheduler-reserved Alpaca resources below. This prevents arbitrary
-    /// normalized evidence from being reinterpreted as broker state.
+    /// 从已完成依赖读取受管执行快照，供没有生产 Alpaca 即时刷新路径时使用。
+    /// 正式 Paper 的 ExecutionGate 会另行刷新；这里只接受明确的 producer/来源，
+    /// 不把任意 NormalizedEvidence 重新解释为 Broker 状态。
     pub(super) fn execution_snapshot_inputs(
         &self,
         task: &ClaimedAttempt,
@@ -152,6 +164,8 @@ impl Daemon {
         Option<ArtifactRef>,
         Option<ArtifactRef>,
     )> {
+        // 只从已成功依赖的 Artifact 输出中识别指定 producer；遇到来源/Run/kind/引用不符
+        // 会立即失败，避免把研究证据重解释成 Broker 快照。
         let mut account = None;
         let mut quotes = None;
         let mut clock = None;
@@ -199,6 +213,8 @@ impl Daemon {
     }
 
     pub(super) fn ancestor_outputs(&self, task: &ClaimedAttempt) -> Result<Vec<Artifact>> {
+        // 从当前 workflow snapshot 沿依赖闭包向上遍历；Skipped 节点只递归展开其依赖，
+        // Succeeded 节点才读取 Store 的已提交输出，其他状态拒绝终端任务继续。
         let snapshot = self.workflow.recover(&task.run_id)?;
         let tasks = snapshot
             .tasks
@@ -246,6 +262,8 @@ impl Daemon {
         &self,
         reference: &ArtifactRef,
     ) -> Result<T> {
+        // 先把 ArtifactRef 声明的 kind 与 Store 当前索引核对，再读 CAS BLOB 并反序列化为 T；
+        // `DeserializeOwned` 要求结果不借用 BLOB 缓冲，便于后续跨 await 使用。
         let artifact = self.store.artifact(&reference.artifact_id)?;
         if artifact.kind != reference.kind {
             return Err(DaemonError::InvalidInput(format!(
@@ -260,6 +278,8 @@ impl Daemon {
 }
 
 impl akzio_runtime::NodeExecutor for Daemon {
+    // NodeExecutor 要求返回可跨线程运行的 boxed Future；`context.task` move 入 async 块，
+    // Future 真正被 executor poll 后才进入 task handler。
     fn execute(
         &self,
         context: akzio_runtime::NodeContext,

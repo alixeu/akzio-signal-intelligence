@@ -1,3 +1,5 @@
+# 文件职责：声明纯领域模型 crate 的序列化、时间、哈希和错误依赖；不引入 I/O 层。
+# 下列依赖与 workspace 共享版本对齐；此 crate 只把它们用于值类型、编解码和确定性校验。
 [package]
 name = "akzio-domain"
 version = "0.2.0"
@@ -7,10 +9,14 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+# 日期/时区用于领域时间点与交易日语义。
 chrono.workspace = true
 chrono-tz.workspace = true
+# serde 定义持久化/wire 结构，serde_json 用于稳定载荷投影与身份哈希。
 serde.workspace = true
 serde_json.workspace = true
+# 哈希负责内容身份；thiserror 只包装纯领域错误，不触发外部操作。
 sha2.workspace = true
 thiserror.workspace = true
+# UUID 仅用于非 CAS 的业务 ID 包装。
 uuid.workspace = true

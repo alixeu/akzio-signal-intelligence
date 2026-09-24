@@ -1,3 +1,12 @@
+// 文件导读：Debug CLI 连接隔离 Core 的 prepare/inspect/step/resume/fork/export 入口，并
+// 保持 fixture、真实模型探测和已有 Run 的导出彼此分离。step/pause/resume/retry-node
+// 控制请求先 inspect 再携带 expected_revision；prepare、fork、export 不走这条 CAS
+// 请求格式。Store/CAS 才决定 claim、lease、状态和权限；受理/Completed 或导出成功都不
+// 等于 Decision、Paper submission、fill 或 Outcome/learning 完成。
+// Rust 机制：clap derive 宏生成强类型枚举；异步控制使用 `Future`/`await`，
+// `watch` 传播关闭信号，`tokio::try_join!` 同时等待 HTTP 与 worker 并传播错误；
+// `Result`/`Option` 分别表达可能失败与可选的资源/输入。
+
 fn default_outcome_processing() -> bool {
     // Debug/fixture 默认保留 Outcome worker；这只决定后续评估是否可处理，
     // 不会把 PositionPlan 的研究或 Decision 结果提升为 Paper 执行。
@@ -14,7 +23,7 @@ enum DebugCommand {
     },
     /// Serve the existing deterministic fixture adapters; never calls a provider.
     ServeFixture,
-    /// Verify the formal nine-node PositionPlan with isolated deterministic adapters.
+    /// Verify the default 21-node PositionPlan with fresh isolated deterministic adapters.
     VerifyFixture,
     /// Evaluate the installed Reviewer on fixed synthetic cases in an isolated Store.
     VerifyResearchQuality {
@@ -84,7 +93,7 @@ enum DebugCommand {
         #[arg(long)]
         input: PathBuf,
     },
-    /// Export a read-only, share-safe diagnostic bundle without rerunning work.
+    /// Read an existing Run and write a share-safe diagnostic bundle to the requested target.
     ExportBundle {
         run_id: String,
         #[arg(long)]
@@ -97,8 +106,9 @@ enum DebugCommand {
 
 async fn dispatch_debug(command: DebugCommand, config: &Config, _config_path: &Path) -> Result<()> {
     use akzio_domain::{DebugAction, DebugControlRequest, DebugSession, TaskId};
-    // 这里区分三类入口：fixture 服务/验证使用本地隔离实现，Preflight/ExportBundle
-    // 可完全只读运行，其余控制命令通过已认证的 daemon API 操作现有 Debug Run。
+    // fixture 服务/验证使用隔离实现；Preflight 的普通分支会向模型 provider 发能力
+    // 探测请求，只有 --resolve-only 跳过模型 I/O；ExportBundle 读取现有 Run，
+    // 但会写显式指定的输出目录。其余控制命令走已认证的 daemon API。
     if matches!(command, DebugCommand::ServeFixture) {
         // ServeFixture 只在显式 fixture 配置下启动 HTTP 和 worker；启动服务本身不代表
         // Run 已完成，也不允许 auto_paper 或非 fixture profile 混入。
@@ -165,8 +175,9 @@ async fn dispatch_debug(command: DebugCommand, config: &Config, _config_path: &P
         return print_json(&reports);
     }
     if let DebugCommand::ExportBundle { run_id, out, store } = command {
-        // 提供 Store Root 时走离线只读导出；否则把同一请求交给 daemon。两条路径都只
-        // 导出已有 Run 的诊断资料，不重新执行节点、模型或 Broker 操作。
+        // 提供 Store Root 时只读打开源库并本地写 out；否则请求 daemon 导出到 out。
+        // 这里的“只读”仅针对源 Run/Store，绝不表示输出目录没有新文件。
+        // 两条路径都不重新执行节点、模型或 Broker 操作。
         if let Some(store_root) = store {
             let store = Store::open_existing(store_root)
                 .context("open explicit Store Root in offline read-only mode")?;
@@ -328,7 +339,8 @@ async fn dispatch_debug(command: DebugCommand, config: &Config, _config_path: &P
 async fn verify_fixture() -> Result<()> {
     use akzio_domain::{DebugAction, DebugControlRequest, TaskStatus};
     // Fixture 验证从新的 .akzio 子目录开始，使用固定模型/适配器和 forbidden Broker，
-    // 只验正式 PositionPlan 拓扑、Store Doctor 与诊断导出，不验真实模型或 Paper 业务。
+    // 下方的 passed 明确要求默认 21 个节点均 Succeeded/Skipped，再核 Store Doctor
+    // 与诊断导出；不验真实模型、Paper 订单或跨交易日 Outcome。
     let output = std::env::current_dir()?.join(".akzio").join(format!("verify-fixture-{}", RunId::new()));
     fs::create_dir_all(&output)?;
     let store_root = output.join("store");
@@ -397,6 +409,8 @@ async fn verify_fixture() -> Result<()> {
 #[cfg(test)]
 mod retired_cli_tests {
     use super::*;
+
+    // 这些解析测试固定旧创建入口已退役的边界，不启动 daemon 或访问 Store。
     #[test]
     fn legacy_creation_commands_are_not_accepted() {
         for args in [vec!["akzio","run","fixture-debug"],vec!["akzio","run","paper-dry-run"],vec!["akzio","run","submit","debug"],vec!["akzio","debug","prepare","--session","2026-09-22","--fixture-controller"]] {

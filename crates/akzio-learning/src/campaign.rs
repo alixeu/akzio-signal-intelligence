@@ -17,6 +17,11 @@ use crate::evaluation::{aggregate_calibration_report, AKZIO_MIN_CALIBRATION_SAMP
 
 const PPM_ONE: u32 = 1_000_000;
 
+// 文件导读：这里把同一 Canary cohort 的三类 subject 与 T+1/T+3/T+5 观察汇总成
+// 一个有版本和哈希的评估；它只决定 canary verdict，真正的 Policy head 变更仍由 Store
+// 的带 lease 事务负责。daemon/outcome/canary 先记录配对观察，再用 verdict 评估各 subject，
+// 最后调用 apply_cohort_evaluation 完成 campaign 状态迁移。
+
 #[derive(Debug, Error)]
 pub enum CanaryError {
     #[error(transparent)]
@@ -37,6 +42,8 @@ pub fn evaluate_canary_cohort(
     observations: &[CanaryPairedObservation],
     evaluated_at: DateTime<Utc>,
 ) -> Result<CanaryCohortEvaluation, CanaryError> {
+    // 输入均为借用：manifest/policy 冻结 cohort 和阈值；observations 应由上层从
+    // Store 获取，本纯函数不验证其持久化来源或提交 Policy head，错误经 ? 返回。
     manifest.validate()?;
     policy.validate()?;
     let policy_hash = policy.identity_hash();
@@ -57,6 +64,8 @@ pub fn evaluate_canary_cohort(
         std::array::from_fn(|_| std::array::from_fn(|_| std::array::from_fn(|_| Vec::new())));
     let mut observation_hashes = Vec::with_capacity(observations.len());
 
+    // session_key 与 horizon 共同构成唯一观察身份；同一交易 Session 的三个窗口分别
+    // 计数，market_days/regime 则用于检查跨日和跨市场状态的覆盖，而不是把缺失窗口当成 0。
     for observation in observations {
         observation.validate()?;
         validate_observation_manifest(manifest, observation)?;
@@ -78,6 +87,8 @@ pub fn evaluate_canary_cohort(
         .into_iter()
         .enumerate()
         {
+            // utility 以 ppm 累加后再与样本数比较；forecast score 保留 parent/candidate
+            // 的逐资产分数，下面只有达到最小样本数才会形成 calibration report。
             rollback |= subject_requires_rollback(subject, policy);
             required_metric_unmeasured |= subject_required_metric_unmeasured(subject);
             if let Some(score) = subject.parent.forecast_score {
@@ -98,8 +109,12 @@ pub fn evaluate_canary_cohort(
     }
 
     observation_hashes.sort();
+    // 排序后再哈希，使输入观察顺序不影响 observation_set_hash；这里的 expect 依赖
+    // ContentHash 列表可 JSON 序列化，若该固定数据类型序列化失败会 panic，而非返回 CanaryError。
     let observation_set_hash = content_hash_json(&serde_json::json!(observation_hashes))
         .expect("canary observation hashes serialize");
+    // 覆盖度分别检查三个 horizon、不同交易日和必需 regime；任一不足即 Defer 条件，
+    // 不会把没有观察的 session 当成零收益样本。
     let coverage_insufficient = paired_sessions_by_horizon
         .iter()
         .zip(policy.required_paired_sessions_per_horizon)
@@ -117,6 +132,8 @@ pub fn evaluate_canary_cohort(
                         * i128::from(*count)
         });
     let mut calibration_reports = Vec::with_capacity(9);
+    // 9 个 report = 3 个 subject × 3 个 Outcome horizon；样本不足时 report 为 None，
+    // confidence_insufficient 会让 verdict 保持 Defer，不能用单条 T+1/T+3/T+5 观察晋级。
     for (subject_index, subject) in [
         CanarySubjectKind::Contract,
         CanarySubjectKind::Topology,
@@ -162,6 +179,8 @@ pub fn evaluate_canary_cohort(
         .is_some_and(|matrix| !matrix.permits_promotion());
     let governance_missing =
         manifest.promotion_integrity.is_none() || manifest.capability_retention.is_none();
+    // 已测出的退化才允许 Rollback；coverage、置信度、必需指标或治理材料缺失属于
+    // Defer；指标完整但 utility 未达到阈值才是 Hold。未知状态不会被解释成通过。
     let verdict = if rollback || integrity_failed || retention_failed {
         CanaryVerdict::Rollback
     } else if coverage_insufficient
@@ -198,6 +217,8 @@ fn validate_observation_manifest(
     manifest: &CanaryCohortManifest,
     observation: &CanaryPairedObservation,
 ) -> Result<(), CanaryError> {
+    // 逐一绑定 manifest 中的 cohort、日期/market regime、资产范围、成本模型、交易日历和数据集；
+    // 首个不匹配就返回具体 CohortMismatch，调用者不能将其他 cohort 的观测混入本次评估。
     if observation.cohort_id != manifest.cohort_id {
         return Err(CanaryError::CohortMismatch("cohort identity"));
     }
@@ -230,6 +251,8 @@ fn subject_requires_rollback(
     subject: &CanaryPairedSubjectMetrics,
     policy: &CanaryPromotionPolicy,
 ) -> bool {
+    // 只有已测量的候选退化会触发回滚；Option::is_some_and 和 Some/Some 比较避免把 None
+    // 误当成 0。与父版本对比的各类风险/过程/回撤阈值共同形成 fail-closed 风险判断。
     subject
         .candidate
         .evidence_completeness_ppm
@@ -282,6 +305,7 @@ fn subject_requires_rollback(
 }
 
 const fn subject_required_metric_unmeasured(subject: &CanaryPairedSubjectMetrics) -> bool {
+    // 必需指标任一缺失即 true，由上层映射到 Defer；未知测量不会被视作合格或退化。
     !subject.risk_recall_is_measured()
         || subject.parent.evidence_completeness_ppm.is_none()
         || subject.candidate.evidence_completeness_ppm.is_none()
@@ -294,6 +318,8 @@ const fn subject_required_metric_unmeasured(subject: &CanaryPairedSubjectMetrics
 }
 
 const fn horizon_index(horizon: OutcomeHorizon) -> usize {
+    // 将有限枚举映射到固定数组下标；match 穷尽所有 horizon，新增变体会要求显式补齐映射。
+    // 固定数组顺序与 OutcomeHorizon::ALL 一致，避免把 T+1/T+3/T+5 的计数错位。
     match horizon {
         OutcomeHorizon::T1 => 0,
         OutcomeHorizon::T3 => 1,
@@ -307,7 +333,9 @@ pub struct CanaryCampaignRuntime {
 }
 
 impl CanaryCampaignRuntime {
+    // Store 按值移入运行时并由字段持有；minimum_ppm 只校验范围，不在构造时创建 campaign。
     pub fn new(store: Store, minimum_ppm: u32) -> Result<Self, CanaryError> {
+        // minimum_ppm 只是本运行时接收的边界校验；campaign 状态不会在构造时写入 Store。
         if minimum_ppm > PPM_ONE {
             return Err(CanaryError::Domain(
                 akzio_domain::DomainError::InvalidBudget {
@@ -318,6 +346,8 @@ impl CanaryCampaignRuntime {
         Ok(Self { store })
     }
 
+    // 按 verdict 与 campaign status 推导 subject 对应的目标 PolicyState；Advance/ Rollback
+    // 只返回建议状态，实际 head 迁移由后续 Store 事务完成，Memory subject 保持当前状态。
     pub fn target_policy_state(
         &self,
         subject: &PolicySubject,
@@ -347,6 +377,8 @@ impl CanaryCampaignRuntime {
         }
     }
 
+    // 此处只借用 lease、campaign ID 和已密封 evaluation，将一次状态迁移交给 Store；
+    // Ok 仅说明 campaign transition 返回了 head，不代表整个 Outcome worker 后续工作都完成。
     pub fn apply_cohort_evaluation(
         &self,
         lease: &DaemonLease,
@@ -355,6 +387,8 @@ impl CanaryCampaignRuntime {
         evaluation: &CanaryCohortEvaluation,
         now: DateTime<Utc>,
     ) -> Result<CanaryCampaignHead, CanaryError> {
+        // 评估结果已经密封；这里不直接改内存，而是把 lease、campaign、status 和
+        // evaluation 一并交给 Store 的受保护状态迁移，失败时不应留下半个 transition。
         Ok(self.store.transition_canary_campaign_with_evaluation(
             lease,
             campaign_id,

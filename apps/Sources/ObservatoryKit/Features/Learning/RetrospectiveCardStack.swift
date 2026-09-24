@@ -1,9 +1,13 @@
 import SwiftUI
 
+// 文件导读：LearningPage 把筛选后的 retrospective 卡片以及 index/detail 两个 Binding 交给此栈；
+// 它提供单卡呈现和前后浏览，不生成 Outcome 或学习结论。先读 body、stack、cardView、controls/step，
+// 理解索引夹取、degraded 文案分支以及按钮动作只更新父页 UI 状态。
 // MARK: - Retrospective stack
 //
 // One readable retrospective at a time, with explicit previous/next controls.
 struct RetrospectiveCardStack: View {
+    // cards 是按筛选结果传入的 sealed retrospective 投影；index 与 showsCounterfactual 由父级 @State 通过 Binding 管理。
     let cards: [RetrospectiveCardPresentation]
     @Binding var index: Int
     @Binding var showsCounterfactual: Bool
@@ -13,6 +17,7 @@ struct RetrospectiveCardStack: View {
     @Environment(\.appLanguage) private var language
 
     var body: some View {
+        // ViewBuilder 根据 cards 是否为空选择等待说明或可浏览的 stack/controls，不为缺失 outcome 生成卡片。
         if cards.isEmpty {
             SectionCard(title: "Retrospective") {
                 StatusExplanation(.waiting, detail: "Retrospectives require a sealed Paper outcome")
@@ -26,6 +31,7 @@ struct RetrospectiveCardStack: View {
     }
 
     private var stack: some View {
+        // clamp 防止过滤器改变后 index 越界；当前卡片仍保留固定高度以稳定邻近布局。
         // Translucent cards must not overlap: neighbouring text remains visible
         // through the material even when the current card has a higher zIndex.
         cardView(cards[min(max(index, 0), cards.count - 1)], isCurrent: true)
@@ -33,6 +39,7 @@ struct RetrospectiveCardStack: View {
     }
 
     private func cardView(_ card: RetrospectiveCardPresentation, isCurrent: Bool) -> some View {
+        // degraded 卡片保留数值和 diagnostic gaps，只隐藏不可验证的结论性文案。
         VStack(alignment: .leading, spacing: AkzioLayout.s2) {
             HStack(spacing: AkzioLayout.s2) {
                 Image(systemName: card.conclusion.symbol)
@@ -68,6 +75,7 @@ struct RetrospectiveCardStack: View {
                     }
                 }
                 VStack(alignment: .trailing, spacing: AkzioLayout.s2) {
+                    // impactPpm 缺失时 0 只用于选择正向展示色；下面的百分比仍由原 Optional 值格式化。
                     Text(PpmFormatter.currency(micros: card.pnlMicros, signed: true))
                         .akzioMetric(18, color: (card.impactPpm ?? 0) >= 0 ? AkzioColor.primaryGold : AkzioColor.actionCoral)
                     Text(PpmFormatter.percent(ppm: card.impactPpm)).akzioMono(11)
@@ -87,6 +95,7 @@ struct RetrospectiveCardStack: View {
     }
 
     private func labelled(_ title: String, _ body: String) -> some View {
+        // labelled 是纯展示 helper；title/body 已由数据投影决定，组件不负责翻译或推断。
         VStack(alignment: .leading, spacing: 2) {
             Text(L10n.text(title, language: language)).akzioText(.caption)
             Text(body).akzioText(.bodySmall)
@@ -94,6 +103,7 @@ struct RetrospectiveCardStack: View {
     }
 
     private var controls: some View {
+        // 两个 Button 的闭包只调用受边界保护的 step；详情按钮独立切换本地 showsCounterfactual。
         HStack(spacing: AkzioLayout.s2) {
             Button { step(-1) } label: { Image(systemName: "chevron.left") }
                 .buttonStyle(PressableButtonStyle())
@@ -116,6 +126,7 @@ struct RetrospectiveCardStack: View {
     }
 
     private func step(_ delta: Int) {
+        // step 在动画闭包内更新 Binding，并把索引限制在 0...cards.count-1，避免空数组被访问。
         withAnimation(policy.resolve(.spring(response: 0.48, dampingFraction: 0.95))) {
             index = min(max(index + delta, 0), cards.count - 1)
         }

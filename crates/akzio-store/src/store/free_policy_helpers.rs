@@ -1,3 +1,9 @@
+// 文件导读：任务结束 helper 负责把 terminal event、Task/Attempt 状态、失败传播、Debug settle
+// 放进调用方事务；它只收束已经通过 permit 检查的 Attempt，不决定模型或业务是否“成功”。
+// 调用链通常从 workflow/tasks.rs 的 commit/retry/defer 进入；先读 finish_permitted_task
+// 的终态顺序，再读 append_event/validate_event_shape 理解统一事件格式与 checkpoint 边界。
+// 输入当前 permit 与请求终态/失败策略，返回经 SkipTask 映射后的最终 status；所有数据库变化留在调用方事务。
+// 本 helper 自身不调用 assert_permit，调用者须在同一事务先验 permit，不能将函数可见性误作授权。
 fn finish_permitted_task(
     transaction: &Transaction<'_>,
     permit: &TaskWritePermit,
@@ -6,6 +12,8 @@ fn finish_permitted_task(
     terminal_artifact_id: Option<&ArtifactId>,
     now: DateTime<Utc>,
 ) -> StoreResult<TaskStatus> {
+    // requested_status 是调用方已决定的终态；SkipTask 仅把 Failed 转成 Skipped。
+    // 之后 append terminal event 并跑生命周期校验，再清 lease 并更新 Attempt；全部沿用外层事务。
     let post_terminal_worker = transaction.query_row(
         "SELECT recipe_id = ?1 FROM rebuild_tasks WHERE task_id = ?2",
         params![POST_TERMINAL_WORKER_RECIPE_ID, permit.task_id.0],
@@ -41,6 +49,7 @@ fn finish_permitted_task(
     validate_agent_turn_lifecycle_events(transaction, Some(&permit.run_id))?;
     validate_context_lifecycle_events(transaction, Some(&permit.run_id))?;
     validate_gate_lifecycle_events(transaction, Some(&permit.run_id))?;
+    // 只有 Succeeded 要求同 Attempt 没有未闭合 ToolCall；失败/取消会保留其审计事实而不伪装成功。
     if status == TaskStatus::Succeeded {
         ensure_no_pending_tool_calls(
             transaction,
@@ -61,6 +70,7 @@ fn finish_permitted_task(
         params![enum_name(status), now.to_rfc3339(), permit.attempt_id.0],
     )?;
     if status == TaskStatus::Failed && !post_terminal_worker {
+        // 普通任务失败根据冻结 on_failure 取消 queued 后续任务；Outcome worker 的失败不反向失败已终态 Run。
         match on_failure {
             FailureDisposition::FailRun => cancel_queued_tasks(transaction, &permit.run_id, now)?,
             FailureDisposition::FailTask => {
@@ -72,15 +82,19 @@ fn finish_permitted_task(
     if !post_terminal_worker {
         refresh_run_status(transaction, &permit.run_id, now)?;
     }
+    // Debug control/acceptance 也在当前事务内结算；任何上一步 Err 都不会提交 Task/Attempt 终态。
     debug::settle_attempt(transaction, permit, &enum_name(status), now)?;
     Ok(status)
 }
 
+// FailRun 时只取消 queued Task，running Attempt 仍由其 permit/lease 自己收束。
 fn cancel_queued_tasks(
     transaction: &Transaction<'_>,
     run_id: &RunId,
     now: DateTime<Utc>,
 ) -> StoreResult<()> {
+    // 先在 Run 范围按 task_id 排序取 queued IDs；随后用 status='queued' 条件更新并只为实际更新行追加事件。
+    // Running Task 不在此处抢占/取消，其自己的 permit 负责完成或恢复。
     let task_ids = {
         let mut statement = transaction.prepare(
             "SELECT task_id FROM rebuild_tasks WHERE run_id = ?1 AND status = 'queued' ORDER BY task_id",
@@ -111,11 +125,14 @@ fn cancel_queued_tasks(
     Ok(())
 }
 
+// FailTask 逐轮传播 failed/cancelled parent，直到没有新的 queued dependent。
 fn cancel_failed_dependents(
     transaction: &Transaction<'_>,
     run_id: &RunId,
     now: DateTime<Utc>,
 ) -> StoreResult<()> {
+    // 每轮通过 dependencies.depends_on_task_id 找到依赖失败/取消父节点的 queued child；
+    // 把本轮更新为 cancelled 后再查下一层，直到没有新项。整个递归式传播仍在调用方事务内。
     loop {
         let task_ids = {
             let mut statement = transaction.prepare(
@@ -159,6 +176,7 @@ fn cancel_failed_dependents(
     }
 }
 
+// 统一校验事件列形状后插入自增 cursor，并在同一事务中更新 RunControl checkpoint boundary。
 fn append_event(
     transaction: &Transaction<'_>,
     run_id: &RunId,
@@ -168,6 +186,8 @@ fn append_event(
     artifact_id: Option<&ArtifactId>,
     created_at: DateTime<Utc>,
 ) -> StoreResult<i64> {
+    // Option 引用借用调用方 ID，仅把其字符串绑定到 SQL 参数；校验形状后取得 rowid，
+    // checkpoint boundary helper 若失败会使调用方事务连同 event 插入一起回滚。
     validate_event_shape(
         event_type,
         task_id.is_some(),
@@ -192,12 +212,14 @@ fn append_event(
     Ok(cursor)
 }
 
+// 只允许无 Artifact 的 started/abandoned Attempt 事实通过专用入口写入。
 fn append_task_event(
     transaction: &Transaction<'_>,
     permit: &TaskWritePermit,
     event_type: LifecycleEventType,
     created_at: DateTime<Utc>,
 ) -> StoreResult<i64> {
+    // 这里只接受两种不带 payload 的事件；携带 Artifact 的 lifecycle 必须从 Artifact commit 路径写入。
     // Only artifact-less attempt facts may enter through this door; anything
     // that carries a payload must go through an artifact write.
     if !matches!(
@@ -219,12 +241,16 @@ fn append_task_event(
     )
 }
 
+// 用事件类型定义 task/attempt/artifact 三列的允许组合，拒绝半成品 lineage。
 fn validate_event_shape(
     event_type: LifecycleEventType,
     has_task_id: bool,
     has_attempt_id: bool,
     has_artifact_id: bool,
 ) -> StoreResult<()> {
+    // `matches!` 把 effect 的三种枚举分支合为布尔条件；它们先执行额外全列要求，
+    // 随后按生命周期类型穷尽验证列组合。
+    // 这只校验事件结构，不证明 Artifact payload 的领域内容或 Broker 结果。
     let effect_event = matches!(
         event_type,
         LifecycleEventType::ExecutionEffectIntent

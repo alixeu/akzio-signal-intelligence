@@ -1,10 +1,14 @@
+// 文件导读：daemon lease 用 owner+递增 epoch+expiry fencing scheduler；Paper session slot
+// 由同一 lease 保护并按 session_key 幂等，lease 成功只代表 Store reservation，不代表 broker fill。
+// 建议先读 acquire/heartbeat/release 理解调度器所有权，再读 reserve_session_slot 和
+// session_slot_for_run 理解数据库提交与恢复；Broker I/O 不在本文件执行。
 use super::*;
 
 impl Store {
-    /// Commits the frozen workflow graph, Run row, nodes, dependencies, and creation
-    /// event as one transaction. A process cannot observe a half-submitted graph.
-    /// Atomically installs the approved Paper workflow, its proposal, its
-    /// run-scoped inputs, and the broker session slot.
+    /// 原子发布 Paper workflow、proposal、run-scoped inputs 和 session slot；
+    /// 此便捷入口不传 approval binding，不能据此推断该 session 已获交易审批。
+    // 这是不携带 RuntimeManifest/Approval binding 的便捷入口；其余 Paper graph、proposal、
+    // lease 与 slot 仍由被委派方法校验并在同一写事务中持久化。
     pub fn reserve_paper_session_with_proposal(
         &self,
         lease: &DaemonLease,
@@ -14,6 +18,10 @@ impl Store {
         self.reserve_paper_session_with_binding(lease, reservation, proposal, None)
     }
 
+    // 在 reservation 前同时验证 approval、manifest session date/expiry/notional，再绑定二者。
+    // 先解码并校验 manifest/approval 的来源/hash、session 日期授权和 expiry；buy notional 留到
+    // ExecutionPlan/Commitment 校验阶段。成功后把 binding 交给事务化写入入口，返回 slot reservation，
+    // 不表示 workflow 已开始、Paper commitment 已写入或 Broker 已接受订单。
     pub fn reserve_paper_session_with_approval(
         &self,
         lease: &DaemonLease,
@@ -46,6 +54,9 @@ impl Store {
 
     /// Atomically elect one daemon scheduler. A successor always receives a
     /// higher epoch so stale leaders cannot mutate a Paper session slot.
+    // 输入 lease 名称、owner 和 now/expiry；IMMEDIATE 事务串行检查同名行。
+    // 无记录时 epoch 从 1 开始；未过期记录使调用返回 None；过期记录由新 owner 接管并递增 epoch。
+    // 返回 Some 只表示持久化 lease 取得成功，不代表之后任何 session/订单副作用成功。
     pub fn acquire_daemon_lease(
         &self,
         lease_name: &str,
@@ -101,6 +112,8 @@ impl Store {
     }
 
     /// Release only this epoch. Retaining the row preserves fencing monotonicity.
+    // 单条条件 UPDATE 要求 name/owner/epoch 匹配且仍未过期；影响 1 行才返回 true。
+    // SQLite 对单条语句提供其语句级原子性，但本方法没有多语句业务事务，也不删除历史 epoch 行。
     pub fn release_daemon_lease(
         &self,
         lease: &DaemonLease,
@@ -113,6 +126,9 @@ impl Store {
         )? == 1)
     }
 
+    // 只延长相同 owner+epoch 的未过期 lease，且不覆盖 maintenance 已延长的时间。
+    // now/expiry 是调用者时间；找不到匹配行或当前 lease 已到期返回 false。
+    // expiry 与当前 expiry 取 max，保证 heartbeat 不缩短维护窗口延长值；更新仅在事务提交后生效。
     pub fn heartbeat_daemon_lease(
         &self,
         lease: &DaemonLease,
@@ -146,6 +162,8 @@ impl Store {
         Ok(true)
     }
 
+    // 读取当前 lease row 并解析时间；查询不续租、不抢占 owner。
+    // SQL 按 lease_name 过滤，零行是 None；持久化 epoch/时间解析失败不会被当作缺少 lease。
     pub fn daemon_lease(&self, lease_name: &str) -> StoreResult<Option<DaemonLease>> {
         let connection = self.connection()?;
         connection
@@ -169,6 +187,8 @@ impl Store {
 
     /// Verify that the caller still owns the current, unexpired daemon epoch.
     /// Broker adapters call this immediately before external Paper I/O.
+    // 用读事务检查数据库中 owner/epoch/expiry 与传入 lease 一致；检查返回 Ok 后锁即释放，
+    // 这本身不把后续 HTTP I/O 与 SQLite 锁组成跨系统原子操作，调用方仍需在写入边界复核。
     pub fn validate_daemon_lease(
         &self,
         lease: &DaemonLease,
@@ -184,6 +204,9 @@ impl Store {
     /// Freeze the exact Paper graph before its Run is installed. A duplicate
     /// session returns the original graph and task IDs without recording the
     /// caller's replacement proposal.
+    // 输入 session_key、冻结 workflow/setup Artifact 和 reservation 时间；事务前校验图与输入闭包，
+    // 事务中检查 lease。已存在的 session_key 不覆盖或记录新 proposal，最后重读 slot 作为结果。
+    // `newly_reserved=false` 表示发现旧 slot，不表示新入参与旧 reservation 相同。
     pub fn reserve_session_slot(
         &self,
         lease: &DaemonLease,
@@ -275,6 +298,9 @@ impl Store {
         })
     }
 
+    // 由 slot 行读取 graph Artifact/CAS payload，再恢复 Paper WorkflowCommit 快照。
+    // 先在一次连接查询 slot 列，随后释放 guard，再分别读取 graph Artifact/BLOB；
+    // 这些读取未包在同一个显式只读事务中，任何损坏字段或 graph 校验失败均为 Err。
     pub fn session_slot(&self, session_key: &str) -> StoreResult<Option<SessionSlot>> {
         let row = {
             let connection = self.connection()?;
@@ -345,6 +371,9 @@ impl Store {
         .transpose()
     }
 
+    // 通过 session slot 找到消耗的 approval/manifest，并重新校验两者 hash/source binding。
+    // 按 Run 关联 slot→approval-consumption，未消费返回 None；找到后解码两个 CAS payload 并校验 hash。
+    // 查询和后续 BLOB 解码之间没有共同事务，方法只返回授权记录，不执行 Paper 操作。
     pub fn paper_approval_for_run(
         &self,
         run_id: &RunId,
@@ -378,12 +407,10 @@ impl Store {
         Ok(Some((manifest, approval)))
     }
 
-    /// Durably reserve the single broker-visible commitment for a Paper
-    /// session and terminally completes the active task attempt in the same
-    /// transaction. A crash therefore cannot leave a committed session slot
-    /// paired with an active commitment task.
     /// Returns the frozen broker-session slot for one scheduler-owned Paper
     /// run. A run may never have more than one such slot.
+    // 先通过 run_id 取可选 session_key，再调用 slot 恢复方法；两次读不是同一显式 SQLite 快照。
+    // 返回 Some 是已持久化 slot 的投影，不是订单提交或成交凭证。
     pub fn session_slot_for_run(&self, run_id: &RunId) -> StoreResult<Option<SessionSlot>> {
         let session_key = {
             let connection = self.connection()?;

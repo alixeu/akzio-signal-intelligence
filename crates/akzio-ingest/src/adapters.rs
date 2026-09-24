@@ -8,6 +8,12 @@ use std::{
     time::Duration as StdDuration,
 };
 
+// 文件导读：adapters.rs 实现 Alpaca Paper/market data、受 policy 约束的 native web/
+// source-document，以及无网络的 Fixture adapter。各路径先限制资源或来源，再按各自
+// policy 处理请求和响应；source-document 的流式读取另有字节上限，不能误认为所有
+// Alpaca JSON 路径都在此处统一限长。返回 AcquiredEvidence 不等于已验证业务事实；
+// NotCalled、NoVerifiableSources、Unauthorized 等失败仍保留可诊断分类。
+
 #[derive(Debug, Error)]
 pub enum EvidenceAdapterError {
     #[error("fixture for {0} is unavailable")]
@@ -52,6 +58,7 @@ pub enum NativeWebFailureKind {
 
 impl NativeWebFailureKind {
     pub const fn as_str(self) -> &'static str {
+        // 稳定诊断码供 Raw/Normalized evidence 和报告消费；枚举项的含义不随 provider 文本改变。
         match self {
             Self::NotCalled => "web_search_not_called",
             Self::ToolUnsupported => "web_search_tool_unsupported",
@@ -67,6 +74,8 @@ fn model_error(
     _source: EvidenceSource,
     _resource: &str,
 ) -> EvidenceAdapterError {
+    // 将模型协议错误折叠为采集层可恢复/不可恢复分类，同时保留 native web 的具体失败
+    // 类型；缺 citation、工具不可用和 HTTP 失败都不能被包装成成功。
     let reason = error.to_string();
     match error {
         ModelError::Http { status, .. } if matches!(status.as_u16(), 401 | 403) => {
@@ -97,6 +106,7 @@ fn model_error(
 }
 
 fn native_web_failure_kind(error: &ModelError) -> NativeWebFailureKind {
+    // 只根据模型错误枚举选择诊断类型，区分没调用工具、工具不可用、无来源和响应非法。
     match error {
         ModelError::NativeWebUnavailable => NativeWebFailureKind::NotCalled,
         ModelError::NativeWebToolNotAllowed => NativeWebFailureKind::ToolUnsupported,
@@ -110,6 +120,7 @@ fn native_web_failure_kind(error: &ModelError) -> NativeWebFailureKind {
 }
 
 fn native_web_failure_reason(error: &ModelError) -> String {
+    // 生成不含 provider 正文/凭据的稳定原因，供审计 metadata 使用。
     match error {
         ModelError::NativeWebUnavailable => "provider did not return a completed search".to_owned(),
         ModelError::NativeWebToolNotAllowed => "provider tool was not allowed".to_owned(),
@@ -131,6 +142,8 @@ fn model_policy_error(
     resource: &str,
     stage: &str,
 ) -> EvidenceAdapterError {
+    // 在保留底层分类的同时加上当前阶段，帮助从一次 acquisition 定位 provider/tool/citation
+    // 哪一步失败。
     model_policy_error_with_raw(error, source, resource, stage, None)
 }
 
@@ -141,6 +154,8 @@ fn model_policy_error_with_raw(
     stage: &str,
     raw: Option<&Value>,
 ) -> EvidenceAdapterError {
+    // 有 raw response 时再依据真实 web_search_call 形状细化 NotCalled/NoSources；没有 raw
+    // 时保持底层 fallback。
     match model_error(error, source, resource) {
         EvidenceAdapterError::Policy {
             evidence_source,
@@ -163,6 +178,10 @@ fn native_web_failure_kind_for_response(
     raw: &Value,
     fallback: NativeWebFailureKind,
 ) -> NativeWebFailureKind {
+    // 仅在错误分类时检查 Responses 的 web_search_call，不从模型文字推断搜索。
+    // 这里的 search/action.sources 启发式可能把合法的 open_page/find_in_page 或
+    // URL annotation 路径归为 NoVerifiableSources；成功资格以 NativeWebPolicy
+    // 的完整响应/citation 校验为准，不以这个诊断码反推真实来源不存在。
     let calls = raw
         .get("output")
         .and_then(Value::as_array)
@@ -190,12 +209,14 @@ fn native_web_failure_kind_for_response(
 }
 
 pub trait EvidenceAdapter: Send + Sync {
+    // 同步 adapter 只获取 AcquiredEvidence；Need 授权、Artifact 和 Store 提交归 runtime。
     fn source(&self) -> EvidenceSource;
 
     fn acquire(&self, request: &EvidenceRequest) -> Result<AcquiredEvidence, EvidenceAdapterError>;
 }
 
 pub trait AsyncEvidenceAdapter: Send + Sync {
+    // 异步 adapter 通过 BoxFuture 借用 request/self，适合 provider I/O 与 Tokio 任务协作。
     fn source(&self) -> EvidenceSource;
 
     fn acquire<'a>(
@@ -208,6 +229,8 @@ pub trait AsyncEvidenceAdapter: Send + Sync {
         request: &'a EvidenceRequest,
         _cutoff: DateTime<Utc>,
     ) -> BoxFuture<'a, Result<AcquiredEvidence, EvidenceAdapterError>> {
+        // 默认 cutoff-aware 调用退化为 acquire；需要 I/O 前冻结 cutoff 的 adapter 会覆盖它，
+        // 旧实现不会因此获得更宽的时间权限。
         self.acquire(request)
     }
 }
@@ -221,6 +244,7 @@ pub enum AlpacaMarketDataFeed {
 
 impl AlpacaMarketDataFeed {
     pub const fn as_str(self) -> &'static str {
+        // IEX/SIP 枚举到 Alpaca feed query 的稳定映射。
         match self {
             Self::Iex => "iex",
             Self::Sip => "sip",
@@ -238,6 +262,7 @@ pub enum AlpacaOptionDataFeed {
 impl std::str::FromStr for AlpacaOptionDataFeed {
     type Err = String;
     fn from_str(value: &str) -> Result<Self, Self::Err> {
+        // CLI 字符串只映射到 opra/indicative 两个显式 feed，未知输入拒绝而不回退。
         match value {
             "opra" => Ok(Self::Opra),
             "indicative" => Ok(Self::Indicative),
@@ -247,6 +272,7 @@ impl std::str::FromStr for AlpacaOptionDataFeed {
 }
 impl AlpacaOptionDataFeed {
     pub const fn as_str(self) -> &'static str {
+        // 领域 feed 枚举到 provider query 的封闭映射。
         match self {
             Self::Opra => "opra",
             Self::Indicative => "indicative",
@@ -269,6 +295,7 @@ pub struct AlpacaPaperEvidenceTransport {
 
 impl std::fmt::Debug for AlpacaPaperEvidenceTransport {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 调试输出只显示脱敏凭据占位符，保留 endpoint/feed 方便诊断配置。
         formatter
             .debug_struct("AlpacaPaperEvidenceTransport")
             .field("base_url", &self.base_url)
@@ -284,6 +311,7 @@ impl AlpacaPaperEvidenceTransport {
     pub fn from_env(
         market_data_feed: Option<AlpacaMarketDataFeed>,
     ) -> Result<Self, EvidenceAdapterError> {
+        // 从环境读取 Paper endpoint/credentials 后复用 new；缺凭据在任何 HTTP 前失败。
         let base_url = env::var("ALPACA_PAPER_BASE_URL")
             .unwrap_or_else(|_| "https://paper-api.alpaca.markets".to_owned());
         let key_id = env::var("ALPACA_API_KEY")
@@ -300,6 +328,8 @@ impl AlpacaPaperEvidenceTransport {
         secret_key: impl Into<String>,
         market_data_feed: Option<AlpacaMarketDataFeed>,
     ) -> Result<Self, EvidenceAdapterError> {
+        // 严格限制 Paper base URL、非空凭据、禁止 redirect 和请求时限；market data URL
+        // 虽是独立 host，资源仍只能由 path_for 的 allowlist 生成。
         let supplied = base_url.into();
         if !matches!(
             supplied.trim(),
@@ -336,11 +366,15 @@ impl AlpacaPaperEvidenceTransport {
     }
 
     pub fn with_option_feed(mut self, feed: AlpacaOptionDataFeed) -> Self {
+        // builder 只改变显式期权数据 feed，不修改 equity feed 或其他采集策略。
         self.option_data_feed = feed;
         self
     }
 
     pub(super) fn path_for(resource: &str) -> Result<String, EvidenceAdapterError> {
+        // 将有限 GovernedResource 映射到固定 Alpaca endpoint/参数；日期、limit 和资产边界
+        // 由 runtime parser 约束，调用方不能传任意 URL。
+        // 前五个字面资源对应固定账户/时钟/全资产报价路径，不从请求文字拼接额外查询参数。
         match resource {
             "paper.account" => Ok("/v2/account".to_owned()),
             "paper.positions" => Ok("/v2/positions".to_owned()),
@@ -350,6 +384,7 @@ impl AlpacaPaperEvidenceTransport {
             "paper.clock" => Ok("/v2/clock".to_owned()),
             "paper.quotes" => Ok("/v2/stocks/quotes/latest?symbols=TQQQ,QQQ,SOXX,SOXL".to_owned()),
             value if value.starts_with("quote:") => {
+                // `Asset::try_from` 把字符串收窄到四个可执行资产；解析失败在 URL/I/O 前返回错误。
                 let asset = value.strip_prefix("quote:").unwrap_or_default();
                 let asset = Asset::try_from(asset).map_err(|_| {
                     EvidenceAdapterError::Transport(
@@ -359,6 +394,7 @@ impl AlpacaPaperEvidenceTransport {
                 Ok(format!("/v2/stocks/{}/quotes/latest", asset.symbol()))
             }
             value if value.starts_with("bars:") => {
+                // `let-else` 只接受解析结果中的 AlpacaBars 变体；其他合法资源也不能误走日线 endpoint。
                 let GovernedResource::AlpacaBars {
                     asset,
                     start,
@@ -387,6 +423,7 @@ impl AlpacaPaperEvidenceTransport {
                 Ok(path)
             }
             value if value.starts_with("corporate_actions:") => {
+                // 公司行动保留显式资产和日期窗口，日期范围与资源语法由 GovernedResource 再核验。
                 let GovernedResource::AlpacaCorporateActions { asset, start, end } =
                     GovernedResource::parse(EvidenceSource::Alpaca, value).map_err(|_| {
                         EvidenceAdapterError::Transport(
@@ -404,6 +441,7 @@ impl AlpacaPaperEvidenceTransport {
                 ))
             }
             value if value.starts_with("option_chain:") => {
+                // 期权链 endpoint 同样只接受解析出的资产/到期区间，不能把任意 options 路径透传给 provider。
                 let GovernedResource::AlpacaOptionChain {
                     asset,
                     expiration_start,
@@ -422,6 +460,7 @@ impl AlpacaPaperEvidenceTransport {
                 ))
             }
             value if value.starts_with("paper.fills:") => {
+                // fills 日期先按 YYYY-MM-DD 解析；provider path 只读取该 session 的成交活动。
                 let session_key = value.trim_start_matches("paper.fills:");
                 chrono::NaiveDate::parse_from_str(session_key, "%Y-%m-%d").map_err(|_| {
                     EvidenceAdapterError::Transport("invalid Paper fills session date".to_owned())
@@ -431,6 +470,8 @@ impl AlpacaPaperEvidenceTransport {
                 ))
             }
             value if value.starts_with("observer.qqq_history:") => {
+                // 历史观察只固定查询 QQQ，并将 1d/1w/1m/3m 映射到有限 bar timeframe；
+                // 多余分段或未知区间在构造 URL 前失败。
                 let mut parts = value.split(':');
                 let _ = parts.next();
                 let range = parts.next().ok_or_else(|| {
@@ -468,6 +509,7 @@ impl AlpacaPaperEvidenceTransport {
     }
 
     fn uses_market_data(resource: &str) -> bool {
+        // 判定请求应走 market-data host；Paper account/clock/fills 留在 Paper API host。
         resource == "paper.quotes"
             || resource.starts_with("quote:")
             || resource.starts_with("bars:")
@@ -477,6 +519,7 @@ impl AlpacaPaperEvidenceTransport {
     }
 
     fn uses_equity_feed(resource: &str) -> bool {
+        // 只有 equity quote/bars/history 资源附加 IEX/SIP feed，期权和 corporate actions 不复用。
         resource == "paper.quotes"
             || resource.starts_with("quote:")
             || resource.starts_with("bars:")
@@ -487,6 +530,7 @@ impl AlpacaPaperEvidenceTransport {
         &self,
         resource: &str,
     ) -> Result<String, EvidenceAdapterError> {
+        // 先取得 allowlisted path，再把配置 feed 追加到 query；配置值不参与路径拼接。
         let mut path = Self::path_for(resource)?;
         if Self::uses_equity_feed(resource) {
             if let Some(feed) = self.market_data_feed {
@@ -499,6 +543,7 @@ impl AlpacaPaperEvidenceTransport {
     }
 
     pub(super) fn base_url_for(&self, resource: &str) -> &str {
+        // 按资源选择固定 host，保持 Paper account 与 market-data 的 endpoint 边界。
         if Self::uses_market_data(resource) {
             &self.market_data_url
         } else {
@@ -511,6 +556,8 @@ impl AlpacaPaperEvidenceTransport {
         source: EvidenceSource,
         resource: &str,
     ) -> Result<AcquiredEvidence, EvidenceAdapterError> {
+        // 总入口按 execution clock/quotes、bars、options 和普通 Paper/market path 分派；每
+        // 个分支保留 provider 请求账本与对应时间，新闻不会被误路由到 Alpaca。
         if source != EvidenceSource::Alpaca {
             return Err(EvidenceAdapterError::SourceMismatch);
         }
@@ -606,6 +653,7 @@ impl AsyncEvidenceAdapter for AlpacaPaperEvidenceTransport {
         request: &'a EvidenceRequest,
         cutoff: DateTime<Utc>,
     ) -> BoxFuture<'a, Result<AcquiredEvidence, EvidenceAdapterError>> {
+        // 调用方冻结 cutoff 后进入 bars/session adapter；异步闭包只持有不可变 self/request。
         Box::pin(async move {
             if request.source != EvidenceSource::Alpaca {
                 return Err(EvidenceAdapterError::SourceMismatch);
@@ -624,6 +672,7 @@ impl AsyncEvidenceAdapter for AlpacaPaperEvidenceTransport {
         &'a self,
         request: &'a EvidenceRequest,
     ) -> BoxFuture<'a, Result<AcquiredEvidence, EvidenceAdapterError>> {
+        // 普通入口以当前 UTC 作为即时采集 cutoff；历史/回放路径使用 acquire_at。
         Box::pin(async move {
             if request.source != EvidenceSource::Alpaca {
                 return Err(EvidenceAdapterError::SourceMismatch);
@@ -659,6 +708,7 @@ pub(super) enum SourceDocumentFailureKind {
 
 impl SourceDocumentFailureKind {
     const fn as_str(self) -> &'static str {
+        // 统一 source fetch 失败到稳定字符串，供每来源 metadata 和 tracing 使用。
         match self {
             Self::Redirect => "redirect",
             Self::HttpStatus => "http_status",
@@ -679,6 +729,7 @@ pub(super) struct SourceDocumentFetchError {
 
 impl SourceDocumentFetchError {
     pub(super) fn new(kind: SourceDocumentFailureKind, message: impl Into<String>) -> Self {
+        // 构造没有 HTTP status 的传输/内容错误，保留具体 failure kind。
         Self {
             kind,
             message: message.into(),
@@ -691,6 +742,8 @@ impl SourceDocumentFetchError {
         status_code: u16,
         message: impl Into<String>,
     ) -> Self {
+        // 构造带 provider HTTP status 的失败，后续 source closure 可按 status 分类。
+        // 把 HTTP 状态保留为结构化 source fetch 错误，供 verified-source completeness 分桶。
         Self {
             kind,
             message: message.into(),
@@ -701,6 +754,7 @@ impl SourceDocumentFetchError {
 
 impl std::fmt::Display for SourceDocumentFetchError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Display 只输出已生成的诊断 message，不泄露原文或认证信息。
         formatter.write_str(&self.message)
     }
 }
@@ -722,6 +776,7 @@ struct HttpSourceDocumentFetcher {
 
 impl HttpSourceDocumentFetcher {
     fn new() -> Result<Self, EvidenceAdapterError> {
+        // 建立独立来源 snapshot client：禁止 redirect、限制连接/总时长并固定脱敏 User-Agent。
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(StdDuration::from_secs(10))
@@ -738,6 +793,8 @@ impl SourceDocumentFetcher for HttpSourceDocumentFetcher {
         &'a self,
         uri: &'a str,
     ) -> BoxFuture<'a, Result<SourceDocumentSnapshot, SourceDocumentFetchError>> {
+        // 对单个 policy-validated URI 执行 bounded GET，依次检查 redirect/status/media/body，
+        // 成功才返回不可变正文快照供 source materialization。
         Box::pin(async move {
             let response = self
                 .client
@@ -873,6 +930,8 @@ struct ProviderSearchIdentity {
 
 impl ProviderSearchIdentity {
     fn new(raw: &Value, request_body: &Value) -> Result<Self, EvidenceAdapterError> {
+        // 从 provider response/request 提取 action/source/payload identity；payload hash 只覆盖
+        // provider 结果，搜索发生与来源验证仍保持两个独立事实。
         let json_hash = |value: &Value| -> Result<String, EvidenceAdapterError> {
             let bytes = serde_json::to_vec(value)
                 .map_err(|error| EvidenceAdapterError::Transport(error.to_string()))?;
@@ -887,6 +946,7 @@ impl ProviderSearchIdentity {
     }
 
     fn provenance(&self) -> Value {
+        // 把搜索身份投影成不含凭据的持久化 metadata，供 discovery/reviewer 审计。
         serde_json::json!({
             "provider_response_id": self.response_id,
             "provider_request_hash": self.request_hash,
@@ -912,6 +972,8 @@ struct SourceDocumentResult {
 fn aggregate_sources_by_canonical_url(
     citations: &[NativeWebCitation],
 ) -> Result<Vec<AggregatedSource>, EvidenceAdapterError> {
+    // 先按 canonical URL 聚合 citation，required_source_count 按文档计数；不同业务 URL 不
+    // 因相似正文被猜测合并。
     let mut order = Vec::<AggregatedSource>::new();
     let mut index = BTreeMap::<String, usize>::new();
     for citation in citations {
@@ -948,6 +1010,8 @@ fn aggregate_sources_by_canonical_url(
 }
 
 fn canonical_source_url(uri: &str) -> Result<String, EvidenceAdapterError> {
+    // 这里只解析 URL 并去掉 fragment，再由 Url 重新序列化；不会移除 UTM 参数、
+    // 跟随 redirect 或推断不同路径/query 是同一业务来源。
     let mut parsed = reqwest::Url::parse(uri)
         .map_err(|error| EvidenceAdapterError::Transport(error.to_string()))?;
     parsed.set_fragment(None);
@@ -955,6 +1019,7 @@ fn canonical_source_url(uri: &str) -> Result<String, EvidenceAdapterError> {
 }
 
 fn source_snapshot_identity(canonical_url: &str, discriminator: &str) -> String {
+    // 以 canonical URL+discriminator 生成稳定 source identity，避免跨来源误去重。
     let mut identity = Vec::with_capacity(canonical_url.len() + discriminator.len() + 1);
     identity.extend_from_slice(canonical_url.as_bytes());
     identity.push(0);
@@ -970,6 +1035,8 @@ impl SourceMaterialization {
         snapshot_error: Option<String>,
         identity: &ProviderSearchIdentity,
     ) -> Result<Self, EvidenceAdapterError> {
+        // DiscoveryOnly/ModelReviewed 路径保留搜索响应和 citation，但明确标记 provider-attributed，
+        // 不声称独立 source snapshot 已验证。
         let required_source_count = aggregate_sources_by_canonical_url(citations)?.len();
         let citations = citations
             .iter()
@@ -1033,6 +1100,8 @@ impl SourceMaterialization {
         documents: Vec<SourceDocumentResult>,
         identity: &ProviderSearchIdentity,
     ) -> Result<Self, EvidenceAdapterError> {
+        // VerifiedSource 路径逐来源处理成功/失败：有效事实与失败项可同时保留，只有 citation、
+        // quote、hash 和 fetch closure 完整的文档才计入 verified_source_count。
         let source_count = documents.len();
         let mut raw = Vec::new();
         let mut citations = Vec::new();
@@ -1232,11 +1301,13 @@ impl SourceMaterialization {
 }
 
 fn binding_byte(binding: &Value, field: &str) -> Result<usize, EvidenceAdapterError> {
+    // 读取 claim/document binding 的非负 byte offset；缺失即拒绝精确引用。
     claim_binding_byte(binding, field)
         .ok_or_else(|| EvidenceAdapterError::Transport(format!("claim binding is missing {field}")))
 }
 
 fn merge_object(target: &mut Value, extra: Value) {
+    // 仅合并 JSON object metadata；调用方已保证 envelope 类型，其他值不改变现有 payload。
     let (Some(target), Some(extra)) = (target.as_object_mut(), extra.as_object()) else {
         return;
     };
@@ -1248,6 +1319,7 @@ fn merge_object(target: &mut Value, extra: Value) {
 /// Comma-joined failure kinds for telemetry only; the durable record keeps the
 /// per-source failure detail.
 fn fetch_failure_kinds(metadata: &Value) -> String {
+    // 为 tracing 汇总 source fetch failure kinds；逐来源失败细节仍保留在 metadata。
     metadata
         .get("sources")
         .and_then(Value::as_array)
@@ -1283,6 +1355,7 @@ impl ModelNativeWebEvidenceTransport {
         client: ModelClient,
         source: EvidenceSource,
     ) -> Result<Self, EvidenceAdapterError> {
+        // NewsWeb 才配置独立 source-document fetcher，SEC/FRED 不凭空添加不适用的抓取器。
         let source_document = (source == EvidenceSource::NewsWeb)
             .then(HttpSourceDocumentFetcher::new)
             .transpose()?
@@ -1295,6 +1368,8 @@ impl ModelNativeWebEvidenceTransport {
         source: EvidenceSource,
         source_document: Option<Arc<dyn SourceDocumentFetcher>>,
     ) -> Self {
+        // 按 source 选择允许 host 集合和固定 NativeWebPolicy；模型只能发受控搜索，不能自由
+        // HTTP/文件/SQL。
         Self {
             client,
             policy: NativeWebPolicy {
@@ -1343,9 +1418,14 @@ impl ModelNativeWebEvidenceTransport {
         resource: &str,
         acquisition_mode: EvidenceAcquisitionMode,
     ) -> Result<AcquiredEvidence, EvidenceAdapterError> {
+        // 一轮 required search→provider response/call/citation 校验→URI 安全→按 acquisition_mode
+        // 选择 provider-attributed 或 independent fetch→构造 provenance/quality；任何缺口保持
+        // 可诊断失败，不把模型文字直接当事实。
         if source == EvidenceSource::Alpaca {
             return Err(EvidenceAdapterError::SourceMismatch);
         }
+        // research_intent 与 WEB_GOVERNANCE 来自只读的 src/prompts.rs 运行时文本；
+        // 这里仅用已解析资源选择文本并构造请求，不在 adapter 内扩写或改变 Prompt ABI。
         let research_intent = crate::prompts::research_intent(source, resource)?;
         let request = ModelRequest {
             instructions: crate::prompts::WEB_GOVERNANCE.to_owned(),
@@ -1371,6 +1451,8 @@ impl ModelNativeWebEvidenceTransport {
         let response = self
             .client
             .respond(request)
+            // `respond` 先创建 Future；到这里 `.await` 才驱动当前异步任务等待 provider。
+            // 外层取消只能停止本地等待，不能据此断言远端没收到请求；此 adapter 不写 Store。
             .await
             .map_err(|error| model_error(error, source, resource))?;
         let provider_search_ms = search_started.elapsed().as_millis();
@@ -1541,6 +1623,8 @@ impl AsyncEvidenceAdapter for ModelNativeWebEvidenceTransport {
         &'a self,
         request: &'a EvidenceRequest,
     ) -> BoxFuture<'a, Result<AcquiredEvidence, EvidenceAdapterError>> {
+        // 先核对 request source，再把受控 acquisition_mode 传给 inner，不把 request 文本升级
+        // 成工具权限。
         Box::pin(async move {
             if request.source != self.source {
                 return Err(EvidenceAdapterError::SourceMismatch);
@@ -1564,6 +1648,8 @@ impl FixtureEvidenceAdapter {
         source: EvidenceSource,
         responses: impl IntoIterator<Item = (String, AcquiredEvidence)>,
     ) -> Self {
+        // fixture 只把显式 resource→AcquiredEvidence 放入内存 BTreeMap，无网络、文件或模型
+        // 能力；它用于离线拓扑/重放，不代表真实 provider 资格。
         Self {
             source,
             responses: responses.into_iter().collect(),
@@ -1577,6 +1663,7 @@ impl EvidenceAdapter for FixtureEvidenceAdapter {
     }
 
     fn acquire(&self, request: &EvidenceRequest) -> Result<AcquiredEvidence, EvidenceAdapterError> {
+        // source 必须匹配且 resource 必须显式存在；缺 fixture 不返回默认空值。
         if request.source != self.source {
             return Err(EvidenceAdapterError::SourceMismatch);
         }
@@ -1596,6 +1683,7 @@ impl AsyncEvidenceAdapter for FixtureEvidenceAdapter {
         &'a self,
         request: &'a EvidenceRequest,
     ) -> BoxFuture<'a, Result<AcquiredEvidence, EvidenceAdapterError>> {
+        // async move 只包装无 I/O 的同一 lookup 语义，保持同步/异步 fixture 一致。
         Box::pin(async move {
             if request.source != self.source {
                 return Err(EvidenceAdapterError::SourceMismatch);
@@ -1626,6 +1714,7 @@ mod alpaca_redirect_tests {
 
     #[tokio::test]
     async fn production_evidence_client_rejects_redirect_before_second_request() {
+        // 生产 Alpaca evidence client 不跟随 redirect，避免 credentials/body 到达未知 host。
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let requests = Arc::new(AtomicUsize::new(0));
@@ -1677,6 +1766,7 @@ mod native_web_error_tests {
 
     #[test]
     fn native_web_failures_keep_their_diagnostic_class() {
+        // 错误分类必须保留“无 citation”和“URI 不安全”等不同根因。
         let error = model_error(
             ModelError::NativeWebCitationsMissing,
             EvidenceSource::NewsWeb,
@@ -1710,6 +1800,7 @@ mod native_web_error_tests {
 
     #[test]
     fn provider_response_shape_distinguishes_not_called_from_no_sources() {
+        // output 无 web_search_call 与有 search call 但无 sources 是两个不同的审计事实。
         assert_eq!(
             native_web_failure_kind_for_response(
                 &serde_json::json!({"output": []}),
@@ -1733,6 +1824,7 @@ mod alpaca_news_tests {
 
     #[test]
     fn alpaca_resource_surface_does_not_claim_to_support_news() {
+        // Alpaca allowlist 不应把新闻资源伪装成市场数据成功。
         let resource = "news:QQQ:2026-09-01:2026-09-15:market";
         assert!(GovernedResource::parse(EvidenceSource::Alpaca, resource).is_err());
 
@@ -1747,6 +1839,8 @@ mod alpaca_news_tests {
     #[tokio::test]
     #[ignore = "requires ALPACA_API_KEY/ALPACA_API_SECRET and live network access"]
     async fn live_alpaca_news_endpoint_returns_a_news_array() {
+        // ignored live contract test 只检查 provider news wire shape，不改变 adapter allowlist，
+        // 也不构成研究/交易验收。
         let key = std::env::var("ALPACA_API_KEY").expect("ALPACA_API_KEY is configured");
         let secret = std::env::var("ALPACA_API_SECRET").expect("ALPACA_API_SECRET is configured");
         let response = Client::new()

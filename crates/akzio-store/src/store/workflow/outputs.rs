@@ -1,4 +1,9 @@
+// 文件导读：Task 完成、过期恢复和 committed outputs 都通过 permit/attempt 校验；
+// 只有成功 Attempt 的正式输出进入 rebuild_attempt_outputs，普通事件不会自动成为输出。
+// finish/recover 负责状态机写入，committed_* 负责从成功索引只读重建；两类入口共享同一 Store 表，
+// 但读取结果不会重新激活或改写 Attempt。
 impl Store {
+    // 只接受 terminal TaskStatus；在 Immediate 事务内复核 permit、读取冻结 on_failure 并收束 Task/Attempt。
     pub fn finish_task(
         &self,
         permit: &TaskWritePermit,
@@ -17,6 +22,8 @@ impl Store {
         Ok(())
     }
 
+    // 用 now 选 lease_until<now 的 running Task；单个 Immediate 事务内逐项检查 workflow 可执行、
+    // Run cancellation 和 durable retry budget，再恢复 queued 或终止失败。返回数是扫描出的过期行数。
     pub fn recover_expired_tasks(&self, now: DateTime<Utc>) -> StoreResult<u64> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -43,6 +50,7 @@ impl Store {
         };
         for (_, run_id, _, _, _, _) in &expired { assert_workflow_executable(&transaction, run_id)?; }
         for (task_id, run_id, attempt_id, lease_id, epoch, contract_hash) in &expired {
+            // 从 SQL 行重建旧 permit；取消 Run 时直接收束 Cancelled，否则依 Task policy 决定 abandon/retry 或 fail。
             let permit = TaskWritePermit {
                 run_id: run_id.clone(),
                 task_id: task_id.clone(),
@@ -73,6 +81,7 @@ impl Store {
             }
             let attempts = task_failure_attempt_count(&transaction, task_id)?;
             if attempts < u64::from(retry.max_attempts) {
+                // 未耗尽时释放当前 owner/lease，标记 Attempt abandoned 并记录 TaskRecovered。
                 transaction.execute(
                     r#"UPDATE rebuild_tasks
                        SET status = 'queued', lease_id = NULL, active_attempt_id = NULL,
@@ -95,6 +104,7 @@ impl Store {
                 )?;
                 debug::settle_attempt(&transaction, &permit, "abandoned_for_recovery", now)?;
             } else {
+                // 耗尽时写 recovery_exhausted event，再按冻结 on_failure 收束终态并传播影响。
                 append_event(
                     &transaction,
                     run_id,
@@ -118,9 +128,9 @@ impl Store {
         Ok(expired.len() as u64)
     }
 
-    /// Returns final artifacts for the only succeeded attempt of an exact task
-    /// in an exact run. Intermediate Agent/Tool artifacts are deliberately
-    /// absent: only the atomic completion surface records attempt outputs.
+    /// 返回精确 Run/Task 下按完成时间倒序选中的成功 Attempt 正式产物；
+    /// 中途的 Agent/Tool Artifact 不在成功输出索引中，不能仅凭事件引用当作任务结果。
+    // 按 run+task 选择最新 succeeded Attempt，再由 helper 校验 event/index/Artifact 三者对应。
     pub fn committed_task_outputs(
         &self,
         run_id: &RunId,
@@ -149,12 +159,10 @@ impl Store {
         read_committed_attempt_outputs(&connection, Some(run_id), task_id, &AttemptId(attempt_id))
     }
 
-    /// Returns final artifacts for one exact succeeded task attempt. This is
-    /// intentionally stricter than an event-log query so callers cannot feed
-    /// an AgentTurn, ToolCall, or failed-attempt artifact into another task.
     /// As [`Self::committed_task_outputs`], but permits an explicitly
     /// successful no-output gate. The task/attempt still had to reach durable
     /// `succeeded`; callers must never use this for arbitrary running work.
+    // 仅把 CommittedOutputAttempt 这个“成功 gate 无 output”形状转换为空 Vec；其它存储/完整性错误继续传播。
     pub fn succeeded_task_outputs_or_empty(
         &self,
         run_id: &RunId,
@@ -172,6 +180,7 @@ impl Store {
         task_id: &TaskId,
         attempt_id: &AttemptId,
     ) -> StoreResult<Vec<Artifact>> {
+        // 输入 task_id/attempt_id 必须精确命中成功关系；expected_run_id=None 只省略额外 Run 对照。
         let connection = self.connection()?;
         read_committed_attempt_outputs(&connection, None, task_id, attempt_id)
     }

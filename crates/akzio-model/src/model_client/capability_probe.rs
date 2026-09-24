@@ -1,3 +1,7 @@
+// 文件导读：能力探测为默认模型 route 和每个命名 route 分别发起受限 Responses 往返，
+// 检查 required function、无状态 continuation 与独立 native-web 行为。硬性 function/
+// continuation 失败向上传播；web 失败收敛为带脱敏审计的状态。此文件只在显式调用时
+// 创建模型请求，不授予工具或研究权限；固定探测文本来自只读 probe_prompts.rs。
 const CAPABILITY_PROBE_TOOL: &str = "akzio_capability_probe";
 const CAPABILITY_PROBE_COMPLETE_TOOL: &str = "akzio_capability_probe_complete";
 const CAPABILITY_PROBE_SOURCE: &str = "runtime_function_tool_stateless_continuation_probe_v1";
@@ -6,6 +10,8 @@ const NATIVE_WEB_PROBE_SOURCE: &str = "native_web_required_search_probe_v2";
 pub async fn probe_configured_model_capabilities(
     config: &OpenAIResponsesConfig,
 ) -> Result<ModelCapabilityProbeSet> {
+    // 默认 route 完成后逐个探测命名 route，不借用别的 route 的结果；
+    // function/continuation 的硬错误经 ? 返回，web 探测失败则记入状态快照。
     // 默认 route 与每个 purpose route 都独立建 client、独立探测；只有全部快照
     // 与当前配置的模型和 reasoning_effort 对齐后，才返回可供上层使用的集合。
     let default = ModelClient::from_config(config)?
@@ -54,8 +60,9 @@ impl ModelClient {
     pub async fn probe_capabilities_audited(
         &self,
     ) -> Result<(ModelCapabilitySnapshot, Vec<Value>)> {
-        // audited 结果包含 provider 请求/响应的脱敏摘要，因此只允许真实 provider
-        // 产生；fixture 没有可证明的外部请求，直接拒绝而不是补造审计记录。
+        // audited 结果排除 auth headers、完整 raw 和 continuation，但包含模型
+        // tool_calls/identity；不是任意文本的通用脱敏器。fixture 没有外部请求，
+        // 因此拒绝为其补造 provider 审计。
         match self {
             Self::OpenAIResponses(client) => {
                 probe_openai_responses_capabilities_audited(client).await
@@ -70,6 +77,8 @@ impl ModelClient {
 async fn probe_openai_responses_capabilities_audited(
     client: &OpenAIResponsesClient,
 ) -> Result<(ModelCapabilitySnapshot, Vec<Value>)> {
+    // 前两次 respond 的错误会短路整个 function/continuation 探测；native web 则在
+    // 后面被折叠成状态快照，故 hosted web 失败不会抹掉已经通过的函数能力证据。
     // 两次 required function call 验证工具调用与无状态续传；随后另做一次 required
     // native web probe。所有请求都经过同一个无状态 Responses adapter。
     let started = std::time::Instant::now();
@@ -163,6 +172,8 @@ async fn probe_openai_responses_capabilities_audited(
 async fn probe_native_web_tool(
     client: &OpenAIResponsesClient,
 ) -> (bool, bool, NativeWebCapabilityStatus, Option<Value>) {
+    // 这个函数刻意不返回 Result：web 探测的 transport、HTTP、解析和来源错误都转为
+    // 可审计的 status；只有函数探测和无状态续传的硬失败才由上层 Result 传播。
     // 使用 Required 而非 Auto，确保“未调用”与“模型选择不搜索”可区分；验证同时
     // 要求 hosted action 和可提取、可 allowlist 校验的 citation。
     let policy = NativeWebPolicy::default();
@@ -229,8 +240,9 @@ async fn probe_native_web_tool(
 }
 
 fn native_web_failure_status(raw: Option<&Value>, error: &ModelError) -> NativeWebCapabilityStatus {
-    // 若已有 raw response，优先按实际 hosted web_call 轨迹区分未调用、无来源和
-    // 来源校验问题；没有 raw 时再按 HTTP/transport/adapter 错误分类。
+    // 错误诊断优先观察 hosted web_call；这里的 search/action.sources 启发式
+    // 可能把包含 open_page/find_in_page 或 URL annotation 的失败路径归入
+    // 无来源，不能据此断言来源不存在。成功仍以完整 action/citation 校验为准。
     if let Some(raw) = raw {
         let calls = raw
             .get("output")
@@ -388,6 +400,8 @@ fn capability_probe_request(tool_name: &str, input: ModelInput) -> ModelRequest 
 }
 
 fn continuation_observations(items: &[Value]) -> (Option<bool>, Option<bool>) {
+    // items 是上一轮响应返回的 transcript 借用；观察函数只读它，不修改或重新请求，
+    // 因而无法凭空补出 reasoning/encrypted continuation 能力。
     // 从 provider 返回的 transcript 中观察 reasoning item；没有该 item 时保持未知，
     // 不把“未返回”误判成明确不支持。
     let reasoning = items
@@ -408,7 +422,8 @@ fn continuation_observations(items: &[Value]) -> (Option<bool>, Option<bool>) {
 }
 
 fn capability_response_audit(response: &ModelResponse, elapsed: std::time::Duration) -> Value {
-    // 记录请求/响应身份、usage、延迟和工具声明，故意不放入完整 raw response。
+    // 记录请求/响应身份、usage、延迟和工具调用，不放完整 raw/continuation。
+    // tool_calls 是 provider 内容而非已验证安全文本，导出仍须受日志权限约束。
     json!({
         "provider": OPENAI_RESPONSES_PROVIDER_ID,
         "requested_model": response.request_body.get("model"),

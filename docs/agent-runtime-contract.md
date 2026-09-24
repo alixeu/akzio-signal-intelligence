@@ -14,23 +14,23 @@
 
 新指导仅压缩重复说明，保留全部必需字段、事实、数值和引用；沿用 Contract 49 引入的输出预算及单请求上限，不扩大任何资源额度。已冻结的 Contract 49 与更早版本保留原指导、预算和哈希；未完成旧任务及有效 lease 仍通过原升级机制阻断切换。
 
-新输出显式声明 EvidenceGap.retriable；可重查的阻断缺口必须携带受控请求。一次补采及最多一次 Analyst 重跑的额度跨恢复保持；第二次仍无事实时保留缺口。既有冻结 Contract、CAS 和哈希不变，未完成任务继续阻断升级。真实 PositionPlan 启动前由 Rust 预检 policy；已安装 policy 必须严格匹配当前模型及 Synthesizer Contract。缺 active policy 时的显式 research-only 边界见下文。
+新输出显式声明 EvidenceGap.retriable；可重查的阻断缺口必须携带受控请求。一次补采及最多一次 Analyst 重跑的额度跨恢复保持；第二次仍无事实时保留缺口。既有冻结 Contract、CAS 和哈希不变，未完成任务继续阻断升级。隔离 Debug PositionPlan 启动前由 Rust 预检 policy；正式 Core 缺 active policy 时按默认 fail-closed Policy 完成 Decision，已安装 policy 仍须严格匹配当前模型及 Synthesizer Contract。
 
 Alpaca 股票研究捕获先核验资产，保留市场时钟、交易日历、显式 IEX/SIP 请求、snapshot/quote/trade 及各自时间戳；收盘日线沿用交易所 Session close + 20 分钟可用性规则。期权捕获默认显式 indicative，不自动切换 OPRA；到期范围最多 30 天、行权价为截止前标的成交价（或完整日线）的 90%-110%、最多 4 页及 512 合约，缺 quote 时最多 6 次、每次 100 合约批量请求；明确权限拒绝后停止补采。按 OCC 合并 contracts 的 dated open interest；缺失保持 unknown。IV/Greeks 没有独立 provider 时间戳时明确为 unknown，不能借用 quote/retrieval 时间。覆盖率和截断状态随 NormalizedEvidence 投影保留；原始请求账本随 RawEvidence 保存。休市旧数据不标为实时。
 
 新 PositionPlan 的 Analyst/Critic/Synthesizer 直接提交结构化 result + deliberation，Rust 校验后持久化；没有 Draft 或第二次格式化模型调用。其他 purpose 与旧冻结 Contract 保留原阶段协议。新的方向资格由同一个 Claim 的正式 price/macro grounds、精确资产/期限、对应 Critique 对这两类 grounds 的当前权威核验和无 slot blocker 共同决定；Context matrix、Submit 与 DecisionGate 共用该规则。Critic 新 evidence 和 deliberation 不能补齐 Claim。模型不填写 expiry/holding period，Rust 从四资产共同的 Alpaca 计划交易日历计算；日历元数据不构成未来价格事实。原 12 forecasts、allocation 守恒、引用闭包仍强制校验。阶段审计记录 provider、parse_validate、persist_stage 耗时，含 structured/draft/submit 标识及 revision。结构化修复显式记录原始调用引用、前后 result 哈希和差异路径；仅修复 deliberation 时切换为只含 deliberation 的修复 Schema，缩减为该元数据和校验错误上下文；Rust 从原始 AgentTurn 冻结并复用 result，模型不能再次提交 result。越权重写 result 会直接拒绝。恢复核对完整提交和元数据修复的各自工具哈希，累计预算保持不变。
 
-PositionPlan 启动器默认要求 decision_capable；缺 active policy 时在启动 Core/LLM 前 fail-fast。显式 `--research-only` 无论 Policy 是否就绪都只逐步执行 Evidence → 首轮 Analyst/Critic → 受控补采与受影响期限重跑 → Synthesizer/ProposalReviewer，Decision 保持未运行。Rust 禁止该缺 policy 的真实 Debug session resume 或 step Decision。不得伪造或自动激活校准 policy；Broker 仍 forbidden。`--keep-artifacts` 可保留隔离 Store 以复核原始 provenance，ZIP 不含 Store、配置或密钥。
+正式运行脚本只连接已启动的 canonical Core，调用 `POST /runs` 创建 PositionPlan/Paper。首次缺 active policy 的 PositionPlan 仍由 Rust DecisionGate 校验研究提案，保留合格 `research_plan.validated`，正式目标强制为零；它在 Decision 后结束，没有 Outcome。Paper 冷启动另走原 NoOrder 与 OutcomeSchedule 路径，不由 PositionPlan 自动切换。隔离 Debug Session 缺 Policy 时仍只允许手动推进研究，Rust 禁止其 resume 或 step Decision；原脚本 `--research-only` 入口已移除。不得伪造或自动激活校准 policy。脚本的 `--keep-artifacts` 仅保留本地报告，不创建或保留隔离 Store，ZIP 不含 Store、配置或密钥。
 
 共享治理与 Analyst/Critic/Synthesizer 正文不再规定阶段，实际请求构建器按 Contract 与角色选择研究单次结构化协议或 Outcome 两阶段协议；旧冻结正文、CAS 与 Contract 不重写，原升级阻断继续生效。Context 对 Invesco JSON holdings 也应用精确权重排序和 12 行投影；期权保留完整聚合、时间与覆盖字段，样例缩为前两项并记录省略数。相同任务的 Retry/Recovery 只复用精确来源、相同 Contract 和相同内容的历史期权投影，仍签发当前 Attempt 的新 ReadGrant，不放宽恢复身份校验。研究角色的 Context 描述明确没有读取工具。
 
-Debug bundle v2 支持经过同一脱敏器处理的 UTF-8 文本和完整 NDJSON 记录；无权限时不导出 RawEvidence 内的 provider 明细。搜索审计从已持久化的 discovery/reviewer provider 响应提取 action/source，不从文章、摘要或模型自述推断；缺失审计显示 unknown/null，搜索发生与来源核验仍是不同事实。研究不完整与导出完整性独立记录；DecisionPolicy 缺失仍不运行 PositionPlan Decision。
+分享安全 bundle 支持经过同一脱敏器处理的 UTF-8 文本和完整 NDJSON 记录；无权限时不导出 RawEvidence 内的 provider 明细。搜索审计从已持久化的 discovery/reviewer provider 响应提取 action/source，不从文章、摘要或模型自述推断；缺失审计显示 unknown/null，搜索发生与来源核验仍是不同事实。研究不完整与导出完整性独立记录；缺 Policy 的隔离 Debug PositionPlan 不运行 Decision，正式 PositionPlan 则以零目标完成 fail-closed Decision。
 
 新 PositionPlan 的 Claim/Critique wire grounds Schema 按 Rust 读取的 Manifest 证据资产范围绑定 anyOf 分支，单资产新闻不能同时声明另一资产；共享宏观仍可声明其合法多资产范围。按相同 scope 合并 ID，避免逐文档展开 Schema。Rust 在恢复 kind 和执行原业务校验前也验证同一个 bound wire Schema，不能仅依赖 provider。新 Run 的 Analyst/Critic 默认 Attempt 时限由 120s 调整为 180s，Synthesizer 保持 180s；原冻结 Contract/Run 的序列化预算不改，累计调用用量与未知用量阻断继续生效。
 
 当前研究发布使用 Contract 69 / Prompt bundle 38（freshness candidate 70）；Outcome 保持 Contract 63 / Prompt bundle 35。新研究提交对未 source-verified 的 news 仅接受描述性 ground，不接受其 supporting_ref；source scope 和 citation 完整性不再代替来源验证。补采建议在提交时校验类型化业务意图，Rust 再绑定冻结资源和时间窗口，并使用与 adapter 相同的 GovernedResource 解析器。旧 CAS/Contract 不重写，未完成任务的升级阻断保留。
 
-新闻复核仅规范化已列明的 utm 跟踪参数，不推断重定向或合并不同业务 URL；逐事实验证并记录 URL 绑定与失败原因，有效事实与失败项可同时保留，model_reviewed 不升级为 source_verified。Context 在必需闭包之后优先覆盖价格、新闻、宏观和事件日历，再分配期权背景；24 项及字节预算不扩张。无读取工具的 PositionPlan 投影明确原文未开放。缺失 Policy 的真实 PositionPlan inspect 和控制入口复用冻结 Session 判定；仍不执行 Decision。
+新闻复核仅规范化已列明的 utm 跟踪参数，不推断重定向或合并不同业务 URL；逐事实验证并记录 URL 绑定与失败原因，有效事实与失败项可同时保留，model_reviewed 不升级为 source_verified。Context 在必需闭包之后优先覆盖价格、新闻、宏观和事件日历，再分配期权背景；24 项及字节预算不扩张。无读取工具的 PositionPlan 投影明确原文未开放。缺失 Policy 的隔离 Debug PositionPlan inspect 和控制入口复用冻结 Session 判定，仍不执行 Decision；正式 PositionPlan 不使用该 Debug 控制。
 
 导出将研究 AgentTurn、采集 provider 响应、hosted web 操作、含 action.sources 的操作以及来源复核失败分别计数。reasoning effort 优先读取 telemetry，否则读取已保存的实际 provider request；未保存不推断。上下文导出列出本包内未选中的证据，不将其解释为在当时 cutoff 已可用。数值依据是模型估计说明，不代表 Critic 已审查具体数值或 Policy 已校准。
 
@@ -182,7 +182,7 @@ DecisionProposal (LLM: Forecast + research_allocation)
 1. **DecisionGate 默认 Fail-Closed**：
    - 若 Store 没有已激活且通过验证的 `DecisionPolicy`，Rust 默认校准样本为零，**目标组合头寸强制为 0**。canonical Store 数据库不存在时由 Rust Store 初始化 schema，初始化不会生成或激活 policy；已有 canonical Store 在 PositionPlan 引导阶段只读打开。运行时只读取 SQL Store 中的 CAS Artifact、激活历史和 active head；旧文件路径兼容字段与 JSON 文件导入链路已移除。operator 将风险限制写入 SQL，collect 从 canonical Outcome 生成 SQL dataset，build 生成 SQL 候选 policy；inspect、validate、activate 均按 Store Artifact ID 操作，生成候选不会自动更新 active head。
    - 这只阻断执行侧 `Decision.targets`；有合格证据的非零 `research_plan.validated` 必须保留，并明确 `execution_status=blocked` 或 PositionPlan 的 `not_applicable`，不得冒充可执行目标。
-   - 校准 `collect` 只接受非隔离 canonical Store 的真实 Decision/Outcome，并要求有效 Synthesizer 模型的发布日期、知识截止日期及显式风险限制。readiness 的 Store 资格与成熟度不代表候选存在或可激活；隔离 Debug（含原生 Paper）的运行报告 `isolated_debug_store`，不计入成熟样本。等待、复制或修改 purpose 不能赋予隔离运行或历史模拟数据正式校准资格。
+   - 校准 `collect` 只接受非隔离 canonical Store 的真实 Paper Decision/Outcome，并要求有效 Synthesizer 模型的发布日期、知识截止日期及显式风险限制。readiness 的 Store 资格与成熟度不代表候选存在或可激活；隔离 Debug 的运行报告 `isolated_debug_store`，不计入成熟样本。等待、复制或修改 purpose 不能赋予隔离运行或历史模拟数据正式校准资格。
    - 只有通过原审批和所有 ExecutionGate blocker 检查后才进入 Allocator：当前为空仓时产生 `NoExecutableOrder`，已有多头仓位时才可能生成归零卖单；缺 approval 的冷启动不进入 Allocator，也不会触发清仓。
 2. **ExecutionGate 与幂等 Commitment**：
    - 正式 scheduler 在 SQL 没有 active policy 时创建不绑定 approval 的 canonical Paper run，以积累未来真实校准标签；已有 active policy 时仍要求原审批。未校准 Paper 冷启动没有 approval 时，pre-trade safety 返回无评估，不作安全断言，也不以缺 manifest 抛错阻断 verdict。原 `UnqualifiedRuntime` blocker 保留，跳过 allocation/plan closure，形成持久化 `NoOrder`；PaperCommit/Reconcile 在获取执行 lease 或访问 Broker 前短路。Evaluate 仍可生成 `OutcomeExecutionLineage::NoOrder` 的 OutcomeSchedule，无需 ExecutionCommitment。此语义不扩张任何执行权限；真实密封仍要求完整 baseline 与四资产共同完成的真实 T+1/T+3/T+5 Session，policy 必须由 operator 显式 inspect、validate、activate。
@@ -239,8 +239,8 @@ DecisionProposal (LLM: Forecast + research_allocation)
 - Store 16 增加 Debug 控制表及 RunScoped DebugRecord CAS 类型；Store 17 增加 DecisionPolicy 安装、激活链和 active head。升级前必须停止旧 worker；旧 running task 或有效 daemon lease 会阻断升级。原 Contract、CAS、Commitment 不重写。
 - Store 18 将 Debug 控制迁入唯一共享 RunControl head，增加结构化 NodeSpec 与 RunScoped RuntimeCheckpoint。queued/leased/running 任务与有效 daemon lease 继续阻断升级；历史 CAS 不回写。图预览、运行检查和恢复边界见 [Workflow Runtime](workflow-runtime.md)。
 - Broker 写入默认 forbidden，在 Reconcile、Dispatch 和 Store effect intent 边界强制阻断；paper_allowed 仍需原审批和全部业务 Gate。
-- `--paper` 使用正式 Paper 图与真实 Alpaca Paper API；旧 `-fakerOnline` / `--faker-online` 及本地模拟 Broker 已删除，历史 `simulated_only` 身份仅保留解码，禁止新执行。原始 `clock.is_open` 不改写，TradingSession 根据 Alpaca Clock、交易日历和美东时间确定；PreMarket / AfterHours / Overnight 发送 `limit + day + extended_hours=true`，Overnight 使用 BOATS 或 overnight 行情并检查当前资产资格。Policy、审批、风险、行情新鲜度与 Commitment 检查不放宽。
-- Closed 时仅延期执行任务；恢复后重新获取 Account / Quote / Clock 并重跑 ExecutionGate，Decision 过期不允许补单。`accepted/new/partially_filled` 持久化为待成交进度，短轮询结束仍可后续 Reconcile；扩展时段不触发 Regular 的 60 秒撤改单逻辑。提交授权在时段边界到期，已提交订单的只读对账继续可用。启动器关闭 auto_paper、启用 Outcome worker 并保留隔离 Store；流程完成至 OutcomeSchedule 不代表成交或跨交易日评估完成。
+- 启动器的 `--mode paper` 使用正式 Paper 图与真实 Alpaca Paper API；旧 `-fakerOnline` / `--faker-online` 及本地模拟 Broker 已删除，历史 `simulated_only` 身份仅保留解码，禁止新执行。原始 `clock.is_open` 不改写，TradingSession 根据 Alpaca Clock、交易日历和美东时间确定；PreMarket / AfterHours / Overnight 发送 `limit + day + extended_hours=true`，Overnight 使用 BOATS 或 overnight 行情并检查当前资产资格。Policy、审批、风险、行情新鲜度与 Commitment 检查不放宽。
+- Closed 时仅延期执行任务；恢复后重新获取 Account / Quote / Clock 并重跑 ExecutionGate，Decision 过期不允许补单。`accepted/new/partially_filled` 持久化为待成交进度，短轮询结束仍可后续 Reconcile；扩展时段不触发 Regular 的 60 秒撤改单逻辑。提交授权在时段边界到期，已提交订单的只读对账继续可用。正式运行脚本不管理 Core 生命周期或修改 auto_paper/Outcome 配置；流程完成至 OutcomeSchedule 不代表成交或跨交易日评估完成。
 - Outcome processing 独立于新 T0 调度，仍保留 Paper purpose 与原跨交易日算法。隔离 Debug 不写 canonical policy/Active Lesson。
 - Debug Store 放在 `.akzio/` 内，避免 App 打包清理 `target/` 时丢失 checkpoint。打包验证默认保留构建产物并使用新 Bundle 路径，具体规则见 [开发 Workflow](development-workflow.md)。
 - 控制命令、恢复与限制见 [分流程 Debug 基础设施](debug-control.md)。Fixture 控制器结果不能作为真实模型或 Paper 业务验收。

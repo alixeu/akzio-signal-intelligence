@@ -1,3 +1,11 @@
+// 文件导读：本文件把配置、源码、模型能力、Contract/Prompt/拓扑、Policy 和治理规则
+// 汇总为可审计的 RuntimeIdentity，并从 SQL Store 的 CAS active head 读取 DecisionPolicy。
+// 这里的身份/哈希只描述运行输入和授权匹配条件；它不是 Paper approval、Decision、
+// ExecutionVerdict、Paper submission、fill 或 Outcome 的证明。
+// Rust 机制：`&Config`/`&Store` 借用而不转移所有权；借用本身不保证纯读取，
+// Store::open 和配置写入函数仍有副作用。`Option` 区分缺失 active head 与真实值，
+// serde/`Result` 把哈希计算、日期解析与文件错误逐层传播。
+
 use akzio_execution::DecisionPolicyArtifact;
 
 fn configured_synthesizer_identity(model: &OpenAIResponsesConfig) -> Result<(String, ContentHash)> {
@@ -32,8 +40,9 @@ struct LoadedDecisionPolicy {
 fn load_decision_policy_from_config(
     config: &Config,
 ) -> Result<LoadedDecisionPolicy> {
-    // 配置只提供 Store Root；Policy 正文和 active head 仍由统一 Store 读取，
-    // 不再从外部 JSON 或旧 decision_policy_path 导入。
+    // 配置只提供 Store Root；Policy 正文和 active head 从统一 Store 读取，
+    // 不再从外部 JSON 导入。注意 Store::open 是可写打开：若库不存在可能初始化，
+    // 已有库也可能触发合法迁移，因此调用此函数不是纯只读预检。
     let store = Store::open(&config.daemon.store_root)?;
     load_decision_policy_from_store(config, &store)
 }
@@ -373,6 +382,8 @@ fn toml_section_mut<'a>(
     document: &'a mut toml::Value,
     name: &str,
 ) -> Result<&'a mut toml::map::Map<String, toml::Value>> {
+    // 返回值的 `'a` 与 document 的可变借用相同：调用方取得 table 借用期间不能再次
+    // 可变借用整棵 TOML 树，因此同一段配置更新不会互相覆盖。
     // 获取或创建指定顶层 TOML table；若现有值不是 table，立即报错而不覆盖用户配置。
     let root = document
         .as_table_mut()
@@ -529,6 +540,8 @@ fn load_config(path: &Path) -> Result<Config> {
         .context("invalid agent.budget configuration")?;
     config.agent.research.validate().context("invalid agent.research configuration")?;
     resolve_model_configuration(&mut config)?;
+    // 凭据占位符在此解析并写入当前进程环境，后续 Alpaca/FRED adapter 从环境读取；
+    // 这些值不回写配置，也不能通过解析成功视为已完成 provider 授权。
     for (name, value) in [("ALPACA_API_KEY", &config.credentials.alpaca_api_key),
         ("ALPACA_API_SECRET", &config.credentials.alpaca_api_secret)] {
         if !value.is_empty() { std::env::set_var(name, resolve_env_placeholder(value, name)?); }
@@ -550,6 +563,7 @@ fn load_config(path: &Path) -> Result<Config> {
     }
 
     let expected = Asset::EXECUTABLE.into_iter().collect::<BTreeSet<_>>();
+    // 先用集合检查唯一资产集合，再比较原向量长度，以同时拒绝缺资产和重复资产。
     let actual = config
         .execution
         .assets
@@ -569,6 +583,8 @@ fn load_config(path: &Path) -> Result<Config> {
     let zero_cost =
         config.execution.transaction_cost_ppm == 0 && config.execution.slippage_ppm == 0;
 
+    // 下面按“是否启动 Paper scheduler”和 profile 分层校验；fixture 可保持零成本，
+    // 研究/历史 profile 则必须声明正成本，并由具体 profile 继续约束 feed、模型日期与条件。
     if auto_paper
         && config.execution.transaction_cost_ppm == 0
         && config.execution.slippage_ppm == 0
@@ -660,6 +676,8 @@ fn load_config(path: &Path) -> Result<Config> {
 #[cfg(test)]
 mod agent_budget_config_tests {
 
+    // 通过 TOML 反序列化验证 revisions 默认是 2、显式 0..=5 有效，以及非法值
+    // 在解析或 validate 时被拒绝；测试名的 default_zero 是旧称，不能据此推断现值。
     #[test]
     fn proposal_revision_toml_default_zero_and_invalid_values() {
         let absent: akzio_domain::AgentSettings = toml::from_str("").unwrap();
@@ -673,6 +691,7 @@ mod agent_budget_config_tests {
         }
     }
 
+    // 检查默认角色预算、全局覆盖与 Analyst 专属覆盖如何逐层合并；不创建模型请求。
     #[test]
     fn budget_toml_defaults_role_override_and_million_input() {
         let absent: akzio_domain::AgentSettings = toml::from_str("").unwrap();
@@ -755,6 +774,7 @@ timeout_seconds = 180
         assert_eq!(critic.max_wall_time_secs, 180);
     }
 
+    // 验证工具调用数既可设为有限整数，也可由字符串表达为 unlimited；0 是合法的禁用值。
     #[test]
     fn role_can_select_unlimited_or_a_finite_tool_limit() {
         use akzio_domain::budget::ToolCallLimit;
@@ -807,6 +827,7 @@ max_tool_calls = "unlimited"
         );
     }
 
+    // 错误类型/越界值必须在配置解析或 validate 阶段失败，防止不完整预算进入 daemon。
     #[test]
     fn invalid_agent_budgets_fail_before_startup() {
         for entry in [

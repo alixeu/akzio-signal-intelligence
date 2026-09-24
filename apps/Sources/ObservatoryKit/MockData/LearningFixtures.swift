@@ -1,10 +1,15 @@
 import Foundation
 
+// 文件导读：把场景化 Outcome/学习状态转换成回顾卡、时间线、政策轨道和影响摘要；
+// ScenarioLibrary.build 调用 learning，子函数再复用 CurveFixtures 与冻结快照日期。
+// 只有场景标记为 canonical Paper 且列出封存 horizon 时才出现回顾卡；这些仍是教学/截图 fixture，不是 Store Outcome。
+// 先读 cards、policyTracks、impact 与 sessionDate：它们展示 Optional 缺失传播、闭包共享 seed 和“工作日”样例日历边界。
 // MARK: - Learning fixtures
 //
 // Retrospectives are outcome-backed: a scenario with no sealed horizon has none.
 enum LearningFixtures {
     static func cards(scenario: MockScenario) -> [RetrospectiveCardPresentation] {
+        // 只有 canonical 且至少有一个封存 horizon 时才生成 retrospective 卡片。
         guard scenario.purpose.isCanonical, !scenario.sealedHorizons.isEmpty else { return [] }
         var generator = SeededGenerator(seed: scenario.seed &+ 811)
         let blueprint: [(String, RetrospectiveConclusion, [RetrospectiveCategory], Double)] = [
@@ -16,6 +21,7 @@ enum LearningFixtures {
         let degradedIndex = scenario == .retrospectiveMixed ? 2 : -1
 
         return blueprint.enumerated().map { index, entry in
+            // Array.map 按蓝图顺序同步执行，闭包捕获并推进同一个 generator；降级项清空收益和 lesson，保持不可用语义。
             let impactPpm = Int(entry.3 * PpmFormatter.ppmPerUnit)
             let degraded = index == degradedIndex
             return RetrospectiveCardPresentation(
@@ -40,6 +46,7 @@ enum LearningFixtures {
     }
 
     static func timeline(scenario: MockScenario) -> [TimelineNodePresentation] {
+        // 时间线先给出会话和 Decision，只有存在封存 horizon 才追加 Outcome/Lesson 节点。
         var nodes: [TimelineNodePresentation] = [
             TimelineNodePresentation(
                 id: "tl-event",
@@ -87,10 +94,12 @@ enum LearningFixtures {
     }
 
     static func policyTracks(scenario: MockScenario) -> [PolicyTrackPresentation] {
+        // policy track 只为 canonical 场景存在，candidateState 和 memoryState 由 scenario 固定。
         guard scenario.purpose.isCanonical else { return [] }
         var generator = SeededGenerator(seed: scenario.seed &+ 829)
 
         func exposure(_ state: CandidatePolicyState) -> Int {
+            // exposure 闭包把生命周期阶段转成页面使用的 ppm 暴露比例。
             switch state {
             case .candidate: 0
             case .canary10: 100_000
@@ -106,6 +115,7 @@ enum LearningFixtures {
             memory: MemoryLifecycle?,
             candidate: CandidatePolicyState?
         ) -> PolicyTrackPresentation {
+            // track 是同步嵌套函数，捕获同一 generator 并按三条轨道的调用顺序取样，不创建独立随机状态。
             PolicyTrackPresentation(
                 subject: subject,
                 name: name,
@@ -127,6 +137,7 @@ enum LearningFixtures {
     }
 
     static func impact(scenario: MockScenario) -> ImpactSummaryPresentation {
+        // impact 从 cards 汇总实际可用影响；缺失卡片不会被填成虚假的收益。
         var generator = SeededGenerator(seed: scenario.seed &+ 853)
         let items = cards(scenario: scenario)
         let totalPpm = items.compactMap(\.impactPpm).reduce(0, +)
@@ -140,6 +151,7 @@ enum LearningFixtures {
             policiesEvolved: policyTracks(scenario: scenario).filter { $0.memoryState != .candidate }.count,
             policiesDelta: items.isEmpty ? 0 : 1,
             areas: RetrospectiveCategory.allCases.map { category in
+                // map 闭包按枚举顺序推进同一 generator；每个领域值只是该场景的确定性展示样例。
                 ImpactAreaPresentation(
                     label: category.displayName,
                     impactPpm: items.isEmpty ? 0 : generator.int(in: -6_000...18_000)
@@ -149,6 +161,7 @@ enum LearningFixtures {
     }
 
     static func learning(scenario: MockScenario) -> LearningPresentation {
+        // 页面所需的卡片、时间线、政策轨道和影响摘要在这里一次性汇总。
         LearningPresentation(
             cards: cards(scenario: scenario),
             timeline: timeline(scenario: scenario),
@@ -162,11 +175,14 @@ enum LearningFixtures {
     /// Labels are derived from the frozen anchor, never from the wall clock.
     /// ponytail: weekday-only fixture calendar; replace with broker sessions when holidays matter.
     static func sessionDate(sessionsAgo: Int) -> Date {
+        // 日历循环只回退周一到周五；日期从冻结 anchor 推导，节假日并未按 broker calendar 校正。
         var calendar = Calendar(identifier: .gregorian)
+        // `!` 是强制解包：假定当前系统时区数据库包含该 IANA 名称；若返回 nil 会直接 trap，而非走 Result 错误分支。
         calendar.timeZone = TimeZone(identifier: "America/New_York")!
         var date = ObservatorySnapshot.anchor
         var remaining = max(0, sessionsAgo)
         while remaining > 0 {
+            // 日期运算也强制解包；当前 fixture 使用有限回退天数，Foundation 若无法表示结果同样会 trap。
             date = calendar.date(byAdding: .day, value: -1, to: date)!
             let weekday = calendar.component(.weekday, from: date)
             if (2...6).contains(weekday) { remaining -= 1 }
@@ -175,6 +191,7 @@ enum LearningFixtures {
     }
 
     static func dateLabel(daysAgo: Int) -> String {
+        // formatter 只负责将冻结日期转为短标签，调用方不会获得实时日期。
         let date = sessionDate(sessionsAgo: daysAgo)
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")

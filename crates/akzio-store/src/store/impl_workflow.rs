@@ -1,3 +1,7 @@
+// 文件导读：这里串起 Paper session slot、Run graph、ExecutionCommitment lineage 和
+// specialized Artifact 校验；调用方传入的 graph/approval 不会绕过 Store 的事务边界。
+// Paper reservation 的调用方在 lease.rs/debug.rs/canary 中；先读 reserve_paper_session_with_binding
+// 再读 commit_workflow_transaction，最后沿 execution commitment lineage 向上游核验 plan/context/verdict。
 impl Store {
     fn reserve_paper_session_with_binding(
         &self,
@@ -6,6 +10,9 @@ impl Store {
         proposal: &Artifact,
         binding: Option<(&Artifact, &Artifact)>,
     ) -> StoreResult<SessionSlotReservation> {
+        // 输入 lease、冻结 reservation/proposal 和可选 approval binding；图/来源先校验，
+        // Immediate 事务中再验证 daemon epoch 并按 session_key 查重，提交后重读 slot 投影。
+        // 已有 key 返回 newly_reserved=false，不写新的 proposal 或替换原 graph。
         self.validate_paper_session_reservation(reservation, proposal)?;
 
         let newly_reserved = {
@@ -51,6 +58,8 @@ impl Store {
         proposal: &Artifact,
         binding: Option<(&Artifact, &Artifact)>,
     ) -> StoreResult<()> {
+        // 供 Canary 等组合事务复用：只重验 lease 并调用内部写 helper；借用调用方 Transaction，
+        // 不获取 mutex、不自行 commit，reservation 和 slot 留待外层一起提交。
         assert_daemon_lease(transaction, lease, reservation.reserved_at)?;
         Self::insert_session_slot_transaction(transaction, lease, reservation, proposal, binding)
     }
@@ -63,6 +72,8 @@ impl Store {
         proposal: &Artifact,
         binding: Option<(&Artifact, &Artifact)>,
     ) -> StoreResult<()> {
+        // 顺序是 setup Artifact→proposal→可选 manifest/approval→workflow rows→setup events→slot/consumption。
+        // 每步复用同一事务，唯一键/外键或任一 `?` 失败时外层不能提交部分 reservation。
         for artifact in &reservation.setup_artifacts {
             insert_artifact(transaction, artifact)?;
         }
@@ -114,6 +125,8 @@ impl Store {
         reservation: &SessionReservation,
         proposal: Option<&Artifact>,
     ) -> StoreResult<()> {
+        // 把 reservation 阶段尚无 Task/Attempt 的 EvidenceNeed 以及可选 proposal 纳入 Run event log；
+        // None proposal 时只写 snapshot-need events，不创建新的 Artifact。
         Self::append_run_setup_events(transaction, &reservation.workflow.run.run_id,
             &reservation.setup_artifacts, reservation.reserved_at)?;
         if let Some(proposal) = proposal {
@@ -133,6 +146,8 @@ impl Store {
     pub(super) fn append_run_setup_events(
         transaction: &Transaction<'_>, run_id: &RunId, setup: &[Artifact], now: DateTime<Utc>,
     ) -> StoreResult<()> {
+        // 按输入顺序逐个追加无 task/attempt 的 SchedulerSnapshotNeedCreated event；
+        // 不插 Artifact 行、不建立 Attempt output index。
         for artifact in setup {
             append_event(transaction, run_id, None, None,
                 LifecycleEventType::SchedulerSnapshotNeedCreated, Some(&artifact.artifact_id), now)?;
@@ -144,6 +159,9 @@ impl Store {
         transaction: &Transaction<'_>,
         commit: &WorkflowCommit,
     ) -> StoreResult<()> {
+        // 输入 WorkflowCommit 的 graph/nodes 与 input closure 先校验；在调用方事务内按
+        // Artifact→Run/control→Task→dependencies→revision→WorkflowCreated 顺序写入。
+        // 此 helper 只执行 SQL，不提交；任一 insert/event/checkpoint 失败整组由外层回滚。
         assert_workflow_input_artifacts(transaction, &commit.nodes)?;
         insert_artifact(transaction, &commit.graph)?;
         let inserted = transaction.execute(
@@ -198,6 +216,10 @@ impl Store {
         run_id: &RunId,
         session_key: &str,
     ) -> StoreResult<ExecutionPlan> {
+        // 输入已读 commitment Artifact/payload、目标 Run/session；反向沿 commitment→verdict→context→plan
+        // 读取 CAS。每层核对 kind、Run origin、typed payload 与精确 source refs，最终返回完整 ExecutionPlan。
+        // 只借用调用方 connection，不拿新锁、不写状态；`invalid` 是捕获 session_key 借用的零参数闭包，
+        // 每次调用新建同一种错误，不会在校验过程中改写 session_key。
         let invalid = || StoreError::InvalidSessionSlot(session_key.to_owned());
         if commitment_artifact.kind != ArtifactKind::ExecutionCommitment
             || commitment_artifact.lifecycle != ArtifactLifecycle::Canonical
@@ -285,6 +307,7 @@ impl Store {
                 .expect("validated closure"),
             context.execution_plan.clone().expect("validated closure"),
         ];
+        // ExecutionContext.validate_complete_plan_closure 已证明这些 Option 存在；此处建立精确引用集合。
         if !has_exact_source_refs(&context_artifact, &context_sources) {
             return Err(invalid());
         }
@@ -340,6 +363,11 @@ impl Store {
         plan: &ExecutionPlan,
         committed_at: DateTime<Utc>,
     ) -> StoreResult<()> {
+        // 通过 session_key 找唯一已消费 binding，累计 Buy orders 的 notional
+        //（checked_add 防溢出），并检查 session date/expiry/maximum_notional。
+        // 注意：当前调用 `validate_paper_approval_binding` 内部使用 `self.read_blob`，
+        // 已持有调用方连接时存在再次获取非重入 Store Mutex 的源码风险；
+        // 不能将此路径描述成全程同连接读取，也不以此断言运行故障。
         let invalid = || StoreError::InvalidSessionSlot(session_key.to_owned());
         let binding = connection
             .query_row(
@@ -376,6 +404,8 @@ impl Store {
     }
 
     fn validate_specialized_artifact(&self, artifact: &Artifact) -> StoreResult<()> {
+        // 按 ArtifactKind 只对 DeliberationNote/RetrospectiveDraft/Retrospective/AttemptRelation 解码专门 payload；
+        // Draft 和 AttemptRelation 还受 RunScoped/source lineage 限制，其他 kind 在此处 no-op。
         match artifact.kind {
             ArtifactKind::DeliberationNote => {
                 let summary: akzio_domain::DeliberationSummary =
@@ -396,6 +426,7 @@ impl Store {
                     .and_then(|origin| origin.run_id.as_ref())
                     .ok_or(StoreError::PermitOriginMismatch)?;
                 for source in &artifact.source_refs {
+                    // RetrospectiveDraft 的 cross-Run source 不允许，即使对应 Artifact 本身可读也拒绝。
                     let source_artifact = self.artifact(&source.artifact_id)?;
                     if source_artifact
                         .origin
@@ -432,6 +463,8 @@ impl Store {
         effect: &ArtifactRef,
         run_id: &RunId,
     ) -> StoreResult<()> {
+        // 先读 Artifact 元数据核对 Ref.kind、canonical lifecycle 和 Run origin，再按 kind 解码并 validate
+        // PaperCommitment/PaperReprice/PaperCancel；只做持久化前的 Rust 校验，不执行 Broker 请求。
         let artifact = self.artifact(&effect.artifact_id)?;
         if effect.kind != artifact.kind
             || !matches!(
@@ -476,6 +509,8 @@ impl Store {
         artifacts: &[Artifact],
         status: TaskStatus,
     ) -> StoreResult<()> {
+        // 只允许 terminal TaskStatus；Succeeded 至少要一个 Artifact。逐项验证 Artifact、拒绝通用学习产物、
+        // 确认 BLOB 可读并跑 specialized payload 校验，仍未写入 Artifact/Attempt 状态。
         if !status.is_terminal() {
             return Err(StoreError::TaskNotRunnable(permit.task_id.clone()));
         }

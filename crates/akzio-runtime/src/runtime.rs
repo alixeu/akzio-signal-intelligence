@@ -1,5 +1,9 @@
 //! Rust-owned fixed workflow compilation for the runtime.
 
+// 文件导读：本文件定义 Runtime 的共享错误、固定研究角色和 WorkflowRuntime 外壳。Proposal
+// 只能经过 catalogue/compilation 变成图；TaskRuntime 负责 lease/Future/取消，Store
+// 负责 durable state。NodeOutcome 的 Succeeded/Committed/Deferred 等协议结果必须与模型
+// 返回、Paper order accepted、fill 和跨日 Outcome 分开报告；本枚举没有 Accepted 变体。
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
@@ -149,6 +153,8 @@ struct ReplayedWorkflow {
 
 #[derive(Debug, Clone)]
 pub struct WorkflowRuntime {
+    // research_settings 与 agent_budgets 在 lower 时冻结进 WorkflowGraph；运行中的
+    // config reload 不会改写已有 node 的预算、retry 或 Contract identity。
     research_settings: akzio_domain::ResearchSettings,
     agent_budgets: BTreeMap<String, TaskBudget>,
     store: Store,
@@ -169,6 +175,8 @@ impl WorkflowRuntime {
         mut self,
         settings: &akzio_domain::ResearchSettings,
     ) -> RuntimeResult<Self> {
+        // `mut self` 消费并返回配置后的新 Runtime；&ResearchSettings 不转移调用方所有权。
+        // 先 validate 再 clone，非法配置不会成为后续 lowering 的默认值。
         settings.validate()?;
         self.research_settings = settings.clone();
         Ok(self)
@@ -178,6 +186,7 @@ impl WorkflowRuntime {
         mut self,
         config: &akzio_domain::AgentBudgetConfig,
     ) -> RuntimeResult<Self> {
+        // 与 research settings 相同，只有成功的验证才会覆盖冻结新图时使用的预算。
         config.validate()?;
         self.agent_budgets = config.resolved();
         Ok(self)
@@ -206,6 +215,8 @@ pub enum RetryCause {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeOutcome {
+    // Outcome 是 TaskRuntime 与业务 handler 的协议值：Succeeded/Committed 只表示本
+    // 阶段已提交或核验，Deferred/Retry 保留后续状态。它们都不等于整个 Run 的业务闭环。
     Succeeded(Vec<Artifact>),
     /// A Rust gate can succeed after forwarding already durable lineage without
     /// manufacturing a duplicate artifact. The task transition remains in the
@@ -229,6 +240,8 @@ fn required_terminal<'a>(
     terminals: &BTreeMap<TaskRecipeId, &'a WorkflowNode>,
     recipe_id: &TaskRecipeId,
 ) -> RuntimeResult<&'a WorkflowNode> {
+    // 生命周期 `'a` 指明返回节点引用来自 terminals 中的节点，而非临时 recipe_id；
+    // `.copied()` 复制的是 &WorkflowNode（指针），没有复制整个 WorkflowNode。
     terminals
         .get(recipe_id)
         .copied()
@@ -236,6 +249,8 @@ fn required_terminal<'a>(
 }
 
 fn leaf_ids(nodes: &[WorkflowNode]) -> Vec<akzio_domain::TaskId> {
+    // 返回“在传入的节点子图内”没有后继依赖的节点；调用方传研究节点集合时，
+    // DecisionGate 才只接研究叶子，不能把中间节点完成误当作研究图已闭合。
     let depended_on = nodes
         .iter()
         .flat_map(|node| node.dependencies.iter().cloned())

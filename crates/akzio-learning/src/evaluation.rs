@@ -31,6 +31,9 @@ use akzio_store::{
 
 const PPM_ONE: u32 = 1_000_000;
 
+// 文件导读：EvaluationRuntime 只接收受治理的观察和已存在的 Artifact 引用；T+1/T+3/T+5
+// 的数值由 Rust 重建，后续模块再把密封 T+5 结果交给 Store 的 Policy/Lesson 事务。
+
 /// Akzio policy, not an external statistical standard. Fewer than three fresh
 /// paired outcomes per horizon cannot advance memory by default.
 pub const AKZIO_MIN_FRESH_PAIRS_PER_HORIZON: u64 = 3;
@@ -52,6 +55,7 @@ pub struct EvaluationPolicy {
 }
 
 impl Default for EvaluationPolicy {
+    // 默认值只定义晋级所需阈值；构造默认 policy 不读取 Store，也不代表任何 Outcome 已合格。
     fn default() -> Self {
         Self {
             minimum_evidence_completeness_ppm: 900_000,
@@ -66,6 +70,8 @@ impl EvaluationPolicy {
     /// A window whose `risk_recall_ppm` is `None` was never measured, so it
     /// cannot prove degradation; `risk_recall_is_measured` gates promotion
     /// separately so an unmeasured outcome neither promotes nor demotes.
+    // 共享借用 Outcome，只检查已测量值是否低于策略下限；None 不参与降级判断，是否允许晋级
+    // 由独立的 risk_recall_is_measured gate 决定。
     pub fn outcome_is_degraded(&self, outcome: &Outcome) -> bool {
         outcome.windows.iter().any(|window| {
             window
@@ -80,6 +86,8 @@ impl EvaluationPolicy {
     /// True only when every window carries a measured risk recall. Forward
     /// policy transitions require this; without it an outcome that silently
     /// skipped risk measurement could buy a promotion.
+    // all 逐窗口消费迭代器；空 windows 按 all 的集合语义会返回 true，因此完整 Outcome 的
+    // 非空结构还由领域校验保证，不能只凭这个辅助方法判定整体资格。
     pub fn risk_recall_is_measured(&self, outcome: &Outcome) -> bool {
         outcome
             .windows
@@ -87,6 +95,7 @@ impl EvaluationPolicy {
             .all(|window| window.risk_recall_ppm.is_some())
     }
 
+    // 同样只报告测量完整性，不计算平均值或替缺失窗口填默认分数。
     pub fn evidence_completeness_is_measured(&self, outcome: &Outcome) -> bool {
         outcome
             .windows
@@ -94,6 +103,8 @@ impl EvaluationPolicy {
             .all(|window| window.evidence_completeness_ppm.is_some())
     }
 
+    // 校验 ppm 上限与非零 fresh-pair 阈值；错误由 EvaluationRuntime::new 的 ? 传播，
+    // 因而非法策略不能构造运行时。
     fn validate(&self) -> Result<(), EvaluationError> {
         if self.minimum_evidence_completeness_ppm > PPM_ONE
             || self.minimum_risk_recall_ppm > PPM_ONE
@@ -125,6 +136,8 @@ pub struct GovernedRiskRecall {
 }
 
 impl GovernedRiskRecall {
+    // assessment 必须指向风险真值 Artifact，expected 集合非空且 detected 是其子集；
+    // 这里仅验证已提供的测量，不访问 Store 核验 Artifact 正文。
     fn validate(&self) -> EvaluationRuntimeResult<()> {
         if self.assessment.kind != ArtifactKind::RiskGroundTruthAssessment
             || self.expected_risk_ids.is_empty()
@@ -156,12 +169,14 @@ pub struct ObservedExecutionMetrics {
 }
 
 impl ObservedExecutionMetrics {
+    // 合并两个有符号估值调整；checked_add 防止溢出并将失败转换为 EvaluationError。
     fn valuation_adjustment_ppm(&self) -> EvaluationRuntimeResult<i64> {
         self.implementation_effect_ppm
             .unwrap_or(0)
             .checked_add(self.initial_valuation_effect_ppm.unwrap_or(0))
             .ok_or(EvaluationError::ArithmeticOverflow)
     }
+    // 若已有真实 signed implementation effect，就不再把 limit shortfall 重复计作滑点成本。
     fn deductible_slippage_ppm(&self) -> u32 {
         if self.implementation_effect_ppm.is_some() {
             0
@@ -186,6 +201,10 @@ pub fn horizon_observations(
     expected_evidence_count: u64,
     observed_evidence_count: u64,
 ) -> EvaluationRuntimeResult<Vec<GovernedHorizonObservation>> {
+    // 嵌套 BTreeMap 按 Asset/NaiveDate 查价；闭包和迭代器最终由 collect 消费，
+    // 任意到期 horizon 缺共同日期或任一资产价格时 ? 使整批返回 Err，不返回部分 Vec。
+    // 调用方须提供已对齐、按交易 Session 排列的 common_dates；此函数只按索引
+    // 检查已到期期限的四资产价格，不独立验证日期单调性或交易所日历。
     if observed_evidence_count > expected_evidence_count {
         return Err(EvaluationError::InvalidMaterialization(
             "evidence observation count",
@@ -229,6 +248,10 @@ pub fn daily_observations(
     bars_by_asset: &BTreeMap<Asset, BTreeMap<NaiveDate, MoneyMicros>>,
     common_dates: &[NaiveDate],
 ) -> EvaluationRuntimeResult<Vec<GovernedDailyObservation>> {
+    // 每个 common_dates 项生成一个日观察；try_fold 按四个可执行资产累积价格表，
+    // collect 只有在所有日期均成功时才返回完整结果。
+    // 日频路径给回撤、tracking error、beta、Sortino 和 benchmark 使用；它同样要求每个
+    // 输入日期都有四资产价格；日期是否为共同交易 Session 由上游保证，本函数不查询日历。
     common_dates
         .iter()
         .map(|observed_trading_day| {
@@ -275,6 +298,9 @@ pub fn realized_execution_target(
     plan: Option<&ExecutionPlan>,
     receipts: &[OrderReceipt],
 ) -> EvaluationRuntimeResult<TargetPortfolio> {
+    // 仅保留 realized_execution 计算结果中的 target；账户、lineage、plan 与 receipts 全部借用，
+    // 默认成本模型按值传入，任何执行事实校验错误继续作为 Result 返回。
+    // `?` 在拆出 .target 前传播错误，不能把无效 Receipt 的目标当成成功返回值。
     Ok(realized_execution(
         account,
         execution,
@@ -296,8 +322,12 @@ pub fn realized_execution(
     receipts: &[OrderReceipt],
     cost_model: OutcomeCostModel,
 ) -> EvaluationRuntimeResult<RealizedExecution> {
+    // 此兼容入口只从账户 mark 或订单限价构造估值价格，缺失时沿用实现中的 1 美元默认值；
+    // 随后清空无法由这些输入证实的 signed effect/baseline，避免把估算结果伪装成真实报价。
     account.validate()?;
     cost_model.validate()?;
+    // 兼容入口只能看到 account mark 和 plan limit，不能伪造 arrival/baseline quote；
+    // 后面清空 signed implementation effect，避免把 limit 诊断与真实估值差额重复计费。
     let prices = Asset::EXECUTABLE
         .into_iter()
         .map(|asset| {
@@ -329,8 +359,10 @@ pub fn realized_execution(
     Ok(realized)
 }
 
-/// Reconstruct shares and cash first, then value all remaining shares at the
-/// immutable execution-context quote midpoint. Later account rebalances are not included.
+/// Reconstruct shares and cash, then value remaining shares at caller-supplied
+/// prices. The caller must bind them to immutable execution-context quotes;
+/// this pure function checks positivity/universe, not CAS provenance.
+/// Later account rebalances are not included.
 pub fn realized_execution_at_prices(
     account: &AccountSnapshot,
     execution: &OutcomeExecutionLineage,
@@ -339,9 +371,14 @@ pub fn realized_execution_at_prices(
     cost_model: OutcomeCostModel,
     prices: &BTreeMap<Asset, MoneyMicros>,
 ) -> EvaluationRuntimeResult<RealizedExecution> {
+    // account/lineage/plan/receipts/prices 都以借用读取，cost_model 按值消费。
+    // 返回的是基于传入冻结价格与终态成交重建的结果；无效任一 receipt 会拒绝整个 Outcome，
+    // 本计算不写 Store，也不包含成交后的账户再平衡。
     account.validate()?;
     cost_model.validate()?;
     validate_prices(prices)?;
+    // 先从账户持仓与 equity 重建数量和现金，再只应用唯一终态 Receipt；随后用冻结的
+    // execution-context midpoint 估值，不能把之后账户的再平衡混进这个 Outcome。
     let mut quantities = Asset::EXECUTABLE
         .into_iter()
         .map(|asset| {
@@ -377,11 +414,17 @@ pub fn realized_execution_at_prices(
         .sum::<i128>();
     let mut order_cost_attributions = Vec::with_capacity(receipts.len());
     if matches!(execution, OutcomeExecutionLineage::ReconciledPaper { .. }) {
+        // 只有 ReconciledPaper 分支消费 plan 与 receipts；NoOrder 分支稍后明确拒绝任何 plan/fill，
+        // 因而研究意图仍可被评估，但不会被伪造成实际成交。
+        // ReconciledPaper 必须有完整 ExecutionPlan 和每个订单的终态 receipt；NoOrder
+        // 则禁止携带 plan/fill，二者是互斥的执行证据边界。
         let plan = plan.ok_or(EvaluationError::InvalidMaterialization("execution plan"))?;
         plan.validate()?;
         for receipt in receipts {
             receipt.validate()?;
             if let Some(previous) = seen_receipts.insert(receipt.client_order_id.clone(), receipt) {
+                // 恢复重放的完全相同 receipt 可幂等跳过；同一 client_order_id 的不同内容
+                // 是冲突，而不是“多一笔成交”。
                 if previous == receipt {
                     continue;
                 }
@@ -500,6 +543,7 @@ pub fn realized_execution_at_prices(
             }
         }
         if seen_assets.len() != plan.orders.len() {
+            // 每个 plan order 都必须有一个唯一终态回执；若缺回执，当前局部重建结果不会返回。
             return Err(EvaluationError::InvalidMaterialization(
                 "missing terminal receipt",
             ));
@@ -518,6 +562,8 @@ pub fn realized_execution_at_prices(
             Ok((*asset, WeightPpm(ppm)))
         })
         .collect::<EvaluationRuntimeResult<BTreeMap<_, _>>>()?;
+    // 权重、turnover、fee 和 signed price effect 都以同一 equity/ppm 基准计算；负仓位
+    // 或算术溢出会返回错误，cash 则按现有账户/成交重建结果保留，不在此处另加规则。
     let target = TargetPortfolio { weights };
     target.validate_universe()?;
     let turnover_ppm = ratio_of_equity_ppm(fill_notional_micros, equity)?;
@@ -548,6 +594,8 @@ pub fn realized_execution_at_prices(
 }
 
 fn ratio_of_equity_ppm(value: i128, equity: i128) -> EvaluationRuntimeResult<u32> {
+    // 将金额比例转为 ppm 前先验证分子与 equity；转换溢出通过 Result 返回，而非截断。
+    // 这是所有执行成本比例的共同分母检查：equity 必须为正，负值表示输入或方向不合法。
     if value < 0 || equity <= 0 {
         return Err(EvaluationError::InvalidMaterialization("execution ratio"));
     }
@@ -646,6 +694,8 @@ pub struct EvaluationRuntime {
     policy: EvaluationPolicy,
 }
 
+// include! 在编译期把拆分文件的 Rust 项目文本插入当前 evaluation 模块，因此这些 impl
+// 共享本文件的导入、私有类型和可见性；它们不是运行时读取的 Prompt/模板，也不额外创建 crate。
 include!("evaluation/runtime_setup.rs");
 include!("evaluation/materialization.rs");
 include!("evaluation/risk_ground_truth.rs");

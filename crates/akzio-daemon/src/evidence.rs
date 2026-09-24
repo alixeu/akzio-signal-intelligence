@@ -1,7 +1,17 @@
 //! Governed evidence acquisition and snapshot materialization.
 
+// 文件导读：本文件实现 EvidenceNeed → adapter → Raw/NormalizedEvidence → 执行快照的受控
+// 数据流。研究阶段只采集研究证据，并把 ExecutionSafety 标为 deferred；ExecutionGate
+// 再独立刷新账户/报价/时钟。provider 可用、HTTP 成功或 artifact 已写入都不等于 Claim、
+// Decision、Paper submission、fill 或 Outcome 完成，时间 cutoff/provenance 不匹配必须 fail closed。
+// Rust 机制：`join_all` 并发 Future 仍由 Permit/Store 约束；借用的 trait object adapter
+// 通过 `Arc` 共享；`BTreeMap/BTreeSet` 保证资源闭包稳定；`Option` 明确区分缺失快照、
+// quote error 和成功值，`Result` 保留内部身份错误而不降级成普通 coverage gap。
+
 use super::*;
 
+// 执行时刷新结果分开返回 account/quotes/clock 和 quote 解码错误；`None` 不会被补成
+// 旧快照，后续 ExecutionGate 据此继续 fail closed。
 #[derive(Debug)]
 pub(super) struct ExecutionSnapshotRefresh {
     pub account: Option<ArtifactRef>,
@@ -10,6 +20,7 @@ pub(super) struct ExecutionSnapshotRefresh {
     pub quote_error: Option<String>,
 }
 
+// 多项执行采集转换后的本地暂存集合；其中 Artifact 仍需由当前 Attempt 的 permit 写入 Store。
 struct ExecutionAcquisitionMaterialization {
     artifacts: BTreeMap<ArtifactId, Artifact>,
     account: Option<Artifact>,
@@ -20,6 +31,8 @@ async fn bounded_research_acquisition<T>(
     acquisition: impl std::future::Future<Output = Result<T>>,
     allowance: std::time::Duration,
 ) -> Result<T> {
+    // timeout 驱动 acquisition Future 至 allowance；超时后该 Future 被 drop，并统一转成
+    // Unavailable 超时错误。调用方对每项独立设限，其他已完成来源仍可参与覆盖报告。
     tokio::time::timeout(allowance, acquisition)
         .await
         .unwrap_or_else(|_| {
@@ -35,6 +48,8 @@ impl Daemon {
         task: &ClaimedAttempt,
         now: DateTime<Utc>,
     ) -> Result<Vec<akzio_domain::Artifact>> {
+        // 按 Run purpose 选择严格的 Paper/PositionPlan 证据政策或通用 Debug/历史采集路径；
+        // bundle 成功输出交给 TaskRuntime 与 Attempt 绑定，collection status/污染诊断可先单独持久化。
         if task.node.input_artifacts.is_empty() {
             return match self.store.run_purpose(&task.run_id)? {
                 RunPurpose::Debug => Ok(Vec::new()),
@@ -309,6 +324,8 @@ impl Daemon {
 
     /// Research identity is frozen in scheduler-owned needs, independent of market openness.
     pub(super) fn research_session_key(&self, run_id: &RunId) -> Result<String> {
+        // Paper 日期只取已持久化 session slot；PositionPlan 等从 EvidenceGate 冻结 Need
+        // 提取唯一日期，既不以本机日期替代，也不要求市场当前开放。
         if self.store.run_purpose(run_id)? == RunPurpose::Paper {
             return self
                 .store
@@ -343,6 +360,8 @@ impl Daemon {
     }
 
     fn validate_paper_evidence_policy(&self, task: &ClaimedAttempt) -> Result<()> {
+        // 对照 purpose 对应的固定 Need 集合检查每个输入 kind、producer、Run origin 和去重；
+        // 多一个、少一个、重复或跨 Run Need 都在 provider I/O 前拒绝。
         let session_key = self.research_session_key(&task.run_id)?;
         let purpose = self.store.run_purpose(&task.run_id)?;
         let expected = akzio_domain::paper_session_evidence_needs(&session_key)
@@ -402,6 +421,8 @@ impl Daemon {
         reason: &str,
         error: &dyn std::fmt::Display,
     ) -> Result<()> {
+        // error 只借用用于日志，持久化的是生命周期事件和当前 Attempt 身份；首轮 Claim
+        // 不在这里撤回，后续读者仍可识别补采失败/放弃。
         eprintln!("{reason} for task {}: {error}", task.node.task_id);
         tracing::warn!(
             run_id = %task.run_id,
@@ -425,6 +446,8 @@ impl Daemon {
         _candidates: &[ArtifactRef],
         now: DateTime<Utc>,
     ) -> Result<Vec<(ArtifactRef, Artifact, EvidenceNeed)>> {
+        // 只从 Claim 的 blocking gaps 取类型化意图，再绑定当前冻结 session；超出八项或
+        // 任一日期/资源校验失败时不开始 adapter I/O。
         let session_key = self.research_session_key(&task.run_id)?;
         let session_date = NaiveDate::parse_from_str(&session_key, "%Y-%m-%d").map_err(|_| {
             DaemonError::InvalidInput("Paper run has invalid session slot".to_owned())
@@ -477,6 +500,8 @@ impl Daemon {
                     LifecycleEventType::SupplementalEvidenceNeedCreated,
                     now,
                 )?;
+                // 每项 Need 单独在当前 Attempt 下提交；此循环不是跨资源事务，若后续项失败，
+                // 较早写入的 Need/event 仍留在 Store 供恢复与审计。
                 Ok((
                     ArtifactRef {
                         artifact_id: artifact.artifact_id.clone(),
@@ -490,6 +515,8 @@ impl Daemon {
     }
 
     fn expand_supplemental_intents(intent: &ResearchIntent) -> Result<Vec<ResearchIntent>> {
+        // 普通受治理 intent 原样保留；Alpaca bars 的多资产 intent 才拆成每资产一条，
+        // 每个新资源从同一冻结起始日期和 max_results 生成。
         if intent.source_family != "alpaca" || intent.resource != "bars" {
             return Ok(vec![intent.clone()]);
         }
@@ -531,6 +558,8 @@ impl Daemon {
         needs: &[(ArtifactRef, Artifact, EvidenceNeed)],
         now: DateTime<Utc>,
     ) -> Result<Vec<ArtifactRef>> {
+        // join_all 并发驱动每个 adapter Future；生产路径先只取/校验 bytes 再 materialize，
+        // fixture 路径使用显式 fixture adapter。最终 artifact 逐项按 permit 写入而非一批事务。
         let purpose = self.store.run_purpose(&task.run_id)?;
         let bundles =
             futures::future::join_all(needs.iter().map(|(reference, _need_artifact, need)| {
@@ -614,6 +643,8 @@ impl Daemon {
             .await;
 
         let mut normalized = Vec::with_capacity(bundles.len());
+        // join_all 会收齐各 Future 后才进入此循环；research.supplement 任一失败立即返回，
+        // 此前成功项可能已逐个提交，后续成功项尚未写入，因此结果不是原子全有/全无。
         for result in bundles {
             let bundle = match result {
                 Ok(bundle) => bundle,
@@ -654,6 +685,8 @@ impl Daemon {
         need: &EvidenceNeed,
         session_date: &NaiveDate,
     ) -> Result<()> {
+        // 按 source family 使用各自固定 resource grammar，并检查所有窗口不晚于 session；
+        // SEC/未知源明确拒绝，避免模型意图变成任意联网请求。
         if intent
             .window_end
             .is_some_and(|end| end.date_naive() > *session_date)
@@ -748,6 +781,7 @@ impl Daemon {
     }
 
     fn parse_resource_date(value: &str) -> Result<NaiveDate> {
+        // 资源日期只接受 YYYY-MM-DD；解析失败保留为配置/协议错误而非猜测时区或默认日期。
         NaiveDate::parse_from_str(value, "%Y-%m-%d")
             .map_err(|_| DaemonError::InvalidInput("invalid supplemental evidence date".to_owned()))
     }
@@ -763,6 +797,8 @@ impl Daemon {
         EvidenceRequest,
         akzio_ingest::AcquiredEvidence,
     )> {
+        // 读取已冻结 EvidenceNeed 并确认 source/permit/adapter 后，只获取并校验原始响应；
+        // 返回的 AcquiredEvidence 由 acquire_evidence 批量检查 cutoff 后再物化。
         let artifact = self.store.artifact(&reference.artifact_id)?;
         let need: EvidenceNeed = serde_json::from_slice(&self.store.read_blob(&artifact.blob)?)?;
         need.validate()
@@ -803,6 +839,8 @@ impl Daemon {
         need_reference: &ArtifactRef,
         now: DateTime<Utc>,
     ) -> Result<(EvidenceNeed, Artifact, EvidenceBundle)> {
+        // 单项通用获取先检查 Need 和来源，再按 fixture_mode 选 adapter；EvidenceRuntime
+        // 返回暂存 bundle，TaskRuntime 最终提交时才把输出与成功 Attempt 绑定。
         if need_reference.kind != ArtifactKind::EvidenceNeed {
             return Err(DaemonError::InvalidInput(format!(
                 "evidence task {} has non-EvidenceNeed input",
@@ -879,6 +917,8 @@ impl Daemon {
         adapter: &dyn AsyncEvidenceAdapter,
         now: DateTime<Utc>,
     ) -> Result<(EvidenceNeed, Artifact, EvidenceBundle)> {
+        // 只接受 scheduler 为当前 Paper Run 冻结的 Alpaca Need；执行快照使用真实 API，且
+        // materialization cutoff 取当前 host clock，不用 provider 时间延长可用窗口。
         if reference.kind != ArtifactKind::EvidenceNeed {
             return Err(DaemonError::InvalidInput(
                 "Paper evidence task has non-EvidenceNeed input".to_owned(),
@@ -918,6 +958,8 @@ impl Daemon {
         acquisitions: Vec<(EvidenceNeed, Artifact, EvidenceBundle)>,
         now: DateTime<Utc>,
     ) -> Result<(BTreeMap<ArtifactId, Artifact>, Option<Artifact>)> {
+        // 把成功的研究 acquisition 分类到账户组合或单项快照；任何错误都在返回前传播，
+        // 但这里创建的 Artifact 仍是待 TaskRuntime 提交的 Attempt 输出。
         let mut artifacts = BTreeMap::new();
         let mut account_components = BTreeMap::new();
 
@@ -967,6 +1009,8 @@ impl Daemon {
         need: &EvidenceNeed,
         normalized: &Artifact,
     ) -> Result<()> {
+        // 重新比对采集时记录的 mode/policy hash；缺失身份保留为未验证资料，身份冲突则拒绝，
+        // citations 不完整继续作为 coverage gap，不能升级成方向性来源。
         let payload: NormalizedEvidencePayload =
             serde_json::from_slice(&self.store.read_blob(&normalized.blob)?)?;
         let document = payload.value.get("source_document");
@@ -1027,6 +1071,8 @@ impl Daemon {
         task: &ClaimedAttempt,
         now: DateTime<Utc>,
     ) -> Result<ExecutionSnapshotRefresh> {
+        // 从当前 Run 的 slot 找齐且去重 6 个 scheduler Need；账户/报价/时钟在执行节点重取，
+        // 任一获取失败都不调用 ExecutionGate，后续 attempt 必须重新读取全部快照。
         let adapter = self
             .production_evidence
             .get(&EvidenceSource::Alpaca)
@@ -1136,6 +1182,8 @@ impl Daemon {
             )
         })?;
         let mut artifacts = artifacts.into_values().collect::<Vec<_>>();
+        // 先按 raw → ingest-normalized → typed snapshot 排序并逐项提交；这些 write_task_artifact
+        // 不构成一组数据库事务，若中途失败，已提交的原始/规范化 Artifact 会继续保留。
         artifacts.sort_by_key(|artifact| match artifact.kind {
             ArtifactKind::RawEvidence => 0,
             ArtifactKind::NormalizedEvidence if artifact.producer.starts_with("akzio.ingest.") => 1,
@@ -1184,6 +1232,8 @@ impl Daemon {
         normalized: &Artifact,
         now: DateTime<Utc>,
     ) -> Result<Option<Artifact>> {
+        // 仅当前 Paper Run 的 scheduler Need 且来源为 Alpaca 时才解码 account/quotes/clock；
+        // 不匹配用途/资源时返回 None，不从一般研究证据推断执行快照。
         if self.store.run_purpose(&task.run_id)? != RunPurpose::Paper
             || evidence_source(&need.source_family)? != EvidenceSource::Alpaca
             || need_artifact.producer != "scheduler.paper_snapshot"
@@ -1245,6 +1295,8 @@ impl Daemon {
         acquisitions: Vec<(EvidenceNeed, Artifact, EvidenceBundle)>,
         now: DateTime<Utc>,
     ) -> Result<ExecutionAcquisitionMaterialization> {
+        // 先聚合账户四项输入，再单独尝试报价/时钟解码；只有明确的 InvalidQuote 被保留为
+        // quote_error 供 Gate 生成 NoOrder，其他身份/Store 错误仍直接失败。
         let mut artifacts = BTreeMap::new();
         let mut account_components = BTreeMap::new();
         let mut quote_error = None;
@@ -1307,6 +1359,8 @@ impl Daemon {
         components: &BTreeMap<String, (Artifact, Artifact)>,
         now: DateTime<Utc>,
     ) -> Result<Option<Artifact>> {
+        // account/positions/open_orders/fills 必须恰为当前 session 的四项；统一用最早
+        // observed_at 作为组合快照时间，因此较新的部分响应不能掩盖较旧输入。
         if self.store.run_purpose(&task.run_id)? != RunPurpose::Paper || components.is_empty() {
             return Ok(None);
         }
@@ -1380,6 +1434,8 @@ impl Daemon {
         normalized: &Artifact,
         payload: &NormalizedEvidencePayload,
     ) -> Result<()> {
+        // 逐一核对 Need 与 NormalizedEvidence 的 source/resource/kind/Run origin，阻断跨任务
+        // 或不同交易日的标准化资料被用作当前执行安全快照。
         if payload.source != EvidenceSource::Alpaca
             || normalized.provenance.source_family != EvidenceSource::Alpaca.as_str()
             || payload.resource != need.resource
@@ -1409,6 +1465,8 @@ impl Daemon {
 // payload failures have typed variants; InvalidInput here comes from the Rust
 // EvidenceNeed/acquisition-identity checks, never unparsed third-party content.
 fn evidence_failure_category(error: &DaemonError) -> Option<&'static str> {
+    // 只把明确的 adapter/内容可用性问题映射成研究 coverage category；内部、身份、权限策略
+    // 或持久化错误返回 None，调用方必须保留原始失败语义并阻断任务。
     use akzio_ingest::{EvidenceAdapterError as A, EvidenceRuntimeError as R};
     let category = match error {
         DaemonError::Evidence(R::Adapter(A::Unauthorized(_))) => "authorization",
@@ -1439,6 +1497,8 @@ fn validated_paper_quotes(
     broker_session: String,
     observed_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<QuoteSnapshot> {
+    // Broker 原始 quote 先解码为强类型快照，再逐项要求 bid/ask 为正且 ask 高于 bid；
+    // 任一报价非法就让调用方保留 InvalidQuote，不把问题资产静默过滤掉。
     let snapshot = decode_paper_quotes(value, broker_session, observed_at)?;
     for (asset, quote) in &snapshot.quotes {
         if quote.bid.0 <= 0 || quote.ask.0 <= quote.bid.0 {
@@ -1455,6 +1515,8 @@ fn validated_paper_quotes(
 mod acquisition_deadline_tests {
     use super::*;
 
+    // 内部身份/Store/策略错误不能被归类成可降级 coverage；只有明确 provider 质量/等待
+    // 错误映射到有限诊断类别。
     #[test]
     fn acquisition_classification_does_not_downgrade_internal_or_identity_errors() {
         use akzio_ingest::{EvidenceAdapterError as A, EvidenceRuntimeError as R};
@@ -1490,6 +1552,7 @@ mod acquisition_deadline_tests {
         );
     }
 
+    // 慢来源超时不丢失已完成来源，且 temporal contamination 保持独立 fail-closed 错误。
     #[tokio::test]
     async fn slow_source_does_not_discard_completed_sources_or_hide_temporal_errors() {
         let allowance = std::time::Duration::from_millis(10);

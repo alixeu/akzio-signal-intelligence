@@ -1,5 +1,7 @@
 import SwiftUI
 
+// 文件职责：集中定义字体尺寸、tracking、等宽数字和文字 Modifier，并通过 Environment 传递全局 text scale。
+// 字体 token 是值语义配置；ViewModifier 在 body 中读取当前 scale 后生成新的 View，不保存跨渲染状态。
 // MARK: - Typography
 //
 // System fonts only (SF Pro Display / SF Pro Text / SF Mono).
@@ -9,6 +11,7 @@ public enum AkzioFont {
     /// Base point sizes. Everything else is derived by multiplying by the accessibility
     /// text scale, so one setting moves the whole type system together.
     public enum Size {
+        // 基准字号不直接读取设置；scaled(size, scale) 在消费点统一应用无障碍范围。
         public static let display: CGFloat = 28
         public static let title: CGFloat = 18
         public static let sectionTitle: CGFloat = 14
@@ -36,16 +39,19 @@ public enum AkzioFont {
     public static let caption = Font.system(size: Size.caption, weight: .medium)
     public static let captionTracking: CGFloat = 0.3
 
+    // 输入目标字号，输出保持数字列稳定的 monospaced-digit Font；适合 KPI/计数动画。
     public static func metric(_ size: CGFloat) -> Font {
         .system(size: size, weight: .semibold).monospacedDigit()
     }
 
     public static func mono(_ size: CGFloat = 12, weight: Font.Weight = .medium) -> Font {
+        // size/weight 是调用方的值配置；返回等宽设计的 Font，不持有字体或环境状态。
         .system(size: size, weight: weight, design: .monospaced)
     }
 
     /// Text Size from Settings, clamped so layout never breaks.
     public static func scaled(_ size: CGFloat, _ scale: Double) -> CGFloat {
+        // 输入基准字号和设置 scale，输出限制在 0.9...1.3 后四舍五入的 CGFloat；不会把异常 scale 传入布局。
         (size * CGFloat(min(max(scale, 0.9), 1.3))).rounded()
     }
 }
@@ -59,6 +65,7 @@ private struct AkzioTextScaleKey: EnvironmentKey {
 extension EnvironmentValues {
     /// 0.9–1.3 from Settings. Read by every text modifier in the design system.
     public var akzioTextScale: Double {
+        // Environment setter 接收 Settings 的值；读取端只得到当前层级的值，未注入时使用 1.0 默认值。
         get { self[AkzioTextScaleKey.self] }
         set { self[AkzioTextScaleKey.self] = newValue }
     }
@@ -71,18 +78,22 @@ public enum AkzioTextRole {
 }
 
 extension View {
+    // 三个入口都返回带 Modifier 的新 View；它们不直接改写调用方的值语义内容。
     /// Applies font + tracking + default colour for a role in one call.
     public func akzioText(_ role: AkzioTextRole, color: Color? = nil) -> some View {
+        // role 选择统一排版规则，Optional color 有值时覆盖默认色；实际排版在 AkzioTextModifier.body 中执行。
         modifier(AkzioTextModifier(role: role, color: color))
     }
 
     /// Monospaced technical value (Run ID, hash, ppm, latency).
     public func akzioMono(_ size: CGFloat = 12, color: Color = AkzioColor.secondaryText) -> some View {
+        // 技术文本沿用传入字号/颜色，并在 modifier 内应用当前 Environment 的文字缩放。
         modifier(AkzioMonoModifier(size: size, color: color))
     }
 
     /// Large numeric readout that must not jitter while animating.
     public func akzioMetric(_ size: CGFloat, color: Color = AkzioColor.primaryText) -> some View {
+        // 指标文本交给专用 Modifier 使用等宽数字字形；size 仍受同一个无障碍 text scale 影响。
         modifier(AkzioMetricModifier(size: size, color: color))
     }
 }
@@ -93,11 +104,13 @@ struct AkzioTextModifier: ViewModifier {
 
     @Environment(\.akzioTextScale) private var scale
 
+    // 输入字号和 Environment scale，输出当前 role 的字体、tracking、行距和默认颜色组合。
     private func font(_ size: CGFloat, weight: Font.Weight) -> Font {
         .system(size: AkzioFont.scaled(size, scale), weight: weight)
     }
 
     func body(content: Content) -> some View {
+        // role switch 只选择 token 组合；可选 color 覆盖颜色，其余排版约束仍由 role 保持一致。
         switch role {
         case .display:
             content.font(font(AkzioFont.Size.display, weight: .semibold))
@@ -138,6 +151,7 @@ struct AkzioMonoModifier: ViewModifier {
 
     @Environment(\.akzioTextScale) private var scale
 
+    // body 把 technical value 固定成等宽字体并随 Environment scale 缩放，适合 ID/hash/ppm/latency。
     func body(content: Content) -> some View {
         content
             .font(AkzioFont.mono(AkzioFont.scaled(size, scale)))
@@ -151,6 +165,7 @@ struct AkzioMetricModifier: ViewModifier {
 
     @Environment(\.akzioTextScale) private var scale
 
+    // body 在等宽数字基础上设置轻微 tracking，确保数值变化时列宽稳定且颜色仍由调用方决定。
     func body(content: Content) -> some View {
         content
             .font(AkzioFont.metric(AkzioFont.scaled(size, scale)))

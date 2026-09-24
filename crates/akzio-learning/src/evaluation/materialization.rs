@@ -1,10 +1,19 @@
+// 文件导读：这里是数值 Outcome 进入学习资格、Experience/Evaluation 与 Policy transition 的主链。
+// 入口从已治理的 schedule/价格/观察生成或重用 Outcome，再从 CAS 复核决策上下文、研究覆盖、
+// 风险真值和 T+5 叙事；最后由 Store 的单事务提交 canonical 学习事实。先读 evaluate_frozen，
+// 再对照 outcome worker 调用，可区分 T+5 的 sealed Outcome 与模型叙事、资格和 Policy 更新。
+
 impl EvaluationRuntime {
+    // lease 可选借用、input 按值消费、draft 只借用；先验证 Paper Run 并生成数值 Outcome，
+    // 后将输入身份转移进 SealedEvaluationInput。既有同 ID Outcome 会复用，不覆盖其冻结事实。
     fn evaluate_with_retrospective(
         &self,
         lease: Option<&DaemonLease>,
         input: EvaluationInput,
         retrospective_draft: Option<&RetrospectiveDraft>,
     ) -> EvaluationRuntimeResult<EvaluationResult> {
+        // 入口先锁定 Paper purpose，再由 Rust 从原始观察密封 Outcome；已存在同一
+        // outcome_id 的 Artifact 会复用，避免重试产生第二份数值事实。
         self.require_paper(&input.permit.run_id)?;
         let outcome = materialize_outcome(&input.materialization)?;
         let now = Utc::now();
@@ -12,6 +21,7 @@ impl EvaluationRuntime {
             .store
             .outcome_for(&input.permit.run_id, &outcome.outcome_id)?
         {
+            // 恢复/重试时复用已存在的 Outcome CAS，不重新登记第二份 Outcome。
             existing
         } else {
             self.artifact(
@@ -42,6 +52,8 @@ impl EvaluationRuntime {
     }
 
     /// Uses the same eligibility, pair-consumption and policy transaction as T5.
+    // 已密封 Outcome 由 Artifact ID 从 Store 取回，再交给同一 evaluate_frozen Gate；
+    // Result 只有在资格计算与 fenced Store 提交均成功后才返回。
     pub fn evaluate_sealed_with_retrospective(
         &self,
         lease: Option<&DaemonLease>,
@@ -53,6 +65,9 @@ impl EvaluationRuntime {
         self.evaluate_frozen(lease, input, artifact, Some(draft), target_state)
     }
 
+    // 这是学习资格与持久化的核心：消费 input，借用可选 lease/draft，先重新读取并验证 CAS
+    // 闭包，再计算资格/状态，最后单次调用 Store 提交。任何前置 Err 都不会返回成功的
+    // EvaluationResult；Store 事务的原子范围以 record_policy_evaluation_fenced 为准。
     fn evaluate_frozen(
         &self,
         lease: Option<&DaemonLease>,
@@ -61,6 +76,8 @@ impl EvaluationRuntime {
         retrospective_draft: Option<&RetrospectiveDraft>,
         target_state: Option<PolicyState>,
     ) -> EvaluationRuntimeResult<EvaluationResult> {
+        // 这里重新从 CAS 读取 OutcomeSchedule、Outcome 和 retrospective draft，并逐项
+        // 校验 Run、T+5、subject 与候选 Policy 绑定；传入一个“看起来完成”的引用不足以越过这些 Gate。
         if input.outcome.kind != ArtifactKind::Outcome
             || outcome_artifact.kind != ArtifactKind::Outcome
             || outcome_artifact
@@ -83,12 +100,15 @@ impl EvaluationRuntime {
         let draft = retrospective_draft.ok_or(EvaluationError::InvalidMaterialization(
             "valid governed retrospective required for learning",
         ))?;
+        // Option::ok_or 把缺失叙事转换成明确错误；T+5 sealed 数值本身不自动取得学习资格。
         draft.validate()?;
 
         if input.hypothesis_id.trim().is_empty() {
             return Err(EvaluationError::EmptyHypothesis);
         }
         match (&input.subject, &input.candidate_policy) {
+            // Memory 不允许附 CandidatePolicy；Contract/Topology 必须提供一组基线与候选引用。
+            // match 同时借用两个枚举，以便校验后仍可继续使用 input 中原有值。
             (PolicySubject::Memory(_), None)
             | (PolicySubject::Contract(_), Some(_))
             | (PolicySubject::Topology(_), Some(_)) => {}
@@ -110,6 +130,10 @@ impl EvaluationRuntime {
             .store
             .policy_evaluation_for_outcome(&input.subject, &input.outcome)?
         {
+            // 幂等回放直接返回已记录 Evaluation、head 和 pair 计数；CandidatePolicy 需要与
+            // 原 Evaluation 精确关联，找不到时拒绝，不在恢复路径补造候选。
+            // 相同 subject/outcome 的重复请求走幂等读取路径；若要求 CandidatePolicy，
+            // 还必须找到与原 Evaluation 完全绑定的已记录 Artifact，否则报错而不补造。
             let evaluation: Evaluation =
                 serde_json::from_slice(&self.store.read_blob(&existing.blob)?)?;
             let mut candidate_policy = None;
@@ -187,6 +211,8 @@ impl EvaluationRuntime {
                 Ok(critique)
             })
             .collect::<EvaluationRuntimeResult<Vec<_>>>()?;
+        // 两条 map 闭包分别按 ArtifactRef 读取/反序列化 Claim 与 Critique；collect 是消费点，
+        // 任一来源不可读或领域校验失败会使整个闭包 Err，不会把部分列表用于研究资格判断。
         let research_sufficient = akzio_domain::research_coverage_is_complete(&claims, &critiques)
             && context.hard_blockers.is_empty()
             && !context
@@ -195,6 +221,8 @@ impl EvaluationRuntime {
         let quality_metrics_measured = self.policy.risk_recall_is_measured(&outcome)
             && self.policy.evidence_completeness_is_measured(&outcome)
             && research_sufficient;
+        // learning_eligible 同时需要风险真值、证据完整度和研究覆盖；缺一项只会让
+        // Experience 记录为不可学习，Outcome/Experience 本身仍可作为审计事实保留。
         let producer_contract_hashes = context
             .claims
             .iter()
@@ -240,8 +268,11 @@ impl EvaluationRuntime {
             .transpose()?
             .unwrap_or(false);
         let retrospective_artifact = if complete_retrospective {
+            // 已有完整叙事时保留原 Artifact；不以新的 draft 覆盖已密封历史。
             existing_retrospective.expect("complete retrospective")
         } else {
+            // 数值 Outcome 已存在但叙事不完整时，构造待提交 T5 叙事；可选 draft 仍需匹配
+            // 同一 outcome/T5，来源引用合并后排序去重以保留可审计闭包。
             let mut retrospective = Retrospective {
                 schema_version: DOMAIN_SCHEMA_VERSION,
                 outcome_id: outcome.outcome_id.clone(),
@@ -414,6 +445,8 @@ impl EvaluationRuntime {
                 )
             })
             .transpose()?;
+        // Option::map 只在有候选输入时构造 CandidatePolicy；transpose 把
+        // Option<Result<Artifact, _>> 转成 Result<Option<Artifact>, _>，因此候选校验失败会阻断提交。
         let candidate_policy_ref = candidate_policy_artifact.as_ref().map(reference);
         let next = next_state_with_fresh_pairs(
             current,
@@ -428,6 +461,7 @@ impl EvaluationRuntime {
         }
 
         let transition = if next == current {
+            // 状态未变化时不伪造 transition；变化时才构造确定性 transition ID。
             None
         } else {
             Some(PolicyTransition {
@@ -476,6 +510,11 @@ impl EvaluationRuntime {
                 },
             )?
             .policy_head;
+        // Store 在同一 SQLite Immediate 事务中校验 lease/permit、写入 Outcome、T5
+        // retrospective、Experience、Evaluation、可选 CandidatePolicy、Lesson evidence
+        // 和 policy cursor/transition；事务失败时不把内存里已构造的对象当成已提交。
+        // 随后的 LessonProposal 写入是逐条的后续 Store 操作：若其中一条失败，前一事务
+        // 已提交的 canonical Evaluation/Policy 不回滚，已成功写入的 Lesson 也保留并可审计。
         self.materialize_retrospective_lessons(
             &retrospective_for_lessons,
             &retrospective_payload,

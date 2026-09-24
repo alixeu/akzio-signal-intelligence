@@ -1,0 +1,581 @@
+{
+  "schemaVersion": 1,
+  "ok": false,
+  "command": "finalize",
+  "status": "skipped",
+  "type": "architecture",
+  "quality": "showcase",
+  "startedAt": "2026-09-29T06:35:15.689Z",
+  "specification": {
+    "path": "/Users/alixeu/project/akzio-signal-intelligence/.archify/akzio-process/candidate.json",
+    "sha256": "055f003a6e049cc14eb3e4a20e214c92b5aff121f881fa190d158b87cda118ac",
+    "bytes": 106937
+  },
+  "artifact": {
+    "path": "/Users/alixeu/project/akzio-signal-intelligence/.archify/akzio-process/akzio-complete-process.html",
+    "sha256": "2fd3c873dce44635d4ab9614289e40ccb1e10a6cd9bedaa5ec673e07df489c7d",
+    "bytes": 946199
+  },
+  "stages": {
+    "validate": {
+      "status": "pass",
+      "exitCode": 0,
+      "durationMs": null,
+      "execution": "embedded-in-deliver",
+      "command": [
+        "/Users/alixeu/.nvm/versions/node/v22.22.3/bin/node",
+        "/Users/alixeu/project/akzio-signal-intelligence/.agents/skills/archify/bin/archify.mjs",
+        "deliver",
+        "architecture",
+        "/Users/alixeu/project/akzio-signal-intelligence/.archify/akzio-process/candidate.json",
+        "/Users/alixeu/project/akzio-signal-intelligence/.archify/akzio-process/akzio-complete-process.html",
+        "--quality",
+        "showcase",
+        "--repo-root",
+        "/Users/alixeu/project/akzio-signal-intelligence",
+        "--json"
+      ],
+      "receipt": {
+        "schemaVersion": 1,
+        "ok": true,
+        "command": "validate",
+        "specification": {
+          "sha256": "055f003a6e049cc14eb3e4a20e214c92b5aff121f881fa190d158b87cda118ac",
+          "bytes": 106937
+        },
+        "validation": {
+          "checksPassed": 9,
+          "checkCount": 9,
+          "compositionProfile": "showcase",
+          "compositionStatus": "pass",
+          "errors": 0,
+          "warnings": 0
+        }
+      }
+    },
+    "deliver": {
+      "status": "pass",
+      "exitCode": 0,
+      "durationMs": 314,
+      "command": [
+        "/Users/alixeu/.nvm/versions/node/v22.22.3/bin/node",
+        "/Users/alixeu/project/akzio-signal-intelligence/.agents/skills/archify/bin/archify.mjs",
+        "deliver",
+        "architecture",
+        "/Users/alixeu/project/akzio-signal-intelligence/.archify/akzio-process/candidate.json",
+        "/Users/alixeu/project/akzio-signal-intelligence/.archify/akzio-process/akzio-complete-process.html",
+        "--quality",
+        "showcase",
+        "--repo-root",
+        "/Users/alixeu/project/akzio-signal-intelligence",
+        "--json"
+      ],
+      "receipt": {
+        "schemaVersion": 1,
+        "receiptId": "5425020c-7ffd-42bf-b6b9-7da4f299013c",
+        "ok": true,
+        "command": "deliver",
+        "type": "architecture",
+        "input": "/Users/alixeu/project/akzio-signal-intelligence/.archify/akzio-process/candidate.json",
+        "output": "/Users/alixeu/project/akzio-signal-intelligence/.archify/akzio-process/akzio-complete-process.html",
+        "specification": {
+          "sha256": "055f003a6e049cc14eb3e4a20e214c92b5aff121f881fa190d158b87cda118ac",
+          "bytes": 106937
+        },
+        "artifact": {
+          "sha256": "2fd3c873dce44635d4ab9614289e40ccb1e10a6cd9bedaa5ec673e07df489c7d",
+          "bytes": 946199
+        },
+        "validation": {
+          "checksPassed": 9,
+          "checkCount": 9,
+          "compositionProfile": "showcase",
+          "compositionStatus": "pass",
+          "errors": 0,
+          "warnings": 0
+        },
+        "evidence": {
+          "verified": true,
+          "repository": "https://github.com/alixeu/akzio-signal-intelligence",
+          "revision": "e4292f09acf5b3798bf16de26718ceb85046a190",
+          "references": 103,
+          "linkMode": "local-only"
+        },
+        "update": {
+          "status": "unavailable",
+          "installedVersion": null,
+          "availableVersion": null,
+          "releaseNotes": null,
+          "checkedAt": null,
+          "source": null,
+          "noticeRequired": false,
+          "noticeText": null,
+          "reason": "disabled"
+        }
+      }
+    },
+    "check": {
+      "status": "pass",
+      "exitCode": 0,
+      "durationMs": 97,
+      "command": [
+        "/Users/alixeu/.nvm/versions/node/v22.22.3/bin/node",
+        "/Users/alixeu/project/akzio-signal-intelligence/.agents/skills/archify/bin/archify.mjs",
+        "check",
+        "/Users/alixeu/project/akzio-signal-intelligence/.archify/akzio-process/akzio-complete-process.html",
+        "--require-provenance"
+      ],
+      "receipt": {
+        "ok": true,
+        "file": "/Users/alixeu/project/akzio-signal-intelligence/.archify/akzio-process/akzio-complete-process.html",
+        "artifact": {
+          "sha256": "2fd3c873dce44635d4ab9614289e40ccb1e10a6cd9bedaa5ec673e07df489c7d",
+          "bytes": 946199
+        },
+        "checks": [
+          {
+            "name": "single_svg",
+            "ok": true,
+            "details": [
+              "found 1 <svg> block(s)"
+            ]
+          },
+          {
+            "name": "finite_svg",
+            "ok": true,
+            "details": []
+          },
+          {
+            "name": "orthogonal_arrows",
+            "ok": true,
+            "details": []
+          },
+          {
+            "name": "label_route_clearance",
+            "ok": true,
+            "details": []
+          },
+          {
+            "name": "relationship_crossings",
+            "ok": true,
+            "details": []
+          },
+          {
+            "name": "relationship_corridors",
+            "ok": true,
+            "details": []
+          },
+          {
+            "name": "container_border_runs",
+            "ok": true,
+            "details": []
+          },
+          {
+            "name": "route_rhythm",
+            "ok": true,
+            "details": []
+          },
+          {
+            "name": "legend_clearance",
+            "ok": true,
+            "details": []
+          }
+        ],
+        "composition": {
+          "schemaVersion": 1,
+          "profile": "showcase",
+          "status": "pass",
+          "summary": {
+            "errors": 0,
+            "warnings": 0
+          },
+          "metrics": {
+            "properCrossings": 0,
+            "resolvedCrossovers": 6,
+            "ambiguousCorridors": 0,
+            "arrowheadCollisions": 0,
+            "containerBorderRuns": 0,
+            "labelRouteClearanceIssues": 0,
+            "labelCanvasOverflowIssues": 0,
+            "minLabelRouteClearance": 8,
+            "desktopReadabilityIssues": 0,
+            "viewportHeightIssues": 0,
+            "minProjectedNodeTextPx": 6.014551333872272,
+            "maxBends": 3,
+            "routesOverSuggestedBends": 5,
+            "maxStretch": 1.086,
+            "routesOverSuggestedStretch": 0,
+            "minSegmentPx": 13,
+            "minInteriorSegmentPx": 110,
+            "shortSegmentCount": 1,
+            "shortEndpointSegmentCount": 1,
+            "shortInteriorSegmentCount": 0,
+            "microSegmentCount": 0
+          },
+          "suggestedLimits": {
+            "bendsPerRelationship": 2,
+            "stretch": 1.35,
+            "segmentPx": 16,
+            "microSegmentPx": 8
+          },
+          "routeReview": {
+            "crossings": [
+              {
+                "left": {
+                  "id": "core-http",
+                  "from": "core",
+                  "to": "http",
+                  "label": "认证入口",
+                  "collectionIndex": 2,
+                  "artifactIndex": 3
+                },
+                "right": {
+                  "id": "http-paper-tick",
+                  "from": "http",
+                  "to": "scheduler",
+                  "label": "手动 Paper → tick",
+                  "collectionIndex": 5,
+                  "artifactIndex": 6
+                },
+                "point": [
+                  422.5,
+                  366
+                ],
+                "sharedNode": "http"
+              },
+              {
+                "left": {
+                  "id": "reviewer-decision",
+                  "from": "reviewer",
+                  "to": "decision",
+                  "label": "已审提案／12 预测",
+                  "collectionIndex": 17,
+                  "artifactIndex": 18
+                },
+                "right": {
+                  "id": "decision-position-end",
+                  "from": "decision",
+                  "to": "position_end",
+                  "label": "PositionPlan 止步",
+                  "collectionIndex": 18,
+                  "artifactIndex": 19
+                },
+                "point": [
+                  272.5,
+                  1426
+                ],
+                "sharedNode": "decision"
+              },
+              {
+                "left": {
+                  "id": "noorder-commit-nooutput",
+                  "from": "no_order",
+                  "to": "commitment",
+                  "label": "NoOutput",
+                  "collectionIndex": 21,
+                  "artifactIndex": 22
+                },
+                "right": {
+                  "id": "commit-reconcile-nooutput",
+                  "from": "commitment",
+                  "to": "reconcile",
+                  "label": "NoOrder：NoOutput",
+                  "collectionIndex": 24,
+                  "artifactIndex": 25
+                },
+                "point": [
+                  854,
+                  1526
+                ],
+                "sharedNode": "commitment"
+              },
+              {
+                "left": {
+                  "id": "commit-reconcile-nooutput",
+                  "from": "commitment",
+                  "to": "reconcile",
+                  "label": "NoOrder：NoOutput",
+                  "collectionIndex": 24,
+                  "artifactIndex": 25
+                },
+                "right": {
+                  "id": "dispatch-reconcile",
+                  "from": "dispatch",
+                  "to": "reconcile",
+                  "label": "回执与恢复",
+                  "collectionIndex": 26,
+                  "artifactIndex": 27
+                },
+                "point": [
+                  854,
+                  1636
+                ],
+                "sharedNode": "reconcile"
+              },
+              {
+                "left": {
+                  "id": "bins-candidate",
+                  "from": "bins",
+                  "to": "candidate_policy",
+                  "label": "冻结校准",
+                  "collectionIndex": 43,
+                  "artifactIndex": 44
+                },
+                "right": {
+                  "id": "risk-candidate",
+                  "from": "risk_fit",
+                  "to": "candidate_policy",
+                  "label": "风险矩阵",
+                  "collectionIndex": 44,
+                  "artifactIndex": 45
+                },
+                "point": [
+                  727.5,
+                  2776
+                ],
+                "sharedNode": "candidate_policy"
+              },
+              {
+                "left": {
+                  "id": "caps-decision",
+                  "from": "risk_cap",
+                  "to": "decision",
+                  "label": "整数正式目标",
+                  "collectionIndex": 54,
+                  "artifactIndex": 55
+                },
+                "right": {
+                  "id": "default-decision",
+                  "from": "default_policy",
+                  "to": "decision",
+                  "label": "零正式目标",
+                  "collectionIndex": 55,
+                  "artifactIndex": 56
+                },
+                "point": [
+                  429.5,
+                  1226
+                ],
+                "sharedNode": "decision"
+              }
+            ],
+            "detours": [
+              {
+                "relationship": {
+                  "id": "http-paper-tick",
+                  "from": "http",
+                  "to": "scheduler",
+                  "label": "手动 Paper → tick",
+                  "collectionIndex": 5,
+                  "artifactIndex": 6
+                },
+                "bends": 3,
+                "stretch": 1
+              },
+              {
+                "relationship": {
+                  "id": "reviewer-decision",
+                  "from": "reviewer",
+                  "to": "decision",
+                  "label": "已审提案／12 预测",
+                  "collectionIndex": 17,
+                  "artifactIndex": 18
+                },
+                "bends": 3,
+                "stretch": 1.081
+              },
+              {
+                "relationship": {
+                  "id": "dispatch-reconcile",
+                  "from": "dispatch",
+                  "to": "reconcile",
+                  "label": "回执与恢复",
+                  "collectionIndex": 26,
+                  "artifactIndex": 27
+                },
+                "bends": 3,
+                "stretch": 1
+              },
+              {
+                "relationship": {
+                  "id": "head-next-start",
+                  "from": "active_head",
+                  "to": "policy_snapshot",
+                  "label": "下一次 Core 启动读",
+                  "collectionIndex": 48,
+                  "artifactIndex": 49
+                },
+                "bends": 3,
+                "stretch": 1.023
+              },
+              {
+                "relationship": {
+                  "id": "caps-decision",
+                  "from": "risk_cap",
+                  "to": "decision",
+                  "label": "整数正式目标",
+                  "collectionIndex": 54,
+                  "artifactIndex": 55
+                },
+                "bends": 3,
+                "stretch": 1.086
+              }
+            ]
+          },
+          "leadingSpace": {
+            "measured": true,
+            "emptyTopPx": 25,
+            "emptyTopRatio": 0.008,
+            "occupiedTop": 25,
+            "viewBoxTop": 0,
+            "canvasHeight": 3210,
+            "typicalNodeHeight": 72,
+            "reviewSuggested": false
+          },
+          "desktopReadability": {
+            "budgetBasis": "legacy-930",
+            "readerContract": "declared-wide-v1",
+            "availableDiagramWidth": 930,
+            "actualBudgetPx": 930,
+            "limit": "legacy",
+            "requestedTargetPx": 7.5,
+            "requestedTargetMet": false,
+            "hardFloorPx": 6,
+            "hardFloorMet": true,
+            "minimumOwner": {
+              "kind": "edge",
+              "id": "app-core",
+              "from": "app",
+              "to": "core"
+            },
+            "minimumSourceTextPx": 8,
+            "minimumProjectedTextPx": 6.014551333872272,
+            "semanticTextCount": 150
+          },
+          "issues": []
+        },
+        "provenance": "current",
+        "deliveryReceiptId": "5425020c-7ffd-42bf-b6b9-7da4f299013c"
+      }
+    },
+    "browser-check": {
+      "status": "skipped",
+      "exitCode": 2,
+      "durationMs": 9,
+      "command": [
+        "/Users/alixeu/.nvm/versions/node/v22.22.3/bin/node",
+        "/Users/alixeu/project/akzio-signal-intelligence/.agents/skills/archify/bin/archify.mjs",
+        "browser-check",
+        "/Users/alixeu/project/akzio-signal-intelligence/.archify/akzio-process/akzio-complete-process.html",
+        "--json",
+        "--require-provenance",
+        "--out-dir",
+        "/Users/alixeu/project/akzio-signal-intelligence/.archify/akzio-process/review-3"
+      ],
+      "execution": "in-process",
+      "receipt": {
+        "schemaVersion": 1,
+        "ok": false,
+        "command": "browser-check",
+        "evidenceKind": "automated-browser",
+        "status": "skipped",
+        "visualReview": "not-requested",
+        "provenance": "current",
+        "deliveryReceiptId": "5425020c-7ffd-42bf-b6b9-7da4f299013c",
+        "artifact": {
+          "path": "/Users/alixeu/project/akzio-signal-intelligence/.archify/akzio-process/akzio-complete-process.html",
+          "sha256": "2fd3c873dce44635d4ab9614289e40ccb1e10a6cd9bedaa5ec673e07df489c7d",
+          "bytes": 946199
+        },
+        "state": {
+          "detail": "read",
+          "motion": "still"
+        },
+        "chrome": {
+          "status": "unavailable",
+          "executable": null
+        },
+        "diagnostics": [
+          {
+            "code": "viewer/chrome-unavailable",
+            "severity": "warning",
+            "message": "Chrome or Chromium is unavailable. Set ARCHIFY_CHROME to its executable path.",
+            "subject": {
+              "artifact": "/Users/alixeu/project/akzio-signal-intelligence/.archify/akzio-process/akzio-complete-process.html"
+            },
+            "evidence": {
+              "executable": null
+            },
+            "supportedFixes": [
+              "set ARCHIFY_CHROME to a Chrome or Chromium executable and rerun browser-check"
+            ]
+          }
+        ],
+        "containment": {
+          "status": "skipped",
+          "policy": "fit-or-reader-declared-readable-vertical-scroll",
+          "viewports": []
+        },
+        "themeStates": {
+          "status": "skipped",
+          "viewports": []
+        },
+        "readability": {
+          "status": "skipped",
+          "minimumProjectedNodeTextPx": 6,
+          "viewports": []
+        },
+        "viewerChrome": {
+          "status": "skipped",
+          "viewports": []
+        },
+        "captures": {
+          "status": "not-requested",
+          "screenshots": [],
+          "contactSheet": null
+        },
+        "sidecars": {
+          "directory": "/Users/alixeu/project/akzio-signal-intelligence/.archify/akzio-process/review-3",
+          "receipt": "akzio-complete-process.browser-check.json",
+          "files": []
+        },
+        "error": "Chrome or Chromium is unavailable. Set ARCHIFY_CHROME to its executable path."
+      }
+    }
+  },
+  "diagnostics": [
+    {
+      "code": "viewer/chrome-unavailable",
+      "severity": "warning",
+      "message": "Chrome or Chromium is unavailable. Set ARCHIFY_CHROME to its executable path.",
+      "subject": {
+        "artifact": "/Users/alixeu/project/akzio-signal-intelligence/.archify/akzio-process/akzio-complete-process.html"
+      },
+      "evidence": {
+        "executable": null
+      },
+      "supportedFixes": [
+        "set ARCHIFY_CHROME to a Chrome or Chromium executable and rerun browser-check"
+      ]
+    }
+  ],
+  "evidence": {
+    "receipt": "/Users/alixeu/project/akzio-signal-intelligence/.archify/akzio-process/review-3/akzio-complete-process.finalize.json",
+    "summaryReceipt": "/Users/alixeu/project/akzio-signal-intelligence/.archify/akzio-process/review-3/akzio-complete-process.finalize-summary.json",
+    "browserCheckReceipt": "/Users/alixeu/project/akzio-signal-intelligence/.archify/akzio-process/review-3/akzio-complete-process.browser-check.json"
+  },
+  "visualReview": "not-requested",
+  "failedStage": "browser-check",
+  "finishedAt": "2026-09-29T06:35:16.176Z",
+  "durationMs": 487,
+  "update": {
+    "status": "current",
+    "installedVersion": "3.0.1",
+    "availableVersion": "3.0.1",
+    "releaseNotes": null,
+    "checkedAt": "2026-09-29T03:14:02.245Z",
+    "source": "cache",
+    "noticeRequired": false,
+    "noticeText": null
+  }
+}

@@ -1,3 +1,7 @@
+// 文件导读：release evidence 是 canonical Store 的只读投影，聚合 workflow、approval、
+// execution、Outcome、learning 和 broker lineage；expectations 只作比较门槛，不补造证据。
+// 建议先读 release_evidence_bundle 的来源收集和 completeness/fixture 分支，再看底部 helper；
+// 多个 Store API 分别读取，不是一个跨方法 SQLite 快照，也不写 Artifact 或激活 Policy。
 use super::*;
 
 const SCHEDULER_LEASE_NAME: &str = "akzio.local.scheduler";
@@ -13,6 +17,9 @@ impl Store {
         run_id: &RunId,
         expectations: &ReleaseEvidenceExpectations,
     ) -> StoreResult<ReleaseEvidenceBundle> {
+        // 输入 Run 与可选期望 hash/owner/epoch；None 表示该项不设比较门槛，绝不代填真实证据。
+        // workflow/session/approval/lease/trajectory 经多个只读入口依次读取，之后另持连接查 Artifact；
+        // 这些步骤没有共同 Transaction，因此结果是组合投影，不保证跨独立连接的同一时点快照。
         let workflow = self.workflow_snapshot(run_id)?;
         let session = self.session_slot_for_run(run_id)?;
         let approval = self.paper_approval_for_run(run_id)?;
@@ -144,6 +151,7 @@ impl Store {
             .map(|artifact| self.read_artifact_payload::<Reconciliation>(artifact))
             .transpose()?;
         if let Some(payload) = &reconciliation_payload {
+            // 只沿 Reconciliation 明确列出的 receipt refs 解码并验证成交身份，不从接受回执推断填满。
             for receipt_ref in &payload.broker_receipts {
                 let artifact = self.artifact(&receipt_ref.artifact_id)?;
                 let receipt: OrderReceipt = self.read_artifact_payload(&artifact)?;
@@ -175,6 +183,8 @@ impl Store {
             .as_ref()
             .map(|account_fingerprint| ReleaseBrokerEvidence {
                 account_fingerprint: account_fingerprint.clone(),
+                // 当前仅根据 fixture 字符串排除和非空 receipt identity 把投影标为 RealBroker；
+                // 这不是独立 Broker 身份证明，更不能仅凭 approval/commitment/receipt ID 证明成交。
                 trust: if !offline_fixture && !order_identities.is_empty() {
                     ReleaseBrokerEvidenceTrust::RealBroker
                 } else {
@@ -214,6 +224,7 @@ impl Store {
         let mut outcomes = BTreeMap::new();
         let outcome_artifact = self.outcome_for_run(run_id)?;
         if let Some(artifact) = &outcome_artifact {
+            // Outcome 必须 sealed 且有 sealed_at；逐 horizon 记录同一 Artifact 的已持久交易日窗口。
             let outcome: Outcome = self.read_artifact_payload(artifact)?;
             outcome.validate_sealed()?;
             let sealed_at = outcome
@@ -262,6 +273,7 @@ impl Store {
         let post_outcome_approval = self
             .latest_artifact_by_kind(ArtifactKind::PostOutcomeResearchApproval)?
             .and_then(|artifact| {
+                // 此可选展示分支把 payload 解码/校验失败收敛为 None，不会阻断其余 release evidence。
                 if let Ok(payload) =
                     self.read_artifact_payload::<PostOutcomeResearchApproval>(&artifact)
                 {
@@ -361,6 +373,8 @@ impl Store {
     }
 }
 
+// 输入 SQL 连接、Run 和 kind；先读取该 kind 全集，再按 origin.run_id 在 Rust 侧精确筛选。
+// 因而 kind 过滤由 SQL 完成，Run 过滤不是额外的 SQL JOIN；所有读取错误整批传播。
 fn run_artifacts(
     connection: &Connection,
     run_id: &RunId,
@@ -378,6 +392,7 @@ fn run_artifacts(
         .collect())
 }
 
+// 在 run_artifacts 结果上只保留 Canonical lifecycle；RunScoped/Debug 内容不升级为 canonical。
 fn canonical_run_artifacts(
     connection: &Connection,
     run_id: &RunId,
@@ -389,6 +404,8 @@ fn canonical_run_artifacts(
         .collect())
 }
 
+// 将 manifest 的 `commit+state-hash` 字符串拆成 commit 与 clean/dirty 标记；
+// 缺少 `+` 时保守返回 dirty=true，不尝试调用 Git 或读取工作区。
 fn repository_state(code_revision: &str) -> (String, bool) {
     match code_revision.split_once('+') {
         Some((commit, state_hash)) => (commit.to_owned(), state_hash != CLEAN_WORKTREE_HASH),
@@ -396,6 +413,8 @@ fn repository_state(code_revision: &str) -> (String, bool) {
     }
 }
 
+// 读取该 Run 最近一条带 transition_id 的 evaluation；没有转换返回 None，
+// SQL 以 event_cursor DESC 选择最新行，JSON/state/hash/time 任一坏值都返回 Err。
 fn release_learning_evidence(
     connection: &Connection,
     run_id: &RunId,
@@ -436,6 +455,8 @@ fn release_learning_evidence(
     .transpose()
 }
 
+// 用输入创建时间起步，再对已知 session、lease expiry、Outcome artifact 时间取最大值；
+// 该值是投影的材料时间边界，不是本函数结束时读取的系统当前时间。
 fn release_materialized_at(
     created_at: DateTime<Utc>,
     session: &Option<SessionSlot>,

@@ -1,3 +1,7 @@
+// 文件导读：定义独立风险真值评估及 reviewer/verifier 身份、来源闭包和密封时间校验。
+// 真值不能从 Decision 自身推导；这里检验声明的身份/来源引用和时效，
+// 不能仅凭字符串不相同就证明现实中的 reviewer/verifier 实际独立。
+// `validate_sealed_at` 还会把具体使用时点与封存/有效期比较；普通 validate 成功本身不表示评估已 sealed。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RiskAssessmentAuthority {
     pub identity: String,
@@ -5,6 +9,7 @@ pub struct RiskAssessmentAuthority {
 }
 
 impl RiskAssessmentAuthority {
+    // reviewer/verifier 的身份和版本必须非空。
     fn validate(&self, field: &'static str) -> Result<(), DomainError> {
         if self.identity.trim().is_empty() || self.version.trim().is_empty() {
             return Err(DomainError::EmptyField { field });
@@ -15,8 +20,9 @@ impl RiskAssessmentAuthority {
 
 /// Independently reviewed risk ground truth for one realized outcome horizon.
 ///
-/// Expected risks come from `basis_refs`, not from the evaluated Decision.
-/// Detected risks are the independently audited subset found in that Decision.
+/// The reviewer declares expected risks with `basis_refs`, not by reading the
+/// evaluated Decision as ground truth. This type checks identities, kinds and
+/// set relations; it does not derive the risk labels from those references.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RiskGroundTruthAssessment {
     pub schema_version: u32,
@@ -36,6 +42,7 @@ pub struct RiskGroundTruthAssessment {
 }
 
 impl RiskGroundTruthAssessment {
+    // 校验引用 kind、评估独立性、basis 排序/类型、风险集合关系和有效时间窗口。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION {
             return Err(DomainError::EmptyField {
@@ -118,6 +125,7 @@ impl RiskGroundTruthAssessment {
         Ok(())
     }
 
+    // 先做普通校验，再确认已经 sealed，且 used_at 位于封存后和有效期内。
     pub fn validate_sealed_at(&self, used_at: DateTime<Utc>) -> Result<(), DomainError> {
         self.validate()?;
         let Some(sealed_at) = self.sealed_at else {
@@ -133,16 +141,18 @@ impl RiskGroundTruthAssessment {
         Ok(())
     }
 
+    // 返回独立评估列出的期望风险数量。
     pub fn expected_count(&self) -> u64 {
         self.expected_risk_ids.len() as u64
     }
 
+    // 返回独立评估实际检测到的风险数量。
     pub fn detected_count(&self) -> u64 {
         self.detected_risk_ids.len() as u64
     }
 }
 
 fn identities_match(left: &str, right: &str) -> bool {
+    // 忽略首尾空白和大小写比较身份，避免同一主体通过格式差异绕过独立性检查。
     left.trim().eq_ignore_ascii_case(right.trim())
 }
-

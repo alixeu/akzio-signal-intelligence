@@ -6,11 +6,11 @@ Core/CLI/App 的 Blueprint、checkpoint 和分页 journal 入口见 [Workflow Ru
 
 ## 入口与隔离
 
-真实 PositionPlan、隔离配置、打包和验证命令统一见 [开发 Workflow](development-workflow.md)。PositionPlan 在 Decision 后结束；缺 policy 时只有显式 research-only 才能执行研究，不能放行 Decision。Paper 调试与执行授权见 [运行时契约](agent-runtime-contract.md) 第 12 节。
+正式 PositionPlan 和 Paper 的运行客户端见 [开发 Workflow](development-workflow.md)；本文件仅描述独立的隔离 Debug 控制。正式 PositionPlan 在 Decision 后结束，缺 Policy 时仍可保留研究分配并以零正式目标完成；缺 Policy 的隔离 Debug Session 则只能手动执行研究，不能放行 Decision。Paper 调试与执行授权见 [运行时契约](agent-runtime-contract.md) 第 12 节。
 
 Debug Core 必须使用 `.akzio/` 下的新隔离 Store，设置 `debug_control=true`、`auto_paper=false`；不得打开 `~/.akzio/store`。Store 隔离标记不能通过重启为普通 Core 移除。真实模型使用对应配置启动 `daemon serve`；`debug serve-fixture` 只服务离线 fixture，不构成真实模型验证。
 
-自动离线验收使用 `debug verify-fixture`，在新隔离 Store 上完成正式 PositionPlan 图及 Store Doctor。真实模型与数据的原生 Paper 执行使用启动器 `--paper`，经正式 Paper 图提交到 Alpaca Paper 并等待成交；原审批与全部 Gate 仍生效，缺 Policy 时保留零执行目标与 NoOrder。旧 `-fakerOnline` / `--faker-online` 参数被拒绝，历史 `simulated_only` 身份不再允许 Broker 执行。命令、归档与配置细节统一见开发 Workflow。
+自动离线验收使用 `debug verify-fixture`，在新隔离 Store 上完成正式 PositionPlan 图及 Store Doctor。`scripts/run_core.py --mode paper` 改为连接已有**正式** Core，不属于这里的 Debug 控制；原审批和全部 Gate 通过后才可能向 Alpaca Paper 下单，缺 Policy 时保持零执行目标与 NoOrder。旧 `-fakerOnline` / `--faker-online` 参数被拒绝，历史 `simulated_only` 身份不再允许 Broker 执行。命令、归档与配置细节统一见开发 Workflow。
 
 Planner / PaperDryRun 的旧创建命令和 fixture 图已删除，旧运行只保留读取与审计；执行控制返回 `legacy_workflow_retired`。完整删除与兼容边界见 [研究协议退役清单](research-protocol-retirement.md)。
 
@@ -63,6 +63,6 @@ Manual 模式最后一个 T0 节点结束仍显示 Paused，业务 workflow comp
 
 Outcome processing 独立于新 T0 的 auto_paper 开关，仍只处理合法 Paper purpose，依据四资产共同完成的真实交易 Session 推进 T1/T3/T5。隔离实验不能激活 canonical policy 或 Active Lesson。业务成功、Acceptance 测试结果和真实模型/Paper/跨交易日验证是分别记录的事实；未运行的检查不能标为通过。
 
-`--paper` 启动器启用 Outcome worker，关闭自动创建 Paper run，并保留隔离 Store。观察窗口结束会停止本次 Core；待成交订单和未成熟 Outcome 需要使用保留配置重新启动 Core、恢复同一 Run 后继续处理。隔离 Store 的 readiness 明确报告 `isolated_debug_store` 和 `use_canonical_store`；其中的运行不能计入正式校准样本，等待或完成隔离 Outcome 都不会解除此限制。
+正式运行脚本不启停 Core、不调整 Outcome worker 或 `auto_paper`，待成交对账与未成熟 Outcome 由已运行的正式 Core 继续推进。隔离 Debug Store 的 readiness 明确报告 `isolated_debug_store` 和 `use_canonical_store`；其中的运行不能计入正式校准样本，等待或完成隔离 Outcome 都不会解除此限制。
 
 导出遵循 Core 脱敏与读取授权；配置、Store、API key、认证 header、Broker secret 和 token 不应进入分享产物。运行是否完成与导出是否完整分别核验，具体以开发 Workflow 的 FINAL_STATUS / EXPORT_STATUS 说明为准。

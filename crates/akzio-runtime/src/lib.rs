@@ -3,6 +3,10 @@
 //! Rust proposals are lowered through immutable recipes and mandatory
 //! terminal gates.
 
+// Runtime 是固定拓扑与任务状态的唯一编译权威：模型/WorkflowProposal 只能提供研究
+// 节点候选，Rust 会补 Evidence/Decision/Execution/Paper/Reconcile/Evaluate Gate，
+// 并通过 Store 事件、lease、checkpoint 和 CAS 维护恢复边界。这里的 topology hash
+// 覆盖编译与执行代码，注释变更会形成新的 runtime identity，不会改写旧 Run。
 mod runtime;
 
 pub use crate::runtime::{
@@ -18,6 +22,8 @@ pub use crate::runtime::{
 use akzio_domain::ContentHash;
 
 pub fn topology_component_hash() -> ContentHash {
+    // 组件顺序和路径是固定的；哈希用于 RuntimeManifest/approval identity，不能
+    // 被用来声称某个图已经执行、成交或完成 Outcome。
     let components: &[(&str, &[u8])] = &[
         (
             "workflow_definition",
@@ -75,6 +81,7 @@ pub fn topology_component_hash() -> ContentHash {
         ("crates/akzio-runtime/src/lib.rs", include_bytes!("lib.rs")),
     ];
     let mut bytes = Vec::new();
+    // 将 path 与 bytes 交错编码，避免不同文件边界拼接出相同的哈希输入。
     for (path, component) in components {
         bytes.extend_from_slice(path.as_bytes());
         bytes.push(0);

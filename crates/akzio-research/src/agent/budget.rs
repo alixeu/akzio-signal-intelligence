@@ -1,3 +1,7 @@
+// 本文件把 Provider telemetry 计入冻结 Task 的累计 token/成本账本；Attempt
+// 墙钟独立计算。估算值用于 fixture 或缺省输入；真实 Provider 缺少 token
+// 总量时会留下 unknown 状态，禁止未经核算的 retry。cached/reasoning
+// 只是分项成本信息，不能突破总 input/output 上限。
 const TOKENS_PER_MILLION: u128 = 1_000_000;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -17,6 +21,8 @@ fn budget_policy_hash(
 }
 
 fn validate_budget_policy(policy: &ModelBudgetPolicy) -> ResearchResult<()> {
+    // 只要声明价格或硬成本上限，就必须同时冻结非空路由和 pricing snapshot，
+    // 这样恢复时可以比较同一政策哈希，而不是用今天的价格重算历史消耗。
     if (policy.pricing.is_some() || policy.max_cost_micros.is_some())
         && policy
             .route_identity
@@ -42,6 +48,8 @@ fn resolve_model_usage(
     estimated_output: u32,
     telemetry: Option<&AgentTurnTelemetry>,
 ) -> ResolvedModelUsage {
+    // telemetry 优先；只有没有 telemetry 的离线 fixture 才回退到 JSON 估算。
+    // 该回退不会伪造真实 Provider 的未知用量，因为真实适配器会先拒绝缺失总量。
     let usage = telemetry.map_or_else(ModelUsage::default, |telemetry| ModelUsage {
         input_tokens: telemetry.input_tokens,
         cached_input_tokens: telemetry.cached_input_tokens,
@@ -91,6 +99,8 @@ fn usage_cost_micros(
     usage: ResolvedModelUsage,
     pricing: &ModelPricingSnapshot,
 ) -> ResearchResult<u64> {
+    // cached input 与 reasoning output 只有在不超过各自总量时才可拆分计价；
+    // 发现 Provider 自相矛盾即返回错误，不以较小值“修正”外部事实。
     let (uncached_input, cached_input, input_rate, cached_rate) = match usage.cached_input_tokens {
         Some(cached) if cached <= usage.input_tokens => (
             usage.input_tokens - cached,
@@ -150,6 +160,8 @@ fn affordable_output_tokens(
     remaining_cost_micros: u64,
     pricing: &ModelPricingSnapshot,
 ) -> u64 {
+    // 输出 cap 是在预扣本次输入成本后计算的，且使用更保守的非零费率；零费率
+    // 表示成本上限对输出没有额外约束；冻结 Task 的 token cap 仍由调用方执行。
     let rate = pricing
         .output_micros_per_million_tokens
         .max(pricing.reasoning_micros_per_million_tokens);

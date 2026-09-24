@@ -1,3 +1,8 @@
+// 文件导读：research_audit 从本 Run 事件可见的 proposal/review/supplement/context coverage
+// Artifact 构造审计记录，记录列表本身不要求每项都是成功 Attempt 输出；
+// progress/final_proposal_review 才另以 committed output 限定审查资格，不替 Decision 计算结果。
+// build_research_audit 负责脱敏前的结构投影，research_progress 把持久 Task/Review 汇成状态；
+// Store::research_audit 提供单个 Deferred 只读快照，final_proposal_review 则面向 DecisionGate 做来源复核。
 use super::*;
 use akzio_domain::{ContextManifestPayload, ProposalReview};
 
@@ -25,6 +30,8 @@ pub(super) fn build_research_audit(
     progress: serde_json::Value,
     artifacts: &[(&Artifact, &serde_json::Value)],
 ) -> ResearchAudit {
+    // 输入 artifacts 是调用方已从 SQL 事件和 CAS 取出的借用对；先按 kind/producer 白名单过滤，
+    // 输出保留 Artifact metadata/source refs 并克隆 payload，避免改动调用方持有的 JSON。
     let records = artifacts
         .iter()
         .filter(|(a, _)| {
@@ -42,6 +49,8 @@ pub(super) fn build_research_audit(
         })
         .map(|(a, payload)| {
             let task_id = a.origin.as_ref().and_then(|o| o.task_id.clone());
+            // revision 仅能从 origin.task_id 回连到 workflow.tasks，再用投影节点 spec 读取；
+            // 缺任一环节时保留 None，不从 payload 或时间猜测 revision。
             let revision = task_id
                 .as_ref()
                 .and_then(|id| {
@@ -54,7 +63,9 @@ pub(super) fn build_research_audit(
                 .and_then(|s| s.proposal_revision);
             let mut payload = (*payload).clone();
             if a.kind == ArtifactKind::ProposalReview {
+                // 能完整反序列化为 ProposalReview 时，附加领域稳定 issue ID；旧/不兼容 payload 保持原样。
                 if let Ok(review) = serde_json::from_value::<ProposalReview>(payload.clone()) {
+                    // flat issue_ids 汇总所有 assessment；下面再按原数组位置写回便于 UI 定位。
                     payload["issue_ids"] = serde_json::json!(review
                         .assessments
                         .iter()
@@ -92,15 +103,18 @@ pub(super) fn build_research_audit(
 }
 
 impl Store {
-    /// Complete run-scoped audit, independent of the Observer trajectory window.
-    /// Immutable CAS payloads and scheduling state are read from one SQL snapshot.
+    /// 不受 Observer trajectory 分页窗口限制的研究白名单审计；
+    /// 它不导出本 Run 所有 Artifact。CAS payload 与调度状态在一份 SQL 快照内读取。
     pub fn research_audit(&self, run_id: &RunId) -> StoreResult<ResearchAudit> {
+        // 一个 Deferred 事务内取得 workflow、事件关联 Artifact、成功 Attempt outputs 和 Debug identity；
+        // 任何 SQL/hash/JSON硬错误中止整次审计，成功后才提交只读事务并返回派生 JSON。
         let mut connection = self.connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
         let workflow = serde_json::to_value(self.workflow_snapshot_with_connection(&tx, run_id)?)?;
         let ids = tx.prepare("SELECT DISTINCT a.artifact_id FROM rebuild_artifacts a JOIN rebuild_events e ON e.artifact_id=a.artifact_id WHERE e.run_id=?1 AND (a.kind IN ('decision_proposal','proposal_review') OR a.producer IN ('context.coverage','learning.retrieval.audit','learning.revalidation.suggestion','research.revision.stop') OR a.producer LIKE 'research.supplement.%') ORDER BY a.created_at,a.artifact_id")?
             .query_map(params![run_id.0], |row| row.get::<_,String>(0))?.collect::<Result<Vec<_>,_>>()?;
         let mut artifacts = Vec::new();
+        // DISTINCT + event.run_id 限定该 Run 中被事件观察到的审计 Artifact；按 created_at/id 稳定顺序读。
         for id in ids {
             let artifact = read_artifact(&tx, &ArtifactId(ContentHash::new(id)?))?;
             let value: serde_json::Value = serde_json::from_slice(&blob::read_blob_bytes(
@@ -115,6 +129,8 @@ impl Store {
             .into_iter().map(|id| Ok(ArtifactId(ContentHash::new(id)?))).collect::<StoreResult<BTreeSet<_>>>()?;
         let missing = debug::read_session(&tx, run_id)?
             .is_some_and(|s| s.identity.research_only_without_policy());
+        // committed 作为成功 Attempt 的输出白名单；本次结果只报告 research_only_without_policy，
+        // 不会因研究状态推断 calibration 或正式 Decision 已获准。
         let refs = artifacts.iter().map(|(a, v)| (a, v)).collect::<Vec<_>>();
         let progress = research_progress(
             workflow["tasks"]
@@ -137,6 +153,8 @@ pub(super) fn research_progress(
     committed: &BTreeSet<ArtifactId>,
     policy_missing: bool,
 ) -> serde_json::Value {
+    // tasks 与 reviews 均为借用输入；先按 recipe 选研究阶段，completed 需所有项 succeeded/skipped，
+    // 而失败、缺审查、policy 缺失分别进入 blocked_reasons，不彼此覆盖。
     use serde_json::json;
     let research = tasks
         .iter()
@@ -171,6 +189,8 @@ pub(super) fn research_progress(
             ))
         })
         .max_by_key(|(revision, _)| *revision);
+    // 只从 committed 成功输出中解析 ProposalReview；无效 JSON / 缺失 origin 或 task 会被 filter_map 丢弃，
+    // 而不是伪造一个拒绝结论。
     let review_failed = research.iter().any(|t| {
         t["node"]["recipe_id"] == akzio_domain::RESEARCH_PROPOSAL_REVIEWER_RECIPE_ID
             && t["status"] == "failed"
@@ -213,6 +233,7 @@ pub(super) fn research_progress(
     } else {
         "not_reached"
     };
+    // 展示字符串只把上面的离散状态翻译成人类可读文本；后面的计数仍基于 committed Artifact 集。
     let research_status = if failed {
         "failed"
     } else if complete {
@@ -251,13 +272,16 @@ pub(super) fn research_progress(
 }
 
 impl Store {
-    /// Only committed successful outputs of dependency tasks can authorize Decision.
-    /// Staged, failed, cross-Run or earlier reviews cannot substitute for the final one.
+    /// 只从依赖闭包内的成功 Attempt 输出恢复最新 ProposalReview。
+    /// 返回已核对来源的 Review 不等于审查通过，更不单独授权 Decision/Execution；
+    /// staged、失败或跨 Run 产物不能替代此候选。
     pub fn final_proposal_review(
         &self,
         run_id: &RunId,
         task_id: &TaskId,
     ) -> StoreResult<Option<(Artifact, ProposalReview)>> {
+        // 先取 Run workflow，再从目标 Decision Task 的依赖边向上遍历；这些后续 Artifact 查询各自只读，
+        // 本函数没有把整个遍历包在一份跨查询 SQLite 事务里。
         let snapshot = self.workflow_snapshot(run_id)?;
         let current = snapshot
             .tasks
@@ -267,6 +291,7 @@ impl Store {
         let mut pending = current.node.dependencies.clone();
         let mut visited = BTreeSet::new();
         let mut reviews = Vec::new();
+        // pending 是尚未访问的依赖 Task ID；visited 防止重复边重复检查，非 succeeded 祖先不贡献 Review。
         while let Some(id) = pending.pop() {
             if !visited.insert(id.clone()) {
                 continue;
@@ -284,6 +309,7 @@ impl Store {
                 if artifact.kind != ArtifactKind::ProposalReview {
                     continue;
                 }
+                // Review 的 frozen proposal_revision 来自其 Task spec；payload 合同版本由已安装 Contract 校验。
                 let revision = task
                     .node
                     .execution_spec()
@@ -316,6 +342,8 @@ impl Store {
                 let manifest = self.artifact(&review.manifest.artifact_id)?;
                 let context: ContextManifestPayload =
                     serde_json::from_slice(&self.read_blob(&manifest.blob)?)?;
+                // 下列条件共同把 Review 锁定到本 Run 的成功 Synthesizer Proposal 和实际提交的 ContextManifest；
+                // Artifact 存在或模型输出可解码本身不够。
                 let proposal_task = proposal
                     .origin
                     .as_ref()
@@ -356,6 +384,7 @@ impl Store {
                 reviews.push((revision, artifact, review));
             }
         }
+        // 对祖先 Review 按冻结 revision 升序；同 revision 多个候选是歧义而非随意选一个。
         reviews.sort_by_key(|(revision, _, _)| *revision);
         if reviews.windows(2).any(|v| v[0].0 == v[1].0) {
             return Err(StoreError::Integrity(

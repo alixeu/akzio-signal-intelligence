@@ -1,3 +1,7 @@
+// 这些辅助方法把模型输出转成可审计 Artifact：deliberation 是 RunScoped 说明，
+// 不是新的权威证据；Turn trace 记录 request/capability/budget identity，供恢复和
+// replay 对照；StoreExecutor 把同步 Store 操作排入队列，逐次 await 不等于
+// 多次写入合成一个事务，也不能替代模型返回后的业务校验。
 impl AgentRuntime {
     fn extract_deliberation(
         &self,
@@ -7,6 +11,8 @@ impl AgentRuntime {
         output: Value,
         now: DateTime<Utc>,
     ) -> ResearchResult<(Value, Option<Artifact>)> {
+        // 先解析完整 envelope，再把 basis ID 限制在本次 Manifest。模型自报 confidence
+        // 不能写入 Artifact provenance，否则会影响后续 Context 排序并形成自授信。
         if contract.deliberation_policy == DeliberationPolicy::Disabled {
             return Ok((output, None));
         }
@@ -62,7 +68,7 @@ impl AgentRuntime {
                 // Provenance confidence is Rust-owned. It must not carry the
                 // model's self-reported `deliberation.confidence_ppm`, because
                 // ContextManifest selection ranks candidates by this field
-// (`akzio-context` context_broker/manifest.rs), which would let an
+                // (`akzio-context` context_broker/manifest.rs), which would let an
                 // agent raise its own note's selection priority in later turns.
                 // The self-report stays inside the note payload.
                 confidence_ppm: 1_000_000,
@@ -90,6 +96,8 @@ impl AgentRuntime {
         effective_budget: &TaskBudget,
         now: DateTime<Utc>,
     ) -> ResearchResult<ContextMaterialization> {
+        // materialization identity 同时绑定 Manifest、Grant、Contract 和预算；
+        // 后续 continuation/recovery 只接受同一 identity，不会把新上下文拼进旧 Attempt。
         if !manifest.grant.matches_permit(permit) {
             return Err(ResearchError::GrantPermitMismatch);
         }
@@ -113,6 +121,8 @@ impl AgentRuntime {
     }
 
     async fn observe_debug_budget(&self,permit:&TaskWritePermit,budget:&AgentRunBudget,boundary:&str)->ResearchResult<()> {
+        // Debug budget 是 observation-only StageAcceptance，不改变预算，也不表示
+        // 当前 Agent 或 Run 已通过业务验收。
         let permit=permit.clone();let snapshot=budget.debug_observation(boundary);
         self.store_executor.execute(move|store|store.observe_debug_budget(&permit,&snapshot,chrono::Utc::now())).await??;
         Ok(())
@@ -125,6 +135,8 @@ impl AgentRuntime {
         response: &AgentModelTurn,
         runtime_snapshot: &AgentTurnRuntimeSnapshot,
     ) -> ResearchResult<Artifact> {
+        // completed trace 先写入 shared Store，再由 Store 发出 AgentTurnCompleted；
+        // response 只是模型事实，正式输出 Artifact 仍要经过 Submit validation。
         let request_hash = model_request_hash(request)?;
         let request = request.clone();
         let response = response.clone();
@@ -160,6 +172,8 @@ impl AgentRuntime {
         will_retry: bool,
         runtime_snapshot: &AgentTurnRuntimeSnapshot,
     ) -> ResearchResult<Artifact> {
+        // 失败 trace 保留 error_detail、debug trace 和 will_retry，便于恢复判断；
+        // 即使可重试，也不会把这次已经发生的 Provider 调用从审计账本删除。
         let request_hash = model_request_hash(request)?;
         let request = request.clone();
         let error_class = error_class.to_owned();
@@ -204,6 +218,9 @@ impl TurnRecord {
         request_hash: &akzio_domain::ContentHash,
         runtime_snapshot: &AgentTurnRuntimeSnapshot,
     ) -> Value {
+        // request/domain_request 保存模型可见的 prompt、Context projection 和工具输出；
+        // 它们不是 HTTP Authorization header，却也不是可公开的脱敏文本。只有 Debug
+        // 时另存 provider wire/原文到 model_debug；RunScoped trace 仍须按权限审计。
         json!({
             "trace_schema_version": 1,
             "turn": self.turn,
@@ -237,6 +254,8 @@ impl TurnRecord {
     }
 
     fn stage_artifact(&self, store: &Store, trace: &Value) -> ResearchResult<Artifact> {
+        // AgentTurn 的 origin 精确指向 Run/Task/Attempt/Contract，source_refs 只连
+        // ContextManifest；模型输出和后续 Deliberation/Claim 的血缘由上层继续扩展。
         Ok(Artifact::new(
             ArtifactKind::AgentTurn,
             store.stage_json(trace)?,

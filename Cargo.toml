@@ -1,4 +1,7 @@
+# 文件职责：声明 Akzio v2 的 Rust workspace、固定工具链兼容版本和共享依赖版本。
+# 成员列表决定 crate 编译边界；本文件不定义运行时状态、Prompt 或 Paper 权限。
 [workspace]
+# 每个成员是独立 crate；CLI/Daemon 通过本地依赖组合这些职责，不合并为一个二进制 crate。
 members = [
     "crates/akzio-domain",
     "crates/akzio-store",
@@ -12,15 +15,18 @@ members = [
     "crates/akzio-daemon",
     "crates/akzio-cli",
 ]
+# resolver 2 分开处理不同目标/feature 的依赖特性，避免测试目标的 feature 无条件泄漏到普通构建。
 resolver = "2"
 
 [workspace.package]
+# crate manifest 用 `.workspace = true` 继承这些包级默认值；工具链版本仍由 rust-toolchain.toml 锁定。
 edition = "2021"
 rust-version = "1.96"
 license = "MIT"
 publish = false
 
 [workspace.dependencies]
+# 统一依赖版本和 feature 配置；各 crate 仍需在自己的 Cargo.toml 显式声明实际使用的依赖。
 anyhow = "1.0.95"
 chrono = { version = "0.4.39", features = ["serde"] }
 chrono-tz = "0.10"

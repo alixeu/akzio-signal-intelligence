@@ -4,6 +4,10 @@
 //! provider only receives the current, replayable turn and may request one of
 //! the Rust-approved tools declared by an agent contract.
 
+// 文件导读：本 crate 定义 ModelRequest/ModelResponse、OpenAI Responses 配置与 ModelClient
+// 抽象，并把 provider SSE 或离线 fixture 统一成同一响应类型。上游 research/ingest 提交
+// 一轮请求并 await 结果；预算、授权、Artifact 持久化和业务验收留在调用方，不能把 HTTP
+// 成功或 fixture 响应当成 Research Submit、Decision 或 Paper 结果。
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::{Arc, Mutex},
@@ -28,6 +32,8 @@ use schema::*;
 
 #[derive(Debug, Error)]
 pub enum ModelError {
+    // Transport 的 reqwest 错误可能带请求 URL；Http 的 body 是未经脱敏的 provider
+    // 错误正文。Debug/Display 或上游审计记录不能把这些错误直接当作无凭据文本。
     #[error("model base URL is empty")]
     EmptyBaseUrl,
     #[error("model API key is empty")]
@@ -68,6 +74,9 @@ pub enum ModelError {
     NativeWebLimitExceeded,
 }
 
+// ModelError 是 adapter 层的统一错误边界；`?` 只负责把下层错误向调用方返回，
+// 不会在这里重试请求、写 Store 或把 incomplete/拒答改成成功结果。
+
 pub type Result<T> = std::result::Result<T, ModelError>;
 
 /// Test-fixture placeholder resolved from the current model request's governed context.
@@ -103,8 +112,8 @@ impl ModelProviderIdentity {
 
 /// Per-purpose OpenAI Responses route settings.
 ///
-/// The API key is intentionally redacted from `Debug` output and never copied
-/// into a durable AgentTurn trace.
+/// This route has no API key field. The parent config redacts its key in
+/// `Debug`; request/response bodies may still contain sensitive caller text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OpenAIResponsesRouteConfig {
@@ -158,6 +167,8 @@ struct OpenAIResponsesConfigWire {
     routes: BTreeMap<String, OpenAIResponsesRouteConfig>,
 }
 
+// 这是 Serde 的 Deserialize trait 实现：先让 wire helper 应用 default/拒绝未知字段，
+// 再执行 provider 兼容性判断；provider 字段不会被保存到运行时配置对象。
 impl<'de> Deserialize<'de> for OpenAIResponsesConfig {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
@@ -189,6 +200,8 @@ impl<'de> Deserialize<'de> for OpenAIResponsesConfig {
 }
 
 impl std::fmt::Debug for OpenAIResponsesConfig {
+    // Debug 只遮盖 api_key 字段；base_url 与其他配置仍会展示，不能把整个输出
+    // 当成经过全面凭据清洗的安全日志。
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("OpenAIResponsesConfig")
@@ -311,6 +324,8 @@ pub struct ModelContinuation {
     fixture_input: Option<String>,
 }
 
+// continuation 是 Rust 自己持有的 transcript 快照；Responses 请求使用 store=false，
+// 所以下一轮必须显式携带这些 items，而不是依赖 provider 端的隐藏会话。
 impl ModelContinuation {
     pub fn from_items(items: Vec<Value>) -> Self {
         // continuation 保存 provider transcript；普通 provider 响应不附带 fixture
@@ -356,6 +371,9 @@ pub enum ModelInput {
     },
 }
 
+// Fresh/Continue 只是输入形状；真正的 Responses JSON 会在 adapter 中把 Fresh 编成
+// 字符串，把 Continue 编成 transcript 加 function_call_output 和可选 instruction 的数组。
+
 pub const NATIVE_WEB_SEARCH_TOOL: &str = "web_search";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -363,9 +381,8 @@ pub struct ModelRequest {
     pub instructions: String,
     pub input: ModelInput,
     pub max_output_tokens: u32,
-    /// Optional phase-local override. A structured Submit call may use a
-    /// lower reasoning effort than the research Draft while retaining the
-    /// same requested/actual model identity and audited route snapshot.
+    /// 可选的单请求 reasoning override。当前研究角色直接 Submit，无 Draft；
+    /// Outcome 仍有 Draft/Submit。覆盖 effort 不改变模型身份、冻结 route 或授权。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
     pub tools: Vec<ModelToolDefinition>,
@@ -386,6 +403,9 @@ pub enum ModelCapabilityBasis {
     StaticDeclared,
     RuntimeNegotiated,
 }
+
+// 能力快照的 Optional 字段用 None 表示“尚未观察到”，不是把缺失信息当成 false；
+// Serde 的 default 只负责旧数据解码兼容，不能把静态 fixture 变成真实握手结果。
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelCapabilitySnapshot {
@@ -541,7 +561,9 @@ fn validate_probed_snapshot(
 }
 
 /// Provider-facing request/result pair retained only inside a RunScoped
-/// AgentTurn when local model debugging is enabled.
+/// AgentTurn when local model debugging is enabled. The adapter's request-body
+/// projection omits HTTP auth headers; this public pair itself cannot prove
+/// arbitrary caller text, provider output or HTTP error body is non-sensitive.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelCallTrace {
     pub request: Value,
@@ -558,12 +580,15 @@ pub struct ModelResponse {
     pub continuation: ModelContinuation,
     pub raw: Value,
     pub usage: ModelUsage,
-    /// Provider payload without authorization headers or credentials.
+    /// Provider request JSON has no authorization header; its caller-supplied
+    /// instructions, input and tool output can still contain sensitive text.
     pub request_body: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelStreamEvent {
+    // 这些事件只描述 reasoning 段的开始、增量和结束；它们不是 Responses 终态，
+    // ModelResponse 仍须等 adapter 接受 completed/incomplete 后才会返回。
     ReasoningStart,
     ReasoningDelta(String),
     ReasoningEnd,
@@ -571,11 +596,13 @@ pub enum ModelStreamEvent {
 
 #[derive(Debug, Clone)]
 pub enum ModelClient {
+    // Clone 对 fixture 变体只复制 Arc 指针：同一 client 的副本仍共享同一个 Mutex FIFO；
+    // 不可变阶段模板则共享 Arc，但没有 Mutex，因为调用只 clone 模板而不消费它。
     OpenAIResponses(OpenAIResponsesClient),
     Fixture(Value),
     FixtureByPurpose(Arc<Mutex<BTreeMap<String, VecDeque<Value>>>>),
-    /// Immutable Draft/Submit templates, isolated by each request's context.
-    /// Sequence fixtures remain separate for intentional exhaustion/failure tests.
+    /// 不可变的 Draft/Submit 模板；研究 Submit-only 取第二格，Outcome 可取两格。
+    /// 占位符按每次请求的 Context 解析；序列 fixture 才用于耗尽/故障测试。
     FixtureByPurposePhase(Arc<BTreeMap<String, [Value; 2]>>),
     FixtureSequence(Arc<Mutex<VecDeque<Value>>>),
 }

@@ -1,11 +1,15 @@
 import SwiftUI
 
+// 文件导读：RunStatusBar 展示当前 Run 投影、连接/行情/数据状态，并把 Run purpose、启动和设置操作回传给 AppShell/Store。
+// 它不持有运行状态，也不作 Paper 授权判断；点击 Run 只调用 Store 启动入口，Core 未就绪时会先启动/验证，再请求 `/runs`，后续完成状态来自 Observer 刷新。
+// 先读 body、controls、runModePicker；其余 computed View 将同一组只读值拆成身份、指标与状态 chip。
 // MARK: - Run status bar
 //
 // Low glass bar pinned to the top: identity on the left, live vitals in the
 // middle, controls on the right. The running dot breathes slowly (2s) instead of
 // blinking, so a long-running run never feels like an alarm.
 struct RunStatusBar: View {
+    // 状态栏是纯展示 View；可运行性、purpose 选择和异步提交结果都由 Store 通过输入/闭包注入。
     let run: RunPresentation
     let health: [HealthMetric]
     let observerState: ObserverConnectionState
@@ -25,6 +29,7 @@ struct RunStatusBar: View {
     @Environment(\.appLanguage) private var language
 
     var body: some View {
+        // ViewThatFits 只改变布局表达，不改变数据来源；窄宽度仍读取同一个 RunPresentation。
         // 状态栏只读当前投影；Run/设置/归档操作通过闭包回传给 Store，不在 View 内持有业务状态。
         HStack(spacing: AkzioLayout.s4) {
             identity
@@ -57,6 +62,7 @@ struct RunStatusBar: View {
 
     @ViewBuilder
     private var identity: some View {
+        // Run ID 不可用时只显示占位；有 ID 时拆成短 ID 与前缀，完整值留在 help 提示中。
         HStack(spacing: AkzioLayout.s2) {
             if run.runId.caseInsensitiveCompare(MissingValue.unavailable.rawValue) == .orderedSame {
                 Text(L10n.text(MissingValue.unavailable.rawValue, language: language))
@@ -78,6 +84,7 @@ struct RunStatusBar: View {
     // MARK: Middle
 
     private var vitals: some View {
+        // 这些指标来自单个 RunPresentation；缺失字段由该模型的格式化器保留为 unavailable。
         HStack(spacing: AkzioLayout.s4) {
             HStack(spacing: 6) {
                 StatusDot(run.hasRun ? run.status.status : .unavailable)
@@ -96,6 +103,7 @@ struct RunStatusBar: View {
     }
 
     private func metric(_ label: String, _ value: String) -> some View {
+        // 小型纯展示组合器；参数是值，不保存状态，也不在布局过程中查询 Core。
         HStack(spacing: AkzioLayout.s1) {
             Text(L10n.text(label, language: language)).akzioText(.caption)
             Text(L10n.text(value, language: language))
@@ -104,6 +112,7 @@ struct RunStatusBar: View {
     }
 
     private var systemHealth: some View {
+        // 健康比例来自 Core readiness 投影；进度条是视觉表达，不构成 Policy 或交易资格判定。
         HStack(spacing: 6) {
             Text(L10n.text("Health", language: language)).akzioText(.caption)
             Text(PpmFormatter.share(ppm: run.systemHealthPpm, fractionDigits: 1))
@@ -117,6 +126,7 @@ struct RunStatusBar: View {
     // MARK: Right
 
     private var controls: some View {
+        // Button/Menu 的闭包只发出用户意图；disabled 是防重复提交的 UI 门，不是 Core 的授权判断。
         // 控件可见性由当前连接、Run purpose 和 in-flight 状态共同决定；禁用只阻止重复提交，不取消已有请求。
         HStack(spacing: AkzioLayout.s3) {
             if observerState == .mock {
@@ -203,6 +213,7 @@ struct RunStatusBar: View {
     }
 
     private var marketChip: some View {
+        // `marketStatusKnown` 与 `marketOpen` 分开判断，未知行情不会被渲染成已收市。
         HStack(spacing: 5) {
             Circle()
                 .fill(run.marketOpen ? AkzioColor.successDot : AkzioColor.mutedText)
@@ -212,6 +223,7 @@ struct RunStatusBar: View {
     }
 
     private var dataChip: some View {
+        // 连接层 stale/offline 会经 effectiveDataStale 提升到 warning 外观，底层 run 数据仍保持原值。
         HStack(spacing: 5) {
             StatusDot(effectiveDataStale ? .stale : run.dataStatus, diameter: 6)
             Text(L10n.text(
@@ -223,6 +235,7 @@ struct RunStatusBar: View {
     }
 
     private var latencyChip: some View {
+        // 延迟是已观察值；nil 的文字格式化由 PpmFormatter 处理，不在 View 中补造时间。
         Text(PpmFormatter.latency(millis: run.latencyMillis))
             .akzioMono(11, color: effectiveDataStale ? AkzioColor.actionCoral : AkzioColor.mutedText)
             .akzioNumeric(run.latencyMillis, policy: policy)

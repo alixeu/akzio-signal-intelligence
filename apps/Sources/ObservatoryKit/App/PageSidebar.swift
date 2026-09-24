@@ -1,10 +1,14 @@
 import SwiftUI
 
+// 文件导读：PageSidebar 把 AppRoute.primary 转成主导航行，并提供独立的 Settings 与收起侧栏入口。
+// 当前路由、主题和点击闭包由 AppShell 从 ObservatoryStore 注入；点击只回传意图，路由转场与设置状态仍由 Store 管理。
+// 先读 body、row 和 settingsRow；`@Environment` 读取语言，`@Namespace` 只为选中高亮提供共享几何身份。
 // MARK: - Workspace sidebar
 //
 // The sidebar reads as a workspace navigation surface: context first,
 // then the routes used to inspect the live Core.
 struct PageSidebar: View {
+    // View 是轻量值类型；业务路由由 route 输入，所有副作用通过闭包交回 ObservatoryStore。
     let route: AppRoute
     let theme: SettingsPresentation.Theme
     let onSelect: (AppRoute) -> Void
@@ -15,6 +19,7 @@ struct PageSidebar: View {
     @Namespace private var highlight
 
     var body: some View {
+        // sidebar 每次重算都从同一组输入绘制，matchedGeometryEffect 只负责视觉身份，不保存导航状态。
         // 主路由按固定顺序展示；Settings 是附加入口，不参与主路由数组。
         VStack(alignment: .leading, spacing: AkzioLayout.s2) {
             windowToolbar
@@ -35,6 +40,7 @@ struct PageSidebar: View {
     }
 
     private var windowToolbar: some View {
+        // 顶部工具栏为原生交通灯预留空间；切换闭包来自父 View，因此此子 View 不保有侧栏显隐状态。
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: AkzioLayout.s2) {
                 // Reserve the native traffic-light region.

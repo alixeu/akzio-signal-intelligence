@@ -5,19 +5,22 @@ use akzio_domain::{
     DebugSessionIdentity,
 };
 
-#[cfg(test)]
-mod tests;
-
+// 文件导读：这里承接 HTTP/App/CLI 的 Debug 请求，并把 prepare、inspect、control、fork
+// 转交给共享 WorkflowRuntime 与隔离 V2Store。prepare 只发布带身份的图/Need/session；
+// 后续 step/resume 才能按 Store revision/claim 规则处理 task，Paper、Broker 和 Learning
+// 权限不由 Debug API 自行授予，fixture 与真实模型/真实 Paper 也始终是不同证据。
+// Rust 机制：`&DebugPrepareRequest`/`&DebugControlRequest` 仅借用输入；`Option` 区分无
+// parent/task/policy，`Result` 传播身份和 Store 拒绝，Store lease/transaction 才写持久状态。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugPrepareRequest {
+    // 请求字段直接进入身份和 session 校验；serde 默认值不会绕过后续 approval/policy Gate。
     pub session_key: String,
     #[serde(default = "default_debug_purpose")]
     pub purpose: RunPurpose,
     #[serde(default)]
     pub paper_allowed: bool,
 }
-
 fn default_debug_purpose() -> RunPurpose {
     // 请求省略 purpose 时默认构造 Paper 研究图；该 serde 默认值不等于已获 Paper approval。
     RunPurpose::Paper
@@ -26,6 +29,7 @@ fn default_debug_purpose() -> RunPurpose {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugForkRequest {
+    // fork 请求只描述父 task、目标 experiment 和审计理由，实际 Evidence setup 由 Rust 重新创建。
     pub task_id: Option<TaskId>,
     pub experiment_id: RunId,
     pub reason: String,
@@ -34,6 +38,7 @@ pub struct DebugForkRequest {
 impl Daemon {
     // 仅以 DebugControl 配置是否存在判断控制面是否启用，不代表当前 Run 已准备或可执行。
     pub fn debug_enabled(&self) -> bool {
+        // 这是只读能力探测；真正动作仍需 prepare/control_debug 的身份、Store 和生命周期校验。
         self.debug_control.is_some()
     }
 

@@ -1,11 +1,20 @@
+// 文件导读：这里是 CLI 的异步入口。先处理不需要 daemon 配置的离线/本地命令，再把
+// 需要服务端权限的命令交给 dispatch；因此配置解析、模型探测、HTTP 认证和 Store
+// 生命周期都在各自明确的边界内发生，CLI 的 `Ok(())` 不会被解释成业务流水线完成。
+// Rust 机制：`#[tokio::main]` 宏生成 Tokio runtime；`async fn` 返回 Future，`?` 沿
+// `anyhow::Result` 传播错误，`match` 对命令枚举做穷尽分派，避免遗漏某个权限分支。
+
 #[tokio::main]
+// CLI 参数被解析为拥有型枚举；早期本地分支直接返回，只有其余命令读取完整配置后才
+// 生成对应控制 Future 并 await。`&cli.command` 是临时借用，后续 match 再按值消费命令。
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     // 先处理不需要常规运行时配置的本地入口，避免离线质量报告、配置编辑、校准和
     // fixture 验证被模型凭据、Paper 环境或 daemon 启动前置条件阻断。
     if let Command::Debug { command: DebugCommand::VerifyResearchQuality { out, phase } } = &cli.command {
-        // offline/report 不构造模型客户端；candidate 等阶段按专用 reviewer 路由（无则
-        // 回退 critic）和 Synthesizer 路由创建客户端，报告失败才返回非零。
+        // offline/report 不构造模型客户端；baseline/candidate 阶段按 reviewer（缺省回退
+        // critic）及 Synthesizer 路由构造真实 client。只有 candidate/report 的 failed
+        // 报告会在打印后变成 CLI 错误；这仍是质量验收，不是 Paper/Outcome 验收。
         let (model, synth_model) = if matches!(phase.as_str(), "offline" | "report") { (None,None) } else {
             let config = read_config_file(&cli.config)?;
             let base = config.model.context("missing model configuration")?;

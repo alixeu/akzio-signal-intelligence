@@ -1,6 +1,23 @@
+// Structured protocol 的“动态”部分仍由 Rust 绑定：Manifest 决定可引用 ID 和
+// evidence scope，日历决定 thesis expiry，allocation anyOf 决定零权重弃权与非零
+// 支持条件。Deliberation repair 只修元数据，正式 result 的语义变化必须显式进入新的
+// Proposal/Review lineage，不能借字段修复绕过 ProposalReview。
+// 当前 Contract 69 从 Submit 开始，只提供投影和 submit_result；这里的 Schema
+// 绑定/修复函数不生成 Draft，也不开放 Context 读取工具。
+// 文件导读：`agent.rs` 以 `include!` 将本文件并入 AgentRuntime 模块。`runtime_run.rs`
+// 先用 Manifest 与 Store 收窄 Submit Schema，再调用模型；返回后解析引用、绑定 Rust
+// 日历并校验结果。下半部从 Store 中恢复不可变 result，记录修订前后差异并限制
+// deliberation-only 修复。建议依次读 `bind_*`、`validate_*`、`record_structured_revision`；
+// `&mut Value` 表示原地收窄/补值，`Result`/`?` 把不合规输入返回给 Attempt，`#[cfg(test)]`
+// 的测试仅构造内存 JSON，不启动模型或 Store。
 // Field-level repair feedback for the structured research protocol. Keep the
 // original assessment and result untouched; the model must correct its values.
+
+// 借用模型提交的 deliberation 做字段数量、权重守恒和 Domain 规则检查；错误转成
+// ResearchError 供 AgentRuntime 生成修复反馈，函数不修改提交值。
 fn validate_research_deliberation(summary: &akzio_domain::DeliberationSummary) -> ResearchResult<()> {
+    // 文本数组与分数数组必须一一对应，且 uncertainty 权重守恒；错误只反馈字段，
+    // 不修改调用方传入的 summary，便于持久化 before/after 对比。
     let mut errors = Vec::new();
     for (field, scores, texts) in [
         ("alternative_match_ppm", summary.alternative_match_ppm.len(), summary.alternatives.len()),
@@ -10,6 +27,8 @@ fn validate_research_deliberation(summary: &akzio_domain::DeliberationSummary) -
             errors.push(format!("deliberation.{field}: got {scores} scores for {texts} text items; provide exactly {texts} scores"));
         }
     }
+    // `iter().map(...).sum()` 在此立即消费迭代器；先把每个 u32 权重扩为 u64，
+    // 避免用较窄整数累加。超出 1,000,000 的 confidence 由后面的 Domain 校验拒绝。
     let total: u64 = summary.uncertainty_weight_ppm.iter().map(|v| u64::from(*v)).sum();
     if let Some(expected) = 1_000_000_u32.checked_sub(summary.confidence_ppm) {
         if total != u64::from(expected) {
@@ -22,7 +41,11 @@ fn validate_research_deliberation(summary: &akzio_domain::DeliberationSummary) -
     summary.validate_model_assessment().map_err(|e| ResearchError::InvalidOutput(e.to_string()))
 }
 
+// 按当前 Manifest 已绑定的引用数量收窄 Synthesizer 的 wire Schema：claims/critiques
+// 必须完整且不重复；allocation 每行只能满足“零权重并说明弃权”或“非零且有支持”之一。
 fn bind_synthesis_submission_schema(schema: &mut Value) {
+    // Synthesizer 必须保留所有 selected Claim/Critique 以闭合 provenance；零分配和
+    // 非零分配使用互斥 Schema 分支，避免模型用 null/空数组模糊执行意图。
     for field in ["claims", "critiques"] {
         let array = &mut schema["properties"]["result"]["properties"][field];
         let count = array.pointer("/items/properties/artifact_id/enum")
@@ -33,6 +56,8 @@ fn bind_synthesis_submission_schema(schema: &mut Value) {
         array["description"] = json!("Retain every selected reference, including unsupported, blocked and neutral horizons. This is provenance closure, not endorsement.");
     }
     let row = &mut schema["properties"]["result"]["properties"]["research_allocation"]["properties"]["allocations"]["items"];
+    // 两个局部 Value 从原 row 克隆后分别施加互斥约束；最后用 anyOf 替换原节点，
+    // 这些 clone 只复制 Schema JSON，不会触碰业务分配或 Store 状态。
     let mut zero = row.clone();
     zero["properties"]["target_weight_ppm"]["maximum"] = json!(0);
     zero["properties"]["abstention_reason"] = json!({"type":"string","minLength":1});
@@ -46,8 +71,14 @@ fn bind_synthesis_submission_schema(schema: &mut Value) {
 
 // Scope is bound from the same selected evidence inspected by the business
 // validator. Grouping identical scopes avoids repeating a branch per document.
+// 对每个 Manifest 选中且已出现在引用 enum 中的 Artifact 读取规范化正文，按资产范围分组，
+// 再把分组写回 wire Schema；Store 读取/JSON 解码失败会经 `?` 阻止请求继续。
 fn bind_ground_scope_schema(store: &Store, manifest: &ContextManifest, schema: &mut Value, contract_version: u32) -> ResearchResult<()> {
+    // 对相同资产 scope 的 Evidence 合并一个 anyOf 分支，既绑定精确 Artifact ID，
+    // 又避免重复生成等价 Schema；未验证新闻的空 scope 只能走 descriptive 分支。
     let Some(items) = schema.pointer_mut("/properties/result/properties/grounds/items") else { return Ok(()); };
+    // `let-else` 在 Schema 没有 grounds.items 时提前结束本函数；允许 ID 来自此前
+    // 按 Manifest 做过的 reference binding，不会从 Store 额外枚举可见材料。
     let allowed = items.pointer("/properties/evidence/properties/artifact_id/enum")
         .and_then(Value::as_array).cloned().unwrap_or_default();
     let mut groups = BTreeMap::<Vec<String>, Vec<Value>>::new();
@@ -65,6 +96,8 @@ fn bind_ground_scope_schema(store: &Store, manifest: &ContextManifest, schema: &
     Ok(())
 }
 
+// 消费按 scope 排序的分组表，每组生成一个可选 Schema 分支；JSON 值被移动进结果，
+// 每个分支只克隆基础结构，再限制 artifact_id 与 assets 的 enum/maxItems。
 fn scoped_ground_alternatives(base: &Value, groups: BTreeMap<Vec<String>, Vec<Value>>, enforce_descriptive: bool) -> Value {
     let branches = groups.into_iter().map(|(scope, ids)| {
         let mut branch = base.clone();
@@ -84,6 +117,8 @@ fn scoped_ground_alternatives(base: &Value, groups: BTreeMap<Vec<String>, Vec<Va
 // Timing is Rust-owned metadata. The model never proposes an expiry that a
 // later formatting call could change. Scheduled closes come from governed
 // Alpaca calendars stored alongside each asset's completed bars.
+// 递归移除所有嵌套对象中的两个模型期限字段及其 required 声明；Schema 由后续 Rust
+// 日历绑定补上正式值，避免模型预测的时间进入业务结果。
 fn remove_model_timing_fields(schema: &mut Value) {
     if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
         properties.remove("thesis_valid_until");
@@ -97,6 +132,8 @@ fn remove_model_timing_fields(schema: &mut Value) {
             )
         });
     }
+    // `values_mut`/`iter_mut` 产生可变借用，`for_each` 立即递归处理每个子 Schema；
+    // 非对象/数组标量没有可删除的字段。
     match schema {
         Value::Object(object) => object.values_mut().for_each(remove_model_timing_fields),
         Value::Array(array) => array.iter_mut().for_each(remove_model_timing_fields),
@@ -104,6 +141,8 @@ fn remove_model_timing_fields(schema: &mut Value) {
     }
 }
 
+// 只从 Manifest 选择的 NormalizedEvidence 中读取 bars 日历，汇成每资产一份映射；
+// 缺少可识别资源时跳过，冲突日历或 Store/JSON 错误则返回 Err，最终由共同日历检查把缺口挡住。
 fn bind_rust_forecast_times(
     store: &Store,
     manifest: &ContextManifest,
@@ -113,6 +152,7 @@ fn bind_rust_forecast_times(
     let mut calendars = BTreeMap::new();
     for selection in &manifest.payload.selections {
         if selection.artifact.kind != ArtifactKind::NormalizedEvidence {
+            // 只把正式规范化证据纳入期限来源；Claim、Review 等 Artifact 不是交易日历。
             continue;
         }
         let artifact = store.artifact(&selection.artifact.artifact_id)?;
@@ -139,11 +179,15 @@ fn bind_rust_forecast_times(
     bind_common_forecast_times(arguments, &calendars, now)
 }
 
+// 用四资产共同可用的未来收盘时间为 Forecast 补入 Rust 管理的期限。修改的是本 Attempt
+// 的可变 arguments；字段缺失、模型抢先填写或日历不完整都会返回 InvalidOutput，不生成正式结果。
 fn bind_common_forecast_times(
     arguments: &mut Value,
     calendars: &BTreeMap<String, BTreeMap<String, DateTime<Utc>>>,
     now: DateTime<Utc>,
 ) -> ResearchResult<()> {
+    // 只选择四资产都存在且晚于当前提交时刻的共同交易 Session close；自然日/单一
+    // 资产日历不能替代共同 Session，模型提交的 expiry 也不能覆盖 Rust 绑定值。
     if Asset::EXECUTABLE
         .iter()
         .any(|asset| !calendars.contains_key(asset.symbol()))
@@ -152,6 +196,8 @@ fn bind_common_forecast_times(
             "Rust forecast timing requires all four governed exchange calendars".into(),
         ));
     }
+    // `first` 只借用首个可执行资产的有序日历；filter 闭包保留未来且其余三项在同一日期
+    // 有完全相同 close 的 Session。`collect` 会消费迭代器并得到按日期排序的 Vec。
     let first = &calendars[Asset::EXECUTABLE[0].symbol()];
     let common = first
         .iter()
@@ -195,9 +241,13 @@ fn bind_common_forecast_times(
     Ok(())
 }
 
+// 这些单元测试验证 wire Schema 与日历绑定的纯内存分支，不访问 V2Store 或模型。
 #[cfg(test)]
 mod structured_timing_tests {
     use super::*;
+
+    // 单资产新闻只能声明其自身 scope，共享宏观可覆盖多资产；descriptive 空 scope
+    // 与无 anyOf 分支的拒绝行为也由同一 Schema 解释器验证。
     #[test]
     fn scoped_wire_schema_rejects_cross_asset_news_and_keeps_shared_macro() {
         let news = "a".repeat(64);
@@ -230,6 +280,9 @@ mod structured_timing_tests {
         assert!(validate_schema_value(&ground, &json!({"anyOf":[]}), "$").is_err());
         assert!(validate_schema_value(&ground, &json!({"anyOf":[base],"additionalProperties":false}), "$").is_err());
     }
+
+    // 期限按当前时刻之后的共同交易 Session 序号绑定；重复绑定会因模型已有期限字段
+    // 被拒绝，缺一个资产的日历也不能退化成单资产日期。
     #[test]
     fn common_exchange_sessions_own_expiry_and_reject_model_override() {
         let now: DateTime<Utc> = "2026-09-04T21:00:00Z".parse().unwrap();
@@ -263,9 +316,13 @@ mod structured_timing_tests {
     }
 }
 
+// 本组测试验证完整引用闭包、零/非零分配分支和 deliberation 权重检查。
 #[cfg(test)]
 mod structured_boundary_tests {
     use super::*;
+
+    // Synthesizer 必须逐项保留选中的 Claim/Critique；零权重需明确弃权，非零项必须
+    // 带 horizon 与证据引用，Schema 不会把 proposal 直接解释为 Decision。
     #[test]
     fn synthesis_wire_requires_full_provenance_and_distinguishes_zero_allocations() {
         let refs = (1..=6).map(|n| json!({"artifact_id":format!("{n:064x}"),
@@ -291,6 +348,8 @@ mod structured_boundary_tests {
         row["evidence_refs"] = json!([ids[0]]);
         validate_schema_value(&row,row_schema,"$.allocation").unwrap();
     }
+
+    // 故意提交错位的文本/分数长度和不守恒权重，确认错误反馈保留实际数量且输入未被改写。
     #[test]
     fn research_deliberation_reports_observed_cardinality_and_sum_without_mutation() {
         let mut summary: akzio_domain::DeliberationSummary = serde_json::from_value(json!({
@@ -308,6 +367,9 @@ mod structured_boundary_tests {
         summary.uncertainty_weight_ppm = vec![130000,150000,110000];
         validate_research_deliberation(&summary).unwrap();
     }
+
+    // Critique 的 evidence gap 必须与目标 Claim 的资产、horizon scope 相容；只匹配其中
+    // 一项仍不能绕过 Rust 的业务校验。
     #[test]
     fn critic_rejects_other_asset_and_horizon_gaps() {
         let claim: ResearchClaim = serde_json::from_value(json!({
@@ -324,6 +386,9 @@ mod structured_boundary_tests {
         critique.evidence_gaps[0].horizons = BTreeSet::from([akzio_domain::DecisionHorizon::T5]);
         assert!(validate_critique_claim_scope(&critique, &claim, akzio_domain::REVIEWED_RESEARCH_CONTRACT_VERSION).is_err());
     }
+
+    // 正式 wire Schema 删除模型可写期限，但规范输出 Schema 仍保留 Rust 最终生成字段；
+    // 此测试比较的是两种 Schema 视图，不触发 Store 写入。
     #[test]
     fn wire_schema_has_no_model_owned_dates_and_legacy_schema_is_unchanged() {
         let canonical = deliberation_output_schema(&decision_proposal_output_schema());
@@ -352,13 +417,17 @@ mod structured_boundary_tests {
     }
 }
 
+// 比较前后 JSON 的语义路径；对象 key 排序由 BTreeSet 统一，数组等非对象值作为整体报告变化。
 fn semantic_changed_paths(before: &Value, after: &Value, path: &str, changes: &mut Vec<String>) {
+    // 递归只报告 JSON 语义路径，不比较对象键顺序；用于 Review/修复审计，不能把
+    // 变化自动判定为可接受。
     if before == after {
         return;
     }
     match (before, after) {
         (Value::Object(left), Value::Object(right)) => {
             for key in left.keys().chain(right.keys()).collect::<BTreeSet<_>>() {
+                // 缺少的 key 用 JSON null 作为比较值；因此这里专注记录路径，不生成补丁或修改任一输入。
                 semantic_changed_paths(
                     left.get(key).unwrap_or(&Value::Null),
                     right.get(key).unwrap_or(&Value::Null),
@@ -371,7 +440,11 @@ fn semantic_changed_paths(before: &Value, after: &Value, path: &str, changes: &m
     }
 }
 
+// 把 Store 中恢复出的原始 result 移入只含 deliberation 的参数对象；result 已存在、
+// 参数不是 object 时拒绝，避免模型携带的新 result 被静默覆盖或混入修复。
 fn bind_frozen_result(arguments: &mut Value, result: Value) -> ResearchResult<()> {
+    // 只有缺少 result 的 metadata-only repair 可以由 Rust 补回旧结果；模型若同时
+    // 带 result，宁可拒绝也不静默覆盖，保持原始提交和修订之间的可追溯性。
     if arguments.get("result").is_some() {
         return Err(ResearchError::InvalidOutput(
             "deliberation repair must not submit result".into(),
@@ -384,6 +457,8 @@ fn bind_frozen_result(arguments: &mut Value, result: Value) -> ResearchResult<()
     Ok(())
 }
 
+// 按已保存的校验反馈识别 metadata-only 修复；`any` 遇到第一条 deliberation 错误即停止，
+// 缺少字符串 message 或不含该字段名的反馈不会命中。
 fn is_deliberation_repair(feedback: &[ModelToolOutput]) -> bool {
     feedback.iter().any(|f| {
         f.output["message"]
@@ -392,11 +467,15 @@ fn is_deliberation_repair(feedback: &[ModelToolOutput]) -> bool {
     })
 }
 
+// 只在反馈指向 deliberation 时锁定 result 的 JSON 语义；其他字段修复仍经过 Attempt
+// 的正常校验，Synthesizer 的提案变化还要绑定相应 ProposalReview，本函数不接受新业务含义。
 fn validate_repair_semantics(
     before: &Value,
     after: &Value,
     feedback: &[ModelToolOutput],
 ) -> ResearchResult<()> {
+    // deliberation 反馈不能改变正式 result；任何语义漂移都必须走普通 Submit/Review
+    // 版本链，而不是把“修复”当作无痕改写。
     if before["result"] != after["result"]
         && feedback.iter().any(|f| {
             f.output["message"]
@@ -410,7 +489,12 @@ fn validate_repair_semantics(
 }
 
 impl AgentRuntime {
+    // 从最新到最旧的持久化 AgentTurn 找回最后的 deliberation 与最近一次正式 result；
+    // runtime_run 在继续模型调用前 await 此 Future。方法借用 self，复制 trace IDs 后
+    // 把拥有型列表移入 StoreExecutor 的阻塞闭包。
     async fn last_structured_submission(&self, traces: &[ArtifactRef]) -> ResearchResult<Value> {
+        // 从最新到最旧的 AgentTurn 找到 immutable result，再采用最近 deliberation；
+        // 这让一次修复只更新元数据，不依赖内存中的模型对象。
         let traces = traces.to_vec();
         self.store_executor
             .execute(move |store| {
@@ -444,6 +528,8 @@ impl AgentRuntime {
             .await?
     }
 
+    // runtime_run await 此 Future 后才继续校验后续 Submit；有隔离 DebugSession 时，先将
+    // 最近两份 terminal submission 的哈希、差异路径与反馈写入审计，不替代 Schema/Review 验收。
     async fn record_structured_revision(
         &self,
         permit: &TaskWritePermit,
@@ -451,6 +537,8 @@ impl AgentRuntime {
         revision: u16,
         feedback: &[ModelToolOutput],
     ) -> ResearchResult<()> {
+        // 记录修订时保留最近两次 terminal submission 的 before/after hash、改变路径和
+        // validation feedback；StageAcceptance 是审计观察，不等于新提案已被 Review 接受。
         let trace_candidates = traces
             .iter()
             .rev()
@@ -460,6 +548,8 @@ impl AgentRuntime {
         let permit = permit.clone();
         let feedback = feedback.to_vec();
         self.store_executor.execute(move |store| {
+            // trace 候选先克隆为拥有型 ArtifactRef，闭包才能在异步等待期间独立读取 Store；
+            // 只取最近两份含 terminal submission 的 AgentTurn。
             let mut turns = Vec::new();
             for reference in trace_candidates {
                 let artifact = store.artifact(&reference.artifact_id)?;
@@ -468,6 +558,8 @@ impl AgentRuntime {
                 if turns.len() == 2 { break; }
             }
             if turns.len() != 2 { return Err(ResearchError::InvalidOutput("structured revision is missing its immutable prior submission".into())); }
+            // 这个同步闭包只借用同一个 Store 参数；每次都从 CAS 解码 AgentTurn，
+            // 不依赖调用栈中已被 move 的模型 Value。
             let read = |r: &ArtifactRef| -> ResearchResult<Value> {
                 let artifact = store.artifact(&r.artifact_id)?;
                 let payload: Value = serde_json::from_slice(&store.read_blob(&artifact.blob)?)?;
@@ -493,6 +585,8 @@ impl AgentRuntime {
             }
             // If only deliberation was rejected, the proposed result must be
             // byte-for-byte semantic JSON equal. Reject, never silently restore it.
+            // 若上面存在 DebugSession，StageAcceptance 已由 Store 单独提交；此处失败会返回 Err，
+            // 但不会回滚已提交的审计记录。
             validate_repair_semantics(&before, &after, &feedback)?;
             Ok(())
         }).await??;
@@ -500,9 +594,13 @@ impl AgentRuntime {
     }
 }
 
+// 以下测试只验证内存中的不可变 result、修复拒绝条件和差异路径，不打开 Store 或调用模型。
 #[cfg(test)]
 mod semantic_revision_tests {
     use super::*;
+
+    // Rust 可从原提交补回缺省 result，但若修复请求自己携带 result，或外层不是对象，
+    // 必须拒绝而不是用原值覆盖模型输出。
     #[test]
     fn metadata_repair_reuses_exact_result_and_rejects_any_model_replacement() {
         let original = json!({"grounds":[{"assets":["QQQ","SOXL"]}],"stance":"bullish","confidence_ppm":700000});
@@ -523,6 +621,8 @@ mod semantic_revision_tests {
         assert!(bind_frozen_result(&mut Value::Null, original).is_err());
     }
 
+    // deliberation 专属错误反馈下，正式 result 的任何字段变化都使修复失败；
+    // 只改 deliberation 时可继续通过。
     #[test]
     fn deliberation_only_repair_cannot_change_formal_result() {
         let before = json!({"result":{"grounds":[{"assets":["QQQ"]}],"stance":"bullish","confidence_ppm":800000},"deliberation":{"basis_artifact_ids":[]}});
@@ -543,6 +643,7 @@ mod semantic_revision_tests {
         }
     }
 
+    // 递归差异应包含移除 grounds、改变 verdict/blocker 和数值的路径，供修订审计读取。
     #[test]
     fn revision_detects_removed_grounds_verdict_blocker_and_numbers() {
         let before = json!({"grounds":[{"assets":["QQQ","SOXL"]}],"stance":"bullish","verification_status":"supported","blocker":false,"confidence_ppm":800000});

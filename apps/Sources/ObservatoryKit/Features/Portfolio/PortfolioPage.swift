@@ -1,23 +1,30 @@
 import SwiftUI
 
+// 文件导读：Portfolio 路由从 Store 选择 LivePortfolioProjection 或按 scenario/range 生成的 Mock；
+// 统一模型驱动 KPI、曲线、配置、仓位、流程、订单/成交与风险面板。PositionPlan 的 target 是研究配置且
+// execution N/A，不能读成订单。先看 portfolio、body、kpiBar、availableRanges，追踪区间选择的异步读取边界。
 // MARK: - Portfolio
 //
 // KPI bar, equity curve with range switching, allocation, positions, the execution
 // tables and the risk panel. The curve is rebuilt from the scenario seed per range,
 // so switching ranges morphs the path instead of re-randomising it.
 struct PortfolioPage: View {
+    // store 同时持有 live Observatory 投影与本地 scenario；页面在这里明确区分两者，不把 fixture 当成真实账户数据。
     let store: ObservatoryStore
 
+    // namespace 只用于跨组件共享元素，language 只影响文案。
     @Environment(\.sharedNamespace) private var namespace
     @Environment(\.appLanguage) private var language
 
     private var portfolio: PortfolioPresentation {
+        // live 走 displayPortfolio；非 live 走带 scenario/range 的确定性 fixture，二者共享同一展示模型但证据边界不同。
         store.isLive
             ? store.displayPortfolio
             : PortfolioFixtures.portfolio(scenario: store.scenario, range: store.equityRange)
     }
 
     var body: some View {
+        // 各子视图只接收 portfolio 的已投影字段；toolbar 的 Binding 只改变范围选择，不重新生成业务事实。
         PageScaffold(route: .portfolio) {
             PageScroll {
                 VStack(alignment: .leading, spacing: AkzioLayout.s4) {
@@ -47,9 +54,11 @@ struct PortfolioPage: View {
                 }
             }
         } toolbar: {
+            // equityRange 的 get/set 连接 store；availableRanges 已在下方按 mock/live 边界筛选。
             AkzioSegmentedControl(
                 selection: Binding(
                     get: { store.equityRange },
+                    // live setter 会由 Store.didSet 启动 Observer 曲线历史读取；Mock 只重选 fixture 范围。
                     set: { store.equityRange = $0 }
                 ),
                 options: availableRanges.map { (value: $0, label: $0.rawValue) }
@@ -58,10 +67,13 @@ struct PortfolioPage: View {
     }
 
     private var availableRanges: [EquityRange] {
+        // live 只暴露 provider 支持的短范围；fixture 可展示全部枚举以便离线检查 UI 投影。
         store.isLive ? [.oneDay, .fiveDay, .oneMonth, .threeMonth] : EquityRange.allCases
     }
 
     private var kpiBar: some View {
+        // KPI 的文本、动画数值和正负 tone 都来自同一 portfolio snapshot；可选 P&L 由 formatter 保留缺失语义。
+        // unrealized/realized 为 nil 时，currency 文本仍显示 unavailable；?? 0 仅供 count-up 与颜色的数值参数使用。
         HStack(spacing: AkzioLayout.s3) {
             tile("Equity", PpmFormatter.currency(micros: portfolio.equityMicros), portfolio.equityValue, tone: .gold)
                 .sharedElement(.equityValue, in: namespace)
@@ -96,6 +108,7 @@ struct PortfolioPage: View {
         tone: AkzioTone,
         secondary: String? = nil
     ) -> some View {
+        // tile 只是把 label/value/numeric/delta 传给 MetricCard，不在卡片层重新计算金额。
         MetricCard(
             label: label,
             value: value,
@@ -107,6 +120,7 @@ struct PortfolioPage: View {
     }
 
     private var curveCard: some View {
+        // EquityCurveChart 接收当前 range 的 curve；legend 只解释 Portfolio 与 benchmark 两条投影线。
         SectionCard(
             title: "Equity Curve",
             subtitle: "\(store.equityRange.rawValue) · vs \(portfolio.benchmarkLabel)"
@@ -127,6 +141,7 @@ struct PortfolioPage: View {
     }
 
     private var positions: some View {
+        // positions 按 portfolio 投影逐项渲染，选择闭包只更新 store.selectedPosition，不会发单。
         LazyVGrid(
             columns: Array(repeating: GridItem(.flexible(), spacing: AkzioLayout.s3), count: 4),
             spacing: AkzioLayout.s3
@@ -143,6 +158,7 @@ struct PortfolioPage: View {
     }
 
     private func legend(_ label: String, tone: AkzioTone, dashed: Bool) -> some View {
+        // legend 的 dashed 仅是视觉标记，label 仍经 language 本地化，不改变曲线数据。
         HStack(spacing: 4) {
             Rectangle()
                 .fill(tone.color.opacity(dashed ? 0.6 : 1))

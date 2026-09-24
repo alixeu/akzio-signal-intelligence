@@ -1,3 +1,7 @@
+// 文件导读：DecisionPolicy 的正文仍是 canonical CAS Artifact，安装表只保存不可变身份列，
+// activation/history/head 分开记录显式激活链；写入候选不等于 active policy 可用于 Decision。
+// 建议先读 write_calibration_artifact 区分输入持久化与 activation，再读 activate_decision_policy
+// 看安装/历史/head 的共同事务；read_decision_policy 是从索引列重建投影的底层入口。
 use super::*;
 
 /// Identity columns indexed beside the immutable CAS envelope. The Store does
@@ -15,6 +19,8 @@ pub struct DecisionPolicyDescriptor {
 }
 
 impl DecisionPolicyDescriptor {
+    // 只接受 canonical、无 origin/source_refs 的 policy envelope，descriptor hash 必须等于 CAS。
+    // descriptor 与 Artifact 均为借用输入；本 helper 不读取 Store，也不解码 policy math payload。
     fn validate(&self, artifact: &Artifact) -> StoreResult<()> {
         if artifact.kind != ArtifactKind::DecisionPolicy
             || artifact.lifecycle != ArtifactLifecycle::Canonical
@@ -44,6 +50,10 @@ impl Store {
     /// Persist calibration inputs or a built policy without selecting an active
     /// policy. The CLI/execution layer validates typed calibration math; this
     /// seam owns canonical provenance and prohibits isolated Debug promotion.
+    // 写入风险限制/dataset/candidate policy 的 canonical Artifact，但不触碰 active head。
+    // 输入 Artifact 与 payload 在外层事务前做基本校验；dataset 的来源 ID/kind 在 Immediate 事务中
+    // 重新读取并仅允许 canonical RiskLimits/Decision/Outcome，最后 Artifact 行与 refs 一起提交。
+    // Debug Store、错误来源或 BLOB 校验失败均提前 Err，不返回“校准可用”结论。
     pub fn write_calibration_artifact(&self, artifact: &Artifact) -> StoreResult<()> {
         artifact.validate()?;
         if self.debug_environment()?.is_some()
@@ -100,6 +110,9 @@ impl Store {
 
     /// Install one validated immutable policy and atomically select it as the
     /// active DecisionGate policy. Re-activating the current hash is idempotent.
+    // 在同一事务中安装 policy、追加 activation 并更新 singleton head；同 hash 重放幂等。
+    // 新 hash 先写 Artifact/installation，再检查时间不倒退、追加 activation 并在同一 IMMEDIATE 事务更新单例 head；
+    // 同一 descriptor+Artifact 重放不追加 history。所有失败在 commit 前由事务回滚，成功后释放 guard 再回读 active。
     pub fn activate_decision_policy(
         &self,
         artifact: &Artifact,
@@ -140,6 +153,7 @@ impl Store {
         }
         let current = decision_policy_head_hash(&transaction)?;
         if current.as_ref() != Some(&descriptor.policy_hash) {
+            // active head 尚未指向候选才写新 activation；此前 activation 的时间用于拒绝时间回退。
             let prior_activation = transaction
                 .query_row(
                     r#"SELECT a.activated_at
@@ -177,6 +191,10 @@ impl Store {
             .ok_or_else(|| StoreError::DecisionPolicyConflict(descriptor.policy_hash.clone()))
     }
 
+    // 只从 active singleton head 读取 descriptor+Artifact，缺 head 返回 None 而非自动选候选。
+    // 先读 singleton_id=1 的 policy hash；没有 head 是 None。若 head 指向缺失的安装行，
+    // 当前 `read_decision_policy` 也返回 None；存在安装但 Artifact/描述符损坏才报 Err。
+    // Doctor 会独立校验 head 与 activation history，不能把单独返回 None 解释为完整性已通过。
     pub fn active_decision_policy(&self) -> StoreResult<Option<StoredDecisionPolicy>> {
         let connection = self.connection()?;
         let Some(hash) = decision_policy_head_hash(&connection)? else {
@@ -187,6 +205,9 @@ impl Store {
 
     /// Copy only the selected immutable policy into an isolated Store. No Run,
     /// Outcome, credential or mutable policy state crosses this seam.
+    // 只读取 source 的 active immutable Artifact/descriptor，把 BLOB staging 到目标 Store，
+    // 再直接调用目标 Store 的 activation 入口写入安装、activation 和 active head；此方法成功时
+    // 目标 policy 已激活，但不会复制 Run/Outcome/凭据或其它 mutable state。
     pub fn bootstrap_active_decision_policy_from(
         &self,
         source: &Store,
@@ -209,6 +230,8 @@ impl Store {
     }
 }
 
+// 读取 singleton active head 的 policy hash；历史 activation 不由此查询覆盖。
+// 零行映射为 None；哈希格式错误传播为 StoreError，不用安装列表猜测 active candidate。
 fn decision_policy_head_hash(connection: &Connection) -> StoreResult<Option<ContentHash>> {
     connection
         .query_row(
@@ -222,6 +245,10 @@ fn decision_policy_head_hash(connection: &Connection) -> StoreResult<Option<Cont
         .map_err(Into::into)
 }
 
+// 由安装表恢复 policy descriptor、Artifact 和 active_at，并重新执行 descriptor 校验。
+// policy_hash 是唯一查询键；LEFT JOIN 仅当该安装是当前 head 时提供 activation 时间。
+// 此函数不反序列化 DecisionPolicy 领域正文，运行时 math/schema 校验由调用层执行。
+// `Option` 区分安装行不存在，`Result` 区分 SQL/哈希/Artifact 解码错误；调用方勿混同。
 fn read_decision_policy(
     connection: &Connection,
     policy_hash: &ContentHash,
@@ -284,6 +311,9 @@ fn read_decision_policy(
     }))
 }
 
+// Doctor 验证每个安装都被 activation 引用，activation previous 链和 singleton head 一致。
+// 扫描安装与全部 activation，按 activation_id 重建 previous hash 链并检查时间单调；末尾要求唯一 head
+// 与最后一条 activation 对齐。仅读取传入连接，发现首个冲突即 Err，不修复/重选 active head。
 pub(super) fn verify_decision_policy_history(connection: &Connection) -> StoreResult<()> {
     let installed = connection
         .prepare(
@@ -371,6 +401,7 @@ pub(super) fn verify_decision_policy_history(connection: &Connection) -> StoreRe
 mod tests {
     use super::*;
 
+    // 每个策略测试使用独立 Store Root，避免 active head 或 BLOB 在测试间共享。
     fn test_store(label: &str) -> Store {
         Store::open(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -380,6 +411,7 @@ mod tests {
         .unwrap()
     }
 
+    // 构造最小 canonical policy envelope/descriptor，测试只覆盖 Store 身份规则。
     fn policy(
         store: &Store,
         name: &str,
@@ -421,6 +453,7 @@ mod tests {
     }
 
     #[test]
+    // build/write 后 policy 仍 inactive，只有显式 activation 才出现 active head。
     fn built_policy_is_durable_but_inactive_until_explicit_activation() {
         let store = test_store("candidate");
         let now = Utc::now();
@@ -440,6 +473,7 @@ mod tests {
     }
 
     #[test]
+    // activation chain、时间回退拒绝和 isolated bootstrap 都保留同一 policy hash/payload。
     fn activation_history_and_isolated_bootstrap_preserve_exact_policy() {
         let source = test_store("source");
         let now = Utc::now();

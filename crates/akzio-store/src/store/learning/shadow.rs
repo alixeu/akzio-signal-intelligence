@@ -1,10 +1,13 @@
+// 文件导读：这里写入未封存的 T1/T3 Outcome 与 Retrospective 快照；RunScoped 中间结果
+// 不进入 succeeded-output 索引，直到符合 T5/完整任务边界才由专用路径发布。
+// 先读 record_partial_outcome_retrospective_fenced 理解 lease/permit、prefix windows 和部分成功边界，
+// 再读 retrospectives 的只读历史列表。
 impl Store {
-    /// Records retry/recovery/replay/shadow lineage as an immutable
-    /// RunScoped artifact. Parent attempts must already exist and the
-    /// resulting graph is checked for cycles inside the same transaction.
-    /// Atomically records one RunScoped partial Outcome snapshot and its
-    /// T+1/T+3 retrospective. The snapshot is not indexed as a committed
-    /// task output because this worker remains retryable until T+5.
+    /// 原子写入同一 Attempt 的 RunScoped 未封存 Outcome 和 T1/T3 复盘。
+    /// 中间 Artifact 有事件但不进入 succeeded-output 索引，worker 仍可推进后续阶段。
+    // 输入必须是同 Attempt 生成的 RunScoped 未封存 Outcome 和 T1/T3 Retrospective；
+    // 事务外检查 payload/窗口形状，Immediate 事务内复核 daemon lease、Task permit、Paper purpose 与来源闭包。
+    // 返回 true 表示新 Artifact/event 已提交，false 表示完全相同 identity 重放；两种情况都不关闭 Attempt。
     pub fn record_partial_outcome_retrospective_fenced(
         &self,
         lease: &DaemonLease,
@@ -57,6 +60,7 @@ impl Store {
             OutcomeHorizon::T3 => 2,
             OutcomeHorizon::T5 => 0,
         };
+        // T1 要恰有一个窗口；T3 要恰有两个且包含 T1，不能把不连续阶段伪装成完整前缀。
         if outcome.windows.len() != expected_windows
             || (retrospective.horizon == OutcomeHorizon::T3
                 && !outcome
@@ -130,6 +134,7 @@ impl Store {
             if existing_payload.outcome_id == retrospective.outcome_id
                 && existing_payload.horizon == retrospective.horizon
             {
+                // 已存在同 outcome/horizon 的同 Artifact 是幂等 false；不同内容冲突且不改旧记录。
                 if existing == *retrospective_artifact {
                     transaction.commit()?;
                     return Ok(false);
@@ -140,6 +145,7 @@ impl Store {
             }
         }
 
+        // Outcome 与 Retrospective 都在当前事务内新增；只写各自生命周期 event，不插 succeeded output index。
         insert_artifact(&transaction, outcome_artifact)?;
         append_event(
             &transaction,
@@ -166,6 +172,8 @@ impl Store {
 
     /// Read only accepted retrospective artifacts for a run. Drafts and
     /// AgentTurn/provider payloads never cross this query boundary.
+    // run_id+kind 有界到该 Run 后再核 origin 精确相等，按 created_at 排序返回 Artifact 元数据；
+    // 不解码/导出 AgentTurn provider payload，也不修改状态。
     pub fn retrospectives(&self, run_id: &RunId) -> StoreResult<Vec<Artifact>> {
         let connection = self.connection()?;
         let mut artifacts =

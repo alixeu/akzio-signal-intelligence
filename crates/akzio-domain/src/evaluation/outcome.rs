@@ -1,3 +1,6 @@
+// 文件导读：定义 OutcomeSchedule、T+1/T+3/T+5 窗口、校准/基准指标、成本归因和
+// 叙事复盘产物；量化结果由 Rust 校验，模型只提交 Retrospective 叙事草稿。
+// Schedule 是 T0 终态到独立 Outcome worker 的持久化桥梁；窗口到期按共同完成的交易 Session 数，而非 elapsed wall-clock 判断。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutcomeHorizon {
@@ -9,6 +12,7 @@ pub enum OutcomeHorizon {
 impl OutcomeHorizon {
     pub const ALL: [Self; 3] = [Self::T1, Self::T3, Self::T5];
 
+    // 把 horizon 映射为 baseline 之后需要完成的交易 session 数。
     pub const fn trading_days(self) -> u8 {
         match self {
             Self::T1 => 1,
@@ -19,6 +23,7 @@ impl OutcomeHorizon {
 
     /// Due means completed trading sessions after the baseline session, never
     /// elapsed wall-clock days.
+    // 用已完成的实际交易 session 数判断到期，不使用墙钟天数。
     pub const fn is_due_after(self, completed_trading_sessions: u8) -> bool {
         completed_trading_sessions >= self.trading_days()
     }
@@ -26,10 +31,10 @@ impl OutcomeHorizon {
 
 /// Rust-owned execution lineage for a future Paper outcome.
 ///
-/// A rejected decision has a durable `NoOrder` verdict and no broker
-/// reconciliation. An accepted decision must retain both the commitment and
-/// its reconciliation; an unreconciled commitment cannot be scheduled for
-/// canonical learning.
+/// `NoOrder` records a durable execution verdict without broker reconciliation;
+/// it may result from missing calibration, approval or another execution blocker,
+/// not necessarily rejection of the research proposal. A reconciled Paper branch
+/// retains both commitment and reconciliation before scheduling.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OutcomeExecutionLineage {
@@ -44,7 +49,9 @@ pub enum OutcomeExecutionLineage {
 }
 
 impl OutcomeExecutionLineage {
+    // NoOrder 只需 ExecutionVerdict；真正 reconciled Paper 必须同时保留 commitment/reconciliation。
     pub fn validate(&self) -> Result<(), DomainError> {
+        // NoOrder 与已对账 Paper 使用不同字段闭包；match 借用当前变体，不移动其中的 ArtifactRef。
         match self {
             Self::NoOrder { execution_verdict } => {
                 if execution_verdict.kind != ArtifactKind::ExecutionVerdict {
@@ -90,6 +97,7 @@ pub struct OutcomeSchedule {
 }
 
 impl OutcomeSchedule {
+    // 校验 schedule 身份和三类核心引用，再复用 execution lineage 的 kind 约束。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION || self.outcome_id.0.trim().is_empty() {
             return Err(DomainError::EmptyField {
@@ -107,6 +115,7 @@ impl OutcomeSchedule {
         self.execution.validate()
     }
 
+    // 返回截至指定交易 session 数已经到期的 horizon，保持 T1/T3/T5 固定顺序。
     pub fn due_horizons(&self, completed_trading_sessions: u8) -> Vec<OutcomeHorizon> {
         OutcomeHorizon::ALL
             .into_iter()
@@ -133,6 +142,7 @@ pub struct ForecastScore {
 }
 
 impl ForecastScore {
+    // 用 checked sum 汇总十个 bin 样本，并检查概率/Brier/正例计数的边界。
     pub fn validate(&self) -> Result<(), DomainError> {
         let sample_count = self
             .bins
@@ -169,6 +179,7 @@ pub struct CalibrationReport {
 }
 
 impl CalibrationReport {
+    // 校验样本非零，Brier 和校准误差均在 ppm 范围内。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.sample_count == 0
             || self.mean_brier_ppm > 1_000_000
@@ -192,6 +203,7 @@ pub struct CountedRatio {
 }
 
 impl CountedRatio {
+    // 校验分母、观测数、比例及下置信界之间的数量关系。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.expected_count == 0
             || self.observed_count > self.expected_count
@@ -245,6 +257,7 @@ impl OutcomeBenchmark {
         Self::NoLlmDeterministic,
     ];
 
+    // 返回 benchmark 定义的稳定名称。
     pub const fn name(self) -> &'static str {
         match self {
             Self::Cash => "cash",
@@ -257,6 +270,7 @@ impl OutcomeBenchmark {
         }
     }
 
+    // 派生 benchmark 所需的最小受治理样本数。
     pub const fn minimum_samples(self) -> u32 {
         match self {
             Self::BetaMatchedQqq | Self::VolatilityTargetedQqq => 5,
@@ -264,6 +278,7 @@ impl OutcomeBenchmark {
         }
     }
 
+    // 将 benchmark 方法/权重/参考路径编码后计算其版本化定义哈希。
     pub fn definition_hash(self) -> Result<ContentHash, DomainError> {
         let definition = match self {
             Self::Cash => serde_json::json!({
@@ -313,6 +328,7 @@ impl OutcomeBenchmark {
 /// Stable governance hash for the complete benchmark-definition bundle.
 /// Runtime identity can include this without importing learning code.
 pub fn outcome_benchmark_definition_bundle_hash() -> Result<ContentHash, DomainError> {
+    // 枚举全部 benchmark，收集各自 definition_hash 后计算 bundle 级治理哈希。
     let definitions = OutcomeBenchmark::ALL
         .into_iter()
         .map(|benchmark| {
@@ -347,6 +363,7 @@ pub struct OutcomeBenchmarkNavPoint {
 }
 
 impl OutcomeBenchmarkNavPoint {
+    // 基准 NAV 必须为正，避免把不可定价路径当成有效收益。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.nav_ppm <= 0 {
             return Err(DomainError::InvalidBudget {
@@ -383,6 +400,7 @@ pub struct OutcomeBenchmarkAttribution {
 }
 
 impl OutcomeBenchmarkAttribution {
+    // 校验版本化定义、可用路径长度/日期/缩放因子，及 benchmark/active return 算术一致性。
     fn validate(
         &self,
         portfolio_net_return_ppm: i64,
@@ -412,6 +430,7 @@ impl OutcomeBenchmarkAttribution {
                         field: "outcome_benchmark_attribution",
                     });
                 }
+                // 逐点检查 NAV 为正且观察日严格递增，防止重复或倒序路径。
                 let mut previous_day = None;
                 for point in nav_path {
                     point.validate()?;
@@ -459,6 +478,7 @@ impl OutcomeBenchmarkAttribution {
 }
 
 impl OutcomeNavPoint {
+    // 投资组合和 benchmark NAV 都必须为正，才能表达收益路径。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.portfolio_nav_ppm <= 0 || self.benchmark_nav_ppm <= 0 {
             return Err(DomainError::InvalidBudget {
@@ -501,6 +521,7 @@ pub struct OutcomeOrderCostAttribution {
 }
 
 impl OutcomeOrderCostAttribution {
+    // 校验成交/未成交数量、价格/成本符号以及 fill/shortfall 与成交数量的配对关系。
     pub fn validate(&self) -> Result<(), DomainError> {
         let quantity = self
             .filled_quantity_micros
@@ -588,7 +609,9 @@ pub struct OutcomeWindow {
 }
 
 impl OutcomeWindow {
+    // 校验窗口指标、计数绑定、风险真值引用、NAV 日期、benchmark 全集和订单成本。
     pub fn validate(&self) -> Result<(), DomainError> {
+        // 只验证本窗口已给出的指标；Option::None 保持“未测量”，不会被当作测得 0 的证据。
         if [
             self.calibration_ppm.unwrap_or_default(),
             self.evidence_completeness_ppm.unwrap_or_default(),
@@ -650,6 +673,7 @@ impl OutcomeWindow {
                 field: "outcome_window.risk_ground_truth",
             });
         }
+        // NAV path 必须按观察日严格递增；没有路径不被这里强制视为错误。
         let mut previous_day = None;
         for point in &self.nav_path {
             point.validate()?;
@@ -676,6 +700,7 @@ impl OutcomeWindow {
                     field: "outcome_window.benchmark_attributions",
                 });
             }
+            // 基准比较使用价格效应 + 实施/估值桥接 - 交易成本/滑点的 checked 算术。
             let portfolio_net_return_ppm = self
                 .portfolio_return_ppm
                 .checked_add(self.implementation_effect_ppm.unwrap_or(0))
@@ -750,6 +775,7 @@ pub struct RetrospectiveFinding {
 }
 
 impl RetrospectiveFinding {
+    // 约束复盘陈述、最多八条来源引用和 confidence ppm 范围。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.statement.trim().is_empty()
             || self.statement.chars().count() > 4_000
@@ -776,6 +802,7 @@ pub struct RetrospectiveLessonProposal {
     pub evidence_refs: Vec<ArtifactRef>,
 }
 impl RetrospectiveLessonProposal {
+    // Lesson 候选必须有范围化陈述、行为、排除条件、资产/horizon 和证据引用。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.statement.trim().is_empty()
             || self.statement.len() > 4000
@@ -824,6 +851,7 @@ pub struct RetrospectiveDraft {
 }
 
 impl RetrospectiveDraft {
+    // 校验 Draft 身份、叙事数组数量/长度，并逐项校验 finding 和 Lesson proposal。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION
             || self.outcome_id.0.trim().is_empty()
@@ -886,6 +914,8 @@ pub struct Retrospective {
 }
 
 impl Retrospective {
+    // 先复用同形 Draft 校验，再检查 Outcome 引用 kind 与 T5 sealed_at 非空；
+    // 本方法不检查 sealed_at 的时间先后或所引用 Outcome 的实际封存状态。
     pub fn validate(&self) -> Result<(), DomainError> {
         let draft = RetrospectiveDraft {
             schema_version: self.schema_version,
@@ -936,6 +966,7 @@ pub struct AttemptRelation {
 }
 
 impl AttemptRelation {
+    // 校验尝试关系的身份非空且 parent/child 不相同。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION
             || self.run_id.0.trim().is_empty()
@@ -953,6 +984,7 @@ impl AttemptRelation {
 }
 
 impl OutcomeCostModel {
+    // 交易成本和滑点均按 ppm 表达，不能超过 100%。
     pub fn validate(self) -> Result<(), DomainError> {
         if self.transaction_cost_ppm > 1_000_000 || self.slippage_ppm > 1_000_000 {
             return Err(DomainError::InvalidBudget {
@@ -977,10 +1009,13 @@ pub struct Outcome {
 }
 
 impl Outcome {
+    // 仅依据字段是否为 Some 判断“声明封存”；未调用 validate_sealed，
+    // 因而不能单凭这个布尔值证明三期窗口和来源完整，更不等同学习资格。
     pub fn is_sealed(&self) -> bool {
         self.sealed_at.is_some()
     }
 
+    // 从所有窗口收集风险真值引用，排序去重后返回 provenance 闭包。
     pub fn risk_ground_truth_refs(&self) -> Vec<ArtifactRef> {
         let mut references = self
             .windows
@@ -992,7 +1027,9 @@ impl Outcome {
         references
     }
 
+    // 校验 Outcome 身份/引用、窗口数量、每个 horizon 唯一性和观察日递增。
     pub fn validate(&self) -> Result<(), DomainError> {
+        // 普通 Outcome 可包含尚未到期的部分窗口；重复 horizon 或非递增观察日会让整个 Outcome 校验失败。
         if self.schema_version != DOMAIN_SCHEMA_VERSION || self.outcome_id.0.trim().is_empty() {
             return Err(DomainError::EmptyField {
                 field: "outcome.identity",
@@ -1044,6 +1081,7 @@ impl Outcome {
         Ok(())
     }
 
+    // 在普通校验之外要求恰好三个 horizon 且存在 sealed_at。
     pub fn validate_sealed(&self) -> Result<(), DomainError> {
         self.validate()?;
         if self.windows.len() != OutcomeHorizon::ALL.len() {

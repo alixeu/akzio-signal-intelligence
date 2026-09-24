@@ -1,17 +1,24 @@
 import Foundation
 
+// 文件导读：把场景转成 Portfolio 页的权重、仓位、订单、成交、风险和对账展示值；
+// ScenarioLibrary.build 调用 portfolio，内部订单/成交由同一枚举条件与独立 seed 派生。
+// 虽使用 ALPACA-PAPER 标签和订单回执枚举，全部内容都是 UI fixture，不调用 Alpaca、Broker 或 Store，也不证明下单/成交。
+// 先读 orders→fills、flow、reconciliation 与 portfolio：这些函数刻意分别表达订单、成交、流程到达和对账状态。
 // MARK: - Portfolio, order and execution fixtures
 
 enum PortfolioFixtures {
+    // 这些 fixture 共同构成 Portfolio 页面从目标权重到订单、成交和 reconcile 的只读链路。
     private static let venue = "ALPACA-PAPER"
 
     static func orders(scenario: MockScenario) -> [OrderPresentation] {
+        // 没有订单或被 Decision 阻断时直接返回空数组，样例不会越过业务 Gate。
         guard scenario.hasOrders, !scenario.isDecisionBlocked else { return [] }
         var generator = SeededGenerator(seed: scenario.seed &+ 601)
         let plan: [(TradableAsset, OrderSide)] = [
             (.tqqq, .buy), (.qqq, .sell), (.soxx, .buy), (.soxl, .buy),
         ]
         return plan.enumerated().map { index, entry in
+            // Array.map 按固定计划顺序执行；闭包捕获并推进本地 generator，数量和限价不是下单请求。
             let quantity = Int64(generator.int(in: 40...260)) * 1_000_000
             let limit = Int64(generator.int(in: 42_000_000...98_000_000))
             return OrderPresentation(
@@ -28,6 +35,7 @@ enum PortfolioFixtures {
     }
 
     private static func state(scenario: MockScenario, index: Int) -> OrderReceiptState {
+        // 订单状态仅由场景和资产序号决定，用来覆盖 filled/partial/accepted/canceled 展示分支。
         if scenario.allFilled { return .filled }
         if scenario.hasPartialFill {
             switch index {
@@ -41,11 +49,13 @@ enum PortfolioFixtures {
     }
 
     static func fills(scenario: MockScenario) -> [FillPresentation] {
+        // filter 只保留已成交或部分成交订单，map 闭包把订单投影为成交记录。
         var generator = SeededGenerator(seed: scenario.seed &+ 619)
         return orders(scenario: scenario)
             .filter { $0.state == .filled || $0.state == .partiallyFilled }
             .enumerated()
             .map { index, order in
+                // 过滤先排除未成交订单，随后 map 再按剩余顺序推进独立 generator 生成演示成交价差。
                 let ratio = order.state == .partiallyFilled ? 0.42 : 1.0
                 return FillPresentation(
                     id: "fill-\(scenario.code)-\(index + 1)",
@@ -60,6 +70,7 @@ enum PortfolioFixtures {
     }
 
     static func flow(scenario: MockScenario) -> [AllocationFlowStage] {
+        // reached 表示样例流程到达的展示节点，不代表真实 Broker 写入已发生。
         let reached: Int
         if scenario.isDecisionBlocked {
             reached = 3
@@ -79,11 +90,13 @@ enum PortfolioFixtures {
             ("Reconcile", "arrow.triangle.2.circlepath"),
         ]
         return stages.enumerated().map { index, stage in
+            // map 闭包只给每个流程节点附上是否已到达的视觉状态。
             AllocationFlowStage(title: stage.0, symbol: stage.1, isActive: index < reached)
         }
     }
 
     static func risk(scenario: MockScenario) -> RiskPresentation {
+        // dataUnavailable 场景保留 nil 指标；stale/partial 只提高展示风险标记。
         guard !scenario.dataUnavailable else {
             return RiskPresentation(
                 betaPpm: nil,
@@ -106,12 +119,14 @@ enum PortfolioFixtures {
     }
 
     static func reconciliation(scenario: MockScenario) -> ReconciliationState {
+        // reconcile 结果独立于订单展示，阻断和 NoOrder 都保持 pending。
         if scenario.isDecisionBlocked || !scenario.hasOrders { return .pending }
         if scenario.hasPartialFill { return .partial }
         return scenario.allFilled ? .complete : .pending
     }
 
     static func portfolio(scenario: MockScenario, range: EquityRange = .oneDay) -> PortfolioPresentation {
+        // portfolio 组装曲线、仓位、订单、风险和 verdict，所有字段都来自同一场景 seed。
         var generator = SeededGenerator(seed: scenario.seed &+ 659)
         let curve = CurveFixtures.equityCurve(scenario: scenario, range: range)
         let equity = curve.last?.portfolio ?? CurveFixtures.baseEquity
@@ -123,6 +138,7 @@ enum PortfolioFixtures {
         let realizedPpm = unavailable ? nil : generator.int(in: -2_400...9_600)
 
         func money(_ ppm: Int?) -> Int64? {
+            // money 是只读局部函数；Optional.map 仅在 ppm 非 nil 时执行转换闭包，缺失仍返回 nil。
             ppm.map { Int64(Double($0) / PpmFormatter.ppmPerUnit * equity * PpmFormatter.ppmPerUnit) }
         }
 

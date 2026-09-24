@@ -1,3 +1,4 @@
+# 文件职责：Diagnosing Bugs skill 的界面元数据；本文件描述 UI 名称和调用约束。
 interface:
   display_name: "Diagnosing Bugs"
   short_description: "Diagnose hard bugs and regressions"

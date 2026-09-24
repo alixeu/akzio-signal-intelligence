@@ -1,4 +1,8 @@
+# 文件导读：本地 CLI/Daemon 的 fixture 默认配置模板；CLI/Daemon 解析各节以创建 loopback
+# 服务、选择离线执行 profile、绑定模型路由和任务预算。它不是 Store 状态，也不包含有效凭据。
+# 运行时会把环境变量和 Store Root 解析为实际值；本文件只声明配置，不保存状态或凭据。
 [daemon]
+# 该节只描述服务进程和其隔离边界；`auto_paper=false` 时不自动启动 Paper 调度。
 store_root = ".akzio/store"
 http_addr = "127.0.0.1:7342"
 # The CLI generates or reads
@@ -9,6 +13,7 @@ worker_count = 4
 auto_paper = false
 
 [execution]
+# fixture profile 的资产白名单及估值假设；ppm 字段是明确配置值，不是从账户推导的结果。
 experiment_profile = "fixture"
 assets = ["TQQQ", "QQQ", "SOXX", "SOXL"]
 market_data_feed = "iex"
@@ -20,6 +25,7 @@ slippage_ppm = 0
 # Copy this file to config/akzio.local.toml before adding a real API key, then
 # start the daemon with `--config config/akzio.local.toml`.
 [model]
+# 模型端点/密钥由模板占位符提供；此处不是模型能力验证或调用授权。
 provider = "openai_responses"
 base_url = "$LLM_GATEWAY_BASE_URL"
 model = "gpt-5.6-luna"
@@ -37,6 +43,7 @@ debug = false
 # does not change input, context, tools, wall time or retries. Historical frozen
 # Contracts and Runs keep their original budgets.
 [agent.budget.default]
+# 默认任务预算由 Rust Contract 解析并累计；它不是整个 Run 的 token 额度。
 max_input_tokens = 1000000
 max_tool_calls = "unlimited"
 
@@ -50,4 +57,5 @@ max_tool_calls = "unlimited"
 
 # Additional proposal revisions after the initial synthesis and review.
 [agent.research]
+# 该数值限制初稿之后允许的提案修订次数；实际拓扑由 Rust 按配置冻结。
 max_proposal_revisions = 2

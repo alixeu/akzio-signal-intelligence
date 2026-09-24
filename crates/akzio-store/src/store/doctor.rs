@@ -1,8 +1,16 @@
+// 文件导读：Doctor 在一条 Store 连接上执行只读检查，串联 SQLite quick_check、CAS 解码、事件形状、
+// Artifact/source closure、lease/slot、执行/学习/Canary 历史；它只报告一致性，不修复数据。
+// 建议按 verify_integrity 中的顺序阅读：底层 SQLite/BLOB → event/lifecycle → Artifact 与 Paper
+// lineage → Policy/Learning/Canary → 全 Run graph → 最后未登记 Artifact 兜底。
 use super::*;
 
 impl Store {
+    // 无输入过滤条件，尝试扫描当前 Store 全部 durable 状态；返回 Ok 仅表示各项结构/引用检查通过，
+    // 不表示 Run 成功、Paper 成交或学习资格完成。此方法只取一条连接但未开启显式只读事务，
+    // Store 内 Mutex 排斥同一实例写入，不保证跨实例/进程的所有多语句检查来自同一时点。
     pub fn verify_integrity(&self) -> StoreResult<()> {
         let connection = self.connection()?;
+        // SQLite quick_check 与每个 durable BLOB 的编码、依赖链、长度及 hash 先行检查。
         let quick_check =
             connection.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))?;
         if quick_check != "ok" {
@@ -25,6 +33,7 @@ impl Store {
                 row.get::<_, Option<String>>(5)?,
             ))
         })?;
+        // event type 先恢复领域 enum，再验证 task/attempt/artifact 列形状；坏行会停止 Doctor。
         for row in event_rows {
             let (cursor, run_id, task_id, attempt_id, event_type, artifact_id) = row?;
             let event_type = LifecycleEventType::parse(&event_type).map_err(|error| {
@@ -44,6 +53,7 @@ impl Store {
                 ))
             })?;
         }
+        // 各生命周期验证器按 cursor 检查成对事件和来源；它们只报告不一致，不回补 terminal。
         run_control::verify_checkpoints(&connection)?;
         validate_tool_lifecycle_events(&connection, None)?;
         validate_agent_turn_lifecycle_events(&connection, None)?;
@@ -58,6 +68,8 @@ impl Store {
         if fk.is_some() {
             return Err(StoreError::Integrity("foreign key check failed".to_owned()));
         }
+        // Attempt output 必须同时满足 succeeded 状态与唯一 artifact.committed event，不能从任意 event
+        // 或失败 Attempt 推导正式输出索引。
         let invalid_attempt_output = connection
             .query_row(
                 r#"SELECT o.event_id
@@ -86,6 +98,8 @@ impl Store {
         // Canary Shadows have two explicit frozen parent grants: T0 evidence
         // and the baseline execution lineage used for their paired Outcome.
         // These do not grant arbitrary cross-Run context or later refreshes.
+        // 只筛 child/parent 都为 RunScoped 且 origin.run_id 不同的引用，再由 Debug/Canary 白名单验证；
+        // provenance 通过不等于向运行时 Agent 授予 Context read grant。
         let cross_run_references = connection
             .prepare(
                 r#"SELECT child.artifact_id, parent.artifact_id
@@ -120,6 +134,8 @@ impl Store {
                 )));
             }
         }
+        // 对所有 Artifact 重新读取主 BLOB，并从 Contract/NormalizedEvidence payload 重算嵌入 blob refs；
+        // SQL 索引和 payload 任何一边不一致即报错，不自动 backfill。
         let mut statement = connection.prepare(
             "SELECT artifact_id, blob_hash, media_type, bytes FROM rebuild_artifacts ORDER BY artifact_id",
         )?;
@@ -189,6 +205,7 @@ impl Store {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         for (lease_name, owner_id, epoch, expires_at, heartbeat_at) in leases {
+            // lease 行只校验身份非空、epoch 非零、heartbeat 不晚于 expiry；到期不删除也不自动接管。
             if lease_name.trim().is_empty() || owner_id.trim().is_empty() || epoch == 0 {
                 return Err(StoreError::Integrity(format!(
                     "invalid daemon lease {lease_name}"
@@ -216,6 +233,7 @@ impl Store {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         for (approval_id, manifest_id, session_key, consumed_at) in approval_rows {
+            // approval consumption 必须回连 canonical Approval/Manifest，并复核 CAS hash、session date 与时限。
             let approval = read_artifact(&connection, &ArtifactId(ContentHash::new(approval_id)?))?;
             let manifest = read_artifact(&connection, &ArtifactId(ContentHash::new(manifest_id)?))?;
             if approval.kind != ArtifactKind::PaperLaunchApproval
@@ -287,6 +305,7 @@ impl Store {
             committed_at,
         ) in slots
         {
+            // session slot 的 run_id 没有 SQL FK/unique，故在应用层补验 Run 存在及每 Run 至多一个 slot。
             if session_key.trim().is_empty() || scheduler_epoch == 0 {
                 return Err(StoreError::Integrity(format!(
                     "invalid session slot {session_key}"
@@ -345,6 +364,8 @@ impl Store {
                     )));
                 }
                 (Some(commitment_artifact_id), Some(committed_at)) => {
+                    // 一旦 slot 带 commitment，必须两列同时存在、该 Artifact 唯一归属 slot，
+                    // 并重新检查 plan/context/verdict/approval lineage；不向 Broker 发请求。
                     // The reprice/cancel tables spell out UNIQUE on their own
                     // effect artifact; the slot's commitment column does not,
                     // so two slots adopting one commitment is checked here.
@@ -415,6 +436,7 @@ impl Store {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         for (commitment_artifact_id, asset, reprice_artifact_id, created_at) in reprices {
+            // reprice 索引键与 payload 中 commitment/asset/prior receipt/client+broker IDs 必须相符。
             let commitment_artifact_id = ArtifactId(ContentHash::new(commitment_artifact_id)?);
             let reprice_artifact_id = ArtifactId(ContentHash::new(reprice_artifact_id)?);
             let asset = Asset::try_from(asset.as_str())?;
@@ -507,6 +529,7 @@ impl Store {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         for (commitment_artifact_id, asset, cancel_artifact_id, created_at) in cancels {
+            // cancel 与 reprice 类似，但独立按 receipt identity 检查，二者都只验证已写 intent。
             let commitment_artifact_id = ArtifactId(ContentHash::new(commitment_artifact_id)?);
             let cancel_artifact_id = ArtifactId(ContentHash::new(cancel_artifact_id)?);
             let asset = Asset::try_from(asset.as_str())?;
@@ -602,6 +625,7 @@ impl Store {
         for (subject_id, state_json, revision, transition_id, transition_cursor, updated_at) in
             heads
         {
+            // 每个当前 Policy head 必须指向该 subject 最新 transition，transition 再指向 Paper Evaluation。
             if subject_id.trim().is_empty() || revision == 0 {
                 return Err(StoreError::Integrity(format!(
                     "policy head {subject_id} is invalid"
@@ -667,6 +691,7 @@ impl Store {
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         for value in pair_keys {
+            // pair_key 由 immutable completion payload 重算，并再次核验父/候选 Decision、Outcome 和 execution 来源。
             let pair_key = ContentHash::new(value)?;
             let pair = read_shadow_pair(&connection, &pair_key)?.ok_or_else(|| {
                 StoreError::Integrity(format!("shadow pair {pair_key} disappeared"))
@@ -702,6 +727,7 @@ impl Store {
             .query_map([], |row| Ok(RunId(row.get(0)?)))?
             .collect::<Result<Vec<_>, _>>()?;
         for run_id in run_ids {
+            // 每个 Run 的当前 graph/task 行与完整 revision 链逐项重建，检测 Task 行和冻结图分叉。
             let snapshot = self.workflow_snapshot_with_connection(&connection, &run_id)?;
             self.verify_workflow_history(&connection, &snapshot)?;
         }
@@ -713,12 +739,9 @@ impl Store {
         self.verify_experiment_history(&connection)?;
         self.verify_lesson_history(&connection)?;
         self.verify_canary_campaign_history(&connection)?;
-        // Every artifact bound to a run must be observable in that run's event
-        // log. Artifacts without an origin run are the Rust- and
-        // operator-owned catalogue entries (contract, runtime manifest,
-        // approval) that exist independently of any run. This runs last: it is
-        // a broad backstop, and the lineage checks above give a far more
-        // specific diagnosis for the same row.
+        // 带 origin.run_id 的 Artifact 必须有同 Run 事件；无 Run origin 的根产物
+        // （例如 Contract、RuntimeManifest、Approval）不由这条 SQL 判定。
+        // 此兜底放在最后，前面的领域检查通常能给出更具体的诊断。
         let unlogged_artifact = connection
             .query_row(
                 r#"SELECT a.artifact_id, a.kind, a.producer

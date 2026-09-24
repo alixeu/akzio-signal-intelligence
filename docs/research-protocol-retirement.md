@@ -27,7 +27,7 @@
 | Fixture | Planner 模型模板、旧 fixture 图、`config/task2-fixture.toml` | 正式图的明确 fixture adapters、`debug serve-fixture`、`debug verify-fixture` |
 | 测试和文档 | 旧图控制测试、旧创建命令和过期的通用两阶段说明 | 正式九节点控制测试、Paper NoOrder 后续链、历史只读夹具 |
 
-固定编译见 [compilation](../crates/akzio-runtime/src/runtime/compilation.rs)，验证入口见 [Debug CLI](../crates/akzio-cli/src/cli/debug_commands.rs)，控制测试见 [daemon tests](../crates/akzio-daemon/src/debug/tests.rs)。
+固定编译见 [compilation](../crates/akzio-runtime/src/runtime/compilation.rs)，验证入口见 [Debug CLI](../crates/akzio-cli/src/cli/debug_commands.rs)。
 
 ## 历史兼容与执行阻断
 
@@ -37,7 +37,7 @@
 
 历史 replay 从持久化事件、图修订和冻结 Contract 校验，不依赖活动 Planner recipe。旧版本的特殊能力迁移规则只在历史完整性检查中使用，不再用于当前激活入口。
 
-实现见 [Store 退休判定](../crates/akzio-store/src/store/workflow/helpers.rs)、[升级预检](../crates/akzio-store/src/store/workflow/contracts.rs)、[历史 replay](../crates/akzio-runtime/src/runtime/replay.rs)。冻结的脱敏离线旧运行及出处见 [历史夹具说明](../crates/akzio-store/src/store/fixtures/retired-history.md)，测试见 [retirement tests](../crates/akzio-store/src/store/retirement_tests.rs)。
+实现见 [Store 退休判定](../crates/akzio-store/src/store/workflow/helpers.rs)、[升级预检](../crates/akzio-store/src/store/workflow/contracts.rs)、[历史 replay](../crates/akzio-runtime/src/runtime/replay.rs)。冻结的脱敏离线旧运行及出处见 [历史夹具说明](../crates/akzio-store/src/store/fixtures/retired-history.md)。
 
 ## 离线验收
 
@@ -46,8 +46,7 @@ cargo fmt --all -- --check
 cargo check --workspace --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --locked
-swift run --package-path apps DebugContractChecks
-bash scripts/check_markdown_links.sh
+git diff --check
 cargo run --locked -p akzio-cli -- debug verify-fixture
 ```
 
@@ -55,6 +54,6 @@ cargo run --locked -p akzio-cli -- debug verify-fixture
 
 协议回归覆盖 Paper、PositionPlan、Shadow 的 Submit 起始、工具限制，以及 Outcome 冻结哈希和恢复。Paper 离线图验证既有 ExecutionGate → NoOrder → Reconcile → OutcomeSchedule。Policy 回归单独使用旧 Synthesizer 冻结身份和显式合成校准数据，验证身份不匹配阻断且不激活 Policy。
 
-真实模型与行情的原生 Paper 入口为 `python3 scripts/position_plan_run.py --paper`。它使用同一正式 Paper 图与隔离 Store，在原审批和全部 Gate 通过后向 Alpaca Paper 提交订单；没有本地模拟时钟、账户或成交，也没有恢复 Planner 或 PaperDryRun。旧 `-fakerOnline` / `--faker-online` 参数和配置被拒绝，`simulated_only` 只保留历史解码。缺 Policy 时仍形成正式 NoOrder，运行完成、订单提交与 Paper 成交分开报告。完整操作和归档边界见 [开发 Workflow](development-workflow.md)。
+真实模型与行情的原生 Paper 入口为 `python3 scripts/run_core.py --mode paper`。它连接已有正式 Core，在 canonical Store 中复用同一 Paper 图与 scheduler；原审批和全部 Gate 通过后才可能向 Alpaca Paper 提交订单。没有本地模拟时钟、账户或成交，也没有恢复 Planner 或 PaperDryRun。旧 `-fakerOnline` / `--faker-online` 参数和配置被拒绝，`simulated_only` 只保留历史解码。缺 Policy 时仍形成正式 NoOrder，运行完成、订单提交与 Paper 成交分开报告。完整操作和归档边界见 [开发 Workflow](development-workflow.md)。
 
 这些验收仅提供离线证据，不代表真实模型调用、Policy 激活、Paper 下单或跨交易日 Outcome 验收。

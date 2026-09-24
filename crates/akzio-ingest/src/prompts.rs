@@ -1,4 +1,9 @@
 //! Evidence acquisition wording and typed resource rendering.
+
+// 文件导读：这里只把 Rust 已解析的 GovernedResource 转成模型研究意图和固定治理前缀。
+// 它不决定允许的 URL、来源或证据资格；这些边界由 GovernedResource、adapter 和
+// EvidenceRuntime 校验；`source_verifier.md` 由新闻审核调用方 include_str! 编译嵌入，
+// 这里不会改变审核模型的来源资格或研究角色的工具权限。
 use crate::{EvidenceAdapterError, EvidenceSource, GovernedResource};
 
 pub(crate) const WEB_GOVERNANCE: &str =
@@ -8,6 +13,8 @@ pub(crate) fn research_intent(
     source: EvidenceSource,
     resource: &str,
 ) -> Result<String, EvidenceAdapterError> {
+    // 先把字符串解析成有限资源枚举，再按资源类型生成中文范围说明；解析失败直接返回
+    // Policy，而不是把任意用户文本拼进模型请求。
     let research_intent = match GovernedResource::parse(source, resource).map_err(|error| {
             EvidenceAdapterError::Policy {
                 evidence_source: source,

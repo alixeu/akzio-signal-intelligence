@@ -1,8 +1,12 @@
 import SwiftUI
 
+// 文件导读：WorkflowPage 把 WorkflowPresentation 传给此条；完成数、活跃数、排队数、告警数和进度
+// 都从同一节点投影读取。先读 body 与 counter；空图的进度值遵循模型定义为 0，不意味着 Run 失败或成功。
 // MARK: - Progress strip
 
 struct WorkflowProgressStrip: View {
+    // workflow 是 Store 提供的只读 WorkflowPresentation；strip 只把 Rust projection 的
+    // progress/count/session 字段格式化为 UI，不在这里推导任务完成或交易结果。
     let workflow: WorkflowPresentation
     let namespace: Namespace.ID?
 
@@ -10,6 +14,8 @@ struct WorkflowProgressStrip: View {
     @Environment(\.appLanguage) private var language
 
     var body: some View {
+        // progressFraction 转回 ppm 百分比，四个 counter 直接使用 projection 的计数；
+        // namespace 只供 sharedElement 动画，Optional 时不承担数据状态。
         HStack(spacing: AkzioLayout.s5) {
             ProgressRing(
                 progress: workflow.progressFraction,
@@ -43,6 +49,8 @@ struct WorkflowProgressStrip: View {
     }
 
     private func counter(_ label: String, _ value: Int, tone: AkzioTone, symbol: String) -> some View {
+        // counter 是纯 ViewBuilder helper；颜色只反映展示语义，value=0 不会被解释为未执行
+        // 以外的业务结论，真正状态仍来自 workflow/task projection。
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 4) {
                 Image(systemName: symbol)

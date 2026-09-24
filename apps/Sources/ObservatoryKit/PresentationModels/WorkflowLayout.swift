@@ -1,7 +1,11 @@
 import Foundation
 
+// 文件导读：把 WorkflowStageKind 映射为 DAG Canvas 的 column/row 坐标；
+// WorkflowFixtures.nodes 与 LiveProjection.workflow 调用它来布局 UI，坐标不参与 Rust 依赖判定或调度顺序。
+// 先读 position 的关联值分支：Analyst 序号决定行，Outcome horizon 按交易日数落到固定轨道。
 enum WorkflowLayout {
     static func position(_ stage: WorkflowStageKind) -> (column: Int, row: Int) {
+        // 这是纯展示布局映射；column/row 不参与 Rust DAG 依赖或执行顺序。
         switch stage {
         case .planner: (0, 1)
         case .evidenceGate: (1, 1)

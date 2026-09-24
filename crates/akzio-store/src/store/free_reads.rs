@@ -1,9 +1,15 @@
+// 文件导读：本文件是低层读取/状态收束 helper：Attempt outputs 只索引成功提交的 Artifact，
+// run status 从全部 Task 行派生；解码/校验错误依各 helper 返回其对应 StoreError，不回退默认值。
+// 写路径由 commit_attempt helper 调用，读路径供 Context/learning/Doctor 共用；Connection/Transaction
+// 均由上层持有，避免辅助函数重新拿 Store Mutex。
+// 成功 Attempt 的 Artifact 与对应 artifact.committed cursor 建立唯一索引，重复插入保持幂等。
 fn record_attempt_output(
     transaction: &Transaction<'_>,
     permit: &TaskWritePermit,
     artifact_id: &ArtifactId,
     event_id: i64,
 ) -> StoreResult<()> {
+    // INSERT OR IGNORE 以 attempt_id+artifact_id 幂等；event_id 由同一次调用刚追加的 commit event 提供。
     transaction.execute(
         r#"INSERT OR IGNORE INTO rebuild_attempt_outputs
             (attempt_id, task_id, artifact_id, event_id)
@@ -18,12 +24,16 @@ fn record_attempt_output(
     Ok(())
 }
 
+// 先确认 Attempt 和 Task 都是 succeeded，再按 artifact.committed 事件恢复正式输出。
 fn read_committed_attempt_outputs(
     connection: &Connection,
     expected_run_id: Option<&RunId>,
     task_id: &TaskId,
     attempt_id: &AttemptId,
 ) -> StoreResult<Vec<Artifact>> {
+    // 第一条 JOIN 精确核对 attempt_id 的 Run/Task/状态与可选 expected_run_id；
+    // 第二条查询只接受同一 Attempt 的 artifact.committed 事件，并按 event cursor 排序。
+    // 无成功输出会返回专用 CommittedOutputAttempt 错误，不把中间 Agent/Tool Artifact 当输出。
     let attempt = connection
         .query_row(
             r#"SELECT a.run_id, a.task_id, a.status, t.status
@@ -88,11 +98,14 @@ fn read_committed_attempt_outputs(
         .collect()
 }
 
+// 所有 Task 离开 queued/running 后才更新 Run 终态；失败优先于全 cancelled。
 fn refresh_run_status(
     transaction: &Transaction<'_>,
     run_id: &RunId,
     now: DateTime<Utc>,
 ) -> StoreResult<()> {
+    // 读取该 Run 全部 Task status；空 Run 或还有 queued/running 时不改 Run 行。
+    // 否则 failed 优先，其次“全 cancelled”才是 cancelled，其余终态组合归 completed。
     let statuses = transaction
         .prepare("SELECT status FROM rebuild_tasks WHERE run_id = ?1")?
         .query_map(params![run_id.0], |row| row.get::<_, String>(0))?
@@ -118,7 +131,10 @@ fn refresh_run_status(
     Ok(())
 }
 
+// 从 Artifact 行和 source refs 重建领域对象，列值/JSON/时间任一损坏都阻断读取。
 fn read_artifact(connection: &Connection, artifact_id: &ArtifactId) -> StoreResult<Artifact> {
+    // 先按 artifact_id 读取主行，再单独按 source_artifact_id 排序恢复引用；origin JSON 解成 Option<ArtifactOrigin>。
+    // 缺主行返回 MissingArtifact，任一 hash/kind/JSON/time 列解码失败即 Err。
     let row = connection
         .query_row(
             r#"SELECT kind, blob_hash, media_type, bytes, producer, lifecycle, provenance_json, origin_json, created_at
@@ -183,7 +199,9 @@ fn read_artifact(connection: &Connection, artifact_id: &ArtifactId) -> StoreResu
     })
 }
 
+// 按 created_at/artifact_id 稳定顺序读取指定 kind，不改变 lifecycle 或 head。
 fn read_kind_artifacts(connection: &Connection, kind: ArtifactKind) -> StoreResult<Vec<Artifact>> {
+    // SQL 先按 kind 过滤并稳定排序 ID，再逐个调用 read_artifact 重建；任一项坏掉不会返回部分 Vec。
     let mut statement = connection.prepare(
         "SELECT artifact_id FROM rebuild_artifacts WHERE kind = ?1 ORDER BY created_at ASC, artifact_id ASC",
     )?;
@@ -195,7 +213,10 @@ fn read_kind_artifacts(connection: &Connection, kind: ArtifactKind) -> StoreResu
         .collect()
 }
 
+// Doctor 按 Run/outcome/horizon 识别最多一条正常记录和一条合法 narrative repair。
 fn verify_retrospective_history(store: &Store, connection: &Connection) -> StoreResult<()> {
+    // 扫全量 Retrospective payload 并按 (Run, outcome_id, horizon) 分组；只容许正常单条或受限 T5
+    // ModelUnavailable→Complete 修复对。每条再核验生命周期及其 sealed/partial Outcome 来源。
     let mut identities = BTreeMap::<_, Vec<(Artifact, Retrospective)>>::new();
     for artifact in read_kind_artifacts(connection, ArtifactKind::Retrospective)? {
         artifact.validate()?;
@@ -210,6 +231,7 @@ fn verify_retrospective_history(store: &Store, connection: &Connection) -> Store
         let identity = (run_id.clone(), payload.outcome_id.clone(), payload.horizon);
         let revisions = identities.entry(identity).or_default();
         revisions.push((artifact.clone(), payload.clone()));
+        // 同一 identity 第三条记录，或两条不能构成允许的有向修复链，立即视为重复损坏。
         if revisions.len() > 2
             || (revisions.len() == 2
                 && !valid_retrospective_repair(
@@ -284,7 +306,10 @@ fn verify_retrospective_history(store: &Store, connection: &Connection) -> Store
     Ok(())
 }
 
+// 验证每个 AttemptRelation 的 parent/child 存在、单父关系和无环链。
 fn verify_attempt_relation_history(store: &Store, connection: &Connection) -> StoreResult<()> {
+    // 对每个 relation 解码/验证 payload，并以 Run+Task+Attempt 三列确认 parent/child 都存在；
+    // parent_by_child 建立单父映射，第二遍沿链最多 1024 hops 检查环。
     let mut parent_by_child = BTreeMap::<(RunId, TaskId, AttemptId), AttemptId>::new();
     for artifact in read_kind_artifacts(connection, ArtifactKind::AttemptRelation)? {
         artifact.validate()?;
@@ -347,7 +372,10 @@ fn verify_attempt_relation_history(store: &Store, connection: &Connection) -> St
     Ok(())
 }
 
+// 将 Task SQL 列解析为 WorkflowNode；dependencies 在独立查询中恢复以保持列职责清晰。
 fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<(RunId, WorkflowNode)> {
+    // rusqlite Row 只在回调中借用；把 JSON/ID/枚举字段转为拥有型 WorkflowNode，
+    // dependencies 留空供 task_dependencies 后续按独立关系表加载。
     let task_id = TaskId(row.get(0)?);
     let run_id = RunId(row.get(1)?);
     let recipe_id = TaskRecipeId::new(row.get::<_, String>(2)?)
@@ -382,6 +410,7 @@ fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<(RunId, WorkflowNode
     ))
 }
 
+// Store 时间统一按 RFC3339 解析为 UTC，坏时间作为 Integrity 而不是默认当前时间。
 fn parse_time(value: &str) -> StoreResult<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .map(|value| value.with_timezone(&Utc))
@@ -391,14 +420,18 @@ fn parse_time(value: &str) -> StoreResult<DateTime<Utc>> {
 /// The indexed subject ID is derived from this typed JSON, never accepted as
 /// an independent authority. A corrupt or hand-edited row must therefore
 /// fail closed rather than silently changing a policy namespace.
+// subject_id 是唯一输入，调用领域反解析恢复 typed subject；格式未知或校验失败均传播错误。
 fn parse_persisted_subject(subject_id: &str) -> StoreResult<PolicySubject> {
     Ok(PolicySubject::from_subject_id(subject_id)?)
 }
 
+// 由 evaluation_artifact_id 恢复 policy ledger 行，并把 subject/cursor/state 解析为 typed 值。
 fn read_policy_evaluation(
     connection: &Connection,
     evaluation_artifact_id: &ArtifactId,
 ) -> StoreResult<Option<StoredPolicyEvaluation>> {
+    // evaluation_artifact_id 唯一定位 ledger row；OptionalExtension 区分缺行 None 与损坏字段 Err，
+    // Option<Hash> 与 Option<TransitionId> 通过 map+transpose 保留双层错误语义。
     let row = connection
         .query_row(
             r#"SELECT subject_id, outcome_artifact_id, experience_artifact_id,
@@ -459,6 +492,7 @@ fn read_policy_evaluation(
 }
 
 /// Bounded per-run artifact lookup backed by the v15 expression index.
+// SQL 以 JSON origin.run_id 与 kind 精确过滤、created_at/id 排序；返回的是 owning Artifact 列表。
 fn read_run_kind_artifacts(
     connection: &Connection,
     run_id: &RunId,
@@ -475,12 +509,15 @@ fn read_run_kind_artifacts(
         .collect()
 }
 
+// 仅允许同一 T5 Outcome 的 ModelUnavailable -> Complete narrative revision。
 fn valid_retrospective_repair(
     previous: &Artifact,
     old: &Retrospective,
     next: &Artifact,
     new: &Retrospective,
 ) -> bool {
+    // 逐项比较 horizon/status/outcome/run，并要求新 Artifact source_refs 包含旧 Retrospective；
+    // 这是只读资格谓词，不修改任一 Artifact 或 head。
     old.horizon == OutcomeHorizon::T5
         && new.horizon == old.horizon
         && old.status == RetrospectiveStatus::ModelUnavailable

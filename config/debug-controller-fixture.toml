@@ -1,5 +1,9 @@
+# 文件导读：供 `akzio-cli debug serve-fixture` 和 Debug 控制接口离线检查使用；HTTP Core 仅使用
+# 独立 Store/端口，调用方仍须按精确 Run/Task 执行显式 prepare、inspect、step 或 resume。
+# debug_control 和禁止 Paper 的设置只作用于该 fixture Core，不改变 canonical Store。
 # Offline controller proof only. No credentials, network providers or Broker.
 [daemon]
+# 这些值把控制器限制在本地隔离服务；`auto_paper=false` 不会启动 Paper scheduler。
 # Keep checkpoints outside build products removed by distribution packaging.
 store_root = ".akzio/debug-controller-store"
 http_addr = "127.0.0.1:17342"
@@ -9,6 +13,7 @@ debug_control = true
 outcome_processing = true
 
 [execution]
+# fixture 中的资产和 feed 只是控制流程配置，不代表采集到了真实行情。
 experiment_profile = "fixture"
 assets = ["TQQQ", "QQQ", "SOXX", "SOXL"]
 market_data_feed = "sip"

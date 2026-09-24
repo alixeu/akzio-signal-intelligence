@@ -1,3 +1,4 @@
+# 文件职责：Codex Code Review skill 的界面元数据；注释不参与 YAML 字段解析。
 interface:
   display_name: "Code Review"
   short_description: "Review a diff on standards and spec"

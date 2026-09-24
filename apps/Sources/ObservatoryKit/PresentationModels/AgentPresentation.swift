@@ -1,16 +1,22 @@
 import Foundation
 
+// 文件导读：定义 Intelligence/Council 页使用的 Agent 角色卡、分析记录和主题等只读值模型；
+// MockData 与 LiveProjection 都会创建这些值，页面消费时不会反向调用 Agent 或读取隐藏推理。
+// Optional 指标表示上游未提供；先读 LiveReasoningRecord.presentation、AnalysisRecordPresentation.metadata
+// 和 CouncilPresentation.role，理解如何把有限观察数据整理成安全 UI 文本。
 // MARK: - Council (Intelligence page)
 
 /// A named uncertainty with a weight. Weights are ppm so the bars format like
 /// every other ratio in the app.
 public struct UncertaintyPresentation: Sendable, Hashable, Identifiable {
+    // 不确定性是上游已计算的 Optional 权重；label 作为稳定列表 ID。
     public let label: String
     public let weightPpm: Int?
 
     public var id: String { label }
 
     public init(label: String, weightPpm: Int?) {
+        // 把已给定的权重与标签封装为值模型；nil 表示没有可展示权重，不在这里计算默认值。
         self.label = label
         self.weightPpm = weightPpm
     }
@@ -19,18 +25,21 @@ public struct UncertaintyPresentation: Sendable, Hashable, Identifiable {
 /// Supporting material a conclusion leans on. Never the model's hidden reasoning —
 /// only the artifacts it cited.
 public struct BasisArtifact: Sendable, Hashable, Identifiable {
+    // BasisArtifact 只展示被引用的依据标签和图标，不承载模型隐藏推理。
     public let label: String
     public let symbol: String
 
     public var id: String { label }
 
     public init(label: String, symbol: String) {
+        // 只保存被上游挑出的依据标签和图标，不接触 Evidence 正文或模型私有推理。
         self.label = label
         self.symbol = symbol
     }
 }
 
 public struct AlternativePresentation: Sendable, Hashable, Identifiable {
+    // alternative 是候选方案的值语义投影，matchPpm 缺失时页面必须保留 unknown。
     public let tag: String
     public let label: String
     public let matchPpm: Int?
@@ -38,6 +47,7 @@ public struct AlternativePresentation: Sendable, Hashable, Identifiable {
     public var id: String { tag }
 
     public init(tag: String, label: String, matchPpm: Int?) {
+        // matchPpm 保持可空，使缺失匹配度不会被误读为零分。
         self.tag = tag
         self.label = label
         self.matchPpm = matchPpm
@@ -45,6 +55,7 @@ public struct AlternativePresentation: Sendable, Hashable, Identifiable {
 }
 
 public struct ModelOption: Sendable, Hashable, Identifiable {
+    // gallery 选项是只读模型展示；isSelected 不代表运行时已经切换 provider。
     public let name: String
     public let tier: String
     public let isSelected: Bool
@@ -52,6 +63,7 @@ public struct ModelOption: Sendable, Hashable, Identifiable {
     public var id: String { name }
 
     public init(name: String, tier: String, isSelected: Bool) {
+        // 画廊选项是展示快照；isSelected 不会触发模型配置或 provider 切换。
         self.name = name
         self.tier = tier
         self.isSelected = isSelected
@@ -61,6 +73,7 @@ public struct ModelOption: Sendable, Hashable, Identifiable {
 // MARK: - Observed analysis
 
 public enum AnalysisRecordKind: String, Sendable, Hashable {
+    // kind 区分 Observer 可公开的记录来源，rawValue 便于跨层追踪。
     case reasoningSummary = "reasoning_summary"
     case researchMemo = "research_memo"
     case analysis
@@ -69,6 +82,7 @@ public enum AnalysisRecordKind: String, Sendable, Hashable {
     case rustOutput = "rust_output"
     case conclusion
 
+    // 后续两个计算属性仅将记录类型映射到标签/色调，rawValue 仍是原始分类值。
     public var displayName: String {
         switch self {
         case .reasoningSummary: "Model summary"
@@ -94,6 +108,7 @@ public enum AnalysisRecordKind: String, Sendable, Hashable {
 /// tool lifecycle metadata, or a validated artifact; hidden reasoning, provider
 /// envelopes, tool arguments, and secrets are never represented by this type.
 public struct AnalysisRecordPresentation: Sendable, Hashable, Identifiable {
+    // 这是 Observer-safe 的分析行值模型；Optional 元数据缺失时保持缺失，不由 UI 猜测。
     public let id: String
     public let sequence: Int64
     public let kind: AnalysisRecordKind
@@ -127,6 +142,7 @@ public struct AnalysisRecordPresentation: Sendable, Hashable, Identifiable {
         taskID: String? = nil,
         horizon: String? = nil
     ) {
+        // 初始化完整复制上游投影；taskID/horizon 可在后续 inspector 归并时补齐。
         self.id = id
         self.sequence = sequence
         self.kind = kind
@@ -145,6 +161,7 @@ public struct AnalysisRecordPresentation: Sendable, Hashable, Identifiable {
     }
 
     public var metadata: String? {
+        // map/compactMap/filter 闭包只拼接可用元数据；空值和 unavailable 不进入页面标签。
         let values = [
             model,
             reasoningMode,
@@ -157,6 +174,7 @@ public struct AnalysisRecordPresentation: Sendable, Hashable, Identifiable {
 }
 
 struct LiveReasoningRecord: Sendable, Hashable, Identifiable {
+    // LiveReasoningRecord 是 Core 流式中间值；presentation 属性把它降级为安全展示行。
     let id: String
     let sequence: Int64
     let runID: String
@@ -168,6 +186,7 @@ struct LiveReasoningRecord: Sendable, Hashable, Identifiable {
     var isComplete: Bool
 
     var presentation: AnalysisRecordPresentation {
+        // body 为空时显示生成中占位，isComplete 只映射为 isStreaming，不改变原始记录。
         AnalysisRecordPresentation(
             id: id,
             sequence: sequence,
@@ -183,6 +202,7 @@ struct LiveReasoningRecord: Sendable, Hashable, Identifiable {
 }
 
 public enum IntelligenceTopicKind: String, Sendable, Hashable {
+    // topic kind 只控制 Intelligence 页面颜色/文案，来源仍由 Observer 投影提供。
     case topic
     case issue
     case alternative
@@ -200,12 +220,14 @@ public enum IntelligenceTopicKind: String, Sendable, Hashable {
 }
 
 public struct IntelligenceTopicPresentation: Sendable, Hashable, Identifiable {
+    // topic 是标题和来源的不可变展示值，不在 Swift 层重新检索证据。
     public let id: String
     public let kind: IntelligenceTopicKind
     public let title: String
     public let source: String
 
     public init(id: String, kind: IntelligenceTopicKind, title: String, source: String) {
+        // topic 的 kind/source 由投影调用方提供；本值类型不检索或验证引用来源。
         self.id = id
         self.kind = kind
         self.title = title
@@ -216,6 +238,7 @@ public struct IntelligenceTopicPresentation: Sendable, Hashable, Identifiable {
 // MARK: - Role card
 
 public struct RoleCardPresentation: Sendable, Hashable, Identifiable {
+    // RoleCard 是 Agent role 的指标投影；Optional token/latency 表示上游没有该指标。
     public let role: AgentRole
     public let model: String
     public let status: AkzioStatus
@@ -239,6 +262,7 @@ public struct RoleCardPresentation: Sendable, Hashable, Identifiable {
         confidencePpm: Int?,
         intensity: ReasoningIntensity
     ) {
+        // 初始化复制角色、模型和指标，避免页面根据状态重新估算 token 或置信度。
         self.role = role
         self.model = model
         self.status = status
@@ -255,6 +279,7 @@ public struct RoleCardPresentation: Sendable, Hashable, Identifiable {
 // MARK: - Selected model detail
 
 public struct CouncilPresentation: Sendable, Hashable {
+    // CouncilPresentation 聚合角色、候选、依据和分析记录，供 Intelligence 页面只读消费。
     public let roles: [RoleCardPresentation]
     public let selectedRole: AgentRole
     public let selectedModelName: String
@@ -284,6 +309,7 @@ public struct CouncilPresentation: Sendable, Hashable {
         topics: [IntelligenceTopicPresentation] = [],
         analysisRecords: [AnalysisRecordPresentation] = []
     ) {
+        // 默认空数组表示上游没有对应可展示记录，不等价于记录已确认不存在。
         self.roles = roles
         self.selectedRole = selectedRole
         self.selectedModelName = selectedModelName
@@ -300,6 +326,7 @@ public struct CouncilPresentation: Sendable, Hashable {
     }
 
     public func role(_ role: AgentRole) -> RoleCardPresentation? {
+        // first 闭包按 role 查找单一卡片；缺失时返回 nil 让调用方决定占位方式。
         roles.first { $0.role == role }
     }
 

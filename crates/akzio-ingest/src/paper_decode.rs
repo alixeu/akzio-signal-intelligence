@@ -1,5 +1,11 @@
 //! Decode Paper provider payloads into domain snapshots and bar series.
 
+// 文件导读：本文件只做 Alpaca Paper 原始 JSON→领域快照/价格序列的类型解码。它保留
+// provider 观察时间、资产白名单、账户组件、报价 feed 和交易时钟；缺字段、重复日期、
+// 非可执行报价资产与达到 100 条的 fills 页会拒绝；持仓中的非白名单资产则保存在
+// external_positions 供后续 Gate 判断。报价/时钟不用下载时间替代 provider timestamp；
+// 解码成功不代表 ExecutionGate 通过，更不代表订单成交。
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use akzio_domain::{
@@ -28,6 +34,9 @@ pub fn parse_daily_bars(
     value: &Value,
     observed_at: DateTime<Utc>,
 ) -> PaperDecodeResult<BTreeMap<NaiveDate, MoneyMicros>> {
+    // 优先解析 bars 数组；没有 bars 时的单值 close 沿用 observed_at 的 UTC 日期
+    // 兼容分支，它不等于四资产共同 Session 的证明。每根 bar 的日期必须可解析且
+    // 唯一，BTreeMap 只负责确定性排序，后续共同日期仍需四资产交集。
     let Some(items) = value.get("bars").and_then(Value::as_array) else {
         let close = value
             .get("close")
@@ -69,6 +78,8 @@ pub fn parse_daily_bars(
 }
 
 pub fn parse_money_micros(value: &Value) -> Option<MoneyMicros> {
+    // 只接受十进制字符串/数字和最多六位小数，转为整数 micros；科学计数法、非法字符和
+    // 整数溢出返回 None，避免浮点或隐式舍入污染后续金额。
     let raw = value
         .as_str()
         .map(str::to_owned)
@@ -110,6 +121,8 @@ pub fn common_bar_dates(
     bars_by_asset: &BTreeMap<Asset, BTreeMap<NaiveDate, MoneyMicros>>,
     baseline: NaiveDate,
 ) -> Vec<NaiveDate> {
+    // 先要求四个可执行资产都存在，再取 baseline 之后的日期交集；缺任一资产直接返回空，
+    // 让 Outcome 不能用单资产窗口冒充共同 Session。
     if Asset::EXECUTABLE
         .into_iter()
         .any(|asset| !bars_by_asset.contains_key(&asset))
@@ -132,6 +145,8 @@ pub fn decode_paper_account(
     broker_session: String,
     observed_at: DateTime<Utc>,
 ) -> PaperDecodeResult<AccountSnapshot> {
+    // 已标准化快照直接反序列化；provider 原始账户则读取 status/equity/buying_power 和
+    // trading_blocked，先建立没有 positions/fills 组件的基础账户。
     if value.get("schema_version").is_some() {
         return Ok(serde_json::from_value(value.clone())?);
     }
@@ -167,6 +182,9 @@ pub fn decode_paper_account_components(
     broker_session: String,
     observed_at: DateTime<Utc>,
 ) -> PaperDecodeResult<AccountSnapshot> {
+    // 在基础账户上合并 positions、open orders 和 fills：可执行资产进入 typed positions，
+    // 其他持仓进入 external_positions，开放订单 ID 只被记录，是否阻断由后续 Gate 判断；
+    // fills 计算 day_turnover，达到 provider page limit (100) 时拒绝不完整页。
     let mut account = decode_paper_account(account_value, broker_session, observed_at)?;
     if account_value.get("schema_version").is_some() {
         return Ok(account);
@@ -256,6 +274,8 @@ pub fn decode_paper_quotes(
     broker_session: String,
     observed_at: DateTime<Utc>,
 ) -> PaperDecodeResult<QuoteSnapshot> {
+    // 将每个 symbol 转为白名单 Asset，并保留 quote.t 作为报价观察时间；没有 quote 或
+    // 没有 provider 时间戳均失败，不能继承抓取时间。
     if value.get("schema_version").is_some() {
         return Ok(serde_json::from_value(value.clone())?);
     }
@@ -307,6 +327,8 @@ pub fn decode_paper_clock(
     broker_session: String,
     _observed_at: DateTime<Utc>,
 ) -> PaperDecodeResult<MarketClockSnapshot> {
+    // 解码 is_open、provider timestamp 和可选 TradingSession；是否可交易由领域 session/
+    // calendar 再判断，_observed_at 不作为 provider 时间兜底。
     if value.get("schema_version").is_some() {
         return Ok(serde_json::from_value(value.clone())?);
     }
@@ -334,6 +356,7 @@ pub fn decode_paper_clock(
 }
 
 pub fn provider_money(value: &Value, field: &str) -> PaperDecodeResult<MoneyMicros> {
+    // 对 provider 对象取指定字段并复用十进制 micros 解码，字段缺失或格式错误立刻失败。
     value
         .get(field)
         .and_then(parse_money_micros)
@@ -343,6 +366,7 @@ pub fn provider_money(value: &Value, field: &str) -> PaperDecodeResult<MoneyMicr
 }
 
 fn provider_timestamp(value: &Value, field: &str) -> PaperDecodeResult<DateTime<Utc>> {
+    // 只接受 RFC3339 provider timestamp 并统一为 UTC，错误带上字段名供证据诊断。
     let raw = value.as_str().ok_or_else(|| {
         PaperDecodeError::InvalidInput(format!("Paper provider field {field} invalid"))
     })?;
@@ -359,6 +383,7 @@ mod freshness_tests {
 
     #[test]
     fn missing_provider_timestamps_cannot_become_fresh_snapshots() {
+        // 回归：下载时刻不能替代缺失的报价/时钟 provider observation time。
         let received_at = DateTime::parse_from_rfc3339("2026-09-09T14:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
@@ -384,6 +409,7 @@ mod freshness_tests {
 
     #[test]
     fn provider_timestamps_are_preserved_for_freshness_gate() {
+        // 回归：旧时间必须原样保留，后续 freshness gate 才能正确阻断。
         let received_at = DateTime::parse_from_rfc3339("2026-09-09T14:00:00Z")
             .unwrap()
             .with_timezone(&Utc);

@@ -1,8 +1,18 @@
+// 文件导读：Outcome worker 是 Run 终态后的耐久任务。OutcomeSchedule 先与成功 Attempt
+// 一起落库，再由 Paper/Shadow 专用协议写入 sealed Outcome、Retrospective；
+// Shadow pair 的完成索引由 learning/shadow.rs 另行提交。
+// Schedule 创建 post-terminal worker 的入口在文件首部；中间阶段写入与最终封存拆分在
+// write_outcome_retrospective_fenced/commit_outcomes，policy evaluation 在 policy.rs。
 impl Store {
     /// Commits the terminal `OutcomeSchedule` and installs the scheduler-owned
     /// learning task in the same SQLite transaction. The learning task is not
     /// part of the frozen research graph; it is a post-terminal durable worker
     /// attached to the Paper run and cannot be created by a planner or agent.
+    // 输入成功 Attempt permit 和 OutcomeSchedule Artifact；校验 schedule 与持久化 purpose 后，
+    // 在一个 Immediate 事务内提交 schedule、Task 输出、动态 worker Task、enqueue event 与 Debug wakeup。
+    // 仅在找到输入中包含相同 schedule Ref 的 worker 时，核对原成功证明并幂等返回；
+    // 其它 worker 或损坏的 input_artifacts_json 不会被该 find_map 当成匹配。
+    // 新 worker 受 Contract budget 与冻结 graph budget 控制。
     pub fn commit_outcome_schedule_with_worker(
         &self,
         permit: &TaskWritePermit,
@@ -41,6 +51,8 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .find_map(|(task_id, input_json)| {
+                // `find_map` 遇到无效 JSON 用 `.ok()?` 跳过该行，并不在此处报完整性错误；
+                // 只有输入包含精确 schedule ArtifactRef 才返回对应 Task ID。
                 let inputs = serde_json::from_str::<Vec<ArtifactRef>>(&input_json).ok()?;
                 inputs
                     .iter()
@@ -58,6 +70,7 @@ impl Store {
         )?
         .map(|(hash, _)| hash)
         .or_else(|| schedule.provenance.producer_contract_hash.clone());
+        // 优先取当前 catalogue head，缺 head 才退回 schedule provenance；有 hash 但安装行不存在则 Err。
         // The Run graph freezes role budgets independently of Contract safety defaults.
         let worker_policy = worker_contract_hash
             .as_ref()
@@ -131,6 +144,7 @@ impl Store {
                 |row| row.get::<_, String>(0),
             )?
             .collect::<Result<Vec<_>, _>>()?;
+        // 只收集本 Run 中所属 Task 和 Attempt 均 succeeded、且事件类型/ArtifactKind 匹配的 DeliberationNote。
         worker_inputs.extend(
             deliberation_note_ids
                 .into_iter()
@@ -158,6 +172,8 @@ impl Store {
             on_failure: worker_on_failure,
             parent_task_id: None,
         };
+        // 如果原 Attempt 已 succeeded，只按成功证明补回后续 worker；否则 schedule Artifact、Task success 和 worker
+        // 都在下方事务中一起完成，绝不复活旧 permit。
         let already_committed:bool=transaction.query_row("SELECT status='succeeded' FROM rebuild_attempts WHERE attempt_id=?1",params![permit.attempt_id.0],|r|r.get(0))?;
         if already_committed {
             // Reattach missing future work using immutable success proof, never
@@ -183,6 +199,9 @@ impl Store {
 
     /// Discover old Paper schedules that were committed while outcome processing
     /// was disabled. The existing commit path checks their original success proof.
+    // 先只读挑最多 1000 个“已完成 Paper Run、Schedule 是成功 output、没有 worker/最终 Outcome”的候选，
+    // 再逐项调用上面的事务入口。每个 Run 独立提交；Ok(n) 是初始候选行数，不保证每项都是新建 worker；
+    // 中途 Err 时较早项可能已补建，函数不会整体回滚。
     pub fn ensure_pending_outcome_workers(&self,now:DateTime<Utc>)->StoreResult<usize> {
         let pending={
             let connection=self.connection()?;
@@ -191,6 +210,7 @@ impl Store {
             rows
         };
         for (run,task,attempt,lease,epoch,contract,id) in &pending {
+            // 从数据库列重建原成功 permit 并重新读取 Schedule；目标入口再次核验原 attempt/output proof。
             let permit=TaskWritePermit{run_id:RunId(run.clone()),task_id:TaskId(task.clone()),attempt_id:AttemptId(attempt.clone()),lease_id:LeaseId(lease.clone()),epoch:*epoch,contract_hash:contract.as_deref().map(ContentHash::new).transpose()?};
             let schedule=self.artifact(&ArtifactId(ContentHash::new(id.clone())?))?;
             self.commit_outcome_schedule_with_worker(&permit,&schedule,now)?;
@@ -201,6 +221,9 @@ impl Store {
     /// Commits sealed Paper or Shadow outcomes through a purpose-aware path.
     /// Generic task artifact APIs reject Outcome so learning lineage cannot be
     /// created without these checks.
+    // 输入一批 sealed Outcome；先逐个在事务外检查 Artifact/BLOB/payload，再在一个 Immediate 事务内
+    // 核验当前 Run purpose 与 schedule/execution lineage、插入全批 CAS、写 outputs 并成功收束 Attempt。
+    // Paper Outcome 是 Canonical，Shadow Outcome 是 RunScoped；任何一个不合格都会回滚整批。
     pub fn commit_outcomes(
         &self,
         permit: &TaskWritePermit,
@@ -241,6 +264,7 @@ impl Store {
             _ => unreachable!("non-learning purpose rejected above"),
         };
         for (artifact, outcome) in outcomes.iter().zip(&payloads) {
+            // Artifact.source_refs 必须恰等于 schedule、market evidence 和 risk-ground-truth 闭包。
             if artifact.lifecycle != expected_lifecycle {
                 return Err(StoreError::InvalidLearningCommit(
                     "commit_outcomes.lifecycle",
@@ -269,6 +293,7 @@ impl Store {
         let (_, on_failure) = task_retry_policy(&transaction, &permit.task_id)?;
         insert_artifact_batch(&transaction, outcomes)?;
         for artifact in outcomes {
+            // 所有 outcomes 都绑定当前 permit 的同一 Attempt；event_id 同时作为正式输出索引键。
             assert_origin_matches(artifact.origin.as_ref(), permit)?;
             let event_id = append_event(
                 &transaction,
@@ -302,6 +327,9 @@ impl Store {
         now: DateTime<Utc>,
         complete_task: bool,
     ) -> StoreResult<()> {
+        // 输入已密封 Outcome/T5 Retrospective 与 complete_task 阶段标记；先在事务外验证类型/领域 payload，
+        // 事务内再核验 lease、permit、Paper purpose、schedule 与来源闭包。
+        // complete_task=false 允许 durable 阶段进度但不发布成功输出；true 才索引 Outcome 并关闭 Attempt。
         outcome_artifact.validate()?;
         retrospective_artifact.validate()?;
         self.read_blob(&outcome_artifact.blob)?;
@@ -400,6 +428,7 @@ impl Store {
                     &retrospective,
                 )
             {
+                // 同 Run/Outcome/Horizon 已有记录时仅允许完全相同 Artifact 或已定义的 Narrative repair 链。
                 return Err(StoreError::Integrity(
                     "duplicate retrospective identity different payload".to_owned(),
                 ));
@@ -411,6 +440,7 @@ impl Store {
             if already_exists {
                 continue;
             }
+            // Outcome 追加 artifact.committed；Retrospective 使用专用 RetrospectiveCreated event。
             insert_artifact(&transaction, artifact)?;
             let event_type = if artifact.kind == ArtifactKind::Retrospective {
                 LifecycleEventType::RetrospectiveCreated
@@ -436,6 +466,7 @@ impl Store {
             // output. The terminal-output index must never publish a deferred
             // or interrupted Attempt.
             if complete_task && event_type == LifecycleEventType::ArtifactCommitted {
+                // 只有 complete_task 时 Outcome 进入 succeeded-output 索引；Retrospective 永远是支持材料。
                 record_attempt_output(&transaction, permit, &artifact.artifact_id, event_id)?;
             }
         }
@@ -457,6 +488,8 @@ impl Store {
     /// Records an immutable outcome-backed comparison. Completion is keyed by
     /// the compared decisions/context/candidate/horizon, never by wall-clock
     /// time, so a recovered attempt cannot create a second pair.
+    // 计算稳定 pair_key 后，在 Immediate 事务中核验 Paper permit 与五个 source refs；
+    // 已存在且 identity 相同返回 Existing，否则追加事件和索引行后返回 Inserted，不在这里推进 Policy head。
     pub fn complete_shadow_pair(
         &self,
         permit: &TaskWritePermit,
@@ -523,6 +556,7 @@ impl Store {
     /// Commits every canonical outcome-backed evaluation. A no-op still closes
     /// the subject's durable pair-consumption cursor, so one completed shadow
     /// pair cannot be used by more than one canonical evaluation.
+    // 无额外 daemon lease 的薄 wrapper；所有 validation、CAS 和提交逻辑复用 policy.rs 的 fenced 入口。
     pub fn record_policy_evaluation(
         &self,
         commit: &PolicyEvaluationCommit,

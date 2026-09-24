@@ -2,7 +2,13 @@
 //!
 //! This module combines domain-owned capacity, compliance, and dependency
 //! contracts into one fail-closed assessment. Missing market or compliance
-//! data never grants execution authorization.
+//! data cannot grant execution authorization. This assessment is reached only
+//! after the execution gate has admitted allocation.
+
+// 文件导读：本模块把容量、信息分类、合规活动和依赖闭包合成一个安全快照。输入由
+// ExecutionGate 以外部采集结果提供，Rust 再依据目标是否增加风险选择“新风险”或
+// “风险降低”许可；缺少成交量、分类、依赖许可或任何合规结果时，assessment 保留
+// 缺口并拒绝执行，而不是把缺失解释成安全；缺审批而提前 NoOrder 的路径不会调用这里。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -21,7 +27,9 @@ pub struct PreTradeSafetyPolicy {
 }
 
 impl PreTradeSafetyPolicy {
+    // `&self` 只读取配置并把底层 DomainError 原样返回；不会在校验时写入或修正策略。
     pub fn validate(&self) -> Result<(), DomainError> {
+        // 先验证容量和合规策略本身，确保后面每个资产的 assessment 都使用已知边界。
         self.capacity.validate()?;
         self.compliance.validate()?;
         Ok(())
@@ -31,6 +39,10 @@ impl PreTradeSafetyPolicy {
         &self,
         input: &PreTradeSafetyInput,
     ) -> Result<PreTradeSafetyAssessment, DomainError> {
+        // 先检查账户、资产集合和参与者数量，再以 BTreeSet/BTreeMap 累积缺失项与违规项；
+        // 最终 permits_execution 同时要求数据完整、容量可行、合规无违规和依赖许可。
+        // 参数为共享借用，因此评估只产生新的快照，不消费输入；`?` 会将首个结构错误
+        // 直接返回给 ExecutionGate，避免把不完整输入转换为允许执行的 assessment。
         self.validate()?;
         input.target.validate_universe()?;
         if input.account_equity.0 <= 0
@@ -50,6 +62,8 @@ impl PreTradeSafetyPolicy {
             .into_iter()
             .filter(|asset| input.target.weights[asset].0 > 0)
             .collect::<BTreeSet<_>>();
+        // 仅风险增加场景要求所有目标资产具备正的成交量事实；风险降低场景不把缺成交量
+        // 当作新增风险容量证明，故对应集合直接为空。
         let missing_average_daily_dollar_volume = if input.risk_increasing {
             active_target_assets
                 .iter()
@@ -80,6 +94,8 @@ impl PreTradeSafetyPolicy {
         let mut missing_information_classifications = BTreeSet::new();
         let mut compliance_violations_by_asset = BTreeMap::new();
         for asset in input.ordered_assets.iter().copied() {
+            // `get().copied()` 复制可 Copy 的分类值；缺项时闭包把资产记录到缺口集合，
+            // 并用 Unknown 继续计算合规违规，最终仍会因缺口而 fail closed。
             let information = input
                 .information_classifications
                 .get(&asset)
@@ -97,6 +113,8 @@ impl PreTradeSafetyPolicy {
         let dependency_permits_new_risk = input.dependency_closure.permits_new_risk(input.now);
         let dependency_permits_risk_reduction =
             input.dependency_closure.permits_risk_reduction(input.now);
+        // 容量只对风险增加做门槛；合规结果必须非空且每个资产的违规集合为空。
+        // 下面把数据完整性、容量、合规和依赖权限合取，任一 false 都不会获准执行。
         let capacity_permits_execution = !input.risk_increasing
             || capacity_scenario
                 .as_ref()
@@ -117,6 +135,8 @@ impl PreTradeSafetyPolicy {
             };
         let permits_risk_increasing = input.risk_increasing && permits_execution;
 
+        // 将本次检查使用的输入副本与派生缺口/许可一起封存在结果中，便于后续持久化审计；
+        // 这里的 clone 是快照数据复制，不代表 Store 事务或 Broker 授权。
         let assessment = PreTradeSafetySnapshot {
             ordered_assets: input.ordered_assets.clone(),
             information_classifications: input
@@ -137,6 +157,7 @@ impl PreTradeSafetyPolicy {
             permits_execution,
             permits_risk_increasing,
         };
+        // Domain 再校验输出内部关系；此处通过只证明快照自洽，不表示订单已生成或提交。
         assessment.validate()?;
         Ok(assessment)
     }
@@ -160,6 +181,8 @@ pub struct PreTradeSafetyInput {
 /// them with the Rust-derived target, order sides, and current account equity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreTradeSafetyEvidence {
+    // 这些字段是 Gate 刷新得到的外部事实投影；它们不携带订单权限，权限仍由下方
+    // assess 根据 target 与 now 重新组合并验证。
     pub homogeneous_agent_count: u32,
     pub average_daily_dollar_volume: BTreeMap<Asset, MoneyMicros>,
     pub information_classifications: BTreeMap<Asset, InformationClassification>,

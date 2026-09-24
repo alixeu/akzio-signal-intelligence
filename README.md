@@ -178,7 +178,7 @@ target/debug/akzio calibration readiness --store ~/.akzio/store --min-samples 30
 
 `collect` 只接受 canonical Store 的真实 Decision、密封 Outcome 和四资产共同交易 Session 标签，同时检查模型身份、Contract、训练窗口及价格序列。有效 Synthesizer 路由必须有可核实的 `release_date` 与 `knowledge_cutoff`。缺少样本或条件时保持阻断，不用目标仓位、事后总结或合成样本填充。`activate` 校验模型与当前 Synthesizer Contract 后，原子更新同一 Policy Artifact 的激活历史和 active head。
 
-隔离 Debug 和原生 Alpaca Paper 入口 `python3 scripts/position_plan_run.py --paper` 可以验证正式图，但其运行不能计入正式校准；readiness 明确报告 `isolated_debug_store`，等待 Outcome 不会改变资格。旧 `-fakerOnline` 已删除。Paper 入口按真实交易时段、原审批和全部 Gate 执行；`NoOrder` 可表示流程已完成，不能据此宣称 Policy 已校准或发生 Paper 下单、成交。扩展时段、待成交恢复和归档边界见 [开发 Workflow](docs/development-workflow.md)。
+`python3 scripts/run_core.py --mode position-plan`（默认）与 `python3 scripts/run_core.py --mode paper` 只连接已有正式 Core，将 Run 写入 canonical Store，不创建 Debug 实验。缺 Policy 的 PositionPlan 保留经 Rust 审查的研究分配，正式目标为零且不安排 Outcome；显式 Paper 冷启动为零目标 / NoOrder，完整成熟的真实市场标签才可能用于未来校准。原审批及全部 Gate 通过后才可能向 Alpaca Paper 下单。隔离 Debug 实验仍不能计入正式校准；旧 `-fakerOnline` 已删除。`NoOrder` 或订单 accepted 不代表成交、Policy 激活或 T+5 完成。运行、扩展时段和归档边界见 [开发 Workflow](docs/development-workflow.md)。
 
 ---
 
@@ -297,7 +297,7 @@ App 可通过 `AKZIO_DEBUG_ENDPOINT` 与 `AKZIO_DEBUG_STORE_ROOT` 连接显式�
 
 项目包含配套的原生 macOS 管理应用（基于 SwiftUI 构建）：
 
-- **打包构建**：运行 `scripts/update_app_and_submit_debug.sh` 生成已签名的分发包 `apps/dist/akzio.app`，并保留构建产物。已有 Bundle 不会被覆盖；再次构建须通过 `AKZIO_APP_BUNDLE` 指定新路径，示例见 [开发 Workflow](docs/development-workflow.md)。
+- **打包构建**：运行 `bash scripts/build_app_and_core.sh` 编译当前 Swift App 与 release Rust Core，生成新的 ad-hoc 签名 Bundle，并输出 `APP_BUNDLE` 和独立的 `RUST_BINARY` 路径。默认每次选择新的 `apps/dist/akzio-*.app`，不会覆盖旧 Bundle；可通过 `AKZIO_APP_BUNDLE` 指定其他未使用目标，详见 [开发 Workflow](docs/development-workflow.md)。
 - **Core 嵌入机制**：App 启动时会通过 `RustCoreSupervisor` 自动将内嵌的 `akzio-core` 启动为 `daemon serve`，无缝读取 `~/.akzio/config.toml`。
 - **状态监控**：若界面显示 `Paper scheduler waiting: broker market is closed`，表明系统正在正常等待下一个美股开盘窗口。
 

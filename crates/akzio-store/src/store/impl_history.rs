@@ -1,5 +1,12 @@
+// 文件导读：历史校验从安装表、activation 链、Policy evaluation/consumption head 重放，
+// 检查每个 immutable predecessor 和 event cursor；它不合并或改写旧 CAS。
+// Store Doctor 调用这两个只读扫描；Connection 由 Doctor 持有，本文件不创建事务，
+// 因而一致性快照由调用方的连接/事务范围决定。
 impl Store {
+    // 输入 Doctor 当前 connection；先重建安装表，再按 purpose 重放 activation predecessor，最后核对 heads。
     fn verify_contract_catalogue_history(&self, connection: &Connection) -> StoreResult<()> {
+        // 先解码所有 installation 并对照索引列/Artifact payload，再重放各 purpose 的 activation predecessor，
+        // 最后要求 catalogue_heads 恰好等于每个 purpose 的最新 activation。
         let installations = connection
             .prepare(
                 "SELECT contract_hash, contract_artifact_id, contract_id, contract_version, purpose, baseline_contract_hash FROM rebuild_contract_installations ORDER BY installed_at, contract_hash",
@@ -17,6 +24,8 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?;
         let mut contracts = BTreeMap::new();
         for (hash, artifact_id, contract_id, version, purpose, baseline) in installations {
+            // candidate install 必须还原 baseline 并通过 bounded subset；canonical context repair
+            // 只在其已有 canonical activation 记录时走受限兼容分支。
             let contract_hash = ContentHash::new(hash)?;
             let stored = self
                 .stored_contract_with_connection(connection, &contract_hash)?
@@ -77,6 +86,7 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?;
         let mut latest = BTreeMap::<String, (i64, ContentHash)>::new();
         for (activation_id, purpose, previous, hash, transition_id) in activations {
+            // latest 保存每个 purpose 目前期望的 predecessor；previous mismatch 会在继续链前失败。
             let contract_hash = ContentHash::new(hash)?;
             let previous = previous.map(ContentHash::new).transpose()?;
             let expected_previous = latest.get(&purpose).map(|(_, hash)| hash.clone());
@@ -95,7 +105,10 @@ impl Store {
                     "contract activation {activation_id} purpose disagrees with its contract"
                 )));
             }
+            // 匹配 `(Option<&ContentHash>, Option<String>)`：无前驱是首次安装，
+            // 有前驱且有 transition 才能按 candidate 晋级/回退检查；不从时间顺序猜授权。
             match (previous.as_ref(), transition_id) {
+                // 初装无前驱无 policy transition；canonical upgrade 需同 contract_id、版本递增且能力有界。
                 (None, None) if contract.baseline_contract_hash.is_none() => {}
                 (Some(previous_hash), None) => {
                     let previous_contract = contracts.get(previous_hash).ok_or_else(|| {
@@ -115,6 +128,7 @@ impl Store {
                     }
                 }
                 (Some(previous_hash), Some(transition_id)) => {
+                    // candidate promote 与 rollback 都需回链指定 subject/state 的持久 PolicyTransition。
                     let transition =
                         read_policy_transition(connection, &PolicyTransitionId(transition_id))?
                             .ok_or_else(|| {
@@ -173,6 +187,7 @@ impl Store {
                 "contract catalogue head count disagrees with activation history".to_owned(),
             ));
         }
+        // 每个 SQL head 都逐项与上面从 activation 日志重放出的最后一项比较。
         for (purpose, contract_hash, activation_id) in heads {
             let contract_hash = ContentHash::new(contract_hash)?;
             if latest.get(&purpose) != Some(&(activation_id, contract_hash)) {
@@ -184,7 +199,10 @@ impl Store {
         Ok(())
     }
 
+    // 按 event_cursor 重建每个 subject 的 from/to、consumed pair cursor、Outcome/Experience/Evaluation lineage。
     fn verify_policy_evaluation_history(&self, connection: &Connection) -> StoreResult<()> {
+        // evaluation 按全局 event_cursor 升序重放；subject_history 保存每个 subject 的前态和消费 cursor，
+        // 所有来源 Artifact 与 event 都从同一传入连接读取，不在这里修正过期 head。
         let evaluation_ids = connection
             .prepare(
                 "SELECT evaluation_artifact_id FROM rebuild_policy_evaluations \
@@ -223,6 +241,7 @@ impl Store {
                 )));
             }
 
+            // canonical learning 的三类主 Artifact 都必须 canonical 且来自 Paper Run。
             let outcome_artifact = read_artifact(connection, &stored.outcome_artifact_id)?;
             let experience_artifact = read_artifact(connection, &stored.experience_artifact_id)?;
             let evaluation_artifact = read_artifact(connection, &stored.evaluation_artifact_id)?;
@@ -256,6 +275,7 @@ impl Store {
                 serde_json::from_slice(&blob::read_blob_with(connection, &evaluation_artifact.blob)?)?;
             evaluation.validate()?;
 
+            // 把 Experience/Evaluation 引用与 sealed OutcomeSchedule 的 Decision/context/execution refs 对齐。
             let outcome_ref = ArtifactRef {
                 artifact_id: outcome_artifact.artifact_id.clone(),
                 kind: ArtifactKind::Outcome,
@@ -279,6 +299,7 @@ impl Store {
             }
 
             match (&stored.subject, &stored.candidate_policy_artifact_id) {
+                // Memory subject 不绑定 candidate policy；Contract/Topology subject 则必须有 canonical Paper candidate。
                 (PolicySubject::Memory(_), None) => {}
                 (PolicySubject::Memory(_), Some(_)) => {
                     return Err(StoreError::Integrity(format!(
@@ -331,6 +352,7 @@ impl Store {
                 None => {}
             }
 
+            // event_cursor 必须指向同 Run 的 policy.evaluated 且 artifact/time 与 ledger 完全一致。
             let event = connection
                 .query_row(
                     "SELECT run_id, event_type, artifact_id, created_at \
@@ -369,6 +391,7 @@ impl Store {
                     "policy evaluation {evaluation_artifact_id} consumed invalid shadow cursor"
                 )));
             }
+            // 消费 cursor 若前进，必须精确落在该 subject 的已持久 ShadowPair completion event 上。
             if stored.consumed_pair_cursor > previous_consumed_cursor {
                 let boundary_exists = connection
                     .query_row(
@@ -395,6 +418,7 @@ impl Store {
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         for subject_id in head_subjects {
+            // consumption head 是重建指针，必须等于该 subject 最新 evaluation 的 artifact/cursor/time。
             let subject = parse_persisted_subject(&subject_id)?;
             let head = read_policy_consumption_head(connection, &subject)?.ok_or_else(|| {
                 StoreError::Integrity(format!(

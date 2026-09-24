@@ -1,3 +1,5 @@
+# 文件职责：声明无状态 OpenAI Responses adapter 的 HTTP、Serde/JSON 与错误依赖。
+# 同步配置和请求编译不发网络请求；Tokio 仅作为开发依赖驱动异步协议测试/fixture。
 [package]
 name = "akzio-model"
 version = "0.2.0"

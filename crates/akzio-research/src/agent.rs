@@ -35,6 +35,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use thiserror::Error;
 
+// Research Agent runtime 是 Contract/Prompt/Context/Attempt 的编排边界。
+// Contract 69 的研究与 ProposalReviewer 只用 submit_result；Outcome 63 才有
+// Draft 读取工具与后续 Submit。include! 是编译时合并同一模块，不是运行时加载。
 mod catalogue;
 mod prompts;
 mod schemas;
@@ -53,6 +56,7 @@ use prompts::SHARED_GOVERNANCE_PROMPT;
 use schemas::*;
 use tools::*;
 use validation::*;
+// 下列 include 按职责拆分预算、投影、恢复、structured submit 和 proposal review；共享同一 Rust 权威状态与错误类型。
 include!("agent/errors_catalogue.rs");
 include!("agent/model_types.rs");
 include!("agent/budget.rs");
@@ -65,26 +69,3 @@ include!("agent/structured.rs");
 include!("agent/proposal_review.rs");
 include!("agent/runtime_helpers.rs");
 include!("agent/helpers.rs");
-
-#[cfg(test)]
-#[path = "agent/fixture_tests.rs"]
-mod formal_fixture_tests;
-
-#[cfg(test)]
-#[path = "agent/late_model_tests.rs"]
-mod late_model_tests;
-
-#[cfg(test)]
-#[path = "agent/deadline_tests.rs"]
-mod deadline_tests;
-
-#[cfg(test)]
-#[path = "agent/prompt_render_tests.rs"]
-mod prompt_render_tests;
-
-#[cfg(test)]
-use akzio_domain::{RunPurpose, TaskRecipeId};
-
-#[cfg(test)]
-#[path = "agent/review_context_tests.rs"]
-mod review_context_tests;

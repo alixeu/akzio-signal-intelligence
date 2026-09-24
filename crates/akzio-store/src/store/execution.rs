@@ -1,3 +1,7 @@
+// 文件导读：Execution 写入先把 Accepted plan/context/verdict 绑定到唯一 session slot，
+// 再以 deterministic commitment/reprice/cancel intent 记录 Paper 侧副作用边界；accepted 不等于 fill。
+// 阅读顺序建议从 commit_execution 看 lease+Attempt+slot 的共同事务，再看 order-action intent，
+// 最后看 effect intent 与 reconciliation 提交；实际 Broker HTTP I/O 由调用方在 durable intent 后执行。
 use super::*;
 
 #[derive(Debug, Clone)]
@@ -7,6 +11,10 @@ pub struct PaperOrderActionCommitResult {
 }
 
 impl Store {
+    // 在 daemon lease+Task permit 下验证 plan/context/verdict/approval，再原子写唯一 commitment slot。
+    // 外层先解码候选 commitment，事务内重验两种 fencing token、Paper purpose、完整 lineage 和 approval。
+    // 同一 session 的相同 Artifact/payload 可以恢复成功 Attempt；不同计划冲突。返回 newly_committed
+    // 只表示这次写入是否首次落库，不表示券商接受或成交。
     pub fn commit_execution(
         &self,
         lease: &DaemonLease,
@@ -64,6 +72,8 @@ impl Store {
         if run_id != commit.permit.run_id.0 {
             return Err(StoreError::InvalidSessionSlot(commit.session_key.clone()));
         }
+        // 已占用 slot 进入幂等恢复分支：先尝试同 Artifact ID，再允许 payload identity 相同的旧 Artifact；
+        // 两者都不匹配时不修改现存 slot，而是报重复 commitment 冲突。
         if let Some(existing_commitment) = existing_commitment {
             if existing_commitment == commit.commitment.artifact_id.0.as_str() {
                 let existing_artifact = read_artifact(
@@ -118,6 +128,7 @@ impl Store {
                     newly_committed: false,
                 });
             }
+            // 不同 Artifact ID 的 payload 只有计划/context/session/client IDs 全相同才可复用旧提交。
             let existing_artifact_id = ArtifactId(ContentHash::new(existing_commitment)?);
             let existing_artifact = read_artifact(&transaction, &existing_artifact_id)?;
             if existing_artifact.kind == ArtifactKind::ExecutionCommitment {
@@ -175,6 +186,7 @@ impl Store {
                 commit.session_key.clone(),
             ));
         }
+        // 首次占 slot 后，Artifact、output index、ExecutionCommitted 事件和 Task 完成共享该事务提交点。
         insert_artifact(&transaction, &commit.commitment)?;
         transaction.execute(
             "UPDATE rebuild_session_slots SET commitment_artifact_id = ?1, committed_at = ?2 WHERE session_key = ?3 AND commitment_artifact_id IS NULL",
@@ -226,6 +238,8 @@ impl Store {
     /// Return the one durable r0 -> r1 intent for an order in a committed
     /// Paper session. The table is only an immutable-history index; callers
     /// still consume the returned artifact and its provenance.
+    // 通过 immutable index 查找指定 commitment/asset 的唯一 reprice intent。
+    // commitment kind 不匹配立即拒绝；SQL 按 commitment ID+资产 symbol 精确查一行，缺行 None。
     pub fn reprice_for(
         &self,
         commitment: &ArtifactRef,
@@ -251,6 +265,8 @@ impl Store {
             .transpose()
     }
 
+    // 通过 immutable index 查找指定 commitment/asset 的唯一 cancel intent。
+    // 返回的是持久化 Artifact 投影，不从 receipt 推断 cancel 已被 Broker 执行。
     pub fn cancel_for(
         &self,
         commitment: &ArtifactRef,
@@ -276,6 +292,8 @@ impl Store {
             .transpose()
     }
 
+    // 解析并验证 Reprice payload，复用通用 order-action intent 持久化/恢复路径。
+    // typed payload 在事务外解码；固定传入 reprice 表/列和对应 lifecycle event，不接受外部表名。
     pub fn commit_execution_reprice_intent(
         &self,
         lease: &DaemonLease,
@@ -305,6 +323,8 @@ impl Store {
         )
     }
 
+    // 解析并验证 Cancel payload，复用同一 commitment/receipt lineage 和幂等索引。
+    // typed payload 在事务外解码；固定传入 cancel 表/列和事件种类，再由共同 helper 原子落库。
     pub fn commit_execution_cancel_intent(
         &self,
         lease: &DaemonLease,
@@ -351,6 +371,8 @@ impl Store {
         recovered_event: LifecycleEventType,
         now: DateTime<Utc>,
     ) -> StoreResult<PaperOrderActionCommitResult> {
+        // table/column/event 仅由上方两个固定 wrapper 提供；先验证不可变输入，再在 Immediate 事务重验
+        // daemon lease、Task permit、Paper Run 和 prior receipt lineage。
         artifact.validate()?;
         if artifact.lifecycle != ArtifactLifecycle::Canonical
             || !artifact.source_refs.contains(commitment)
@@ -385,6 +407,8 @@ impl Store {
             )
             .optional()?
         {
+            // commitment+asset 索引已有一条 intent 时读取原 Artifact 并记 recovered event；
+            // 当前输入只用于确认 receipt lineage，不比较/覆盖已有 payload。
             let existing_id = ArtifactId(ContentHash::new(existing_id)?);
             let existing = read_artifact(&transaction, &existing_id)?;
             append_event(
@@ -429,6 +453,7 @@ impl Store {
             now,
         )?;
         transaction.commit()?;
+        // Ok(recovered=false) 只确认 SQL intent 已提交；外部 adapter 仍需实际请求和后续回执。
         Ok(PaperOrderActionCommitResult {
             artifact: artifact.clone(),
             recovered: false,
@@ -446,6 +471,8 @@ impl Store {
         broker_order_id: &str,
         run_id: &RunId,
     ) -> StoreResult<()> {
+        // commitment/receipt Ref kind 与同一 Run 来源先核对，再解码两种 CAS payload；
+        // receipt 的 plan hash、资产和 client/broker ID 必须逐字段与调用参数匹配。
         if commitment.kind != ArtifactKind::ExecutionCommitment
             || prior_receipt.kind != ArtifactKind::OrderReceipt
         {
@@ -489,9 +516,13 @@ impl Store {
         Ok(())
     }
 
-    /// Atomically records the single Rust-owned Paper effect intent and
-    /// terminally completes its task. The broker
-    /// adapter may receive only the returned immutable intent afterwards.
+    /// 在 Broker I/O 前原子记录 Rust-owned Paper effect intent。
+    /// 它不终结 Task；后续对账路径才收束 Attempt。
+    // 在外部 broker I/O 前写唯一 durable intent；重复 intent 返回 true 而不重复追加。
+    // Artifact 先做只读预检，IMMEDIATE 事务内重验 lease/permit/Paper/Debug policy 和历史事件。
+    // true 表示相同 intent 已存在，false 表示新 intent event 已提交；二者都不报告 Broker 返回结果。
+    // 注意：当前实现只写 ExecutionEffectIntent event，不调用 finish_permitted_task；
+    // Attempt/Task 的最终收束由后续 fenced reconciliation 提交路径完成。
     pub fn record_paper_effect_intent(
         &self,
         lease: &DaemonLease,
@@ -519,6 +550,7 @@ impl Store {
             transaction.commit()?;
             return Ok(true);
         }
+        // Intent 与外部 HTTP 副作用分开提交；进程在提交后中断时，恢复逻辑能看到未终结的 intent。
         append_event(
             &transaction,
             &permit.run_id,
@@ -532,6 +564,8 @@ impl Store {
         Ok(false)
     }
 
+    // 只有已有 intent 才能追加 settled/recovered terminal；重复 terminal 视为幂等成功。
+    // 本方法只写本地 terminal event；它不发 Broker 请求，也不验证实际成交数量。
     pub fn settle_paper_effect(
         &self,
         lease: &DaemonLease,
@@ -549,6 +583,7 @@ impl Store {
         assert_paper_effect_artifact(&transaction, effect, &permit.run_id)?;
         validate_paper_effect_events(&transaction, Some(&permit.run_id))?;
         if paper_effect_terminal_exists(&transaction, &permit.run_id, &effect.artifact_id)? {
+            // 已存在 terminal 时只确认幂等结束，不追加第二个 settlement。
             transaction.commit()?;
             return Ok(());
         }
@@ -576,6 +611,9 @@ impl Store {
 
     /// Commit Paper reconciliation artifacts and the effect settlement marker
     /// under the same daemon lease/attempt fence and SQLite transaction.
+    // 将 Reconcile Artifact 和 effect terminal 放入同一 fenced Attempt 事务，避免半提交。
+    // 仅允许成功 Attempt；事务内共写 Reconciliation outputs、Task/Attempt 完成与 effect terminal。
+    // 这提供 SQLite 内原子性，不把之前/之后的 Broker I/O 纳入事务。
     pub fn commit_fenced_attempt_with_effect(
         &self,
         lease: &DaemonLease,
