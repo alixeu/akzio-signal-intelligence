@@ -231,23 +231,6 @@ impl StoreExecutor {
         .map_err(|error| RuntimeError::StoreExecutor(error.to_string()))?
     }
 
-    /// Reject new work and wait until the active/queued operation set drains.
-    pub async fn shutdown_and_drain(&self) -> RuntimeResult<()> {
-        // Release 禁止新操作；owned permit 只有在当前 closure 和已排队操作都完成后才能取得，随后立即 drop 完成 drain。
-        self.state
-            .accepting_operations
-            .store(false, Ordering::Release);
-        let permit = self
-            .state
-            .queue
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|error| RuntimeError::StoreExecutor(error.to_string()))?;
-        drop(permit);
-        Ok(())
-    }
-
     pub fn telemetry(&self) -> StoreExecutorTelemetry {
         // Acquire/Release 读取与写入配对，Relaxed 计数只用于诊断；telemetry 不参与业务授权或 lease 判断。
         StoreExecutorTelemetry {

@@ -231,11 +231,6 @@ impl ModelClientAdapter {
         }
     }
 
-    pub fn with_budget_policy(mut self, budget_policy: ModelBudgetPolicy) -> Self {
-        self.budget_policy = budget_policy;
-        self
-    }
-
     pub fn with_capability_snapshot(
         mut self,
         capability_snapshot: ModelCapabilitySnapshot,

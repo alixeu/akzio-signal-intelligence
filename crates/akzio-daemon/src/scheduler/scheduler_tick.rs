@@ -60,7 +60,13 @@ impl PaperScheduler {
                 return Ok(None);
             }
             if campaign.status.is_level() {
-                return self.tick_canary(&campaign, &session_key, clock, now).await;
+                return self
+                    .tick_canary(&campaign, &session_key, clock, now)
+                    .await
+                    .map_err(|error| SchedulerError::SubmissionUnknown {
+                        run_id: None,
+                        error: Box::new(error),
+                    });
             }
         }
         // A first canonical research session must be able to earn its future
@@ -214,43 +220,62 @@ impl PaperScheduler {
         let workflow = self.workflow.clone();
         let reservation = self
             .store_executor
-            .execute(move |_| match binding {
-                Some((runtime_manifest, approval)) => workflow
-                    .reserve_paper_session_with_inputs_for_run_approved(
+            .execute(move |store| {
+                let result = match binding {
+                    Some((runtime_manifest, approval)) => workflow
+                        .reserve_paper_session_with_inputs_for_run_approved(
+                            &lease,
+                            run_id,
+                            &session_key,
+                            &proposal,
+                            &setup_artifacts,
+                            &runtime_manifest,
+                            &approval,
+                            now,
+                        ),
+                    None => workflow.reserve_paper_session_with_inputs_for_run(
                         &lease,
                         run_id,
                         &session_key,
                         &proposal,
                         &setup_artifacts,
-                        &runtime_manifest,
-                        &approval,
                         now,
                     ),
-                None => workflow.reserve_paper_session_with_inputs_for_run(
-                    &lease,
-                    run_id,
-                    &session_key,
-                    &proposal,
-                    &setup_artifacts,
-                    now,
-                ),
+                };
+                result.map_err(|error| SchedulerError::SubmissionUnknown {
+                    run_id: store
+                        .session_slot(&session_key)
+                        .ok()
+                        .flatten()
+                        .map(|slot| slot.workflow.run.run_id),
+                    error: Box::new(error.into()),
+                })
             })
-            .await??;
+            .await
+            .map_err(|error| SchedulerError::SubmissionUnknown {
+                run_id: None,
+                error: Box::new(error.into()),
+            })??;
         if reservation.newly_reserved {
             if let Some(logger) = &self.run_log {
-                logger.record(
-                    &akzio_model::ModelAuditContext {
-                        run_id: reservation.slot.workflow.run.run_id.0.clone(),
-                        phase: "T0".into(),
-                        task_id: None,
-                        attempt_id: None,
-                        call_id: None,
-                        retry_index: None,
-                    },
-                    "rust.run.submitted",
-                    serde_json::json!({"purpose":"paper","source":"scheduler",
+                logger
+                    .record(
+                        &akzio_model::ModelAuditContext {
+                            run_id: reservation.slot.workflow.run.run_id.0.clone(),
+                            phase: "T0".into(),
+                            task_id: None,
+                            attempt_id: None,
+                            call_id: None,
+                            retry_index: None,
+                        },
+                        "rust.run.submitted",
+                        serde_json::json!({"purpose":"paper","source":"scheduler",
                         "session_key":reservation.slot.session_key}),
-                )?;
+                    )
+                    .map_err(|error| SchedulerError::SubmissionUnknown {
+                        run_id: Some(reservation.slot.workflow.run.run_id.clone()),
+                        error: Box::new(error.into()),
+                    })?;
             }
         }
         Ok(Some(reservation))

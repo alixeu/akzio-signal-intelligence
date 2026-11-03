@@ -16,8 +16,7 @@
 - [七、初次运行三大关键现象与排坑指南](#七初次运行三大关键现象与排坑指南)
 - [八、快速开始与环境配置](#八快速开始与环境配置)
 - [九、CLI 操作与运维指令大全](#九cli-操作与运维指令大全)
-- [十、Observatory 桌面应用](#十observatory-桌面应用)
-- [十一、代码规范与验证矩阵](#十一代码规范与验证矩阵)
+- [十、代码规范与验证矩阵](#十代码规范与验证矩阵)
 
 ---
 
@@ -63,7 +62,6 @@
 flowchart TD
     subgraph 控制面
         CLI["akzio CLI"]
-        App["Observatory macOS App"]
     end
 
     subgraph 服务端 Daemon
@@ -87,7 +85,6 @@ flowchart TD
     end
 
     CLI -->|x-akzio-token| API
-    App -->|x-akzio-token| API
     API --> Sch
     Sch --> WR
     WR --> AR
@@ -178,7 +175,7 @@ target/debug/akzio calibration readiness --store ~/.akzio/store --min-samples 30
 
 `collect` 只接受 canonical Store 的真实 Decision、密封 Outcome 和四资产共同交易 Session 标签，同时检查模型身份、Contract、训练窗口及价格序列。有效 Synthesizer 路由必须有可核实的 `release_date` 与 `knowledge_cutoff`。缺少样本或条件时保持阻断，不用目标仓位、事后总结或合成样本填充。`activate` 校验模型与当前 Synthesizer Contract 后，原子更新同一 Policy Artifact 的激活历史和 active head。
 
-日常运行只用 `bash scripts/run_core.sh position-plan`（生成计划，不下单）和 `bash scripts/run_core.sh paper`（生成计划并进入 Paper 执行）。已有正式 Core 时复用；没有服务时脚本自动启动同一配置的正式 Core，等待 ready 后才向 App 使用的同一个接口提交，不依赖 Python。自动启动的 Core 会在脚本退出后继续处理后续任务；App 当前不能附着这一外部进程，用同配置的原生 `run replay/detail` 查询。冷启动由 Core 自动判断：缺 Policy 时保留合格研究分配、正式目标归零，Paper 为 NoOrder。两种模式都有 T1/T3/T5 预测，但只有 Paper 安排后续 Outcome；完整成熟的真实市场标签才可能用于校准。原审批及全部 Gate 通过后才可能发单，不保证每次都下单或成交。返回 Run ID 仅确认提交/复用。两种模式说明见 [AGENTS](AGENTS.md)，开发诊断与导出见 [开发 Workflow](docs/development-workflow.md)。
+日常运行只用 `bash scripts/run_core.sh position-plan`（生成计划，不下单）和 `bash scripts/run_core.sh paper`（生成计划并进入 Paper 执行）。已有正式 Core 时复用；没有服务时脚本自动启动同一配置的正式 Core，等待 ready 后向正式 HTTP 客户端使用的同一个接口提交，不依赖 Python。自动启动的 Core 会在脚本退出后继续处理后续任务；用同配置的原生 `run replay/detail` 查询。冷启动由 Core 自动判断：缺 Policy 时保留合格研究分配、正式目标归零，Paper 为 NoOrder。两种模式都有 T1/T3/T5 预测，但只有 Paper 安排后续 Outcome；完整成熟的真实市场标签才可能用于校准。原审批及全部 Gate 通过后才可能发单，不保证每次都下单或成交。返回 Run ID 仅确认提交/复用。两种模式说明见 [AGENTS](AGENTS.md)，开发诊断与导出见 [开发 Workflow](docs/development-workflow.md)。
 
 ---
 
@@ -226,9 +223,7 @@ target/debug/akzio calibration readiness --store ~/.akzio/store --min-samples 30
 
 ### 8.2 配置文件设置
 
-App 首次启动时使用 [Observatory 模板](config/akzio.observatory.toml) 初始化 `~/.akzio/config.toml`，之后在 App Settings 中配置模型端点、模型和凭据。已有用户配置不会被初始化流程覆盖。
-
-仅使用 CLI 时，可调用同一个初始化入口：
+使用 CLI 初始化 `~/.akzio/config.toml`；已有用户配置不会被覆盖：
 
 ```bash
 cargo run --locked -p akzio-cli -- observatory-config \
@@ -237,7 +232,7 @@ cargo run --locked -p akzio-cli -- observatory-config \
   --store-root "$HOME/.akzio/store"
 ```
 
-初始化使用 `paper-engineering` profile，默认 `auto_paper=false`。模板中的模型端点与密钥占位符从 `LLM_GATEWAY_BASE_URL`、`LLM_GATEWAY_API_KEY` 解析；Alpaca 与 FRED 凭据分别从 `ALPACA_API_KEY`、`ALPACA_API_SECRET`、`FRED_API_KEY` 读取，也可在初始化后通过 Settings 配置。
+初始化使用 `paper-engineering` profile，默认 `auto_paper=false`。模板中的模型端点与密钥占位符从 `LLM_GATEWAY_BASE_URL`、`LLM_GATEWAY_API_KEY` 解析；Alpaca 与 FRED 凭据分别从 `ALPACA_API_KEY`、`ALPACA_API_SECRET`、`FRED_API_KEY` 读取，也可在初始化后编辑配置文件。
 
 `paper-research` 与 `historical-eval` 是独立研究 profile，切换时仍须满足 Rust 对精确模型身份、发布日期、知识截止时间及评估条件的校验；不能使用示例日期代替实际模型元数据。启用正式 Paper 调度仍需既有审批与全部 Gate。运行及验证入口见 [开发 Workflow](docs/development-workflow.md)。
 
@@ -277,17 +272,7 @@ cargo run -p akzio-cli -- store doctor
 
 独立 Debug Core、命令组、控制路由和 App 入口均已退役；旧隔离 Store 只能作历史读取，不能转为正式 Core。正式 Core 在 `~/.akzio/log/YYYYMMDD/` 为每个真实 Run 的 T0/T1/T3/T5 分别生成私有 ZIP，包含脱敏 LLM 过程与 Rust 事件；启动模型探测另存独立 ZIP。完整性与日志故障阻断见[运行日志](docs/run-log.md)，历史兼容见[退役说明](docs/debug-control.md)。
 
-## 十、Observatory 桌面应用
-
-项目包含配套的原生 macOS 管理应用（基于 SwiftUI 构建）：
-
-- **打包构建**：运行 `bash scripts/build_app_and_core.sh` 编译当前 Swift App 与 release Rust Core，生成新的 ad-hoc 签名 Bundle，并输出 `APP_BUNDLE` 和独立的 `RUST_BINARY` 路径。默认每次选择新的 `apps/dist/akzio-*.app`，不会覆盖旧 Bundle；可通过 `AKZIO_APP_BUNDLE` 指定其他未使用目标，详见 [开发 Workflow](docs/development-workflow.md)。
-- **Core 嵌入机制**：App 启动时会通过 `RustCoreSupervisor` 自动将内嵌的 `akzio-core` 启动为 `daemon serve`，无缝读取 `~/.akzio/config.toml`。
-- **状态监控**：若界面显示 `Paper scheduler waiting: broker market is closed`，表明系统正在正常等待下一个美股开盘窗口。
-
----
-
-## 十一、代码规范与验证矩阵
+## 十、代码规范与验证矩阵
 
 在任何代码交付或向主干提交前，必须依次通过以下层级的本地离线严格验证：
 
@@ -315,7 +300,7 @@ cargo run -p akzio-cli -- store doctor
 - **outcome/learning-verified**：完成 T+5 交易日封存并成功生成完整的 Evaluated Experience。
 
 
-## 十二、当前修复语义与版本
+## 十一、当前修复语义与版本
 
 下面描述代码实现，不能代替运行验收。当前约束见 [运行时契约](docs/agent-runtime-contract.md)，验证入口与证据等级见 [开发 Workflow](docs/development-workflow.md)。
 

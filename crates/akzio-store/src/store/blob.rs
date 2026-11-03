@@ -342,12 +342,6 @@ impl Store {
         put_blob_bytes(&connection, bytes, media_type.into())
     }
 
-    // 泛型 T 只需实现 Serialize；具体 T 编译期实例化（静态分发），借用 value 编码为 owned JSON Vec，
-    // 再复用 put_bytes 的 CAS/压缩校验。序列化失败经 `?` 转为 StoreError，成功不自动建立 Artifact。
-    pub fn put_json<T: Serialize>(&self, value: &T) -> StoreResult<BlobRef> {
-        self.put_bytes(&serde_json::to_vec(value)?, "application/json")
-    }
-
     // 借用原始字节；若 durable CAS 已有相同内容则直接复用，否则暂存到当前连接 TEMP 表。
     // 后一种情况下同一 Store 副本共享该连接可读，其他独立连接不可见；返回 BlobRef
     // 本身不保证新负载已 durable，引用它的 Artifact 事务 promotion 后才持久。

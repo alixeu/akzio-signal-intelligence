@@ -146,10 +146,6 @@ impl RiskGroundTruthAssessment {
         self.expected_risk_ids.len() as u64
     }
 
-    // 返回独立评估实际检测到的风险数量。
-    pub fn detected_count(&self) -> u64 {
-        self.detected_risk_ids.len() as u64
-    }
 }
 
 fn identities_match(left: &str, right: &str) -> bool {

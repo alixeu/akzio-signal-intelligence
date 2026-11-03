@@ -155,6 +155,9 @@ impl Store {
         node.input_artifacts.dedup();
         // 新 Task 无 dependencies/parent_task_id，通过已密封 Outcome 和旧 T5 Retrospective 输入建立修复上下文。
         insert_task_node(&transaction, run_id, &node, now)?;
+        // 上一次 T5 完成会把普通 RunControl 收束为 completed；repair 与初次 Outcome
+        // 一样属于 post-terminal 工作，必须在同一事务唤醒，否则新任务永远无法领取。
+        run_control::wake_continuous(&transaction, run_id, now)?;
         append_event(
             &transaction,
             run_id,

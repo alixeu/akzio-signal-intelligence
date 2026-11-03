@@ -54,7 +54,7 @@ jobs:
               sys.exit("\n".join(broken))
           PY
       - run: cargo fmt --all -- --check
-      - run: bash -n scripts/run_core.sh && bash -n scripts/build_app_and_core.sh
+      - run: bash -n scripts/run_core.sh
       - run: cargo check --workspace --locked
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo test --workspace --locked

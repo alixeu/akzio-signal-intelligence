@@ -482,16 +482,6 @@ pub struct ComplianceActivitySnapshot {
     pub available_controls: BTreeSet<ComplianceControl>,
 }
 
-impl ComplianceActivitySnapshot {
-    // 生成 Paper 默认可用的五项基础合规控制集合。
-    pub fn paper_baseline() -> Self {
-        Self {
-            available_controls: ComplianceControl::PAPER_BASELINE.into_iter().collect(),
-            ..Self::default()
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ComplianceActionPolicy {
     #[serde(default)]
@@ -585,11 +575,6 @@ impl ComplianceActionPolicy {
             violations.insert(ComplianceViolation::FrontRunningRisk);
         }
         Ok(violations)
-    }
-
-    // 把合规要求提升为完整八项市场完整性控制。
-    pub fn require_full_market_integrity(&mut self) {
-        self.required_controls = ComplianceControl::ALL.into_iter().collect();
     }
 }
 

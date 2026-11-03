@@ -450,18 +450,6 @@ impl AgentContract {
         })
     }
 
-    // 消费 self 后替换候选能力上限并重算哈希；返回新的拥有值，
-    // 不会回写已有冻结 Contract/CAS，也不使公开字段在内存中不可变。
-    pub fn with_candidate_capability_ceiling(
-        mut self,
-        candidate_capability_ceiling: CandidateCapabilityCeiling,
-    ) -> Result<Self, DomainError> {
-        self.candidate_capability_ceiling = candidate_capability_ceiling;
-        self.contract_hash = self.expected_hash()?;
-        self.validate()?;
-        Ok(self)
-    }
-
     // 询问当前 Contract 是否允许 candidate 的上下文与工具请求。
     pub fn permits_candidate(&self, candidate: &Self) -> bool {
         self.candidate_capability_ceiling

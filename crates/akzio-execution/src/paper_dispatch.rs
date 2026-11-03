@@ -217,28 +217,6 @@ impl PaperDispatchRuntime {
         }
     }
 
-    pub fn with_execution_policy(mut self, policy: crate::ExecutionPolicy) -> Self {
-        // builder 消费 self 并返回新拥有的 Self，便于链式配置；policy 也按值移入，不共享可变副本。
-        self.execution_policy = policy;
-        self
-    }
-
-    pub fn with_settlement_timeout(mut self, settlement_timeout: std::time::Duration) -> Self {
-        // builder 按值接收 Duration 并消费 self；只改本地观察预算，超时不会把 accepted/partial 改成 filled。
-        self.settlement_timeout = settlement_timeout;
-        self
-    }
-
-    pub fn with_settlement_action_grace(
-        mut self,
-        settlement_action_grace: std::time::Duration,
-    ) -> Self {
-        // builder 按值替换 action grace；它只决定 Regular 未结订单何时进入有限处置，
-        // 不影响 Extended-hours 订单的长生命周期。
-        self.settlement_action_grace = settlement_action_grace;
-        self
-    }
-
     pub fn with_failpoint(mut self, failpoint: PaperDispatchFailpoint) -> Self {
         // builder 消费/返回 Self，只替换诊断枚举；真正触发会在 dispatch 已记录 effect intent 后 exit。
         self.failpoint = failpoint;

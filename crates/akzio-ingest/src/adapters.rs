@@ -368,12 +368,6 @@ impl AlpacaPaperEvidenceTransport {
         })
     }
 
-    pub fn with_option_feed(mut self, feed: AlpacaOptionDataFeed) -> Self {
-        // builder 只改变显式期权数据 feed，不修改 equity feed 或其他采集策略。
-        self.option_data_feed = feed;
-        self
-    }
-
     pub(super) fn path_for(resource: &str) -> Result<String, EvidenceAdapterError> {
         // 将有限 GovernedResource 映射到固定 Alpaca endpoint/参数；日期、limit 和资产边界
         // 由 runtime parser 约束，调用方不能传任意 URL。

@@ -99,11 +99,8 @@ impl Daemon {
         }
         candidates.sort();
         candidates.dedup();
-        let mut node = task.node.clone();
-        node.objective = format!(
-            "[outcome_horizon=t5] Repair only the narrative for outcome {}. Rust numeric facts, metric basis, original research and cutoff are immutable. Do not fetch new prices. Cite the sealed Outcome. The model supplies narrative only; Rust separately rechecks learning eligibility.",
-            schedule.outcome_id.0
-        );
+        // repair 的冻结 objective 已限定只修 T5 叙事；outcome_id 和原数值事实由 candidates
+        // 提供。沿用原节点才能通过 AgentRuntime 的 Store 冻结身份复核。
         let draft = if old.status == akzio_domain::RetrospectiveStatus::Complete {
             let source = old
                 .source_refs
@@ -120,7 +117,7 @@ impl Daemon {
                 .agents
                 .run(
                     &task.permit,
-                    &node,
+                    &task.node,
                     candidates,
                     self.model_for(task.node.recipe_id.as_str()),
                     now,

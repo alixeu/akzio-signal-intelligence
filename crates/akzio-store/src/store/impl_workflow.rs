@@ -375,9 +375,7 @@ impl Store {
     ) -> StoreResult<()> {
         // 通过 session_key 找唯一已消费 binding，累计 Buy orders 的 notional
         //（checked_add 防溢出），并检查 session date/expiry/maximum_notional。
-        // 注意：当前调用 `validate_paper_approval_binding` 内部使用 `self.read_blob`，
-        // 已持有调用方连接时存在再次获取非重入 Store Mutex 的源码风险；
-        // 不能将此路径描述成全程同连接读取，也不以此断言运行故障。
+        // 复用调用方的连接读取 binding，避免在 commitment/只读投影事务内重入 Store Mutex。
         let invalid = || StoreError::InvalidSessionSlot(session_key.to_owned());
         let binding = connection
             .query_row(
@@ -394,7 +392,7 @@ impl Store {
         let approval_artifact =
             read_artifact(connection, &ArtifactId(ContentHash::new(approval_id)?))?;
         let (manifest, approval) =
-            self.validate_paper_approval_binding(&manifest_artifact, &approval_artifact)?;
+            self.validate_paper_approval_binding_with_connection(connection,&manifest_artifact,&approval_artifact)?;
         let session =
             chrono::NaiveDate::parse_from_str(session_key, "%Y-%m-%d").map_err(|_| invalid())?;
         let buy_notional = plan

@@ -108,14 +108,6 @@ pub struct InstrumentEvidenceRequirement {
     pub need: EvidenceNeed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InstrumentEvidenceBlocker {
-    pub registry_version: u32,
-    pub key: InstrumentEvidenceKey,
-    pub expected_source_family: String,
-    pub expected_resource: String,
-}
-
 // 无输入，输出静态注册表版本与全部 Profile 字段的 SHA-256 身份；Profile 数组按声明顺序参与哈希。
 pub fn instrument_evidence_registry_hash() -> ContentHash {
     // 按注册表顺序拼接静态属性后哈希；任何注册表字段变化都会改变身份。
@@ -226,59 +218,6 @@ pub fn instrument_evidence_needs_for_session(session_key: &str) -> Vec<EvidenceN
         .map(|requirement| requirement.need)
         .collect::<BTreeSet<_>>()
         .into_iter()
-        .collect()
-}
-
-// 输入一个可执行 Asset，输出其静态必需类别集合，并额外包含共享宏观日历 key。
-pub fn instrument_evidence_required_keys_for_asset(
-    asset: Asset,
-) -> BTreeSet<InstrumentEvidenceKey> {
-    // 依据注册表确认该资产是否每日重置，再确定是否需要杠杆条款类别。
-    let daily_reset = INSTRUMENT_EVIDENCE_REGISTRY
-        .iter()
-        .find(|profile| profile.asset == asset)
-        .is_some_and(|profile| profile.daily_reset());
-    let mut categories = BTreeSet::from([
-        InstrumentEvidenceCategory::EtfHoldings,
-        InstrumentEvidenceCategory::IndexMetadata,
-        InstrumentEvidenceCategory::CorporateActions,
-        InstrumentEvidenceCategory::EarningsEventCalendar,
-        InstrumentEvidenceCategory::ImpliedVolatilityTermStructure,
-        InstrumentEvidenceCategory::LiquiditySpread,
-    ]);
-    if daily_reset {
-        categories.insert(InstrumentEvidenceCategory::LeveragedEtfTerms);
-    }
-    let mut keys = categories
-        .into_iter()
-        .map(|category| InstrumentEvidenceKey {
-            asset: Some(asset),
-            category,
-        })
-        .collect::<BTreeSet<_>>();
-    keys.insert(InstrumentEvidenceKey {
-        asset: None,
-        category: InstrumentEvidenceCategory::MacroReleaseCalendar,
-    });
-    keys
-}
-
-// `'a` 约束迭代器中的资源字符串只被本次调用借用；输出缺少 Need 的 blocker，不取得或保存这些字符串引用。
-pub fn instrument_evidence_blockers_for_session<'a>(
-    session_key: &str,
-    resources: impl IntoIterator<Item = &'a str>,
-) -> Vec<InstrumentEvidenceBlocker> {
-    // 先把实际 resource 收成集合，再筛出注册表中缺失的 requirement。
-    let actual = resources.into_iter().collect::<BTreeSet<_>>();
-    instrument_evidence_requirements_for_session(session_key)
-        .into_iter()
-        .filter(|requirement| !actual.contains(requirement.need.resource.as_str()))
-        .map(|requirement| InstrumentEvidenceBlocker {
-            registry_version: INSTRUMENT_EVIDENCE_REGISTRY_VERSION,
-            key: requirement.key,
-            expected_source_family: requirement.need.source_family,
-            expected_resource: requirement.need.resource,
-        })
         .collect()
 }
 

@@ -281,57 +281,6 @@ pub struct CapabilityScenarioResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CapabilityRetentionPolicy {
-    #[serde(default)]
-    pub zero_tolerance_scenarios: BTreeSet<String>,
-    #[serde(default)]
-    pub max_noncritical_regression_count: u32,
-    #[serde(default)]
-    pub max_weighted_regression_ppm: u32,
-    #[serde(default)]
-    pub aggregate_noninferiority_margin_ppm: u32,
-    #[serde(default)]
-    pub max_drawdown_degradation_ppm: u32,
-    #[serde(default)]
-    pub tail_risk_degradation_ppm: u32,
-    #[serde(default)]
-    pub per_regime_minimum_floor_ppm: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scenario_bank_hash: Option<ContentHash>,
-}
-
-pub const GOLDEN_SCENARIOS: &[&str] = &[
-    "extreme_gap",
-    "flash_crash",
-    "liquidity_evaporation",
-    "trading_halt",
-    "stock_split_adjustment",
-    "earnings_guidance_slash",
-    "irregular_earnings_timestamp",
-    "delayed_news_arrival",
-    "duplicate_news_cluster",
-    "missing_market_quotes",
-    "source_timeout",
-    "broker_timeout",
-    "broker_partial_fill",
-    "duplicate_order_idempotency",
-    "execution_retry_safety",
-    "reconciliation_mismatch_quarantine",
-    "bull_bear_material_conflict",
-    "risk_hard_block",
-    "model_malformed_json",
-    "provider_failover",
-    "context_manifest_incomplete",
-    "read_grant_expired",
-    "clock_skew_drift",
-];
-
-pub fn default_golden_scenario_bank() -> BTreeSet<String> {
-    // 将编译期固定场景数组复制为有序集合，供资格矩阵复用。
-    GOLDEN_SCENARIOS.iter().map(|&s| s.to_owned()).collect()
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityRetentionMatrix {
     pub champion_snapshot: ContentHash,
     pub challenger_snapshot: ContentHash,
@@ -373,52 +322,6 @@ impl CapabilityRetentionMatrix {
             && self.scenarios.iter().all(|scenario| {
                 !scenario.critical || !scenario.champion_passed || scenario.challenger_passed
             })
-    }
-
-    // 这里只叠加零容忍、非关键回归数量和回撤/尾部风险退化阈值；
-    // policy 中其他预留字段不在本方法计算，不能把 true 当完整资格授权。
-    pub fn permits_promotion_with_policy(&self, policy: &CapabilityRetentionPolicy) -> bool {
-        if !self.permits_promotion() {
-            return false;
-        }
-
-        // 1. Zero tolerance / Golden Scenarios check
-        for scenario in &self.scenarios {
-            if policy
-                .zero_tolerance_scenarios
-                .contains(&scenario.scenario_id)
-                && !scenario.challenger_passed
-            {
-                return false;
-            }
-        }
-
-        // 2. Non-critical regression count
-        // filter 统计“champion 通过而 challenger 未通过”的非关键场景。
-        let noncritical_regressions = self
-            .scenarios
-            .iter()
-            .filter(|s| !s.critical && s.champion_passed && !s.challenger_passed)
-            .count() as u32;
-        if noncritical_regressions > policy.max_noncritical_regression_count {
-            return false;
-        }
-
-        // 3. Max drawdown degradation floor
-        for scenario in &self.scenarios {
-            if let Some(dd_delta) = scenario.delta_metrics.get("max_drawdown_ppm") {
-                if dd_delta < -(policy.max_drawdown_degradation_ppm as i64) {
-                    return false;
-                }
-            }
-            if let Some(tail_delta) = scenario.delta_metrics.get("tail_risk_ppm") {
-                if tail_delta < -(policy.tail_risk_degradation_ppm as i64) {
-                    return false;
-                }
-            }
-        }
-
-        true
     }
 }
 

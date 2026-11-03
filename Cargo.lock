@@ -86,6 +86,7 @@ dependencies = [
  "sha2",
  "thiserror",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
  "zip",
@@ -1978,6 +1979,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

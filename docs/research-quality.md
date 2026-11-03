@@ -11,7 +11,7 @@
 | 修订 | 已通过 forecast 的模型字段及 numeric_basis 不得顺带改写；Rust 仍绑定交易日历字段。配置及其 basis 允许随修复联动。全稿重新评审；连续两次拒绝的 scope、问题身份、引用和内容相同则停止，Decision 继续阻断。 |
 | Lesson | 同一 SQL 快照分页扫描全部 Active heads，先检查 scope、治理有效期和使用量，再按 regime/stage/asset/horizon 匹配、更新时间和 ID 排序。最多四条；严格内容去重，显式冲突组整体入选或整体排除。 |
 | 重验 | 已引用来源出现同资源、同来源族的新版本时，生成带精确引用的运行内建议。来源更新不是已证明矛盾，不改变 Active 生命周期，不根据单次亏损退役。 |
-| App 与导出 | 同一个 Rust `ResearchAudit` 投影提供给 Observer 与 bundle。Workflow Inspector 显示问题、引用、选择和停止原因；Learning 展示当前运行的召回与重验建议，保留与正式 Outcome 学习的区别。 |
+| Observer 与导出 | 同一个 Rust `ResearchAudit` 投影提供给 Observer 与 bundle。Workflow Inspector 显示问题、引用、选择和停止原因；Learning 展示当前运行的召回与重验建议，保留与正式 Outcome 学习的区别。 |
 
 历史 Contract/CAS 不改写。旧 Review 缺少 issues 仍可读取；新规则按版本生效。Domain 10、Store 18 和 Outcome 63/35 保持不变。
 

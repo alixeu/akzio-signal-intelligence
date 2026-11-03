@@ -18,6 +18,7 @@ mod application;
 mod dispatch;
 mod evidence;
 mod http;
+mod launch;
 mod observer;
 mod observer_analytics;
 mod outcome;
@@ -202,12 +203,6 @@ pub struct RuntimePolicyIdentity {
     pub minimum_fresh_pairs_per_horizon: u64,
 }
 
-// 用默认 fail-closed DecisionPolicy 计算一份可审计的运行时策略身份；返回哈希只是身份
-// 投影，不加载 Store active head，也不授权任何订单。
-pub fn default_runtime_policy_identity() -> Result<RuntimePolicyIdentity> {
-    runtime_policy_identity(&DecisionPolicy::default())
-}
-
 // 校验执行侧默认 Policy，再把 Decision、Execution、Dispatch 和 Outcome 评估规则分别哈希；
 // `decision_policy` 只借用输入，失败经 DaemonError 向启动/审批调用方传播。
 pub fn runtime_policy_identity(decision_policy: &DecisionPolicy) -> Result<RuntimePolicyIdentity> {
@@ -248,14 +243,6 @@ pub fn runtime_policy_identity(decision_policy: &DecisionPolicy) -> Result<Runti
 pub struct RuntimeGovernanceIdentity {
     pub component_hashes: BTreeMap<String, ContentHash>,
     pub bundle_hash: ContentHash,
-}
-
-// 以默认策略构造治理身份；调用委托给下方显式策略版本，未写入 Store 或模型服务。
-pub fn default_runtime_governance_identity(
-    cost_model: &OutcomeCostModel,
-) -> Result<RuntimeGovernanceIdentity> {
-    let policy = default_runtime_policy_identity()?;
-    runtime_governance_identity(cost_model, &policy)
 }
 
 // 把成本模型和前述策略哈希汇总成 component/bundle identity；这里的 JSON 仅参与哈希，
@@ -399,6 +386,7 @@ pub struct DaemonConfig {
 struct DaemonTransport {
     http_token: String,
     worker_pool: WorkerPoolConfig,
+    submissions: Arc<std::sync::Mutex<tokio_util::task::TaskTracker>>,
 }
 
 #[derive(Clone)]
@@ -496,11 +484,6 @@ pub struct DaemonHealth {
 #[derive(Debug, Serialize)]
 pub struct ObserverInvalidation {
     pub cursor: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunSubmissionResponse {
-    pub run_id: RunId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

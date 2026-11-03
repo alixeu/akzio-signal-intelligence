@@ -186,14 +186,6 @@ impl RegimeSnapshot {
         Ok(())
     }
 
-    /// Verifies whether this snapshot can participate in DecisionContext / retrieval.
-    // 只有 DecisionTime 且信息不晚于调用方决策时点的快照可进入决策上下文。
-    pub fn permits_decision_context(&self, decision_at: DateTime<Utc>) -> bool {
-        self.classification_kind == RegimeClassificationKind::DecisionTime
-            && self.as_of <= decision_at
-            && self.decision_at <= decision_at
-    }
-
     /// Set of canonical labels for compatibility checking across retrieval and lesson scopes.
     // 将五个主导枚举转换为基础标签和带维度前缀的标签，放入有序集合去重。
     pub fn canonical_regime_labels(&self) -> BTreeSet<String> {

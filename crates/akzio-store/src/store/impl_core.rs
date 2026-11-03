@@ -112,6 +112,16 @@ impl Store {
         runtime_manifest: &Artifact,
         approval: &Artifact,
     ) -> StoreResult<(RuntimeManifest, PaperLaunchApproval)> {
+        let connection = self.connection()?;
+        self.validate_paper_approval_binding_with_connection(&connection,runtime_manifest,approval)
+    }
+
+    fn validate_paper_approval_binding_with_connection(
+        &self,
+        connection: &Connection,
+        runtime_manifest: &Artifact,
+        approval: &Artifact,
+    ) -> StoreResult<(RuntimeManifest, PaperLaunchApproval)> {
         if runtime_manifest.kind != ArtifactKind::RuntimeManifest
             || approval.kind != ArtifactKind::PaperLaunchApproval
             || runtime_manifest.lifecycle != ArtifactLifecycle::Canonical
@@ -131,9 +141,9 @@ impl Store {
         runtime_manifest.validate()?;
         approval.validate()?;
         let manifest_payload: RuntimeManifest =
-            serde_json::from_slice(&self.read_blob(&runtime_manifest.blob)?)?;
+            self.read_artifact_payload_with_connection(connection,runtime_manifest)?;
         let approval_payload: PaperLaunchApproval =
-            serde_json::from_slice(&self.read_blob(&approval.blob)?)?;
+            self.read_artifact_payload_with_connection(connection,approval)?;
         manifest_payload.validate()?;
         approval_payload.validate()?;
         if approval_payload.runtime_manifest.artifact_id != runtime_manifest.artifact_id

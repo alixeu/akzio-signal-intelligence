@@ -494,17 +494,6 @@ impl DecisionPolicy {
             .then_some((probability_ppm, expected_alpha_ppm))
     }
 
-    pub fn target_for(
-        &self,
-        decision_at: DateTime<Utc>,
-        confidence_ppm: u32,
-        forecasts: &[Forecast],
-    ) -> Result<TargetPortfolio, DomainError> {
-        // 仅返回 target 的便捷入口；风险评估仍由统一 traced 路径计算，避免两个入口漂移。
-        self.target_with_risk(decision_at, confidence_ppm, forecasts)
-            .map(|(target, _)| target)
-    }
-
     pub fn target_with_risk(
         &self,
         decision_at: DateTime<Utc>,

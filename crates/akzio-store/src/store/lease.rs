@@ -5,19 +5,6 @@
 use super::*;
 
 impl Store {
-    /// 原子发布 Paper workflow、proposal、run-scoped inputs 和 session slot；
-    /// 此便捷入口不传 approval binding，不能据此推断该 session 已获交易审批。
-    // 这是不携带 RuntimeManifest/Approval binding 的便捷入口；其余 Paper graph、proposal、
-    // lease 与 slot 仍由被委派方法校验并在同一写事务中持久化。
-    pub fn reserve_paper_session_with_proposal(
-        &self,
-        lease: &DaemonLease,
-        reservation: &SessionReservation,
-        proposal: &Artifact,
-    ) -> StoreResult<SessionSlotReservation> {
-        self.reserve_paper_session_with_binding(lease, reservation, proposal, None)
-    }
-
     // 在 reservation 前同时验证 approval、manifest session date/expiry/notional，再绑定二者。
     // 先解码并校验 manifest/approval 的来源/hash、session 日期授权和 expiry；buy notional 留到
     // ExecutionPlan/Commitment 校验阶段。成功后把 binding 交给事务化写入入口，返回 slot reservation，

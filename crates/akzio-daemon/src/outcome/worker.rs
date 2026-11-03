@@ -245,13 +245,8 @@ impl Daemon {
         });
         candidates.sort();
         candidates.dedup();
-        let mut stage_node = task.node.clone();
-        stage_node.objective = format!(
-            "[outcome_horizon={}] Review outcome {} using only the Rust stage packet; market cutoff session {}.",
-            serde_json::to_value(horizon)?.as_str().unwrap_or_default(),
-            schedule.outcome_id.0,
-            stage_day
-        );
+        // 使用 Store 冻结的原节点；阶段 horizon 与 cutoff 已由 stage_artifact 明确给出，
+        // 不能再克隆并改写 objective，否则 AgentRuntime 会在模型 I/O 前拒绝节点身份。
         let (retrospective_draft, diagnostic) = if task.node.contract_hash.is_some() {
             // AgentRuntime 的 Future 被当前 worker await；两阶段提交完成且 draft 身份与
             // 冻结 horizon/outcome 匹配才写入 Attempt，模型失败按类别记诊断而不改数值 facts。
@@ -259,7 +254,7 @@ impl Daemon {
                 .agents
                 .run(
                     &task.permit,
-                    &stage_node,
+                    &task.node,
                     candidates,
                     self.model_for(task.node.recipe_id.as_str()),
                     now,

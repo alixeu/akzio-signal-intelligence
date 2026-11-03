@@ -66,12 +66,6 @@ impl AllocationRuntime {
         &self.policy
     }
 
-    // 输入以共享借用传递，`allocate_with_limit` 完成全部检查后返回新拥有的 plan。
-    pub fn allocate(&self, input: &AllocationInput) -> AllocationResult<ExecutionPlan> {
-        // 常规入口使用策略内的单次最大名义金额；需要审批上限时由 Gate 调用带 limit 的入口。
-        self.allocate_with_limit(input, self.policy.max_new_notional)
-    }
-
     pub fn allocate_with_limit(
         &self,
         input: &AllocationInput,

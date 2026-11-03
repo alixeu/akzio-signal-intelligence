@@ -32,7 +32,7 @@ Provider retry、预算失败、交易时段延期仍按既有语义执行，没
 | `GET /v1/observer/runs/{run_id}/inspection` | 持久化图、Blueprint、控制 head、checkpoint、恢复状态 |
 | `GET /v1/observer/runs/{run_id}/journal?after=0&limit=100` | journal 游标分页；支持 `task_id`、`attempt_id`，上限 500 |
 
-Journal 返回 Artifact 和 source refs，不返回原始模型/工具载荷。正式运行的私有日志在[阶段 ZIP](run-log.md)；分享安全原始投影仍通过现有授权导出读取。Observer Run Detail 携带 inspection，SwiftUI Workflow 页可预览定义、检查恢复记录和加载事件来源。
+Journal 返回 Artifact 和 source refs，不返回原始模型/工具载荷。正式运行的私有日志在[阶段 ZIP](run-log.md)；分享安全原始投影仍通过现有授权导出读取。Observer Run Detail 携带 inspection，可预览定义、检查恢复记录和加载事件来源。
 
 ```sh
 akzio --config <正式配置> workflow blueprint --purpose position_plan --format json

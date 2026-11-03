@@ -174,21 +174,27 @@ impl Daemon {
         listener: TcpListener,
         shutdown: watch::Receiver<bool>,
     ) -> Result<()> {
-        // listener 复查 loopback 后交给 Axum；graceful shutdown 只结束连接服务，正在执行
-        // 的 task 状态仍由 TaskRuntime/Store 恢复。
+        // 先停止新提交，再等待已准入的提交/审计结束；最终 ZIP 归档
+        // 必须在本 Future、scheduler 与 workers 全部结束之后。
         let address = listener.local_addr()?;
         if !address.ip().is_loopback() {
             return Err(DaemonError::InvalidInput(
                 "daemon HTTP control API must bind a loopback address".to_owned(),
             ));
         }
-        axum::serve(
+        let shutting_down = self.clone();
+        let served = axum::serve(
             listener,
             self.router().layer(axum::Extension(shutdown.clone())),
         )
-        .with_graceful_shutdown(wait_for_shutdown(shutdown))
+        .with_graceful_shutdown(async move {
+            wait_for_shutdown(shutdown).await;
+            let _ = shutting_down.close_formal_submissions();
+        })
         .await
-        .map_err(DaemonError::Io)
+        .map_err(DaemonError::Io);
+        self.close_formal_submissions()?.wait().await;
+        served
     }
 }
 
@@ -1157,6 +1163,13 @@ fn authorize(daemon: &Daemon, headers: &HeaderMap) -> std::result::Result<(), St
         .filter(|value| *value == daemon.transport.http_token)
         .map(|_| ())
         .ok_or(StatusCode::UNAUTHORIZED)
+}
+
+pub(crate) fn native_client_headers(headers: &HeaderMap) -> bool {
+    !headers.contains_key("origin")
+        && headers
+            .get("sec-fetch-site")
+            .is_none_or(|value| value == "none")
 }
 
 async fn http_store_events(

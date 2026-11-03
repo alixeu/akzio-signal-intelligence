@@ -37,100 +37,26 @@ async fn http_launch_run(
     authorize(&daemon, &headers).map_err(|status| {
         (status, Json(serde_json::json!({"error":"authenticated_native_client_required"})))
     })?;
-    if headers.contains_key("origin") || headers.get("sec-fetch-site").is_some_and(|v| v != "none")
-    {
+    if !native_client_headers(&headers) {
         return Err((
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({"error":"native_client_required"})),
         ));
     }
-    if let Some(logger) = &daemon.run_log {
-        logger.assert_available().map_err(|error| (
+    let submission = daemon.submit_formal_run(request.purpose, "http").await
+    .map_err(|error| match error {
+        crate::launch::FormalRunLaunchError::Rejected(error) => run_http_error(error),
+        crate::launch::FormalRunLaunchError::Unknown { run_id, .. } => (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error":"run_log_unavailable","detail":error.to_string()})),
-        ))?;
-    }
-    let (run_id, newly_created) = match request.purpose {
-        RunPurpose::PositionPlan => {
-            let operation = daemon.clone();
-            let run_id = run_daemon_store_operation(daemon.store_executor.clone(), move || {
-                let now = Utc::now();
-                let session = now
-                    .with_timezone(&chrono_tz::America::New_York)
-                    .date_naive()
-                    .to_string();
-                let (workflow, setup) = operation.prepare_position_plan(&session, now)?;
-                operation.store.commit_position_plan(&workflow, &setup)?;
-                Ok(workflow.run.run_id)
-            })
-            .await
-            .map_err(run_http_error)?;
-            (run_id, true)
-        }
-        RunPurpose::Paper => {
-            let paper = daemon.paper.paper_observer.clone().ok_or_else(|| {
-                run_http_error(DaemonError::InvalidInput(
-                    "完整模式尚未启用：配置 daemon.manual_paper=true 后重启 Core".into(),
-                ))
-            })?;
-            if daemon.paper.runtime_identity_hash.is_none() {
-                return Err(run_http_error(DaemonError::InvalidInput(
-                    "Paper runtime identity is unavailable".into(),
-                )));
-            }
-            let clock = AlpacaPaperSessionClock::new(paper);
-            let reservation = daemon
-                .paper
-                .scheduler
-                .tick(&clock, &daemon.paper_workflow_source(), Utc::now())
-                .await
-                .map_err(|error| run_http_error(error.into()))?;
-            let reservation = reservation
-                .ok_or_else(|| {
-                    run_http_error(DaemonError::InvalidInput(
-                        "Paper 暂未启动：请检查交易时段、当前审批及校准状态；未创建订单".into(),
-                    ))
-                })?;
-            (
-                reservation.slot.workflow.run.run_id,
-                reservation.newly_reserved,
-            )
-        }
-        _ => {
-            return Err(run_http_error(DaemonError::InvalidInput(
-                "仅支持 PositionPlan 或 Paper".into(),
-            )));
-        }
-    };
-    if newly_created {
-        if let Some(logger) = &daemon.run_log {
-            let scope = akzio_model::ModelAuditContext {
-                run_id: run_id.0.clone(),
-                phase: "T0".into(),
-                task_id: None,
-                attempt_id: None,
-                call_id: None,
-                retry_index: None,
-            };
-            logger
-                .record(
-                    &scope,
-                    "rust.run.submitted",
-                    serde_json::json!({"purpose":request.purpose,"source":"http"}),
-                )
-                .map_err(|error| {
-                    (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Json(serde_json::json!({
-                            "error":"run_log_unavailable_after_commit",
-                            "run_id":run_id,
-                            "detail":error.to_string(),
-                        })),
-                    )
-                })?;
-        }
-    }
-    Ok(Json(serde_json::json!({"run_id":run_id})))
+            Json(serde_json::json!({
+                "error":"unknown_after_post",
+                "submission_status":"unknown_after_post",
+                "run_id":run_id,
+            })),
+        ),
+    })?;
+    // 保留已有 REST wire shape。
+    Ok(Json(serde_json::json!({"run_id":submission.run_id})))
 }
 
 #[cfg(test)]

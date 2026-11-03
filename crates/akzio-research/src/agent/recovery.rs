@@ -647,6 +647,19 @@ fn recovery_lineage(
         {
             return Ok(None);
         }
+        // 已提交 Outcome 阶段是新的预算与 Context 边界，不是上一阶段的重试。
+        // 只有尚未提交 Retrospective 的 Attempt 才沿 Retry/Recovery 继续恢复；
+        // 这样 T1→T3→T5 不会继承旧 cutoff，也不会把新阶段误判为用量未知。
+        let parent_events =
+            store.attempt_events(&permit.run_id, &permit.task_id, &relation.parent_attempt_id)?;
+        let mut stage_committed = false;
+        for event in parent_events {
+            stage_committed |=
+                event.lifecycle_kind()? == LifecycleEventType::RetrospectiveCreated;
+        }
+        if stage_committed {
+            break;
+        }
         child = relation.parent_attempt_id;
         lineage.push(child.clone());
     }

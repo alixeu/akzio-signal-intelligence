@@ -32,7 +32,6 @@ CI 的实际配置见 [ci.yml](../.github/workflows/ci.yml)。与 CI 对齐的�
 
 ```bash
 bash -n scripts/run_core.sh
-bash -n scripts/build_app_and_core.sh
 cargo fmt --all -- --check
 cargo check --workspace --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
@@ -45,32 +44,19 @@ cargo test --workspace --locked
 
 正式拓扑的离线验收使用 `cargo test --workspace --locked` 中注入 fixture adapters 的 Rust 测试；不再启动可操作的 fixture Core，也不再运行 `debug verify-fixture`。旧 Debug CLI、HTTP 控制和独立配置已退役。需要单独运行 `store doctor` 时，仍必须确认目标配置、endpoint、Store 和已获准的服务；不得为了验证改连正式 Store 或启动模型/Paper。运行归档见[私有阶段日志](run-log.md)。
 
-## 4. Observatory App
+## 4. 正式运行与 Core 生命周期
 
-日常 App 的运行入口只提供 PositionPlan（仅生成仓位计划）和 Paper（完整模式）。认证原生客户端通过 `POST /runs` 提交 purpose；PositionPlan 原子发布正式研究图，在 Decision 后结束；Paper 请求现有 scheduler tick，沿用真实 Clock、审批绑定、Session 排他预约与全部 Gate，同 Session 返回已有 Run。休市或审批等前置未满足时返回明确拒绝，不伪造已开始。
+日常正式客户端只提供 PositionPlan（仅生成仓位计划）和 Paper（完整模式）。认证原生客户端通过 `POST /runs` 提交 purpose；PositionPlan 原子发布正式研究图，在 Decision 后结束；Paper 请求现有 scheduler tick，沿用真实 Clock、审批绑定、Session 排他预约与全部 Gate，同 Session 返回已有 Run。休市或审批等前置未满足时返回明确拒绝，不伪造已开始。
 
-`daemon.manual_paper=true` 仅配置手动 Paper 运行能力，初始化与自动 Paper 相同的 Broker、runtime identity 和启动校验；`auto_paper=false` 时不会自动创建新 T0。内置 App 模板默认采用这组配置。旧隔离 Debug Store 始终拒绝作为正式 Core 打开，已有日常配置需要显式迁移后生效。
+`daemon.manual_paper=true` 仅配置手动 Paper 运行能力，初始化与自动 Paper 相同的 Broker、runtime identity 和启动校验；`auto_paper=false` 时不会自动创建新 T0。内置配置模板默认采用这组配置。旧隔离 Debug Store 始终拒绝作为正式 Core 打开，已有日常配置需要显式迁移后生效。
 
+日常脚本只保留 `bash scripts/run_core.sh position-plan` 和 `bash scripts/run_core.sh paper`，无参数或 `--help` 仅显示简短帮助，不依赖 Python/curl/jq。两者分别调用 Rust `run start --purpose position-plan|paper --auto-serve`，与正式 HTTP 客户端使用同一个 `POST /runs`。若所选回环端口已有服务，必须核验配置 Store 的 token、canonical `/ready` 和导出能力，只复用该服务；仅连接明确被拒绝时，才用同一当前源码的 `akzio --config <config> daemon serve` 启动正式 Core，等待 ready 后提交。认证、隔离 Store、旧版 Core 或非连接拒绝错误不能触发额外服务。默认读取 `~/.akzio/config.toml`，仅可在模式前指定 `--config FILE`（相对路径按调用者目录解析）；CLI 通过 `cargo run --locked` 从当前源码构建，不自动选旧二进制。脚本不提供开发/运维模式、`--dry-run` 或任意 CLI 透传，日常说明见 [AGENTS](../AGENTS.md)。
 
-SwiftUI 或 App/Core 接口修改还需运行与改动相关的 Swift 检查；完整 Bundle 构建不能替代实际 UI 验收。
-
-macOS 自用分发版本统一通过 `scripts/build_app_and_core.sh` 编译、打包与 ad-hoc 签名。它从当前源码构建 Swift App 和 release Rust CLI：分别得到新 `.app` 内的 `Contents/MacOS/akzio-core` 和独立的 `target/release/akzio`；脚本输出 `APP_BUNDLE`、`RUST_BINARY`、`EMBEDDED_CORE` 的路径。默认给每次构建选择新的时间戳 Bundle，保留产物且拒绝覆盖已有目标。运行：
-
-```bash
-bash scripts/build_app_and_core.sh
-```
-
-若需指定目标，可设 `AKZIO_APP_BUNDLE=<尚不存在的路径>`。已有目标不可覆盖；清理构建目录、删除旧 Bundle 仍须明确授权。源码入口见 [打包入口](../scripts/build_app_and_core.sh) 和 [内部构建脚本](../apps/Scripts/build_app.sh)。
-
-`apps/Scripts/create_dmg.sh` 接受同一个 `AKZIO_APP_BUNDLE`，可用 `AKZIO_DMG_PATH` 指定新的 DMG 路径；已有 DMG 不会被覆盖。
-
-日常脚本只保留 `bash scripts/run_core.sh position-plan` 和 `bash scripts/run_core.sh paper`，无参数或 `--help` 仅显示简短帮助，不依赖 Python/curl/jq。两者分别调用 Rust `run start --purpose position-plan|paper --auto-serve`，与 App 使用同一个 `POST /runs`。若所选回环端口已有服务，必须核验配置 Store 的 token、canonical `/ready` 和导出能力，只复用该服务；仅连接明确被拒绝时，才用同一当前源码的 `akzio --config <config> daemon serve` 启动正式 Core，等待 ready 后提交。认证、隔离 Store、旧版 Core 或非连接拒绝错误不能触发额外服务。默认读取 `~/.akzio/config.toml`，仅可在模式前指定 `--config FILE`（相对路径按调用者目录解析）；CLI 通过 `cargo run --locked` 从当前源码构建，不自动选旧二进制。脚本不提供开发/运维模式、`--dry-run` 或任意 CLI 透传，日常说明见 [AGENTS](../AGENTS.md)。
-
-已有 App/Core 时不重复启动；没有服务时自动启动的 Core 将在脚本返回后独立运行，以便处理未来 Outcome。默认 App 配置、Store/token 和新启动日志都在 `~/.akzio/`：分别为 `config.toml`、`store/` 与 `logs/core-*.log`。日志目录设为仅用户可进入，日志文件仅用户可读写；每次启动使用新日志，不覆盖 App 的 `logs/core.log`，不再写仓库 `.akzio/`。若显式指定另一正式配置，日志跟随其 Store Root 的父目录下的 `logs/`。PID 和日志路径从 `CORE_STARTED_PID`、`CORE_LOG` 输出。若启动前模型能力探测、凭据、Policy/Contract 或 Paper 配置失败，会在 ready 前退出并提示查看日志，不会提交 Run；启动等待有界（最多五分钟），超时后 Core 可能仍在启动，不能盲目重发。App supervisor 当前拒绝占用中的端口且不会附着外部 Core，脚本自启的 Core 应用同配置的原生 `run replay/detail` 查询，不能声称在 App 中可管理。正式客户端只读原配置和指定 Store 的 token，要求绝对 Store Root、回环地址及一致的 `AKZIO_STORE_ROOT`，禁止代理、认证重定向及 HTTP 自动重试；通过 `/ready` 核对 canonical Store、私有日志可用性和分享安全导出能力，再向 `POST /runs` 提交一次 purpose。客户端不复制/修改配置、Store 或 Policy，不把 PositionPlan 自动切换为 Paper。若 `auto_paper=true` 且尚无 Core，PositionPlan 拒绝自动启动以避免间接开启 Paper scheduler；脚本不改此配置。`unknown_after_post` 表示可能已经创建 Run，必须先查询原 Run/Session，不能直接重试。隔离 Debug 实验命令已退役，不再通过其他入口恢复。
+已有 Core 时不重复启动；没有服务时自动启动的 Core 将在脚本返回后独立运行，以便处理未来 Outcome。默认配置、Store/token 和新启动日志都在 `~/.akzio/`：分别为 `config.toml`、`store/` 与 `logs/core-*.log`。日志目录设为仅用户可进入，日志文件仅用户可读写；每次启动使用新日志，不覆盖已有 `logs/core.log`，不再写仓库 `.akzio/`。若显式指定另一正式配置，日志跟随其 Store Root 的父目录下的 `logs/`。PID 和日志路径从 `CORE_STARTED_PID`、`CORE_LOG` 输出。若启动前模型能力探测、凭据、Policy/Contract 或 Paper 配置失败，会在 ready 前退出并提示查看日志，不会提交 Run；启动等待有界（最多五分钟），超时后 Core 可能仍在启动，不能盲目重发。脚本自启的 Core 应用同配置的原生 `run replay/detail` 查询。正式客户端只读原配置和指定 Store 的 token，要求绝对 Store Root、回环地址及一致的 `AKZIO_STORE_ROOT`，禁止代理、认证重定向及 HTTP 自动重试；通过 `/ready` 核对 canonical Store、私有日志可用性和分享安全导出能力，再向 `POST /runs` 提交一次 purpose。客户端不复制/修改配置、Store 或 Policy，不把 PositionPlan 自动切换为 Paper。若 `auto_paper=true` 且尚无 Core，PositionPlan 拒绝自动启动以避免间接开启 Paper scheduler；脚本不改此配置。`unknown_after_post` 表示可能已经创建 Run，必须先查询原 Run/Session，不能直接重试。隔离 Debug 实验命令已退役，不再通过其他入口恢复。
 
 `/ready` 提供 `store_scope`、`run_log_ready` 和 `formal_run_bundle_supported` 供客户端在提交前核对；旧版 Core 须更新并重启。认证的 `POST /control/store/export-run-bundle` 只导出 canonical Paper/PositionPlan 的分享安全快照到新目录，不回写 Store，也不向隔离 Debug Run 开放；历史 Debug bundle 的只读导出仍单独保留。
 
-缺 active DecisionPolicy 时，正式 PositionPlan 仍通过 Rust DecisionGate 形成可审查的研究分配与**全零正式目标仓位**，在 Decision 后结束，不产生 ExecutionVerdict 或 Outcome；证据不足时研究分配也可能为现金/阻断。已安装 Policy 的模型与 Contract 不匹配仍由正式 Core 拒绝或由原 Gate fail closed，客户端不补造或激活 Policy。`paper` 的冷启动由正式 scheduler 自动判断，无需单独模式。两者在 T0 都包含 T1/T3/T5 预测，只有 Paper 安排后续跨交易日评估。日常在 App 查看结果；开发诊断可用原生 `akzio --config <config> run detail RUN_ID` 读取有界 Observer JSON，`run replay` 读取持久化生命周期，`run retrospectives` 读取已保存复盘。研究提案、正式目标、ExecutionVerdict、订单提交、成交与 OutcomeSchedule 仍分别核对；投影缺失不等于零订单或真实成交。
+缺 active DecisionPolicy 时，正式 PositionPlan 仍通过 Rust DecisionGate 形成可审查的研究分配与**全零正式目标仓位**，在 Decision 后结束，不产生 ExecutionVerdict 或 Outcome；证据不足时研究分配也可能为现金/阻断。已安装 Policy 的模型与 Contract 不匹配仍由正式 Core 拒绝或由原 Gate fail closed，客户端不补造或激活 Policy。`paper` 的冷启动由正式 scheduler 自动判断，无需单独模式。两者在 T0 都包含 T1/T3/T5 预测，只有 Paper 安排后续跨交易日评估。日常通过原生 `akzio --config <config> run detail RUN_ID` 查看有界 Observer JSON；开发诊断可用 `run replay` 读取持久化生命周期，`run retrospectives` 读取已保存复盘。研究提案、正式目标、ExecutionVerdict、订单提交、成交与 OutcomeSchedule 仍分别核对；投影缺失不等于零订单或真实成交。
 
 提交命令只打印 JSON `run_id`、`purpose`、`submission_status=submitted_or_reused`，不等待 T0、不自动导出或清理。返回 0 仅表示该次提交/复用被确认，不能解释为流程完成、订单成交或 Outcome 密封；传输/解码/HTTP 错误返回非零，提交不确定时明确标为 `unknown_after_post`。这与已删除的 Python 入口的 `FINAL_STATUS`、0/1/2/3 业务退出码、自动 ZIP 和 `--keep-artifacts` 不兼容。参数错误返回非零；Shell 保留底层命令退出码。
 
@@ -94,7 +80,7 @@ Regular 订单沿用原逻辑；其余可交易时段使用 `limit + day + exten
 
 Closed 会持久化延期任务，等下次可交易时段或 Decision 到期。再次领取时重新刷新 Account / Quote / Clock，再运行原 ExecutionGate；Decision 过期会被拒绝。提交成功的 `accepted/new/partially_filled` 不是最终成交，短轮询超时只保存待成交进度并等待下一次 Reconcile。扩展时段订单不因原来的 60 秒阈值撤改，Regular 行为不变。最终成交、取消、过期或拒绝以 Alpaca 回执为准。
 
-日常双模式脚本复用或启动正式 Core，不暂停 Run、不关闭进程。T0 结束或订单待成交时，正式 Core 与同一 Store 继续承担对账及未来 Outcome；再次检查用运行中的 App（仅其管理的 Core）或原生 `run inspect` / `run replay`，不能重发 PositionPlan POST 来代替恢复。`paper` 同交易 Session 的复用由 Rust session slot 负责。`OutcomeSchedule` 仅表示未来任务已安排，不等于订单成交、T+5 密封或 Policy 激活。Core 退出后需在同一 Store 恢复服务才能继续工作。
+日常双模式脚本复用或启动正式 Core，不暂停 Run、不关闭进程。T0 结束或订单待成交时，正式 Core 与同一 Store 继续承担对账及未来 Outcome；再次检查用原生 `run inspect` / `run replay`，不能重发 PositionPlan POST 来代替恢复。`paper` 同交易 Session 的复用由 Rust session slot 负责。`OutcomeSchedule` 仅表示未来任务已安排，不等于订单成交、T+5 密封或 Policy 激活。Core 退出后需在同一 Store 恢复服务才能继续工作。
 
 提交确认、`replay` 运行状态、bundle 导出完整性、Paper 回执中的订单提交/成交与 Outcome 状态分别核对；accepted/new/partially_filled 仍不是最终成交。查询错误不取消原 Run，不复制 Store。预测分数来自 T0 的逐资产/期限 forecasts，组合指标来自冻结实际敞口，不把 research_plan 建议权重当作已成交持仓。
 
@@ -130,7 +116,7 @@ akzio --config <config> calibration activate --store <store> --policy <policy-id
 
 首次安装的 canonical Paper 冷启动与 PositionPlan 是两条不同入口：前者用于积累真实 Outcome，须显式选择 `paper` 并满足真实行情/模型配置；后者可在缺 Policy 时产出零正式目标和研究分配，但不产生校准样本。脚本不修改 `auto_paper` 或 Paper 审批，也不自动激活 Policy。`auto_paper=false`、`manual_paper=true`、`outcome_processing=true` 可只手动创建 T0 而持续处理已安排的 Outcome；配置仍须 operator 明确维护。
 
-普通 Observatory Core 使用 `~/.akzio/store` 与 `~/.akzio/config.toml`；旧隔离 Store 只保留历史读取，不得改作正式运行。`Paper scheduler waiting: broker market is closed` 是正常非交易状态，不视为服务异常。
+普通正式 Core 使用 `~/.akzio/store` 与 `~/.akzio/config.toml`；旧隔离 Store 只保留历史读取，不得改作正式运行。`Paper scheduler waiting: broker market is closed` 是正常非交易状态，不视为服务异常。
 
 Shell 的两个提交模式及原生查询/分享安全导出不会删除正式 Core、Store、Run、Commitment、报告或历史状态。需要独立备份/恢复时使用显式的 `store backup/restore` 原生命令，沿用原审批，不把分享安全 bundle 当成数据库备份。
 

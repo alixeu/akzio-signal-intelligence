@@ -68,8 +68,8 @@ fn port_is_listening(address: SocketAddr) -> Result<bool> {
 }
 
 fn prepare_formal_log_root(store_root: &Path) -> Result<PathBuf> {
-    // App 的 home/store 与 home/logs 共享同一根；正式 CLI 日志也放在该 home 下，
-    // 而不是仓库 .akzio/。不打开或复制 Store/token，也不覆盖 App 自己的 core.log。
+    // home/store 与 home/logs 共享同一根；正式 CLI 日志也放在该 home 下，
+    // 而不是仓库 .akzio/。不打开或复制 Store/token，也不覆盖已有 core.log。
     let home = store_root.parent().context("正式 Store 缺少 home 父目录")?;
     let log_root = home.join("logs");
     match fs::symlink_metadata(&log_root) {
@@ -115,7 +115,7 @@ fn spawn_formal_core(config_path: &Path, store_root: &Path) -> Result<impl FnMut
     let binary = std::env::current_exe().context("定位当前 Rust CLI 二进制")?;
 
     // nohup + 独立进程组让 Core 在脚本返回和终端断开后继续处理 T1/T3/T5。
-    // stdin EOF 退出仅供 App 的受控 child 使用；CLI 自动启动不继承这一行为。
+    // stdin EOF 退出仅供受控 child 使用；CLI 自动启动不继承这一行为。
     let mut command = std::process::Command::new("nohup");
     command
         .arg(binary)

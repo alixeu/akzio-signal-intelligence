@@ -37,6 +37,12 @@ pub const SCHEDULER_LEASE_NAME: &str = "akzio.local.scheduler";
 
 #[derive(Debug, Error)]
 pub enum SchedulerError {
+    #[error("Paper reservation result is unknown; inspect the original session before retrying")]
+    SubmissionUnknown {
+        run_id: Option<RunId>,
+        #[source]
+        error: Box<SchedulerError>,
+    },
     #[error(transparent)]
     RunLogUnavailable(#[from] crate::RunLogError),
     #[error(transparent)]

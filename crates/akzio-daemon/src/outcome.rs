@@ -25,4 +25,7 @@ mod shadow;
 #[path = "outcome/worker.rs"]
 mod worker;
 
+#[cfg(test)]
+mod tests;
+
 use helpers::*;

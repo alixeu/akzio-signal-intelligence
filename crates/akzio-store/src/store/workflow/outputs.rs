@@ -178,13 +178,4 @@ impl Store {
         }
     }
 
-    pub fn committed_attempt_outputs(
-        &self,
-        task_id: &TaskId,
-        attempt_id: &AttemptId,
-    ) -> StoreResult<Vec<Artifact>> {
-        // 输入 task_id/attempt_id 必须精确命中成功关系；expected_run_id=None 只省略额外 Run 对照。
-        let connection = self.connection()?;
-        read_committed_attempt_outputs(&connection, None, task_id, attempt_id)
-    }
 }

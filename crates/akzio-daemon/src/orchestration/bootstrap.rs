@@ -250,6 +250,7 @@ impl Daemon {
             },
             transport: DaemonTransport {
                 http_token: config.http_token,
+                submissions: Arc::new(std::sync::Mutex::new(tokio_util::task::TaskTracker::new())),
                 worker_pool: WorkerPoolConfig {
                     worker_count: config.worker_count.max(1),
                     ..WorkerPoolConfig::default()

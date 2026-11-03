@@ -115,7 +115,7 @@ Analyst/Critic 提交 news、price、macro 类型化意图、资产或受支持�
 
 独立 `research.proposal_reviewer` 继承 Critic 的模型路由与有效单任务预算，在 Run 创建时冻结。输入包含完整提案、有效 Claim/Critique、numeric_basis 和关键反证。numeric_basis 恰好覆盖 12 个 forecast、四资产与现金共 17 项，说明输入、单位、方法、假设与不确定性；配置说明仓位、重叠风险与现金理由。ProposalReview 逐项通过/拒绝并给出原因，由 Rust 绑定精确 proposal Artifact、内容哈希、Manifest 和 Contract；任何内容变化都需新 Review。拒绝意见进入下一次 Synthesizer；通过后跳过剩余修订。耗尽、上下文不足或审查失败明确阻断 Decision。结构化格式修复与业务提案修订独立计数，恢复不重置预算。
 
-Context 的必需集合包括有效 Claim/Critique、已审 grounds、numeric_basis 引用和反证，先于可选背景；24 项上限不变，关键材料放不下即报覆盖缺口。创建 Manifest 时持久化候选覆盖记录；导出时才出现的证据只能标记存在，不能回推历史可用性。Rust 输出研究进度、审查状态、revision 与 Decision 阻断；脚本与 App 显示该投影，workflow 原状态保留。审查通过只证明依据与推理被审查，SQL active Policy、适配和风险 Gate 独立生效，不生成或自动激活 Policy。Outcome 协议与历史哈希不变。
+Context 的必需集合包括有效 Claim/Critique、已审 grounds、numeric_basis 引用和反证，先于可选背景；24 项上限不变，关键材料放不下即报覆盖缺口。创建 Manifest 时持久化候选覆盖记录；导出时才出现的证据只能标记存在，不能回推历史可用性。Rust 输出研究进度、审查状态、revision 与 Decision 阻断；脚本与 Observer 只读接口展示该投影，workflow 原状态保留。审查通过只证明依据与推理被审查，SQL active Policy、适配和风险 Gate 独立生效，不生成或自动激活 Policy。Outcome 协议与历史哈希不变。
 
 Contract 69 的拒绝 assessment 必须有 1–3 个类型化 issues；通过项 issues 为空。Rust 生成稳定问题 ID，冻结已通过 forecast 的模型字段及 numeric_basis，保留配置联动和 Rust 日历绑定。两次拒绝的问题、引用及被拒绝内容完全不变时停止剩余修订，保留拒绝 Review 并阻断 Decision。Lesson 召回先扫描同一 SQL 快照的全部 Active heads 再筛选排序，四条上限内保留完整显式冲突组；来源更新只生成 RunScoped 重验建议。具体审计和实验入口见[研究质量验证](research-quality.md)。
 
