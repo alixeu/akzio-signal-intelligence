@@ -50,3 +50,22 @@ unicode-normalization = "0.1.24"
 uuid = { version = "1.12.0", features = ["v4", "serde"] }
 zstd = "0.13.3"
 zip = { version = "=8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+# 编译期工程硬约束（由各 crate `[lints] workspace = true` 统一继承，CI 与本地 `-D warnings` 生效）。
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+dbg_macro = "deny"
+disallowed_macros = "deny"
+disallowed_methods = "deny"
+disallowed_types = "deny"
+mem_forget = "deny"
+rc_mutex = "deny"
+todo = "deny"
+unimplemented = "deny"
+lossy_float_literal = "deny"
+rest_pat_in_fully_bound_structs = "deny"

@@ -1,0 +1,44 @@
+{
+  "akzio-autonomous-loop-guard": {
+    "enabled": true,
+    "PreToolUse": [
+      {
+        "matcher": "run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ./loop/bin/hook_guard.py",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "write_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ./loop/bin/hook_guard.py",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "edit_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ./loop/bin/hook_guard.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python3 ./loop/bin/hook_guard.py",
+        "timeout": 10
+      }
+    ]
+  }
+}

@@ -38,3 +38,6 @@ uuid.workspace = true
 [build-dependencies]
 # 仅供 build.rs 计算源码身份摘要；不参与 CLI 运行时依赖图。
 sha2.workspace = true
+
+[lints]
+workspace = true

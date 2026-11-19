@@ -5,7 +5,7 @@ name: ci
 on:
   pull_request:
   push:
-    branches: [master]
+    branches: [main]
 
 permissions:
   contents: read
@@ -15,11 +15,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # PR checkout includes the merge commit and its base parent.
+          fetch-depth: 2
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Check Markdown local links
+      - name: Check Markdown links and doc-slop guardrails
         run: |
           python3 - <<'PY'
           import os
@@ -34,6 +37,31 @@ jobs:
           ).strip()).resolve()
           if git_root != root.resolve():
               sys.exit("Markdown check requires the repository Git inventory")
+
+          # 1. Tracked Markdown location guardrail (prevents committing stray AI .md files in root or crates/)
+          tracked_md = subprocess.check_output(["git", "ls-files", "-z", "--", "*.md"]).split(b"\0")
+          allowed_root_md = {"AGENTS.md", "CONTEXT.md", "README.md"}
+          bad_paths = []
+          for raw in filter(None, tracked_md):
+              rel = os.fsdecode(raw).replace("\\", "/")
+              if "/" not in rel and rel not in allowed_root_md:
+                  bad_paths.append(f"unapproved tracked root markdown: {rel}")
+              elif rel.startswith("crates/") and not re.match(
+                  r"^crates/[^/]+/src/(?:.+/)?(?:prompts|fixtures)/.+\.md$", rel
+              ):
+                  bad_paths.append(f"unapproved tracked markdown inside crates/: {rel}")
+          if bad_paths:
+              sys.exit("\n".join(bad_paths))
+
+          # 2. Keep AGENTS.md concise (rules belong in lints/tests/hooks, not prose)
+          agents_text = (root / "AGENTS.md").read_text(encoding="utf-8")
+          if len(agents_text.encode("utf-8")) > 6000 or len(agents_text.splitlines()) > 85:
+              sys.exit(
+                  f"AGENTS.md exceeds budget ({len(agents_text.encode('utf-8'))} bytes, "
+                  f"{len(agents_text.splitlines())} lines; max 6000 bytes / 85 lines)"
+              )
+
+          # 3. Verify all local Markdown links
           inventory = subprocess.check_output(
               ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", "*.md"]
           )
@@ -53,6 +81,43 @@ jobs:
           if broken:
               sys.exit("\n".join(broken))
           PY
+      - name: Check PR diff anti-slop guardrails
+        if: github.event_name == 'pull_request'
+        run: |
+          python3 - <<'PY'
+          import re, subprocess, sys
+
+          # The first parent of the checked-out PR merge commit is its base.
+          diff = subprocess.check_output(
+              ["git", "diff", "--unified=0", "HEAD^1", "HEAD", "--", "crates/"],
+              text=True,
+          )
+          banned = [
+              (re.compile(r"#\s*\[\s*allow\s*\("), "Adding #[allow(...)] in PR diff is forbidden"),
+              (re.compile(r"#\s*!\s*\[\s*allow\s*\("), "Adding #![allow(...)] in PR diff is forbidden"),
+              (re.compile(r"#\s*\[\s*ignore\b"), "Adding #[ignore] in PR diff is forbidden"),
+          ]
+          current_file = ""
+          errors = []
+          for line in diff.splitlines():
+              if line.startswith("+++ b/"):
+                  current_file = line[6:].strip()
+                  continue
+              if not current_file.endswith(".rs") or current_file == "crates/akzio-daemon/tests/architecture_guardrails.rs":
+                  continue
+              if line.startswith("+") and not line.startswith("+++"):
+                  content = line[1:]
+                  for pat, msg in banned:
+                      if pat.search(content):
+                          errors.append(f"{current_file}: {msg}: {content.strip()}")
+          if errors:
+              sys.exit("\n".join(errors))
+          PY
+      - name: Run agent hook guard unit tests (when present)
+        run: |
+          if [ -d .agents/loop/bin ]; then
+            python3 -m unittest discover -s .agents/loop/bin -p 'test_*.py' -v
+          fi
       - run: cargo fmt --all -- --check
       - run: bash -n scripts/run_core.sh
       - run: cargo check --workspace --locked

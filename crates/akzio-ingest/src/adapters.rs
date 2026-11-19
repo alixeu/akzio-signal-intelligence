@@ -1840,7 +1840,13 @@ mod alpaca_news_tests {
         // 也不构成研究/交易验收。
         let key = std::env::var("ALPACA_API_KEY").expect("ALPACA_API_KEY is configured");
         let secret = std::env::var("ALPACA_API_SECRET").expect("ALPACA_API_SECRET is configured");
-        let response = Client::new()
+        let client = Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("Alpaca news HTTP client builds");
+        let response = client
             .get("https://data.alpaca.markets/v1beta1/news")
             .query(&[
                 ("symbols", "QQQ"),

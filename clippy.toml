@@ -1,0 +1,19 @@
+# Clippy compile-time guardrails (enforced via `[workspace.lints.clippy]` in Cargo.toml).
+# Keep rules focused on real safety/architecture boundaries without noisy style churn.
+
+disallowed-macros = [
+    { path = "std::dbg", reason = "Do not leave dbg!() macros in committed code." },
+    { path = "std::todo", reason = "Do not leave incomplete todo!() stubs." },
+    { path = "std::unimplemented", reason = "Do not leave unimplemented!() stubs." },
+]
+
+disallowed-methods = [
+    { path = "reqwest::get", reason = "Use an explicitly configured reqwest::Client (no_proxy, redirect::Policy::none, explicit timeout)." },
+    { path = "reqwest::Client::new", reason = "Use reqwest::Client::builder() with explicit no_proxy, redirect::Policy::none, and timeout." },
+    { path = "reqwest::ClientBuilder::danger_accept_invalid_certs", reason = "Disabling TLS certificate verification is forbidden." },
+    { path = "reqwest::ClientBuilder::danger_accept_invalid_hostnames", reason = "Disabling TLS hostname verification is forbidden." },
+    { path = "reqwest::blocking::get", allow-invalid = true, reason = "Do not use blocking reqwest; use async Client::builder()." },
+    { path = "reqwest::blocking::Client::new", allow-invalid = true, reason = "Do not use blocking reqwest; use async Client::builder()." },
+    { path = "reqwest::blocking::Client::builder", allow-invalid = true, reason = "Do not use blocking reqwest; use async Client::builder()." },
+    { path = "std::mem::forget", reason = "Do not leak values or guards with std::mem::forget." },
+]

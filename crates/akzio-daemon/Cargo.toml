@@ -39,3 +39,6 @@ tokio-util.workspace = true
 [dev-dependencies]
 # 测试使用独立 HTTP client 访问本地 handler，不加入 daemon 的生产依赖。
 reqwest.workspace = true
+
+[lints]
+workspace = true
