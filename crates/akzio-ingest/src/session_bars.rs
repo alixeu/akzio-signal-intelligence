@@ -11,7 +11,8 @@ use super::*;
 use chrono::{NaiveDate, NaiveTime, TimeZone};
 use chrono_tz::America::New_York;
 
-const BAR_AVAILABILITY_LAG_MINUTES: i64 = 20;
+use crate::forecast_calendar::BAR_AVAILABILITY_LAG_MINUTES;
+
 const MAX_BAR_PAGES: usize = 16;
 const MAX_PROVIDER_BYTES: usize = 8 * 1024 * 1024;
 

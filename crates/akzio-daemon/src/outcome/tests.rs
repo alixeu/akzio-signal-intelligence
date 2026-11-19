@@ -85,6 +85,20 @@ async fn scheduled_with_calendar(
     baseline: NaiveDate,
     closes: Option<&BTreeMap<NaiveDate, DateTime<Utc>>>,
 ) -> (Daemon, RunId, Artifact, ClaimedAttempt) {
+    let (daemon, id) = run_paper_with_calendar(baseline, closes).await;
+    let schedule = daemon.store.outcome_schedule_for_run(&id).unwrap().unwrap();
+    daemon
+        .store
+        .ensure_pending_outcome_workers(Utc::now())
+        .unwrap();
+    let task = claim_outcome(&daemon);
+    (daemon, id, schedule, task)
+}
+
+async fn run_paper_with_calendar(
+    baseline: NaiveDate,
+    closes: Option<&BTreeMap<NaiveDate, DateTime<Utc>>>,
+) -> (Daemon, RunId) {
     let mut daemon = daemon();
     let now = Utc::now();
     install_execution_snapshots(&mut daemon, baseline, now);
@@ -103,7 +117,27 @@ async fn scheduled_with_calendar(
                 (need.resource, evidence)
             })
             .collect();
-        daemon.fixture_evidence = Arc::new(BTreeMap::from([(EvidenceSource::Alpaca, bars)]));
+        let mut evidence = BTreeMap::from([(EvidenceSource::Alpaca, bars)]);
+        if baseline > akzio_ingest::market_session_day(now) {
+            // The fixture moves the broker session forward, but no future FRED
+            // vintage is available at the real T0 capture clock.
+            let unavailable_fred =
+                akzio_domain::paper_session_evidence_needs(&baseline.to_string())
+                    .into_iter()
+                    .filter(|need| need.source_family == "fred")
+                    .map(|need| {
+                        let mut evidence = crate::debug_fixture_evidence(
+                            EvidenceSource::Fred,
+                            &need.resource,
+                            now,
+                        );
+                        evidence.raw.clear();
+                        (need.resource, evidence)
+                    })
+                    .collect();
+            evidence.insert(EvidenceSource::Fred, unavailable_fred);
+        }
+        daemon.fixture_evidence = Arc::new(evidence);
     }
     let id = daemon
         .paper
@@ -125,22 +159,7 @@ async fn scheduled_with_calendar(
             break;
         }
     }
-    let schedule = daemon.store.outcome_schedule_for_run(&id).unwrap().unwrap();
-    daemon
-        .store
-        .ensure_pending_outcome_workers(Utc::now())
-        .unwrap();
-    let task = daemon
-        .store
-        .claim_next_task_for_workload(
-            "outcome-regression-worker",
-            Utc::now(),
-            Duration::minutes(5),
-            akzio_store::TaskWorkload::Outcome,
-        )
-        .unwrap()
-        .unwrap();
-    (daemon, id, schedule, task)
+    (daemon, id)
 }
 
 fn claim_outcome(daemon: &Daemon) -> ClaimedAttempt {
@@ -296,6 +315,26 @@ async fn research_session_uses_persisted_paper_slot_and_position_plan_needs() {
         "2026-11-09"
     );
 
+    let premarket: DateTime<Utc> = "2026-11-10T12:00:00Z".parse().unwrap();
+    let paper = daemon
+        .paper
+        .scheduler
+        .tick(
+            &RegressionSession("2026-11-10".into()),
+            &daemon.paper_workflow_source(),
+            premarket,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        daemon
+            .store
+            .research_session_key(&paper.slot.workflow.run.run_id)
+            .unwrap(),
+        "2026-11-10"
+    );
+
     let weekend: DateTime<Utc> = "2026-11-07T17:00:00Z".parse().unwrap();
     let (plan, setup) = daemon
         .prepare_position_plan(RunId::new(), "2026-11-07", weekend)
@@ -310,25 +349,97 @@ async fn research_session_uses_persisted_paper_slot_and_position_plan_needs() {
     );
 }
 
+/// WHY THIS TEST EXISTS (Task #9): A delayed structured Submit must reject elapsed bound forecasts before publishing a Proposal.
+/// Do not weaken or delete this assertion.
+#[tokio::test]
+async fn expired_frozen_calendar_outcome_submit_does_not_publish_a_proposal() {
+    let baseline: NaiveDate = "2026-03-06".parse().unwrap();
+    let closes = BTreeMap::from_iter([0, 3, 4, 5, 6, 7].map(|offset| {
+        let day = baseline + Duration::days(offset);
+        let hour = if offset == 0 { 21 } else { 20 };
+        (day, day.and_hms_opt(hour, 0, 0).unwrap().and_utc())
+    }));
+    let (daemon, id) = run_paper_with_calendar(baseline, Some(&closes)).await;
+    assert_eq!(
+        daemon.store.research_session_key(&id).unwrap(),
+        baseline.to_string()
+    );
+    let rejections = daemon
+        .store
+        .run_artifacts_by_kind(&id, ArtifactKind::DebugRecord)
+        .unwrap()
+        .into_iter()
+        .filter(|item| item.producer == "debug.stage_acceptance")
+        .map(|item| {
+            daemon
+                .read_artifact_payload::<akzio_domain::StageAcceptance>(&reference(&item))
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        rejections.iter().any(|item| {
+            item.business_result == "SubmitRejected"
+                && item
+                    .checks
+                    .iter()
+                    .any(|check| check.actual.contains("strictly after submission time"))
+        }),
+        "expected a persisted expiry rejection, got {rejections:?}"
+    );
+    for kind in [ArtifactKind::DecisionProposal, ArtifactKind::Decision] {
+        assert!(daemon
+            .store
+            .run_artifacts_by_kind(&id, kind)
+            .unwrap()
+            .is_empty());
+    }
+    assert!(daemon
+        .store
+        .outcome_schedule_for_run(&id)
+        .unwrap()
+        .is_none());
+}
+
 /// WHY THIS TEST EXISTS (Task #9): The exact calendar must bind both Paper forecasts and the late Outcome worker.
 /// Do not weaken or delete this assertion.
 #[tokio::test]
 async fn fixed_outcome_waits_for_the_original_session_and_its_publication_lag() {
-    let baseline = akzio_ingest::market_session_day(Utc::now());
-    let closes = BTreeMap::from_iter((0..=6).map(|offset| {
-        let day = baseline + Duration::days(offset);
-        (day, day.and_hms_opt(18, 0, 0).unwrap().and_utc())
+    use chrono::{Datelike, Weekday};
+
+    let today = akzio_ingest::market_session_day(Utc::now());
+    let thanksgiving = (today.year()..=today.year() + 1)
+        .map(|year| {
+            (22..=28)
+                .map(|day| NaiveDate::from_ymd_opt(year, 11, day).unwrap())
+                .find(|day| day.weekday() == Weekday::Thu)
+                .unwrap()
+        })
+        .find(|holiday| holiday.pred_opt().unwrap() > today)
+        .unwrap();
+    let baseline = thanksgiving.pred_opt().unwrap();
+    let closes = BTreeMap::from_iter([-1, 1, 4, 5, 6, 7, 8].map(|offset| {
+        let day = thanksgiving + Duration::days(offset);
+        let hour = if offset == 1 { 18 } else { 21 };
+        (day, day.and_hms_opt(hour, 0, 0).unwrap().and_utc())
     }));
-    let t1 = baseline + Duration::days(1);
-    let t3 = baseline + Duration::days(3);
-    let t5 = baseline + Duration::days(5);
-    let (mut daemon, _, schedule_artifact, task) =
+    let t1 = thanksgiving + Duration::days(1);
+    let t3 = thanksgiving + Duration::days(5);
+    let t5 = thanksgiving + Duration::days(7);
+    let (mut daemon, id, schedule_artifact, mut task) =
         scheduled_with_calendar(baseline, Some(&closes)).await;
     let schedule_ref = reference(&schedule_artifact);
     let schedule: OutcomeSchedule = daemon.read_artifact_payload(&schedule_ref).unwrap();
     let decision: Decision = daemon.read_artifact_payload(&schedule.decision).unwrap();
+    assert_eq!(schedule.baseline_trading_day, baseline);
+    assert!(!closes.contains_key(&thanksgiving));
+    assert_eq!(closes[&t1].format("%H:%M").to_string(), "18:00");
+    assert_eq!(closes[&t3].format("%H:%M").to_string(), "21:00");
     for forecast in decision.forecasts {
-        let day = baseline + Duration::days(i64::from(forecast.horizon.trading_days()));
+        let day = match forecast.horizon {
+            akzio_domain::DecisionHorizon::T1 => t1,
+            akzio_domain::DecisionHorizon::T3 => t3,
+            akzio_domain::DecisionHorizon::T5 => t5,
+        };
         assert_eq!(forecast.thesis.unwrap().thesis_valid_until, closes[&day]);
     }
     let before_publication = closes[&t1] + Duration::minutes(19);
@@ -366,7 +477,7 @@ async fn fixed_outcome_waits_for_the_original_session_and_its_publication_lag() 
         .await
         .unwrap()
         .is_none());
-    let intermediary = baseline + Duration::days(2);
+    let intermediary = thanksgiving + Duration::days(4);
     install_window_bars(
         &mut daemon,
         baseline,
@@ -415,6 +526,58 @@ async fn fixed_outcome_waits_for_the_original_session_and_its_publication_lag() 
     assert!(error
         .to_string()
         .contains(&format!("frozen venue close for {t3}")));
+    daemon
+        .store
+        .release_daemon_lease(&lease, Utc::now())
+        .unwrap();
+
+    let seal_at = closes[&t5] + Duration::minutes(43);
+    let closes_through_t5 = closes.into_iter().take(6).collect();
+    install_window_bars(&mut daemon, baseline, &closes_through_t5, seal_at, None);
+    install_narratives(
+        &mut daemon,
+        &schedule,
+        &schedule_artifact,
+        &OutcomeHorizon::ALL,
+    );
+    for horizon in OutcomeHorizon::ALL {
+        let completion = daemon.execute_outcome_worker(&task, seal_at).await.unwrap();
+        assert_complete_narrative(&daemon, &task, &schedule, horizon);
+        if horizon == OutcomeHorizon::T5 {
+            assert!(matches!(completion, TaskCompletion::Committed));
+        } else {
+            assert!(matches!(completion, TaskCompletion::DeferredUntil(_)));
+            let retry = Utc::now() + Duration::seconds(1);
+            daemon
+                .store
+                .defer_task(&task.permit, retry, Utc::now())
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+            task = claim_outcome(&daemon);
+        }
+    }
+
+    let artifact = daemon.store.outcome_for_run(&id).unwrap().unwrap();
+    let sealed: Outcome = daemon.read_artifact_payload(&reference(&artifact)).unwrap();
+    sealed.validate_sealed().unwrap();
+    assert_eq!(sealed.schedule, schedule_ref);
+    assert_eq!(sealed.sealed_at, Some(seal_at));
+    assert_eq!(
+        sealed
+            .windows
+            .iter()
+            .map(|window| window.observed_trading_day)
+            .collect::<Vec<_>>(),
+        [t1, t3, t5]
+    );
+    assert_eq!(sealed.market_evidence.len(), Asset::EXECUTABLE.len());
+    for evidence in &sealed.market_evidence {
+        assert!(artifact.source_refs.contains(evidence));
+        let payload: akzio_ingest::NormalizedEvidencePayload =
+            daemon.read_artifact_payload(evidence).unwrap();
+        assert_eq!(payload.time_basis.retrieved_at, seal_at);
+        assert_eq!(payload.observed_at, seal_at);
+    }
 }
 
 fn install_narratives(

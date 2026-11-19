@@ -9,6 +9,8 @@ use serde_json::Value;
 
 use crate::{EvidenceAdapterError, EvidenceRuntimeResult, EvidenceSource, GovernedResource};
 
+pub(crate) const BAR_AVAILABILITY_LAG_MINUTES: i64 = 20;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScheduledSession {
     pub date: NaiveDate,
@@ -58,11 +60,19 @@ impl ForecastCalendars {
             );
         }
         let manifest = serde_json::from_slice(&store.read_blob(&artifact.blob)?)?;
-        let calendars = Self::read(store, &manifest)?;
+        let calendars = Self::read_selections(store, &manifest, false)?;
         Ok(calendars.has_frozen_schedule().then_some(calendars))
     }
 
     pub fn read(store: &Store, manifest: &ContextManifestPayload) -> EvidenceRuntimeResult<Self> {
+        Self::read_selections(store, manifest, true)
+    }
+
+    fn read_selections(
+        store: &Store,
+        manifest: &ContextManifestPayload,
+        read_legacy_closes: bool,
+    ) -> EvidenceRuntimeResult<Self> {
         let mut calendars = Self::default();
         for selection in &manifest.selections {
             if selection.artifact.kind != ArtifactKind::NormalizedEvidence {
@@ -75,10 +85,10 @@ impl ForecastCalendars {
                 );
             }
             let payload: Value = serde_json::from_slice(&store.read_blob(&artifact.blob)?)?;
-            let Some(resource) = payload["resource"].as_str() else {
-                continue;
-            };
             if let Some(calendar) = payload.pointer("/value/forecast_calendar") {
+                let resource = payload["resource"].as_str().ok_or_else(|| {
+                    invalid_calendar("forecast calendar is missing its governed resource")
+                })?;
                 let GovernedResource::AlpacaBars {
                     asset,
                     raw_prices: false,
@@ -100,9 +110,13 @@ impl ForecastCalendars {
                     .push((asset, serde_json::from_value(calendar.clone())?));
                 continue;
             }
-            let Some(symbol) = resource
-                .strip_prefix("bars:")
-                .and_then(|r| r.split(':').next())
+            if !read_legacy_closes {
+                continue;
+            }
+            let Some(symbol) = payload["resource"]
+                .as_str()
+                .and_then(|resource| resource.strip_prefix("bars:"))
+                .and_then(|resource| resource.split(':').next())
             else {
                 continue;
             };
@@ -137,7 +151,9 @@ impl ForecastCalendars {
         let mut assets = BTreeSet::new();
         let mut common = None;
         for (asset, calendar) in &self.scheduled {
-            if calendar.version != 1 || !(0..=60).contains(&calendar.availability_lag_minutes) {
+            if calendar.version != 1
+                || calendar.availability_lag_minutes != BAR_AVAILABILITY_LAG_MINUTES
+            {
                 return Err(invalid_calendar(
                     "unsupported forecast calendar version or publication lag",
                 )
@@ -253,6 +269,15 @@ mod tests {
             .sessions_after("2026-11-28".parse().unwrap())
             .unwrap();
         assert_eq!(weekend[0].date, "2026-11-30".parse::<NaiveDate>().unwrap());
+
+        let mut invalid = calendar;
+        for (_, metadata) in &mut invalid.scheduled {
+            metadata.availability_lag_minutes = 0;
+        }
+        let error = invalid
+            .sessions_after("2026-11-25".parse().unwrap())
+            .unwrap_err();
+        assert!(error.to_string().contains("publication lag"));
     }
 
     /// WHY THIS TEST EXISTS (Task #9): DST changes UTC availability without advancing a horizon when one asset lacks a scheduled date.

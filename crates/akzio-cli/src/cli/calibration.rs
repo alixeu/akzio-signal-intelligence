@@ -932,6 +932,8 @@ mod calibration_readiness_tests {
             let mut value = json!({});
             if marked {
                 value["forecast_calendar"] = json!({"version":1,"availability_lag_minutes":20,"session_closes":scheduled});
+            } else {
+                value["forecast_session_closes"] = json!({"historical": "not a close"});
             }
             stage(ArtifactKind::NormalizedEvidence, ArtifactLifecycle::RunScoped, json!({
                 "resource":format!("bars:{}:1d:2025-10-01:252", asset.symbol()), "source":"alpaca", "value":value,
@@ -1658,6 +1660,11 @@ knowledge_cutoff = "2025-01-01"
         assert_eq!(actual, latest);
         let training_end: DateTime<Utc> = "2026-11-27T18:48:59Z".parse().unwrap();
         assert!(actual > training_end);
+        let premature = make_observations(session.available_at - chrono::Duration::seconds(1));
+        assert_eq!(
+            observed_label_time(&session, baseline, &sealed, &premature),
+            None
+        );
         assert_eq!(
             observed_label_time(&session, baseline, &sealed, &sealed),
             Some(final_receipt)
@@ -2694,6 +2701,12 @@ fn calibration_bars(
             .with_context(|| format!("parse outcome bars for {asset}"))?;
         let destination = bars_by_asset.entry(asset).or_default();
         for (date, price) in bars {
+            if sessions
+                .iter()
+                .any(|session| session.date == date && retrieved_at < session.available_at)
+            {
+                continue;
+            }
             let entry = destination.entry(date).or_insert(ObservedBar {
                 price,
                 retrieved_at,
@@ -2723,7 +2736,9 @@ fn observed_label_time(
                 .try_fold(latest, |latest, date| {
                     let expected = sealed.get(&date)?;
                     let observation = captured.get(&date)?;
-                    (expected.price.0 > 0 && expected.price == observation.price)
+                    (expected.price.0 > 0
+                        && expected.price == observation.price
+                        && (date != session.date || observation.retrieved_at >= session.available_at))
                         .then_some(latest.max(observation.retrieved_at))
                 })
         })
