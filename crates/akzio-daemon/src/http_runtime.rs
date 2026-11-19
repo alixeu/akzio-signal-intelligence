@@ -51,10 +51,9 @@ async fn http_run_inspection(
 ) -> std::result::Result<Json<akzio_store::RunInspection>, StatusCode> {
     // Inspection 通过 StoreExecutor 读取 checkpoint/allowed_actions；runtime identity 不匹配
     // 时 daemon 只收紧动作，不能由 HTTP client 自行恢复权限。
-    let operation = daemon.clone();
     daemon
         .store_executor
-        .execute(move |_| operation.runtime_inspection(&RunId(run_id)))
+        .execute(move |store| Daemon::runtime_inspection(&store, &RunId(run_id)))
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map(Json)
@@ -65,10 +64,13 @@ async fn http_run_inspection(
 }
 
 impl Daemon {
-    pub(crate) fn runtime_inspection(&self, run: &RunId) -> Result<akzio_store::RunInspection> {
+    pub(crate) fn runtime_inspection(
+        store: &Store,
+        run: &RunId,
+    ) -> Result<akzio_store::RunInspection> {
         // 这是 observer 的权限投影层：仅按当前 Debug runtime identity 过滤 allowed_actions，
         // 原始 workflow/task/lease 状态仍由 Store 保持不变。
-        let mut view = self.store.inspect_run(run)?;
+        let mut view = store.inspect_run(run)?;
         if view.control.debug_identity.is_some() {
             view.allowed_actions.clear();
         }

@@ -301,6 +301,15 @@ fn assert_complete_narrative(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn outcome_worker_uses_frozen_node_for_every_narrative_stage() {
     let (mut daemon, id, schedule_artifact, mut task) = scheduled().await;
+    let before_seal = daemon.observer_run_detail(&id).unwrap().operator_report;
+    assert_eq!(before_seal["execution"]["status"], "no_order");
+    assert_eq!(before_seal["execution"]["planned_order_count"], 0);
+    assert_eq!(before_seal["execution"]["observed_receipt_count"], 0);
+    assert!(!before_seal["execution"]["blockers"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(before_seal["outcome"].is_null());
     let schedule: OutcomeSchedule =
         serde_json::from_slice(&daemon.store.read_blob(&schedule_artifact.blob).unwrap()).unwrap();
     install_bars(&mut daemon, Utc::now());
@@ -330,10 +339,27 @@ async fn outcome_worker_uses_frozen_node_for_every_narrative_stage() {
             task = claim_outcome(&daemon);
         }
     }
-    let outcome = daemon.store.outcome_for_run(&id).unwrap().unwrap();
+    let outcome_artifact = daemon.store.outcome_for_run(&id).unwrap().unwrap();
     let outcome: Outcome =
-        serde_json::from_slice(&daemon.store.read_blob(&outcome.blob).unwrap()).unwrap();
+        serde_json::from_slice(&daemon.store.read_blob(&outcome_artifact.blob).unwrap()).unwrap();
     outcome.validate_sealed().unwrap();
+    let after_seal = daemon.observer_run_detail(&id).unwrap().operator_report;
+    assert_eq!(
+        after_seal["outcome"]["artifact"],
+        serde_json::to_value(reference(&outcome_artifact)).unwrap()
+    );
+    assert_eq!(
+        after_seal["outcome"]["schedule"],
+        serde_json::to_value(reference(&schedule_artifact)).unwrap()
+    );
+    assert_eq!(
+        after_seal["outcome"]["sealed_at"],
+        serde_json::to_value(outcome.sealed_at).unwrap()
+    );
+    assert!(after_seal["outcome"]["horizons"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!(OutcomeHorizon::T5)));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

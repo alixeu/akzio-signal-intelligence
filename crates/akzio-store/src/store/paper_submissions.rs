@@ -576,19 +576,11 @@ impl Store {
         commitment_ref: &ArtifactRef,
     ) -> StoreResult<Vec<(ArtifactRef, OrderReceipt)>> {
         let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
-        let (run_id, commitment) = load_committed_paper(&transaction, commitment_ref)?;
-        if !matches!(
-            read_batch(&transaction, commitment_ref, &run_id, &commitment)?,
-            Some(PaperSubmissionBatch::LegacyUnknown)
-        ) {
-            return Ok(Vec::new());
+        if !connection.is_autocommit() {
+            return legacy_paper_submission_receipts_with_connection(&connection, commitment_ref);
         }
-        Ok(
-            read_legacy_receipts(&transaction, commitment_ref, &run_id, &commitment)?
-                .into_values()
-                .collect(),
-        )
+        let transaction = connection.transaction()?;
+        legacy_paper_submission_receipts_with_connection(&transaction, commitment_ref)
     }
 
     /// Read the bounded latest order states on one SQLite snapshot.
@@ -597,9 +589,31 @@ impl Store {
         commitment: &ArtifactRef,
     ) -> StoreResult<Option<PaperSubmissionBatch>> {
         let mut connection = self.connection()?;
+        // Reuse a caller's read snapshot so journal state and workflow cursor agree.
+        if !connection.is_autocommit() {
+            return paper_submission_batch_with_connection(&connection, commitment);
+        }
         let transaction = connection.transaction()?;
         paper_submission_batch_with_connection(&transaction, commitment)
     }
+}
+
+fn legacy_paper_submission_receipts_with_connection(
+    connection: &Connection,
+    commitment_ref: &ArtifactRef,
+) -> StoreResult<Vec<(ArtifactRef, OrderReceipt)>> {
+    let (run_id, commitment) = load_committed_paper(connection, commitment_ref)?;
+    if !matches!(
+        read_batch(connection, commitment_ref, &run_id, &commitment)?,
+        Some(PaperSubmissionBatch::LegacyUnknown)
+    ) {
+        return Ok(Vec::new());
+    }
+    Ok(
+        read_legacy_receipts(connection, commitment_ref, &run_id, &commitment)?
+            .into_values()
+            .collect(),
+    )
 }
 
 pub(super) fn paper_submission_batch_with_connection(

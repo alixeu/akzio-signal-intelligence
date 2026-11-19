@@ -394,8 +394,10 @@ impl Store {
 
     // 以 Deferred 事务组装 workflow/control/checkpoint 投影；任何一项不可读都返回 Err，不做修复。
     pub fn inspect_run(&self, run: &RunId) -> StoreResult<RunInspection> {
-        // 公开入口只获取一个 Deferred 连接，具体投影复用 connection-scoped inspect。
         let mut connection = self.connection()?;
+        if !connection.is_autocommit() {
+            return self.inspect_run_with_connection(&connection, run);
+        }
         let tx = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
         self.inspect_run_with_connection(&tx, run)
     }

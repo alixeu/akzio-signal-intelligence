@@ -106,28 +106,40 @@ impl Store {
     /// 不受 Observer trajectory 分页窗口限制的研究白名单审计；
     /// 它不导出本 Run 所有 Artifact。CAS payload 与调度状态在一份 SQL 快照内读取。
     pub fn research_audit(&self, run_id: &RunId) -> StoreResult<ResearchAudit> {
-        // 一个 Deferred 事务内取得 workflow、事件关联 Artifact、成功 Attempt outputs 和 Debug identity；
-        // 任何 SQL/hash/JSON硬错误中止整次审计，成功后才提交只读事务并返回派生 JSON。
         let mut connection = self.connection()?;
+        if !connection.is_autocommit() {
+            return self.research_audit_with_connection(&connection, run_id);
+        }
         let tx = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
-        let workflow = serde_json::to_value(self.workflow_snapshot_with_connection(&tx, run_id)?)?;
-        let ids = tx.prepare("SELECT DISTINCT a.artifact_id FROM rebuild_artifacts a JOIN rebuild_events e ON e.artifact_id=a.artifact_id WHERE e.run_id=?1 AND (a.kind IN ('decision_proposal','proposal_review') OR a.producer IN ('context.coverage','learning.retrieval.audit','learning.revalidation.suggestion','research.revision.stop') OR a.producer LIKE 'research.supplement.%') ORDER BY a.created_at,a.artifact_id")?
+        let audit = self.research_audit_with_connection(&tx, run_id)?;
+        tx.commit()?;
+        Ok(audit)
+    }
+
+    fn research_audit_with_connection(
+        &self,
+        connection: &Connection,
+        run_id: &RunId,
+    ) -> StoreResult<ResearchAudit> {
+        let workflow =
+            serde_json::to_value(self.workflow_snapshot_with_connection(connection, run_id)?)?;
+        let ids = connection.prepare("SELECT DISTINCT a.artifact_id FROM rebuild_artifacts a JOIN rebuild_events e ON e.artifact_id=a.artifact_id WHERE e.run_id=?1 AND (a.kind IN ('decision_proposal','proposal_review') OR a.producer IN ('context.coverage','learning.retrieval.audit','learning.revalidation.suggestion','research.revision.stop') OR a.producer LIKE 'research.supplement.%') ORDER BY a.created_at,a.artifact_id")?
             .query_map(params![run_id.0], |row| row.get::<_,String>(0))?.collect::<Result<Vec<_>,_>>()?;
         let mut artifacts = Vec::new();
         // DISTINCT + event.run_id 限定该 Run 中被事件观察到的审计 Artifact；按 created_at/id 稳定顺序读。
         for id in ids {
-            let artifact = read_artifact(&tx, &ArtifactId(ContentHash::new(id)?))?;
+            let artifact = read_artifact(connection, &ArtifactId(ContentHash::new(id)?))?;
             let value: serde_json::Value = serde_json::from_slice(&blob::read_blob_bytes(
-                &tx,
+                connection,
                 &artifact.blob.hash,
                 artifact.blob.bytes,
             )?)?;
             artifacts.push((artifact, value));
         }
-        let committed = tx.prepare("SELECT o.artifact_id FROM rebuild_attempt_outputs o JOIN rebuild_attempts a ON a.attempt_id=o.attempt_id WHERE a.run_id=?1 AND a.status='succeeded'")?
+        let committed = connection.prepare("SELECT o.artifact_id FROM rebuild_attempt_outputs o JOIN rebuild_attempts a ON a.attempt_id=o.attempt_id WHERE a.run_id=?1 AND a.status='succeeded'")?
             .query_map(params![run_id.0],|row| row.get::<_,String>(0))?.collect::<Result<Vec<_>,_>>()?
             .into_iter().map(|id| Ok(ArtifactId(ContentHash::new(id)?))).collect::<StoreResult<BTreeSet<_>>>()?;
-        let missing = debug::read_session(&tx, run_id)?
+        let missing = debug::read_session(connection, run_id)?
             .is_some_and(|s| s.identity.research_only_without_policy());
         // committed 作为成功 Attempt 的输出白名单；本次结果只报告 research_only_without_policy，
         // 不会因研究状态推断 calibration 或正式 Decision 已获准。
@@ -141,9 +153,7 @@ impl Store {
             &committed,
             missing,
         );
-        let audit = build_research_audit(&workflow, progress, &refs);
-        tx.commit()?;
-        Ok(audit)
+        Ok(build_research_audit(&workflow, progress, &refs))
     }
 }
 
