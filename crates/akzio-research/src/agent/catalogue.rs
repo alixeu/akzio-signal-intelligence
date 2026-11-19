@@ -50,6 +50,33 @@ impl ActiveResearchCatalogue {
             .install_candidate(store, active_contract_hash, candidate, now)
     }
 
+    /// Explicitly install the price-fact Analyst underneath the existing active contract.
+    pub fn install_analyst_price_fact_candidate(
+        &self,
+        store: &Store,
+        now: DateTime<Utc>,
+    ) -> ResearchResult<InstalledContract> {
+        let active = self
+            .contracts
+            .contracts()
+            .find(|installed| installed.contract.purpose.as_str() == RESEARCH_ANALYST_RECIPE_ID)
+            .ok_or(ResearchError::MissingActiveContract(
+                RESEARCH_ANALYST_RECIPE_ID,
+            ))?;
+        if active.contract.version != ACTIVE_CONTRACT_VERSION {
+            return Err(ResearchError::InvalidOutput(
+                "price fact candidate requires Analyst Contract 69".into(),
+            ));
+        }
+        let mut candidate = active.contract.clone();
+        candidate.version = ANALYST_PRICE_FACT_CANDIDATE_VERSION;
+        let mut schema = serde_json::from_slice(&store.read_blob(&candidate.output.schema)?)?;
+        add_price_fact_schema(&mut schema)?;
+        candidate.output.schema = store.stage_json(&schema)?;
+        candidate.contract_hash = candidate.expected_hash()?;
+        self.install_candidate(store, &active.contract.contract_hash, &candidate, now)
+    }
+
     pub fn install_analyst_freshness_candidate(
         &self,
         store: &Store,
@@ -82,6 +109,7 @@ pub(super) const COMPACT_SUBMISSION_CONTRACT_VERSION: u32 = 51;
 pub(super) const ACTIVE_CONTRACT_VERSION: u32 = 69;
 pub(super) const ACTIVE_PROMPT_BUNDLE_VERSION: u32 = 38;
 pub const ANALYST_FRESHNESS_CANDIDATE_VERSION: u32 = 70;
+pub(super) const ANALYST_PRICE_FACT_CANDIDATE_VERSION: u32 = 72;
 
 pub(super) const RFC3339_TIMESTAMP_PATTERN: &str =
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$";

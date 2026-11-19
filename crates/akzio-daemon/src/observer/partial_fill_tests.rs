@@ -340,6 +340,7 @@ impl<'a> PaperReportFixture<'a> {
                 materiality_ppm: 100_000,
                 confidence_ppm: 500_000,
                 grounds: vec![EvidenceGround {
+                    fact: None,
                     evidence: reference(&evidence),
                     support: "Observation only".into(),
                     role: EvidenceGroundRole::Descriptive,

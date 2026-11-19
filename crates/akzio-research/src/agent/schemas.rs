@@ -264,6 +264,89 @@ pub(super) fn claim_output_schema() -> Value {
     })
 }
 
+pub(super) fn add_price_fact_schema(schema: &mut Value) -> ResearchResult<()> {
+    let ground = schema
+        .pointer_mut("/properties/result/properties/grounds/items")
+        .ok_or_else(|| ResearchError::InvalidOutput("Analyst grounds schema missing".into()))?;
+    let asset = ground["properties"]["assets"]["items"].clone();
+    let unit = json!({"type":"string", "enum":["usd_micros"]});
+    let observation = json!({
+        "type": "object",
+        "properties": {
+            "bar_timestamp": {"type":"string", "pattern":RFC3339_TIMESTAMP_PATTERN, "maxLength":40},
+            "value_micros": {"type":"integer", "minimum":1}
+        },
+        "required": ["bar_timestamp", "value_micros"],
+        "additionalProperties": false
+    });
+    let fred_date =
+        json!({"type":"string", "pattern":r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$", "maxLength":10});
+    let fred_observation = json!({
+        "type":"object",
+        "properties": {
+            "date": fred_date,
+            "value": {"type":"string", "pattern":r"^[+-]?[0-9]{1,18}(\.[0-9]{1,12})?$", "maxLength":32}
+        },
+        "required":["date", "value"],
+        "additionalProperties":false
+    });
+    let fred_series = json!({"type":"string", "pattern":r"^[a-zA-Z0-9._-]+$", "maxLength":64});
+    let fred_unit = json!({"type":"string", "enum":["series_native"]});
+    let direction = json!({"type":"string", "enum":["increase", "decrease", "unchanged"]});
+    ground["properties"]["fact"] = json!({
+        "description": "Copy an exact shown row. For adjusted Alpaca daily bars use t and USD micros (100 USD = 100000000 micros). For FRED use series_native only for an observations response with units lin. Copy the exact series ID and point vintage from the resource, and the shown observation date and decimal string. Compare earlier and later rows from the same series and vintage in chronological order. Use null when a row, unit, or point vintage is uncertain. Statement and support are model judgments. Coverage is a process measure.",
+        "anyOf": [
+            {"type":"null"},
+            {
+                "type":"object",
+                "properties": {
+                    "kind": {"type":"string", "enum":["alpaca_daily_close"]},
+                    "asset": asset, "unit": unit, "bar": observation
+                },
+                "required": ["kind", "asset", "unit", "bar"],
+                "additionalProperties": false
+            },
+            {
+                "type":"object",
+                "properties": {
+                    "kind": {"type":"string", "enum":["alpaca_daily_close_comparison"]},
+                    "asset": asset, "unit": unit, "earlier": observation, "later": observation,
+                    "direction": direction
+                },
+                "required": ["kind", "asset", "unit", "earlier", "later", "direction"],
+                "additionalProperties": false
+            },
+            {
+                "type":"object",
+                "properties": {
+                    "kind":{"type":"string", "enum":["fred_observation"]},
+                    "series_id":fred_series, "vintage":fred_date, "unit":fred_unit,
+                    "observation":fred_observation
+                },
+                "required":["kind", "series_id", "vintage", "unit", "observation"],
+                "additionalProperties":false
+            },
+            {
+                "type":"object",
+                "properties": {
+                    "kind":{"type":"string", "enum":["fred_observation_comparison"]},
+                    "series_id":fred_series, "vintage":fred_date, "unit":fred_unit,
+                    "earlier":fred_observation, "later":fred_observation, "direction":direction
+                },
+                "required":["kind", "series_id", "vintage", "unit", "earlier", "later", "direction"],
+                "additionalProperties":false
+            }
+        ]
+    });
+    ground["required"]
+        .as_array_mut()
+        .ok_or_else(|| {
+            ResearchError::InvalidOutput("Analyst grounds required fields missing".into())
+        })?
+        .push(json!("fact"));
+    Ok(())
+}
+
 pub(super) fn critique_output_schema() -> Value {
     json!({
         "type": "object",

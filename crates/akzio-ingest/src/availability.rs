@@ -156,19 +156,30 @@ impl NormalizedEvidencePayload {
         if self.source != EvidenceSource::Fred {
             return Err(Unknown::LateCaptureWithoutVersion);
         }
-        // This attestation is generated only by rerunning the direct adapter from raw bytes
-        // before sealing the normalized CAS artifact. The source date alone proves nothing.
-        let snapshot = proof
-            .fred_snapshot
-            .as_ref()
-            .filter(|snapshot| {
-                Some(snapshot.vintage) == self.time_basis.vintage
-                    && snapshot.request_uri == self.provenance.source_uri
-                    && self.provenance.dedupe_key == format!("fred:{}", snapshot.raw_hash)
-            })
+        let snapshot = self
+            .fred_point_snapshot()
             .ok_or(Unknown::FredPointSnapshotUnverified)?;
         Ok(EvidenceAvailabilityBasis::FredPointSnapshot {
             vintage: snapshot.vintage,
+        })
+    }
+
+    /// Check that the normalized point snapshot was sealed from this raw content.
+    pub fn proves_fred_snapshot(&self, raw_hash: &ContentHash) -> bool {
+        self.fred_point_snapshot()
+            .is_some_and(|snapshot| &snapshot.raw_hash == raw_hash)
+    }
+
+    fn fred_point_snapshot(&self) -> Option<&FredPointSnapshot> {
+        let proof = self.availability_proof.as_ref()?;
+        if self.source != EvidenceSource::Fred || proof.version != AVAILABILITY_PROOF_VERSION {
+            return None;
+        }
+        // The direct adapter must have reproduced the normalized value from the raw bytes.
+        proof.fred_snapshot.as_ref().filter(|snapshot| {
+            Some(snapshot.vintage) == self.time_basis.vintage
+                && snapshot.request_uri == self.provenance.source_uri
+                && self.provenance.dedupe_key == format!("fred:{}", snapshot.raw_hash)
         })
     }
 }

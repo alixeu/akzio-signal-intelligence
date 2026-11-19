@@ -925,6 +925,14 @@ impl AgentRuntime {
                 } else {
                     None
                 };
+            let fact_request = (installed.contract.version == catalogue::ANALYST_PRICE_FACT_CANDIDATE_VERSION
+                && installed.contract.purpose.as_str() == RESEARCH_ANALYST_RECIPE_ID)
+                .then_some(request);
+            let fact_frozen_result = if fact_request.is_some() {
+                frozen_result.clone()
+            } else {
+                None
+            };
             if let Some((result, _)) = frozen_result {
                 bind_frozen_result(&mut validation_arguments, result)?;
             }
@@ -939,8 +947,14 @@ impl AgentRuntime {
                     // deliberation 和 source closure 在这次 StoreExecutor 工作中顺序校验；
                     // 这不等于跨所有 Store 读取和后续 output stage 的单一 SQL snapshot。
                     if let Some(schema) = &bound_wire_schema {
-                        validate_schema_value(&validation_arguments, schema, "$")
-                            .map_err(ResearchError::InvalidOutput)?;
+                        validate_schema_value(&validation_arguments, schema, "$").map_err(|message| {
+                            if fact_request.is_some() {
+                                if let Some(error) = fact_verification::unsupported_fact_unit(&validation_arguments) {
+                                    return error;
+                                }
+                            }
+                            ResearchError::InvalidOutput(message)
+                        })?;
                     }
                     resolve_reference_kinds(
                         &mut validation_arguments,
@@ -1012,6 +1026,15 @@ impl AgentRuntime {
                         turn_now,
                         validation_contract.version,
                     )?;
+                    if let Some(request) = fact_request {
+                        fact_verification::verify_facts(
+                            &validation_runtime.store,
+                            &validation_manifest,
+                            &request,
+                            fact_frozen_result.as_ref().map(|(result, turn)| (result, turn)),
+                            &output,
+                        )?;
+                    }
                     Ok::<_, ResearchError>((output, deliberation_note, research_sources))
                 })
                 .await?;

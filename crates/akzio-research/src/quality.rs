@@ -89,14 +89,26 @@ pub(crate) fn attempt(
 ) -> Result<(AgentRuntime, ClaimedAttempt)> {
     // 每个 case 固定自己的 Run、Task 和预算。修改本地配置不会
     // 改写已提交 graph；恢复时仍以 Store 中的 Attempt 消耗为准。
+    let catalogue = ActiveResearchCatalogue::install(store, Utc::now())?.contracts;
+    attempt_with_contract(store, catalogue, role, objective, None)
+}
+
+fn attempt_with_contract(
+    store: &Store,
+    catalogue: crate::ContractCatalogue,
+    role: &str,
+    objective: &str,
+    candidate: Option<&ContentHash>,
+) -> Result<(AgentRuntime, ClaimedAttempt)> {
     let now = Utc::now();
-    let catalogue = ActiveResearchCatalogue::install(store, now)?.contracts;
-    let contract = &catalogue
-        .contracts()
-        // `find` 只借用安装后的 contracts；找不到调用者要求的 role 时转换为 InvalidOutput。
-        .find(|c| c.contract.purpose.as_str() == role)
-        .ok_or_else(|| ResearchError::InvalidOutput("quality role missing".into()))?
-        .contract;
+    let installed = match candidate {
+        Some(hash) => catalogue.get(hash)?,
+        None => catalogue
+            .contracts()
+            .find(|installed| installed.contract.purpose.as_str() == role)
+            .ok_or_else(|| ResearchError::InvalidOutput("quality role missing".into()))?,
+    };
+    let contract = &installed.contract;
     let mut budget = contract.budget.clone();
     budget.max_input_tokens = 24_000;
     budget.max_output_tokens = 8_000;
@@ -1184,6 +1196,639 @@ mod offline_quality_tests {
                 expected,
                 "{event_type} {status}"
             );
+        }
+    }
+
+    const PRICE_DAYS: [&str; 6] = [
+        "2026-11-06",
+        "2026-11-09",
+        "2026-11-10",
+        "2026-11-11",
+        "2026-11-12",
+        "2026-11-13",
+    ];
+
+    fn price_bar_fixture(
+        store: &Store,
+        permit: &TaskWritePermit,
+        late: bool,
+        missing_close: bool,
+    ) -> Artifact {
+        use akzio_ingest::{
+            AcquiredEvidence, EvidenceProvenance, EvidenceRequest, EvidenceRuntime, EvidenceSource,
+        };
+
+        let resource = "bars:QQQ:1d:2026-11-06:6";
+        let need = persist(
+            store,
+            permit,
+            ArtifactKind::EvidenceNeed,
+            "runtime.evidence.need",
+            &json!({
+                "schema_version": DOMAIN_SCHEMA_VERSION, "source_family": "alpaca",
+                "resource": resource, "max_age_secs": 3600,
+            }),
+            vec![],
+        )
+        .unwrap();
+        let cutoff = Utc::now();
+        let observed_at = if late {
+            cutoff + Duration::seconds(1)
+        } else {
+            cutoff - Duration::seconds(1)
+        };
+        let source_uri = "fixture://alpaca/bars?adjustment=all&feed=iex".to_owned();
+        let bars = PRICE_DAYS
+            .into_iter()
+            .enumerate()
+            .map(|(i, date)| {
+                json!({
+                    "t": format!("{date}T05:00:00Z"), "o": 100, "h": 110, "l": 90,
+                    "c": format!("{}.000001", 100 + i), "v": 50,
+                })
+            })
+            .collect::<Vec<_>>();
+        let session_closes = PRICE_DAYS
+            .into_iter()
+            .filter(|date| !missing_close || *date != PRICE_DAYS[4])
+            .map(|date| (date, format!("{date}T21:00:00Z")))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let normalized = json!({
+            "market": {}, "symbol": "QQQ", "price_basis": "adjusted_research", "decision_cutoff": cutoff,
+            "bars": bars, "session_closes": session_closes, "availability_lag_minutes": 20,
+            "content_available_at": "2026-11-13T21:20:00Z",
+        });
+        let request = EvidenceRequest {
+            source: EvidenceSource::Alpaca,
+            resource: resource.into(),
+            max_age: Duration::hours(1),
+            acquisition_mode: EvidenceAcquisitionMode::ModelReviewed,
+        };
+        let acquired = AcquiredEvidence {
+            raw: serde_json::to_vec(&json!({"bars":bars})).unwrap(),
+            media_type: "application/json".into(),
+            source_uri: source_uri.clone(),
+            observed_at,
+            normalized,
+            provenance: EvidenceProvenance {
+                document_id: None,
+                published_at: None,
+                observed_at,
+                revision: None,
+                source_uri,
+                dedupe_key: "typed-close-fixture".into(),
+                citations: Vec::new(),
+            },
+            quality: Default::default(),
+        };
+        let bundle = EvidenceRuntime::new(store.clone(), [EvidenceSource::Alpaca])
+            .materialize_validated(permit, &reference(&need), &request, acquired, cutoff)
+            .unwrap();
+        for artifact in [&bundle.raw, &bundle.normalized] {
+            store
+                .write_task_artifact(
+                    permit,
+                    artifact,
+                    LifecycleEventType::ArtifactCommitted,
+                    Utc::now(),
+                )
+                .unwrap();
+        }
+        bundle.normalized
+    }
+
+    fn observed_close(index: usize) -> Value {
+        json!({"bar_timestamp":format!("{}T05:00:00Z", PRICE_DAYS[index]),
+            "value_micros": (100 + index) * 1_000_000 + 1})
+    }
+
+    /// WHY THIS TEST EXISTS (Task #28): An authorized evidence reference alone cannot prove a price, direction, unit, or exact row seen by the Analyst.
+    /// Do not weaken or delete this assertion.
+    #[tokio::test]
+    async fn analyst_price_fact_candidate_checks_the_actual_submit_projection() {
+        let root = OwnedExperiment(
+            std::env::current_dir()
+                .unwrap()
+                .join("../../target/analyst-price-fact-tests")
+                .join(RunId::new().0),
+        );
+        let store = Store::open(&root.0).unwrap();
+        let active = ActiveResearchCatalogue::install(&store, Utc::now()).unwrap();
+        let freshness = active
+            .install_analyst_freshness_candidate(&store, Utc::now())
+            .unwrap();
+        let candidate = active
+            .install_analyst_price_fact_candidate(&store, Utc::now())
+            .unwrap();
+        assert_eq!(candidate.contract.version, 72);
+        let after = ActiveResearchCatalogue::install(&store, Utc::now()).unwrap();
+        assert_eq!(
+            active.contracts.contracts().collect::<Vec<_>>(),
+            after.contracts.contracts().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            freshness,
+            after
+                .install_analyst_freshness_candidate(&store, Utc::now())
+                .unwrap()
+        );
+        let original = after
+            .contracts
+            .contracts()
+            .find(|c| c.contract.purpose.as_str() == RESEARCH_ANALYST_RECIPE_ID)
+            .unwrap();
+        let mut comparable = candidate.contract.clone();
+        comparable.version = original.contract.version;
+        comparable.output.schema = original.contract.output.schema.clone();
+        comparable.contract_hash = original.contract.contract_hash.clone();
+        assert_eq!(comparable, original.contract);
+        let candidate_hash = candidate.contract.contract_hash.clone();
+        let active_hash = original.contract.contract_hash.clone();
+        let catalogue = after.contracts.with_installed_candidate(candidate).unwrap();
+
+        let level = json!({"kind":"alpaca_daily_close", "asset":"QQQ", "unit":"usd_micros", "bar":observed_close(5)});
+        let comparison = json!({"kind":"alpaca_daily_close_comparison", "asset":"QQQ", "unit":"usd_micros",
+            "earlier":observed_close(4), "later":observed_close(5), "direction":"increase"});
+        let revise = |original: &Value, changes: Value| {
+            let mut revised = original.clone();
+            for (key, value) in changes.as_object().unwrap() {
+                revised[key] = value.clone();
+            }
+            revised
+        };
+        for (case, fact, reason) in [
+            (
+                "wrong_value",
+                revise(
+                    &level,
+                    json!({"bar":{"bar_timestamp":level["bar"]["bar_timestamp"],"value_micros":105_000_000}}),
+                ),
+                Some("value_mismatch"),
+            ),
+            (
+                "hidden",
+                revise(&level, json!({"bar":observed_close(0)})),
+                Some("bar_not_presented"),
+            ),
+            (
+                "wrong_timestamp",
+                revise(
+                    &level,
+                    json!({"bar":{"bar_timestamp":"2026-11-13T05:00:01Z","value_micros":105_000_001}}),
+                ),
+                Some("bar_not_presented"),
+            ),
+            (
+                "wrong_direction",
+                revise(&comparison, json!({"direction":"decrease"})),
+                Some("direction_mismatch"),
+            ),
+            (
+                "reversed",
+                revise(
+                    &comparison,
+                    json!({"earlier":observed_close(5),"later":observed_close(4),"direction":"decrease"}),
+                ),
+                Some("invalid_chronology"),
+            ),
+            (
+                "wrong_unit",
+                revise(&level, json!({"unit":"percent"})),
+                Some("unsupported_price_unit"),
+            ),
+            (
+                "wrong_asset",
+                revise(&level, json!({"asset":"SOXX"})),
+                Some("asset_mismatch"),
+            ),
+            ("late", level.clone(), Some("capture_after_cutoff")),
+            (
+                "missing_close",
+                comparison.clone(),
+                Some("session_close_unknown"),
+            ),
+            ("valid_close", level.clone(), None),
+            ("valid_comparison", comparison.clone(), None),
+            ("repair_value", level.clone(), None),
+            ("repair_deliberation", level.clone(), None),
+            ("unknown", Value::Null, None),
+            ("legacy", Value::Null, None),
+        ] {
+            let (runtime, task) = attempt_with_contract(
+                &store,
+                catalogue.clone(),
+                RESEARCH_ANALYST_RECIPE_ID,
+                "Verify a typed observed price",
+                Some(if case == "legacy" {
+                    &active_hash
+                } else {
+                    &candidate_hash
+                }),
+            )
+            .unwrap();
+            let evidence = price_bar_fixture(
+                &store,
+                &task.permit,
+                case == "late",
+                case == "missing_close",
+            );
+            let mut claim = crate::fixture_claim_output();
+            claim["statement"] = json!("The observed close does not establish the next return.");
+            claim["grounds"][0]["evidence"] = json!({"artifact_id":evidence.artifact_id});
+            claim["grounds"][0]["assets"] = json!(["QQQ"]);
+            if case != "legacy" {
+                claim["grounds"][0]["fact"] = fact.clone();
+            }
+            let akzio_model::ModelClient::FixtureByPurposePhase(templates) =
+                crate::fixture_model_client()
+            else {
+                panic!("expected phase fixture");
+            };
+            let mut response = templates[RESEARCH_ANALYST_RECIPE_ID][1].clone();
+            let mut arguments: Value =
+                serde_json::from_str(response["output"][0]["arguments"].as_str().unwrap()).unwrap();
+            arguments["result"] = claim;
+            arguments["deliberation"]["basis_artifact_ids"] = json!([evidence.artifact_id]);
+            response["output"][0]["arguments"] = json!(arguments.to_string());
+            let client = match case {
+                "repair_value" => {
+                    let mut first = response.clone();
+                    let mut rejected = arguments.clone();
+                    rejected["result"]["grounds"][0]["fact"]["bar"]["value_micros"] = json!(1);
+                    first["output"][0]["arguments"] = json!(rejected.to_string());
+                    ModelClient::fixture_sequence([first, response])
+                }
+                "repair_deliberation" => {
+                    let mut first = response.clone();
+                    let mut rejected = arguments.clone();
+                    rejected["deliberation"]["uncertainties"] =
+                        json!(["The forecast is uncertain."]);
+                    rejected["deliberation"]["uncertainty_weight_ppm"] = json!([10_000]);
+                    first["output"][0]["arguments"] = json!(rejected.to_string());
+                    let repair = json!({"deliberation": arguments["deliberation"]});
+                    response["output"][0]["arguments"] = json!(repair.to_string());
+                    ModelClient::fixture_sequence([first, response])
+                }
+                _ => ModelClient::Fixture(response),
+            };
+            let model = ModelClientAdapter::with_debug(client, true);
+            let result = runtime
+                .run(
+                    &task.permit,
+                    &task.node,
+                    [reference(&evidence)],
+                    &model,
+                    Utc::now(),
+                )
+                .await;
+            if case == "hidden" || case == "valid_close" {
+                let evidence_id = json!(evidence.artifact_id);
+                let input = store
+                    .run_artifacts_by_kind(&task.run_id, ArtifactKind::AgentTurn)
+                    .unwrap()
+                    .into_iter()
+                    .find_map(|turn| {
+                        let trace: Value =
+                            serde_json::from_slice(&store.read_blob(&turn.blob).unwrap()).unwrap();
+                        let input = trace
+                            .pointer("/response/model_debug/request/input")?
+                            .as_str()?;
+                        let input: Value = serde_json::from_str(input).unwrap();
+                        assert_eq!(input["context"], trace["request"]["context"]);
+                        assert_eq!(
+                            input["context_manifest"],
+                            trace["request"]["manifest_artifact_id"]
+                        );
+                        Some(input)
+                    })
+                    .unwrap();
+                let document = input["context"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|value| {
+                        value["type"] == "must_read"
+                            && value["metadata"]["document_id"] == evidence_id
+                    })
+                    .unwrap();
+                let shown = document
+                    .pointer("/value/value_summary/bars")
+                    .unwrap()
+                    .as_array()
+                    .unwrap();
+                let original: Value =
+                    serde_json::from_slice(&store.read_blob(&evidence.blob).unwrap()).unwrap();
+                let sealed = original["value"]["bars"].as_array().unwrap();
+                assert_eq!(sealed.len(), 6);
+                assert_eq!(shown.as_slice(), &sealed[1..]);
+                assert!(document
+                    .pointer("/value/value_summary/session_closes")
+                    .is_none());
+            }
+            if let Some(reason) = reason {
+                assert!(
+                    matches!(&result, Err(ResearchError::InvalidOutput(message)) if message.contains(reason)),
+                    "{case}: {result:?}"
+                );
+                assert!(store
+                    .run_artifacts_by_kind(&task.run_id, ArtifactKind::Claim)
+                    .unwrap()
+                    .is_empty());
+                continue;
+            }
+            let artifact = result.unwrap_or_else(|error| panic!("{case}: {error}"));
+            store
+                .write_task_artifact(
+                    &task.permit,
+                    &artifact,
+                    LifecycleEventType::ArtifactCommitted,
+                    Utc::now(),
+                )
+                .unwrap();
+            let persisted: Value =
+                serde_json::from_slice(&store.read_blob(&artifact.blob).unwrap()).unwrap();
+            assert_eq!(persisted["grounds"][0]["fact"], fact, "{case}");
+            assert_eq!(persisted["stance"], "neutral");
+            assert_eq!(
+                persisted["grounds"][0]["evidence"],
+                json!(reference(&evidence))
+            );
+            assert!(artifact.source_refs.contains(&reference(&evidence)));
+            if case == "legacy" {
+                let decoded: ResearchClaim = serde_json::from_value(persisted).unwrap();
+                assert!(serde_json::to_value(&decoded).unwrap()["grounds"][0]
+                    .get("fact")
+                    .is_none());
+            }
+        }
+    }
+
+    fn fred_fact_fixture(
+        store: &Store,
+        permit: &TaskWritePermit,
+        cutoff: chrono::DateTime<Utc>,
+        vintage: chrono::NaiveDate,
+        days: &[chrono::NaiveDate; 6],
+        case: &str,
+    ) -> Artifact {
+        use akzio_ingest::{
+            AcquiredEvidence, EvidenceProvenance, EvidenceRequest, EvidenceRuntime, EvidenceSource,
+            FredDirectTransport,
+        };
+
+        let start = days[0];
+        let end = days[5];
+        let resource = format!("series:DFII10:{start}:{end}:{vintage}");
+        let need = persist(
+            store,
+            permit,
+            ArtifactKind::EvidenceNeed,
+            "runtime.evidence.need",
+            &json!({
+                "schema_version": DOMAIN_SCHEMA_VERSION, "source_family":"fred",
+                "resource":resource, "max_age_secs":3600,
+            }),
+            vec![],
+        )
+        .unwrap();
+        let mut rows = days
+            .iter()
+            .zip([
+                "-2",
+                "-1",
+                "0",
+                "0.125",
+                "-9007199254740992.000000000002",
+                "-9007199254740992.000000000001",
+            ])
+            .map(|(date, value)| {
+                json!({
+                    "date":date, "value":value, "realtime_start":vintage, "realtime_end":vintage,
+                })
+            })
+            .collect::<Vec<_>>();
+        if case == "duplicate" {
+            rows.push(rows[5].clone());
+        }
+        if case == "wrong_row_vintage" {
+            rows[5]["realtime_start"] = json!(vintage.succ_opt().unwrap());
+            rows[5]["realtime_end"] = json!(vintage.succ_opt().unwrap());
+        }
+        if case == "missing_value" {
+            rows[5]["value"] = json!(".");
+        }
+        if case == "overprecision" {
+            rows[5]["value"] = json!("0.1250000000001");
+        }
+        let mut envelope = json!({
+            "realtime_start":vintage, "realtime_end":vintage,
+            "count":rows.len(), "offset":0, "limit":1000, "observations":rows,
+        });
+        match case {
+            "missing_provider_unit" | "null_without_unit" => {}
+            "transformed_provider_unit" => envelope["units"] = json!("pch"),
+            _ => envelope["units"] = json!("lin"),
+        }
+        let raw = serde_json::to_vec(&envelope).unwrap();
+        let (normalized, quality) =
+            FredDirectTransport::normalize_response(&resource, &raw).unwrap();
+        let source_uri = if case == "unproved_capture" {
+            "fixture://fred/unproved-response".into()
+        } else {
+            format!("https://api.stlouisfed.org/fred/series/observations?series_id=DFII10&file_type=json&observation_start={start}&observation_end={end}&realtime_start={vintage}&realtime_end={vintage}")
+        };
+        let observed_at = cutoff + Duration::seconds(1);
+        let request = EvidenceRequest {
+            source: EvidenceSource::Fred,
+            resource: resource.clone(),
+            max_age: Duration::hours(1),
+            acquisition_mode: EvidenceAcquisitionMode::ModelReviewed,
+        };
+        let provenance = EvidenceProvenance {
+            document_id: Some(resource),
+            published_at: None,
+            observed_at,
+            revision: None,
+            source_uri: source_uri.clone(),
+            dedupe_key: format!("fred:{}", ContentHash::of_bytes(&raw)),
+            citations: vec![],
+        };
+        let acquired = AcquiredEvidence {
+            raw,
+            media_type: "application/json".into(),
+            source_uri,
+            observed_at,
+            normalized,
+            provenance,
+            quality,
+        };
+        let bundle = EvidenceRuntime::new(store.clone(), [EvidenceSource::Fred])
+            .materialize_with_frozen_cutoff(
+                permit,
+                &reference(&need),
+                &request,
+                acquired,
+                cutoff,
+                Utc::now(),
+            )
+            .unwrap();
+        for artifact in [&bundle.raw, &bundle.normalized] {
+            store
+                .write_task_artifact(
+                    permit,
+                    artifact,
+                    LifecycleEventType::ArtifactCommitted,
+                    Utc::now(),
+                )
+                .unwrap();
+        }
+        bundle.normalized
+    }
+
+    /// WHY THIS TEST EXISTS (Task #28): A valid FRED reference cannot prove an unshown row, another vintage, or an inferred economic unit.
+    /// Do not weaken or delete this assertion.
+    #[tokio::test]
+    async fn analyst_candidate_verifies_fred_levels_and_trends_in_native_units() {
+        let root = OwnedExperiment(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/analyst-fred-fact-tests")
+                .join(RunId::new().0),
+        );
+        let store = Store::open(&root.0).unwrap();
+        let active = ActiveResearchCatalogue::install(&store, Utc::now()).unwrap();
+        let candidate = active
+            .install_analyst_price_fact_candidate(&store, Utc::now())
+            .unwrap();
+        let candidate_hash = candidate.contract.contract_hash.clone();
+        let catalogue = active
+            .contracts
+            .with_installed_candidate(candidate)
+            .unwrap();
+        let cutoff = Utc::now() - Duration::seconds(2);
+        let vintage = cutoff.date_naive() - chrono::Days::new(2);
+        let days = std::array::from_fn(|index| vintage - chrono::Days::new((6 - index) as u64));
+        let observation = |index: usize, value: &str| json!({"date":days[index],"value":value});
+        let level = json!({"kind":"fred_observation","series_id":"DFII10","vintage":vintage,
+            "unit":"series_native","observation":observation(5,"-9007199254740992.000000000001")});
+        let comparison = json!({"kind":"fred_observation_comparison","series_id":"DFII10","vintage":vintage,
+            "unit":"series_native","earlier":observation(4,"-9007199254740992.000000000002"),
+            "later":observation(5,"-9007199254740992.000000000001"),"direction":"increase"});
+        for (case, reason) in [
+            ("level", None),
+            ("trailing_zeroes", None),
+            ("trend", None),
+            ("unknown", None),
+            ("null_without_unit", None),
+            (
+                "transformed_provider_unit",
+                Some("fred_native_units_unverified"),
+            ),
+            (
+                "missing_provider_unit",
+                Some("fred_native_units_unverified"),
+            ),
+            ("wrong_unit", Some("unsupported_fred_unit")),
+            ("wrong_series", Some("fred_series_or_vintage_mismatch")),
+            ("wrong_vintage", Some("fred_series_or_vintage_mismatch")),
+            ("wrong_value", Some("fred_value_mismatch")),
+            ("overprecision", Some("fred_decimal_out_of_range")),
+            ("wrong_direction", Some("direction_mismatch")),
+            ("reverse_dates", Some("invalid_chronology")),
+            ("hidden_row", Some("fred_observation_not_presented")),
+            ("missing_value", Some("fred_observation_not_presented")),
+            (
+                "duplicate",
+                Some("availability_fred_point_snapshot_unverified"),
+            ),
+            (
+                "wrong_row_vintage",
+                Some("availability_fred_point_snapshot_unverified"),
+            ),
+            (
+                "unproved_capture",
+                Some("availability_fred_point_snapshot_unverified"),
+            ),
+        ] {
+            let (runtime, task) = attempt_with_contract(
+                &store,
+                catalogue.clone(),
+                RESEARCH_ANALYST_RECIPE_ID,
+                "Verify a FRED series-native observation",
+                Some(&candidate_hash),
+            )
+            .unwrap();
+            let evidence = fred_fact_fixture(&store, &task.permit, cutoff, vintage, &days, case);
+            let mut fact = level.clone();
+            match case {
+                "trend" => fact = comparison.clone(),
+                "trailing_zeroes" => fact["observation"] = observation(3, "+0.125000000000"),
+                "unknown" | "null_without_unit" => fact = Value::Null,
+                "wrong_unit" => fact["unit"] = json!("percent"),
+                "wrong_series" => fact["series_id"] = json!("DGS10"),
+                "wrong_vintage" => fact["vintage"] = json!(vintage.succ_opt().unwrap()),
+                "wrong_value" => {
+                    fact["observation"]["value"] = json!("-9007199254740992.000000000002")
+                }
+                "hidden_row" => fact["observation"] = observation(0, "-2"),
+                "wrong_direction" => {
+                    fact = comparison.clone();
+                    fact["direction"] = json!("decrease");
+                }
+                "reverse_dates" => {
+                    fact = comparison.clone();
+                    fact["earlier"] = comparison["later"].clone();
+                    fact["later"] = comparison["earlier"].clone();
+                }
+                _ => {}
+            }
+            let mut claim = crate::fixture_claim_output();
+            claim["statement"] = json!("The observed FRED levels do not establish a forecast.");
+            claim["grounds"][0]["evidence"] = json!({"artifact_id":evidence.artifact_id});
+            claim["grounds"][0]["fact"] = fact.clone();
+            let ModelClient::FixtureByPurposePhase(templates) = crate::fixture_model_client()
+            else {
+                panic!("expected phase fixture");
+            };
+            let mut response = templates[RESEARCH_ANALYST_RECIPE_ID][1].clone();
+            let mut arguments: Value =
+                serde_json::from_str(response["output"][0]["arguments"].as_str().unwrap()).unwrap();
+            arguments["result"] = claim;
+            arguments["deliberation"]["basis_artifact_ids"] = json!([evidence.artifact_id]);
+            response["output"][0]["arguments"] = json!(arguments.to_string());
+            let model = ModelClientAdapter::with_debug(ModelClient::Fixture(response), true);
+            let result = runtime
+                .run(
+                    &task.permit,
+                    &task.node,
+                    [reference(&evidence)],
+                    &model,
+                    Utc::now(),
+                )
+                .await;
+            if let Some(reason) = reason {
+                assert!(
+                    matches!(&result, Err(ResearchError::InvalidOutput(message)) if message.contains(reason)),
+                    "{case}: {result:?}"
+                );
+                assert!(store
+                    .run_artifacts_by_kind(&task.run_id, ArtifactKind::Claim)
+                    .unwrap()
+                    .is_empty());
+                continue;
+            }
+            let claim = result.unwrap_or_else(|error| panic!("{case}: {error}"));
+            store
+                .write_task_artifact(
+                    &task.permit,
+                    &claim,
+                    LifecycleEventType::ArtifactCommitted,
+                    Utc::now(),
+                )
+                .unwrap();
+            let persisted: Value =
+                serde_json::from_slice(&store.read_blob(&claim.blob).unwrap()).unwrap();
+            assert_eq!(persisted["grounds"][0]["fact"], fact);
+            assert!(claim.source_refs.contains(&reference(&evidence)));
         }
     }
 

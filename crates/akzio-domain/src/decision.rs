@@ -1495,6 +1495,7 @@ mod scoped_blocker_tests {
     fn directional_ground(label: &str, asset: Asset, domain: ResearchShard) -> EvidenceGround {
         // 构造指定资产/研究域的方向性 ground。
         EvidenceGround {
+            fact: None,
             evidence: evidence_ref(label),
             support: format!("authoritative support for {asset:?} {domain:?}"),
             role: EvidenceGroundRole::Directional,

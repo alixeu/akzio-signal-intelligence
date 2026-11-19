@@ -5,7 +5,7 @@
 
 use std::collections::BTreeSet;
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -218,11 +218,79 @@ impl ResearchIntent {
     }
 }
 
+/// One claim about an observed value of a governed daily bar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EvidenceFact {
+    AlpacaDailyClose {
+        asset: Asset,
+        unit: PriceFactUnit,
+        bar: ObservedBarClose,
+    },
+    AlpacaDailyCloseComparison {
+        asset: Asset,
+        unit: PriceFactUnit,
+        earlier: ObservedBarClose,
+        later: ObservedBarClose,
+        direction: ObservedPriceDirection,
+    },
+    FredObservation {
+        series_id: String,
+        vintage: NaiveDate,
+        unit: FredFactUnit,
+        observation: ObservedFredValue,
+    },
+    FredObservationComparison {
+        series_id: String,
+        vintage: NaiveDate,
+        unit: FredFactUnit,
+        earlier: ObservedFredValue,
+        later: ObservedFredValue,
+        direction: ObservedPriceDirection,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FredFactUnit {
+    SeriesNative,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservedFredValue {
+    pub date: NaiveDate,
+    /// Exact decimal in the identified series' original numerical scale.
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PriceFactUnit {
+    UsdMicros,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservedBarClose {
+    /// Literal provider timestamp from the authorized bar row.
+    pub bar_timestamp: String,
+    pub value_micros: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservedPriceDirection {
+    Increase,
+    Decrease,
+    Unchanged,
+}
+
 /// A concrete statement of support attached to one governed evidence artifact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceGround {
     pub evidence: ArtifactRef,
     pub support: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fact: Option<EvidenceFact>,
     #[serde(default)]
     pub role: EvidenceGroundRole,
     #[serde(default)]

@@ -950,6 +950,7 @@ mod allocated_risk_tests {
                     materiality_ppm: WeightPpm::SCALE,
                     confidence_ppm: WeightPpm::SCALE,
                     grounds: vec![EvidenceGround {
+                        fact: None,
                         evidence: quotes.clone(),
                         support: "Frozen executable SOXX quote".into(),
                         role: Default::default(),

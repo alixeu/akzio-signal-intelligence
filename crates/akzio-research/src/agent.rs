@@ -39,6 +39,7 @@ use thiserror::Error;
 // Contract 69 的研究与 ProposalReviewer 只用 submit_result；Outcome 63 才有
 // Draft 读取工具与后续 Submit。include! 是编译时合并同一模块，不是运行时加载。
 mod catalogue;
+mod fact_verification;
 mod prompts;
 mod schemas;
 mod tools;
