@@ -83,6 +83,11 @@ pub enum ResearchError {
         usage: ModelUsage,
         trace: Option<Box<ModelCallTrace>>,
     },
+    #[error("{source}")]
+    ResponseFailureWithUsage {
+        source: Box<ResearchError>,
+        usage: ModelUsage,
+    },
     #[error("Agent model {error_class} failed: {message}")]
     ModelDebug {
         error_class: &'static str,
@@ -147,6 +152,7 @@ impl ResearchError {
                 error_class: "invalid_output",
                 ..
             } => Some(RetryCause::InvalidOutput),
+            Self::ResponseFailureWithUsage { source, .. } => source.retry_cause(),
             _ => None,
         }
     }

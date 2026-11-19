@@ -56,6 +56,12 @@ pub enum ModelError {
     Incomplete { reason: String, usage: ModelUsage },
     #[error("model response has neither output text nor a tool call")]
     MissingOutput,
+    /// A terminal Responses failure with usage reported by the provider.
+    #[error("{source}")]
+    ResponseFailureWithUsage {
+        source: Box<ModelError>,
+        usage: ModelUsage,
+    },
     #[error("model capability probe failed: {0}")]
     CapabilityProbe(String),
     #[error("fixture response sequence is exhausted")]

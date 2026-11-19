@@ -646,6 +646,12 @@ impl AgentRuntime {
                         break (turn, runtime_snapshot, request_hash);
                     }
                     Err(error) => {
+                        let (error, reported_usage) = match error {
+                            ResearchError::ResponseFailureWithUsage { source, usage } => {
+                                (*source, Some(usage))
+                            }
+                            error => (error, None),
+                        };
                         if matches!(error, ResearchError::RunLogUnavailable(_)) {
                             return Err(error);
                         }
@@ -658,6 +664,12 @@ impl AgentRuntime {
                             && retryable
                             && turn_attempt < installed.contract.retry.max_attempts;
                         let turn_now = logical_now(event_time_origin, started.elapsed());
+                        let mut error_detail = research_error_detail(&error);
+                        if let Some(usage) = reported_usage {
+                            // This is provider evidence for reporting. Keep the
+                            // existing failure and retry accounting contract.
+                            error_detail["provider_usage"] = json!(usage);
+                        }
                         let failed_turn = self
                             .record_failed_turn(
                                 TurnRecord {
@@ -670,7 +682,7 @@ impl AgentRuntime {
                                 },
                                 &request,
                                 model_error_class(&error),
-                                Some(research_error_detail(&error)),
+                                Some(error_detail),
                                 model_debug_trace(&error),
                                 will_retry,
                                 &runtime_snapshot,

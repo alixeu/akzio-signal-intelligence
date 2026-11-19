@@ -78,6 +78,10 @@ fn model_error(
 ) -> EvidenceAdapterError {
     // 将模型协议错误折叠为采集层可恢复/不可恢复分类，同时保留 native web 的具体失败
     // 类型；缺 citation、工具不可用和 HTTP 失败都不能被包装成成功。
+    let error = match error {
+        ModelError::ResponseFailureWithUsage { source, .. } => *source,
+        error => error,
+    };
     let reason = error.to_string();
     match error {
         ModelError::RunLogUnavailable(message) => EvidenceAdapterError::RunLogUnavailable(message),

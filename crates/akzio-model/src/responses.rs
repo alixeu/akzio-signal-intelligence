@@ -340,6 +340,7 @@ fn model_audit_error_class(error: &ModelError) -> &'static str {
         ModelError::Http { .. } => "http",
         ModelError::Transport(_) | ModelError::StreamIdleTimeout { .. } => "transport",
         ModelError::InvalidStream(_) => "invalid_stream",
+        ModelError::ResponseFailureWithUsage { source, .. } => model_audit_error_class(source),
         _ => "model_protocol",
     }
 }
@@ -396,9 +397,16 @@ fn handle_sse_data(
             stream.response = Some(response.clone());
         }
         Some("response.failed") | Some("error") => {
-            // provider 明确失败时不保存 response，调用方只能看到 InvalidStream。
             end_reasoning(stream, on_event);
-            return Err(ModelError::InvalidStream(event.to_string()));
+            let error = ModelError::InvalidStream(event.to_string());
+            if event["type"] == "response.failed" {
+                if let Some(response) = event.get("response").filter(|response| {
+                    response.get("status").and_then(Value::as_str) == Some("failed")
+                }) {
+                    return Err(with_reported_usage(error, normalize_usage(response)));
+                }
+            }
+            return Err(error);
         }
         _ => {}
     }
@@ -531,27 +539,24 @@ pub(super) fn openai_response_from_raw(raw: Value, request_body: Value) -> Resul
     // fixture 可直接传入 raw，因此本函数本身不证明 response.completed 事件发生。
     // 把 provider raw 规范化为 ModelResponse，并在协议边界拒绝 incomplete、refusal
     // 和空输出；这里不持久化，也不决定研究提交、Decision 或 Execution 状态。
+    let usage = normalize_usage(&raw);
     if raw.get("status").and_then(Value::as_str) == Some("incomplete") {
         let reason = raw
             .pointer("/incomplete_details/reason")
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_owned();
-        return Err(ModelError::Incomplete {
-            reason,
-            usage: normalize_usage(&raw),
-        });
+        return Err(ModelError::Incomplete { reason, usage });
     }
     if let Some(refusal) = extract_refusal(&raw) {
-        return Err(ModelError::Refused(refusal));
+        return Err(with_reported_usage(ModelError::Refused(refusal), usage));
     }
     let output_text = extract_output_text(&raw).unwrap_or_default();
     let tool_calls = extract_tool_calls(&raw);
     if output_text.is_empty() && tool_calls.is_empty() {
         // 只有可见文本或工具调用至少有一个时，才可交给上层的 Schema/业务校验继续处理。
-        return Err(ModelError::MissingOutput);
+        return Err(with_reported_usage(ModelError::MissingOutput, usage));
     }
-    let usage = normalize_usage(&raw);
     // store=false has no server-side conversation. Keep the actual input as
     // well as this output, including earlier tool results and the initial
     // authorized context. Returning only output silently forgets that context.
@@ -575,6 +580,17 @@ pub(super) fn openai_response_from_raw(raw: Value, request_body: Value) -> Resul
         usage,
         request_body,
     })
+}
+
+fn with_reported_usage(source: ModelError, usage: ModelUsage) -> ModelError {
+    if usage == ModelUsage::default() {
+        source
+    } else {
+        ModelError::ResponseFailureWithUsage {
+            source: Box::new(source),
+            usage,
+        }
+    }
 }
 
 fn usage_value(raw: &Value, pointers: &[&str]) -> Option<u64> {

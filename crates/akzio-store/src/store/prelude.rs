@@ -433,35 +433,40 @@ pub struct TrajectoryToolLifecycle {
 /// comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct RunModelUsage {
-    /// Distinct `AgentTurn` artifacts plus unmatched dispatch starts. Failed
-    /// calls may consume tokens; unmatched starts have unknown provider usage.
+    /// Recorded provider turns plus unmatched dispatch starts.
     pub turns: u64,
-    /// Turns without reported token counts, including unmatched dispatches.
+    /// Turns without both valid provider totals, including unmatched dispatches.
     pub turns_missing_usage: u64,
+    /// All reported input tokens, including cached input tokens.
     pub input_tokens: u64,
     pub cached_input_tokens: u64,
+    /// All reported output tokens, including reasoning tokens.
     pub output_tokens: u64,
     pub reasoning_tokens: u64,
     pub latency_millis: u64,
+    /// Turns with a recorded latency measurement.
+    #[serde(default)]
+    pub turns_with_latency: u64,
+    /// Version 1 requires both totals for every provider turn. Legacy version
+    /// 0 aggregates need to be rebuilt from the immutable turns.
+    #[serde(default)]
+    pub token_accounting_version: u32,
 }
 
 impl RunModelUsage {
-    // 借用 `self` 只读取各类 provider token 数；饱和加法在 u64 上限处封顶，避免溢出回绕。
-    /// Every token the provider charged for, cached input included: a cached
-    /// prompt is cheaper, not free, and dropping it would understate a
-    /// context-heavy arm.
+    const TOKEN_ACCOUNTING_VERSION: u32 = 1;
+
+    /// Sum of the reported input and output totals. Cache and reasoning counts
+    /// describe subsets of those totals.
     pub const fn billable_tokens(&self) -> u64 {
-        self.input_tokens
-            .saturating_add(self.cached_input_tokens)
-            .saturating_add(self.output_tokens)
-            .saturating_add(self.reasoning_tokens)
+        self.input_tokens.saturating_add(self.output_tokens)
     }
 
-    // `turns > 0` 防止“没有任何调用”被误报为完整；缺失计数必须为零才允许使用总量。
-    /// True only when at least one turn was seen and every one of them reported
-    /// usage.
+    /// True when every observed turn has both provider totals.
     pub const fn is_complete(&self) -> bool {
-        self.turns > 0 && self.turns_missing_usage == 0
+        self.token_accounting_version == Self::TOKEN_ACCOUNTING_VERSION
+            && self.turns > 0
+            && self.turns_missing_usage == 0
     }
 
     // 返回 Option 是显式表示是否有完整观测：不完整时舍弃部分和，避免下游误当总账。
@@ -479,10 +484,8 @@ impl RunModelUsage {
         }
     }
 
-    // 延迟总量沿用 token usage 的完整性判据；当前未逐条要求 latency_millis 非空，
-    // 所以此 Option 为 Some 也不证明每次调用都报告了真实延迟。
     pub const fn latency_millis_if_complete(&self) -> Option<u64> {
-        if self.is_complete() {
+        if self.is_complete() && self.turns_with_latency == self.turns {
             Some(self.latency_millis)
         } else {
             None
@@ -528,17 +531,12 @@ struct StoredTrajectoryTelemetry {
 }
 
 impl StoredTrajectoryTelemetry {
-    // `Option::is_some` 仅判断是否至少报告过一个 token 类别；聚合器实际用 unwrap_or_default
-    // 将同一 turn 的其它缺失类别计为 0。所有类别都 None 才会被记作 usage unknown；
-    // 这描述当前持久化统计规则，不独立证明 provider 对缺失类别收费为零。
-    /// A turn with no token field at all was never accounted for; a turn that
-    /// reported any category is counted by this Store projection.
-    /// 缺失类别在当前聚合实现中按零读取；这不能证明 provider 对该类别实际收费为零。
-    fn reported_usage(&self) -> bool {
-        self.input_tokens.is_some()
-            || self.cached_input_tokens.is_some()
-            || self.output_tokens.is_some()
-            || self.reasoning_tokens.is_some()
+    fn has_valid_totals(&self) -> bool {
+        self.input_tokens
+            .is_some_and(|input| self.cached_input_tokens.unwrap_or_default() <= input)
+            && self
+                .output_tokens
+                .is_some_and(|output| self.reasoning_tokens.unwrap_or_default() <= output)
     }
 }
 

@@ -899,6 +899,290 @@ mod offline_quality_tests {
         }
     }
 
+    /// WHY THIS TEST EXISTS (Task #14): Persisted Responses usage feeds the producer token basis shared by Outcome and Canary. Cached and reasoning tokens are subsets, and partial reports cannot establish complete usage.
+    /// Do not weaken or delete this assertion.
+    #[tokio::test]
+    async fn persisted_responses_usage_is_counted_once_and_requires_both_totals() {
+        let root = OwnedExperiment(
+            std::env::current_dir()
+                .unwrap()
+                .join(".akzio")
+                .join(format!("cargo-usage-{}", RunId::new())),
+        );
+        let store = Store::open(&root.0).unwrap();
+        let full_usage = json!({
+            "input_tokens": 100, "input_tokens_details": {"cached_tokens": 70},
+            "output_tokens": 40, "output_tokens_details": {"reasoning_tokens": 30},
+        });
+        for (status, provider_usage, expected_turns, expected_total) in [
+            ("completed", full_usage.clone(), 1, Some(140)),
+            ("incomplete", full_usage.clone(), 1, Some(140)),
+            (
+                "completed",
+                json!({"input_tokens_details": {"cached_tokens": 70}, "output_tokens": 40}),
+                1,
+                None,
+            ),
+            ("preflight_rejection", full_usage, 0, None),
+        ] {
+            let (runtime, task) = attempt(
+                &store,
+                RESEARCH_ANALYST_RECIPE_ID,
+                "Observe synthetic usage",
+            )
+            .unwrap();
+            let evidence = persist(
+                &store,
+                &task.permit,
+                ArtifactKind::NormalizedEvidence,
+                "evidence.normalize",
+                &json!({"source": "alpaca", "resource": "quote:TQQQ", "value": {"price": 100}}),
+                vec![],
+            )
+            .unwrap();
+            let client = ModelClient::Fixture(json!({
+                "status": status,
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": [{"type": "message", "role": "assistant", "content": [
+                    {"type": "output_text", "text": "Fixture intentionally omits submit_result"}
+                ]}],
+                "usage": provider_usage,
+            }));
+            let mut capability = client.capability_snapshot();
+            capability.supports_tool_calls = status != "preflight_rejection";
+            let model = ModelClientAdapter::new(client).with_capability_snapshot(capability);
+            let result = runtime
+                .run(
+                    &task.permit,
+                    &task.node,
+                    [reference(&evidence)],
+                    &model,
+                    Utc::now(),
+                )
+                .await;
+            assert!(
+                matches!(
+                    (status, &result),
+                    ("completed", Err(ResearchError::AmbiguousSubmission))
+                        | ("incomplete", Err(ResearchError::ProviderIncomplete { .. }))
+                        | (
+                            "preflight_rejection",
+                            Err(ResearchError::CapabilityMismatch { .. })
+                        )
+                ),
+                "{status}: {result:?}"
+            );
+
+            let health = store.run_lifecycle_health(&task.permit.run_id).unwrap();
+            let usage = health.lifecycle_usage;
+            let producer_usage = store
+                .model_usage_for_producing_run(&reference(&evidence))
+                .unwrap();
+            assert_eq!(usage.turns, expected_turns, "{status}");
+            assert_eq!(usage, producer_usage);
+            assert_eq!(health.outcome_usage.turns, 0);
+            assert_eq!(
+                producer_usage.billable_tokens_if_complete(),
+                expected_total,
+                "{status}"
+            );
+            if status == "incomplete" {
+                assert_eq!(usage.latency_millis_if_complete(), None);
+            }
+            if status == "completed" && expected_total.is_some() {
+                assert_eq!(usage.cached_input_tokens, 70);
+                assert_eq!(usage.reasoning_tokens, 30);
+                assert!(usage.latency_millis_if_complete().is_some());
+
+                let mut historical = serde_json::to_value(usage).unwrap();
+                let fields = historical.as_object_mut().unwrap();
+                fields.remove("token_accounting_version").unwrap();
+                fields.remove("turns_with_latency").unwrap();
+                let historical: akzio_store::RunModelUsage =
+                    serde_json::from_value(historical).unwrap();
+                assert_eq!(historical.billable_tokens_if_complete(), None);
+
+                store
+                    .append_task_event(
+                        &task.permit,
+                        LifecycleEventType::AgentTurnStarted,
+                        Utc::now(),
+                    )
+                    .unwrap();
+                let interrupted = store.run_model_usage(&task.permit.run_id).unwrap();
+                assert_eq!(interrupted.turns, 2);
+                assert_eq!(interrupted.turns_missing_usage, 1);
+                assert_eq!(interrupted.billable_tokens_if_complete(), None);
+            }
+        }
+    }
+
+    /// WHY THIS TEST EXISTS (Task #14): A completed refusal, empty output or failed Responses event can report actual usage even though Agent execution rejects the output.
+    /// Do not weaken or delete this assertion.
+    #[tokio::test]
+    async fn terminal_responses_errors_keep_reported_usage() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        let root = OwnedExperiment(
+            std::env::current_dir()
+                .unwrap()
+                .join(".akzio")
+                .join(format!("cargo-failed-usage-{}", RunId::new())),
+        );
+        let store = Store::open(&root.0).unwrap();
+        let full_usage = json!({
+            "input_tokens": 100, "input_tokens_details": {"cached_tokens": 70},
+            "output_tokens": 40, "output_tokens_details": {"reasoning_tokens": 30},
+        });
+        let refusal = json!([{"type": "message", "role": "assistant", "content": [
+            {"type": "refusal", "refusal": "Rejected by provider"}
+        ]}]);
+        for (event_type, status, output, usage, class, expected) in [
+            (
+                "response.completed",
+                "completed",
+                refusal,
+                full_usage.clone(),
+                "other",
+                Some(140),
+            ),
+            (
+                "response.completed",
+                "completed",
+                json!([]),
+                full_usage.clone(),
+                "invalid_output",
+                Some(140),
+            ),
+            (
+                "response.failed",
+                "failed",
+                json!([]),
+                full_usage.clone(),
+                "invalid_output",
+                Some(140),
+            ),
+            (
+                "response.failed",
+                "failed",
+                json!([]),
+                json!({"input_tokens": 0, "output_tokens": 0}),
+                "invalid_output",
+                Some(0),
+            ),
+            (
+                "response.failed",
+                "in_progress",
+                json!([]),
+                full_usage,
+                "invalid_output",
+                None,
+            ),
+            (
+                "response.failed",
+                "failed",
+                json!([]),
+                json!({"input_tokens": 100}),
+                "invalid_output",
+                None,
+            ),
+        ] {
+            let (runtime, task) =
+                attempt(&store, RESEARCH_ANALYST_RECIPE_ID, "Observe failed usage").unwrap();
+            let evidence = persist(
+                &store,
+                &task.permit,
+                ArtifactKind::NormalizedEvidence,
+                "evidence.normalize",
+                &json!({"source": "alpaca", "resource": "quote:TQQQ", "value": {"price": 100}}),
+                vec![],
+            )
+            .unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let event = json!({"type": event_type, "response": {
+                "id": "offline-response", "status": status, "output": output, "usage": usage,
+            }});
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(socket);
+                let mut content_length = 0;
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            content_length = value.trim().parse().unwrap();
+                        }
+                    }
+                }
+                reader
+                    .read_exact(&mut vec![0; content_length])
+                    .await
+                    .unwrap();
+                let body = format!("data: {event}\n\n");
+                let reply = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                reader.get_mut().write_all(reply.as_bytes()).await.unwrap();
+            });
+            let client = akzio_model::OpenAIResponsesClient::new(
+                format!("http://{address}/v1"),
+                "offline-test-key",
+                "offline-test",
+                "low",
+            )
+            .unwrap();
+            let model = ModelClientAdapter::with_response_language(
+                ModelClient::OpenAIResponses(client),
+                true,
+                "en",
+            )
+            .with_capability_snapshot(ModelClient::Fixture(Value::Null).capability_snapshot());
+            let result = runtime
+                .run(
+                    &task.permit,
+                    &task.node,
+                    [reference(&evidence)],
+                    &model,
+                    Utc::now(),
+                )
+                .await;
+            assert!(result.is_err());
+            tokio::time::timeout(std::time::Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+            let events = store.events_after(&task.permit.run_id, 0, 100).unwrap();
+            let terminal = events
+                .iter()
+                .find(|event| {
+                    matches!(
+                        event.lifecycle_kind().unwrap(),
+                        LifecycleEventType::AgentTurnFailed
+                            | LifecycleEventType::AgentTurnRetryableFailed
+                    )
+                })
+                .unwrap();
+            let artifact = store
+                .artifact(terminal.artifact_id.as_ref().unwrap())
+                .unwrap();
+            let payload: Value =
+                serde_json::from_slice(&store.read_blob(&artifact.blob).unwrap()).unwrap();
+            assert_eq!(payload["error_class"], class);
+            let usage = store
+                .model_usage_for_producing_run(&reference(&evidence))
+                .unwrap();
+            assert_eq!(usage.turns, 1);
+            assert_eq!(
+                usage.billable_tokens_if_complete(),
+                expected,
+                "{event_type} {status}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn synthetic_quality_cases_run_inside_cargo_without_a_model_or_broker() {
         let root = OwnedExperiment(

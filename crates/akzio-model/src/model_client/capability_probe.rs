@@ -396,6 +396,7 @@ fn safe_model_error(error: &ModelError) -> Value {
         | ModelError::EmptyModel
         | ModelError::EmptyReasoningEffort => json!({"kind": "configuration"}),
         ModelError::InvalidStream(_) => json!({"kind": "invalid_stream"}),
+        ModelError::ResponseFailureWithUsage { source, .. } => safe_model_error(source),
         ModelError::RunLogUnavailable(_) => json!({"kind": "run_log_unavailable"}),
     }
 }

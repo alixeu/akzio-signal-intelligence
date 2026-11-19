@@ -119,6 +119,7 @@ fn model_error_result(error: &ModelError) -> Value {
             "reason": reason,
             "usage": usage,
         }),
+        ModelError::ResponseFailureWithUsage { source, .. } => model_error_result(source),
         ModelError::MissingOutput => json!({"error": "missing_output"}),
         ModelError::CapabilityProbe(message) => {
             json!({"error": "capability_probe", "message": sanitize_provider_text(message)})
@@ -165,6 +166,12 @@ fn model_client_error(error: ModelError, trace: Option<ModelCallTrace>) -> Resea
                 trace: trace.map(Box::new),
             };
         }
+        ModelError::ResponseFailureWithUsage { source, usage } => {
+            return ResearchError::ResponseFailureWithUsage {
+                source: Box::new(model_client_error(*source, trace)),
+                usage,
+            };
+        }
         error => error,
     };
     let (error_class, message) = match error {
@@ -191,7 +198,9 @@ fn model_client_error(error: ModelError, trace: Option<ModelCallTrace>) -> Resea
         ModelError::CapabilityProbe(message) => ("configuration", sanitize_provider_text(&message)),
         ModelError::InvalidStream(_) => ("invalid_output", "invalid response stream".to_owned()),
         ModelError::Refused(message) => return ResearchError::ModelRefused(message),
-        ModelError::Incomplete { .. } => unreachable!("handled before error classification"),
+        ModelError::Incomplete { .. } | ModelError::ResponseFailureWithUsage { .. } => {
+            unreachable!("handled before error classification")
+        }
         ModelError::NativeWebUnavailable
         | ModelError::NativeWebToolNotAllowed
         | ModelError::NativeWebArgumentsInvalid

@@ -65,6 +65,39 @@ impl AgentTurnPairing {
     }
 }
 
+#[derive(Deserialize)]
+struct StoredUsageTurn {
+    response: Option<StoredTrajectoryResponse>,
+    telemetry: Option<StoredTrajectoryTelemetry>,
+    error_class: Option<String>,
+    error_detail: Option<StoredUsageFailure>,
+}
+
+#[derive(Deserialize)]
+struct StoredUsageFailure {
+    provider_usage: Option<StoredTrajectoryTelemetry>,
+    usage: Option<StoredTrajectoryTelemetry>,
+    response: Option<StoredTrajectoryResponse>,
+}
+
+impl StoredUsageTurn {
+    fn provider_telemetry(&self) -> Option<&StoredTrajectoryTelemetry> {
+        self.response
+            .as_ref()
+            .and_then(|response| response.telemetry.as_ref())
+            .or(self.telemetry.as_ref())
+            .or_else(|| {
+                let failure = self.error_detail.as_ref()?;
+                match self.error_class.as_deref()? {
+                    "provider_incomplete" | "provider_usage_missing" => failure.usage.as_ref(),
+                    // The late-turn budget ledger can contain local estimates.
+                    "wall_time" => failure.response.as_ref()?.telemetry.as_ref(),
+                    _ => failure.provider_usage.as_ref(),
+                }
+            })
+    }
+}
+
 impl Store {
     // 用同一连接读取 Run/Task/Attempt 状态分组、全局 event 数和 expires_at>now 的 lease 数。
     // 各 SELECT 没有包进显式只读事务；跨独立 Store/process 并发写入时计数不保证同一 SQLite snapshot。
@@ -219,7 +252,10 @@ impl Store {
         let mut after = 0_i64;
         let mut counted = BTreeSet::new();
         let mut pairing = AgentTurnPairing::default();
-        let mut usage = RunModelUsage::default();
+        let mut usage = RunModelUsage {
+            token_accounting_version: RunModelUsage::TOKEN_ACCOUNTING_VERSION,
+            ..RunModelUsage::default()
+        };
         loop {
             let page = self.events_after(run_id, after, PAGE_SIZE)?;
             if page.is_empty() {
@@ -232,14 +268,15 @@ impl Store {
                 }) {
                     continue;
                 }
-                pairing.observe(event);
+                let lifecycle = event.lifecycle_kind()?;
                 if !matches!(
-                    event.lifecycle_kind()?,
+                    lifecycle,
                     LifecycleEventType::AgentTurn
                         | LifecycleEventType::AgentTurnCompleted
                         | LifecycleEventType::AgentTurnFailed
                         | LifecycleEventType::AgentTurnRetryableFailed
                 ) {
+                    pairing.observe(event);
                     continue;
                 }
                 let Some(artifact_id) = event.artifact_id.as_ref() else {
@@ -255,27 +292,31 @@ impl Store {
                         event.cursor, artifact.kind
                     )));
                 }
-                usage.turns += 1;
-                let Ok(payload) = serde_json::from_slice::<StoredTrajectoryTurn>(
-                    &self.read_blob(&artifact.blob)?,
-                ) else {
-                    // An unreadable turn payload is an unaccounted call, not a
-                    // free one.
-                    usage.turns_missing_usage += 1;
+                let payload =
+                    serde_json::from_slice::<StoredUsageTurn>(&self.read_blob(&artifact.blob)?)
+                        .ok();
+                // The runtime writes this diagnostic before AgentTurnStarted.
+                // It must neither count as a call nor close a pending start.
+                if lifecycle == LifecycleEventType::AgentTurnFailed
+                    && payload.as_ref().is_some_and(|turn| {
+                        turn.error_class.as_deref() == Some("capability_mismatch")
+                    })
+                {
                     continue;
-                };
-                let telemetry = payload
-                    .response
+                }
+                pairing.observe(event);
+                usage.turns += 1;
+                let Some(telemetry) = payload
                     .as_ref()
-                    .and_then(|response| response.telemetry.as_ref())
-                    .or(payload.telemetry.as_ref());
-                // 若 response.telemetry 缺失则退回顶层 telemetry；至少一个 token 类别已报告才累加，
-                // 其余未报告类别以 0 累加。当前 `turns_missing_usage` 不因 latency 单独缺失而增加。
-                let Some(telemetry) = telemetry.filter(|telemetry| telemetry.reported_usage())
+                    .and_then(StoredUsageTurn::provider_telemetry)
                 else {
                     usage.turns_missing_usage += 1;
                     continue;
                 };
+                if !telemetry.has_valid_totals() {
+                    usage.turns_missing_usage += 1;
+                }
+                // Keep reported subtotals even when a complete token basis is unavailable.
                 usage.input_tokens = usage
                     .input_tokens
                     .saturating_add(telemetry.input_tokens.unwrap_or_default());
@@ -288,9 +329,10 @@ impl Store {
                 usage.reasoning_tokens = usage
                     .reasoning_tokens
                     .saturating_add(telemetry.reasoning_tokens.unwrap_or_default());
-                usage.latency_millis = usage
-                    .latency_millis
-                    .saturating_add(telemetry.latency_millis.unwrap_or_default());
+                if let Some(latency_millis) = telemetry.latency_millis {
+                    usage.latency_millis = usage.latency_millis.saturating_add(latency_millis);
+                    usage.turns_with_latency += 1;
+                }
             }
             if page.len() < PAGE_SIZE {
                 break;
