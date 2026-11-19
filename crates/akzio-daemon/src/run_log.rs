@@ -1771,14 +1771,19 @@ fn unavailable(message: impl Into<String>) -> RunLogError {
 fn lock_core_store(store_root: &Path) -> Result<File> {
     // Keep this file across restarts so all contenders lock the same inode.
     let path = store_root.join(".core.lock");
-    match fs::symlink_metadata(&path) {
-        Ok(metadata) if !metadata.is_file() => {
-            return Err(unavailable("Core lock path is not a regular file"));
+    let initial = match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            validate_core_lock_metadata(&metadata)?;
+            Some(metadata)
         }
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(unavailable(format!("inspect Core lock: {error}"))),
-    }
+    };
+    let file = open_core_lock(&path, initial.as_ref())?;
+    acquire_core_lock(&path, file)
+}
+
+fn open_core_lock(path: &Path, initial: Option<&fs::Metadata>) -> Result<File> {
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(false);
     #[cfg(unix)]
@@ -1790,26 +1795,69 @@ fn lock_core_store(store_root: &Path) -> Result<File> {
     let file = options
         .open(path)
         .map_err(|error| unavailable(format!("open Core lock: {error}")))?;
-    let metadata = file
+    let opened = file
         .metadata()
         .map_err(|error| unavailable(format!("inspect open Core lock: {error}")))?;
+    validate_core_lock_metadata(&opened)?;
+    if let Some(initial) = initial {
+        verify_core_lock_identity(initial, &opened, "Core lock changed during secure open")?;
+    }
+    Ok(file)
+}
+
+fn acquire_core_lock(path: &Path, file: File) -> Result<File> {
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(fs::TryLockError::WouldBlock) => {
+            return Err(unavailable("Store already has an active Core"));
+        }
+        Err(fs::TryLockError::Error(error)) => {
+            return Err(unavailable(format!("acquire Core lock: {error}")));
+        }
+    }
+    let held = file
+        .metadata()
+        .map_err(|error| unavailable(format!("inspect held Core lock: {error}")))?;
+    let current = fs::symlink_metadata(path)
+        .map_err(|error| unavailable(format!("recheck Core lock path: {error}")))?;
+    validate_core_lock_metadata(&held)?;
+    validate_core_lock_metadata(&current)?;
+    verify_core_lock_identity(&held, &current, "Core lock changed during lock acquisition")?;
+    Ok(file)
+}
+
+fn validate_core_lock_metadata(metadata: &fs::Metadata) -> Result<()> {
     if !metadata.is_file() {
         return Err(unavailable("Core lock is not a regular file"));
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o777 != 0o600 {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.mode() & 0o777 != 0o600 {
             return Err(unavailable("Core lock file is not private (expected 0600)"));
         }
-    }
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(fs::TryLockError::WouldBlock) => Err(unavailable("Store already has an active Core")),
-        Err(fs::TryLockError::Error(error)) => {
-            Err(unavailable(format!("acquire Core lock: {error}")))
+        if metadata.nlink() != 1 {
+            return Err(unavailable("Core lock file must have exactly one link"));
         }
     }
+    Ok(())
+}
+
+fn verify_core_lock_identity(
+    first: &fs::Metadata,
+    second: &fs::Metadata,
+    changed: &str,
+) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if first.dev() != second.dev() || first.ino() != second.ino() {
+            return Err(unavailable(changed));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (first, second, changed);
+    Ok(())
 }
 
 fn create_private_file(path: &Path) -> Result<File> {
@@ -3059,6 +3107,59 @@ mod tests {
         );
         drop(logger);
         assert_eq!(root.logger().recover_orphans(&store).unwrap(), 1);
+    }
+
+    /// WHY THIS TEST EXISTS (Task #6): A hard-linked lock file must not grant Core ownership of a Store.
+    /// Do not weaken or delete this assertion.
+    #[cfg(unix)]
+    #[test]
+    fn core_lock_rejects_a_hard_link() {
+        let root = TestRoot::new();
+        let store_root = root.0.join("store");
+        Store::prepare_root(&store_root).unwrap();
+        let path = store_root.join(".core.lock");
+        create_private_file(&path).unwrap();
+        fs::hard_link(&path, store_root.join("linked.lock")).unwrap();
+
+        let result = RunLogger::open_at(root.0.join("log"), &store_root);
+        assert!(matches!(
+            result,
+            Err(RunLogError::Unavailable(message)) if message.contains("exactly one link")
+        ));
+    }
+
+    /// WHY THIS TEST EXISTS (Task #6): A replacement regular private file must not pass either lock identity check.
+    /// Do not weaken or delete this assertion.
+    #[cfg(unix)]
+    #[test]
+    fn core_lock_rejects_inode_replacement_during_startup() {
+        let root = TestRoot::new();
+        let path = root.0.join(".core.lock");
+        create_private_file(&path).unwrap();
+        let initial = fs::symlink_metadata(&path).unwrap();
+        fs::rename(&path, root.0.join("initial.lock")).unwrap();
+        create_private_file(&path).unwrap();
+        let result = open_core_lock(&path, Some(&initial));
+        assert!(
+            matches!(
+                result,
+                Err(RunLogError::Unavailable(message)) if message.contains("changed during secure open")
+            ),
+            "the replacement path was accepted during open"
+        );
+
+        let current = fs::symlink_metadata(&path).unwrap();
+        let opened = open_core_lock(&path, Some(&current)).unwrap();
+        fs::rename(&path, root.0.join("opened.lock")).unwrap();
+        create_private_file(&path).unwrap();
+        let result = acquire_core_lock(&path, opened);
+        assert!(
+            matches!(
+                result,
+                Err(RunLogError::Unavailable(message)) if message.contains("changed during lock acquisition")
+            ),
+            "the replaced descriptor was accepted after locking"
+        );
     }
 
     /// WHY THIS TEST EXISTS (Task #6): A second Core must leave the first Core's live audit alone until its Store lock is released.
