@@ -356,14 +356,14 @@ pub(super) fn outcome_lesson_genesis_exists(
     if ensure_lesson_table_set(connection)? == 0 {
         return Ok(false);
     }
-    let genesis: Option<String> = connection.query_row(
-        "SELECT artifact_id FROM rebuild_lesson_events WHERE lesson_id=?1 AND event_type='lesson.created' ORDER BY event_id LIMIT 1",
-        params![lesson.lesson_id.0], |row| row.get(0),
-    ).optional()?;
-    let head_exists: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM rebuild_lesson_heads WHERE lesson_id=?1)",
+    // A concurrent repair commits the head and genesis together. Read both
+    // in one statement so they share the same snapshot on a plain connection.
+    let (head_exists, genesis): (bool, Option<String>) = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM rebuild_lesson_heads WHERE lesson_id=?1),
+                (SELECT artifact_id FROM rebuild_lesson_events
+                 WHERE lesson_id=?1 AND event_type='lesson.created' ORDER BY event_id LIMIT 1)",
         params![lesson.lesson_id.0],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     match (head_exists, genesis) {
         (false, None) => Ok(false),
