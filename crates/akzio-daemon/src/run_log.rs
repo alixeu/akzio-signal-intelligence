@@ -783,7 +783,8 @@ impl RunLogger {
         self.state
             .lock()
             .map_err(|_| unavailable("log lock poisoned"))?
-            .unavailable = Some(reason.to_owned());
+            .unavailable
+            .get_or_insert_with(|| reason.to_owned());
         Ok(())
     }
 

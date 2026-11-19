@@ -97,10 +97,15 @@ mod formal_launch_tests {
     }
 
     fn fixture() -> Arc<Daemon> {
+        fixture_with_log(|_| {})
+    }
+
+    fn fixture_with_log(prepare_log: impl FnOnce(&crate::RunLogger)) -> Arc<Daemon> {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/formal-run-http-tests")
             .join(RunId::new().0);
         let run_log = crate::RunLogger::for_test(root.join("log"));
+        prepare_log(&run_log);
         Arc::new(
             Daemon::with_model(
                 DaemonConfig {
@@ -169,6 +174,40 @@ mod formal_launch_tests {
         assert!(matches!(
             result,
             Err(crate::SchedulerError::RunLogUnavailable(_))
+        ));
+    }
+
+    /// WHY THIS TEST EXISTS (Task #5): A Store read failure before sealing must block new formal work.
+    /// Do not weaken or delete this assertion.
+    #[tokio::test]
+    async fn archive_preparation_failure_blocks_readiness_and_formal_launch() {
+        let run_id = RunId::new();
+        let daemon = fixture_with_log(|logger| {
+            // Stage an inflight log for a Run missing from the Store at archive time.
+            let context = akzio_model::ModelAuditContext {
+                run_id: run_id.0.clone(),
+                phase: "T0".into(),
+                task_id: None,
+                attempt_id: None,
+                call_id: None,
+                retry_index: None,
+            };
+            logger
+                .record(&context, "fixture.segment", serde_json::Value::Null)
+                .unwrap();
+        });
+        assert!(daemon.ready().unwrap().run_log_ready);
+
+        assert!(matches!(
+            daemon.archive_ready_run_stages(),
+            Err(DaemonError::Store(StoreError::MissingRun(missing))) if missing == run_id
+        ));
+        let readiness = daemon.ready().unwrap();
+        assert_eq!(readiness.status, "run_log_blocked");
+        assert!(!readiness.run_log_ready);
+        assert!(matches!(
+            daemon.submit_formal_run(RunPurpose::PositionPlan, "test").await,
+            Err(crate::launch::FormalRunLaunchError::Rejected(DaemonError::RunLogUnavailable(_)))
         ));
     }
 

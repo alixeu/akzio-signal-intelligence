@@ -4,9 +4,10 @@ impl Daemon {
     /// Seals only actual durable stage boundaries; an Outcome's wait/poll is
     /// not a finished T1/T3/T5, and a terminal T0 is not a broker fill.
     pub fn archive_ready_run_stages(&self) -> Result<()> {
-        let Some(logger) = &self.run_log else {
-            return Ok(());
-        };
+        self.archive_with_run_log(|logger| self.archive_ready_stages(logger))
+    }
+
+    fn archive_ready_stages(&self, logger: &RunLogger) -> Result<()> {
         for (run_id, phase) in logger.pending()? {
             if logger.has_active_task(&run_id, &phase)? {
                 continue;
@@ -70,15 +71,24 @@ impl Daemon {
     /// Called only after HTTP, scheduler and worker futures have joined on a
     /// normal shutdown, so no writer can append to a segment being sealed.
     pub fn archive_remaining_after_shutdown(&self) -> Result<()> {
-        self.archive_ready_run_stages()?;
+        self.archive_with_run_log(|logger| {
+            self.archive_ready_stages(logger)?;
+            for (run_id, phase) in logger.pending()? {
+                let cursor = self.store.workflow_snapshot(&run_id)?.event_cursor;
+                self.archive_one(logger, &run_id, &phase, cursor, "stopped_incomplete")?;
+            }
+            Ok(())
+        })
+    }
+
+    fn archive_with_run_log(&self, archive: impl FnOnce(&RunLogger) -> Result<()>) -> Result<()> {
         let Some(logger) = &self.run_log else {
             return Ok(());
         };
-        for (run_id, phase) in logger.pending()? {
-            let cursor = self.store.workflow_snapshot(&run_id)?.event_cursor;
-            self.archive_one(logger, &run_id, &phase, cursor, "stopped_incomplete")?;
-        }
-        Ok(())
+        archive(logger).inspect_err(|_| {
+            // Preparation can fail before RunLogger's sealing path blocks new work.
+            let _ = logger.mark_unavailable("Run archive could not be completed");
+        })
     }
 
     fn archive_one(
