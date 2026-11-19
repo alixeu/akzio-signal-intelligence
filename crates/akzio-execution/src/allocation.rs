@@ -382,7 +382,7 @@ fn order_notionals(orders: &[OrderIntent]) -> std::result::Result<OrderNotionals
     })
 }
 
-fn target_after_orders(
+pub(crate) fn target_after_orders(
     account: &AccountSnapshot,
     orders: &[OrderIntent],
 ) -> std::result::Result<TargetPortfolio, ExecutionError> {
@@ -425,7 +425,7 @@ fn target_after_orders(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use akzio_domain::{
         ArtifactId, ArtifactKind, DecisionId, PortfolioRiskAssessment, Position, Quote, RunId,
         DOMAIN_SCHEMA_VERSION,
@@ -437,7 +437,7 @@ mod tests {
 
     const BROKER_SESSION: &str = "2026-11-04";
 
-    fn now() -> DateTime<Utc> {
+    pub(crate) fn now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 11, 4, 15, 0, 0)
             .single()
             .expect("fixed timestamp")
@@ -450,7 +450,7 @@ mod tests {
         }
     }
 
-    fn decision_context(now: DateTime<Utc>, weight: u32) -> DecisionContext {
+    pub(crate) fn decision_context(now: DateTime<Utc>, weight: u32) -> DecisionContext {
         let mut target = TargetPortfolio::zeroed();
         target.weights.insert(Asset::Tqqq, WeightPpm(weight));
         DecisionContext {
@@ -490,7 +490,10 @@ mod tests {
         }
     }
 
-    fn account(now: DateTime<Utc>, positions: BTreeMap<Asset, Position>) -> AccountSnapshot {
+    pub(crate) fn account(
+        now: DateTime<Utc>,
+        positions: BTreeMap<Asset, Position>,
+    ) -> AccountSnapshot {
         AccountSnapshot {
             schema_version: DOMAIN_SCHEMA_VERSION,
             broker_session: BROKER_SESSION.to_owned(),
@@ -506,7 +509,7 @@ mod tests {
         }
     }
 
-    fn quotes(now: DateTime<Utc>, bid: i64, ask: i64) -> QuoteSnapshot {
+    pub(crate) fn quotes(now: DateTime<Utc>, bid: i64, ask: i64) -> QuoteSnapshot {
         QuoteSnapshot {
             feed: None,
             schema_version: DOMAIN_SCHEMA_VERSION,
@@ -523,7 +526,7 @@ mod tests {
         }
     }
 
-    fn clock(now: DateTime<Utc>) -> MarketClockSnapshot {
+    pub(crate) fn clock(now: DateTime<Utc>) -> MarketClockSnapshot {
         MarketClockSnapshot {
             session: None,
             schema_version: DOMAIN_SCHEMA_VERSION,
@@ -533,7 +536,7 @@ mod tests {
         }
     }
 
-    fn input(
+    pub(crate) fn input(
         now: DateTime<Utc>,
         decision_context: DecisionContext,
         account: AccountSnapshot,

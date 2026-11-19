@@ -299,6 +299,45 @@ impl PortfolioRiskModel {
         Ok(())
     }
 
+    pub(crate) fn certified_fill_covariance(&self) -> Option<u128> {
+        let mut matrix = [[0_i128; Asset::EXECUTABLE.len()]; Asset::EXECUTABLE.len()];
+        let mut negative_terms = 0;
+        for (i, left) in Asset::EXECUTABLE.iter().enumerate() {
+            for (j, right) in Asset::EXECUTABLE.iter().enumerate() {
+                let covariance = *self.covariance_ppm_squared.get(left)?.get(right)?;
+                if covariance != *self.covariance_ppm_squared.get(right)?.get(left)? {
+                    return None;
+                }
+                matrix[i][j] = i128::from(covariance);
+                negative_terms += u128::from(covariance < 0);
+            }
+        }
+
+        // Certify positive semidefiniteness using integer lower bounds on the
+        // Schur complements. Each inexact entry costs less than one unit. A
+        // matching diagonal deduction per row makes the difference from the
+        // exact complement diagonally dominant and positive semidefinite.
+        for k in 0..matrix.len() {
+            let pivot = matrix[k][k];
+            if pivot <= 0 {
+                if pivot < 0 || matrix[k][k + 1..].iter().any(|value| *value != 0) {
+                    return None;
+                }
+                continue;
+            }
+            for i in k + 1..matrix.len() {
+                let mut deduction = 0;
+                for j in k + 1..matrix.len() {
+                    let product = matrix[i][k].checked_mul(matrix[k][j])?;
+                    matrix[i][j] = matrix[i][j].checked_sub(product.div_euclid(pivot))?;
+                    deduction += i128::from(product.rem_euclid(pivot) != 0);
+                }
+                matrix[i][i] = matrix[i][i].checked_sub(deduction)?;
+            }
+        }
+        Some(negative_terms)
+    }
+
     fn identity_hash(&self) -> Result<akzio_domain::ContentHash, DomainError> {
         // 风险矩阵序列化后的内容 hash 被写入 PortfolioRiskAssessment，绑定本次 Decision 的
         // 风险计算版本。
@@ -325,6 +364,33 @@ pub struct DecisionPolicy {
     pub max_portfolio_beta_ppm: u32,
     pub asset_calibrations: BTreeMap<Asset, AssetRiskCalibration>,
     pub portfolio_risk_model: PortfolioRiskModel,
+}
+
+const PORTFOLIO_VARIANCE_SCALE: i128 = 1_000_000_000_000;
+
+pub(crate) struct FillRisk {
+    pub variance_numerator: u128,
+    pub beta_ppm: u32,
+    pub expected_shortfall_ppm: u32,
+    pub gap_loss_ppm: u32,
+}
+
+impl FillRisk {
+    pub fn increases_over(&self, before: &Self) -> bool {
+        self.variance_numerator > before.variance_numerator
+            || self.beta_ppm > before.beta_ppm
+            || self.expected_shortfall_ppm > before.expected_shortfall_ppm
+            || self.gap_loss_ppm > before.gap_loss_ppm
+    }
+
+    pub fn within_volatility_limit(&self, limit_ppm: u32, negative_terms: u128) -> bool {
+        let limit = u128::from(limit_ppm);
+        let historical_variance_upper =
+            self.variance_numerator / PORTFOLIO_VARIANCE_SCALE as u128 + negative_terms;
+        // Each negative term can round up towards zero by less than one unit.
+        self.variance_numerator <= limit * limit * PORTFOLIO_VARIANCE_SCALE as u128
+            && historical_variance_upper < (limit + 1) * (limit + 1)
+    }
 }
 
 impl DecisionPolicy {
@@ -686,18 +752,9 @@ impl DecisionPolicy {
 
         let mut target = TargetPortfolio::zeroed();
         let mut liquidity_binding_assets = Vec::new();
-        let volatility_budget = u64::from(self.target_annualized_volatility_ppm);
-        let beta_budget = u64::from(self.max_portfolio_beta_ppm);
         for (asset, (calibration, signal_strength_ppm)) in eligible {
-            // 三种硬上限先取最小值，再与流动性上限取最小，最后乘 signal strength；
-            // 记录 liquidity_binding_assets 仅表示流动性确实比其他上限更紧。
-            let volatility_cap = volatility_budget.saturating_mul(u64::from(WeightPpm::SCALE))
-                / u64::from(calibration.annualized_volatility_ppm);
-            let beta_cap = beta_budget.saturating_mul(u64::from(WeightPpm::SCALE))
-                / u64::from(calibration.beta_ppm);
-            let unconstrained = volatility_cap
-                .min(beta_cap)
-                .min(u64::from(calibration.max_capital_weight.0));
+            // 资产波动、β、资本与流动性上限共同决定原始 sizing。
+            let unconstrained = self.asset_cap_before_liquidity(calibration);
             let liquidity_capped = unconstrained.min(u64::from(calibration.liquidity_weight_cap.0));
             let weight = liquidity_capped.saturating_mul(u64::from(signal_strength_ppm))
                 / u64::from(WeightPpm::SCALE);
@@ -862,16 +919,55 @@ impl DecisionPolicy {
         Ok(HorizonDecisionTrace { sleeves, conflicts })
     }
 
-    fn assess_target(
+    fn asset_cap_before_liquidity(&self, calibration: &AssetRiskCalibration) -> u64 {
+        let scale = u64::from(WeightPpm::SCALE);
+        let volatility_cap = u64::from(self.target_annualized_volatility_ppm) * scale
+            / u64::from(calibration.annualized_volatility_ppm);
+        let beta_cap =
+            u64::from(self.max_portfolio_beta_ppm) * scale / u64::from(calibration.beta_ppm);
+        volatility_cap
+            .min(beta_cap)
+            .min(u64::from(calibration.max_capital_weight.0))
+    }
+
+    pub(crate) fn fits_fill_target(
         &self,
         target: &TargetPortfolio,
-        mut liquidity_binding_assets: Vec<Asset>,
-    ) -> Result<PortfolioRiskAssessment, DomainError> {
-        // 用 ppm 权重和 covariance 计算组合方差，再聚合 beta/shortfall/gap，并保留流动性
-        // 绑定资产；这是事前风险快照，不是成交后 Outcome。
-        // 两层循环实现 wᵀΣw；零权重项跳过以免要求其无关协方差单元，非零项缺矩阵格会
-        // 返回 DomainError，而负方差也会在开方前拒绝。
-        let mut variance = 0_i128;
+        risk: &FillRisk,
+        negative_terms: u128,
+        gross_limit: u32,
+    ) -> Result<bool, DomainError> {
+        if gross_weight_ppm(target)? > gross_limit.min(self.max_gross_weight.0)
+            || risk.beta_ppm > self.max_portfolio_beta_ppm
+            || risk.expected_shortfall_ppm > self.portfolio_risk_model.max_expected_shortfall_ppm
+            || risk.gap_loss_ppm > self.portfolio_risk_model.max_gap_loss_ppm
+            || !risk.within_volatility_limit(self.target_annualized_volatility_ppm, negative_terms)
+        {
+            return Ok(false);
+        }
+        for (asset, weight) in &target.weights {
+            let calibration =
+                self.asset_calibrations
+                    .get(asset)
+                    .ok_or(DomainError::InvalidBudget {
+                        field: "portfolio_risk_model.calibration",
+                    })?;
+            let limit = self
+                .asset_cap_before_liquidity(calibration)
+                .min(u64::from(calibration.liquidity_weight_cap.0));
+            if u64::from(weight.0) > limit {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn weighted_variance(&self, target: &TargetPortfolio) -> Result<(i128, i128), DomainError> {
+        // Weights and the validated i64 covariance entries fit exactly in i128.
+        // Keep the decision's historical per-term rounding alongside the exact sum
+        // needed to prove a bound between fill scenarios.
+        let mut rounded = 0_i128;
+        let mut numerator = 0_i128;
         for left in Asset::EXECUTABLE {
             let left_weight = i128::from(target.weights[&left].0);
             if left_weight == 0 {
@@ -891,21 +987,15 @@ impl DecisionPolicy {
                     .ok_or(DomainError::InvalidBudget {
                         field: "portfolio_risk_model.covariance",
                     })?;
-                variance = variance.saturating_add(
-                    left_weight
-                        .saturating_mul(right_weight)
-                        .saturating_mul(i128::from(covariance))
-                        / 1_000_000_000_000_i128,
-                );
+                let term = left_weight * right_weight * i128::from(covariance);
+                rounded += term / PORTFOLIO_VARIANCE_SCALE;
+                numerator += term;
             }
         }
-        if variance < 0 {
-            return Err(DomainError::InvalidBudget {
-                field: "portfolio_risk_model.variance",
-            });
-        }
-        // 这个闭包借用 target 与 self，并由传入的字段选择器汇总 beta/shortfall/gap；
-        // `try_fold` 遇到缺失的非零资产 calibration 时中止并保留 DomainError。
+        Ok((rounded, numerator))
+    }
+
+    fn weighted_linear_risks(&self, target: &TargetPortfolio) -> Result<[u32; 3], DomainError> {
         let aggregate = |selector: fn(&AssetRiskCalibration) -> u32| {
             Asset::EXECUTABLE
                 .into_iter()
@@ -930,6 +1020,42 @@ impl DecisionPolicy {
                 }
             })
         };
+        Ok([
+            scaled(aggregate(|calibration| calibration.beta_ppm)?)?,
+            scaled(aggregate(|calibration| calibration.expected_shortfall_ppm)?)?,
+            scaled(aggregate(|calibration| calibration.gap_loss_ppm)?)?,
+        ])
+    }
+
+    pub(crate) fn fill_risk(&self, target: &TargetPortfolio) -> Result<FillRisk, DomainError> {
+        let (_, numerator) = self.weighted_variance(target)?;
+        let variance_numerator =
+            u128::try_from(numerator).map_err(|_| DomainError::InvalidBudget {
+                field: "portfolio_risk_model.variance",
+            })?;
+        let [beta_ppm, expected_shortfall_ppm, gap_loss_ppm] =
+            self.weighted_linear_risks(target)?;
+        Ok(FillRisk {
+            variance_numerator,
+            beta_ppm,
+            expected_shortfall_ppm,
+            gap_loss_ppm,
+        })
+    }
+
+    fn assess_target(
+        &self,
+        target: &TargetPortfolio,
+        mut liquidity_binding_assets: Vec<Asset>,
+    ) -> Result<PortfolioRiskAssessment, DomainError> {
+        let (variance, _) = self.weighted_variance(target)?;
+        if variance < 0 {
+            return Err(DomainError::InvalidBudget {
+                field: "portfolio_risk_model.variance",
+            });
+        }
+        let [beta_ppm, expected_shortfall_ppm, gap_loss_ppm] =
+            self.weighted_linear_risks(target)?;
         // 风险计算可能从多处收集同一资产，排序并去重后再写入快照，确保审计值稳定。
         liquidity_binding_assets.sort();
         liquidity_binding_assets.dedup();
@@ -942,11 +1068,9 @@ impl DecisionPolicy {
                 .count() as u8,
             covariance_sample_count: self.portfolio_risk_model.sample_count,
             ex_ante_volatility_ppm: Some(integer_sqrt(variance as u128) as u32),
-            beta_ppm: Some(scaled(aggregate(|calibration| calibration.beta_ppm)?)?),
-            expected_shortfall_ppm: Some(scaled(aggregate(|calibration| {
-                calibration.expected_shortfall_ppm
-            })?)?),
-            gap_loss_ppm: Some(scaled(aggregate(|calibration| calibration.gap_loss_ppm)?)?),
+            beta_ppm: Some(beta_ppm),
+            expected_shortfall_ppm: Some(expected_shortfall_ppm),
+            gap_loss_ppm: Some(gap_loss_ppm),
             liquidity_binding_assets,
             leveraged_holding_limit_days: self.portfolio_risk_model.max_leveraged_holding_days,
         })
@@ -1131,10 +1255,10 @@ include!("decision_gate/helpers.rs");
 // 仅在测试编译时启用：用本地构造的完整校准面验证 DecisionPolicy 的零目标、资格和弃权语义；
 // 测试数据不进入 Store，也不代表真实校准样本。
 #[cfg(test)]
-mod decision_trace_tests {
+pub(crate) mod decision_trace_tests {
     use super::*;
 
-    fn policy_with_positive_calibration_bin(now: DateTime<Utc>) -> DecisionPolicy {
+    pub(crate) fn policy_with_positive_calibration_bin(now: DateTime<Utc>) -> DecisionPolicy {
         // 测试构造一个完整但最小的正向校准面，用来验证中性 forecast 仍保持 abstention。
         let scope = ForecastCalibrationScope {
             model_id: "test-model".to_owned(),

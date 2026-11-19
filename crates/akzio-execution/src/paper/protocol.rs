@@ -170,7 +170,7 @@ fn side_name(side: OrderSide) -> &'static str {
     }
 }
 
-fn order_request(order: &OrderIntent, client_order_id: &str) -> Result<Value> {
+pub(crate) fn order_request(order: &OrderIntent, client_order_id: &str) -> Result<Value> {
     // 将已由 Rust 生成的 OrderIntent 编码为 limit/day 请求，保留 extended_hours 与 durable ID。
     // OrderIntent 与 ID 只读借用；quantity_string 的错误经 `?` 阻断请求体构造，直到成功
     // 才生成新 Value 交给 transport。
@@ -190,9 +190,8 @@ fn money_string(value: MoneyMicros) -> String {
     format!("{whole}.{fraction:06}")
 }
 
-fn quantity_string(order: &OrderIntent) -> Result<String> {
-    // 用名义金额除以限价得到 millionths 数量；零数量在 POST 前阻断。
-    // `order` 共享借用；limit_price 为 0 时 checked_div 得 None 并取 0，随后统一拒绝为零数量。
+pub(crate) fn order_quantity_millionths(order: &OrderIntent) -> Result<i64> {
+    // Risk assessment and transmission must use the same rounded share quantity.
     let quantity_millionths = order
         .notional
         .0
@@ -202,6 +201,11 @@ fn quantity_string(order: &OrderIntent) -> Result<String> {
     if quantity_millionths <= 0 {
         return Err(PaperError::ZeroQuantity);
     }
+    Ok(quantity_millionths)
+}
+
+fn quantity_string(order: &OrderIntent) -> Result<String> {
+    let quantity_millionths = order_quantity_millionths(order)?;
     let whole = quantity_millionths / 1_000_000;
     let fraction = quantity_millionths.unsigned_abs() % 1_000_000;
     Ok(format!("{whole}.{fraction:06}"))

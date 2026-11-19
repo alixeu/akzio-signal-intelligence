@@ -203,6 +203,15 @@ impl Store {
         read_decision_policy(&connection, &hash)
     }
 
+    /// Read the immutable installed policy that a prior Decision pinned.
+    pub fn decision_policy_by_hash(
+        &self,
+        policy_hash: &ContentHash,
+    ) -> StoreResult<Option<StoredDecisionPolicy>> {
+        let connection = self.connection()?;
+        read_decision_policy(&connection, policy_hash)
+    }
+
     /// Copy only the selected immutable policy into an isolated Store. No Run,
     /// Outcome, credential or mutable policy state crosses this seam.
     // 只读取 source 的 active immutable Artifact/descriptor，把 BLOB staging 到目标 Store，

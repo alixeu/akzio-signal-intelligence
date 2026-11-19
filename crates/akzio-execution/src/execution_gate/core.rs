@@ -3,6 +3,13 @@
 // 和 ExecutionVerdict；快照/Gate blocker 会累积为 NoOrder。此处只 stage 结果，commit 才将
 // Artifact 与 task 终态一起交给 Store；PaperCommitment 只持久化承诺。上游快照可有
 // 只读 Broker/行情 I/O；订单写请求与对账由后续 Dispatch/Reconcile 路径负责。
+struct AllocatedPlanRisk {
+    full_fill_target: akzio_domain::TargetPortfolio,
+    projected_drawdown_ppm: u32,
+    risk_increasing: bool,
+    exceeds_frozen_limits: bool,
+}
+
 impl ExecutionRuntime {
     // Store 按值移入 runtime 并由其持有；策略也在构造期验证，失败时返回 Gate 错误，
     // 不会留下半初始化的 runtime 或触发 Store/Broker I/O。
@@ -150,29 +157,24 @@ impl ExecutionRuntime {
             } else {
                 self.allocation.policy().max_new_notional
             };
-            let projected_drawdown_ppm = decision
-                .portfolio_risk
-                .expected_shortfall_ppm
-                .unwrap_or_default();
-            // 将 Store 解出的 payload 克隆到 AllocationInput，避免把读取的 snapshot
-            // 所有权从本函数移走；分配器只产生计划，不写 Store。
-            let allocation = self.allocation.allocate_with_limit(
-                &AllocationInput {
-                    decision_context_ref: input.decision_context.clone(),
-                    decision_context: decision,
-                    account_snapshot_ref: input.account_snapshot.clone().expect("checked above"),
-                    account: account_payload.clone(),
-                    quote_snapshot_ref: input.quote_snapshot.clone().expect("checked above"),
-                    quotes: quote_payload.clone(),
-                    market_clock_snapshot_ref: input
-                        .market_clock_snapshot
-                        .clone()
-                        .expect("checked above"),
-                    clock: clock_payload.clone(),
-                    now: input.now,
-                },
-                maximum_total_notional,
-            );
+            // Keep the frozen input available for checking the achieved plan.
+            let allocation_input = AllocationInput {
+                decision_context_ref: input.decision_context.clone(),
+                decision_context: decision,
+                account_snapshot_ref: input.account_snapshot.clone().expect("checked above"),
+                account: account_payload.clone(),
+                quote_snapshot_ref: input.quote_snapshot.clone().expect("checked above"),
+                quotes: quote_payload.clone(),
+                market_clock_snapshot_ref: input
+                    .market_clock_snapshot
+                    .clone()
+                    .expect("checked above"),
+                clock: clock_payload.clone(),
+                now: input.now,
+            };
+            let allocation = self
+                .allocation
+                .allocate_with_limit(&allocation_input, maximum_total_notional);
             match allocation {
                 Ok(plan) => {
                     plan.validate()?;
@@ -190,83 +192,12 @@ impl ExecutionRuntime {
                             blockers.insert(HardBlocker::MarketClosed);
                         }
                     }
-                    // 分配完成后继续跑独立因子/换手和 mandate Gate；它们决定是否能 Accepted，
-                    // 不会改变已计算的 Decision 目标或把研究提案升级成订单。
-                    blockers.extend(
-                        self.gate_policy
-                            .blockers_for(&plan.factor_exposure, plan.turnover_ppm),
-                    );
-                    let mandate = self.gate_policy.assess_mandate(
-                        account_payload,
-                        &plan.target,
-                        projected_drawdown_ppm,
-                        plan.turnover_ppm,
-                    );
-                    if !mandate.permitted() {
-                        blockers.insert(HardBlocker::MandateViolation);
-                    }
-                    mandate_assessment = Some(mandate);
-                    // 安全证据由 Gate 外部采集但仅作为输入值；存在时由 Rust 再计算 capacity、
-                    // classification、compliance、dependency。缺失时明确补齐三个 blocker。
-                    if let Some(evidence) = &input.pretrade_safety {
-                        let ordered_assets = plan
-                            .orders
-                            .iter()
-                            .map(|order| order.asset)
-                            .collect::<BTreeSet<_>>();
-                        let risk_increasing = plan
-                            .orders
-                            .iter()
-                            .any(|order| order.side == crate::OrderSide::Buy);
-                        let assessment = self.pretrade_safety.assess(&PreTradeSafetyInput {
-                            target: plan.target.clone(),
-                            ordered_assets,
-                            risk_increasing,
-                            account_equity: account_payload.equity,
-                            homogeneous_agent_count: evidence.homogeneous_agent_count,
-                            average_daily_dollar_volume: evidence
-                                .average_daily_dollar_volume
-                                .clone(),
-                            information_classifications: evidence
-                                .information_classifications
-                                .clone(),
-                            recent_compliance_activity: evidence.recent_compliance_activity.clone(),
-                            dependency_closure: evidence.dependency_closure.clone(),
-                            now: input.now,
-                        })?;
-                        if assessment.risk_increasing
-                            && (assessment.capacity_scenario.is_none()
-                                || assessment
-                                    .capacity_scenario
-                                    .as_ref()
-                                    .is_some_and(|scenario| !scenario.within_capacity))
-                        {
-                            blockers.insert(HardBlocker::CapacityLimit);
-                        }
-                        if !assessment.missing_information_classifications.is_empty()
-                            || assessment
-                                .compliance_violations_by_asset
-                                .values()
-                                .any(|violations| !violations.is_empty())
-                        {
-                            blockers.insert(HardBlocker::ComplianceViolation);
-                        }
-                        if (assessment.risk_increasing && !assessment.dependency_permits_new_risk)
-                            || (!assessment.risk_increasing
-                                && !assessment.dependency_permits_risk_reduction)
-                        {
-                            blockers.insert(HardBlocker::DependencyDegraded);
-                        }
-                        // 即使 assessment 返回，也只有 permits_execution=true 且全局 blockers
-                        // 最终为空时才会 Accepted；此处仅记录 assessment 和各 Gate 原因。
-                        pretrade_safety = Some(assessment);
-                    } else {
-                        blockers.extend([
-                            HardBlocker::CapacityLimit,
-                            HardBlocker::ComplianceViolation,
-                            HardBlocker::DependencyDegraded,
-                        ]);
-                    }
+                    (mandate_assessment, pretrade_safety) = self.assess_allocated_plan(
+                        &allocation_input,
+                        &plan,
+                        input.pretrade_safety.as_ref(),
+                        &mut blockers,
+                    )?;
                     plan_payload = Some(plan);
                 }
                 // 业务性 allocation 错误被映射为稳定 HardBlocker，仍可输出 NoOrder；
@@ -444,5 +375,283 @@ impl ExecutionRuntime {
             return Err(ExecutionGateError::Integrity("input artifact kinds"));
         }
         Ok(())
+    }
+    fn frozen_plan_risk(
+        &self,
+        input: &AllocationInput,
+        plan: &crate::ExecutionPlan,
+    ) -> ExecutionGateResult<Option<AllocatedPlanRisk>> {
+        let decision = &input.decision_context;
+        let Some(stored) = self
+            .store
+            .decision_policy_by_hash(&decision.decision_policy_hash)?
+        else {
+            return Ok(None);
+        };
+        let bytes = self.store.read_blob(&stored.artifact.blob)?;
+        let Ok(envelope) = crate::DecisionPolicyArtifact::decode_strict(&bytes) else {
+            return Ok(None);
+        };
+        let provenance = &envelope.provenance;
+        let descriptor = &stored.descriptor;
+        let scope = envelope.policy.active_forecast_calibration.as_ref();
+        if provenance.output_hash != decision.decision_policy_hash
+            || provenance.provider_id.as_ref() != Some(&descriptor.provider_id)
+            || provenance.model_route.as_ref() != Some(&descriptor.model_route)
+            || provenance.contract_hash.as_ref() != Some(&descriptor.contract_hash)
+            || scope.is_none_or(|scope| {
+                scope.model_id != descriptor.model_id
+                    || scope.model_version_hash != descriptor.model_version_hash
+            })
+            || !envelope.policy.decision_capable()
+            || match &decision.portfolio_risk.risk_model_hash {
+                Some(hash) => hash != &provenance.risk_model_hash,
+                // A calibrated decision can legitimately abstain on every asset.
+                // Its frozen policy still supplies the risk of existing positions.
+                None => decision.target.weights.values().any(|weight| weight.0 != 0),
+            }
+        {
+            return Ok(None);
+        }
+        Ok(self.assess_fill_corners(input, plan, &envelope.policy))
+    }
+
+    fn wire_fill_weight(
+        input: &AllocationInput,
+        order: &crate::OrderIntent,
+    ) -> Option<crate::WeightPpm> {
+        let equity = i128::from(input.account.equity.0);
+        if equity <= 0 {
+            return None;
+        }
+        let (held, market_value) =
+            input
+                .account
+                .positions
+                .get(&order.asset)
+                .map_or((0, 0), |position| {
+                    (
+                        i128::from(position.quantity_micros),
+                        i128::from(position.market_value.0),
+                    )
+                });
+        let quantity = i128::from(crate::paper::order_quantity_millionths(order).ok()?);
+        let shares = match order.side {
+            crate::OrderSide::Buy => held.checked_add(quantity)?,
+            crate::OrderSide::Sell => held.checked_sub(quantity)?,
+        };
+        if shares < 0 {
+            return None;
+        }
+        // Revalue held assets at frozen market_value/quantity. With no held
+        // shares, use the validated frozen quote midpoint. Retain the rational
+        // mark until the final ppm division, so every rounded partial fill lies
+        // between the no-fill and full-fill ppm weights.
+        let scale = i128::from(crate::WeightPpm::SCALE);
+        let weight = if held > 0 && market_value > 0 {
+            market_value
+                .checked_mul(shares)?
+                .checked_mul(scale)?
+                .checked_div(held.checked_mul(equity)?)?
+        } else if held == 0 && market_value == 0 {
+            let quote = input.quotes.quotes.get(&order.asset)?;
+            quote.validate().ok()?;
+            let twice_mark = i128::from(quote.bid.0) + i128::from(quote.ask.0);
+            // Millionth shares and ppm weights cancel their common scale.
+            shares.checked_mul(twice_mark)?.checked_div(2 * equity)?
+        } else {
+            return None;
+        };
+        let weight = u32::try_from(weight).ok()?;
+        (weight <= crate::WeightPpm::SCALE).then_some(crate::WeightPpm(weight))
+    }
+
+    fn assess_fill_corners(
+        &self,
+        input: &AllocationInput,
+        plan: &crate::ExecutionPlan,
+        policy: &crate::DecisionPolicy,
+    ) -> Option<AllocatedPlanRisk> {
+        use crate::allocation::target_after_orders;
+        use akzio_domain::{Asset, WeightPpm};
+
+        let unique_assets = plan
+            .orders
+            .iter()
+            .map(|order| order.asset)
+            .collect::<BTreeSet<_>>();
+        if plan.orders.is_empty()
+            || plan.orders.len() > Asset::EXECUTABLE.len()
+            || unique_assets.len() != plan.orders.len()
+        {
+            return None;
+        }
+        let negative_terms = policy.portfolio_risk_model.certified_fill_covariance()?;
+        let mandate = &self.gate_policy.mandate;
+        let gross_limit = self
+            .allocation
+            .policy()
+            .max_gross_weight
+            .0
+            .min(mandate.maximum_gross_exposure.0)
+            .min(WeightPpm::SCALE - mandate.minimum_cash_reserve.0);
+        let before_target = target_after_orders(&input.account, &[]).ok()?;
+        let endpoints = plan
+            .orders
+            .iter()
+            .map(|order| Some((order.asset, Self::wire_fill_weight(input, order)?)))
+            .collect::<Option<Vec<_>>>()?;
+        let before = policy.fill_risk(&before_target).ok()?;
+        let mut exceeds_frozen_limits = !policy
+            .fits_fill_target(&before_target, &before, negative_terms, gross_limit)
+            .ok()?;
+        let mut risk_increasing = plan
+            .orders
+            .iter()
+            .any(|order| order.side == crate::OrderSide::Buy);
+        let mut maximum_shortfall = before.expected_shortfall_ppm;
+        let mut full_fill_target = before_target.clone();
+        let mut full_shortfall = before.expected_shortfall_ppm;
+
+        // Frozen equity and non-negative long positions yield a box in weight
+        // space, with at most one independently fillable order per asset. Gross,
+        // beta, tail and gap aggregate linearly, and certified variance is convex.
+        // Every interior risk is bounded by these at most sixteen vertices.
+        let all = (1 << endpoints.len()) - 1;
+        for mask in 1..=all {
+            let mut target = before_target.clone();
+            for (index, (asset, weight)) in endpoints.iter().enumerate() {
+                if (mask & (1 << index)) != 0 {
+                    target.weights.insert(*asset, *weight);
+                }
+            }
+            let risk = policy.fill_risk(&target).ok()?;
+            risk_increasing |= risk.increases_over(&before);
+            maximum_shortfall = maximum_shortfall.max(risk.expected_shortfall_ppm);
+            exceeds_frozen_limits |= !policy
+                .fits_fill_target(&target, &risk, negative_terms, gross_limit)
+                .ok()?;
+            if mask == all {
+                full_fill_target = target;
+                full_shortfall = risk.expected_shortfall_ppm;
+            }
+        }
+        // Tiny partial buys can approach any sell-only or no-fill corner. A
+        // corrective sale is exempt from its pre-existing limit breaches only
+        // when no fill combination increases risk above the frozen account.
+        Some(AllocatedPlanRisk {
+            full_fill_target,
+            projected_drawdown_ppm: if risk_increasing {
+                maximum_shortfall
+            } else {
+                full_shortfall
+            },
+            risk_increasing,
+            exceeds_frozen_limits: risk_increasing && exceeds_frozen_limits,
+        })
+    }
+
+    fn assess_allocated_plan(
+        &self,
+        input: &AllocationInput,
+        plan: &crate::ExecutionPlan,
+        pretrade: Option<&PreTradeSafetyEvidence>,
+        blockers: &mut BTreeSet<HardBlocker>,
+    ) -> ExecutionGateResult<(
+        Option<akzio_domain::MandateAssessment>,
+        Option<crate::PreTradeSafetyAssessment>,
+    )> {
+        // Report independent static plan limits even when frozen risk cannot
+        // be reconstructed. The persisted plan keeps its original valuation.
+        blockers.extend(
+            self.gate_policy
+                .blockers_for(&plan.factor_exposure, plan.turnover_ppm),
+        );
+        let Some(risk) = self.frozen_plan_risk(input, plan)? else {
+            blockers.insert(HardBlocker::InvalidProvenance);
+            return Ok((None, None));
+        };
+        if risk.exceeds_frozen_limits {
+            blockers.insert(HardBlocker::FactorLimit);
+        }
+        let wire_exposure = akzio_domain::FactorExposure::from_target(&risk.full_fill_target)?;
+        blockers.extend(
+            self.gate_policy
+                .blockers_for(&wire_exposure, plan.turnover_ppm),
+        );
+        let mut mandate = self.gate_policy.assess_mandate(
+            &input.account,
+            &risk.full_fill_target,
+            risk.projected_drawdown_ppm,
+            plan.turnover_ppm,
+        );
+        if risk.risk_increasing
+            && self
+                .gate_policy
+                .mandate
+                .prohibited_actions
+                .contains(&akzio_domain::MandateActionType::IncreaseRisk)
+        {
+            mandate
+                .violations
+                .insert(akzio_domain::MandateViolation::ProhibitedAction);
+        }
+        if !mandate.permitted() {
+            blockers.insert(HardBlocker::MandateViolation);
+        }
+        // 安全证据由 Gate 外部采集但仅作为输入值；存在时由 Rust 再计算 capacity、
+        // classification、compliance、dependency。缺失时明确补齐三个 blocker。
+        let pretrade_safety = if let Some(evidence) = pretrade {
+            let ordered_assets = plan
+                .orders
+                .iter()
+                .map(|order| order.asset)
+                .collect::<BTreeSet<_>>();
+            let assessment = self.pretrade_safety.assess(&PreTradeSafetyInput {
+                target: risk.full_fill_target,
+                ordered_assets,
+                risk_increasing: risk.risk_increasing,
+                account_equity: input.account.equity,
+                homogeneous_agent_count: evidence.homogeneous_agent_count,
+                average_daily_dollar_volume: evidence.average_daily_dollar_volume.clone(),
+                information_classifications: evidence.information_classifications.clone(),
+                recent_compliance_activity: evidence.recent_compliance_activity.clone(),
+                dependency_closure: evidence.dependency_closure.clone(),
+                now: input.now,
+            })?;
+            if assessment.risk_increasing
+                && (assessment.capacity_scenario.is_none()
+                    || assessment
+                        .capacity_scenario
+                        .as_ref()
+                        .is_some_and(|scenario| !scenario.within_capacity))
+            {
+                blockers.insert(HardBlocker::CapacityLimit);
+            }
+            if !assessment.missing_information_classifications.is_empty()
+                || assessment
+                    .compliance_violations_by_asset
+                    .values()
+                    .any(|violations| !violations.is_empty())
+            {
+                blockers.insert(HardBlocker::ComplianceViolation);
+            }
+            if (assessment.risk_increasing && !assessment.dependency_permits_new_risk)
+                || (!assessment.risk_increasing && !assessment.dependency_permits_risk_reduction)
+            {
+                blockers.insert(HardBlocker::DependencyDegraded);
+            }
+            // 即使 assessment 返回，也只有 permits_execution=true 且全局 blockers
+            // 最终为空时才会 Accepted；此处仅记录 assessment 和各 Gate 原因。
+            Some(assessment)
+        } else {
+            blockers.extend([
+                HardBlocker::CapacityLimit,
+                HardBlocker::ComplianceViolation,
+                HardBlocker::DependencyDegraded,
+            ]);
+            None
+        };
+        Ok((Some(mandate), pretrade_safety))
     }
 }
