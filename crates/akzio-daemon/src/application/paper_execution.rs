@@ -659,6 +659,7 @@ impl<'a> PaperExecution<'a> {
                 permit: task.permit.clone(),
                 verdict,
                 session_key,
+                startup_decision_policy_hash: self.daemon.startup_decision_policy_hash.clone(),
                 now,
             })?;
         // 这里的 Committed 是执行承诺已持久化并通过 lease 边界，不表示 Alpaca 已受理

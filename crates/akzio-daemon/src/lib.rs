@@ -358,6 +358,8 @@ pub struct DaemonConfig {
     pub market_data_feed: Option<AlpacaMarketDataFeed>,
     pub outcome_cost_model: OutcomeCostModel,
     pub decision_policy: DecisionPolicy,
+    /// The validated active SQL hash selected at startup. `None` selects the zero-target fallback.
+    pub startup_decision_policy_hash: Option<ContentHash>,
     pub runtime_identity_hash: Option<ContentHash>,
     pub historical_evaluation_condition: Option<ExperimentCondition>,
     pub model_knowledge_cutoff: Option<NaiveDate>,
@@ -401,6 +403,7 @@ pub struct Daemon {
     fixture_mode: bool,
     production_evidence: Arc<BTreeMap<EvidenceSource, Arc<dyn AsyncEvidenceAdapter>>>,
     decision_runtime: DecisionRuntime,
+    startup_decision_policy_hash: Option<ContentHash>,
     execution_runtime: ExecutionRuntime,
     paper_commitment_runtime: PaperCommitmentRuntime,
     paper_dispatch_runtime: PaperDispatchRuntime,
@@ -459,6 +462,10 @@ pub struct DaemonHealth {
     pub frozen: bool,
     pub decision_policy_status: String,
     pub decision_policy_hash: ContentHash,
+    pub startup_decision_policy_hash: Option<ContentHash>,
+    pub active_decision_policy_hash: Option<ContentHash>,
+    #[serde(default)]
+    pub decision_policy_restart_required: bool,
     pub decision_policy_input_hash: Option<ContentHash>,
     pub decision_capable: bool,
     #[serde(default)]

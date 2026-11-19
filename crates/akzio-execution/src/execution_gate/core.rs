@@ -54,10 +54,16 @@ impl ExecutionRuntime {
         };
         Ok(Self {
             store,
+            startup_decision_policy_hash: None,
             allocation,
             gate_policy,
             pretrade_safety,
         })
+    }
+
+    pub fn with_startup_decision_policy_hash(mut self, policy_hash: Option<ContentHash>) -> Self {
+        self.startup_decision_policy_hash = policy_hash;
+        self
     }
 
     // 只返回执行限额的共享引用；调用者可读取但不能通过它更改已构造的 runtime 策略。
@@ -122,11 +128,16 @@ impl ExecutionRuntime {
             self.store.paper_approval_for_run(&input.permit.run_id)?
         {
             let qualification_key = manifest.runtime_identity().qualification_key()?;
-            if !ModelQualificationGate::permits(
-                &qualification_key,
-                &approval.qualification,
-                input.now,
-            ) {
+            let approved_policy = Some(&manifest.decision_policy_hash);
+            if manifest.decision_policy_hash != decision.decision_policy_hash
+                || self.startup_decision_policy_hash.as_ref() != approved_policy
+                || self.store.active_decision_policy_hash()?.as_ref() != approved_policy
+                || !ModelQualificationGate::permits(
+                    &qualification_key,
+                    &approval.qualification,
+                    input.now,
+                )
+            {
                 blockers.insert(HardBlocker::UnqualifiedRuntime);
             }
             if approval.mandate.identity_hash() != self.gate_policy.mandate.identity_hash() {

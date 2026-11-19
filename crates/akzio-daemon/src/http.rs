@@ -293,17 +293,20 @@ async fn http_health(
 
 async fn http_ready(
     State(daemon): State<Arc<Daemon>>,
-) -> std::result::Result<Json<DaemonHealth>, StatusCode> {
-    // Ready 在 health 之外检查 Paper broker 注入；SERVICE_UNAVAILABLE 只说明服务当前不可
-    // 运行，不把某次 readiness 变成 Paper approval 或 execution authorization。
+) -> std::result::Result<(StatusCode, Json<DaemonHealth>), StatusCode> {
     let operation = daemon.clone();
-    run_daemon_store_operation(daemon.store_executor.clone(), move || operation.ready())
-        .await
-        .map(Json)
-        .map_err(|error| match error {
-            DaemonError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
-        })
+    let health =
+        run_daemon_store_operation(daemon.store_executor.clone(), move || operation.health())
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    match daemon.check_readiness(&health) {
+        Ok(()) => Ok((StatusCode::OK, Json(health))),
+        Err(DaemonError::Store(StoreError::DecisionPolicyRestartRequired)) => {
+            Ok((StatusCode::SERVICE_UNAVAILABLE, Json(health)))
+        }
+        Err(DaemonError::Unavailable(_)) => Err(StatusCode::SERVICE_UNAVAILABLE),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
 }
 
 async fn http_observer_run(

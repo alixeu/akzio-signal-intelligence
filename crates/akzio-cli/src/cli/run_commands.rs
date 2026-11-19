@@ -244,6 +244,7 @@ async fn serve(config: &Config, config_path: &Path) -> Result<()> {
                 slippage_ppm: config.execution.slippage_ppm,
             },
             decision_policy,
+            startup_decision_policy_hash: loaded_policy.active_hash,
             runtime_identity_hash,
             historical_evaluation_condition,
             model_knowledge_cutoff,

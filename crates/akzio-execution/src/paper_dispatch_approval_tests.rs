@@ -76,6 +76,40 @@ pub(super) fn paper_workflow() -> (Store, WorkflowCommit) {
     (store, workflow)
 }
 
+fn activate_fixture_policy(store: &Store, policy_hash: ContentHash, now: DateTime<Utc>) {
+    let blob = store.stage_json(&policy_hash).unwrap();
+    let descriptor = akzio_store::DecisionPolicyDescriptor {
+        policy_hash,
+        envelope_hash: blob.hash.clone(),
+        provider_id: "fixture".into(),
+        model_id: "fixture".into(),
+        model_version_hash: ContentHash::of_bytes(b"offline-model-version"),
+        model_route: "research.synthesizer".into(),
+        contract_hash: ContentHash::of_bytes(b"offline-contract"),
+    };
+    let artifact = Artifact::new(
+        ArtifactKind::DecisionPolicy,
+        blob,
+        "test.fixture",
+        ArtifactLifecycle::Canonical,
+        ArtifactProvenance {
+            source_family: "fixture".into(),
+            observed_at: None,
+            retrieved_at: now,
+            source_uri: None,
+            confidence_ppm: 1_000_000,
+            producer_contract_hash: None,
+        },
+        None,
+        vec![],
+        now,
+    )
+    .unwrap();
+    store
+        .activate_decision_policy(&artifact, &descriptor, now)
+        .unwrap();
+}
+
 fn reserve_fixture_session(store: &Store, workflow: WorkflowCommit, lease: &DaemonLease) {
     use akzio_domain::{
         ModelQualificationEvidence, ModelQualificationReport, PaperApprovalScope,
@@ -83,6 +117,7 @@ fn reserve_fixture_session(store: &Store, workflow: WorkflowCommit, lease: &Daem
     };
     let now = workflow.run.created_at;
     let hash = ContentHash::of_bytes(b"offline fixture");
+    activate_fixture_policy(store, hash.clone(), now);
     let expires_at = now + chrono::Duration::minutes(10);
     let components = [("default".to_owned(), hash.clone())].into();
     let bundle_hash = akzio_domain::runtime_component_bundle_hash(&components).unwrap();
@@ -211,14 +246,46 @@ fn reserve_fixture_session(store: &Store, workflow: WorkflowCommit, lease: &Daem
         .unwrap();
 }
 
-pub(super) fn paper_run_with_commitment(decision_matches: bool) -> (Store, PaperDispatchInput) {
-    build_paper_commitment_fixture(decision_matches, false)
+pub(super) fn paper_run_with_commitment(
+    execution_policy_matches: bool,
+) -> (Store, PaperDispatchInput) {
+    build_paper_commitment_fixture(execution_policy_matches, false)
 }
 
 fn build_paper_commitment_fixture(
-    decision_matches: bool,
+    execution_policy_matches: bool,
     transport_client_ids: bool,
 ) -> (Store, PaperDispatchInput) {
+    let (store, lease, commit) =
+        stage_paper_commitment_fixture(execution_policy_matches, transport_client_ids, None);
+    let policy = store.active_decision_policy_hash().unwrap();
+    store
+        .commit_execution(&lease, &commit, policy.as_ref())
+        .unwrap();
+    let permit = store
+        .claim_next_task_for_workload(
+            "approval-fixture",
+            Utc::now(),
+            chrono::Duration::minutes(1),
+            akzio_store::TaskWorkload::Session,
+        )
+        .unwrap()
+        .unwrap()
+        .permit;
+    let input = PaperDispatchInput {
+        lease,
+        permit,
+        commitment: artifact_ref(&commit.commitment),
+        now: commit.committed_at,
+    };
+    (store, input)
+}
+
+fn stage_paper_commitment_fixture(
+    execution_policy_matches: bool,
+    transport_client_ids: bool,
+    decision_policy: Option<ContentHash>,
+) -> (Store, DaemonLease, akzio_store::ExecutionCommit) {
     use akzio_domain::{
         DependencyClosure, ExecutionVerdict, FactorExposure, LifecycleEventType, MandateAssessment,
         PreTradeSafetySnapshot, TargetPortfolio,
@@ -254,19 +321,16 @@ fn build_paper_commitment_fixture(
         .unwrap()
         .unwrap();
     reserve_fixture_session(&store, workflow, &lease);
-    let claim = || {
-        store
-            .claim_next_task_for_workload(
-                "approval-fixture",
-                Utc::now(),
-                chrono::Duration::minutes(1),
-                akzio_store::TaskWorkload::Session,
-            )
-            .unwrap()
-            .unwrap()
-            .permit
-    };
-    let permit = claim();
+    let permit = store
+        .claim_next_task_for_workload(
+            "approval-fixture",
+            Utc::now(),
+            chrono::Duration::minutes(1),
+            akzio_store::TaskWorkload::Session,
+        )
+        .unwrap()
+        .unwrap()
+        .permit;
     let stage = |kind, blob, source_refs| {
         let lifecycle = if matches!(kind, ArtifactKind::EvidenceNeed | ArtifactKind::RawEvidence) {
             ArtifactLifecycle::RunScoped
@@ -298,11 +362,7 @@ fn build_paper_commitment_fixture(
     };
     let broker_session = now.date_naive().to_string();
     let hash = ContentHash::of_bytes(b"offline fixture");
-    let decision_policy_hash = if decision_matches {
-        hash.clone()
-    } else {
-        ContentHash::of_bytes(b"different DecisionPolicy")
-    };
+    let decision_policy_hash = decision_policy.unwrap_or_else(|| hash.clone());
     let target = TargetPortfolio::zeroed();
     let decision = persist(stage(
         ArtifactKind::DecisionContext,
@@ -400,7 +460,11 @@ fn build_paper_commitment_fixture(
         account_snapshot: account.clone(),
         quote_snapshot: quotes.clone(),
         market_clock_snapshot: clock.clone(),
-        policy_hash: crate::ExecutionPolicy::default().policy_hash().unwrap(),
+        policy_hash: if execution_policy_matches {
+            crate::ExecutionPolicy::default().policy_hash().unwrap()
+        } else {
+            ContentHash::of_bytes(b"historical execution policy")
+        },
         maximum_total_notional: MoneyMicros(10_000_000),
         factor_exposure: FactorExposure::from_target(&target).unwrap(),
         target,
@@ -519,28 +583,54 @@ fn build_paper_commitment_fixture(
         store.stage_json(&commitment).unwrap(),
         vec![context, verdict],
     );
-    let reference = artifact_ref(&commitment);
-    store
-        .commit_execution(
-            &lease,
-            &akzio_store::ExecutionCommit {
-                session_key: broker_session,
-                permit,
-                commitment,
-                committed_at: now,
-            },
-        )
-        .unwrap();
-    let permit = claim();
-    (
-        store,
-        PaperDispatchInput {
-            lease,
-            permit,
-            commitment: reference,
-            now,
-        },
-    )
+    let commit = akzio_store::ExecutionCommit {
+        session_key: broker_session,
+        permit,
+        commitment,
+        committed_at: now,
+    };
+    (store, lease, commit)
+}
+
+/// WHY THIS TEST EXISTS (Task #7): A stale runtime or an old consumed approval cannot publish a first Commitment even when given a complete accepted plan.
+/// Do not weaken or delete this assertion.
+#[test]
+fn first_paper_commitment_checks_active_startup_decision_and_manifest_together() {
+    let hash_b = ContentHash::of_bytes(b"offline replacement decision policy");
+    for (decision_b, restart) in [(false, false), (true, true)] {
+        let (store, lease, commit) =
+            stage_paper_commitment_fixture(true, true, decision_b.then(|| hash_b.clone()));
+        let original = store.active_decision_policy().unwrap().unwrap();
+        let startup_a = original.descriptor.policy_hash.clone();
+        let operator = Store::open(store.root()).unwrap();
+        activate_fixture_policy(&operator, hash_b.clone(), Utc::now());
+        let startup = if restart { &hash_b } else { &startup_a };
+        assert!(matches!(
+            store.commit_execution(&lease, &commit, Some(startup)),
+            Err(StoreError::DecisionPolicyMismatch)
+        ));
+        let slot = store.session_slot(&commit.session_key).unwrap().unwrap();
+        assert_eq!(slot.workflow.run.run_id, commit.permit.run_id);
+        assert!(slot.commitment_artifact_id.is_none());
+        assert!(store
+            .run_artifacts_by_kind(&commit.permit.run_id, ArtifactKind::ExecutionCommitment)
+            .unwrap()
+            .is_empty());
+        assert!(!store
+            .paper_effect_intent_for_run(&commit.permit.run_id)
+            .unwrap());
+        if !decision_b {
+            operator
+                .activate_decision_policy(&original.artifact, &original.descriptor, Utc::now())
+                .unwrap();
+            assert!(
+                store
+                    .commit_execution(&lease, &commit, Some(&startup_a))
+                    .unwrap()
+                    .newly_committed
+            );
+        }
+    }
 }
 
 struct RecordingBroker {
@@ -670,7 +760,8 @@ impl CommittedPaperBroker for RecordingBroker {
 #[tokio::test]
 async fn wrong_account_cannot_dispatch_or_observe_an_existing_commitment() {
     let (store, input) = paper_run_with_commitment(true);
-    let runtime = PaperDispatchRuntime::new(store.clone());
+    let runtime = PaperDispatchRuntime::new(store.clone())
+        .with_startup_decision_policy_hash(store.active_decision_policy_hash().unwrap());
     let wrong = RecordingBroker::new("another-account");
     let result = runtime.dispatch(&wrong, &input).await;
     assert_eq!(*wrong.calls.lock().unwrap(), ["account"]);
@@ -705,9 +796,10 @@ async fn wrong_account_cannot_dispatch_or_observe_an_existing_commitment() {
 /// WHY THIS TEST EXISTS (Task #4): An approval for a different Policy may only observe a durable effect on the verified account.
 /// Do not weaken or delete this assertion.
 #[tokio::test]
-async fn original_account_with_different_decision_policy_can_only_observe_recorded_orders() {
+async fn original_account_with_different_execution_policy_can_only_observe_recorded_orders() {
     let (store, input) = paper_run_with_commitment(false);
-    let runtime = PaperDispatchRuntime::new(store.clone());
+    let runtime = PaperDispatchRuntime::new(store.clone())
+        .with_startup_decision_policy_hash(store.active_decision_policy_hash().unwrap());
     let broker = RecordingBroker::new("offline-account");
     assert!(runtime.dispatch(&broker, &input).await.is_err());
     assert_eq!(*broker.calls.lock().unwrap(), ["account"]);
@@ -799,7 +891,9 @@ async fn original_account_with_different_decision_policy_can_only_observe_record
 async fn matching_original_account_and_policy_continue_normal_dispatch() {
     let (store, input) = paper_run_with_commitment(true);
     let broker = RecordingBroker::new("offline-account");
+    let policy = store.active_decision_policy_hash().unwrap();
     let result = PaperDispatchRuntime::new(store)
+        .with_startup_decision_policy_hash(policy)
         .dispatch(&broker, &input)
         .await
         .unwrap();
@@ -819,6 +913,7 @@ enum PaperTransportReply {
     UnsupportedPatchStatus,
     TerminalPatchWhileOriginalLive,
     ReplacedDuringCancel,
+    LegacyCancel,
     LegacyPartialThenUnavailable,
     LegacyReplacedDuringCancel,
     LegacyReplacementOriginalMissing,
@@ -883,6 +978,7 @@ async fn paper_transport_fixture(
         async move {
             let mut ambiguous_response_delivered = false;
             let mut replacement_requested = false;
+            let mut original_lookups = 0;
             let mut malformed_post_observations = 0;
             let mut replacement_original_observations = 0;
             let mut original = terminal.clone();
@@ -957,7 +1053,18 @@ async fn paper_transport_fixture(
                                 "recovery GET started before the durable observation-only stop"
                             );
                         }
-                        if reply == PaperTransportReply::LegacyReplacementOriginalMissing {
+                        if path.ends_with(&client_order_id)
+                            && reply == PaperTransportReply::LegacyCancel
+                        {
+                            if original_lookups == 1 {
+                                original["status"] = serde_json::json!("partially_filled");
+                                original["filled_qty"] = serde_json::json!("0.5");
+                                original["filled_avg_price"] = serde_json::json!("1");
+                                original["updated_at"] = serde_json::json!(Utc::now());
+                            }
+                            original_lookups += 1;
+                            ("200 OK", original.clone())
+                        } else if reply == PaperTransportReply::LegacyReplacementOriginalMissing {
                             if path.ends_with(&successor_id) {
                                 ("200 OK", successor.clone())
                             } else if path.ends_with(&sibling_id) {
@@ -1065,7 +1172,7 @@ async fn paper_transport_fixture(
                         }
                     }
                     ("GET", "/v2/orders/offline-order-one") => {
-                        assert!(reply.replaces());
+                        assert!(reply.replaces() || reply == PaperTransportReply::LegacyCancel);
                         ("200 OK", original.clone())
                     }
                     ("GET", "/v2/orders/offline-replacement") => match reply {
@@ -1098,6 +1205,7 @@ async fn paper_transport_fixture(
                             | PaperTransportReply::UnsupportedPatchStatus
                             | PaperTransportReply::TerminalPatchWhileOriginalLive
                             | PaperTransportReply::ReplacedDuringCancel
+                            | PaperTransportReply::LegacyCancel
                             | PaperTransportReply::LegacyPartialThenUnavailable
                             | PaperTransportReply::LegacyReplacedDuringCancel
                             | PaperTransportReply::LegacyReplacementOriginalMissing => {
@@ -1126,6 +1234,15 @@ async fn paper_transport_fixture(
                             };
                             ("200 OK", payload)
                         }
+                    }
+                    ("DELETE", "/v2/orders/offline-order-one") => {
+                        assert!(matches!(
+                            reply,
+                            PaperTransportReply::UnknownPatch | PaperTransportReply::LegacyCancel
+                        ));
+                        original["status"] = serde_json::json!("canceled");
+                        original["updated_at"] = serde_json::json!(Utc::now());
+                        ("200 OK", serde_json::json!({}))
                     }
                     other => panic!("unexpected test transport request {other:?}"),
                 };
@@ -1245,6 +1362,7 @@ async fn real_transport_settles_first_fill_and_proven_unsent_sibling() {
             })
         });
     let output = PaperDispatchRuntime::new(store.clone())
+        .with_startup_decision_policy_hash(store.active_decision_policy_hash().unwrap())
         .dispatch(&client, &input)
         .await
         .unwrap();
@@ -1266,6 +1384,102 @@ async fn real_transport_settles_first_fill_and_proven_unsent_sibling() {
     server.abort();
 }
 
+/// WHY THIS TEST EXISTS (Task #7): Activation in the second POST audit hook must leave the first receipt durable and prevent admission of the sibling, including after restarting with the new policy.
+/// Do not weaken or delete this assertion.
+#[tokio::test]
+async fn real_transport_policy_switch_stops_the_next_post_and_restart_observes() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (store, mut input) = build_paper_commitment_fixture(true, true);
+    let commitment = journaled_commitment(&store, &input);
+    let startup = store.active_decision_policy_hash().unwrap();
+    let replacement = ContentHash::of_bytes(b"offline replacement decision policy");
+    let (client, requests, _, server) = paper_transport_fixture(
+        &store,
+        &input.commitment,
+        &commitment,
+        PaperTransportReply::FilledPost,
+    )
+    .await;
+    let admissions = Arc::new(AtomicUsize::new(0));
+    let client = client.with_write_guard({
+        let admissions = admissions.clone();
+        let operator = Store::open(store.root()).unwrap();
+        let reference = input.commitment.clone();
+        let replacement = replacement.clone();
+        Arc::new(move |kind| {
+            assert_eq!(kind, PaperWriteKind::Submit);
+            if admissions.fetch_add(1, Ordering::SeqCst) == 1 {
+                let Some(PaperSubmissionBatch::Journaled { orders, .. }) =
+                    operator.paper_submission_batch(&reference).unwrap()
+                else {
+                    panic!("expected the original order journal");
+                };
+                assert_eq!(orders[0].state, PaperSubmissionState::Terminal);
+                assert!(orders[0].receipt.is_some());
+                assert_eq!(orders[1].state, PaperSubmissionState::Ready);
+                activate_fixture_policy(&operator, replacement.clone(), Utc::now());
+            }
+            Ok(())
+        })
+    });
+    let runtime =
+        PaperDispatchRuntime::new(store.clone()).with_startup_decision_policy_hash(startup);
+    let output = runtime.dispatch(&client, &input).await.unwrap();
+    assert!(!output.settled);
+    assert_eq!(admissions.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        store.active_decision_policy_hash().unwrap(),
+        Some(replacement.clone())
+    );
+    let batch = store.paper_submission_batch(&input.commitment).unwrap();
+    let Some(PaperSubmissionBatch::Journaled { ref orders, .. }) = batch else {
+        panic!("policy switch must preserve the original order journal");
+    };
+    assert_eq!(orders[0].asset, Asset::Qqq);
+    assert_eq!(orders[0].state, PaperSubmissionState::Terminal);
+    assert!(orders[0].receipt.is_some());
+    assert_eq!(orders[1].asset, Asset::Soxx);
+    assert_eq!(orders[1].state, PaperSubmissionState::Ready);
+    assert_eq!(output.reconciliation.receipts.len(), 1);
+    let request_count = requests.lock().unwrap().len();
+
+    claim_paper_reattempt(&store, &mut input);
+    let restarted = PaperDispatchRuntime::new(store.clone())
+        .with_startup_decision_policy_hash(Some(replacement));
+    let output = restarted.dispatch(&client, &input).await.unwrap();
+    assert!(!output.settled);
+    assert_eq!(output.reconciliation.receipts.len(), 1);
+    assert_eq!(
+        store.paper_submission_batch(&input.commitment).unwrap(),
+        batch
+    );
+    let requests = requests.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.starts_with("POST "))
+            .count(),
+        1
+    );
+    assert!(!requests
+        .iter()
+        .any(|request| request.starts_with("PATCH ") || request.starts_with("DELETE ")));
+    let restart_reads = &requests[request_count..];
+    assert_eq!(
+        restart_reads.first().map(String::as_str),
+        Some("GET /v2/account")
+    );
+    assert!(restart_reads
+        .iter()
+        .skip(1)
+        .all(|request| request.starts_with("GET /v2/orders:by_client_order_id?")));
+    assert!(restart_reads
+        .iter()
+        .any(|request| request.ends_with(&commitment.client_order_ids[&Asset::Qqq])));
+    server.abort();
+}
+
 /// WHY THIS TEST EXISTS (Task #30): A received POST with an unusable response and repeated 404s must never resubmit either original, while a later exact receipt can settle.
 /// Do not weaken or delete this assertion.
 #[tokio::test]
@@ -1281,7 +1495,8 @@ async fn real_transport_never_resends_after_unusable_post_response() {
         PaperTransportReply::UnknownPost,
     )
     .await;
-    let runtime = PaperDispatchRuntime::new(store.clone());
+    let runtime = PaperDispatchRuntime::new(store.clone())
+        .with_startup_decision_policy_hash(store.active_decision_policy_hash().unwrap());
     let output = runtime.dispatch(&client, &input).await.unwrap();
     assert!(!output.settled);
     assert!(output.reconciliation.receipts.is_empty());
@@ -1344,45 +1559,57 @@ fn claim_paper_reattempt(store: &Store, input: &mut PaperDispatchInput) {
     assert_ne!(input.permit.attempt_id, previous);
 }
 
-fn seed_replaceable_paper_orders(
-    store: &Store,
-    input: &PaperDispatchInput,
-    commitment: &PaperCommitment,
-) {
-    let authority = PaperSubmissionAuthority {
-        lease: &input.lease,
-        permit: &input.permit,
-        commitment: &input.commitment,
-    };
-    store.begin_paper_submission_batch(&authority).unwrap();
-    for (asset, broker_order_id, state) in [
+fn original_order_receipts(commitment: &PaperCommitment) -> [OrderReceipt; 2] {
+    [
         (Asset::Qqq, "offline-order-one", OrderReceiptState::Accepted),
         (
             Asset::Soxx,
             "offline-order-two",
             OrderReceiptState::Canceled,
         ),
-    ] {
+    ]
+    .map(|(asset, broker_order_id, state)| OrderReceipt {
+        plan_hash: commitment.plan_hash.clone(),
+        asset,
+        client_order_id: commitment.client_order_ids[&asset].clone(),
+        broker_order_id: broker_order_id.into(),
+        state,
+        requested_quantity_micros: 1_000_000,
+        filled_quantity_micros: 0,
+        remaining_quantity_micros: 1_000_000,
+        average_fill_price: None,
+        broker_updated_at: commitment.created_at,
+        reason: None,
+        observed_at: commitment.created_at,
+    })
+}
+
+fn seed_original_receipts(
+    store: &Store,
+    authority: &PaperSubmissionAuthority<'_>,
+    commitment: &PaperCommitment,
+) {
+    for receipt in original_order_receipts(commitment) {
         store
-            .record_paper_submission_receipt(
-                &authority,
-                &OrderReceipt {
-                    plan_hash: commitment.plan_hash.clone(),
-                    asset,
-                    client_order_id: commitment.client_order_ids[&asset].clone(),
-                    broker_order_id: broker_order_id.into(),
-                    state,
-                    requested_quantity_micros: 1_000_000,
-                    filled_quantity_micros: 0,
-                    remaining_quantity_micros: 1_000_000,
-                    average_fill_price: None,
-                    broker_updated_at: commitment.created_at,
-                    reason: None,
-                    observed_at: commitment.created_at,
-                },
-            )
+            .record_paper_submission_receipt(authority, &receipt)
             .unwrap();
     }
+}
+
+fn seed_replaceable_paper_orders(
+    store: &Store,
+    input: &PaperDispatchInput,
+    commitment: &PaperCommitment,
+) {
+    let policy = store.active_decision_policy_hash().unwrap();
+    let authority = PaperSubmissionAuthority {
+        startup_decision_policy_hash: policy.as_ref(),
+        lease: &input.lease,
+        permit: &input.permit,
+        commitment: &input.commitment,
+    };
+    store.begin_paper_submission_batch(&authority).unwrap();
+    seed_original_receipts(store, &authority, commitment);
 }
 
 /// WHY THIS TEST EXISTS (Task #30): An admitted PATCH with a lost receipt remains uncertain after 404 even when every original is terminal, and later settles through the exact successor without another PATCH.
@@ -1409,6 +1636,7 @@ async fn assert_replacement_recovery(reply: PaperTransportReply) {
         settlement_timeout: std::time::Duration::ZERO,
         settlement_action_grace: std::time::Duration::ZERO,
         ..PaperDispatchRuntime::new(store.clone())
+            .with_startup_decision_policy_hash(store.active_decision_policy_hash().unwrap())
     };
     for (attempt, observe_successor) in [false, false, true].into_iter().enumerate() {
         visible.store(observe_successor, Ordering::SeqCst);
@@ -1500,7 +1728,8 @@ async fn real_transport_defers_unusable_receipts_until_exact_readback() {
         PaperTransportReply::UnsupportedPostStatus,
     )
     .await;
-    let runtime = PaperDispatchRuntime::new(store.clone());
+    let runtime = PaperDispatchRuntime::new(store.clone())
+        .with_startup_decision_policy_hash(store.active_decision_policy_hash().unwrap());
     for _ in 0..2 {
         let result = runtime.dispatch(&client, &input).await;
         assert!(
@@ -1571,6 +1800,7 @@ async fn real_transport_keeps_terminal_replacement_pending_until_original_closes
         settlement_timeout: std::time::Duration::ZERO,
         settlement_action_grace: std::time::Duration::ZERO,
         ..PaperDispatchRuntime::new(store.clone())
+            .with_startup_decision_policy_hash(store.active_decision_policy_hash().unwrap())
     };
     let mut output = runtime.dispatch(&client, &input).await.unwrap();
     for attempt in 0..2 {
@@ -1655,6 +1885,7 @@ async fn real_transport_defers_cancel_when_original_becomes_replaced() {
         settlement_timeout: std::time::Duration::ZERO,
         settlement_action_grace: std::time::Duration::ZERO,
         ..PaperDispatchRuntime::new(store.clone())
+            .with_startup_decision_policy_hash(store.active_decision_policy_hash().unwrap())
     };
     let output = runtime.dispatch(&client, &input).await.unwrap();
     assert!(!output.settled);
@@ -1783,7 +2014,8 @@ async fn real_legacy_transport_persists_partial_before_second_lookup_fails() {
         PaperTransportReply::LegacyPartialThenUnavailable,
     )
     .await;
-    let runtime = PaperDispatchRuntime::new(store.clone());
+    let runtime = PaperDispatchRuntime::new(store.clone())
+        .with_startup_decision_policy_hash(store.active_decision_policy_hash().unwrap());
     for original_is_missing_this_attempt in [false, false, true] {
         if original_is_missing_this_attempt {
             claim_paper_reattempt(&store, &mut input);
@@ -1840,7 +2072,8 @@ async fn real_legacy_transport_preserves_replaced_readback_before_cancel_deferra
         PaperTransportReply::LegacyReplacedDuringCancel,
     )
     .await;
-    let runtime = PaperDispatchRuntime::new(store.clone());
+    let runtime = PaperDispatchRuntime::new(store.clone())
+        .with_startup_decision_policy_hash(store.active_decision_policy_hash().unwrap());
     let output = runtime
         .reconcile_existing_only(&client, &input)
         .await
@@ -1891,6 +2124,239 @@ async fn real_legacy_transport_preserves_replaced_readback_before_cancel_deferra
     server.abort();
 }
 
+/// WHY THIS TEST EXISTS (Task #7): Activation in the PATCH audit hook must leave the exact enrolled successor Ready and preserve the original broker receipts.
+/// Do not weaken or delete this assertion.
+#[tokio::test]
+async fn real_transport_policy_switch_stops_an_enrolled_replacement() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (store, input) = build_paper_commitment_fixture(true, true);
+    let commitment = journaled_commitment(&store, &input);
+    let startup = store.active_decision_policy_hash().unwrap();
+    let replacement = ContentHash::of_bytes(b"offline replacement decision policy");
+    let authority = PaperSubmissionAuthority {
+        startup_decision_policy_hash: startup.as_ref(),
+        lease: &input.lease,
+        permit: &input.permit,
+        commitment: &input.commitment,
+    };
+    store.begin_paper_submission_batch(&authority).unwrap();
+    seed_original_receipts(&store, &authority, &commitment);
+    let (client, requests, _, server) = paper_transport_fixture(
+        &store,
+        &input.commitment,
+        &commitment,
+        PaperTransportReply::UnknownPatch,
+    )
+    .await;
+    let admissions = Arc::new(AtomicUsize::new(0));
+    let client = client.with_write_guard({
+        let admissions = admissions.clone();
+        let operator = Store::open(store.root()).unwrap();
+        let replacement = replacement.clone();
+        Arc::new(move |kind| {
+            assert_eq!(kind, PaperWriteKind::Replace);
+            admissions.fetch_add(1, Ordering::SeqCst);
+            activate_fixture_policy(&operator, replacement.clone(), Utc::now());
+            Ok(())
+        })
+    });
+    let runtime = PaperDispatchRuntime {
+        settlement_timeout: std::time::Duration::ZERO,
+        settlement_action_grace: std::time::Duration::ZERO,
+        ..PaperDispatchRuntime::new(store.clone()).with_startup_decision_policy_hash(startup)
+    };
+    let output = runtime.dispatch(&client, &input).await.unwrap();
+    assert!(!output.settled);
+    assert_eq!(admissions.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        store.active_decision_policy_hash().unwrap(),
+        Some(replacement)
+    );
+    let Some(PaperSubmissionBatch::Journaled { orders, .. }) =
+        store.paper_submission_batch(&input.commitment).unwrap()
+    else {
+        panic!("policy switch must preserve the original order journal");
+    };
+    let successor = orders.iter().find(|order| order.reprice.is_some()).unwrap();
+    assert_eq!(
+        successor.client_order_id,
+        replacement_client_order_id(&commitment.client_order_ids[&Asset::Qqq])
+    );
+    assert_eq!(successor.state, PaperSubmissionState::Ready);
+    assert!(successor.receipt.is_none());
+    assert_eq!(output.reconciliation.receipts.len(), 2);
+    assert!(requests
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|request| request.starts_with("GET ")));
+    server.abort();
+}
+
+/// WHY THIS TEST EXISTS (Task #7): A policy change during the protective DELETE audit preserves an existing cancellation under the original approval and exact account.
+/// Do not weaken or delete this assertion.
+#[tokio::test]
+async fn real_transport_policy_switch_preserves_a_protective_cancel() {
+    assert_protective_cancel_policy_switch(false).await;
+}
+
+/// WHY THIS TEST EXISTS (Task #7): A legacy batch must retain a new partial fill through the confirmed original cancellation when policy switches.
+/// Do not weaken or delete this assertion.
+#[tokio::test]
+async fn real_transport_policy_switch_preserves_legacy_cancel_observation() {
+    assert_protective_cancel_policy_switch(true).await;
+}
+
+async fn assert_protective_cancel_policy_switch(legacy: bool) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (store, input) = build_paper_commitment_fixture(true, true);
+    let commitment = journaled_commitment(&store, &input);
+    let startup = store.active_decision_policy_hash().unwrap();
+    let replacement = ContentHash::of_bytes(b"offline replacement decision policy");
+    let prior_receipt = if legacy {
+        store
+            .record_paper_effect_intent(&input.lease, &input.permit, &input.commitment, input.now)
+            .unwrap();
+        assert_eq!(
+            store.paper_submission_batch(&input.commitment).unwrap(),
+            Some(PaperSubmissionBatch::LegacyUnknown)
+        );
+        let [original, _] = original_order_receipts(&commitment);
+        let reconciliation = ReconciliationRuntime::new(store.clone());
+        let progress = reconciliation
+            .reconcile(&ReconciliationInput {
+                permit: input.permit.clone(),
+                commitment: input.commitment.clone(),
+                reprices: vec![],
+                cancels: vec![],
+                broker_receipts: vec![original],
+                now: input.now,
+            })
+            .unwrap();
+        reconciliation
+            .write_progress(&input.lease, &input.permit, &progress, input.now)
+            .unwrap();
+        artifact_ref(&progress.receipts[0])
+    } else {
+        let authority = PaperSubmissionAuthority {
+            startup_decision_policy_hash: startup.as_ref(),
+            lease: &input.lease,
+            permit: &input.permit,
+            commitment: &input.commitment,
+        };
+        store.begin_paper_submission_batch(&authority).unwrap();
+        seed_original_receipts(&store, &authority, &commitment);
+        let Some(PaperSubmissionBatch::Journaled { orders, .. }) =
+            store.paper_submission_batch(&input.commitment).unwrap()
+        else {
+            panic!("expected the original order journal");
+        };
+        orders
+            .iter()
+            .find(|order| order.asset == Asset::Qqq)
+            .unwrap()
+            .receipt
+            .clone()
+            .unwrap()
+    };
+    let cancel = PaperCancel {
+        schema_version: DOMAIN_SCHEMA_VERSION,
+        cancel_id: PaperCancelId::new(),
+        commitment: input.commitment.clone(),
+        prior_receipt: prior_receipt.clone(),
+        asset: Asset::Qqq,
+        client_order_id: commitment.client_order_ids[&Asset::Qqq].clone(),
+        broker_order_id: "offline-order-one".into(),
+        reason: PaperCancelReason::RiskReduction,
+        created_at: input.now,
+    };
+    let cancel = Artifact::new(
+        ArtifactKind::ExecutionCancel,
+        store.stage_json(&cancel).unwrap(),
+        "execution.cancel",
+        ArtifactLifecycle::Canonical,
+        crate::trusted_execution_provenance(&input.permit, input.now),
+        Some(input.permit.artifact_origin()),
+        vec![input.commitment.clone(), prior_receipt],
+        input.now,
+    )
+    .unwrap();
+    store
+        .commit_execution_cancel_intent(&input.lease, &input.permit, &cancel, input.now)
+        .unwrap();
+    store
+        .write_freeze_state(true, "offline protective recovery", input.now)
+        .unwrap();
+    let (client, requests, _, server) = paper_transport_fixture(
+        &store,
+        &input.commitment,
+        &commitment,
+        if legacy {
+            PaperTransportReply::LegacyCancel
+        } else {
+            PaperTransportReply::UnknownPatch
+        },
+    )
+    .await;
+    let admissions = Arc::new(AtomicUsize::new(0));
+    let client = client.with_write_guard({
+        let admissions = admissions.clone();
+        let operator = Store::open(store.root()).unwrap();
+        let replacement = replacement.clone();
+        Arc::new(move |kind| {
+            assert_eq!(kind, PaperWriteKind::Cancel);
+            admissions.fetch_add(1, Ordering::SeqCst);
+            activate_fixture_policy(&operator, replacement.clone(), Utc::now());
+            Ok(())
+        })
+    });
+    let runtime =
+        PaperDispatchRuntime::new(store.clone()).with_startup_decision_policy_hash(startup);
+    let output = runtime.dispatch(&client, &input).await.unwrap();
+    assert_eq!(output.settled, !legacy);
+    assert_eq!(admissions.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        store.active_decision_policy_hash().unwrap(),
+        Some(replacement)
+    );
+    let order = &output.execution.orders[0];
+    if legacy {
+        assert_eq!(order.status, "canceled");
+        assert_eq!(order.filled_quantity_micros, 500_000);
+        let stored = store
+            .artifact(&output.reconciliation.receipts[0].artifact_id)
+            .unwrap();
+        let receipt: OrderReceipt =
+            serde_json::from_slice(&store.read_blob(&stored.blob).unwrap()).unwrap();
+        assert_eq!(receipt.state, OrderReceiptState::Canceled);
+        assert_eq!(receipt.filled_quantity_micros, 500_000);
+        assert_eq!(
+            receipt.client_order_id,
+            commitment.client_order_ids[&Asset::Qqq]
+        );
+    } else {
+        assert_eq!(order.status, "canceled");
+    }
+    assert!(store
+        .paper_effect_intent_recorded(&input.permit.run_id, &cancel.artifact_id)
+        .unwrap());
+    let requests = requests.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.as_str() == "DELETE /v2/orders/offline-order-one")
+            .count(),
+        1
+    );
+    assert!(requests
+        .iter()
+        .all(|request| request.starts_with("GET ")
+            || request == "DELETE /v2/orders/offline-order-one"));
+    server.abort();
+}
+
 /// WHY THIS TEST EXISTS (Task #30): A visible legacy r1 is durable even when r0 returns 404, but a historical Accepted r0 does not permit settlement or resend.
 /// Do not weaken or delete this assertion.
 #[tokio::test]
@@ -1910,7 +2376,8 @@ async fn real_legacy_transport_keeps_replacement_pending_without_original_closur
         PaperTransportReply::LegacyReplacementOriginalMissing,
     )
     .await;
-    let runtime = PaperDispatchRuntime::new(store.clone());
+    let runtime = PaperDispatchRuntime::new(store.clone())
+        .with_startup_decision_policy_hash(store.active_decision_policy_hash().unwrap());
     for _ in 0..2 {
         claim_paper_reattempt(&store, &mut input);
         let output = runtime

@@ -165,6 +165,7 @@ pub fn paper_execution_policy_hash() -> PaperDispatchResult<ContentHash> {
 #[derive(Debug, Clone)]
 pub struct PaperDispatchRuntime {
     store: Store,
+    startup_decision_policy_hash: Option<ContentHash>,
     execution_policy: crate::ExecutionPolicy,
     settlement_timeout: std::time::Duration,
     settlement_action_grace: std::time::Duration,
@@ -203,7 +204,10 @@ impl PaperDispatchRuntime {
         let committed = self.load_committed_plan(&input.permit, &input.commitment)?;
         let decision = self.load_frozen_decision(&input.permit, &committed.plan)?;
         let (manifest, _) = self.verify_original_account(broker, input).await?;
-        let may_cancel = self.approval_matches_plan(&manifest, &decision, &committed.plan)?;
+        // An already committed protective cancel retains its original approval.
+        // If the active head cannot be read, observe the original order only.
+        let may_cancel = self.approval_matches_plan(&manifest, &decision, &committed.plan)?
+            && self.store.active_decision_policy_hash().is_ok();
         self.reconcile_recorded(broker, input, committed, None, may_cancel)
             .await
     }
@@ -229,6 +233,7 @@ impl PaperDispatchRuntime {
             store: &self.store,
             input,
             commitment: &commitment,
+            startup_decision_policy_hash: self.startup_decision_policy_hash.as_ref(),
             journaled: matches!(batch, Some(PaperSubmissionBatch::Journaled { .. })),
         };
         if let Some(known) = known.as_ref().filter(|_| !journal.journaled) {
@@ -479,6 +484,7 @@ impl PaperDispatchRuntime {
         // Store 按值移入并由 runtime 持有；设置默认执行策略与观察时限，不执行 Store/Broker I/O。
         Self {
             store,
+            startup_decision_policy_hash: None,
             execution_policy: crate::ExecutionPolicy::default(),
             settlement_timeout: std::time::Duration::from_secs(
                 DEFAULT_PAPER_SETTLEMENT_TIMEOUT_SECS,
@@ -488,6 +494,11 @@ impl PaperDispatchRuntime {
             ),
             failpoint: PaperDispatchFailpoint::Disabled,
         }
+    }
+
+    pub fn with_startup_decision_policy_hash(mut self, policy_hash: Option<ContentHash>) -> Self {
+        self.startup_decision_policy_hash = policy_hash;
+        self
     }
 
     pub fn with_failpoint(mut self, failpoint: PaperDispatchFailpoint) -> Self {
@@ -537,12 +548,31 @@ impl PaperDispatchRuntime {
         let committed = self.load_committed_plan(&input.permit, &input.commitment)?;
         let decision = self.load_frozen_decision(&input.permit, &committed.plan)?;
         let (manifest, approval) = self.verify_original_account(broker, input).await?;
-        if !self.approval_matches_plan(&manifest, &decision, &committed.plan)? {
+        let original_approved =
+            self.approval_matches_plan(&manifest, &decision, &committed.plan)?;
+        if !original_approved {
             if !self.commitment_effect_recorded(input)? {
                 return Err(PaperError::ApprovalPolicyMismatch.into());
             }
             return self
                 .reconcile_recorded(broker, input, committed, None, false)
+                .await;
+        }
+        let approved_hash = Some(&manifest.decision_policy_hash);
+        let live_policy = self.store.active_decision_policy_hash();
+        let coherent = live_policy
+            .as_ref()
+            .is_ok_and(|active| active.as_ref() == approved_hash)
+            && self.startup_decision_policy_hash.as_ref() == approved_hash;
+        if !coherent {
+            if !self.commitment_effect_recorded(input)? {
+                return match live_policy {
+                    Err(error) => Err(error.into()),
+                    Ok(_) => Err(PaperError::ActiveDecisionPolicyMismatch.into()),
+                };
+            }
+            return self
+                .reconcile_recorded(broker, input, committed, None, live_policy.is_ok())
                 .await;
         }
         let approval_expiry = manifest
@@ -561,6 +591,31 @@ impl PaperDispatchRuntime {
                 | PaperDispatchError::Store(StoreError::ExecutionFrozen { .. }),
             ) => None,
             Err(PaperDispatchError::Broker(PaperError::FrozenAfterReceipts(known))) => Some(known),
+            Err(
+                error @ (PaperDispatchError::Store(StoreError::DecisionPolicyHeadUnavailable(_))
+                | PaperDispatchError::Broker(PaperError::SubmissionJournal(
+                    StoreError::DecisionPolicyHeadUnavailable(_),
+                ))),
+            ) => {
+                if !self.commitment_effect_recorded(input)? {
+                    return Err(error);
+                }
+                return self
+                    .reconcile_recorded(broker, input, committed, None, false)
+                    .await;
+            }
+            Err(
+                PaperDispatchError::Store(StoreError::DecisionPolicyMismatch)
+                | PaperDispatchError::Broker(PaperError::ActiveDecisionPolicyMismatch),
+            ) => {
+                if !self.commitment_effect_recorded(input)? {
+                    return Err(PaperError::ActiveDecisionPolicyMismatch.into());
+                }
+                let may_cancel = self.store.active_decision_policy_hash().is_ok();
+                return self
+                    .reconcile_recorded(broker, input, committed, None, may_cancel)
+                    .await;
+            }
             Err(PaperDispatchError::Broker(
                 PaperError::SubmissionObservationOnly
                 | PaperError::SubmissionResultUnknown { .. }
@@ -572,8 +627,9 @@ impl PaperDispatchRuntime {
                 | PaperError::Http { .. }
                 | PaperError::BrokerReceiptUnavailable { .. },
             )) => {
+                let may_cancel = self.store.active_decision_policy_hash().is_ok();
                 return self
-                    .reconcile_recorded(broker, input, committed, None, true)
+                    .reconcile_recorded(broker, input, committed, None, may_cancel)
                     .await;
             }
             result => return result,
@@ -583,7 +639,8 @@ impl PaperDispatchRuntime {
         }
         // This dispatch already verified the account on this immutable broker
         // client. A second probe must not stand between known receipts and Store.
-        self.reconcile_recorded(broker, input, committed, known, true)
+        let may_cancel = self.store.active_decision_policy_hash().is_ok();
+        self.reconcile_recorded(broker, input, committed, known, may_cancel)
             .await
             .map_err(PaperDispatchError::during_frozen_reconciliation)
     }
@@ -610,6 +667,7 @@ impl PaperDispatchRuntime {
             store: &self.store,
             input,
             commitment,
+            startup_decision_policy_hash: self.startup_decision_policy_hash.as_ref(),
             journaled: true,
         };
         let batch = self
@@ -1868,7 +1926,8 @@ mod safety_only_tests {
             cancellations: AtomicUsize::new(0),
             lookup: FrozenLookup::Visible,
         };
-        let runtime = PaperDispatchRuntime::new(store.clone());
+        let runtime = PaperDispatchRuntime::new(store.clone())
+            .with_startup_decision_policy_hash(store.active_decision_policy_hash().unwrap());
         // First call crosses the freeze during broker I/O. The next starts frozen.
         for expected_observations in [1, 2] {
             let output = runtime.dispatch(&broker, &input).await.unwrap();
@@ -1938,6 +1997,7 @@ mod safety_only_tests {
                 lookup,
             };
             let output = PaperDispatchRuntime::new(store.clone())
+                .with_startup_decision_policy_hash(store.active_decision_policy_hash().unwrap())
                 .dispatch(&broker, &input)
                 .await;
             assert_eq!(broker.account_checks.load(Ordering::SeqCst), 1);
@@ -1989,7 +2049,8 @@ mod safety_only_tests {
                 cancellations: AtomicUsize::new(0),
                 lookup,
             };
-            let mut runtime = PaperDispatchRuntime::new(store.clone());
+            let mut runtime = PaperDispatchRuntime::new(store.clone())
+                .with_startup_decision_policy_hash(store.active_decision_policy_hash().unwrap());
             runtime.settlement_timeout = std::time::Duration::ZERO;
             runtime.settlement_action_grace = std::time::Duration::ZERO;
             let output = runtime.dispatch(&broker, &input).await;
@@ -2041,8 +2102,10 @@ mod safety_only_tests {
         let commitment = store.artifact(&input.commitment.artifact_id).unwrap();
         let commitment: PaperCommitment =
             serde_json::from_slice(&store.read_blob(&commitment.blob).unwrap()).unwrap();
+        let policy = store.active_decision_policy_hash().unwrap();
         store
             .begin_paper_submission_batch(&PaperSubmissionAuthority {
+                startup_decision_policy_hash: policy.as_ref(),
                 lease: &input.lease,
                 permit: &input.permit,
                 commitment: &input.commitment,
@@ -2107,7 +2170,8 @@ mod safety_only_tests {
         // a fresh observation when deciding whether to run the durable cancel.
         broker.lookup = FrozenLookup::Missing;
         broker.freeze_at_write_admission = true;
-        let runtime = PaperDispatchRuntime::new(store.clone());
+        let runtime = PaperDispatchRuntime::new(store.clone())
+            .with_startup_decision_policy_hash(store.active_decision_policy_hash().unwrap());
         let output = runtime.dispatch(&broker, &input).await.unwrap();
         assert!(!output.settled);
         assert_eq!(output.execution.orders[0].status, "accepted");
@@ -2150,6 +2214,7 @@ mod safety_only_tests {
             .write_freeze_state(true, "operator stop", input.now)
             .unwrap();
         let error = PaperDispatchRuntime::new(store.clone())
+            .with_startup_decision_policy_hash(store.active_decision_policy_hash().unwrap())
             .dispatch(&PanicOnBrokerIo, &input)
             .await
             .unwrap_err();

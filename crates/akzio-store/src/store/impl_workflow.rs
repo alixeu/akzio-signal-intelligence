@@ -7,6 +7,7 @@ impl Store {
         lease: &DaemonLease,
         reservation: &SessionReservation,
         approved_proposal: Option<(&Artifact, &Artifact, &Artifact)>,
+        expected_policy_hash: Option<&ContentHash>,
     ) -> StoreResult<SessionSlotReservation> {
         let (run_id, newly_reserved) = {
             let mut connection = self.connection()?;
@@ -28,6 +29,7 @@ impl Store {
                     lease,
                     reservation,
                     approved_proposal,
+                    expected_policy_hash,
                 )?;
                 (reservation.workflow.run.run_id.clone(), true)
             };
@@ -65,7 +67,9 @@ impl Store {
         lease: &DaemonLease,
         reservation: &SessionReservation,
         approved_proposal: Option<(&Artifact, &Artifact, &Artifact)>,
+        expected_policy_hash: Option<&ContentHash>,
     ) -> StoreResult<()> {
+        Self::assert_decision_policy_head(transaction, expected_policy_hash)?;
         for artifact in &reservation.setup_artifacts {
             insert_artifact(transaction, artifact)?;
         }
@@ -350,27 +354,14 @@ impl Store {
         session_key: &str,
         plan: &ExecutionPlan,
         committed_at: DateTime<Utc>,
-    ) -> StoreResult<()> {
+    ) -> StoreResult<ContentHash> {
         // 通过 session_key 找唯一已消费 binding，累计 Buy orders 的 notional
         //（checked_add 防溢出），并检查 session date/expiry/maximum_notional。
         // 复用调用方的连接读取 binding，避免在 commitment/只读投影事务内重入 Store Mutex。
         let invalid = || StoreError::InvalidSessionSlot(session_key.to_owned());
-        let binding = connection
-            .query_row(
-                "SELECT runtime_manifest_artifact_id, approval_artifact_id FROM rebuild_paper_approval_consumptions WHERE session_key = ?1",
-                params![session_key],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()?;
-        let Some((manifest_id, approval_id)) = binding else {
-            return Err(invalid());
-        };
-        let manifest_artifact =
-            read_artifact(connection, &ArtifactId(ContentHash::new(manifest_id)?))?;
-        let approval_artifact =
-            read_artifact(connection, &ArtifactId(ContentHash::new(approval_id)?))?;
-        let (manifest, approval) =
-            self.validate_paper_approval_binding_with_connection(connection,&manifest_artifact,&approval_artifact)?;
+        let (manifest, approval) = self
+            .read_consumed_paper_approval(connection, session_key)?
+            .ok_or_else(invalid)?;
         let session =
             chrono::NaiveDate::parse_from_str(session_key, "%Y-%m-%d").map_err(|_| invalid())?;
         let buy_notional = plan
@@ -386,7 +377,34 @@ impl Store {
         {
             return Err(invalid());
         }
-        Ok(())
+        Ok(manifest.decision_policy_hash)
+    }
+
+    fn read_consumed_paper_approval(
+        &self,
+        connection: &Connection,
+        session_key: &str,
+    ) -> StoreResult<Option<(RuntimeManifest, PaperLaunchApproval)>> {
+        let binding = connection
+            .query_row(
+                "SELECT runtime_manifest_artifact_id, approval_artifact_id FROM rebuild_paper_approval_consumptions WHERE session_key = ?1",
+                params![session_key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((manifest_id, approval_id)) = binding else {
+            return Ok(None);
+        };
+        let manifest_artifact =
+            read_artifact(connection, &ArtifactId(ContentHash::new(manifest_id)?))?;
+        let approval_artifact =
+            read_artifact(connection, &ArtifactId(ContentHash::new(approval_id)?))?;
+        self.validate_paper_approval_binding_with_connection(
+            connection,
+            &manifest_artifact,
+            &approval_artifact,
+        )
+        .map(Some)
     }
 
     fn validate_specialized_artifact(&self, artifact: &Artifact) -> StoreResult<()> {

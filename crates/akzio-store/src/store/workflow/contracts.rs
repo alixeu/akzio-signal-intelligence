@@ -269,11 +269,19 @@ impl Store {
 
     /// Atomically publish bounded research inputs and a non-executing PositionPlan.
     // 仅接受 PositionPlan purpose；setup Artifacts、workflow 图和 Run 事件在同一个 Immediate 事务提交。
-    pub fn commit_position_plan(&self, workflow: &WorkflowCommit, setup: &[Artifact]) -> StoreResult<()> {
-        if workflow.run.purpose != RunPurpose::PositionPlan { return Err(StoreError::PermitOriginMismatch); }
+    pub fn commit_position_plan(
+        &self,
+        workflow: &WorkflowCommit,
+        setup: &[Artifact],
+        startup_policy_hash: Option<&ContentHash>,
+    ) -> StoreResult<()> {
+        if workflow.run.purpose != RunPurpose::PositionPlan {
+            return Err(StoreError::PermitOriginMismatch);
+        }
         self.validate_workflow_commit(workflow)?;
         let mut connection = self.connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::assert_decision_policy_head(&tx, startup_policy_hash)?;
         insert_artifact_batch(&tx, setup)?;
         Self::commit_workflow_transaction(&tx, workflow)?;
         Self::append_run_setup_events(&tx, &workflow.run.run_id, setup, workflow.run.created_at)?;

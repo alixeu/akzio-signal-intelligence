@@ -19,6 +19,7 @@ impl Store {
         &self,
         lease: &DaemonLease,
         commit: &ExecutionCommit,
+        startup_decision_policy_hash: Option<&ContentHash>,
     ) -> StoreResult<ExecutionCommitResult> {
         if commit.session_key.trim().is_empty()
             || commit.commitment.kind != ArtifactKind::ExecutionCommitment
@@ -52,7 +53,7 @@ impl Store {
             &commit.permit.run_id,
             &commit.session_key,
         )?;
-        self.validate_consumed_paper_approval(
+        let approved_policy_hash = self.validate_consumed_paper_approval(
             &transaction,
             &commit.session_key,
             &plan,
@@ -186,6 +187,13 @@ impl Store {
                 commit.session_key.clone(),
             ));
         }
+        self.assert_fresh_paper_decision_policy(
+            &transaction,
+            &commit.permit.run_id,
+            &plan.decision_context,
+            &approved_policy_hash,
+            startup_decision_policy_hash,
+        )?;
         // 首次占 slot 后，Artifact、output index、ExecutionCommitted 事件和 Task 完成共享该事务提交点。
         insert_artifact(&transaction, &commit.commitment)?;
         transaction.execute(

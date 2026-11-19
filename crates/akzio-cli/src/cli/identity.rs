@@ -30,6 +30,7 @@ fn configured_synthesizer_identity(model: &OpenAIResponsesConfig) -> Result<(Str
 #[derive(Debug, Clone)]
 struct LoadedDecisionPolicy {
     policy: DecisionPolicy,
+    active_hash: Option<ContentHash>,
     status: String,
     input_hash: Option<ContentHash>,
     contract_hash: Option<ContentHash>,
@@ -57,6 +58,7 @@ fn load_decision_policy_from_store(
         let bytes = store.read_blob(&stored.artifact.blob)?;
         let loaded = decode_loaded_decision_policy(config, &bytes, Some(&stored.descriptor))?;
         return Ok(LoadedDecisionPolicy {
+            active_hash: Some(stored.descriptor.policy_hash),
             artifact_id: Some(stored.artifact.artifact_id),
             source: "store_active_head",
             ..loaded
@@ -64,6 +66,7 @@ fn load_decision_policy_from_store(
     }
     Ok(LoadedDecisionPolicy {
         policy: DecisionPolicy::default(),
+        active_hash: None,
         status: "store_active_head_missing".to_owned(),
         input_hash: None,
         contract_hash: None,
@@ -139,6 +142,7 @@ fn decode_loaded_decision_policy(
     let status = decision_policy_status(&policy);
     Ok(LoadedDecisionPolicy {
         policy,
+        active_hash: None,
         status: status.to_owned(),
         input_hash: Some(input_hash),
         contract_hash: artifact.provenance.contract_hash,

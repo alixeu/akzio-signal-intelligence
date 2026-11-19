@@ -51,6 +51,7 @@ fn daemon() -> Daemon {
                 slippage_ppm: 0,
             },
             decision_policy: akzio_execution::DecisionPolicy::default(),
+            startup_decision_policy_hash: None,
             runtime_identity_hash: None,
             historical_evaluation_condition: None,
             model_knowledge_cutoff: None,

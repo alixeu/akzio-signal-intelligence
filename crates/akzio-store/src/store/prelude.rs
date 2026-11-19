@@ -185,6 +185,12 @@ pub enum StoreError {
     PolicyEvaluationConflict(String),
     #[error("decision policy {0} conflicts with its immutable installation")]
     DecisionPolicyConflict(ContentHash),
+    #[error("active DecisionPolicy changed; restart Core before allocating a new Run")]
+    DecisionPolicyRestartRequired,
+    #[error("Paper admission requires the same DecisionPolicy in the consumed approval, Decision, Core startup and active Store head")]
+    DecisionPolicyMismatch,
+    #[error("cannot read the active DecisionPolicy for Paper admission: {0}")]
+    DecisionPolicyHeadUnavailable(#[source] Box<StoreError>),
     #[error("shadow pair {0} conflicts with a prior immutable completion")]
     ShadowPairConflict(String),
     #[error("canary campaign {0} conflicts with the current campaign")]

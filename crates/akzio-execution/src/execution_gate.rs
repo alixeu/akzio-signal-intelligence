@@ -15,9 +15,10 @@ use std::collections::BTreeSet;
 
 use akzio_domain::{
     AccountSnapshot, Artifact, ArtifactKind, ArtifactLifecycle, ArtifactRef, CandidatePolicy,
-    ContextManifestPayload, DecisionContext, DomainError, ExecutionContext, ExecutionVerdict,
-    Experience, FreezeState, HardBlocker, MarketClockSnapshot, ModelQualificationGate, MoneyMicros,
-    NoOrder, PolicySubject, QuoteSnapshot, RunPurpose, TaskStatus, TaskWritePermit,
+    ContentHash, ContextManifestPayload, DecisionContext, DomainError, ExecutionContext,
+    ExecutionVerdict, Experience, FreezeState, HardBlocker, MarketClockSnapshot,
+    ModelQualificationGate, MoneyMicros, NoOrder, PolicySubject, QuoteSnapshot, RunPurpose,
+    TaskStatus, TaskWritePermit,
 };
 use akzio_store::{Store, StoreError};
 use chrono::{DateTime, Duration, Utc};
@@ -78,6 +79,7 @@ pub struct ExecutionGateOutput {
 #[derive(Debug, Clone)]
 pub struct ExecutionRuntime {
     store: Store,
+    startup_decision_policy_hash: Option<ContentHash>,
     allocation: AllocationRuntime,
     gate_policy: ExecutionGatePolicy,
     pretrade_safety: PreTradeSafetyPolicy,
@@ -864,11 +866,12 @@ mod allocated_risk_tests {
             .join("../../target/execution-risk-tests")
             .join(RunId::new().0);
         let store = Store::open(root).unwrap();
-        let runtime =
-            ExecutionRuntime::new(store.clone(), Default::default(), Default::default()).unwrap();
         let mut frozen = policy_with_positive_calibration_bin(now);
         frozen.max_gross_weight = WeightPpm(350_000);
         let policy_hash = install_policy(&store, &frozen, now);
+        let runtime = ExecutionRuntime::new(store.clone(), Default::default(), Default::default())
+            .unwrap()
+            .with_startup_decision_policy_hash(Some(policy_hash.clone()));
         let permit = reserve_approved_execution(&store, &policy_hash, now);
         let mut account = fixtures::account(
             now,

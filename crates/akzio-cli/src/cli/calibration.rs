@@ -126,7 +126,8 @@ fn handle_calibration(command: &CalibrationCommand, config_path: &Path) -> Resul
             print_json(
                 &serde_json::json!({"status":"active","policy_hash":active.descriptor.policy_hash,
                 "policy_artifact_id":active.artifact.artifact_id,"policy_input_hash":active.descriptor.envelope_hash,
-                "activated_at":active.activated_at,"store_integrity":"passed"}),
+                "activated_at":active.activated_at,"store_integrity":"passed",
+                "core_activation":"on_restart"}),
             )
         }
         CalibrationCommand::Bootstrap {
@@ -646,7 +647,7 @@ mod calibration_readiness_tests {
         assert!(policy.decision_capable());
         let current = akzio_daemon::canonical_synthesizer_contract_hash(&store).unwrap();
         let mut loaded = LoadedDecisionPolicy {
-            policy, status: "ready_for_current_decision".into(),
+            policy, active_hash: None, status: "ready_for_current_decision".into(),
             input_hash: Some(ContentHash::of_bytes(b"synthetic-old-policy-envelope")),
             artifact_id: Some(ArtifactId(ContentHash::of_bytes(b"synthetic-old-policy-artifact"))),
             contract_hash: Some(ContentHash::new("62f26b115dca5a93a3da9398f9b39d13985d1f65d64ee84771f052d44637cb84").unwrap()),

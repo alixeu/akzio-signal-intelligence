@@ -64,6 +64,8 @@ pub enum PaperError {
     AccountMismatch,
     #[error("the Run's Decision or ExecutionPolicy does not match its consumed Paper approval")]
     ApprovalPolicyMismatch,
+    #[error("the original Paper approval does not match the active DecisionPolicy selected at Core startup")]
+    ActiveDecisionPolicyMismatch,
     #[error("Alpaca Paper market is closed")]
     MarketClosed,
     #[error("Alpaca Paper market session differs from the frozen order session")]
@@ -188,6 +190,7 @@ pub struct PaperSubmissionJournal<'a> {
     store: &'a Store,
     input: &'a PaperDispatchInput,
     commitment: &'a PaperCommitment,
+    startup_decision_policy_hash: Option<&'a ContentHash>,
     journaled: bool,
 }
 
@@ -197,6 +200,7 @@ impl PaperSubmissionJournal<'_> {
             lease: &self.input.lease,
             permit: &self.input.permit,
             commitment: &self.input.commitment,
+            startup_decision_policy_hash: self.startup_decision_policy_hash,
         }
     }
 
@@ -208,6 +212,9 @@ impl PaperSubmissionJournal<'_> {
             Ok(PaperSubmissionAdmission::Admitted) => Ok(()),
             Ok(PaperSubmissionAdmission::ObserveOnly) => Err(PaperError::SubmissionObservationOnly),
             Err(StoreError::ExecutionFrozen { .. }) => Err(PaperError::Frozen),
+            Err(StoreError::DecisionPolicyMismatch) => {
+                Err(PaperError::ActiveDecisionPolicyMismatch)
+            }
             Err(error) => Err(PaperError::SubmissionJournal(error)),
         }
     }

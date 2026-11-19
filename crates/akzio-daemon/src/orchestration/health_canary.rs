@@ -1,5 +1,5 @@
 // 文件导读：本文件管理 worker supervision、health/ready 投影以及 Canary stage/resume。
-// health 读取 Store lease/metrics/Policy 状态，ready 只检查进程配置和 broker 注入；Canary
+// health 读取 Store lease/metrics/Policy 状态；ready 检查启动 Policy 是否仍与 SQL head 一致及 broker 注入。Canary
 // campaign 的 staged/advance 仍不是 active Contract/Topology、Paper fill 或学习晋升证明。
 // Rust 机制：`Arc`/闭包把 daemon 克隆进 TaskHandler；`watch` 只读关闭状态；Store 错误经
 // `Result` 传播，health 用 `Option` 表示没有 scheduler lease/approval，而不是默认健康。
@@ -60,8 +60,14 @@ impl Daemon {
             .unwrap_or(false);
         let metrics = self.store.metrics(Utc::now())?;
         let policy = self.decision_runtime.policy();
+        let active_decision_policy_hash = self.store.active_decision_policy_hash()?;
+        let decision_policy_restart_required =
+            self.startup_decision_policy_hash != active_decision_policy_hash;
+        let decision_capable = !decision_policy_restart_required && policy.decision_capable();
         let decision_policy_status = {
-            if policy.decision_capable() {
+            if decision_policy_restart_required {
+                "restart_required".to_owned()
+            } else if decision_capable {
                 "ready_for_current_decision".to_owned()
             } else if policy.asset_calibrations.is_empty() {
                 "unconfigured_fail_closed".to_owned()
@@ -81,6 +87,8 @@ impl Daemon {
                 .is_some_and(|logger| logger.assert_available().is_err())
             {
                 "run_log_blocked".to_owned()
+            } else if decision_policy_restart_required {
+                "decision_policy_restart_required".to_owned()
             } else if self.paper.auto_paper && lease.is_none() {
                 "paper_scheduler_fail_closed".to_owned()
             } else {
@@ -104,8 +112,11 @@ impl Daemon {
             frozen,
             decision_policy_status,
             decision_policy_hash: policy.policy_hash()?,
+            startup_decision_policy_hash: self.startup_decision_policy_hash.clone(),
+            active_decision_policy_hash,
+            decision_policy_restart_required,
             decision_policy_input_hash: None,
-            decision_capable: policy.decision_capable(),
+            decision_capable,
             news_web_status: self.news_web_status.clone(),
             news_web_route: self.news_web_route.clone(),
             scheduler_owner: lease.as_ref().map(|lease| lease.owner_id.clone()),
@@ -119,15 +130,21 @@ impl Daemon {
     /// visible in health and Observer data, but must not prevent inspection or
     /// recovery after a restart.
     pub fn ready(&self) -> Result<DaemonHealth> {
-        // 只在 health 基础上检查当前配置中 Paper broker 是否已注入；不扫描 Run 失败，
-        // 以便故障后的 inspect/recovery 仍可访问。
         let health = self.health()?;
+        self.check_readiness(&health)?;
+        Ok(health)
+    }
+
+    pub(crate) fn check_readiness(&self, health: &DaemonHealth) -> Result<()> {
+        if health.decision_policy_restart_required {
+            return Err(StoreError::DecisionPolicyRestartRequired.into());
+        }
         if self.paper.auto_paper && self.paper.paper_broker.is_none() {
             return Err(DaemonError::Unavailable(
                 "Paper broker is not injected".to_owned(),
             ));
         }
-        Ok(health)
+        Ok(())
     }
 
     pub fn canary_status(&self) -> Result<Option<akzio_store::CanaryCampaignHead>> {

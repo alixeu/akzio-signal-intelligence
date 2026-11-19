@@ -191,24 +191,54 @@ where
 }
 
 async fn require_formal_ready(client: &ControlApiClient) -> Result<serde_json::Value> {
-    // 有意读取最小 JSON 投影；旧版 Core 缺字段时明确拒绝，不用默认值推断 canonical。
-    let ready: serde_json::Value = client
+    let response = client
+        .request(Method::GET, client.endpoint(&["ready"]))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .context("正式 Core 无法通过 /ready；请先启动对应 Core，未提交 Run")?;
+    let status = response.status();
+    if !status.is_success() {
+        if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+            // Only the typed readiness flag can influence the diagnostic.
+            let health: serde_json::Value = response.json().await.unwrap_or_default();
+            if health["decision_policy_restart_required"] == true {
+                bail!("decision_policy_restart_required：请重启 Core 以加载已激活策略，未提交 Run");
+            }
+        }
+        bail!("正式 Core 无法通过 /ready (HTTP {status})；未提交 Run");
+    }
+    let ready: serde_json::Value = response.json().await.context("解析正式 Core readiness")?;
+    if ready["status"] != "ok" {
+        bail!("Core 未 ready；未提交 Run");
+    }
+    require_formal_capabilities(&ready)?;
+    Ok(ready)
+}
+
+async fn require_formal_inspection(client: &ControlApiClient) -> Result<()> {
+    let health: serde_json::Value = client
         .json_with_timeout(
-            client.request(Method::GET, client.endpoint(&["ready"])),
+            client.request(Method::GET, client.endpoint(&["health"])),
             Duration::from_secs(10),
         )
         .await
-        .context("正式 Core 无法通过 /ready；请先启动对应 Core，未提交 Run")?;
-    if ready["status"] != "ok" || ready["store_scope"] != "canonical" {
-        bail!("Core 未 ready 或不是 canonical Store；未提交 Run");
+        .context("无法读取已认证 Core 的健康状态")?;
+    require_formal_capabilities(&health)
+}
+
+fn require_formal_capabilities(health: &serde_json::Value) -> Result<()> {
+    // Require explicit capability fields, including from older Core versions.
+    if health["store_scope"] != "canonical" {
+        bail!("Core 未报告 canonical Store");
     }
-    if ready["formal_run_bundle_supported"] != true {
-        bail!("Core 缺少正式 Run bundle 接口；请更新并重启 Core，未提交 Run");
+    if health["formal_run_bundle_supported"] != true {
+        bail!("Core 缺少正式 Run bundle 接口；请更新并重启 Core");
     }
-    if ready["run_log_ready"] != true {
-        bail!("Core 缺少完整私有运行日志能力或日志已阻断；未提交 Run");
+    if health["run_log_ready"] != true {
+        bail!("Core 缺少完整私有运行日志能力或日志已阻断");
     }
-    Ok(ready)
+    Ok(())
 }
 
 fn unknown_submission(
@@ -285,6 +315,12 @@ async fn start(client: &ControlApiClient, purpose: FormalPurpose) -> Result<serd
         ));
     }
     if !status.is_success() {
+        if status == reqwest::StatusCode::CONFLICT {
+            let body: serde_json::Value = response.json().await.unwrap_or_default();
+            if body["error"] == "decision_policy_restart_required" {
+                bail!("RUN_SUBMISSION=rejected (HTTP {status})；decision_policy_restart_required：请重启 Core 以加载已激活策略，未提交 Run");
+            }
+        }
         // 不回显服务端正文，避免 token/provider 敏感文本被错误响应带回终端。
         bail!("RUN_SUBMISSION=rejected (HTTP {status})；请检查 Core 的交易时段、审批及错误日志");
     }
@@ -404,7 +440,7 @@ pub(crate) async fn execute(command: &RunCommand, config_path: &Path) -> Result<
             print_json(&inspect_paper_submission(&client, request_id).await?)
         }
         RunCommand::Detail { run_id } => {
-            require_formal_ready(&client).await?;
+            require_formal_inspection(&client).await?;
             let detail: serde_json::Value = client
                 .json_with_timeout(
                     client.request(
@@ -421,7 +457,7 @@ pub(crate) async fn execute(command: &RunCommand, config_path: &Path) -> Result<
             print_json(&detail)
         }
         RunCommand::ExportBundle { run_id, target } => {
-            require_formal_ready(&client).await?;
+            require_formal_inspection(&client).await?;
             let manifest: serde_json::Value = client
                 .json_with_timeout(
                     client
@@ -800,6 +836,89 @@ mod tests {
             assert!(!format!("{error:#}").contains("private-test-token"));
             assert_eq!(core.requests.lock().unwrap().len(), 1);
         }
+    }
+
+    /// WHY THIS TEST EXISTS (Task #7): Restart-required readiness blocks new submissions while canonical inspection and validated export stay available.
+    /// Do not weaken or delete this assertion.
+    #[tokio::test]
+    async fn policy_switch_keeps_cli_detail_and_export_available() {
+        const REQUEST_ID: &str = "6cce8588-846b-41d2-b1c5-502a0d4c3196";
+        const SWITCHING: &str = r#"{"status":"decision_policy_restart_required","store_scope":"canonical","formal_run_bundle_supported":true,"run_log_ready":true,"decision_policy_restart_required":true}"#;
+        let core = Core::new(vec![
+            Some((200, SWITCHING)),
+            Some((200, r#"{"workflow":{"run":{"run_id":"run-1"}}}"#)),
+            Some((200, SWITCHING)),
+            Some((
+                200,
+                r#"{"run_id":"run-1","missing":[],"integrity":{"status":"complete","unknown_after_crash_calls":0,"corruption_or_missing_blobs":0,"dropped_records":0}}"#,
+            )),
+            Some((
+                200,
+                r#"{"request_id":"6cce8588-846b-41d2-b1c5-502a0d4c3196","lookup_status":"session_run_found","session_key":"2026-10-09","run_id":"run-1"}"#,
+            )),
+            Some((503, SWITCHING)),
+            Some((200, READY)),
+            Some((
+                409,
+                r#"{"error":"decision_policy_restart_required","detail":"offline private diagnostic"}"#,
+            )),
+        ]);
+        let (root, _) = test_config(core.address);
+        let config_path = root.join("config.toml");
+        execute(
+            &RunCommand::Detail {
+                run_id: "run-1".into(),
+            },
+            &config_path,
+        )
+        .await
+        .unwrap();
+        execute(
+            &RunCommand::ExportBundle {
+                run_id: "run-1".into(),
+                target: root.join("bundle"),
+            },
+            &config_path,
+        )
+        .await
+        .unwrap();
+        execute(
+            &RunCommand::Submission {
+                request_id: REQUEST_ID.into(),
+            },
+            &config_path,
+        )
+        .await
+        .unwrap();
+        let error = start(&core.client(), FormalPurpose::PositionPlan)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("decision_policy_restart_required"));
+        let rejected = start(&core.client(), FormalPurpose::PositionPlan)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(rejected.contains("RUN_SUBMISSION=rejected"));
+        assert!(rejected.contains("decision_policy_restart_required"));
+        assert!(!rejected.contains("offline private diagnostic"));
+        let requests = core.requests.lock().unwrap();
+        assert_eq!(requests.len(), 8);
+        for (request, expected) in requests.iter().zip([
+            "GET /health ",
+            "GET /v1/observer/runs/run-1 ",
+            "GET /health ",
+            "POST /control/store/export-run-bundle ",
+            "GET /v1/runs/submissions/6cce8588-846b-41d2-b1c5-502a0d4c3196 ",
+            "GET /ready ",
+            "GET /ready ",
+            "POST /runs ",
+        ]) {
+            assert!(request.starts_with(expected));
+        }
+        drop(requests);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

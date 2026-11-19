@@ -155,7 +155,7 @@ impl Store {
         }
         // 这些检查发生在获取写事务前，避免把数量或绑定错误带入 Store 状态变更。
         self.validate_paper_session_reservation(parent, proposal)?;
-        self.validate_paper_approval_binding(runtime_manifest, approval)?;
+        let (manifest, _) = self.validate_paper_approval_binding(runtime_manifest, approval)?;
         reservation.validate()?;
         if reservation.scheduler_epoch != lease.epoch
             || reservation.session_key != parent.session_key
@@ -197,6 +197,7 @@ impl Store {
             lease,
             parent,
             Some((proposal, runtime_manifest, approval)),
+            Some(&manifest.decision_policy_hash),
         )?;
         for shadow in shadow_workflows {
             Self::commit_workflow_transaction(&transaction, shadow)?;

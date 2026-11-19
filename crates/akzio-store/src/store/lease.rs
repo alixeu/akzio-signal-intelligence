@@ -83,6 +83,7 @@ impl Store {
             lease,
             reservation,
             Some((proposal, runtime_manifest, approval)),
+            Some(&manifest_payload.decision_policy_hash),
         )
     }
 
@@ -280,7 +281,24 @@ impl Store {
             }
             self.read_blob(&artifact.blob)?;
         }
-        self.reserve_paper_session_transaction(lease, reservation, None)
+        self.reserve_paper_session_transaction(lease, reservation, None, None)
+    }
+
+    /// Reuse a reserved slot, or verify the policy for a possible new reservation.
+    /// Both reads share one snapshot. The new-slot writer still fences the head.
+    pub fn session_slot_for_admission(
+        &self,
+        session_key: &str,
+        startup_policy_hash: Option<&ContentHash>,
+    ) -> StoreResult<Option<SessionSlot>> {
+        self.with_read_snapshot(|snapshot| {
+            let slot = snapshot.session_slot(session_key)?;
+            if slot.is_none() {
+                let connection = snapshot.connection()?;
+                Self::assert_decision_policy_head(&connection, startup_policy_hash)?;
+            }
+            Ok(slot)
+        })
     }
 
     // 由 slot 行读取 graph Artifact/CAS payload，再恢复 Paper WorkflowCommit 快照。

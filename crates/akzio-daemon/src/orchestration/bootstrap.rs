@@ -203,9 +203,20 @@ impl Daemon {
         ) {
             agents = agents.with_historical_projection(condition, cutoff);
         }
-        let decision_runtime = DecisionRuntime::new(store.clone(), config.decision_policy.clone())?;
+        let startup_policy_hash = config.startup_decision_policy_hash;
+        let policy_matches_startup = match &startup_policy_hash {
+            Some(hash) => config.decision_policy.policy_hash()? == *hash,
+            None => config.decision_policy == DecisionPolicy::default(),
+        };
+        if !policy_matches_startup {
+            return Err(DaemonError::InvalidInput(
+                "DecisionPolicy does not match the selected startup policy".to_owned(),
+            ));
+        }
+        let decision_runtime = DecisionRuntime::new(store.clone(), config.decision_policy)?;
         let execution_runtime =
-            ExecutionRuntime::new(store.clone(), Default::default(), Default::default())?;
+            ExecutionRuntime::new(store.clone(), Default::default(), Default::default())?
+                .with_startup_decision_policy_hash(startup_policy_hash.clone());
         let fixture_capabilities = model.capability_snapshot();
         let scheduler = PaperScheduler::new(
             store.clone(),
@@ -215,6 +226,7 @@ impl Daemon {
         .with_store_executor(store_executor.clone())
         .with_market_data_feed(config.market_data_feed)
         .with_runtime_identity_hash(config.runtime_identity_hash.clone())
+        .with_startup_decision_policy_hash(startup_policy_hash.clone())
         .with_run_log(config.run_log.clone());
 
         Ok(Self {
@@ -235,9 +247,11 @@ impl Daemon {
             fixture_mode,
             production_evidence: Arc::new(BTreeMap::new()),
             decision_runtime,
+            startup_decision_policy_hash: startup_policy_hash.clone(),
             execution_runtime,
             paper_commitment_runtime: PaperCommitmentRuntime::new(store.clone()),
             paper_dispatch_runtime: PaperDispatchRuntime::new(store.clone())
+                .with_startup_decision_policy_hash(startup_policy_hash)
                 .with_failpoint(PaperDispatchFailpoint::from_env()),
             outcome_scheduling_runtime: OutcomeSchedulingRuntime::new(store.clone()),
             paper: DaemonPaperState {

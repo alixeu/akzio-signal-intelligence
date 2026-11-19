@@ -84,7 +84,11 @@ impl Daemon {
             .date_naive()
             .to_string();
         let (workflow, setup) = self.prepare_position_plan(RunId::new(), &session, now)?;
-        self.store.commit_position_plan(&workflow, &setup)?;
+        self.store.commit_position_plan(
+            &workflow,
+            &setup,
+            self.startup_decision_policy_hash.as_ref(),
+        )?;
         if let Some(logger) = &self.run_log {
             logger.record(
                 &akzio_model::ModelAuditContext {
@@ -214,6 +218,7 @@ mod replay_tests {
                     slippage_ppm: 0,
                 },
                 decision_policy: Default::default(),
+                startup_decision_policy_hash: None,
                 runtime_identity_hash: None,
                 historical_evaluation_condition: None,
                 model_knowledge_cutoff: None,

@@ -209,6 +209,7 @@ impl Daemon {
                                 | akzio_execution::paper::PaperError::AccountIdentityUnavailable
                                 | akzio_execution::paper::PaperError::AccountMismatch
                                 | akzio_execution::paper::PaperError::ApprovalPolicyMismatch
+                                | akzio_execution::paper::PaperError::ActiveDecisionPolicyMismatch
                         ))
                         | DaemonError::Evidence(EvidenceRuntimeError::Adapter(
                             EvidenceAdapterError::RunLogUnavailable(_)

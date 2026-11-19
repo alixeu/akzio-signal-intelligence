@@ -117,7 +117,14 @@ impl Daemon {
                             let run_id = requested_run_id.unwrap_or_default();
                             let (workflow, setup) =
                                 operation.prepare_position_plan(run_id, &session, now)?;
-                            if let Err(error) = store.commit_position_plan(&workflow, &setup) {
+                            if let Err(error) = store.commit_position_plan(
+                                &workflow,
+                                &setup,
+                                operation.startup_decision_policy_hash.as_ref(),
+                            ) {
+                                if matches!(error, StoreError::DecisionPolicyRestartRequired) {
+                                    return Err(DaemonError::from(error).into());
+                                }
                                 return Err(FormalRunLaunchError::Unknown {
                                     run_id: store
                                         .workflow_snapshot(&workflow.run.run_id)

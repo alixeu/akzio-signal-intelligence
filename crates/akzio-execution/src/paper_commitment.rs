@@ -13,9 +13,9 @@
 // 返回已存在且逐项相同的 commitment，不会新建第二套订单身份。
 
 use akzio_domain::{
-    Artifact, ArtifactKind, ArtifactLifecycle, ArtifactRef, Asset, DomainError, ExecutionContext,
-    ExecutionVerdict, FreezeState, OrderSide, PaperCommitment, PaperCommitmentId, RunPurpose,
-    TaskWritePermit,
+    Artifact, ArtifactKind, ArtifactLifecycle, ArtifactRef, Asset, ContentHash, DomainError,
+    ExecutionContext, ExecutionVerdict, FreezeState, OrderSide, PaperCommitment, PaperCommitmentId,
+    RunPurpose, TaskWritePermit,
 };
 use akzio_store::{DaemonLease, ExecutionCommit, Store, StoreError};
 use chrono::{DateTime, Utc};
@@ -82,6 +82,7 @@ pub struct PaperCommitmentInput {
     pub permit: TaskWritePermit,
     pub verdict: ArtifactRef,
     pub session_key: String,
+    pub startup_decision_policy_hash: Option<ContentHash>,
     pub now: DateTime<Utc>,
 }
 
@@ -288,6 +289,7 @@ impl PaperCommitmentRuntime {
                 commitment: commitment.clone(),
                 committed_at: Utc::now(),
             },
+            input.startup_decision_policy_hash.as_ref(),
         )?;
         // 新写入时返回刚构造的 Artifact；若事务发现已有同一幂等 commitment，则重新从 Store
         // 读取其权威版本。只有此方法返回后，上层 dispatch 才可能接触 Paper adapter。

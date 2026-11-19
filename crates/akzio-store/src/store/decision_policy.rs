@@ -212,6 +212,22 @@ impl Store {
         read_decision_policy(&connection, policy_hash)
     }
 
+    /// The authoritative SQL selection, including an explicit missing head.
+    pub fn active_decision_policy_hash(&self) -> StoreResult<Option<ContentHash>> {
+        let connection = self.connection()?;
+        decision_policy_head_hash(&connection)
+    }
+
+    pub(super) fn assert_decision_policy_head(
+        connection: &Connection,
+        expected: Option<&ContentHash>,
+    ) -> StoreResult<()> {
+        if decision_policy_head_hash(connection)?.as_ref() != expected {
+            return Err(StoreError::DecisionPolicyRestartRequired);
+        }
+        Ok(())
+    }
+
     /// Copy only the selected immutable policy into an isolated Store. No Run,
     /// Outcome, credential or mutable policy state crosses this seam.
     // 只读取 source 的 active immutable Artifact/descriptor，把 BLOB staging 到目标 Store，

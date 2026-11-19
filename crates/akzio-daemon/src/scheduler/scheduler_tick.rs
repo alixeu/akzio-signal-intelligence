@@ -94,9 +94,12 @@ impl PaperScheduler {
             }
         }
         let stored_session_key = session_key.clone();
+        let startup_policy_hash = self.startup_decision_policy_hash.clone();
         if let Some(slot) = self
             .store_executor
-            .execute(move |store| store.session_slot(&stored_session_key))
+            .execute(move |store| {
+                store.session_slot_for_admission(&stored_session_key, startup_policy_hash.as_ref())
+            })
             .await??
         {
             self.acquire_or_renew_async().await?;
@@ -134,15 +137,7 @@ impl PaperScheduler {
         // A first canonical research session must be able to earn its future
         // calibration labels. No active policy means no trading approval is
         // bound, even if an older approval artifact exists in the Store.
-        let cold_start = self
-            .store_executor
-            .execute(|store| {
-                store
-                    .active_decision_policy()
-                    .map(|policy| policy.is_none())
-            })
-            .await??;
-        let binding = if cold_start {
+        let binding = if self.startup_decision_policy_hash.is_none() {
             None
         } else {
             let scheduler = self.clone();
@@ -164,11 +159,9 @@ impl PaperScheduler {
                     .execute(move |store| store.read_blob(&manifest_blob))
                     .await??,
             )?;
-            if let Some(expected) = &self.runtime_identity_hash {
-                if manifest_payload.runtime_identity_hash()? != *expected {
-                    eprintln!("Paper scheduler waiting: runtime identity does not match approval");
-                    return Ok(None);
-                }
+            if !self.manifest_matches_runtime(&manifest_payload)? {
+                eprintln!("Paper scheduler waiting: runtime identity does not match approval");
+                return Ok(None);
             }
             let account_id = clock.paper_account_id().await?;
             if manifest_payload.broker_account_id != account_id

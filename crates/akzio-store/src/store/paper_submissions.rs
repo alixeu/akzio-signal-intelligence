@@ -15,6 +15,7 @@ pub struct PaperSubmissionAuthority<'a> {
     pub lease: &'a DaemonLease,
     pub permit: &'a TaskWritePermit,
     pub commitment: &'a ArtifactRef,
+    pub startup_decision_policy_hash: Option<&'a ContentHash>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +66,103 @@ pub enum PaperSubmissionStop<'a> {
 }
 
 impl Store {
+    fn assert_new_submission_allowed(
+        &self,
+        transaction: &Transaction<'_>,
+        authority: &PaperSubmissionAuthority<'_>,
+        commitment: &PaperCommitment,
+    ) -> StoreResult<bool> {
+        let run_id = &authority.permit.run_id;
+        debug::assert_broker_write(transaction, run_id)?;
+        if run_cancelled(transaction, run_id)?
+            || paper_effect_terminal_exists(transaction, run_id, &authority.commitment.artifact_id)?
+        {
+            return Ok(false);
+        }
+        self.assert_paper_submission_decision_policy(transaction, authority, commitment)?;
+        if let Some(state) = Store::read_execution_freeze_state_with_connection(transaction)?
+            .filter(|state| state.frozen)
+        {
+            return Err(StoreError::ExecutionFrozen {
+                reason: state.reason,
+            });
+        }
+        Ok(true)
+    }
+
+    fn assert_paper_submission_decision_policy(
+        &self,
+        transaction: &Transaction<'_>,
+        authority: &PaperSubmissionAuthority<'_>,
+        commitment: &PaperCommitment,
+    ) -> StoreResult<()> {
+        let session_key = &commitment.broker_session;
+        let (manifest, _) = self
+            .read_consumed_paper_approval(transaction, session_key)?
+            .ok_or(StoreError::DecisionPolicyMismatch)?;
+        let run_id = &authority.permit.run_id;
+        let commitment_artifact = read_artifact(transaction, &authority.commitment.artifact_id)?;
+        let plan = self.validate_execution_commitment_lineage(
+            transaction,
+            &commitment_artifact,
+            commitment,
+            run_id,
+            session_key,
+        )?;
+        self.assert_fresh_paper_decision_policy(
+            transaction,
+            run_id,
+            &plan.decision_context,
+            &manifest.decision_policy_hash,
+            authority.startup_decision_policy_hash,
+        )
+    }
+
+    pub(super) fn assert_fresh_paper_decision_policy(
+        &self,
+        transaction: &Transaction<'_>,
+        run_id: &RunId,
+        decision_ref: &ArtifactRef,
+        approved_policy_hash: &ContentHash,
+        startup_policy_hash: Option<&ContentHash>,
+    ) -> StoreResult<()> {
+        if startup_policy_hash != Some(approved_policy_hash) {
+            return Err(StoreError::DecisionPolicyMismatch);
+        }
+        Self::assert_decision_policy_head(transaction, startup_policy_hash).map_err(|error| {
+            match error {
+                StoreError::DecisionPolicyRestartRequired => StoreError::DecisionPolicyMismatch,
+                other => StoreError::DecisionPolicyHeadUnavailable(Box::new(other)),
+            }
+        })?;
+        let decision_artifact = read_artifact(transaction, &decision_ref.artifact_id)?;
+        if decision_artifact.kind != decision_ref.kind
+            || decision_artifact.kind != ArtifactKind::DecisionContext
+            || decision_artifact.lifecycle != ArtifactLifecycle::Canonical
+            || decision_artifact
+                .origin
+                .as_ref()
+                .and_then(|origin| origin.run_id.as_ref())
+                != Some(run_id)
+        {
+            return Err(StoreError::InvalidPaperEffect(
+                decision_ref.artifact_id.clone(),
+            ));
+        }
+        let decision: akzio_domain::DecisionContext =
+            self.read_artifact_payload_with_connection(transaction, &decision_artifact)?;
+        decision.validate()?;
+        if decision.run_id != *run_id {
+            return Err(StoreError::InvalidPaperEffect(
+                decision_ref.artifact_id.clone(),
+            ));
+        }
+        if decision.decision_policy_hash != *approved_policy_hash {
+            return Err(StoreError::DecisionPolicyMismatch);
+        }
+        Ok(())
+    }
+
     /// Publish the batch intent together with one Ready row for every original ID.
     /// An existing unjournaled effect remains observation-only.
     pub fn begin_paper_submission_batch(
@@ -108,7 +206,7 @@ impl Store {
             transaction.commit()?;
             return Ok(batch);
         }
-        if !assert_new_submission_allowed(&transaction, authority)? {
+        if !self.assert_new_submission_allowed(&transaction, authority, &commitment)? {
             return Err(StoreError::InvalidPaperEffect(
                 reference.artifact_id.clone(),
             ));
@@ -169,7 +267,7 @@ impl Store {
             || orders
                 .iter()
                 .any(|order| order.state == PaperSubmissionState::PossiblySubmitted)
-            || !assert_new_submission_allowed(&transaction, authority)?
+            || !self.assert_new_submission_allowed(&transaction, authority, &commitment)?
         {
             return Ok(None);
         }
@@ -209,7 +307,7 @@ impl Store {
             || orders
                 .iter()
                 .any(|order| order.state == PaperSubmissionState::PossiblySubmitted)
-            || !assert_new_submission_allowed(&transaction, authority)?
+            || !self.assert_new_submission_allowed(&transaction, authority, &commitment)?
         {
             return Ok(PaperSubmissionAdmission::ObserveOnly);
         }
@@ -847,27 +945,6 @@ fn load_committed_paper(
     Ok((run_id, commitment))
 }
 
-fn assert_new_submission_allowed(
-    transaction: &Transaction<'_>,
-    authority: &PaperSubmissionAuthority<'_>,
-) -> StoreResult<bool> {
-    let run_id = &authority.permit.run_id;
-    debug::assert_broker_write(transaction, run_id)?;
-    if run_cancelled(transaction, run_id)?
-        || paper_effect_terminal_exists(transaction, run_id, &authority.commitment.artifact_id)?
-    {
-        return Ok(false);
-    }
-    if let Some(state) = Store::read_execution_freeze_state_with_connection(transaction)?
-        .filter(|state| state.frozen)
-    {
-        return Err(StoreError::ExecutionFrozen {
-            reason: state.reason,
-        });
-    }
-    Ok(true)
-}
-
 fn run_cancelled(connection: &Connection, run_id: &RunId) -> StoreResult<bool> {
     Ok(connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM rebuild_run_cancellations WHERE run_id = ?1)",
@@ -1288,9 +1365,10 @@ mod tests {
     use super::*;
     use crate::store::workflow::retired_debug_execution_tests::formal_fixture;
     use akzio_domain::{
-        DecisionId, DependencyClosure, FactorExposure, HardBlocker, MandateAssessment,
-        MarketClockSnapshot, MoneyMicros, OrderIntent, OrderReceiptState, PaperCommitmentId,
-        PaperRepriceId, PreTradeSafetySnapshot, TargetPortfolio,
+        DependencyClosure, FactorExposure, HardBlocker, MandateAssessment, MandateSnapshot,
+        MarketClockSnapshot, ModelQualificationEvidence, ModelQualificationReport, MoneyMicros,
+        OrderIntent, OrderReceiptState, PaperApprovalScope, PaperCommitmentId, PaperRepriceId,
+        PreTradeSafetySnapshot, TargetPortfolio,
     };
 
     struct Fixture {
@@ -1299,6 +1377,7 @@ mod tests {
         permit: TaskWritePermit,
         commitment: ArtifactRef,
         plan_hash: ContentHash,
+        startup_policy_hash: ContentHash,
     }
 
     impl Fixture {
@@ -1323,154 +1402,14 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .permit;
+            let startup_policy_hash = ContentHash::of_bytes(b"fixture decision policy");
+            activate_fixture_policy(&store, &startup_policy_hash);
             let session_key = now.date_naive().to_string();
-            let hash = ContentHash::of_bytes(b"fixture policy");
-            let target = TargetPortfolio::zeroed();
-            let decision_at = valid_until - Duration::minutes(5);
-            let mut artifacts = Vec::new();
-            let mut stage = |kind, payload: serde_json::Value, sources| {
-                let artifact = fixture_artifact(&store, &permit, kind, &payload, sources);
-                let artifact_ref = reference(&artifact);
-                artifacts.push(artifact);
-                artifact_ref
-            };
-            let decision = stage(
-                ArtifactKind::DecisionContext,
-                serde_json::json!({
-                    "schema_version": DOMAIN_SCHEMA_VERSION,
-                    "decision_id": DecisionId::new(), "run_id": run_id,
-                    "claims": [], "critiques": [], "evidence": [], "policy_influences": [],
-                    "material_conflicts": [], "hard_blockers": [HardBlocker::MissingEvidence],
-                    "soft_warnings": [], "decision_policy_hash": hash, "target": target,
-                    "created_at": decision_at,
-                    "validity": {
-                        "evidence_cutoff": decision_at, "generated_at": decision_at,
-                        "valid_until": valid_until, "maximum_execution_delay_ms": 300_000,
-                        "market_state_hash": hash,
-                    },
-                }),
-                vec![],
-            );
-            let account = stage(
-                ArtifactKind::NormalizedEvidence,
-                serde_json::json!("account"),
-                vec![],
-            );
-            let quotes = stage(
-                ArtifactKind::NormalizedEvidence,
-                serde_json::json!("quotes"),
-                vec![],
-            );
-            let clock = stage(
-                ArtifactKind::NormalizedEvidence,
-                serde_json::to_value(MarketClockSnapshot {
-                    session: None,
-                    schema_version: DOMAIN_SCHEMA_VERSION,
-                    broker_session: session_key.clone(),
-                    is_open: true,
-                    observed_at: decision_at,
-                })
-                .unwrap(),
-                vec![],
-            );
-            let mut plan = ExecutionPlan {
-                schema_version: DOMAIN_SCHEMA_VERSION,
-                decision_context: decision.clone(),
-                account_snapshot: account.clone(),
-                quote_snapshot: quotes.clone(),
-                market_clock_snapshot: clock.clone(),
-                policy_hash: hash.clone(),
-                maximum_total_notional: MoneyMicros(50_000_000),
-                factor_exposure: FactorExposure::from_target(&target).unwrap(),
-                target,
-                orders: [Asset::Qqq, Asset::Soxx]
-                    .into_iter()
-                    .map(|asset| OrderIntent {
-                        extended_hours: false,
-                        asset,
-                        side: OrderSide::Sell,
-                        notional: MoneyMicros(25_000_000),
-                        limit_price: MoneyMicros(25_000_000),
-                    })
-                    .collect(),
-                gross_exposure_ppm: 0,
-                net_exposure_ppm: 0,
-                turnover_ppm: 0,
-                broker_session: session_key.clone(),
-                created_at: decision_at,
-                plan_hash: hash.clone(),
-            };
-            plan.refresh_hash().unwrap();
-            let plan_hash = plan.plan_hash.clone();
-            let mut sources = vec![
-                decision.clone(),
-                account.clone(),
-                quotes.clone(),
-                clock.clone(),
-            ];
-            let plan_ref = stage(
-                ArtifactKind::ExecutionPlan,
-                serde_json::to_value(&plan).unwrap(),
-                sources.clone(),
-            );
-            sources.push(plan_ref.clone());
-            let context_ref = stage(
-                ArtifactKind::ExecutionContext,
-                serde_json::to_value(ExecutionContext {
-                    schema_version: DOMAIN_SCHEMA_VERSION,
-                    run_id: run_id.clone(),
-                    decision_context: decision,
-                    account_snapshot: Some(account),
-                    quote_snapshot: Some(quotes),
-                    market_clock_snapshot: Some(clock),
-                    execution_plan: Some(plan_ref),
-                    factor_exposure: Some(plan.factor_exposure),
-                    turnover_ppm: Some(0),
-                    plan_hash: Some(plan_hash.clone()),
-                    broker_session: Some(session_key.clone()),
-                    mandate_assessment: Some(MandateAssessment {
-                        mandate_hash: hash,
-                        violations: Default::default(),
-                        distance_before_ppm: 0,
-                        distance_after_ppm: 0,
-                    }),
-                    pretrade_safety: Some(PreTradeSafetySnapshot {
-                        ordered_assets: [Asset::Qqq, Asset::Soxx].into(),
-                        information_classifications: Default::default(),
-                        recent_compliance_activity: Default::default(),
-                        dependency_closure: DependencyClosure {
-                            captured_at: decision_at,
-                            dependencies: Default::default(),
-                        },
-                        capacity_scenario: None,
-                        missing_average_daily_dollar_volume: Default::default(),
-                        compliance_violations_by_asset: [
-                            (Asset::Qqq, Default::default()),
-                            (Asset::Soxx, Default::default()),
-                        ]
-                        .into(),
-                        missing_information_classifications: Default::default(),
-                        risk_increasing: false,
-                        dependency_permits_new_risk: false,
-                        dependency_permits_risk_reduction: true,
-                        permits_execution: true,
-                        permits_risk_increasing: false,
-                    }),
-                    final_process_quality: None,
-                    frozen: false,
-                    created_at: decision_at,
-                })
-                .unwrap(),
-                sources,
-            );
-            let verdict = stage(
-                ArtifactKind::ExecutionVerdict,
-                serde_json::to_value(ExecutionVerdict::Accepted {
-                    execution_context: context_ref.clone(),
-                })
-                .unwrap(),
-                vec![context_ref.clone()],
-            );
+            let (manifest, approval) = approval_fixture(&store, &startup_policy_hash, now);
+            let (prerequisites, context, verdict, plan_hash) =
+                execution_fixture(&store, &permit, &startup_policy_hash, now, valid_until);
+            let context_ref = reference(&context);
+            let verdict_ref = reference(&verdict);
             let commitment = fixture_artifact(
                 &store,
                 &permit,
@@ -1487,7 +1426,7 @@ mod tests {
                     .into(),
                     created_at: now,
                 },
-                vec![context_ref, verdict],
+                vec![context_ref, verdict_ref],
             );
             // Upstream accepted slot and immutable identity are fixture inputs.
             // Journal operations below use real Store entry points and fences.
@@ -1496,15 +1435,23 @@ mod tests {
                 let transaction = connection
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .unwrap();
-                for artifact in &artifacts {
+                for artifact in prerequisites
+                    .iter()
+                    .chain([&context, &verdict, &commitment])
+                {
                     insert_artifact(&transaction, artifact).unwrap();
                 }
-                insert_artifact(&transaction, &commitment).unwrap();
                 transaction.execute(
                     "INSERT INTO rebuild_session_slots (session_key, run_id, topology_id, graph_artifact_id,
                          run_created_at, scheduler_epoch, reserved_at, commitment_artifact_id, committed_at)
                      VALUES (?1, ?2, 'retired-debug-execution-test', ?3, ?4, ?5, ?4, ?6, ?4)",
                     params![session_key, run_id.0, graph_id.0.as_str(), now.to_rfc3339(), lease.epoch, commitment.artifact_id.0.as_str()],
+                ).unwrap();
+                transaction.execute(
+                    "INSERT INTO rebuild_paper_approval_consumptions
+                       (approval_artifact_id, runtime_manifest_artifact_id, session_key, consumed_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![approval.artifact_id.0.as_str(), manifest.artifact_id.0.as_str(), session_key, now.to_rfc3339()],
                 ).unwrap();
                 transaction.commit().unwrap();
             }
@@ -1514,6 +1461,7 @@ mod tests {
                 permit,
                 commitment: reference(&commitment),
                 plan_hash,
+                startup_policy_hash,
             }
         }
 
@@ -1522,6 +1470,7 @@ mod tests {
                 lease: &self.lease,
                 permit: &self.permit,
                 commitment: &self.commitment,
+                startup_decision_policy_hash: Some(&self.startup_policy_hash),
             }
         }
 
@@ -1601,11 +1550,417 @@ mod tests {
         .unwrap()
     }
 
+    fn execution_fixture(
+        store: &Store,
+        permit: &TaskWritePermit,
+        startup_policy_hash: &ContentHash,
+        now: DateTime<Utc>,
+        valid_until: DateTime<Utc>,
+    ) -> ([Artifact; 5], Artifact, Artifact, ContentHash) {
+        let run_id = &permit.run_id;
+        let broker_session = now.date_naive().to_string();
+        let target = TargetPortfolio::zeroed();
+        let decision_at = valid_until - Duration::minutes(5);
+        let decision = fixture_artifact(
+            store,
+            permit,
+            ArtifactKind::DecisionContext,
+            &serde_json::json!({
+                "schema_version": DOMAIN_SCHEMA_VERSION, "decision_id": "offline-decision", "run_id": run_id,
+                "claims": [], "critiques": [], "evidence": [], "policy_influences": [], "material_conflicts": [],
+                "hard_blockers": [HardBlocker::MissingEvidence], "soft_warnings": [],
+                "decision_policy_hash": startup_policy_hash, "target": target, "created_at": decision_at,
+                "validity": {
+                    "evidence_cutoff": decision_at, "generated_at": decision_at,
+                    "valid_until": valid_until, "maximum_execution_delay_ms": 300_000,
+                    "market_state_hash": startup_policy_hash,
+                },
+            }),
+            vec![],
+        );
+        let snapshot = |name| {
+            fixture_artifact(
+                store,
+                permit,
+                ArtifactKind::NormalizedEvidence,
+                &name,
+                vec![],
+            )
+        };
+        let account = snapshot("account");
+        let quote = snapshot("quote");
+        let clock = fixture_artifact(
+            store,
+            permit,
+            ArtifactKind::NormalizedEvidence,
+            &MarketClockSnapshot {
+                session: None,
+                schema_version: DOMAIN_SCHEMA_VERSION,
+                broker_session: broker_session.clone(),
+                is_open: true,
+                observed_at: decision_at,
+            },
+            vec![],
+        );
+        let sources = vec![
+            reference(&decision),
+            reference(&account),
+            reference(&quote),
+            reference(&clock),
+        ];
+        let factor_exposure = FactorExposure::from_target(&target).unwrap();
+        let mut plan = ExecutionPlan {
+            schema_version: DOMAIN_SCHEMA_VERSION,
+            decision_context: reference(&decision),
+            account_snapshot: reference(&account),
+            quote_snapshot: reference(&quote),
+            market_clock_snapshot: reference(&clock),
+            policy_hash: ContentHash::of_bytes(b"fixture allocation policy"),
+            maximum_total_notional: MoneyMicros(10_000_000),
+            target,
+            orders: [Asset::Qqq, Asset::Soxx]
+                .into_iter()
+                .map(|asset| OrderIntent {
+                    asset,
+                    extended_hours: false,
+                    side: OrderSide::Sell,
+                    notional: MoneyMicros(1_000_000),
+                    limit_price: MoneyMicros(1_000_000),
+                })
+                .collect(),
+            gross_exposure_ppm: 0,
+            net_exposure_ppm: 0,
+            factor_exposure: factor_exposure.clone(),
+            turnover_ppm: 0,
+            broker_session: broker_session.clone(),
+            created_at: now,
+            plan_hash: startup_policy_hash.clone(),
+        };
+        plan.refresh_hash().unwrap();
+        let plan_artifact = fixture_artifact(
+            store,
+            permit,
+            ArtifactKind::ExecutionPlan,
+            &plan,
+            sources.clone(),
+        );
+        let context = ExecutionContext {
+            schema_version: DOMAIN_SCHEMA_VERSION,
+            run_id: run_id.clone(),
+            decision_context: reference(&decision),
+            account_snapshot: Some(reference(&account)),
+            quote_snapshot: Some(reference(&quote)),
+            market_clock_snapshot: Some(reference(&clock)),
+            execution_plan: Some(reference(&plan_artifact)),
+            factor_exposure: Some(factor_exposure),
+            turnover_ppm: Some(0),
+            plan_hash: Some(plan.plan_hash.clone()),
+            broker_session: Some(broker_session),
+            mandate_assessment: Some(MandateAssessment {
+                mandate_hash: MandateSnapshot::default().identity_hash(),
+                violations: Default::default(),
+                distance_before_ppm: 0,
+                distance_after_ppm: 0,
+            }),
+            pretrade_safety: Some(PreTradeSafetySnapshot {
+                ordered_assets: [Asset::Qqq, Asset::Soxx].into(),
+                information_classifications: Default::default(),
+                recent_compliance_activity: Default::default(),
+                dependency_closure: DependencyClosure {
+                    captured_at: now,
+                    dependencies: Default::default(),
+                },
+                capacity_scenario: None,
+                missing_average_daily_dollar_volume: Default::default(),
+                compliance_violations_by_asset: [
+                    (Asset::Qqq, Default::default()),
+                    (Asset::Soxx, Default::default()),
+                ]
+                .into(),
+                missing_information_classifications: Default::default(),
+                risk_increasing: false,
+                dependency_permits_new_risk: false,
+                dependency_permits_risk_reduction: true,
+                permits_execution: true,
+                permits_risk_increasing: false,
+            }),
+            final_process_quality: None,
+            frozen: false,
+            created_at: now,
+        };
+        let context = fixture_artifact(
+            store,
+            permit,
+            ArtifactKind::ExecutionContext,
+            &context,
+            [sources, vec![reference(&plan_artifact)]].concat(),
+        );
+        let verdict = fixture_artifact(
+            store,
+            permit,
+            ArtifactKind::ExecutionVerdict,
+            &ExecutionVerdict::Accepted {
+                execution_context: reference(&context),
+            },
+            vec![reference(&context)],
+        );
+        (
+            [decision, account, quote, clock, plan_artifact],
+            context,
+            verdict,
+            plan.plan_hash,
+        )
+    }
+
+    fn approval_fixture(
+        store: &Store,
+        policy_hash: &ContentHash,
+        now: DateTime<Utc>,
+    ) -> (Artifact, Artifact) {
+        let expires_at = now + Duration::hours(1);
+        let components = BTreeMap::from([("default".to_owned(), policy_hash.clone())]);
+        let bundle_hash = akzio_domain::runtime_component_bundle_hash(&components).unwrap();
+        let manifest: RuntimeManifest = serde_json::from_value(serde_json::json!({
+            "schema_version": DOMAIN_SCHEMA_VERSION, "code_revision": "fixture", "rust_toolchain": "1.96.0",
+            "experiment_profile": "fixture", "model_capability_hashes": components,
+            "model_capability_bundle_hash": bundle_hash, "governance_component_hashes": components,
+            "governance_bundle_hash": bundle_hash, "cargo_lock_hash": policy_hash, "config_hash": policy_hash,
+            "provider_id": "fixture", "model_id": "fixture", "prompt_hash": policy_hash,
+            "contract_hash": policy_hash, "topology_hash": policy_hash, "decision_policy_hash": policy_hash,
+            "execution_policy_hash": policy_hash, "evaluation_policy_hash": policy_hash, "market_data_feed": "sip",
+            "broker_account_id": "offline-account", "maximum_notional": 10_000_000,
+            "allowed_session_start": now.date_naive(), "allowed_session_end": now.date_naive(),
+            "expires_at": expires_at, "created_at": now,
+        })).unwrap();
+        let manifest_artifact =
+            canonical_fixture_artifact(store, ArtifactKind::RuntimeManifest, &manifest, vec![]);
+        let evidence_ref = |kind| ArtifactRef {
+            artifact_id: ArtifactId(policy_hash.clone()),
+            kind,
+        };
+        let mut qualification = ModelQualificationReport {
+            key: manifest.runtime_identity().qualification_key().unwrap(),
+            behavior_fingerprint: policy_hash.clone(),
+            evidence: ModelQualificationEvidence {
+                frozen_context_manifest: evidence_ref(ArtifactKind::ContextManifest),
+                replay_evaluation: evidence_ref(ArtifactKind::Evaluation),
+                adversarial_evaluation: evidence_ref(ArtifactKind::Evaluation),
+                execution_simulation_evaluation: evidence_ref(ArtifactKind::Evaluation),
+                shadow_evaluation: evidence_ref(ArtifactKind::Evaluation),
+                canary_evaluation: evidence_ref(ArtifactKind::Evaluation),
+            },
+            replay_passed: true,
+            adversarial_passed: true,
+            execution_simulation_passed: true,
+            shadow_passed: true,
+            canary_passed: true,
+            critical_regressions: 0,
+            approved_by: "fixture operator".into(),
+            qualified_at: now,
+            expires_at,
+            report_hash: policy_hash.clone(),
+        };
+        qualification.report_hash = qualification.unsigned_hash();
+        let manifest_ref = reference(&manifest_artifact);
+        let mut approval = PaperLaunchApproval {
+            schema_version: DOMAIN_SCHEMA_VERSION,
+            operator_identity: "fixture operator".into(),
+            runtime_manifest: manifest_ref.clone(),
+            runtime_manifest_hash: manifest.manifest_hash().unwrap(),
+            scope: PaperApprovalScope::Canary,
+            reason: "journal policy fixture".into(),
+            behavior_bundle_hash: None,
+            approved_at: now,
+            expires_at,
+            qualification,
+            mandate: MandateSnapshot::default(),
+            approval_hash: policy_hash.clone(),
+        };
+        approval.approval_hash = approval.unsigned_hash().unwrap();
+        let approval_artifact = canonical_fixture_artifact(
+            store,
+            ArtifactKind::PaperLaunchApproval,
+            &approval,
+            vec![manifest_ref],
+        );
+        store
+            .write_paper_approval_binding(&manifest_artifact, &approval_artifact)
+            .unwrap();
+        (manifest_artifact, approval_artifact)
+    }
+
+    fn activate_fixture_policy(store: &Store, policy_hash: &ContentHash) {
+        let now = Utc::now();
+        let artifact =
+            canonical_fixture_artifact(store, ArtifactKind::DecisionPolicy, policy_hash, vec![]);
+        store
+            .activate_decision_policy(
+                &artifact,
+                &crate::DecisionPolicyDescriptor {
+                    policy_hash: policy_hash.clone(),
+                    envelope_hash: artifact.blob.hash.clone(),
+                    model_id: "fixture".into(),
+                    provider_id: "fixture".into(),
+                    model_route: "research.synthesizer".into(),
+                    model_version_hash: ContentHash::of_bytes(b"fixture model"),
+                    contract_hash: ContentHash::of_bytes(b"fixture contract"),
+                },
+                now,
+            )
+            .unwrap();
+    }
+
+    fn canonical_fixture_artifact(
+        store: &Store,
+        kind: ArtifactKind,
+        payload: &impl Serialize,
+        refs: Vec<ArtifactRef>,
+    ) -> Artifact {
+        let now = Utc::now();
+        Artifact::new(
+            kind,
+            store.stage_json(payload).unwrap(),
+            "test.paper_submission",
+            ArtifactLifecycle::Canonical,
+            ArtifactProvenance {
+                source_family: "akzio.test".into(),
+                observed_at: None,
+                retrieved_at: now,
+                source_uri: None,
+                confidence_ppm: 1_000_000,
+                producer_contract_hash: None,
+            },
+            None,
+            refs,
+            now,
+        )
+        .unwrap()
+    }
+
     fn reference(artifact: &Artifact) -> ArtifactRef {
         ArtifactRef {
             artifact_id: artifact.artifact_id.clone(),
             kind: artifact.kind,
         }
+    }
+
+    /// WHY THIS TEST EXISTS (Task #7): Activating a different policy after the first receipt must veto the next admission without erasing the original order or its receipt.
+    /// Do not weaken or delete this assertion.
+    #[test]
+    fn active_policy_switch_stops_next_admission_and_preserves_receipt() {
+        let fixture = Fixture::new();
+        let authority = fixture.authority();
+        let no_active_startup = PaperSubmissionAuthority {
+            startup_decision_policy_hash: None,
+            ..authority
+        };
+        assert!(matches!(
+            fixture
+                .store
+                .begin_paper_submission_batch(&no_active_startup),
+            Err(StoreError::DecisionPolicyMismatch)
+        ));
+        assert!(fixture
+            .store
+            .paper_submission_batch(&fixture.commitment)
+            .unwrap()
+            .is_none());
+        fixture
+            .store
+            .begin_paper_submission_batch(&authority)
+            .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .admit_paper_submission(&authority, "qqq-r0", fixture.lease.expires_at)
+                .unwrap(),
+            PaperSubmissionAdmission::Admitted
+        );
+        let receipt = fixture.receipt(OrderReceiptState::PartiallyFilled, 300_000, Utc::now());
+        fixture
+            .store
+            .record_paper_submission_receipt(&authority, &receipt)
+            .unwrap();
+        let orders = journal_orders(
+            fixture
+                .store
+                .paper_submission_batch(&fixture.commitment)
+                .unwrap()
+                .unwrap(),
+        );
+        let original_receipt = find_order(&orders, "qqq-r0")
+            .unwrap()
+            .receipt
+            .clone()
+            .unwrap();
+        let reprice = fixture.reprice(original_receipt, Utc::now());
+        assert_eq!(
+            fixture
+                .store
+                .begin_paper_reprice_submission(&authority, &reprice)
+                .unwrap()
+                .unwrap()
+                .state,
+            PaperSubmissionState::Ready
+        );
+        let operator_store = Store::open(fixture.store.root()).unwrap();
+        let new_policy = ContentHash::of_bytes(b"new active policy");
+        activate_fixture_policy(&operator_store, &new_policy);
+        assert!(matches!(
+            fixture
+                .store
+                .admit_paper_submission(&authority, "soxx-r0", fixture.lease.expires_at),
+            Err(StoreError::DecisionPolicyMismatch)
+        ));
+        assert!(matches!(
+            fixture
+                .store
+                .admit_paper_submission(&authority, "qqq-r1", fixture.lease.expires_at),
+            Err(StoreError::DecisionPolicyMismatch)
+        ));
+        let restarted = PaperSubmissionAuthority {
+            startup_decision_policy_hash: Some(&new_policy),
+            ..authority
+        };
+        assert!(matches!(
+            fixture
+                .store
+                .admit_paper_submission(&restarted, "soxx-r0", fixture.lease.expires_at),
+            Err(StoreError::DecisionPolicyMismatch)
+        ));
+        let terminal = fixture.receipt(OrderReceiptState::Filled, 1_000_000, Utc::now());
+        fixture
+            .store
+            .record_paper_submission_receipt(&restarted, &terminal)
+            .unwrap();
+        let orders = journal_orders(
+            fixture
+                .store
+                .paper_submission_batch(&fixture.commitment)
+                .unwrap()
+                .unwrap(),
+        );
+        let observed = find_order(&orders, "qqq-r0").unwrap();
+        assert_eq!(observed.state, PaperSubmissionState::Terminal);
+        let observed_receipt = observed.receipt.as_ref().unwrap();
+        let artifact = fixture
+            .store
+            .artifact(&observed_receipt.artifact_id)
+            .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .read_artifact_payload::<OrderReceipt>(&artifact)
+                .unwrap(),
+            terminal
+        );
+        let replacement = find_order(&orders, "qqq-r1").unwrap();
+        assert_eq!(replacement.state, PaperSubmissionState::Ready);
+        assert_eq!(replacement.transition_index, 0);
+        assert_eq!(replacement.reprice, Some(reprice));
+        let unsubmitted = find_order(&orders, "soxx-r0").unwrap();
+        assert_eq!(unsubmitted.state, PaperSubmissionState::Ready);
+        assert_eq!(unsubmitted.transition_index, 0);
     }
 
     fn journal_orders(batch: PaperSubmissionBatch) -> Vec<PaperSubmissionOrder> {

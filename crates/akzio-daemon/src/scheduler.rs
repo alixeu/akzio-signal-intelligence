@@ -310,6 +310,7 @@ pub struct PaperScheduler {
     lease: Arc<Mutex<Option<DaemonLease>>>,
     market_data_feed: Option<AlpacaMarketDataFeed>,
     runtime_identity_hash: Option<akzio_domain::ContentHash>,
+    startup_decision_policy_hash: Option<akzio_domain::ContentHash>,
     run_log: Option<Arc<crate::RunLogger>>,
 }
 

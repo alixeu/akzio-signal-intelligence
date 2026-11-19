@@ -71,12 +71,8 @@ impl PaperScheduler {
                 .execute(move |store| store.read_blob(&manifest_blob))
                 .await??,
         )?;
-        if let Some(expected) = &self.runtime_identity_hash {
-            if manifest_payload.runtime_identity_hash()? != *expected {
-                return Ok(None);
-            }
-        }
-        if manifest_payload.code_revision != campaign.spec.source_revision
+        if !self.manifest_matches_runtime(&manifest_payload)?
+            || manifest_payload.code_revision != campaign.spec.source_revision
             || manifest_payload.maximum_notional != campaign.spec.maximum_total_notional
         {
             return Ok(None);

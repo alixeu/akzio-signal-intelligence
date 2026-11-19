@@ -23,6 +23,7 @@ impl PaperScheduler {
             lease: Arc::new(Mutex::new(None)),
             market_data_feed: None,
             runtime_identity_hash: None,
+            startup_decision_policy_hash: None,
             run_log: None,
         })
     }
@@ -58,6 +59,28 @@ impl PaperScheduler {
         // identity hash 只用于 reservation 与 approval binding 的等值检查，不产生 approval。
         self.runtime_identity_hash = runtime_identity_hash;
         self
+    }
+
+    /// Bind admission to the active hash selected by this Core at startup.
+    pub fn with_startup_decision_policy_hash(
+        mut self,
+        policy_hash: Option<akzio_domain::ContentHash>,
+    ) -> Self {
+        self.startup_decision_policy_hash = policy_hash;
+        self
+    }
+
+    pub(super) fn manifest_matches_runtime(
+        &self,
+        manifest: &RuntimeManifest,
+    ) -> SchedulerResult<bool> {
+        if self.startup_decision_policy_hash.as_ref() != Some(&manifest.decision_policy_hash) {
+            return Ok(false);
+        }
+        if let Some(expected) = &self.runtime_identity_hash {
+            return Ok(manifest.runtime_identity_hash()? == *expected);
+        }
+        Ok(true)
     }
 
     pub fn with_lease_duration(mut self, lease_duration: Duration) -> SchedulerResult<Self> {
