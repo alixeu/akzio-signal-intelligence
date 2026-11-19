@@ -46,6 +46,12 @@ impl AuditedPaperBroker {
 }
 
 impl CommittedPaperBroker for AuditedPaperBroker {
+    fn paper_account_id(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = akzio_execution::paper::Result<String>> + Send + '_>> {
+        self.inner.paper_account_id()
+    }
+
     fn observe_existing_commitment<'a>(
         &'a self,
         commitment: &'a PaperCommitment,

@@ -64,7 +64,6 @@ use akzio_execution::{
     ExecutionGateInput, ExecutionGatePolicy, ExecutionPlan, ExecutionPolicy, ExecutionRuntime,
     PaperCommitmentError, PaperCommitmentInput, PaperCommitmentRuntime, PaperDispatchError,
     PaperDispatchFailpoint, PaperDispatchInput, PaperDispatchRuntime,
-    DEFAULT_PAPER_SETTLEMENT_ACTION_GRACE_SECS, DEFAULT_PAPER_SETTLEMENT_TIMEOUT_SECS,
 };
 pub use akzio_ingest::AlpacaMarketDataFeed;
 use akzio_ingest::{
@@ -206,27 +205,11 @@ pub struct RuntimePolicyIdentity {
 // `decision_policy` 只借用输入，失败经 DaemonError 向启动/审批调用方传播。
 pub fn runtime_policy_identity(decision_policy: &DecisionPolicy) -> Result<RuntimePolicyIdentity> {
     let evaluation_policy = EvaluationPolicy::default();
-    let execution_policy = ExecutionPolicy::default();
-    execution_policy
-        .validate()
-        .map_err(|error| DaemonError::InvalidInput(error.to_string()))?;
-    let execution_gate_policy = ExecutionGatePolicy::default();
-    execution_gate_policy
-        .validate()
-        .map_err(|error| DaemonError::InvalidInput(error.to_string()))?;
     Ok(RuntimePolicyIdentity {
         decision_policy_hash: decision_policy
             .policy_hash()
             .map_err(|error| DaemonError::InvalidInput(error.to_string()))?,
-        execution_policy_hash: content_hash_json(&serde_json::json!({
-            "version": 1,
-            "allocation_policy": execution_policy,
-            "execution_gate_policy": execution_gate_policy,
-            "paper_dispatch": {
-                "settlement_timeout_secs": DEFAULT_PAPER_SETTLEMENT_TIMEOUT_SECS,
-                "settlement_action_grace_secs": DEFAULT_PAPER_SETTLEMENT_ACTION_GRACE_SECS
-            }
-        }))?,
+        execution_policy_hash: akzio_execution::paper::paper_execution_policy_hash()?,
         evaluation_policy_hash: content_hash_json(&serde_json::json!({
             "minimum_evidence_completeness_ppm": evaluation_policy.minimum_evidence_completeness_ppm,
             "minimum_risk_recall_ppm": evaluation_policy.minimum_risk_recall_ppm,

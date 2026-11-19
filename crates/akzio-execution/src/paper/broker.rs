@@ -3,6 +3,21 @@
 // commitment、授权和恢复语义，不在 trait adapter 中增加新的业务分支。
 
 impl CommittedPaperBroker for AlpacaPaper {
+    fn paper_account_id(&self) -> Pin<Box<dyn Future<Output = Result<String>> + Send + '_>> {
+        Box::pin(async move {
+            let account = self
+                .account()
+                .await
+                .map_err(|_| PaperError::AccountIdentityUnavailable)?;
+            account
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+                .ok_or(PaperError::AccountIdentityUnavailable)
+        })
+    }
+
     fn observe_existing_commitment<'a>(
         &'a self,
         commitment: &'a PaperCommitment,

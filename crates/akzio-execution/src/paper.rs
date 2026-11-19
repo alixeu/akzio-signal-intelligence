@@ -54,6 +54,12 @@ pub enum PaperError {
     },
     #[error("frozen decision, approval or execution snapshot no longer authorizes submission")]
     SubmissionUnauthorized,
+    #[error("Paper account identity could not be verified")]
+    AccountIdentityUnavailable,
+    #[error("current Paper account does not match the Run's consumed approval")]
+    AccountMismatch,
+    #[error("the Run's Decision or ExecutionPolicy does not match its consumed Paper approval")]
+    ApprovalPolicyMismatch,
     #[error("Alpaca Paper market is closed")]
     MarketClosed,
     #[error("broker response omitted {0}")]
@@ -145,6 +151,11 @@ pub use submission_authorization::PaperSubmissionAuthorization;
 // Pin 让被轮询的 future 保持固定地址，Send 允许 Tokio 将其交给可跨线程调度的任务。
 // Future 本身惰性，只有调用方 await/调度器 poll 才运行；Send + Sync 约束 broker 可安全共享。
 pub trait CommittedPaperBroker: Send + Sync {
+    /// Verify the account using the same credentials as the order methods.
+    fn paper_account_id(&self) -> Pin<Box<dyn Future<Output = Result<String>> + Send + '_>> {
+        Box::pin(async { Err(PaperError::AccountIdentityUnavailable) })
+    }
+
     /// Lookup only the immutable client IDs already bound to a Commitment.
     /// The default refuses this safety path; only an explicitly implemented
     /// adapter can claim that it never submits or replaces an order here.
@@ -193,9 +204,9 @@ pub trait CommittedPaperBroker: Send + Sync {
 #[path = "paper_dispatch.rs"]
 mod paper_dispatch;
 pub use paper_dispatch::{
-    PaperDispatchError, PaperDispatchFailpoint, PaperDispatchInput, PaperDispatchOutput,
-    PaperDispatchResult, PaperDispatchRuntime, DEFAULT_PAPER_SETTLEMENT_ACTION_GRACE_SECS,
-    DEFAULT_PAPER_SETTLEMENT_TIMEOUT_SECS,
+    paper_execution_policy_hash, PaperDispatchError, PaperDispatchFailpoint, PaperDispatchInput,
+    PaperDispatchOutput, PaperDispatchResult, PaperDispatchRuntime,
+    DEFAULT_PAPER_SETTLEMENT_ACTION_GRACE_SECS, DEFAULT_PAPER_SETTLEMENT_TIMEOUT_SECS,
 };
 fn receipt_state(status: &str) -> PaperDispatchResult<OrderReceiptState> {
     // `match` 穷尽已知 wire status；输入先 trim/转小写，未列出的状态保留原规范化文本

@@ -201,8 +201,14 @@ impl Daemon {
                     &error,
                     DaemonError::RunLogUnavailable(_)
                         | DaemonError::Research(ResearchError::RunLogUnavailable(_))
+                        | DaemonError::PaperDispatch(
+                            PaperDispatchError::RecordedEffectObservationUnavailable(_)
+                        )
                         | DaemonError::PaperDispatch(PaperDispatchError::Broker(
                             akzio_execution::paper::PaperError::RunLogUnavailable(_)
+                                | akzio_execution::paper::PaperError::AccountIdentityUnavailable
+                                | akzio_execution::paper::PaperError::AccountMismatch
+                                | akzio_execution::paper::PaperError::ApprovalPolicyMismatch
                         ))
                         | DaemonError::Evidence(EvidenceRuntimeError::Adapter(
                             EvidenceAdapterError::RunLogUnavailable(_)
