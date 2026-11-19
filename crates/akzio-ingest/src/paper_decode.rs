@@ -12,7 +12,7 @@ use akzio_domain::{
     AccountSnapshot, Asset, DomainError, MarketClockSnapshot, MoneyMicros, Position, Quote,
     QuoteSnapshot, DOMAIN_SCHEMA_VERSION,
 };
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -46,6 +46,50 @@ pub fn parse_daily_bars(
             })?;
         return Ok(BTreeMap::from([(observed_at.date_naive(), close)]));
     };
+    parse_dated_bars(items, |timestamp| timestamp.date_naive())
+}
+
+/// Require each available scheduled bar to identify the same UTC close frozen at T0.
+/// A missing price is left for the caller to defer; a present bar without close proof is invalid.
+pub fn parse_scheduled_daily_bars(
+    value: &Value,
+    sessions: &[crate::ScheduledSession; 5],
+) -> PaperDecodeResult<BTreeMap<NaiveDate, MoneyMicros>> {
+    let bars = parse_venue_daily_bars(value)?;
+    for session in sessions
+        .iter()
+        .filter(|session| bars.contains_key(&session.date))
+    {
+        let close = value
+            .get("session_closes")
+            .and_then(|closes| closes.get(session.date.to_string()))
+            .and_then(Value::as_str)
+            .and_then(|at| at.parse::<DateTime<Utc>>().ok());
+        if close != Some(session.close_at) {
+            return Err(PaperDecodeError::InvalidInput(format!(
+                "daily bar does not prove the frozen venue close for {}",
+                session.date
+            )));
+        }
+    }
+    Ok(bars)
+}
+
+// Read explicit dates in the same exchange timezone as Alpaca ingestion.
+fn parse_venue_daily_bars(value: &Value) -> PaperDecodeResult<BTreeMap<NaiveDate, MoneyMicros>> {
+    let bars = value
+        .get("bars")
+        .and_then(Value::as_array)
+        .ok_or_else(|| PaperDecodeError::Unavailable("venue daily bars are missing".into()))?;
+    parse_dated_bars(bars, |timestamp| {
+        crate::market_session_day(timestamp.with_timezone(&Utc))
+    })
+}
+
+fn parse_dated_bars(
+    items: &[Value],
+    venue_date: impl Fn(DateTime<FixedOffset>) -> NaiveDate,
+) -> PaperDecodeResult<BTreeMap<NaiveDate, MoneyMicros>> {
     let mut bars = BTreeMap::new();
     for item in items {
         let close = item
@@ -61,7 +105,7 @@ pub fn parse_daily_bars(
             .and_then(Value::as_str)
             .and_then(|timestamp| {
                 DateTime::parse_from_rfc3339(timestamp)
-                    .map(|value| value.date_naive())
+                    .map(&venue_date)
                     .or_else(|_| NaiveDate::parse_from_str(timestamp, "%Y-%m-%d").map_err(|_| ()))
                     .ok()
             })
@@ -380,6 +424,19 @@ fn provider_timestamp(value: &Value, field: &str) -> PaperDecodeResult<DateTime<
 #[cfg(test)]
 mod freshness_tests {
     use super::*;
+
+    /// WHY THIS TEST EXISTS (Task #9): Daily timestamp offsets may straddle a UTC civil date.
+    /// Do not weaken or delete this assertion.
+    #[test]
+    fn venue_daily_bar_date_matches_new_york_acquisition() {
+        let payload = serde_json::json!({"bars":[{"t":"2026-11-28T02:00:00Z","c":"100.0"}]});
+        let bars = parse_venue_daily_bars(&payload).unwrap();
+        assert_eq!(
+            bars.into_keys().collect::<Vec<_>>(),
+            ["2026-11-27".parse().unwrap()]
+        );
+        assert!(parse_venue_daily_bars(&serde_json::json!({"close":"100.0"})).is_err());
+    }
 
     #[test]
     fn missing_provider_timestamps_cannot_become_fresh_snapshots() {

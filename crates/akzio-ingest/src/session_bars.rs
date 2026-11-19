@@ -254,8 +254,11 @@ impl AlpacaPaperEvidenceTransport {
             .map(|(date, close)| (date.to_string(), *close))
             .collect::<BTreeMap<_, _>>();
         let closes = all_closes
-            .into_iter()
-            .filter(|(_, close)| *close + Duration::minutes(BAR_AVAILABILITY_LAG_MINUTES) <= cutoff)
+            .iter()
+            .filter_map(|(&date, &close)| {
+                (close + Duration::minutes(BAR_AVAILABILITY_LAG_MINUTES) <= cutoff)
+                    .then_some((date, close))
+            })
             .collect::<BTreeMap<_, _>>();
         let Some((&latest_session, &latest_close)) = closes.last_key_value() else {
             return Err(EvidenceAdapterError::Pending(
@@ -386,7 +389,7 @@ impl AlpacaPaperEvidenceTransport {
             .unwrap_or(latest_close)
             + Duration::minutes(BAR_AVAILABILITY_LAG_MINUTES);
         let observed_at = Utc::now();
-        let normalized = serde_json::json!({
+        let mut normalized = serde_json::json!({
             "market": market, "feed": self.market_data_feed.map(|f| f.as_str()),
             "request_url": source_uri, "timezone": "America/New_York", "decision_cutoff": cutoff,
             "symbol": asset.symbol(), "bars": selected.iter().map(|(_, bar)| bar).collect::<Vec<_>>(),
@@ -397,6 +400,14 @@ impl AlpacaPaperEvidenceTransport {
             "forecast_session_closes": forecast_session_closes,
             "calendar_source": calendar_url.as_str(), "availability_lag_minutes": BAR_AVAILABILITY_LAG_MINUTES,
         });
+        if !raw_prices {
+            // Keep the scheduled dates even when their closes precede a late acquisition cutoff.
+            normalized["forecast_calendar"] = serde_json::json!({
+                "version": 1,
+                "availability_lag_minutes": BAR_AVAILABILITY_LAG_MINUTES,
+                "session_closes": all_closes,
+            });
+        }
         validate_daily_bar_payload(&normalized).map_err(|_| invalid("OHLCV invalid"))?;
         let raw = serde_json::to_vec(&serde_json::json!({"market_requests":market_requests,"bar_request_url":source_uri,"calendar_request_url":calendar_url.as_str(),"calendar": calendar, "pages": pages, "corporate_actions": corporate_actions}))
             .map_err(|_| invalid("provider payload serialization"))?;

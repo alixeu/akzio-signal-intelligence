@@ -2,6 +2,49 @@
 // specialized Artifact 校验；调用方传入的 graph/approval 不会绕过 Store 的事务边界。
 // Paper reservation 经 lease.rs 或 Canary 入口校验，再由这里写入 slot 和 workflow。
 impl Store {
+    /// Return the immutable session identity used to bind research horizons.
+    pub fn research_session_key(&self, run_id: &RunId) -> StoreResult<String> {
+        match self.run_purpose(run_id)? {
+            RunPurpose::Paper => self.session_slot_for_run(run_id)?
+                .map(|slot| slot.session_key)
+                .ok_or_else(|| StoreError::Integrity("Paper run has no session slot".into())),
+            RunPurpose::Shadow => {
+                let session = self.canary_session_for_run(run_id)?
+                    .ok_or_else(|| StoreError::Integrity("Shadow run has no canary reservation".into()))?;
+                let parent = self.session_slot_for_run(&session.reservation.parent_run_id)?
+                    .ok_or_else(|| StoreError::Integrity("Shadow parent has no Paper session slot".into()))?;
+                if parent.session_key != session.reservation.session_key {
+                    return Err(StoreError::Integrity("Shadow reservation disagrees with parent session".into()));
+                }
+                Ok(parent.session_key)
+            }
+            RunPurpose::PositionPlan => {
+                let snapshot = self.workflow_snapshot(run_id)?;
+                let gate = snapshot.tasks.iter().find(|task| task.node.recipe_id.as_str() == "gate.evidence")
+                    .ok_or_else(|| StoreError::Integrity("research evidence gate missing".into()))?;
+                let mut sessions = BTreeSet::new();
+                for reference in &gate.node.input_artifacts {
+                    let artifact = self.artifact(&reference.artifact_id)?;
+                    if reference.kind != ArtifactKind::EvidenceNeed || artifact.kind != reference.kind {
+                        return Err(StoreError::Integrity("research evidence gate input is not an EvidenceNeed".into()));
+                    }
+                    let need: akzio_domain::EvidenceNeed = serde_json::from_slice(&self.read_blob(&artifact.blob)?)?;
+                    if let Some(resource) = need.resource.strip_prefix("option_chain:") {
+                        let date = resource.split(':').nth(1).ok_or_else(|| StoreError::Integrity("invalid research session".into()))?;
+                        chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+                            .map_err(|_| StoreError::Integrity("invalid research session".into()))?;
+                        sessions.insert(date.to_owned());
+                    }
+                }
+                if sessions.len() != 1 {
+                    return Err(StoreError::Integrity("research needs require one frozen session".into()));
+                }
+                Ok(sessions.pop_first().expect("one frozen research session"))
+            }
+            _ => Err(StoreError::Integrity("run purpose has no active research session".into())),
+        }
+    }
+
     fn reserve_paper_session_transaction(
         &self,
         lease: &DaemonLease,

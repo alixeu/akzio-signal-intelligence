@@ -16,8 +16,13 @@ use akzio_execution::{
     HistoricalPriceSeries, OfflineCalibrationInput, OfflineRiskLimits,
     build_offline_decision_policy,
 };
-use akzio_ingest::{EvidenceSource, NormalizedEvidencePayload, parse_daily_bars};
+use akzio_ingest::{
+    parse_scheduled_daily_bars, EvidenceSource, ForecastCalendars, GovernedResource,
+    NormalizedEvidencePayload, ScheduledSession,
+};
 use chrono::DateTime;
+
+const CALIBRATION_LABEL_TIMING: &str = "venue_calendar_and_observed_bars_v1";
 
 fn handle_calibration(command: &CalibrationCommand, config_path: &Path) -> Result<()> {
     // `command: &CalibrationCommand` 只借用解析出的命令；match 的每个分支按各自权限
@@ -504,6 +509,7 @@ fn calibration_readiness_report(
         "policy_status_scope":"configured_model_and_persisted_active_contract",
         "activation_requires_operator":true,
         "operator_sequence":"collect -> build -> inspect -> validate -> activate; inspect, validate and activate must be explicitly performed by the operator",
+        "label_timing_basis":CALIBRATION_LABEL_TIMING,
         "scan_limit":CALIBRATION_SCAN_LIMIT, "decisions_scanned":scan.artifacts.len(),
         "scan_limit_reached":scan.truncated,
         "cohort":cohort_report,
@@ -567,13 +573,11 @@ fn calibration_run_readiness(
             {
                 return Ok(Err("outcome_schedule_mismatch".into()));
             }
-            let bars = match outcome_bars(store, &outcome) {
-                Ok(bars) => bars,
-                Err(error) => return Ok(Err(format!("outcome_bars_unusable: {error}"))),
-            };
-            Ok(candidate_has_all_labels(
-                &decision, schedule, &outcome, &bars,
-            ))
+            Ok(
+                calibration_labels(store, run_id, &decision, schedule, a, &outcome)
+                    .map(|_| ())
+                    .map_err(|error| format!("{error:#}")),
+            )
         })
         .transpose()?;
     // 未封存时仍收集同一 Schedule 下已经存在的窗口，供 pending 报告精确列出缺口；
@@ -851,6 +855,7 @@ mod calibration_readiness_tests {
         decided_at: DateTime<Utc>,
         model_id: &str,
         contract_hash: &ContentHash,
+        marked: bool,
     ) -> RunId {
         use akzio_domain::{
             HardBlocker, OutcomeExecutionLineage, TaskStatus, DOMAIN_SCHEMA_VERSION,
@@ -872,7 +877,12 @@ mod calibration_readiness_tests {
                 "calibration.fixture",
                 lifecycle,
                 ArtifactProvenance {
-                    source_family: "akzio.runtime".into(),
+                    source_family: if kind == ArtifactKind::NormalizedEvidence {
+                        "alpaca"
+                    } else {
+                        "akzio.runtime"
+                    }
+                    .into(),
                     observed_at: Some(at),
                     retrieved_at: at,
                     source_uri: None,
@@ -889,6 +899,57 @@ mod calibration_readiness_tests {
             artifact_id: artifact.artifact_id.clone(),
             kind: artifact.kind,
         };
+        let baseline = decided_at.date_naive();
+        let closes = if baseline == "2026-11-25".parse::<NaiveDate>().unwrap() {
+            [
+                "2026-11-27T18:00:00Z",
+                "2026-11-30T21:00:00Z",
+                "2026-12-01T21:00:00Z",
+                "2026-12-02T21:00:00Z",
+                "2026-12-03T21:00:00Z",
+            ]
+            .map(|at| at.parse::<DateTime<Utc>>().unwrap())
+        } else {
+            // The other fixture dates are in daylight time. Exclude the venue holidays in that span.
+            use chrono::Datelike;
+            let holidays =
+                ["2026-06-19", "2026-07-03"].map(|date| date.parse::<NaiveDate>().unwrap());
+            baseline
+                .iter_days()
+                .skip(1)
+                .filter(|date| date.weekday().number_from_monday() <= 5 && !holidays.contains(date))
+                .take(5)
+                .map(|date| date.and_hms_opt(20, 0, 0).unwrap().and_utc())
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap()
+        };
+        let scheduled = closes
+            .into_iter()
+            .map(|at| (at.date_naive(), at))
+            .collect::<BTreeMap<_, _>>();
+        let research_bars = Asset::EXECUTABLE.into_iter().map(|asset| {
+            let mut value = json!({});
+            if marked {
+                value["forecast_calendar"] = json!({"version":1,"availability_lag_minutes":20,"session_closes":scheduled});
+            }
+            stage(ArtifactKind::NormalizedEvidence, ArtifactLifecycle::RunScoped, json!({
+                "resource":format!("bars:{}:1d:2025-10-01:252", asset.symbol()), "source":"alpaca", "value":value,
+            }), vec![], &attempt.permit, decided_at)
+        }).collect::<Vec<_>>();
+        let refs = research_bars.iter().map(reference).collect::<Vec<_>>();
+        let manifest = stage(
+            ArtifactKind::ContextManifest,
+            ArtifactLifecycle::RunScoped,
+            json!({
+                "schema_version":DOMAIN_SCHEMA_VERSION, "contract_hash":ContentHash::of_bytes(b"fixture"),
+                "selections":refs.iter().map(|artifact| json!({"artifact":artifact,"reason":"calendar fixture","estimated_tokens":1})).collect::<Vec<_>>(),
+                "total_bytes":256,"estimated_tokens":4,"input_hash":ContentHash::of_bytes(b"fixture")
+            }),
+            refs,
+            &attempt.permit,
+            decided_at,
+        );
         let turn = stage(
             ArtifactKind::AgentTurn,
             ArtifactLifecycle::RunScoped,
@@ -912,17 +973,19 @@ mod calibration_readiness_tests {
                 "decision_policy_hash": ContentHash::of_bytes(b"fixture-policy"),
                 "target": akzio_domain::TargetPortfolio::zeroed(), "created_at": decided_at,
             }),
-            vec![reference(&turn)],
+            vec![reference(&manifest), reference(&turn)],
             &attempt.permit,
             decided_at,
         );
+        let mut frozen_decision = calibration_fixture_decision(decided_at, reference(&context));
+        for forecast in &mut frozen_decision.forecasts {
+            forecast.thesis.as_mut().unwrap().thesis_valid_until =
+                closes[usize::from(forecast.horizon.trading_days()) - 1];
+        }
         let decision = stage(
             ArtifactKind::Decision,
             ArtifactLifecycle::Canonical,
-            json!(calibration_fixture_decision(
-                decided_at,
-                reference(&context)
-            )),
+            json!(frozen_decision),
             vec![reference(&context)],
             &attempt.permit,
             decided_at,
@@ -974,20 +1037,18 @@ mod calibration_readiness_tests {
             &attempt.permit,
             decided_at,
         );
+        let mut artifacts = research_bars;
+        artifacts.extend([
+            manifest,
+            turn,
+            context,
+            decision,
+            execution,
+            verdict,
+            schedule_artifact.clone(),
+        ]);
         store
-            .commit_attempt(
-                &attempt.permit,
-                &[
-                    turn,
-                    context,
-                    decision,
-                    execution,
-                    verdict,
-                    schedule_artifact.clone(),
-                ],
-                TaskStatus::Succeeded,
-                now,
-            )
+            .commit_attempt(&attempt.permit, &artifacts, TaskStatus::Succeeded, now)
             .unwrap();
         assert_eq!(store.ensure_pending_outcome_workers(now).unwrap(), 1);
         let worker = store
@@ -999,9 +1060,13 @@ mod calibration_readiness_tests {
             )
             .unwrap()
             .unwrap();
-        let days = [0, 1, 3, 7]
-            .map(|offset| schedule.baseline_trading_day + chrono::Duration::days(offset));
-        let observed_at = session_close_time(days[3]);
+        let days = [
+            schedule.baseline_trading_day,
+            closes[0].date_naive(),
+            closes[2].date_naive(),
+            closes[4].date_naive(),
+        ];
+        let observed_at = days[3].and_hms_opt(21, 43, 0).unwrap().and_utc();
         let need = stage(
             ArtifactKind::EvidenceNeed,
             ArtifactLifecycle::RunScoped,
@@ -1020,16 +1085,21 @@ mod calibration_readiness_tests {
         );
         let mut market_evidence = Vec::new();
         for asset in Asset::EXECUTABLE {
+            let received_at = if asset == Asset::EXECUTABLE[3] {
+                observed_at
+            } else {
+                observed_at - chrono::Duration::minutes(19)
+            };
             let bars = days.map(|day| json!({"t": day, "c": "100"}));
             market_evidence.push(stage(ArtifactKind::NormalizedEvidence, ArtifactLifecycle::RunScoped, json!({
-                "schema_version": DOMAIN_SCHEMA_VERSION, "source": "alpaca", "resource": format!("bars:{}:1d", asset.symbol()),
-                "need": reference(&need), "raw": reference(&raw), "observed_at": observed_at,
-                "time_basis": {"available_at": observed_at, "retrieved_at": observed_at,
-                    "decision_clock": {"decision_cutoff": observed_at}},
+                "schema_version": DOMAIN_SCHEMA_VERSION, "source": "alpaca", "resource": format!("bars:{}:1d:{}:252:raw:{}", asset.symbol(), days[0], days[3]),
+                "need": reference(&need), "raw": reference(&raw), "observed_at": received_at,
+                "time_basis": {"available_at": received_at, "retrieved_at": received_at,
+                    "decision_clock": {"decision_cutoff": received_at}},
                 "contamination_certificate": {"available_at_or_before_cutoff": true, "event_at_or_before_cutoff": true,
                     "release_at_or_before_cutoff": true, "retrieval_at_or_after_availability": true, "vintage_at_or_before_cutoff": true},
-                "provenance": {"observed_at": observed_at, "source_uri": "fixture://cohort/bars", "dedupe_key": asset.symbol(), "citations": []},
-                "quality": akzio_ingest::EvidenceQuality::default(), "value": {"bars": bars},
+                "provenance": {"observed_at": received_at, "source_uri": "fixture://cohort/bars", "dedupe_key": asset.symbol(), "citations": []},
+                "quality": akzio_ingest::EvidenceQuality::default(), "value": {"bars": bars, "session_closes": scheduled},
             }), vec![reference(&need), reference(&raw)], &worker.permit, observed_at));
         }
         for evidence in std::iter::once(&need)
@@ -1139,21 +1209,40 @@ knowledge_cutoff = "2025-01-01"
         let (model, _) = configured_synthesizer_identity(config.model.as_ref().unwrap()).unwrap();
         let historical_at = parse_calibration_time("2026-06-01T15:00:00Z", "fixture").unwrap();
         let current_at = historical_at + chrono::Duration::days(7);
-        let historical =
-            commit_calibration_fixture_outcome(&store, historical_at, &model, &historical_hash);
-        let current =
-            commit_calibration_fixture_outcome(&store, current_at, &model, &active.contract_hash);
+        let historical = commit_calibration_fixture_outcome(
+            &store,
+            historical_at,
+            &model,
+            &historical_hash,
+            true,
+        );
+        let current = commit_calibration_fixture_outcome(
+            &store,
+            current_at,
+            &model,
+            &active.contract_hash,
+            true,
+        );
         commit_calibration_fixture_outcome(
             &store,
             current_at + chrono::Duration::days(40),
             &model,
             &active.contract_hash,
+            true,
         );
         commit_calibration_fixture_outcome(
             &store,
             current_at + chrono::Duration::days(19),
             &model,
             &active.contract_hash,
+            true,
+        );
+        let legacy = commit_calibration_fixture_outcome(
+            &store,
+            historical_at + chrono::Duration::days(1),
+            &model,
+            &active.contract_hash,
+            false,
         );
         commit_calibration_fixture_decisions(&store, RunPurpose::PositionPlan, current_at, 501);
         let risk = serde_json::from_value::<OfflineRiskLimits>(serde_json::json!({
@@ -1172,8 +1261,8 @@ knowledge_cutoff = "2025-01-01"
         )
         .unwrap();
         for (scope, expected) in [
-            (None, current),
-            (Some(historical_hash.to_string()), historical),
+            (None, &current),
+            (Some(historical_hash.to_string()), &historical),
         ] {
             let requested = CalibrationScopeArgs {
                 training_start: Some("2026-06-01T15:00:00Z".into()),
@@ -1190,9 +1279,9 @@ knowledge_cutoff = "2025-01-01"
                 &config_path,
             )
             .unwrap();
-            assert_eq!(readiness["decisions_scanned"], 3);
-            assert_eq!(collect["scan"]["decision_artifacts_considered"], 3);
-            assert_eq!(readiness["cohort"]["excluded_decisions"], 2);
+            assert_eq!(readiness["decisions_scanned"], 4);
+            assert_eq!(collect["scan"]["decision_artifacts_considered"], 4);
+            assert_eq!(readiness["cohort"]["excluded_decisions"], 3);
             let exclusions = collect["gaps"]["skipped_runs"].as_array().unwrap();
             assert!(exclusions
                 .iter()
@@ -1214,6 +1303,118 @@ knowledge_cutoff = "2025-01-01"
                 collect["scan"]["selected_run_ids"]
             );
         }
+
+        // Both cutoffs follow the first three receipts and precede the old UTC day-end proxy.
+        let cutoff = "2026-06-15T21:43:00Z";
+        for (end, admitted) in [("2026-06-15T21:42:59Z", false), (cutoff, true)] {
+            let requested = CalibrationScopeArgs {
+                training_start: Some("2026-06-01T15:00:00Z".into()),
+                training_end: Some(end.into()),
+                contract_hash: None,
+            };
+            let readiness =
+                calibration_readiness_report(&path, 1, &config_path, Some(&requested)).unwrap();
+            let collect = collect_calibration_report(
+                &path,
+                limits.artifact_id.0.as_str(),
+                1,
+                &requested,
+                &config_path,
+            )
+            .unwrap();
+            let expected = if admitted {
+                serde_json::json!([current])
+            } else {
+                serde_json::json!([])
+            };
+            assert_eq!(readiness["cohort"]["selected_run_ids"], expected);
+            assert_eq!(collect["scan"]["selected_run_ids"], expected);
+            let slot_counts = readiness["gap"]["slot_counts"].as_object().unwrap();
+            assert_eq!(slot_counts.len(), 12);
+            for (slot, count) in slot_counts {
+                assert_eq!(count.as_u64().unwrap(), u64::from(admitted));
+                assert_eq!(
+                    collect["scan"]["sample_counts"][slot].as_u64().unwrap_or(0),
+                    u64::from(admitted)
+                );
+            }
+            assert_eq!(
+                collect["scan"]["collected_forecast_samples"],
+                12 * u64::from(admitted)
+            );
+            let excluded = readiness["runs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|row| row["status"] == "excluded")
+                .cloned()
+                .map(|mut row| {
+                    row.as_object_mut().unwrap().remove("status");
+                    row
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(collect["gaps"]["skipped_runs"], serde_json::json!(excluded));
+            let unmarked = excluded
+                .iter()
+                .find(|row| row["run_id"] == legacy.0)
+                .unwrap();
+            assert_eq!(unmarked["reason"], "maturity_label_missing");
+            assert!(unmarked["detail"]
+                .as_str()
+                .unwrap()
+                .starts_with("label_timing_unknown"));
+            if admitted {
+                let dataset_id = collect["dataset_artifact"].as_str().unwrap();
+                let artifact =
+                    calibration_artifact(&store, dataset_id, ArtifactKind::CalibrationDataset)
+                        .unwrap();
+                let outcome = store.outcome_for_run(&current).unwrap().unwrap();
+                assert!(artifact.source_refs.contains(&ArtifactRef {
+                    artifact_id: outcome.artifact_id,
+                    kind: ArtifactKind::Outcome,
+                }));
+                let dataset: StoredCalibrationDataset =
+                    serde_json::from_slice(&store.read_blob(&artifact.blob).unwrap()).unwrap();
+                assert_eq!(
+                    dataset.input.training_end,
+                    cutoff.parse::<DateTime<Utc>>().unwrap()
+                );
+                assert_eq!(dataset.input.forecasts.len(), 12);
+                assert!(dataset
+                    .input
+                    .forecasts
+                    .iter()
+                    .all(|sample| sample.realized_at == dataset.input.training_end));
+                assert_eq!(dataset.report["label_proofs"], collect["label_proofs"]);
+            } else {
+                let late = excluded
+                    .iter()
+                    .find(|row| row["run_id"] == current.0)
+                    .unwrap();
+                assert_eq!(late["reason"], "training_window_incomplete");
+                assert_eq!(collect["status"], "BLOCKED");
+                assert!(collect["dataset_artifact"].is_null());
+            }
+        }
+
+        let requested = CalibrationScopeArgs {
+            training_start: None,
+            training_end: None,
+            contract_hash: Some(historical_hash.to_string()),
+        };
+        let collect = collect_calibration_report(
+            &path,
+            limits.artifact_id.0.as_str(),
+            30,
+            &requested,
+            &config_path,
+        )
+        .unwrap();
+        assert_eq!(
+            collect["scan"]["selected_run_ids"],
+            serde_json::json!([historical])
+        );
+        assert_eq!(collect["identity"]["training_end"], "2026-06-08T21:43:00Z");
     }
 
     // 组装仅供身份比较测试的结构有效 Policy；合成数值不会写入或激活 Store。
@@ -1405,6 +1606,136 @@ knowledge_cutoff = "2025-01-01"
         );
     }
 
+    /// WHY THIS TEST EXISTS (Task #9): An early close and a delayed receipt set the concrete training cutoff, not UTC midnight.
+    /// Do not weaken or delete this assertion.
+    #[test]
+    fn calibration_cutoff_uses_the_proven_receipt_of_the_exact_label() {
+        let baseline = "2026-11-25".parse().unwrap();
+        let session = ScheduledSession {
+            date: "2026-11-27".parse().unwrap(),
+            close_at: "2026-11-27T18:00:00Z".parse().unwrap(),
+            available_at: "2026-11-27T18:20:00Z".parse().unwrap(),
+        };
+        let early: DateTime<Utc> = "2026-11-27T18:22:00Z".parse().unwrap();
+        let latest: DateTime<Utc> = "2026-11-27T18:49:00Z".parse().unwrap();
+        let final_receipt: DateTime<Utc> = "2026-12-04T22:00:00Z".parse().unwrap();
+        let make_observations = |retrieved_at| {
+            Asset::EXECUTABLE
+                .into_iter()
+                .map(|asset| {
+                    (
+                        asset,
+                        BTreeMap::from([
+                            (
+                                baseline,
+                                ObservedBar {
+                                    price: MoneyMicros(100),
+                                    retrieved_at,
+                                },
+                            ),
+                            (
+                                session.date,
+                                ObservedBar {
+                                    price: MoneyMicros(105),
+                                    retrieved_at,
+                                },
+                            ),
+                        ]),
+                    )
+                })
+                .collect::<CalibrationBars>()
+        };
+        let sealed = make_observations(final_receipt);
+        let mut partial = make_observations(early);
+        let asset = Asset::EXECUTABLE[3];
+        let bar = partial
+            .get_mut(&asset)
+            .unwrap()
+            .get_mut(&session.date)
+            .unwrap();
+        bar.retrieved_at = latest;
+        let actual = observed_label_time(&session, baseline, &sealed, &partial).unwrap();
+        assert_eq!(actual, latest);
+        let training_end: DateTime<Utc> = "2026-11-27T18:48:59Z".parse().unwrap();
+        assert!(actual > training_end);
+        assert_eq!(
+            observed_label_time(&session, baseline, &sealed, &sealed),
+            Some(final_receipt)
+        );
+        partial
+            .get_mut(&asset)
+            .unwrap()
+            .get_mut(&session.date)
+            .unwrap()
+            .price = MoneyMicros(106);
+        assert_eq!(
+            observed_label_time(&session, baseline, &sealed, &partial),
+            None
+        );
+        partial.remove(&asset);
+        assert_eq!(
+            observed_label_time(&session, baseline, &sealed, &partial),
+            None
+        );
+    }
+
+    /// WHY THIS TEST EXISTS (Task #9): Readiness must derive a real receipt from fixed same-schedule Store evidence and exclude unmarked history.
+    /// Do not weaken or delete this assertion.
+    #[test]
+    fn readiness_and_labels_use_the_committed_calendar_and_bar_proof() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/calibration-calendar-tests")
+            .join(RunId::new().0);
+        let store = Store::open(root).unwrap();
+        let now = "2026-11-25T16:00:00Z".parse().unwrap();
+        let contract_hash = ContentHash::of_bytes(b"fixture");
+        let run_id =
+            commit_calibration_fixture_outcome(&store, now, "fixture", &contract_hash, true);
+        let decision_artifact = store
+            .run_artifacts_by_kind(&run_id, ArtifactKind::Decision)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let decision: Decision =
+            serde_json::from_slice(&store.read_blob(&decision_artifact.blob).unwrap()).unwrap();
+        let schedule_artifact = store.outcome_schedule_for_run(&run_id).unwrap().unwrap();
+        let schedule: OutcomeSchedule =
+            serde_json::from_slice(&store.read_blob(&schedule_artifact.blob).unwrap()).unwrap();
+        let sealed_artifact = store.outcome_for_run(&run_id).unwrap().unwrap();
+        let sealed: Outcome =
+            serde_json::from_slice(&store.read_blob(&sealed_artifact.blob).unwrap()).unwrap();
+        let labels = calibration_labels(
+            &store,
+            &run_id,
+            &decision,
+            &schedule,
+            &sealed_artifact,
+            &sealed,
+        )
+        .unwrap();
+        assert_eq!(
+            labels.horizons[&DecisionHorizon::T5].realized_at,
+            "2026-12-03T21:43:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+        assert_eq!(
+            calibration_run_readiness(&store, &decision_artifact, &run_id).unwrap()["status"],
+            "sealed"
+        );
+        let legacy =
+            commit_calibration_fixture_outcome(&store, now, "fixture", &contract_hash, false);
+        let decision = store
+            .run_artifacts_by_kind(&legacy, ArtifactKind::Decision)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let readiness = calibration_run_readiness(&store, &decision, &legacy).unwrap();
+        assert_eq!(readiness["status"], "blocked");
+        assert!(readiness["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("label_timing_unknown"));
+    }
+
     // 分别覆盖 pending、blocked、no_schedule、sealed 及统一 12 个槽位的样本计数。
     #[test]
     fn readiness_classifies_maturity_and_frozen_baseline_without_calendar_guessing() {
@@ -1466,10 +1797,8 @@ struct CollectedCalibrationCandidate {
     run_id: RunId,
     decision_artifact: akzio_domain::Artifact,
     decision: Decision,
-    outcome: Outcome,
-    outcome_artifact_id: ArtifactId,
-    schedule: OutcomeSchedule,
-    bars: BTreeMap<Asset, BTreeMap<NaiveDate, MoneyMicros>>,
+    outcome_ref: ArtifactRef,
+    labels: CalibrationLabels,
     provider_id: String,
     model_id: String,
     contract_hash: ContentHash,
@@ -1707,37 +2036,47 @@ fn select_calibration_cohort(
             .window
             .0
             .is_some_and(|start| decision.created_at < start)
-            || scope.window.1.is_some_and(|end| {
-                decision.created_at > end
-                    || outcome
-                        .windows
-                        .iter()
-                        .any(|window| session_close_time(window.observed_trading_day) > end)
-            })
+            || scope.window.1.is_some_and(|end| decision.created_at > end)
         {
             skipped
                 .push(serde_json::json!({"run_id":run_id,"reason":"training_window_incomplete"}));
             continue;
         }
-        let bars = match outcome_bars(store, &outcome) {
-            Ok(value) => value,
+        let labels = match calibration_labels(
+            store,
+            &run_id,
+            &decision,
+            &schedule,
+            &outcome_artifact,
+            &outcome,
+        ) {
+            Ok(labels) => labels,
             Err(error) => {
-                skipped.push(serde_json::json!({"run_id":run_id,"reason":"outcome_bars_unusable","detail":error.to_string()}));
+                skipped.push(serde_json::json!({
+                    "run_id": run_id, "reason": "maturity_label_missing", "detail": format!("{error:#}"),
+                }));
                 continue;
             }
         };
-        if let Err(reason) = candidate_has_all_labels(&decision, &schedule, &outcome, &bars) {
-            skipped.push(serde_json::json!({"run_id":run_id,"reason":"maturity_label_missing","detail":reason}));
+        if scope.window.1.is_some_and(|end| {
+            labels
+                .horizons
+                .values()
+                .any(|label| label.realized_at > end)
+        }) {
+            skipped
+                .push(serde_json::json!({"run_id":run_id,"reason":"training_window_incomplete"}));
             continue;
         }
         candidates.push(CollectedCalibrationCandidate {
             run_id,
             decision_artifact,
             decision,
-            outcome,
-            outcome_artifact_id: outcome_artifact.artifact_id,
-            schedule,
-            bars,
+            outcome_ref: ArtifactRef {
+                artifact_id: outcome_artifact.artifact_id,
+                kind: ArtifactKind::Outcome,
+            },
+            labels,
             provider_id: identity.provider_id,
             model_id: identity.model_id,
             contract_hash: identity.contract_hash,
@@ -1791,8 +2130,8 @@ fn collect_calibration_report(
     let actual_end = requested_end.or_else(|| {
         selected
             .iter()
-            .flat_map(|candidate| candidate.outcome.windows.iter())
-            .map(|window| session_close_time(window.observed_trading_day))
+            .flat_map(|candidate| candidate.labels.horizons.values())
+            .map(|label| label.realized_at)
             .max()
     });
     let mut samples = Vec::new();
@@ -1807,28 +2146,7 @@ fn collect_calibration_report(
     // 同一资产/日期的不同收盘价则保留冲突并阻断写入。
     for candidate in &selected {
         for forecast in &candidate.decision.forecasts {
-            let window_horizon = match forecast.horizon {
-                DecisionHorizon::T1 => OutcomeHorizon::T1,
-                DecisionHorizon::T3 => OutcomeHorizon::T3,
-                DecisionHorizon::T5 => OutcomeHorizon::T5,
-            };
-            let window = candidate
-                .outcome
-                .windows
-                .iter()
-                .find(|window| window.horizon == window_horizon)
-                .context("selected calibration window missing")?;
-            let base = candidate
-                .bars
-                .get(&forecast.asset)
-                .and_then(|bars| bars.get(&candidate.schedule.baseline_trading_day))
-                .context("selected calibration baseline bar missing")?;
-            let future = candidate
-                .bars
-                .get(&forecast.asset)
-                .and_then(|bars| bars.get(&window.observed_trading_day))
-                .context("selected calibration realized bar missing")?;
-            let realized_at = session_close_time(window.observed_trading_day);
+            let label = &candidate.labels.horizons[&forecast.horizon];
             *sample_counts
                 .entry(format!("{}:{:?}", forecast.asset, forecast.horizon))
                 .or_default() += 1;
@@ -1837,10 +2155,10 @@ fn collect_calibration_report(
                 asset: forecast.asset,
                 horizon: forecast.horizon,
                 forecast_at: candidate.decision.created_at,
-                realized_at,
+                realized_at: label.realized_at,
                 raw_probability_ppm: forecast.positive_return_probability_ppm,
                 raw_expected_return_ppm: forecast.expected_return_ppm,
-                realized_return_ppm: relative_return_ppm(*base, *future)?,
+                realized_return_ppm: label.realized_returns[&forecast.asset],
                 provenance: HistoricalForecastProvenance {
                     provider_id: candidate.provider_id.clone(),
                     model_id: candidate.model_id.clone(),
@@ -1856,8 +2174,9 @@ fn collect_calibration_report(
                 },
             });
         }
-        for (asset, bars) in &candidate.bars {
-            for (date, price) in bars {
+        for (asset, bars) in &candidate.labels.bars {
+            for (date, bar) in bars {
+                let price = &bar.price;
                 if actual_start.is_some_and(|start| *date < start.date_naive())
                     || actual_end.is_some_and(|end| *date > end.date_naive())
                 {
@@ -1950,7 +2269,7 @@ fn collect_calibration_report(
     if status == "ready_for_build" {
         let input = OfflineCalibrationInput {
             schema_version: 1,
-            policy_version: "offline_historical_v2".to_owned(),
+            policy_version: format!("offline_historical_v3:{CALIBRATION_LABEL_TIMING}"),
             algorithm_version: "offline_historical_risk_v1".to_owned(),
             provider_id: scope.provider_id.clone(),
             model_id: scope.model_id.clone(),
@@ -1976,6 +2295,27 @@ fn collect_calibration_report(
     let mut identity = scope.identity_report();
     identity["training_start"] = serde_json::to_value(actual_start)?;
     identity["training_end"] = serde_json::to_value(actual_end)?;
+    identity["label_timing_basis"] = serde_json::json!(CALIBRATION_LABEL_TIMING);
+    // Keep partial Outcome proofs in the hashed report and canonical refs in the Dataset DAG.
+    let label_proofs: Vec<_> = selected
+        .iter()
+        .map(|candidate| {
+            let horizons: Vec<_> = candidate
+                .labels
+                .horizons
+                .iter()
+                .map(|(horizon, label)| {
+                    serde_json::json!({
+                        "horizon": horizon,
+                        "date": label.date,
+                        "realized_at": label.realized_at,
+                        "observed_outcome": label.outcome,
+                    })
+                })
+                .collect();
+            serde_json::json!({"run_id": candidate.run_id, "horizons": horizons})
+        })
+        .collect();
     let mut report = serde_json::json!({
         "status": status,
         "source_store": store_path,
@@ -1993,6 +2333,7 @@ fn collect_calibration_report(
             "common_price_points": common_dates.len(),
         },
         "identity": identity,
+        "label_proofs": label_proofs,
         "gaps": {
             "min_samples": min_samples,
             "enough_forecasts": enough_forecasts,
@@ -2020,10 +2361,7 @@ fn collect_calibration_report(
                 artifact_id: candidate.decision_artifact.artifact_id.clone(),
                 kind: ArtifactKind::Decision,
             });
-            sources.push(ArtifactRef {
-                artifact_id: candidate.outcome_artifact_id.clone(),
-                kind: ArtifactKind::Outcome,
-            });
+            sources.push(candidate.outcome_ref.clone());
         }
         let write_store = Store::open(store_path)?;
         let stored = persist_calibration_artifact(
@@ -2047,14 +2385,6 @@ fn parse_calibration_time(value: &str, field: &str) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .map(|value| value.with_timezone(&Utc))
         .with_context(|| format!("{field} must be RFC3339"))
-}
-
-fn session_close_time(date: NaiveDate) -> DateTime<Utc> {
-    // 日级标签使用固定的当日 23:59:59 作为“该交易日已结束”的比较点；
-    // 这是校准窗口的统一时间基准，不是对交易所实际收盘钟点的重新测量。
-    date.and_hms_opt(23, 59, 59)
-        .expect("23:59:59 is a valid time")
-        .and_utc()
 }
 
 fn relative_return_ppm(base: MoneyMicros, future: MoneyMicros) -> Result<i64> {
@@ -2162,13 +2492,177 @@ fn synthesizer_identity_for_decision(
     Ok(found)
 }
 
-fn outcome_bars(
+#[derive(Debug, Clone, Copy)]
+struct ObservedBar {
+    price: MoneyMicros,
+    retrieved_at: DateTime<Utc>,
+}
+
+type CalibrationBars = BTreeMap<Asset, BTreeMap<NaiveDate, ObservedBar>>;
+
+struct CalibrationLabel {
+    date: NaiveDate,
+    realized_at: DateTime<Utc>,
+    outcome: ArtifactRef,
+    realized_returns: BTreeMap<Asset, i64>,
+}
+
+struct CalibrationLabels {
+    bars: CalibrationBars,
+    horizons: BTreeMap<DecisionHorizon, CalibrationLabel>,
+}
+
+fn calibration_labels(
     store: &Store,
+    run_id: &RunId,
+    decision: &Decision,
+    schedule: &OutcomeSchedule,
+    sealed_artifact: &Artifact,
+    sealed: &Outcome,
+) -> Result<CalibrationLabels> {
+    let stored_schedule = store
+        .outcome_schedule_for_run(run_id)?
+        .context("outcome_schedule_missing")?;
+    if stored_schedule.artifact_id != sealed.schedule.artifact_id
+        || sealed.outcome_id != schedule.outcome_id
+        || schedule.decision_context != decision.decision_context
+        || !belongs_to_run(sealed_artifact, run_id)
+        || !outcome_evidence_is_bound(sealed_artifact, sealed)
+    {
+        bail!("outcome_schedule_mismatch");
+    }
+    let calendar = ForecastCalendars::for_decision_context(store, &schedule.decision_context)?
+        .context("label_timing_unknown: frozen venue calendar missing")?;
+    let sessions = calendar.sessions_after(schedule.baseline_trading_day)?;
+    let bars =
+        calibration_bars(store, run_id, sealed, &sessions).context("outcome_bars_unusable")?;
+    let mut horizons = BTreeMap::new();
+    for (horizon, outcome_horizon) in DecisionHorizon::ALL.into_iter().zip(OutcomeHorizon::ALL) {
+        let session = &sessions[usize::from(horizon.trading_days()) - 1];
+        if !has_outcome_window(sealed, outcome_horizon, session.date)
+            || decision.created_at >= session.close_at
+            || decision
+                .forecasts
+                .iter()
+                .filter(|forecast| forecast.horizon == horizon)
+                .any(|forecast| {
+                    forecast
+                        .thesis
+                        .as_ref()
+                        .is_none_or(|thesis| thesis.thesis_valid_until != session.close_at)
+                })
+        {
+            bail!("label_session_mismatch: {horizon:?}");
+        }
+        let realized_at = observed_label_time(session, schedule.baseline_trading_day, &bars, &bars)
+            .with_context(|| format!("label_receipt_unknown: {horizon:?}"))?;
+        // Receipt proof already requires positive baseline and endpoint prices for each asset.
+        let realized_returns = Asset::EXECUTABLE
+            .into_iter()
+            .map(|asset| {
+                let prices = &bars[&asset];
+                relative_return_ppm(
+                    prices[&schedule.baseline_trading_day].price,
+                    prices[&session.date].price,
+                )
+                .with_context(|| format!("{asset} {horizon:?} realized return is invalid"))
+                .map(|value| (asset, value))
+            })
+            .collect::<Result<_>>()?;
+        horizons.insert(
+            horizon,
+            CalibrationLabel {
+                date: session.date,
+                realized_at,
+                outcome: ArtifactRef {
+                    artifact_id: sealed_artifact.artifact_id.clone(),
+                    kind: ArtifactKind::Outcome,
+                },
+                realized_returns,
+            },
+        );
+    }
+    // A persisted partial can prove earlier availability only for the same
+    // exact schedule and the same baseline/endpoint prices as the sealed label.
+    for horizon in [OutcomeHorizon::T1, OutcomeHorizon::T3] {
+        let Some(retrospective) = store.retrospective_for(run_id, &schedule.outcome_id, horizon)?
+        else {
+            continue;
+        };
+        let retrospective: akzio_domain::Retrospective =
+            serde_json::from_slice(&store.read_blob(&retrospective.blob)?)?;
+        if retrospective.validate().is_err() {
+            continue;
+        }
+        let artifact = store.artifact(&retrospective.outcome.artifact_id)?;
+        if artifact.kind != ArtifactKind::Outcome
+            || artifact.lifecycle != ArtifactLifecycle::RunScoped
+            || artifact.producer != sealed_artifact.producer
+            || !belongs_to_run(&artifact, run_id)
+        {
+            continue;
+        }
+        let partial: Outcome = serde_json::from_slice(&store.read_blob(&artifact.blob)?)?;
+        if partial.is_sealed()
+            || partial.schedule != sealed.schedule
+            || partial.outcome_id != sealed.outcome_id
+            || partial.validate().is_err()
+            || !outcome_evidence_is_bound(&artifact, &partial)
+        {
+            continue;
+        }
+        let Ok(receipts) = calibration_bars(store, run_id, &partial, &sessions) else {
+            continue;
+        };
+        for (horizon, outcome_horizon) in DecisionHorizon::ALL.into_iter().zip(OutcomeHorizon::ALL)
+        {
+            let label = horizons.get_mut(&horizon).expect("sealed label validated");
+            let session = &sessions[usize::from(horizon.trading_days()) - 1];
+            if !has_outcome_window(&partial, outcome_horizon, label.date) {
+                continue;
+            }
+            if let Some(at) =
+                observed_label_time(session, schedule.baseline_trading_day, &bars, &receipts)
+                    .filter(|at| *at < label.realized_at)
+            {
+                label.realized_at = at;
+                label.outcome.artifact_id = artifact.artifact_id.clone();
+            }
+        }
+    }
+    Ok(CalibrationLabels { bars, horizons })
+}
+
+fn has_outcome_window(outcome: &Outcome, horizon: OutcomeHorizon, date: NaiveDate) -> bool {
+    outcome
+        .windows
+        .iter()
+        .any(|window| window.horizon == horizon && window.observed_trading_day == date)
+}
+
+fn belongs_to_run(artifact: &Artifact, run_id: &RunId) -> bool {
+    artifact
+        .origin
+        .as_ref()
+        .and_then(|origin| origin.run_id.as_ref())
+        == Some(run_id)
+}
+
+fn outcome_evidence_is_bound(artifact: &Artifact, outcome: &Outcome) -> bool {
+    artifact.source_refs.contains(&outcome.schedule)
+        && outcome
+            .market_evidence
+            .iter()
+            .all(|reference| artifact.source_refs.contains(reference))
+}
+
+fn calibration_bars(
+    store: &Store,
+    run_id: &RunId,
     outcome: &Outcome,
-) -> Result<BTreeMap<Asset, BTreeMap<NaiveDate, MoneyMicros>>> {
-    // 只从 Outcome 已绑定的 Alpaca NormalizedEvidence 读取日线，并按资产/日期合并；
-    // 来源不符、四资产不全或同一日期价格冲突都使该候选不可用于校准。
-    let mut bars_by_asset = BTreeMap::new();
+    sessions: &[ScheduledSession; 5],
+) -> Result<CalibrationBars> {
+    let mut bars_by_asset = CalibrationBars::new();
     for reference in &outcome.market_evidence {
         if reference.kind != ArtifactKind::NormalizedEvidence {
             continue;
@@ -2179,75 +2673,58 @@ fn outcome_bars(
         if payload.source != EvidenceSource::Alpaca || !payload.resource.starts_with("bars:") {
             continue;
         }
-        let asset = payload
-            .resource
-            .split(':')
-            .nth(1)
-            .and_then(|value| Asset::try_from(value).ok())
-            .context("outcome bar resource has no executable asset")?;
-        let bars = parse_daily_bars(&payload.value, payload.observed_at)
-            .with_context(|| format!("parse outcome bars for {asset}"))?;
-        let destination = bars_by_asset.entry(asset).or_insert_with(BTreeMap::new);
-        for (date, price) in bars {
-            if let Some(existing) = destination.insert(date, price) {
-                if existing != price {
-                    bail!(
-                        "outcome bars contain conflicting {} price on {}",
-                        asset,
-                        date
-                    );
-                }
-            }
+        let GovernedResource::AlpacaBars {
+            asset,
+            raw_prices: true,
+            ..
+        } = GovernedResource::parse(payload.source, &payload.resource)?
+        else {
+            bail!("label bar must be an Alpaca raw daily series");
+        };
+        let retrieved_at = payload.time_basis.retrieved_at;
+        if artifact.kind != reference.kind
+            || !belongs_to_run(&artifact, run_id)
+            || artifact.provenance.source_family != "alpaca"
+            || retrieved_at != payload.observed_at
+            || retrieved_at < payload.time_basis.available_at
+        {
+            bail!("label bar provenance unavailable for {asset}");
         }
-    }
-    if bars_by_asset.len() != Asset::EXECUTABLE.len() {
-        bail!("outcome market evidence lacks all four executable asset bar series");
+        let bars = parse_scheduled_daily_bars(&payload.value, sessions)
+            .with_context(|| format!("parse outcome bars for {asset}"))?;
+        let destination = bars_by_asset.entry(asset).or_default();
+        for (date, price) in bars {
+            let entry = destination.entry(date).or_insert(ObservedBar {
+                price,
+                retrieved_at,
+            });
+            if entry.price != price {
+                bail!("outcome bars contain conflicting {asset} price on {date}");
+            }
+            entry.retrieved_at = entry.retrieved_at.min(retrieved_at);
+        }
     }
     Ok(bars_by_asset)
 }
 
-fn candidate_has_all_labels(
-    decision: &Decision,
-    schedule: &OutcomeSchedule,
-    outcome: &Outcome,
-    bars: &BTreeMap<Asset, BTreeMap<NaiveDate, MoneyMicros>>,
-) -> std::result::Result<(), String> {
-    // 对每个 Decision forecast 找到对应 Outcome horizon，并要求实现日位于 Decision
-    // cutoff 之后，同时存在该资产的 baseline 与 realized 日线，避免用未来前的数据作标签。
-    for forecast in &decision.forecasts {
-        let horizon = match forecast.horizon {
-            DecisionHorizon::T1 => OutcomeHorizon::T1,
-            DecisionHorizon::T3 => OutcomeHorizon::T3,
-            DecisionHorizon::T5 => OutcomeHorizon::T5,
-        };
-        let Some(window) = outcome
-            .windows
-            .iter()
-            .find(|window| window.horizon == horizon)
-        else {
-            return Err(format!("missing {:?} Outcome window", horizon));
-        };
-        if session_close_time(window.observed_trading_day) <= decision.created_at {
-            return Err(format!(
-                "{:?} realized session is not after the frozen decision cutoff",
-                horizon
-            ));
-        }
-        let Some(asset_bars) = bars.get(&forecast.asset) else {
-            return Err(format!("missing {} bar series", forecast.asset));
-        };
-        let Some((base, future)) = asset_bars
-            .get(&schedule.baseline_trading_day)
-            .zip(asset_bars.get(&window.observed_trading_day))
-        else {
-            return Err(format!(
-                "missing {} baseline or {:?} realized session bar",
-                forecast.asset, horizon
-            ));
-        };
-        relative_return_ppm(*base, *future).map_err(|error| {
-            format!("{} {:?} realized return is invalid: {error}", forecast.asset, horizon)
-        })?;
-    }
-    Ok(())
+fn observed_label_time(
+    session: &ScheduledSession,
+    baseline: NaiveDate,
+    sealed: &CalibrationBars,
+    captured: &CalibrationBars,
+) -> Option<DateTime<Utc>> {
+    Asset::EXECUTABLE
+        .into_iter()
+        .try_fold(session.available_at, |latest, asset| {
+            let sealed = sealed.get(&asset)?;
+            let captured = captured.get(&asset)?;
+            [baseline, session.date]
+                .into_iter()
+                .try_fold(latest, |latest, date| {
+                    let expected = sealed.get(&date)?;
+                    let observation = captured.get(&date)?;
+                    (expected.price.0 > 0 && expected.price == observation.price)
+                        .then_some(latest.max(observation.retrieved_at))
+                })
+        })
 }

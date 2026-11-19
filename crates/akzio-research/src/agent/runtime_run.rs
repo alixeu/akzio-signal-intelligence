@@ -939,7 +939,13 @@ impl AgentRuntime {
                             .collect::<Vec<_>>(),
                     )?;
                     if direct_structured && validation_contract.output.artifact_kind == ArtifactKind::DecisionProposal {
-                        bind_rust_forecast_times(&validation_runtime.store, &validation_manifest, &mut validation_arguments, turn_now)?;
+                        bind_rust_forecast_times(
+                            &validation_runtime.store,
+                            &validation_permit.run_id,
+                            &validation_manifest,
+                            &mut validation_arguments,
+                            turn_now,
+                        )?;
                     }
                     if validation_contract.output.artifact_kind == ArtifactKind::ProposalReview {
                         bind_review_identity(&validation_runtime.store, &validation_manifest, &validation_contract, &mut validation_arguments)?;

@@ -147,46 +147,28 @@ fn remove_model_timing_fields(schema: &mut Value) {
     }
 }
 
-// 只从 Manifest 选择的 NormalizedEvidence 中读取 bars 日历，汇成每资产一份映射；
-// 缺少可识别资源时跳过，冲突日历或 Store/JSON 错误则返回 Err，最终由共同日历检查把缺口挡住。
+// Bind the forecast from the same immutable Manifest that authorizes its evidence.
 fn bind_rust_forecast_times(
     store: &Store,
+    run_id: &akzio_domain::RunId,
     manifest: &ContextManifest,
     arguments: &mut Value,
     now: DateTime<Utc>,
 ) -> ResearchResult<()> {
-    let mut calendars = BTreeMap::new();
-    for selection in &manifest.payload.selections {
-        if selection.artifact.kind != ArtifactKind::NormalizedEvidence {
-            // 只把正式规范化证据纳入期限来源；Claim、Review 等 Artifact 不是交易日历。
-            continue;
-        }
-        let artifact = store.artifact(&selection.artifact.artifact_id)?;
-        let payload: Value = serde_json::from_slice(&store.read_blob(&artifact.blob)?)?;
-        let Some(symbol) = payload["resource"]
-            .as_str()
-            .and_then(|r| r.strip_prefix("bars:"))
-            .and_then(|r| r.split(':').next())
-        else {
-            continue;
-        };
-        let Some(closes) = payload.pointer("/value/forecast_session_closes") else {
-            continue;
-        };
-        let closes: BTreeMap<String, DateTime<Utc>> = serde_json::from_value(closes.clone())?;
-        if let Some(previous) = calendars.insert(symbol.to_owned(), closes.clone()) {
-            if previous != closes {
-                return Err(ResearchError::InvalidOutput(
-                    "conflicting exchange calendars".into(),
-                ));
-            }
-        }
+    let calendars = akzio_ingest::ForecastCalendars::read(store, &manifest.payload)
+        .map_err(|error| ResearchError::InvalidOutput(error.to_string()))?;
+    if calendars.has_frozen_schedule() {
+        let session_key = store.research_session_key(run_id)?;
+        let baseline = chrono::NaiveDate::parse_from_str(&session_key, "%Y-%m-%d")
+            .map_err(|error| ResearchError::InvalidOutput(error.to_string()))?;
+        let scheduled = calendars.sessions_after(baseline)
+            .map_err(|error| ResearchError::InvalidOutput(error.to_string()))?;
+        return bind_forecast_expiries(arguments, &scheduled.map(|session| session.close_at));
     }
-    bind_common_forecast_times(arguments, &calendars, now)
+    bind_common_forecast_times(arguments, calendars.legacy_closes(), now)
 }
 
-// 用四资产共同可用的未来收盘时间为 Forecast 补入 Rust 管理的期限。修改的是本 Attempt
-// 的可变 arguments；字段缺失、模型抢先填写或日历不完整都会返回 InvalidOutput，不生成正式结果。
+// Pre-versioned evidence keeps its original close-based binding.
 fn bind_common_forecast_times(
     arguments: &mut Value,
     calendars: &BTreeMap<String, BTreeMap<String, DateTime<Utc>>>,
@@ -215,6 +197,10 @@ fn bind_common_forecast_times(
         })
         .map(|(_, close)| *close)
         .collect::<Vec<_>>();
+    bind_forecast_expiries(arguments, &common)
+}
+
+fn bind_forecast_expiries(arguments: &mut Value, closes: &[DateTime<Utc>]) -> ResearchResult<()> {
     let forecasts = arguments
         .pointer_mut("/result/forecasts")
         .and_then(Value::as_array_mut)
@@ -224,7 +210,7 @@ fn bind_common_forecast_times(
             serde_json::from_value(forecast["horizon"].clone())
                 .map_err(|e| ResearchError::InvalidOutput(e.to_string()))?;
         let days = horizon.trading_days();
-        let expiry = common.get(usize::from(days) - 1).ok_or_else(|| {
+        let expiry = closes.get(usize::from(days) - 1).ok_or_else(|| {
             ResearchError::InvalidOutput(
                 "governed common-session calendar does not cover forecast horizon".into(),
             )

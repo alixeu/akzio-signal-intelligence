@@ -228,39 +228,7 @@ impl Daemon {
 
     /// Research identity is frozen in scheduler-owned needs, independent of market openness.
     pub(super) fn research_session_key(&self, run_id: &RunId) -> Result<String> {
-        // Paper 日期只取已持久化 session slot；PositionPlan 等从 EvidenceGate 冻结 Need
-        // 提取唯一日期，既不以本机日期替代，也不要求市场当前开放。
-        if self.store.run_purpose(run_id)? == RunPurpose::Paper {
-            return self
-                .store
-                .session_slot_for_run(run_id)?
-                .map(|slot| slot.session_key)
-                .ok_or_else(|| DaemonError::InvalidInput("Paper run has no session slot".into()));
-        }
-        let snapshot = self.store.workflow_snapshot(run_id)?;
-        let gate = snapshot
-            .tasks
-            .iter()
-            .find(|t| t.node.recipe_id.as_str() == akzio_runtime::EVIDENCE_GATE_RECIPE_ID)
-            .ok_or_else(|| DaemonError::InvalidInput("research evidence gate missing".into()))?;
-        let mut sessions = BTreeSet::new();
-        for reference in &gate.node.input_artifacts {
-            let need: EvidenceNeed = self.read_artifact_payload(reference)?;
-            if need.resource.starts_with("option_chain:") {
-                if let Some(date) = need.resource.split(':').nth(2) {
-                    NaiveDate::parse_from_str(date, "%Y-%m-%d").map_err(|_| {
-                        DaemonError::InvalidInput("invalid research session".into())
-                    })?;
-                    sessions.insert(date.to_owned());
-                }
-            }
-        }
-        if sessions.len() != 1 {
-            return Err(DaemonError::InvalidInput(
-                "research needs require one frozen session".into(),
-            ));
-        }
-        Ok(sessions.into_iter().next().expect("one session"))
+        Ok(self.store.research_session_key(run_id)?)
     }
 
     fn validate_paper_evidence_policy(&self, task: &ClaimedAttempt) -> Result<()> {

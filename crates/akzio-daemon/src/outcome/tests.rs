@@ -4,7 +4,7 @@
 use super::*;
 use akzio_domain::{OutcomeWindow, RetrospectiveStatus};
 
-struct RegressionSession;
+struct RegressionSession(String);
 
 impl BrokerSessionClock for RegressionSession {
     fn open_session_key(
@@ -16,7 +16,7 @@ impl BrokerSessionClock for RegressionSession {
                 + '_,
         >,
     > {
-        Box::pin(async { Ok(Some("2026-10-09".into())) })
+        Box::pin(async { Ok(Some(self.0.clone())) })
     }
 
     fn paper_account_id(
@@ -62,8 +62,8 @@ fn daemon() -> Daemon {
     .unwrap()
 }
 
-fn install_execution_snapshots(daemon: &mut Daemon, now: DateTime<Utc>) {
-    let responses = akzio_domain::paper_session_evidence_needs("2026-10-09")
+fn install_execution_snapshots(daemon: &mut Daemon, baseline: NaiveDate, now: DateTime<Utc>) {
+    let responses = akzio_domain::paper_session_evidence_needs(&baseline.to_string())
         .into_iter()
         .map(|need| {
             let acquired =
@@ -78,13 +78,38 @@ fn install_execution_snapshots(daemon: &mut Daemon, now: DateTime<Utc>) {
 }
 
 async fn scheduled() -> (Daemon, RunId, Artifact, ClaimedAttempt) {
+    scheduled_with_calendar("2026-10-09".parse().unwrap(), None).await
+}
+
+async fn scheduled_with_calendar(
+    baseline: NaiveDate,
+    closes: Option<&BTreeMap<NaiveDate, DateTime<Utc>>>,
+) -> (Daemon, RunId, Artifact, ClaimedAttempt) {
     let mut daemon = daemon();
-    install_execution_snapshots(&mut daemon, Utc::now());
+    let now = Utc::now();
+    install_execution_snapshots(&mut daemon, baseline, now);
+    if let Some(closes) = closes {
+        let bars = akzio_domain::paper_session_evidence_needs(&baseline.to_string())
+            .into_iter()
+            .filter(|need| need.resource.starts_with("bars:"))
+            .map(|need| {
+                let mut evidence =
+                    crate::debug_fixture_evidence(EvidenceSource::Alpaca, &need.resource, now);
+                evidence.normalized["forecast_session_closes"] = serde_json::json!(closes);
+                evidence.normalized["forecast_calendar"] = serde_json::json!({
+                    "version":1, "availability_lag_minutes":20, "session_closes":closes
+                });
+                evidence.raw = serde_json::to_vec(&evidence.normalized).unwrap();
+                (need.resource, evidence)
+            })
+            .collect();
+        daemon.fixture_evidence = Arc::new(BTreeMap::from([(EvidenceSource::Alpaca, bars)]));
+    }
     let id = daemon
         .paper
         .scheduler
         .tick(
-            &RegressionSession,
+            &RegressionSession(baseline.to_string()),
             &daemon.paper_workflow_source(),
             Utc::now(),
         )
@@ -174,7 +199,6 @@ fn artifact<T: Serialize>(
 }
 
 fn install_bars(daemon: &mut Daemon, now: DateTime<Utc>) {
-    let market_day = akzio_ingest::market_session_day(now);
     let sessions = [
         "2026-10-12",
         "2026-10-13",
@@ -182,27 +206,40 @@ fn install_bars(daemon: &mut Daemon, now: DateTime<Utc>) {
         "2026-10-15",
         "2026-10-16",
     ];
-    let bars = sessions
+    let closes = sessions
         .into_iter()
         .map(|date| {
-            serde_json::json!({
-                "t":date,"o":"99.0","h":"101.0","l":"98.0","c":"100.0","v":1000
-            })
+            (
+                date.parse().unwrap(),
+                format!("{date}T20:00:00Z").parse().unwrap(),
+            )
         })
-        .collect::<Vec<_>>();
+        .collect();
+    install_window_bars(daemon, "2026-10-09".parse().unwrap(), &closes, now, None);
+}
+
+fn install_window_bars(
+    daemon: &mut Daemon,
+    baseline: NaiveDate,
+    closes: &BTreeMap<NaiveDate, DateTime<Utc>>,
+    now: DateTime<Utc>,
+    missing: Option<(Asset, NaiveDate)>,
+) {
+    let market_day = akzio_ingest::market_session_day(now);
     let responses = Asset::EXECUTABLE.into_iter().map(|asset| {
-        let resource = format!("bars:{}:1d:2026-10-09:252:raw:{market_day}", asset.symbol());
+        let resource = format!("bars:{}:1d:{baseline}:252:raw:{market_day}", asset.symbol());
         let source_uri = format!("fixture://outcome-bars/{}", asset.symbol());
+        let bars = closes.keys().copied().filter(|day| missing != Some((asset, *day)))
+            .map(|day| serde_json::json!({"t":day,"o":"99.0","h":"101.0","l":"98.0","c":"100.0","v":1000}))
+            .collect::<Vec<_>>();
         let normalized = serde_json::json!({
             "symbol":asset.symbol(),
-            "bars":bars.clone(),
+            "bars":bars,
             "price_basis":"raw_requires_stage_action_check",
             "corporate_actions_response":{"corporate_actions":{},"next_page_token":null},
             "content_available_at":now-Duration::minutes(1),
-            "latest_completed_session":"2026-10-16",
-            "session_closes":sessions.into_iter().map(|date| {
-                (date.to_owned(),format!("{date}T20:00:00Z"))
-            }).collect::<BTreeMap<_,_>>()
+            "latest_completed_session":closes.last_key_value().unwrap().0,
+            "session_closes":closes,
         });
         let acquired = AcquiredEvidence {
             raw: serde_json::to_vec(&normalized).unwrap(),
@@ -228,6 +265,156 @@ fn install_bars(daemon: &mut Daemon, now: DateTime<Utc>) {
         responses,
     ));
     daemon.production_evidence = Arc::new(BTreeMap::from([(EvidenceSource::Alpaca, adapter)]));
+}
+
+/// WHY THIS TEST EXISTS (Task #9): Paper overnight and a weekend PositionPlan must retain different authoritative session dates.
+/// Do not weaken or delete this assertion.
+#[tokio::test]
+async fn research_session_uses_persisted_paper_slot_and_position_plan_needs() {
+    let daemon = daemon();
+    let overnight: DateTime<Utc> = "2026-11-09T03:00:00Z".parse().unwrap();
+    assert_eq!(
+        akzio_ingest::market_session_day(overnight).to_string(),
+        "2026-11-08"
+    );
+    let paper = daemon
+        .paper
+        .scheduler
+        .tick(
+            &RegressionSession("2026-11-09".into()),
+            &daemon.paper_workflow_source(),
+            overnight,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        daemon
+            .store
+            .research_session_key(&paper.slot.workflow.run.run_id)
+            .unwrap(),
+        "2026-11-09"
+    );
+
+    let weekend: DateTime<Utc> = "2026-11-07T17:00:00Z".parse().unwrap();
+    let (plan, setup) = daemon
+        .prepare_position_plan(RunId::new(), "2026-11-07", weekend)
+        .unwrap();
+    daemon
+        .store
+        .commit_position_plan(&plan, &setup, daemon.startup_decision_policy_hash.as_ref())
+        .unwrap();
+    assert_eq!(
+        daemon.store.research_session_key(&plan.run.run_id).unwrap(),
+        "2026-11-07"
+    );
+}
+
+/// WHY THIS TEST EXISTS (Task #9): The exact calendar must bind both Paper forecasts and the late Outcome worker.
+/// Do not weaken or delete this assertion.
+#[tokio::test]
+async fn fixed_outcome_waits_for_the_original_session_and_its_publication_lag() {
+    let baseline = akzio_ingest::market_session_day(Utc::now());
+    let closes = BTreeMap::from_iter((0..=6).map(|offset| {
+        let day = baseline + Duration::days(offset);
+        (day, day.and_hms_opt(18, 0, 0).unwrap().and_utc())
+    }));
+    let t1 = baseline + Duration::days(1);
+    let t3 = baseline + Duration::days(3);
+    let t5 = baseline + Duration::days(5);
+    let (mut daemon, _, schedule_artifact, task) =
+        scheduled_with_calendar(baseline, Some(&closes)).await;
+    let schedule_ref = reference(&schedule_artifact);
+    let schedule: OutcomeSchedule = daemon.read_artifact_payload(&schedule_ref).unwrap();
+    let decision: Decision = daemon.read_artifact_payload(&schedule.decision).unwrap();
+    for forecast in decision.forecasts {
+        let day = baseline + Duration::days(i64::from(forecast.horizon.trading_days()));
+        assert_eq!(forecast.thesis.unwrap().thesis_valid_until, closes[&day]);
+    }
+    let before_publication = closes[&t1] + Duration::minutes(19);
+    let lease = daemon
+        .store
+        .acquire_daemon_lease(
+            "exact-window-regression",
+            "fixture",
+            Utc::now(),
+            closes[&t5] + Duration::days(1),
+        )
+        .unwrap()
+        .unwrap();
+    assert!(daemon
+        .collect_outcome_materialization(
+            &lease,
+            &task,
+            &schedule_ref,
+            &schedule,
+            before_publication
+        )
+        .await
+        .unwrap()
+        .is_none());
+    let now = closes.last_key_value().unwrap().1.to_owned() + Duration::minutes(20);
+    install_window_bars(
+        &mut daemon,
+        baseline,
+        &closes,
+        now,
+        Some((Asset::EXECUTABLE[0], t1)),
+    );
+    assert!(daemon
+        .collect_outcome_materialization(&lease, &task, &schedule_ref, &schedule, now)
+        .await
+        .unwrap()
+        .is_none());
+    let intermediary = baseline + Duration::days(2);
+    install_window_bars(
+        &mut daemon,
+        baseline,
+        &closes,
+        now,
+        Some((Asset::EXECUTABLE[0], intermediary)),
+    );
+    let available = daemon
+        .collect_outcome_materialization(&lease, &task, &schedule_ref, &schedule, now)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        available
+            .materialization
+            .observations
+            .iter()
+            .map(|obs| obs.observed_trading_day)
+            .collect::<Vec<_>>(),
+        [t1]
+    );
+    install_window_bars(&mut daemon, baseline, &closes, now, None);
+    let available = daemon
+        .collect_outcome_materialization(&lease, &task, &schedule_ref, &schedule, now)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        available
+            .materialization
+            .observations
+            .iter()
+            .map(|obs| obs.observed_trading_day)
+            .collect::<Vec<_>>(),
+        [t1, t3, t5]
+    );
+    // Same day and price with a provider close differing from the frozen venue calendar.
+    let mut conflicting = closes.clone();
+    conflicting.insert(t3, closes[&t3] + Duration::hours(1));
+    install_window_bars(&mut daemon, baseline, &conflicting, now, None);
+    let error = daemon
+        .collect_outcome_materialization(&lease, &task, &schedule_ref, &schedule, now)
+        .await
+        .err()
+        .expect("the provider close must match the frozen schedule");
+    assert!(error
+        .to_string()
+        .contains(&format!("frozen venue close for {t3}")));
 }
 
 fn install_narratives(

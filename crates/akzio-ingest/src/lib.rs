@@ -11,6 +11,7 @@
 mod availability;
 mod direct;
 mod financial_content;
+mod forecast_calendar;
 mod fred_observations;
 mod news;
 mod official;
@@ -22,12 +23,13 @@ pub mod runtime;
 pub use akzio_domain::fred_observations::fred_series_direction_gap;
 pub use akzio_domain::EvidenceAcquisitionMode;
 pub use direct::{FredDirectTransport, SecEdgarDirectTransport};
+pub use forecast_calendar::{ForecastCalendars, ScheduledSession};
 pub use news::{configured_news_evidence_transport, configured_news_evidence_transport_with_audit};
 pub use official::OfficialInstrumentEvidenceTransport;
 pub use paper_decode::{
     common_bar_dates, decode_paper_account, decode_paper_account_components, decode_paper_clock,
-    decode_paper_quotes, parse_daily_bars, parse_money_micros, provider_money, PaperDecodeError,
-    PaperDecodeResult,
+    decode_paper_quotes, parse_daily_bars, parse_money_micros, parse_scheduled_daily_bars,
+    provider_money, PaperDecodeError, PaperDecodeResult,
 };
 pub use quant_features::{QuantFeatureSnapshot, QUANT_FEATURE_FORMULA_VERSION};
 pub use runtime::validate_outcome_price_window;

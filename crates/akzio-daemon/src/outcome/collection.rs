@@ -34,6 +34,19 @@ impl Daemon {
         if market_day <= schedule.baseline_trading_day {
             return Ok(None);
         }
+        let scheduled = akzio_ingest::ForecastCalendars::for_decision_context(
+            &self.store,
+            &schedule.decision_context,
+        )?
+        .map(|calendars| calendars.sessions_after(schedule.baseline_trading_day))
+        .transpose()?;
+        if scheduled
+            .as_ref()
+            .is_some_and(|sessions| sessions[0].available_at > now)
+        {
+            return Ok(None);
+        }
+        let deadline = schedule.baseline_trading_day + Duration::days(366);
         let decision_artifact = self.store.artifact(&schedule.decision.artifact_id)?;
         let decision: Decision =
             serde_json::from_slice(&self.store.read_blob(&decision_artifact.blob)?)?;
@@ -77,7 +90,7 @@ impl Daemon {
                 "bars:{}:1d:{}:252:raw:{}",
                 asset.symbol(),
                 schedule.baseline_trading_day,
-                market_day.min(schedule.baseline_trading_day + Duration::days(366))
+                market_day.min(deadline)
             );
             let need = EvidenceNeed {
                 schema_version: akzio_domain::DOMAIN_SCHEMA_VERSION,
@@ -105,22 +118,35 @@ impl Daemon {
                     adapter.as_ref(),
                     now,
                 )
-                .await?;
-            let bars = parse_daily_bars(&acquired.normalized, acquired.observed_at)?;
-            if bars.is_empty() {
+                .await;
+            let acquired = match acquired {
+                Err(EvidenceRuntimeError::Adapter(
+                    akzio_ingest::EvidenceAdapterError::Pending(_),
+                )) if scheduled.is_some() && market_day < deadline => return Ok(None),
+                result => result?,
+            };
+            let bars = if let Some(sessions) = &scheduled {
+                akzio_ingest::parse_scheduled_daily_bars(&acquired.normalized, sessions)?
+            } else {
+                parse_daily_bars(&acquired.normalized, acquired.observed_at)?
+            };
+            if bars.is_empty() && scheduled.is_none() {
                 return Ok(None);
             }
             bars_by_asset.insert(asset, bars);
             acquisitions.push((need_reference, request, acquired));
         }
 
-        let common_dates = common_bar_dates(&bars_by_asset, schedule.baseline_trading_day)
-            .into_iter()
-            .take(5)
-            .collect::<Vec<_>>();
+        // Unmarked schedules keep the historical date selection, including any partial stages.
+        let common_dates = match &scheduled {
+            Some(sessions) => completed_scheduled_dates(sessions, &bars_by_asset, now),
+            None => common_bar_dates(&bars_by_asset, schedule.baseline_trading_day)
+                .into_iter()
+                .take(5)
+                .collect(),
+        };
         if common_dates.len() < 5
-            && (bars_by_asset.values().any(|bars| bars.len() >= 252)
-                || market_day >= schedule.baseline_trading_day + Duration::days(366))
+            && (bars_by_asset.values().any(|bars| bars.len() >= 252) || market_day >= deadline)
         {
             return Err(DaemonError::Unavailable(
                 "common-session search exhausted the bounded 252-bar/366-day window".to_owned(),
@@ -345,4 +371,22 @@ impl Daemon {
             ))
         })
     }
+}
+
+fn completed_scheduled_dates(
+    sessions: &[akzio_ingest::ScheduledSession; 5],
+    bars: &BTreeMap<Asset, BTreeMap<NaiveDate, MoneyMicros>>,
+    cutoff: DateTime<Utc>,
+) -> Vec<NaiveDate> {
+    sessions
+        .iter()
+        .take_while(|session| {
+            session.available_at <= cutoff
+                && Asset::EXECUTABLE.iter().all(|asset| {
+                    bars.get(asset)
+                        .is_some_and(|prices| prices.contains_key(&session.date))
+                })
+        })
+        .map(|session| session.date)
+        .collect()
 }

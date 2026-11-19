@@ -528,6 +528,7 @@ fn compact_governed_projection(kind: ArtifactKind, value: Value) -> Value {
                 }
             }
             object.remove("session_closes");
+            object.remove("forecast_calendar");
             compact_fund_holdings(object);
         }
         let mut projected = serde_json::json!({"projection_version":1,"source":value["source"],
@@ -1348,6 +1349,20 @@ mod fund_holdings_projection_tests {
         let data = &projection["value_summary"]["data"];
         assert_eq!(data["rows_projection"]["omitted_count"], 0);
         assert_eq!(data["rows_projection"]["retained_count"], 1);
+    }
+
+    /// WHY THIS TEST EXISTS (Task #9): Rust-owned session metadata must not displace or expand model evidence.
+    /// Do not weaken or delete this assertion.
+    #[test]
+    fn forecast_calendar_does_not_change_model_projection_bytes() {
+        let value = serde_json::json!({"source":"alpaca", "resource":"bars:TQQQ:1d",
+            "value":{"bars":[{"t":"2026-11-25","c":"100.0"}]}});
+        let previous = compact_governed_projection(ArtifactKind::NormalizedEvidence, value.clone());
+        let mut with_calendar = value;
+        with_calendar["value"]["forecast_calendar"] = serde_json::json!({"version":1,
+            "availability_lag_minutes":20,"session_closes":{"2026-11-27":"2026-11-27T18:00:00Z"}});
+        let projection = compact_governed_projection(ArtifactKind::NormalizedEvidence, with_calendar);
+        assert_eq!(serde_json::to_vec(&projection).unwrap(), serde_json::to_vec(&previous).unwrap());
     }
 
     /// Non-holdings evidence must not be reshaped by the holdings bound.
