@@ -287,6 +287,23 @@ impl TaskWorkload {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutcomeLessonDerivation {
+    pub evaluation: ArtifactId,
+    pub expected: Option<usize>,
+    /// Drafts without a verified original genesis, including individually blocked Drafts.
+    pub pending: Option<usize>,
+    pub blocked_reason: Option<String>,
+    #[serde(default)]
+    pub draft_failures: Vec<OutcomeLessonDraftFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutcomeLessonDraftFailure {
+    pub lesson_id: LessonId,
+    pub reason: String,
+}
+
 /// Read-only projection of the two timelines; never a second stored state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunLifecycleHealth {
@@ -298,6 +315,8 @@ pub struct RunLifecycleHealth {
     pub narrative_repair_pending: bool,
     pub learning_recorded: bool,
     pub learning_eligible: Option<bool>,
+    #[serde(default)]
+    pub outcome_lesson_derivations: Vec<OutcomeLessonDerivation>,
     pub decision_production_usage: Option<RunModelUsage>,
     pub outcome_usage: RunModelUsage,
     pub lifecycle_usage: RunModelUsage,

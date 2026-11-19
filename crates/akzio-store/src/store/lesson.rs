@@ -99,6 +99,8 @@ pub struct LessonRevalidationScan {
     pub contested: u64,
 }
 
+mod derivation;
+
 include!("lesson/write.rs");
 include!("lesson/queries_verify.rs");
 include!("lesson/helpers.rs");

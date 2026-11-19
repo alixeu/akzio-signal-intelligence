@@ -539,6 +539,7 @@ async fn fixed_outcome_waits_for_the_original_session_and_its_publication_lag() 
         &schedule,
         &schedule_artifact,
         &OutcomeHorizon::ALL,
+        &[],
     );
     for horizon in OutcomeHorizon::ALL {
         let completion = daemon.execute_outcome_worker(&task, seal_at).await.unwrap();
@@ -585,6 +586,7 @@ fn install_narratives(
     schedule: &OutcomeSchedule,
     schedule_artifact: &Artifact,
     horizons: &[OutcomeHorizon],
+    lessons: &[akzio_domain::RetrospectiveLessonProposal],
 ) {
     let now = Utc::now();
     let schedule_ref = reference(schedule_artifact);
@@ -599,7 +601,7 @@ fn install_narratives(
             "findings":[],
             "counterfactuals":[],
             "lesson_candidates":[],
-            "lesson_proposals":[],
+            "lesson_proposals": if *horizon == OutcomeHorizon::T5 { lessons } else { &[] },
             "diagnostic_gaps":[],
             "source_refs":[{"artifact_id":schedule_ref.artifact_id.clone(),"kind":"outcome_schedule"}],
             "created_at":now,
@@ -668,6 +670,7 @@ async fn outcome_worker_uses_frozen_node_for_every_narrative_stage() {
         &schedule,
         &schedule_artifact,
         &OutcomeHorizon::ALL,
+        &[],
     );
 
     for horizon in OutcomeHorizon::ALL {
@@ -827,6 +830,7 @@ async fn narrative_repair_uses_the_frozen_repair_node() {
         &schedule,
         &schedule_artifact,
         &[OutcomeHorizon::T5],
+        &[],
     );
 
     let completion = daemon
@@ -1036,4 +1040,222 @@ async fn outcome_materializes_actual_fill_but_no_cost_for_proven_unsent_order() 
         daemon.realized_execution(&schedule, &context),
         Err(DaemonError::InvalidInput(_))
     ));
+}
+
+/// WHY THIS TEST EXISTS (Task #17): A committed T5 evaluation must survive the process stopping before its derived Lessons are written.
+/// Do not weaken or delete this assertion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn committed_evaluation_recovers_missing_draft_lessons_after_restart() {
+    let (mut daemon, run_id, schedule_artifact, mut task) = scheduled().await;
+    let schedule: OutcomeSchedule =
+        serde_json::from_slice(&daemon.store.read_blob(&schedule_artifact.blob).unwrap()).unwrap();
+    let candidates: Vec<_> = ["First rule", "Second rule"]
+        .into_iter()
+        .map(|statement| akzio_domain::RetrospectiveLessonProposal {
+            statement: statement.to_owned(),
+            recommended_behavior: "Review the frozen allocation evidence.".into(),
+            exclusions: vec!["Exclude sessions with missing observations.".into()],
+            assets: std::collections::BTreeSet::from([Asset::Qqq]),
+            horizons: std::collections::BTreeSet::from([akzio_domain::DecisionHorizon::T5]),
+            evidence_refs: vec![reference(&schedule_artifact)],
+        })
+        .collect();
+    install_bars(&mut daemon, Utc::now());
+    install_narratives(
+        &mut daemon,
+        &schedule,
+        &schedule_artifact,
+        &OutcomeHorizon::ALL,
+        &candidates,
+    );
+    for horizon in OutcomeHorizon::ALL {
+        let now = Utc::now();
+        let completion = daemon.execute_outcome_worker(&task, now).await.unwrap();
+        assert_complete_narrative(&daemon, &task, &schedule, horizon);
+        if horizon == OutcomeHorizon::T5 {
+            assert!(matches!(completion, TaskCompletion::Committed));
+        } else {
+            assert!(matches!(completion, TaskCompletion::DeferredUntil(_)));
+            let completed_at = Utc::now();
+            let ready_at = completed_at + Duration::seconds(1);
+            daemon
+                .store
+                .defer_task(&task.permit, ready_at, completed_at)
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+            task = claim_outcome(&daemon);
+        }
+    }
+    let root = daemon.store.root().to_path_buf();
+    drop(daemon);
+    let first_restart = Store::open(&root).unwrap();
+    let blocked_root = root.with_file_name(format!("blocked-{}", RunId::new().0));
+    first_restart.backup_to(&blocked_root).unwrap();
+    let health = first_restart.run_lifecycle_health(&run_id).unwrap();
+    assert!(health.learning_recorded);
+    assert_eq!(first_restart.lessons(None, 10).unwrap().len(), 0);
+    let [pending] = health.outcome_lesson_derivations.as_slice() else {
+        panic!("expected one committed Evaluation");
+    };
+    assert_eq!(pending.expected, Some(2));
+    assert_eq!(pending.pending, Some(2));
+    assert_eq!(pending.blocked_reason, None);
+    assert!(pending.draft_failures.is_empty());
+    let evaluation = first_restart.artifact(&pending.evaluation).unwrap();
+    let final_retrospective = evaluation
+        .source_refs
+        .iter()
+        .find(|source| source.kind == ArtifactKind::Retrospective)
+        .unwrap();
+    let evaluation_payload: akzio_domain::Evaluation =
+        serde_json::from_slice(&first_restart.read_blob(&evaluation.blob).unwrap()).unwrap();
+    assert!(first_restart
+        .repair_outcome_lesson_drafts(&RunId::new(), &evaluation.artifact_id, 1)
+        .is_err());
+    assert!(first_restart
+        .repair_outcome_lesson_drafts(&run_id, &final_retrospective.artifact_id, 1)
+        .is_err());
+    assert_eq!(
+        first_restart
+            .repair_outcome_lesson_drafts(&run_id, &evaluation.artifact_id, 1)
+            .unwrap(),
+        (1, Vec::new())
+    );
+    let [first]: [_; 1] = first_restart.lessons(None, 10).unwrap().try_into().unwrap();
+    assert_eq!(first.lesson.statement, candidates[0].statement);
+    assert_eq!(first.lesson.created_at, evaluation_payload.created_at);
+    assert_eq!(first.lesson.source_refs[0], *final_retrospective);
+    assert_eq!(first.lesson.lifecycle, akzio_domain::LessonLifecycle::Draft);
+    let blocked_store = Store::open(&blocked_root).unwrap();
+    let mut conflicting = first.lesson.clone();
+    conflicting.statement = "Different content under the original Lesson identity".into();
+    let original_source = blocked_store
+        .artifact(&final_retrospective.artifact_id)
+        .unwrap();
+    blocked_store
+        .write_lesson(&conflicting, &original_source, conflicting.created_at)
+        .unwrap();
+    let concurrent_store = Store::open(&blocked_root).unwrap();
+    let barrier = std::sync::Barrier::new(2);
+    let repair = |store: &Store| {
+        barrier.wait();
+        store
+            .repair_outcome_lesson_drafts(&run_id, &evaluation.artifact_id, 2)
+            .unwrap()
+    };
+    let repairs = std::thread::scope(|threads| {
+        let first = threads.spawn(|| repair(&blocked_store));
+        let second = threads.spawn(|| repair(&concurrent_store));
+        [first.join().unwrap(), second.join().unwrap()]
+    });
+    assert_eq!(repairs.iter().map(|(created, _)| created).sum::<usize>(), 1);
+    for (_, failures) in repairs {
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].lesson_id, conflicting.lesson_id);
+    }
+    let (_, blocked) = blocked_store.repair_outcome_lesson_batch(0).unwrap();
+    let blocked_lessons = blocked_store.lessons(None, 10).unwrap();
+    assert_eq!(
+        blocked_lessons.len(),
+        2,
+        "one conflicting genesis must not prevent deriving the other Draft"
+    );
+    let unchanged = blocked_lessons
+        .iter()
+        .find(|row| row.lesson.lesson_id == conflicting.lesson_id)
+        .unwrap();
+    assert_eq!(unchanged.lesson, conflicting);
+    assert_eq!(unchanged.revision, 1);
+    let recovered = blocked_lessons
+        .iter()
+        .find(|row| row.lesson.statement == candidates[1].statement)
+        .unwrap();
+    assert_eq!(recovered.lesson.created_at, evaluation_payload.created_at);
+    assert_eq!(recovered.lesson.source_refs[0], *final_retrospective);
+    assert_eq!(
+        recovered.lesson.lifecycle,
+        akzio_domain::LessonLifecycle::Draft
+    );
+    assert_eq!(blocked.len(), 1);
+    assert!(blocked[0].contains("outcome_lesson.conflicting_genesis"));
+    assert!(blocked[0].contains(conflicting.lesson_id.0.as_str()));
+    let (_, blocked_again) = blocked_store.repair_outcome_lesson_batch(0).unwrap();
+    assert_eq!(blocked_again, blocked);
+    assert_eq!(blocked_store.lessons(None, 10).unwrap(), blocked_lessons);
+    let blocked_health = blocked_store.run_lifecycle_health(&run_id).unwrap();
+    let derivation = &blocked_health.outcome_lesson_derivations[0];
+    assert_eq!(derivation.expected, Some(2));
+    assert_eq!(derivation.pending, Some(1));
+    assert_eq!(derivation.blocked_reason, None);
+    let [failure] = derivation.draft_failures.as_slice() else {
+        panic!("expected precisely one blocked Draft");
+    };
+    assert_eq!(failure.lesson_id, conflicting.lesson_id);
+    assert!(failure
+        .reason
+        .contains("outcome_lesson.conflicting_genesis"));
+    let head = first_restart
+        .transition_lesson(
+            &first.lesson.lesson_id,
+            akzio_domain::LessonLifecycle::Active,
+            "offline-fixture-reviewer",
+            "Reviewed the original Draft while the second Draft was pending.",
+            Utc::now(),
+        )
+        .unwrap();
+    assert_eq!(
+        first_restart
+            .run_lifecycle_health(&run_id)
+            .unwrap()
+            .outcome_lesson_derivations[0]
+            .pending,
+        Some(1)
+    );
+    drop(first_restart);
+
+    let second_restart = Store::open(&root).unwrap();
+    assert_eq!(
+        second_restart.repair_outcome_lesson_batch(0).unwrap(),
+        (0, Vec::new())
+    );
+    let health = second_restart.run_lifecycle_health(&run_id).unwrap();
+    assert_eq!(health.outcome_lesson_derivations[0].pending, Some(0));
+    assert_eq!(health.outcome_lesson_derivations[0].blocked_reason, None);
+    assert_eq!(
+        second_restart.lesson(&first.lesson.lesson_id).unwrap(),
+        Some(head)
+    );
+    let lessons = second_restart.lessons(None, 10).unwrap();
+    assert_eq!(lessons.len(), 2);
+    for (index, proposal) in candidates.iter().enumerate() {
+        let id = akzio_domain::content_hash_json(&serde_json::json!({
+            "retrospective": final_retrospective.artifact_id,
+            "index": index,
+            "statement": proposal.statement,
+        }))
+        .unwrap();
+        let lesson = second_restart
+            .lesson(&akzio_domain::LessonId(id.as_str().to_owned()))
+            .unwrap()
+            .unwrap()
+            .lesson;
+        assert_eq!(lesson.statement, proposal.statement);
+        assert_eq!(lesson.recommended_behavior, proposal.recommended_behavior);
+        assert_eq!(lesson.exclusions, proposal.exclusions);
+        assert_eq!(lesson.created_at, evaluation_payload.created_at);
+        assert_eq!(
+            lesson.source_refs,
+            [final_retrospective.clone(), reference(&schedule_artifact)]
+        );
+    }
+    assert_eq!(
+        second_restart
+            .repair_outcome_lesson_drafts(&run_id, &evaluation.artifact_id, 2)
+            .unwrap(),
+        (0, Vec::new())
+    );
+    assert_eq!(
+        second_restart.artifact(&evaluation.artifact_id).unwrap(),
+        evaluation
+    );
 }

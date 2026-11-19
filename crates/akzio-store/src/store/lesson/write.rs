@@ -15,6 +15,24 @@ impl Store {
         source: &Artifact,
         now: DateTime<Utc>,
     ) -> StoreResult<LessonWriteResult> {
+        self.write_lesson_revision_one(lesson, source, now, false)
+    }
+
+    fn write_lesson_preserving_genesis(
+        &self,
+        lesson: &Lesson,
+        source: &Artifact,
+    ) -> StoreResult<LessonWriteResult> {
+        self.write_lesson_revision_one(lesson, source, lesson.created_at, true)
+    }
+
+    fn write_lesson_revision_one(
+        &self,
+        lesson: &Lesson,
+        source: &Artifact,
+        now: DateTime<Utc>,
+        preserve_genesis: bool,
+    ) -> StoreResult<LessonWriteResult> {
         if self.debug_environment()?.is_some() && matches!(lesson.lifecycle, LessonLifecycle::Active | LessonLifecycle::Contested) {
             return Err(StoreError::InvalidLearningCommit("debug_learning_isolated"));
         }
@@ -80,7 +98,8 @@ impl Store {
             let current = self
                 .read_lesson_from_transaction(&transaction, &lesson.lesson_id)?
                 .ok_or_else(|| StoreError::Integrity("lesson head disappeared".to_owned()))?;
-            if current.lesson != *lesson {
+            let preserved = preserve_genesis && derivation::outcome_lesson_genesis_exists(&transaction, lesson)?;
+            if !preserved && current.lesson != *lesson {
                 return Err(StoreError::Integrity(format!(
                     "lesson {} conflicts with its immutable head",
                     lesson.lesson_id

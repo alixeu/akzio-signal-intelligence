@@ -237,6 +237,7 @@ impl Store {
                 .run_artifacts_by_kind(run_id, ArtifactKind::Evaluation)?
                 .is_empty(),
             learning_eligible,
+            outcome_lesson_derivations: self.outcome_lesson_derivations(run_id)?,
             decision_production_usage: schedule_payload
                 .as_ref()
                 .map(|s| self.model_usage_for_producing_run(&s.decision))

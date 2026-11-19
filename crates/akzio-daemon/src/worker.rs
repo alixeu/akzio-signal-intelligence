@@ -13,7 +13,15 @@
 // 因而可被多个 Tokio worker 共享；`JoinSet` 管理后台 recovery/worker 生命周期；`watch`
 // 传播取消，`FnMut` recovery 闭包保留可变调用状态，StalePermit 仅记录告警并继续轮询。
 
-use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicI64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use akzio_runtime::{RuntimeError, TaskCompletion, TaskRuntime};
 use akzio_store::{ClaimedAttempt, Store, StoreError};
@@ -97,11 +105,13 @@ impl WorkerPool {
         let runtime = self.runtime.clone();
         let lesson_revalidation_store = self.lesson_revalidation_store.clone();
         let run_log_guard = self.run_log_guard.clone();
+        let lesson_repair_cursor = Arc::new(AtomicI64::new(0));
         self.serve_with_recovery(handler, shutdown, move || {
             recover_expired_tasks(
                 runtime.clone(),
                 lesson_revalidation_store.clone(),
                 run_log_guard.clone(),
+                lesson_repair_cursor.clone(),
             )
         })
         .await
@@ -168,6 +178,7 @@ async fn recover_expired_tasks(
     runtime: TaskRuntime,
     lesson_revalidation_store: Option<Store>,
     run_log_guard: Option<Arc<RunLogger>>,
+    lesson_repair_cursor: Arc<AtomicI64>,
 ) -> Result<u64, RuntimeError> {
     // recovery 先处理过期 Attempt，再可选地 contest 到期 Lesson；两个动作都在 durable Store
     // 边界内，不会重置失败预算或重新发送不确定的外部请求。
@@ -177,13 +188,26 @@ async fn recover_expired_tasks(
             .as_ref()
             .is_none_or(|logger| logger.assert_available().is_ok())
     }) {
-        tokio::task::spawn_blocking(move || store.contest_lessons_due_for_revalidation(Utc::now()))
-            .await
-            .map_err(|error| {
-                RuntimeError::Store(StoreError::Integrity(format!(
-                    "lesson revalidation maintenance panicked: {error}"
-                )))
-            })??;
+        tokio::task::spawn_blocking(move || {
+            match store.repair_outcome_lesson_batch(lesson_repair_cursor.load(Ordering::Relaxed)) {
+                Ok((next_cursor, blocked)) => {
+                    lesson_repair_cursor.store(next_cursor, Ordering::Relaxed);
+                    for error in blocked {
+                        tracing::warn!(%error, "Outcome Lesson derivation blocked");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "Outcome Lesson maintenance could not read the ledger")
+                }
+            }
+            store.contest_lessons_due_for_revalidation(Utc::now())
+        })
+        .await
+        .map_err(|error| {
+            RuntimeError::Store(StoreError::Integrity(format!(
+                "lesson revalidation maintenance panicked: {error}"
+            )))
+        })??;
     }
     Ok(recovered)
 }

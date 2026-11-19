@@ -3,63 +3,6 @@
 // schedule、观察和可选 RetrospectiveDraft；学习资格与 Policy/Evaluation 创建由其他入口继续判断。
 
 impl EvaluationRuntime {
-    // 仅处理已提交 Retrospective 中的 lesson_proposals；循环里单条非法 proposal 会经 ? 终止，
-    // 空白 statement 则只跳过该条，Store 写成功也只得到 Draft/quarantine Lesson。
-    fn materialize_retrospective_lessons(
-        &self,
-        retrospective_artifact: &Artifact,
-        retrospective: &Retrospective,
-        created_at: DateTime<Utc>,
-    ) -> EvaluationRuntimeResult<()> {
-        // 只有已提交的 T+5 retrospective lesson_proposals 才进入这里；每条 proposal
-        // 先验收并写成 Draft + outcome_quarantined，绝不会因为一次 Outcome 自动变成 Active。
-        for (index, candidate) in retrospective.lesson_proposals.iter().enumerate() {
-            candidate.validate()?;
-            let statement = candidate.statement.trim();
-            if statement.is_empty() {
-                continue;
-            }
-            let lesson = Lesson {
-                schema_version: DOMAIN_SCHEMA_VERSION,
-                lesson_id: LessonId(stable_id(&serde_json::json!({
-                    "retrospective": retrospective_artifact.artifact_id,
-                    "index": index,
-                    "statement": statement,
-                }))?),
-                origin: LessonOrigin::OutcomeDerived,
-                lifecycle: LessonLifecycle::Draft,
-                title: format!("Outcome lesson {}", index + 1),
-                statement: statement.to_owned(),
-                rationale: retrospective.summary.clone(),
-                recommended_behavior: candidate.recommended_behavior.clone(),
-                exclusions: candidate.exclusions.clone(),
-                scope: LessonScope {
-                    assets: candidate.assets.clone(),
-                    horizons: candidate.horizons.clone(),
-                    ..LessonScope::default()
-                },
-                source_refs: std::iter::once(reference(retrospective_artifact))
-                    .chain(candidate.evidence_refs.iter().cloned())
-                    .collect(),
-                supersedes: Vec::new(),
-                conflicts_with: Vec::new(),
-                confidence_ppm: 500_000,
-                authored_by: None,
-                approved_by: None,
-                created_at,
-                updated_at: created_at,
-                governance: Some(akzio_domain::LessonGovernance::outcome_quarantined(
-                    created_at,
-                )),
-            };
-            // source_refs 同时保留 retrospective 和 proposal evidence，供后续人工治理/召回
-            // 审计；空 statement 被跳过，因此“有 proposal”不等于“写入一条 Lesson”。
-            self.store
-                .write_lesson(&lesson, retrospective_artifact, created_at)?;
-        }
-        Ok(())
-    }
-
     // 从 Store 查询该 Run 的真实 purpose 并委托 canonical-purpose 校验；PositionPlan/debug
     // 不因提供了相同 payload 而取得 Paper Outcome 学习写权限。
     fn require_paper(&self, run_id: &akzio_domain::RunId) -> EvaluationRuntimeResult<()> {

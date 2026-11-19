@@ -450,9 +450,6 @@ impl EvaluationRuntime {
                 created_at,
             })
         };
-        let retrospective_for_lessons = retrospective_artifact.clone();
-        let retrospective_payload: Retrospective =
-            serde_json::from_slice(&self.store.read_blob(&retrospective_for_lessons.blob)?)?;
         let lesson_evidence = self.lesson_evidence_for_outcome(
             &schedule.decision_context,
             &outcome_ref,
@@ -484,14 +481,7 @@ impl EvaluationRuntime {
         // Store 在同一 SQLite Immediate 事务中校验 lease/permit、写入 Outcome、T5
         // retrospective、Experience、Evaluation、可选 CandidatePolicy、Lesson evidence
         // 和 policy cursor/transition；事务失败时不把内存里已构造的对象当成已提交。
-        // 随后的 LessonProposal 写入是逐条的后续 Store 操作：若其中一条失败，前一事务
-        // 已提交的 canonical Evaluation/Policy 不回滚，已成功写入的 Lesson 也保留并可审计。
-        self.materialize_retrospective_lessons(
-            &retrospective_for_lessons,
-            &retrospective_payload,
-            created_at,
-        )?;
-
+        // Draft Lesson 由后台维护从已提交 Evaluation 的精确来源幂等补齐。
         Ok(EvaluationResult {
             outcome: outcome_ref,
             experience: experience_ref,
