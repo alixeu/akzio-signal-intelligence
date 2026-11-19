@@ -455,14 +455,14 @@ impl AgentRuntime {
             let frozen_result = if direct_structured && is_deliberation_repair(&pending_tool_outputs) {
                 // deliberation 修复只能复用上一份 immutable result；模型获得反馈和旧
                 // deliberation，不得借修复机会重写 Claim/Forecast/Review 正式结果。
-                let original = self.last_structured_submission(&trace_refs).await?;
+                let (original, result_turn) = self.last_structured_submission(&trace_refs).await?;
                 request.context = vec![json!({"type":"deliberation_repair","previous_deliberation":original["deliberation"],"validation_feedback":pending_tool_outputs,"frozen_result_hash":akzio_domain::ContentHash::of_bytes(&serde_json::to_vec(&original["result"])?)})];
                 request.continuation = None;
                 request.tool_outputs.clear();
                 request.continuation_instruction = None;
                 request.prompt = format!("{governance}\n本次仅修复此前被 Rust 拒绝的 deliberation。正式 result 已冻结，不得提交、重写或推断 result。保留原有依据和叙事，仅修复指出的错误；uncertainty_weight_ppm 的总和必须严格等于 1000000-confidence_ppm。恰好调用一次 submit_result，只包含 deliberation。引用 ID 必须来自此不可变 ledger：{reference_ledger}");
                 request.terminal = Some(deliberation_terminal.clone());
-                Some(original["result"].clone())
+                Some((original["result"].clone(), result_turn))
             } else { None };
             let provisional_input_tokens = estimate_tokens(&request)?;
             // A memo and a Submit must both fit. Optional schema repair is bounded
@@ -508,6 +508,7 @@ impl AgentRuntime {
                     budget_usage: budget.debug_observation("RequestProvenance"),
                     capability: capability_snapshot,
                     capability_hash: capability_snapshot_hash,
+                    configured_responses_route: model.frozen_responses_route()?,
                     budget_policy: budget_policy.clone(),
                     budget_policy_hash: budget_policy_hash.clone(),
                     tool_set_hash: tool_set_hash.clone(),
@@ -803,10 +804,11 @@ impl AgentRuntime {
                     &runtime_snapshot,
                 )
                 .await?;
-            trace_refs.push(ArtifactRef {
+            let accepted_turn = ArtifactRef {
                 artifact_id: turn_artifact.artifact_id,
                 kind: ArtifactKind::AgentTurn,
-            });
+            };
+            trace_refs.push(accepted_turn.clone());
             let provider_output_limit = turn
                 .telemetry
                 .as_ref()
@@ -912,7 +914,18 @@ impl AgentRuntime {
             let validation_contract = installed.contract.clone();
             let validation_manifest = manifest.clone();
             let mut validation_arguments = submission.arguments.clone();
-            if let Some(result) = frozen_result {
+            let accepted_synthesizer_submit =
+                if direct_structured && request.purpose == RESEARCH_SYNTHESIZER_RECIPE_ID {
+                    AcceptedSynthesizerSubmit::from_turn(
+                        &submission.arguments,
+                        accepted_turn,
+                        request_hash.clone(),
+                        frozen_result.as_ref(),
+                    )?
+                } else {
+                    None
+                };
+            if let Some((result, _)) = frozen_result {
                 bind_frozen_result(&mut validation_arguments, result)?;
             }
             let validation_spec = node.execution_spec();
@@ -960,6 +973,7 @@ impl AgentRuntime {
                         &validation_contract,
                         &validation_manifest,
                         validation_arguments,
+                        accepted_synthesizer_submit,
                         turn_now,
                     )?;
                     validate_output_schema(

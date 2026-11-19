@@ -293,6 +293,17 @@ impl OpenAIResponsesConfig {
         ModelProviderIdentity::OpenAIResponses
     }
 
+    fn responses_route_settings(&self) -> Value {
+        json!({
+            "provider": self.provider_identity().as_str(),
+            "model": self.model,
+            "release_date": self.release_date,
+            "knowledge_cutoff": self.knowledge_cutoff,
+            "reasoning_effort": self.reasoning_effort,
+            "response_language": self.response_language,
+        })
+    }
+
     pub fn for_route(&self, route: &OpenAIResponsesRouteConfig) -> Self {
         // route 级字段覆盖同名全局字段；未提供或为空的 response_language
         // 回退到全局值。选出的配置不再携带 routes，避免再次递归选择。

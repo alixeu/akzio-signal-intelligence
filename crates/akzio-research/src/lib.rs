@@ -16,10 +16,11 @@ mod prompt_registry;
 mod quality;
 
 pub use crate::agent::{
-    ActiveResearchCatalogue, AgentModel, AgentModelRequest, AgentModelTurn, AgentReasoningEvent,
-    AgentRunBudget, AgentRuntime, AgentTerminalDefinition, AgentTerminalSubmission, AgentToolCall,
-    AgentToolDefinition, AgentTurnPhase, ContractCatalogue, InstalledContract, ModelClientAdapter,
-    ResearchError, ResearchResult as Result, ACTIVE_RESEARCH_MAX_NODES,
+    AcceptedSynthesizerSubmit, ActiveResearchCatalogue, AgentModel, AgentModelRequest,
+    AgentModelTurn, AgentReasoningEvent, AgentRunBudget, AgentRuntime, AgentTerminalDefinition,
+    AgentTerminalSubmission, AgentToolCall, AgentToolDefinition, AgentTurnPhase, ContractCatalogue,
+    InstalledContract, ModelClientAdapter, ResearchError, ResearchResult as Result,
+    ACTIVE_RESEARCH_MAX_NODES,
 };
 pub use crate::fixture::{fixture_claim_output, fixture_critique_output, fixture_model_client};
 

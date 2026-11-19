@@ -23,6 +23,7 @@ pub struct OpenAIResponsesClient {
     api_key: String,
     pub(super) model: String,
     pub(super) reasoning_effort: String,
+    pub(super) configured_route_identity: Option<Value>,
     stream_idle_timeout: Duration,
     audit: Option<Arc<dyn ModelAuditSink>>,
 }
@@ -94,6 +95,7 @@ impl OpenAIResponsesClient {
             api_key,
             model,
             reasoning_effort,
+            configured_route_identity: None,
             stream_idle_timeout,
             audit: None,
         })

@@ -41,17 +41,33 @@ impl ModelClient {
         // OpenAIResponsesClient::new 负责清理地址并校验凭据、模型和 reasoning；这里
         // 只把已经选择的 route 配置转换为 provider client。它仅拒绝空 base_url，
         // 并不在此强制官方 host；显式自定义 endpoint 的信任边界仍由配置方负责。
-        Ok(Self::OpenAIResponses(OpenAIResponsesClient::new(
+        let mut client = OpenAIResponsesClient::new(
             &config.base_url,
             &config.api_key,
             &config.model,
             &config.reasoning_effort,
-        )?))
+        )?;
+        client.configured_route_identity = Some(config.responses_route_settings());
+        Ok(Self::OpenAIResponses(client))
     }
 
     pub fn from_config(config: &ModelConfig) -> Result<Self> {
         // 保留旧别名入口，但实际仍只创建 OpenAI Responses client。
         Self::from_openai_responses_config(config)
+    }
+
+    /// Capture credential-free settings of the selected client. The digest
+    /// lets higher layers compare routes without persisting endpoint URLs.
+    pub fn configured_responses_route_identity(
+        &self,
+        endpoint_digest: impl FnOnce(&str) -> String,
+    ) -> Option<Value> {
+        let Self::OpenAIResponses(client) = self else {
+            return None;
+        };
+        let mut settings = client.configured_route_identity.clone()?;
+        settings["endpoint_hash"] = json!(endpoint_digest(&client.base_url));
+        Some(settings)
     }
 
     pub fn capability_snapshot(&self) -> ModelCapabilitySnapshot {

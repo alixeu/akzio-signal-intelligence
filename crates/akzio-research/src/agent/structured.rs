@@ -484,7 +484,10 @@ impl AgentRuntime {
     // 从最新到最旧的持久化 AgentTurn 找回最后的 deliberation 与最近一次正式 result；
     // runtime_run 在继续模型调用前 await 此 Future。方法借用 self，复制 trace IDs 后
     // 把拥有型列表移入 StoreExecutor 的阻塞闭包。
-    async fn last_structured_submission(&self, traces: &[ArtifactRef]) -> ResearchResult<Value> {
+    async fn last_structured_submission(
+        &self,
+        traces: &[ArtifactRef],
+    ) -> ResearchResult<(Value, ArtifactRef)> {
         // 从最新到最旧的 AgentTurn 找到 immutable result，再采用最近 deliberation；
         // 这让一次修复只更新元数据，不依赖内存中的模型对象。
         let traces = traces.to_vec();
@@ -509,7 +512,7 @@ impl AgentRuntime {
                             if let Some(deliberation) = latest_deliberation {
                                 original["deliberation"] = deliberation;
                             }
-                            return Ok(original);
+                            return Ok((original, reference.clone()));
                         }
                     }
                 }

@@ -1847,6 +1847,69 @@ mod formal_launch_tests {
         assert!(!store.paper_effect_intent_for_run(&run).unwrap());
     }
 
+    /// WHY THIS TEST EXISTS (Task #26): A real accepted Synthesizer proposal must identify its exact result and accepted Submit turns rather than leaving calibration to pick the latest trace.
+    /// Do not weaken or delete this assertion.
+    #[tokio::test]
+    async fn task10_synthesizer_proposal_preserves_exact_turn_lineage() {
+        let daemon = fixture();
+        let store = daemon.store.clone();
+        let reservation = daemon
+            .paper
+            .scheduler
+            .tick(
+                &OpenPaperSession,
+                &daemon.paper_workflow_source(),
+                Utc::now(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let run = reservation.slot.workflow.run.run_id;
+        for _ in 0..40 {
+            if !daemon.run_one("synthesizer-lineage-fixture").await.unwrap() {
+                break;
+            }
+        }
+        let proposals = store
+            .run_artifacts_by_kind(&run, ArtifactKind::DecisionProposal)
+            .unwrap();
+        let [proposal] = proposals.as_slice() else {
+            panic!("expected one accepted proposal")
+        };
+        let notes = proposal
+            .source_refs
+            .iter()
+            .filter(|reference| reference.kind == ArtifactKind::DeliberationNote)
+            .collect::<Vec<_>>();
+        let [note] = notes.as_slice() else {
+            panic!("expected one linked DeliberationNote")
+        };
+        let note = store.artifact(&note.artifact_id).unwrap();
+        let note_payload: serde_json::Value =
+            serde_json::from_slice(&store.read_blob(&note.blob).unwrap()).unwrap();
+        let lineage = note_payload
+            .get("accepted_synthesizer_submit")
+            .expect("Rust must record the exact accepted Submit on the linked note");
+        let result_turn: akzio_domain::ArtifactRef =
+            serde_json::from_value(lineage["result_turn"].clone()).unwrap();
+        let accepted_turn: akzio_domain::ArtifactRef =
+            serde_json::from_value(lineage["accepted_turn"].clone()).unwrap();
+        assert_eq!(result_turn, accepted_turn);
+        assert_eq!(accepted_turn.kind, ArtifactKind::AgentTurn);
+        assert!(note.source_refs.contains(&accepted_turn));
+        assert!(proposal.source_refs.contains(&accepted_turn));
+        let turn = store.artifact(&accepted_turn.artifact_id).unwrap();
+        assert_eq!(turn.origin, proposal.origin);
+        let turn_payload: serde_json::Value =
+            serde_json::from_slice(&store.read_blob(&turn.blob).unwrap()).unwrap();
+        assert_eq!(turn_payload["request"]["phase"], "submit");
+        assert_eq!(turn_payload["request"]["purpose"], "research.synthesizer");
+        assert_eq!(
+            turn_payload["request_hash"],
+            lineage["accepted_request_hash"]
+        );
+    }
+
     #[tokio::test]
     async fn canonical_paper_cold_start_schedules_outcome_without_broker_writes() {
         let daemon = fixture();

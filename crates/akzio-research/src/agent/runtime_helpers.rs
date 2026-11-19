@@ -9,6 +9,7 @@ impl AgentRuntime {
         contract: &AgentContract,
         manifest: &ContextManifest,
         output: Value,
+        accepted_synthesizer_submit: Option<AcceptedSynthesizerSubmit>,
         now: DateTime<Utc>,
     ) -> ResearchResult<(Value, Option<Artifact>)> {
         // 先解析完整 envelope，再把 basis ID 限制在本次 Manifest。模型自报 confidence
@@ -55,9 +56,17 @@ impl AgentRuntime {
                 ));
             }
         }
+        let note_blob = if let Some(lineage) = accepted_synthesizer_submit {
+            basis_refs.extend([lineage.result_turn.clone(), lineage.accepted_turn.clone()]);
+            let mut note_payload = serde_json::to_value(&envelope.deliberation)?;
+            note_payload["accepted_synthesizer_submit"] = serde_json::to_value(lineage)?;
+            self.store.stage_json(&note_payload)?
+        } else {
+            self.store.stage_json(&envelope.deliberation)?
+        };
         let note = Artifact::new(
             ArtifactKind::DeliberationNote,
-            self.store.stage_json(&envelope.deliberation)?,
+            note_blob,
             format!("agent.deliberation.{}", contract.purpose.as_str()),
             ArtifactLifecycle::RunScoped,
             ArtifactProvenance {
@@ -151,6 +160,9 @@ impl AgentRuntime {
                     "completed_at_utc": record.now,
                 });
                 trace["response"] = json!(response);
+                if let Some(route) = runtime_snapshot.configured_responses_route {
+                    trace["configured_responses_route"] = route;
+                }
                 let artifact = record.stage_artifact(&store, &trace)?;
                 store.write_task_artifact(
                     &record.permit,

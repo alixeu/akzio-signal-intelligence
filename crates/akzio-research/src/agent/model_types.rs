@@ -79,12 +79,51 @@ pub struct AgentTurnTelemetry {
     pub reasoning_tokens: Option<u64>,
 }
 
+/// Binds a validated Synthesizer output to its result and metadata producers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptedSynthesizerSubmit {
+    pub version: u32,
+    pub result_turn: ArtifactRef,
+    pub accepted_turn: ArtifactRef,
+    pub result_hash: akzio_domain::ContentHash,
+    pub accepted_request_hash: akzio_domain::ContentHash,
+}
+
+impl AcceptedSynthesizerSubmit {
+    fn from_turn(
+        arguments: &Value,
+        accepted_turn: ArtifactRef,
+        accepted_request_hash: akzio_domain::ContentHash,
+        frozen_result: Option<&(Value, ArtifactRef)>,
+    ) -> ResearchResult<Option<Self>> {
+        let original = frozen_result
+            .map(|(result, reference)| (result, reference))
+            .or_else(|| {
+                arguments
+                    .get("result")
+                    .map(|result| (result, &accepted_turn))
+            });
+        let Some((result, reference)) = original else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            version: 1,
+            result_turn: reference.clone(),
+            accepted_turn,
+            result_hash: akzio_domain::ContentHash::of_bytes(&serde_json::to_vec(result)?),
+            accepted_request_hash,
+        }))
+    }
+}
+
 #[derive(Debug, Clone)]
 struct AgentTurnRuntimeSnapshot {
     resolved_budget: TaskBudget,
     budget_usage: Value,
     capability: ModelCapabilitySnapshot,
     capability_hash: akzio_domain::ContentHash,
+    configured_responses_route: Option<Value>,
     budget_policy: ModelBudgetPolicy,
     budget_policy_hash: akzio_domain::ContentHash,
     tool_set_hash: akzio_domain::ContentHash,
@@ -178,6 +217,10 @@ pub trait AgentModel: Send + Sync {
         None
     }
 
+    fn frozen_responses_route(&self) -> ResearchResult<Option<Value>> {
+        Ok(None)
+    }
+
     fn budget_policy(&self) -> ModelBudgetPolicy {
         ModelBudgetPolicy::default()
     }
@@ -241,6 +284,21 @@ impl ModelClientAdapter {
 }
 
 impl AgentModel for ModelClientAdapter {
+    fn frozen_responses_route(&self) -> ResearchResult<Option<Value>> {
+        let Some(mut settings) = self.client.configured_responses_route_identity(|endpoint| {
+            akzio_domain::ContentHash::of_bytes(endpoint.as_bytes())
+                .as_str()
+                .to_owned()
+        }) else {
+            return Ok(None);
+        };
+        settings["response_language"] = json!(self.response_language);
+        let route_hash = akzio_domain::content_hash_json(&settings)?;
+        Ok(Some(
+            json!({"version":1,"settings":settings,"route_hash":route_hash}),
+        ))
+    }
+
     fn capability_snapshot(&self) -> ModelCapabilitySnapshot {
         self.capability_snapshot.clone()
     }
@@ -744,5 +802,87 @@ mod provider_accounting_tests {
         complete["usage"] = json!({"input_tokens": 125, "output_tokens": 50});
         let accepted = real_provider_turn(complete).await.unwrap();
         assert_eq!(accepted.telemetry.unwrap().output_tokens, Some(50));
+    }
+}
+
+#[cfg(test)]
+mod task10_model_identity_tests {
+    use super::*;
+
+    /// WHY THIS TEST EXISTS (Task #26): Route fallback must be captured from the configured production client without persisting authentication or its endpoint URL.
+    /// Do not weaken or delete this assertion.
+    #[test]
+    fn task10_effective_client_route_is_frozen_without_credentials() {
+        let mut config: akzio_model::OpenAIResponsesConfig = serde_json::from_value(json!({
+            "provider": "openai_responses",
+            "base_url": "https://gateway.invalid/v1?fixture-query=secret",
+            "api_key": "fixture-api-key",
+            "model": "default-alias",
+            "release_date": "2025-01-01",
+            "knowledge_cutoff": "2024-05-01",
+            "response_language": "English",
+            "routes": {
+                "research.synthesizer": {
+                    "model": "synthesizer-alias",
+                    "reasoning_effort": "high",
+                    "response_language": " ",
+                    "release_date": "2025-06-01"
+                }
+            }
+        }))
+        .unwrap();
+        let freeze = |config: &akzio_model::OpenAIResponsesConfig| {
+            let effective = config.for_route(&config.routes["research.synthesizer"]);
+            ModelClientAdapter::with_response_language(
+                ModelClient::from_config(&effective).unwrap(),
+                false,
+                effective.response_language,
+            )
+            .frozen_responses_route()
+            .unwrap()
+            .unwrap()
+        };
+        let route = freeze(&config);
+        assert_eq!(route["settings"]["model"], "synthesizer-alias");
+        assert_eq!(route["settings"]["release_date"], "2025-06-01");
+        assert_eq!(route["settings"]["knowledge_cutoff"], "2024-05-01");
+        assert_eq!(route["settings"]["response_language"], "English");
+        assert_eq!(route["settings"]["reasoning_effort"], "high");
+        let frozen_bytes = serde_json::to_string(&route).unwrap();
+        for secret in ["fixture-api-key", "fixture-query", "gateway.invalid"] {
+            assert!(!frozen_bytes.contains(secret), "route persisted {secret}");
+        }
+        let route_config = config.routes.get_mut("research.synthesizer").unwrap();
+        route_config.release_date = Some("2025-08-01".into());
+        assert_ne!(freeze(&config)["route_hash"], route["route_hash"]);
+    }
+
+    /// WHY THIS TEST EXISTS (Task #26): A deliberation repair must attribute the frozen result to the earlier full Submit even if the accepting response was later.
+    /// Do not weaken or delete this assertion.
+    #[test]
+    fn task10_deliberation_repair_keeps_original_result_turn() {
+        let reference = |bytes| ArtifactRef {
+            kind: ArtifactKind::AgentTurn,
+            artifact_id: ArtifactId(akzio_domain::ContentHash::of_bytes(bytes)),
+        };
+        let result_turn = reference(b"full submit");
+        let accepted_turn = reference(b"metadata response");
+        let accepted_request_hash = akzio_domain::ContentHash::of_bytes(b"metadata request");
+        let frozen_result = (json!({"summary":"immutable result"}), result_turn.clone());
+        let lineage = AcceptedSynthesizerSubmit::from_turn(
+            &json!({"deliberation":{"selected_path":"repaired"}}),
+            accepted_turn.clone(),
+            accepted_request_hash.clone(),
+            Some(&frozen_result),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(lineage.result_turn, result_turn);
+        assert_eq!(lineage.accepted_turn, accepted_turn);
+        assert_eq!(lineage.accepted_request_hash, accepted_request_hash);
+        assert_eq!(
+            lineage.result_hash,
+            akzio_domain::ContentHash::of_bytes(br#"{"summary":"immutable result"}"#)
+        );
     }
 }
