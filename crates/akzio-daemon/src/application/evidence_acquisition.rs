@@ -94,11 +94,45 @@ impl<'a> EvidenceAcquisition<'a> {
         &self,
         task: &ClaimedAttempt,
         needs: &[(ArtifactRef, Artifact, EvidenceNeed)],
-        now: DateTime<Utc>,
+        original_candidates: &[ArtifactRef],
     ) -> Result<Vec<ArtifactRef>> {
-        self.daemon
-            .acquire_supplemental_evidence(task, needs, now)
-            .await
+        let original = original_candidates
+            .iter()
+            .filter(|reference| reference.kind == ArtifactKind::NormalizedEvidence)
+            .map(|reference| {
+                self.daemon
+                    .read_artifact_payload::<NormalizedEvidencePayload>(reference)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let cutoff = super::research_supplement::frozen_research_cutoff(&original)?;
+        let references = self
+            .daemon
+            .acquire_supplemental_evidence(task, needs, cutoff)
+            .await?;
+        let mut admissible = Vec::with_capacity(references.len());
+        for reference in references {
+            let payload: NormalizedEvidencePayload =
+                self.daemon.read_artifact_payload(&reference)?;
+            if let Some(reason) =
+                super::research_supplement::supplemental_candidate_gap(&payload, cutoff)
+            {
+                self.daemon.supplement_record(
+                    task,
+                    "research.supplement.excluded",
+                    &serde_json::json!({
+                        "resource": payload.resource,
+                        "decision_cutoff": cutoff,
+                        "status": "excluded",
+                        "reason": reason,
+                    }),
+                    vec![reference],
+                    Utc::now(),
+                )?;
+            } else {
+                admissible.push(reference);
+            }
+        }
+        Ok(admissible)
     }
 
     // 记录补采被放弃或失败的可审计事件；它不撤回首轮 Claim，也不把缺口标记为已解决。

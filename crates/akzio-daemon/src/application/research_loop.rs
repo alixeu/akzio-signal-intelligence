@@ -17,7 +17,237 @@ fn reference(artifact: &Artifact) -> ArtifactRef {
     }
 }
 
+fn supplement_input_kind(kind: ArtifactKind) -> bool {
+    matches!(
+        kind,
+        ArtifactKind::ContextManifest
+            | ArtifactKind::Claim
+            | ArtifactKind::Critique
+            | ArtifactKind::DecisionProposal
+            | ArtifactKind::ProposalReview
+            | ArtifactKind::NormalizedEvidence
+            | ArtifactKind::SemanticDetail
+    )
+}
+
 impl Daemon {
+    pub(crate) fn completed_supplement_for_request(
+        &self,
+        ancestors: &mut Vec<Artifact>,
+    ) -> Result<(SupplementalRound, bool)> {
+        let Some(record) = ancestors
+            .iter()
+            .find(|a| a.producer == "research.supplement.result")
+        else {
+            return Ok((SupplementalRound::default(), false));
+        };
+        let mut round: SupplementalRound = self.read_artifact_payload(&reference(record))?;
+        if round.evidence.is_empty() {
+            return Ok((round, false));
+        }
+        let original = ancestors
+            .iter()
+            .filter(|a| {
+                a.kind == ArtifactKind::NormalizedEvidence
+                    && !round.evidence.contains(&reference(a))
+            })
+            .map(|a| self.read_artifact_payload::<NormalizedEvidencePayload>(&reference(a)))
+            .collect::<Result<Vec<_>>>()?;
+        let cutoff = super::research_supplement::frozen_research_cutoff(&original)?;
+        let mut excluded = BTreeSet::new();
+        for evidence in &round.evidence {
+            let receipt = ancestors
+                .iter()
+                .find(|artifact| reference(artifact) == *evidence);
+            let same_producer_task = |a: &Artifact| {
+                a.origin
+                    .as_ref()
+                    .zip(record.origin.as_ref())
+                    .is_some_and(|(a, b)| a.run_id == b.run_id && a.task_id == b.task_id)
+            };
+            if evidence.kind != ArtifactKind::NormalizedEvidence
+                || !record.source_refs.contains(evidence)
+                || !receipt.is_some_and(same_producer_task)
+            {
+                return Err(DaemonError::InvalidInput(
+                    "completed supplement evidence is outside its committed outputs".into(),
+                ));
+            }
+            let payload: NormalizedEvidencePayload = self.read_artifact_payload(evidence)?;
+            if let Some(reason) =
+                super::research_supplement::supplemental_candidate_gap(&payload, cutoff)
+            {
+                tracing::warn!(artifact_id=%evidence.artifact_id, reason, "completed supplemental receipt excluded from new research request");
+                excluded.insert(evidence.artifact_id.clone());
+            }
+        }
+        if excluded.is_empty() {
+            return Ok((round, false));
+        }
+        round
+            .evidence
+            .retain(|evidence| !excluded.contains(&evidence.artifact_id));
+        round.affected_horizons.retain(|horizon| {
+            round.dispositions.iter().any(|row| {
+                row.horizon == *horizon
+                    && row
+                        .evidence
+                        .iter()
+                        .any(|evidence| round.evidence.contains(evidence))
+            })
+        });
+        // The old summary still claims the rejected receipts were admissible. Keep it and its
+        // dependent research in CAS, but leave them out of any new model request.
+        excluded.insert(record.artifact_id.clone());
+        let mut retained = Vec::with_capacity(ancestors.len());
+        for artifact in std::mem::take(ancestors) {
+            if !self.depends_on_excluded_supplement(&artifact, &excluded)? {
+                retained.push(artifact);
+            }
+        }
+        *ancestors = retained;
+        Ok((round, true))
+    }
+
+    pub(crate) fn unavailable_supplemental_inputs(
+        &self,
+        task: &ClaimedAttempt,
+        roots: impl IntoIterator<Item = ArtifactRef>,
+    ) -> Result<BTreeSet<ArtifactId>> {
+        // Shadow/Replay evaluate the original frozen evidence by reference.
+        if !matches!(
+            self.store.run_purpose(&task.run_id)?,
+            RunPurpose::Paper | RunPurpose::PositionPlan
+        ) {
+            return Ok(BTreeSet::new());
+        }
+        let mut pending = roots.into_iter().collect::<Vec<_>>();
+        let mut seen = BTreeSet::new();
+        let mut receipts = Vec::new();
+        while let Some(source) = pending.pop() {
+            if !supplement_input_kind(source.kind) || !seen.insert(source.clone()) {
+                continue;
+            }
+            let artifact = self.store.artifact(&source.artifact_id)?;
+            if artifact.kind != source.kind {
+                return Err(DaemonError::InvalidInput(
+                    "invalid supplemental lineage kind".into(),
+                ));
+            }
+            if artifact.kind == ArtifactKind::NormalizedEvidence {
+                for source in artifact
+                    .source_refs
+                    .iter()
+                    .filter(|r| r.kind == ArtifactKind::EvidenceNeed)
+                {
+                    let need = self.store.artifact(&source.artifact_id)?;
+                    if need.producer != "agent.supplemental.evidence_need" {
+                        continue;
+                    }
+                    let valid_origin = artifact
+                        .origin
+                        .as_ref()
+                        .zip(need.origin.as_ref())
+                        .is_some_and(|(a, n)| {
+                            a.run_id.as_ref() == Some(&task.run_id)
+                                && a.run_id == n.run_id
+                                && a.task_id.is_some()
+                                && a.task_id == n.task_id
+                        });
+                    let payload: NormalizedEvidencePayload =
+                        self.read_artifact_payload(&reference(&artifact))?;
+                    if need.kind != ArtifactKind::EvidenceNeed
+                        || !valid_origin
+                        || payload.need != *source
+                    {
+                        return Err(DaemonError::InvalidInput(
+                            "invalid supplemental receipt lineage".into(),
+                        ));
+                    }
+                    receipts.push((artifact.artifact_id.clone(), payload));
+                }
+            } else {
+                pending.extend(self.supplement_input_sources(&artifact)?);
+            }
+        }
+        if receipts.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+
+        // Use the successfully committed original Gate, never a downstream
+        // receipt's self-reported cutoff or the resumed attempt's wall clock.
+        let snapshot = self.store.workflow_snapshot(&task.run_id)?;
+        let gate = snapshot
+            .tasks
+            .iter()
+            .find(|stored| stored.node.recipe_id.as_str() == akzio_runtime::EVIDENCE_GATE_RECIPE_ID)
+            .ok_or_else(|| DaemonError::InvalidInput("original EvidenceGate missing".into()))?;
+        let original = self
+            .store
+            .committed_task_outputs(&task.run_id, &gate.node.task_id)?;
+        let original = original
+            .iter()
+            .filter(|a| a.kind == ArtifactKind::NormalizedEvidence)
+            .map(|a| self.read_artifact_payload(&reference(a)))
+            .collect::<Result<Vec<NormalizedEvidencePayload>>>()?;
+        let cutoff = super::research_supplement::frozen_research_cutoff(&original)?;
+        let mut unavailable = BTreeSet::new();
+        for (id, payload) in receipts {
+            if let Some(reason) =
+                super::research_supplement::supplemental_candidate_gap(&payload, cutoff)
+            {
+                tracing::warn!(artifact_id=%id, reason, "pre-upgrade supplemental receipt unavailable at T0");
+                unavailable.insert(id);
+            }
+        }
+        Ok(unavailable)
+    }
+
+    fn supplement_input_sources(&self, artifact: &Artifact) -> Result<Vec<ArtifactRef>> {
+        if artifact.kind == ArtifactKind::ContextManifest {
+            let manifest: akzio_domain::ContextManifestPayload =
+                self.read_artifact_payload(&reference(artifact))?;
+            return Ok(manifest
+                .selections
+                .into_iter()
+                .map(|s| s.artifact)
+                .collect());
+        }
+        if matches!(
+            artifact.kind,
+            ArtifactKind::Claim
+                | ArtifactKind::Critique
+                | ArtifactKind::DecisionProposal
+                | ArtifactKind::ProposalReview
+        ) || artifact.producer == "research.supplement.result"
+        {
+            return Ok(artifact.source_refs.clone());
+        }
+        Ok(Vec::new())
+    }
+
+    pub(crate) fn depends_on_excluded_supplement(
+        &self,
+        artifact: &Artifact,
+        excluded: &BTreeSet<ArtifactId>,
+    ) -> Result<bool> {
+        if excluded.contains(&artifact.artifact_id) {
+            return Ok(true);
+        }
+        let mut pending = self.supplement_input_sources(artifact)?;
+        let mut seen = BTreeSet::new();
+        while let Some(reference) = pending.pop() {
+            if excluded.contains(&reference.artifact_id) {
+                return Ok(true);
+            }
+            if supplement_input_kind(reference.kind) && seen.insert(reference.clone()) {
+                let source = self.store.artifact(&reference.artifact_id)?;
+                pending.extend(self.supplement_input_sources(&source)?);
+            }
+        }
+        Ok(false)
+    }
+
     // 执行 reviewed research contract 的有界研究循环：根据 revision、horizon、补采结果
     // 选择本轮输入，必要时写入 revision stop 标记，最后只调用一次受预算约束的 AgentRuntime。
     // 返回的 Succeeded/Skipped 仅描述研究节点状态，不等于 Decision 或 Execution 完成。
@@ -28,7 +258,7 @@ impl Daemon {
     ) -> Result<TaskCompletion> {
         // ancestor_outputs 只返回已成功/跳过依赖的正式产物；当前 snapshot 用来解析
         // 每个产物所属 task 的 research_round/proposal_revision，而不是从 Artifact 猜版本。
-        let ancestors = self.ancestor_outputs(task)?;
+        let mut ancestors = self.ancestor_outputs(task)?;
         let snapshot = self.store.workflow_snapshot(&task.run_id)?;
         if ancestors
             .iter()
@@ -46,6 +276,7 @@ impl Daemon {
                 .and_then(|id| snapshot.tasks.iter().find(|t| &t.node.task_id == id))
                 .map(|t| t.node.execution_spec())
         };
+        let (round, degraded_supplement) = self.completed_supplement_for_request(&mut ancestors)?;
         let latest_review = ancestors
             .iter()
             .filter(|a| a.kind == ArtifactKind::ProposalReview)
@@ -98,10 +329,6 @@ impl Daemon {
         let round_artifact = ancestors
             .iter()
             .find(|a| a.producer == "research.supplement.result");
-        let round = round_artifact
-            .map(|a| self.read_artifact_payload::<SupplementalRound>(&reference(a)))
-            .transpose()?
-            .unwrap_or_default();
         let horizon = task.node.execution_spec().horizon;
         let refined = task.node.execution_spec().research_round == Some(1);
         if refined && !round.affected_horizons.iter().any(|h| Some(*h) == horizon) {
@@ -194,6 +421,9 @@ impl Daemon {
                     })
                     .map(reference),
             );
+            if degraded_supplement && seeds.is_empty() {
+                return Ok(TaskCompletion::Skipped);
+            }
         } else {
             // Synthesizer 使用每个 horizon 的最新 Claim，并只吸收指向这些 Claim 的
             // Critique；ProposalReview/提案和 governed evidence 作为额外上下文加入。

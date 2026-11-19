@@ -460,7 +460,7 @@ impl Daemon {
         &self,
         task: &ClaimedAttempt,
         needs: &[(ArtifactRef, Artifact, EvidenceNeed)],
-        now: DateTime<Utc>,
+        decision_cutoff: DateTime<Utc>,
     ) -> Result<Vec<ArtifactRef>> {
         // join_all 并发驱动每个 adapter Future；生产路径先只取/校验 bytes 再 materialize，
         // fixture 路径使用显式 fixture adapter。最终 artifact 逐项按 permit 写入而非一批事务。
@@ -483,23 +483,23 @@ impl Daemon {
                         max_age: Duration::seconds(max_age_secs),
                         acquisition_mode: evidence_acquisition_mode(purpose, &need),
                     };
-                    let bundle = if self.fixture_mode {
+                    let acquired = if self.fixture_mode {
                         let mut responses = self
                             .fixture_evidence
                             .get(&source)
                             .cloned()
                             .unwrap_or_default();
-                        responses
-                            .entry(need.resource.clone())
-                            .or_insert_with(|| debug_fixture_evidence(source, &need.resource, now));
+                        responses.entry(need.resource.clone()).or_insert_with(|| {
+                            debug_fixture_evidence(source, &need.resource, decision_cutoff)
+                        });
                         let adapter = FixtureEvidenceAdapter::new(source, responses);
                         runtime
-                            .acquire_and_normalize_async(
+                            .acquire_validated_async(
                                 &task.permit,
                                 &reference,
                                 &request,
                                 &adapter,
-                                now,
+                                decision_cutoff,
                             )
                             .await?
                     } else {
@@ -513,31 +513,24 @@ impl Daemon {
                                         source.as_str()
                                     ))
                                 })?;
-                        let acquired = runtime
+                        runtime
                             .acquire_validated_async(
                                 &task.permit,
                                 &reference,
                                 &request,
                                 adapter.as_ref(),
-                                now,
+                                decision_cutoff,
                             )
-                            .await?;
-                        // Freeze availability after real retrieval, as in the initial
-                        // collection; the refined Analyst gets this new evidence clock.
-                        runtime.materialize_validated(
-                            &task.permit,
-                            &reference,
-                            &request,
-                            acquired,
-                            if task.node.recipe_id.as_str()
-                                == akzio_domain::RESEARCH_SUPPLEMENT_RECIPE_ID
-                            {
-                                now
-                            } else {
-                                Utc::now()
-                            },
-                        )?
+                            .await?
                     };
+                    let bundle = runtime.materialize_with_frozen_cutoff(
+                        &task.permit,
+                        &reference,
+                        &request,
+                        acquired,
+                        decision_cutoff,
+                        Utc::now(),
+                    )?;
                     if need.source_family == "news_web" {
                         self.validate_paper_news_acquisition(task, &need, &bundle.normalized)?;
                     }
@@ -564,17 +557,21 @@ impl Daemon {
                     continue;
                 }
             };
+            let committed_at = Utc::now();
+            if committed_at < bundle.normalized.created_at {
+                return Err(akzio_ingest::EvidenceRuntimeError::TemporalContamination.into());
+            }
             self.store.write_task_artifact(
                 &task.permit,
                 &bundle.raw,
                 LifecycleEventType::EvidenceRaw,
-                now,
+                committed_at,
             )?;
             self.store.write_task_artifact(
                 &task.permit,
                 &bundle.normalized,
                 LifecycleEventType::EvidenceNormalized,
-                now,
+                committed_at,
             )?;
             normalized.push(ArtifactRef {
                 artifact_id: bundle.normalized.artifact_id,

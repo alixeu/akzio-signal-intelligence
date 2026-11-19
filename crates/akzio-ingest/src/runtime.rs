@@ -610,18 +610,18 @@ pub struct EvidenceTimeBasis {
 
 impl EvidenceTimeBasis {
     fn validate(&self) -> Result<(), EvidenceRuntimeError> {
+        self.validate_at(&self.decision_clock)
+    }
+
+    pub(crate) fn validate_at(&self, clock: &DecisionClock) -> Result<(), EvidenceRuntimeError> {
         // 所有 event/release/available/vintage 都必须落在 DecisionClock 许可范围，release
         // 不得晚于 availability，retrieved 不得早于 availability；任一关系破坏即污染。
-        if !self.decision_clock.contains(self.available_at)
-            || self
-                .event_time
-                .is_some_and(|value| !self.decision_clock.contains(value))
-            || self
-                .released_at
-                .is_some_and(|value| !self.decision_clock.contains(value))
+        if !clock.contains(self.available_at)
+            || self.event_time.is_some_and(|value| !clock.contains(value))
+            || self.released_at.is_some_and(|value| !clock.contains(value))
             || self
                 .vintage
-                .is_some_and(|value| !self.decision_clock.contains_vintage(value))
+                .is_some_and(|value| !clock.contains_vintage(value))
             || self
                 .released_at
                 .is_some_and(|value| value > self.available_at)
@@ -751,6 +751,8 @@ pub struct NormalizedEvidencePayload {
     pub observed_at: DateTime<Utc>,
     pub time_basis: EvidenceTimeBasis,
     pub contamination_certificate: EvidenceContaminationCertificate,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub availability_proof: Option<crate::EvidenceAvailabilityProof>,
     #[serde(default)]
     pub quant_features: Option<QuantFeatureSnapshot>,
     #[serde(default)]

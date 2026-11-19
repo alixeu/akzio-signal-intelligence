@@ -80,37 +80,66 @@ fn expand_intent(
 
 // 提取事实比较所需的稳定字段，忽略 retrieved_at/provider_result 等每次请求都会变的
 // 元数据；用于判断补采是否真的带来新事实，而不是只换了响应包装。
-fn fact_value(payload: &Value) -> Value {
-    if payload["resource"]
-        .as_str()
-        .is_some_and(|r| r.starts_with("news:"))
-    {
-        return json!({"facts":payload.pointer("/value/reviewed_facts"),"verified":payload.pointer("/value/source_document/source_verified")});
-    }
-    match payload["resource"].as_str().unwrap_or_default() {
+fn fact_value(resource: &str, value: &Value) -> Value {
+    match resource {
+        r if r.starts_with("news:") => {
+            json!({"facts":value["reviewed_facts"],"verified":value.pointer("/source_document/source_verified")})
+        }
         r if r.starts_with("bars:") => {
-            json!({"bars":payload["value"]["bars"],"feed":payload["value"]["feed"],"adjustment":payload["value"]["adjustment"]})
+            json!({"bars":value["bars"],"feed":value["feed"],"adjustment":value["adjustment"]})
         }
         r if r.starts_with("series:") => {
             // Both sides passed the row gate. Compare the actual known date/value pairs so
             // removing legacy missing markers does not look like a newly acquired fact.
-            let observations = payload["value"]["observations"]
+            let observations = value["observations"]
                 .as_array()
                 .into_iter()
                 .flatten()
                 .filter(|row| row["value"].as_str().is_some_and(|value| value != "."))
                 .map(|row| json!([row["date"], row["value"]]))
                 .collect::<Vec<_>>();
-            json!({"observations":observations,"units":payload["value"]["units"]})
+            json!({"observations":observations,"units":value["units"]})
         }
         _ => Value::Null,
     }
 }
 
+pub(super) fn frozen_research_cutoff(
+    original: &[NormalizedEvidencePayload],
+) -> Result<DateTime<Utc>> {
+    original
+        .iter()
+        .map(|payload| payload.time_basis.decision_clock.decision_cutoff)
+        .min()
+        .ok_or_else(|| {
+            DaemonError::InvalidInput(
+                "supplemental round requires the original frozen evidence cutoff".into(),
+            )
+        })
+}
+
+pub(super) fn supplemental_candidate_gap(
+    payload: &NormalizedEvidencePayload,
+    cutoff: DateTime<Utc>,
+) -> Option<&'static str> {
+    if let Err(reason) = payload.availability_at(cutoff) {
+        return Some(reason.as_str());
+    }
+    if !payload.quality.citations_complete {
+        return Some("citations_incomplete");
+    }
+    if payload.resource.starts_with("news:")
+        && payload.value.pointer("/source_document/source_verified") != Some(&Value::Bool(true))
+    {
+        return Some("news_source_unverified");
+    }
+    akzio_ingest::fred_series_direction_gap(&payload.resource, &payload.value)
+}
+
 impl Daemon {
     // 将补采状态/结果写成 RunScoped SemanticDetail，并通过 TaskWritePermit 提交到 Store；
     // 返回 Artifact 供当前 Attempt 输出引用，写入本身不代表证据已被接受。
-    fn supplement_record<T: serde::Serialize>(
+    pub(crate) fn supplement_record<T: serde::Serialize>(
         &self,
         task: &ClaimedAttempt,
         producer: &str,
@@ -181,25 +210,9 @@ impl Daemon {
         let original = ancestors
             .iter()
             .filter(|a| a.kind == ArtifactKind::NormalizedEvidence)
-            .map(|a| self.read_artifact_payload::<Value>(&artifact_ref(a)))
+            .map(|a| self.read_artifact_payload::<NormalizedEvidencePayload>(&artifact_ref(a)))
             .collect::<Result<Vec<_>>>()?;
-        let cutoff = original
-            .iter()
-            .filter_map(|v| {
-                v.pointer("/time_basis/decision_clock/decision_cutoff")
-                    .and_then(Value::as_str)
-            })
-            .filter_map(|s| {
-                DateTime::parse_from_rfc3339(s)
-                    .ok()
-                    .map(|t| t.with_timezone(&Utc))
-            })
-            .min()
-            .ok_or_else(|| {
-                DaemonError::InvalidInput(
-                    "supplemental round requires the original frozen evidence cutoff".into(),
-                )
-            })?;
+        let cutoff = frozen_research_cutoff(&original)?;
         let mut requests = Vec::new();
         for a in ancestors
             .iter()
@@ -328,7 +341,16 @@ impl Daemon {
                 if let Some(previous) = done.get(&key) {
                     row.status = "deduplicated".into();
                     row.reason = format!("shared resource disposition: {}", previous.status);
-                    row.evidence = previous.evidence.clone();
+                    for reference in &previous.evidence {
+                        let payload: NormalizedEvidencePayload =
+                            self.read_artifact_payload(reference)?;
+                        if let Some(reason) = supplemental_candidate_gap(&payload, cutoff) {
+                            row.reason =
+                                format!("previous supplemental receipt excluded: {reason}");
+                        } else {
+                            row.evidence.push(reference.clone());
+                        }
+                    }
                 } else if started.contains(&key) {
                     row.status = "unknown_after_crash".into();
                     row.reason = "request started before interruption; not reissued".into();
@@ -378,6 +400,7 @@ impl Daemon {
                             cutoff,
                         )
                         .await;
+                    let mut excluded_receipts = Vec::new();
                     match refs {
                         Err(error) => {
                             self.ensure_run_log_ready()?;
@@ -388,35 +411,21 @@ impl Daemon {
                             row.status = "no_new_facts".into();
                             row.reason = "no new admissible facts within frozen cutoff".into();
                             for r in refs {
-                                // 只有 citations 完整、新闻 source_verified、available_at
-                                // 不晚于原 cutoff 且事实内容不同的引用，才进入本轮 evidence。
-                                let payload: Value = self.read_artifact_payload(&r)?;
-                                let available = payload
-                                    .pointer("/time_basis/available_at")
-                                    .and_then(Value::as_str)
-                                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok());
-                                let verified = payload["quality"]["citations_complete"] == true
-                                    && (!key.starts_with("news:")
-                                        || payload
-                                            .pointer("/value/source_document/source_verified")
-                                            == Some(&Value::Bool(true)));
-                                if verified
-                                    && akzio_ingest::fred_series_direction_gap(
-                                        &key,
-                                        &payload["value"],
-                                    )
-                                    .is_none()
-                                    && available.is_some_and(|t| t.with_timezone(&Utc) <= cutoff)
-                                    && !original.iter().any(|v| {
-                                        v["resource"] == payload["resource"]
-                                            && akzio_ingest::fred_series_direction_gap(
-                                                &key,
-                                                &v["value"],
-                                            )
+                                let payload: NormalizedEvidencePayload =
+                                    self.read_artifact_payload(&r)?;
+                                if let Some(reason) = supplemental_candidate_gap(&payload, cutoff) {
+                                    row.status = "excluded".into();
+                                    row.reason = reason.into();
+                                    excluded_receipts.push(r);
+                                    continue;
+                                }
+                                if !original.iter().any(|v| {
+                                    v.resource == payload.resource
+                                        && akzio_ingest::fred_series_direction_gap(&key, &v.value)
                                             .is_none()
-                                            && fact_value(v) == fact_value(&payload)
-                                    })
-                                {
+                                        && fact_value(&key, &v.value)
+                                            == fact_value(&key, &payload.value)
+                                }) {
                                     row.evidence.push(r);
                                 }
                             }
@@ -437,6 +446,7 @@ impl Daemon {
                         row.evidence
                             .iter()
                             .cloned()
+                            .chain(excluded_receipts)
                             .chain([row.requester.clone()])
                             .collect(),
                         Utc::now(),
@@ -483,6 +493,64 @@ impl Daemon {
 mod tests {
     use super::*;
 
+    /// WHY THIS TEST EXISTS (Task #13): a late response can report a stale observation/publication date with materially revised content.
+    /// Do not weaken or delete this assertion.
+    #[test]
+    fn supplemental_admission_rejects_dated_but_late_unversioned_values() {
+        let cutoff = "2026-09-15T17:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        for (source, resource, facts) in [
+            (
+                "alpaca",
+                "bars:QQQ:1d:2026-09-01:5",
+                json!({"bars":[{"close":125.5}],"feed":"sip","price_basis":"adjusted_research"}),
+            ),
+            (
+                "news_web",
+                "news:QQQ:2026-09-01:2026-09-15:market",
+                json!({"reviewed_facts":["revised after cutoff"],"source_document":{"source_verified":true}}),
+            ),
+            (
+                "sec_edgar",
+                "companyfacts:0000320193",
+                json!({"facts":{"reported":"later revised filing data"}}),
+            ),
+        ] {
+            let evidence_ref = |label: &[u8], kind| ArtifactRef {
+                artifact_id: ArtifactId(ContentHash::of_bytes(label)),
+                kind,
+            };
+            let captured = "2026-09-16T17:00:00Z";
+            let mut payload = json!({"schema_version":DOMAIN_SCHEMA_VERSION,"source":source,"resource":resource,"value":facts,
+                "need":evidence_ref(b"need", ArtifactKind::EvidenceNeed),
+                "raw":evidence_ref(b"raw", ArtifactKind::RawEvidence),
+                "observed_at":captured,
+                "provenance":{"observed_at":captured,"source_uri":"fixture://receipt","dedupe_key":"timing-fixture","citations":[]},
+                "time_basis":{"event_time":"2026-09-14T00:00:00Z","released_at":"2026-09-14T16:00:00Z",
+                    "available_at":"2026-09-14T16:15:00Z","retrieved_at":captured,
+                    "decision_clock":{"decision_cutoff":cutoff}},
+                "contamination_certificate":{"available_at_or_before_cutoff":true,"event_at_or_before_cutoff":true,
+                    "release_at_or_before_cutoff":true,"retrieval_at_or_after_availability":true,"vintage_at_or_before_cutoff":true},
+                "availability_proof":{"version":1,"captured_at":captured},
+                "quality":{"citations_complete":true,"completeness_ppm":1000000,"normalized":true}});
+            let sealed: NormalizedEvidencePayload =
+                serde_json::from_value(payload.clone()).unwrap();
+            assert!(
+                supplemental_candidate_gap(&sealed, cutoff).is_some(),
+                "{resource}"
+            );
+
+            // The same capture is available for a live decision frozen after receipt.
+            let live_cutoff = "2026-09-16T17:00:01Z".parse().unwrap();
+            payload["time_basis"]["decision_clock"]["decision_cutoff"] = json!(live_cutoff);
+            let sealed_live: NormalizedEvidencePayload = serde_json::from_value(payload).unwrap();
+            assert_eq!(supplemental_candidate_gap(&sealed_live, live_cutoff), None);
+            let replay: NormalizedEvidencePayload =
+                serde_json::from_slice(&serde_json::to_vec(&sealed_live).unwrap()).unwrap();
+            assert_eq!(supplemental_candidate_gap(&replay, live_cutoff), None);
+            assert!(supplemental_candidate_gap(&replay, cutoff).is_some());
+        }
+    }
+
     // 四资产新闻意图必须分别绑定四个已冻结单资产资源；任一资源缺失即拒绝整组展开。
     #[test]
     fn four_asset_news_expands_only_to_frozen_single_asset_resources() {
@@ -512,8 +580,14 @@ mod tests {
         let mut b = a.clone();
         b["value"]["retrieved_at"] = json!("b");
         b["value"]["provider_result"]["id"] = json!("2");
-        assert_eq!(fact_value(&a), fact_value(&b));
+        assert_eq!(
+            fact_value("bars:QQQ:x", &a["value"]),
+            fact_value("bars:QQQ:x", &b["value"])
+        );
         b["value"]["bars"][0]["close"] = json!(124);
-        assert_ne!(fact_value(&a), fact_value(&b));
+        assert_ne!(
+            fact_value("bars:QQQ:x", &a["value"]),
+            fact_value("bars:QQQ:x", &b["value"])
+        );
     }
 }

@@ -40,7 +40,7 @@ impl<'a> ResearchRun<'a> {
         }
         // 未达到 reviewed contract 阈值的已存任务沿用通用候选路径；仍经过 AgentSession
         // 的 Permit/Contract/Context 校验，不能因此恢复旧 Planner 的创建或执行能力。
-        let candidates = self.daemon.agent_session().candidates(task)?;
+        let candidates = self.legacy_research_candidates(task)?;
         if task.node.recipe_id.as_str() == akzio_domain::RESEARCH_CRITIC_RECIPE_ID {
             // Critic 只有在 Claim 集合满足结构化审查条件时才调用模型；否则以 NoOutput
             // 结束本节点，保留其依赖 Claim 的正式状态。
@@ -130,7 +130,7 @@ impl<'a> ResearchRun<'a> {
                     match self
                         .daemon
                         .evidence_acquisition()
-                        .supplemental(task, &prepared, now)
+                        .supplemental(task, &prepared, &candidates)
                         .await
                     {
                         Ok(supplemental_refs) if supplemental_refs.is_empty() => {
@@ -182,6 +182,47 @@ impl<'a> ResearchRun<'a> {
             }
         }
         Ok(TaskCompletion::Succeeded(vec![output]))
+    }
+
+    pub(crate) fn legacy_research_candidates(
+        &self,
+        task: &ClaimedAttempt,
+    ) -> Result<Vec<ArtifactRef>> {
+        let candidates = self.daemon.agent_session().candidates(task)?;
+        if let Some(parent) = &task.node.parent_task_id {
+            // The Agent derives a child grant from this committed manifest.
+            // That immutable grant cannot be reduced by filtering candidates.
+            let proof = self
+                .daemon
+                .store
+                .current_succeeded_attempt(&task.run_id, parent)?;
+            let unavailable = self
+                .daemon
+                .unavailable_supplemental_inputs(task, proof.context_manifest)?;
+            if let Some(receipt) = unavailable.first() {
+                return Err(DaemonError::InvalidInput(format!(
+                    "supplement_unavailable_at_t0: parent context depends on receipt {receipt}"
+                )));
+            }
+            return Ok(candidates);
+        }
+        let unavailable = self
+            .daemon
+            .unavailable_supplemental_inputs(task, candidates.iter().cloned())?;
+        if unavailable.is_empty() {
+            return Ok(candidates);
+        }
+        let mut qualified = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let artifact = self.daemon.store.artifact(&candidate.artifact_id)?;
+            if !self
+                .daemon
+                .depends_on_excluded_supplement(&artifact, &unavailable)?
+            {
+                qualified.push(candidate);
+            }
+        }
+        Ok(qualified)
     }
 
     // 只比较当前纽约日期与 Run 冻结的 research session key；不判断开市，也不延长

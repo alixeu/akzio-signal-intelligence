@@ -1092,6 +1092,205 @@ mod formal_launch_tests {
         server.await.unwrap().unwrap();
     }
 
+    /// WHY THIS TEST EXISTS (Task #13): a verified historical FRED response must keep its real receipt and journal times.
+    /// Do not weaken or delete this assertion.
+    #[tokio::test]
+    async fn late_fred_supplement_preserves_t0_cutoff_and_actual_receipt_and_commit_times() {
+        use akzio_domain::{ArtifactKind, ArtifactRef, ContentHash, EvidenceNeed};
+        use akzio_ingest::{
+            AcquiredEvidence, AsyncEvidenceAdapter, EvidenceAvailabilityBasis, EvidenceProvenance,
+            EvidenceSource, FixtureEvidenceAdapter, FredDirectTransport, NormalizedEvidencePayload,
+        };
+        use std::collections::BTreeMap;
+
+        let mut daemon = fixture();
+        let daemon = Arc::get_mut(&mut daemon).unwrap();
+        let cutoff = Utc::now() - chrono::Duration::days(2);
+        let session = cutoff
+            .with_timezone(&chrono_tz::America::New_York)
+            .date_naive()
+            .to_string();
+        let (plan, setup) = daemon
+            .prepare_position_plan(akzio_domain::RunId::new(), &session, cutoff)
+            .unwrap();
+        daemon
+            .store
+            .commit_position_plan(&plan, &setup, daemon.startup_decision_policy_hash.as_ref())
+            .unwrap();
+        let task = daemon
+            .store
+            .claim_next_task_for_workload(
+                "supplement-clock-fixture",
+                Utc::now(),
+                chrono::Duration::minutes(5),
+                akzio_store::TaskWorkload::Session,
+            )
+            .unwrap()
+            .unwrap();
+        let (need_artifact, need) = setup
+            .into_iter()
+            .find_map(|artifact| {
+                let payload: EvidenceNeed =
+                    serde_json::from_slice(&daemon.store.read_blob(&artifact.blob).ok()?).ok()?;
+                payload
+                    .resource
+                    .starts_with("series:DFII10:")
+                    .then_some((artifact, payload))
+            })
+            .unwrap();
+        let parts = need.resource.split(':').collect::<Vec<_>>();
+        let (start, end, vintage) = (parts[2], parts[3], parts[4]);
+        let expected_vintage = vintage.parse().unwrap();
+        let source_uri = format!("https://api.stlouisfed.org/fred/series/observations?series_id=DFII10&file_type=json&observation_start={start}&observation_end={end}&realtime_start={vintage}&realtime_end={vintage}");
+        let body = serde_json::to_vec(
+            &serde_json::json!({"realtime_start":vintage,"realtime_end":vintage,
+            "count":1,"offset":0,"limit":1000,"observations":[{"date":vintage,"value":"1.25",
+            "realtime_start":vintage,"realtime_end":vintage}]}),
+        )
+        .unwrap();
+        let (normalized, quality) =
+            FredDirectTransport::normalize_response(&need.resource, &body).unwrap();
+        let observed_at = Utc::now();
+        let capture = AcquiredEvidence {
+            raw: body.clone(),
+            media_type: "application/json".into(),
+            source_uri: source_uri.clone(),
+            observed_at,
+            normalized,
+            quality,
+            provenance: EvidenceProvenance {
+                document_id: Some(need.resource.clone()),
+                published_at: None,
+                observed_at,
+                revision: None,
+                source_uri,
+                dedupe_key: format!("fred:{}", ContentHash::of_bytes(&body)),
+                citations: Vec::new(),
+            },
+        };
+        let adapter: Arc<dyn AsyncEvidenceAdapter> = Arc::new(FixtureEvidenceAdapter::new(
+            EvidenceSource::Fred,
+            [(need.resource.clone(), capture)],
+        ));
+        daemon.fixture_mode = false;
+        daemon.production_evidence = Arc::new(BTreeMap::from([(EvidenceSource::Fred, adapter)]));
+        let reference = ArtifactRef {
+            artifact_id: need_artifact.artifact_id.clone(),
+            kind: ArtifactKind::EvidenceNeed,
+        };
+        let accepted = daemon
+            .acquire_supplemental_evidence(&task, &[(reference, need_artifact, need)], cutoff)
+            .await
+            .unwrap();
+        let [reference] = accepted.as_slice() else {
+            panic!("expected one materialized receipt")
+        };
+        let normalized = daemon.store.artifact(&reference.artifact_id).unwrap();
+        let payload: NormalizedEvidencePayload = daemon.read_artifact_payload(reference).unwrap();
+        let raw = daemon.store.artifact(&payload.raw.artifact_id).unwrap();
+        assert_eq!(daemon.store.read_blob(&raw.blob).unwrap(), body);
+        assert_eq!(payload.time_basis.decision_clock.decision_cutoff, cutoff);
+        assert_eq!(payload.time_basis.retrieved_at, observed_at);
+        assert_eq!(
+            payload.availability_at(cutoff),
+            Ok(EvidenceAvailabilityBasis::FredPointSnapshot {
+                vintage: expected_vintage
+            })
+        );
+        let events = daemon.store.events_after(&task.run_id, 0, 100).unwrap();
+        for artifact in [&raw, &normalized] {
+            assert_eq!(artifact.provenance.retrieved_at, observed_at);
+            assert!(artifact.created_at >= observed_at);
+            let event = events
+                .iter()
+                .find(|event| event.artifact_id.as_ref() == Some(&artifact.artifact_id))
+                .unwrap();
+            assert!(event.created_at >= artifact.created_at);
+            assert!(event.created_at > cutoff);
+        }
+        // Simulate a completed pre-upgrade round awaiting its first downstream Agent request.
+        let mut legacy = payload.clone();
+        legacy.availability_proof = None;
+        let legacy = akzio_domain::Artifact::new(
+            ArtifactKind::NormalizedEvidence,
+            daemon.store.stage_json(&legacy).unwrap(),
+            normalized.producer.clone(),
+            normalized.lifecycle,
+            normalized.provenance.clone(),
+            normalized.origin.clone(),
+            normalized.source_refs.clone(),
+            normalized.created_at,
+        )
+        .unwrap();
+        let legacy_ref = ArtifactRef {
+            artifact_id: legacy.artifact_id.clone(),
+            kind: legacy.kind,
+        };
+        daemon
+            .store
+            .write_task_artifact(
+                &task.permit,
+                &legacy,
+                akzio_domain::LifecycleEventType::EvidenceNormalized,
+                Utc::now(),
+            )
+            .unwrap();
+        let round_payload = akzio_domain::SupplementalRound {
+            evidence: vec![legacy_ref.clone()],
+            affected_horizons: [akzio_domain::DecisionHorizon::T1].into(),
+            dispositions: vec![],
+        };
+        let round = daemon
+            .supplement_record(
+                &task,
+                "research.supplement.result",
+                &round_payload,
+                vec![legacy_ref.clone()],
+                Utc::now(),
+            )
+            .unwrap();
+        let derived = akzio_domain::Artifact::new(
+            ArtifactKind::Claim,
+            daemon
+                .store
+                .stage_json(&serde_json::json!({"fixture":"pre-upgrade claim"}))
+                .unwrap(),
+            "agent.research.analyst",
+            akzio_domain::ArtifactLifecycle::RunScoped,
+            legacy.provenance.clone(),
+            legacy.origin.clone(),
+            vec![legacy_ref.clone()],
+            Utc::now(),
+        )
+        .unwrap();
+        daemon
+            .store
+            .write_task_artifact(
+                &task.permit,
+                &derived,
+                akzio_domain::LifecycleEventType::ArtifactCommitted,
+                Utc::now(),
+            )
+            .unwrap();
+        let mut candidates = vec![normalized, legacy.clone(), round.clone(), derived.clone()];
+        let (effective, degraded) = daemon
+            .completed_supplement_for_request(&mut candidates)
+            .unwrap();
+        assert!(degraded);
+        assert!(effective.evidence.is_empty());
+        assert!(effective.affected_horizons.is_empty());
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            daemon.store.artifact(&legacy_ref.artifact_id).unwrap(),
+            legacy
+        );
+        assert_eq!(daemon.store.artifact(&round.artifact_id).unwrap(), round);
+        assert_eq!(
+            daemon.store.artifact(&derived.artifact_id).unwrap(),
+            derived
+        );
+    }
+
     #[tokio::test]
     async fn normal_position_plan_launch_and_share_safe_bundle_need_no_policy() {
         let daemon = fixture();
@@ -1799,7 +1998,58 @@ mod formal_launch_tests {
         )
     }
 
-    async fn decide_pre_upgrade_fred(weak: bool, directional: bool) {
+    fn old_inline_supplement(
+        daemon: &Daemon,
+        permit: &akzio_domain::TaskWritePermit,
+        original: &akzio_domain::Artifact,
+        need: &akzio_domain::EvidenceNeed,
+    ) -> akzio_domain::Artifact {
+        use akzio_domain::*;
+        use akzio_ingest::NormalizedEvidencePayload;
+        let now = Utc::now();
+        let need = fred_gate_fixture_artifact(
+            daemon,
+            permit,
+            ArtifactKind::EvidenceNeed,
+            "agent.supplemental.evidence_need",
+            need,
+            vec![],
+        );
+        let mut payload: NormalizedEvidencePayload = daemon
+            .read_artifact_payload(&fred_gate_fixture_ref(original))
+            .unwrap();
+        payload.need = fred_gate_fixture_ref(&need);
+        payload.observed_at = now;
+        payload.time_basis.retrieved_at = now;
+        payload.provenance.observed_at = now;
+        payload.availability_proof = None;
+        let normalized = Artifact::new(
+            ArtifactKind::NormalizedEvidence,
+            daemon.store.stage_json(&payload).unwrap(),
+            original.producer.clone(),
+            original.lifecycle,
+            ArtifactProvenance {
+                retrieved_at: now,
+                ..original.provenance.clone()
+            },
+            Some(permit.artifact_origin()),
+            vec![payload.need.clone(), payload.raw],
+            now,
+        )
+        .unwrap();
+        for (artifact, event) in [
+            (need, LifecycleEventType::SupplementalEvidenceNeedCreated),
+            (normalized.clone(), LifecycleEventType::EvidenceNormalized),
+        ] {
+            daemon
+                .store
+                .write_task_artifact(permit, &artifact, event, now)
+                .unwrap();
+        }
+        normalized
+    }
+
+    async fn decide_pre_upgrade_fred(weak: bool, directional: bool, inline_supplement: bool) {
         use akzio_domain::*;
         use akzio_ingest::{EvidenceSource, NormalizedEvidencePayload};
         let mut daemon = fixture();
@@ -1828,7 +2078,7 @@ mod formal_launch_tests {
         Arc::make_mut(&mut daemon.fixture_evidence)
             .entry(EvidenceSource::Fred)
             .or_default()
-            .insert(fred.resource, response);
+            .insert(fred.resource.clone(), response);
         daemon
             .store
             .commit_position_plan(&plan, &setup, daemon.startup_decision_policy_hash.as_ref())
@@ -1880,6 +2130,14 @@ mod formal_launch_tests {
                     if spec.horizon == Some(DecisionHorizon::T1)
                         && spec.research_round != Some(1) =>
                 {
+                    if inline_supplement {
+                        macro_series = Some(old_inline_supplement(
+                            daemon,
+                            &task.permit,
+                            macro_series.as_ref().unwrap(),
+                            &fred,
+                        ));
+                    }
                     let price = fred_gate_fixture_ref(price.as_ref().unwrap());
                     let fred = fred_gate_fixture_ref(macro_series.as_ref().unwrap());
                     let mut value = akzio_research::fixture_claim_output();
@@ -1905,6 +2163,18 @@ mod formal_launch_tests {
                     let claim = fred_gate_fixture_ref(claim.as_ref().unwrap());
                     let price = fred_gate_fixture_ref(price.as_ref().unwrap());
                     let fred = fred_gate_fixture_ref(macro_series.as_ref().unwrap());
+                    if inline_supplement {
+                        let raw = daemon.agent_session().candidates(&task).unwrap();
+                        assert!(raw.contains(&claim));
+                        assert!(raw.contains(&fred));
+                        let qualified = daemon
+                            .research_run()
+                            .legacy_research_candidates(&task)
+                            .unwrap();
+                        assert!(!qualified.contains(&claim));
+                        assert!(!qualified.contains(&fred));
+                        assert!(qualified.contains(&price));
+                    }
                     let mut value = akzio_research::fixture_critique_output();
                     value["target"] = serde_json::json!(claim);
                     let claim_payload: ResearchClaim =
@@ -2001,6 +2271,20 @@ mod formal_launch_tests {
                         .unwrap()
                         .unwrap();
                     assert!(review.accepted());
+                    if inline_supplement {
+                        let result = daemon.paper_execution().decision_gate(&task, Utc::now());
+                        assert!(
+                            matches!(&result, Err(crate::DaemonError::InvalidInput(reason))
+                            if reason.contains("supplement_unavailable_at_t0")),
+                            "{result:?}"
+                        );
+                        assert!(daemon
+                            .store
+                            .run_artifacts_by_kind(&task.run_id, ArtifactKind::Decision)
+                            .unwrap()
+                            .is_empty());
+                        return;
+                    }
                     let decision = akzio_execution::DecisionRuntime::new(
                         daemon.store.clone(),
                         akzio_execution::DecisionPolicy::default(),
@@ -2069,8 +2353,15 @@ mod formal_launch_tests {
     /// Do not weaken or delete this assertion.
     #[tokio::test]
     async fn decision_gate_requalifies_fred_in_pre_upgrade_reviewed_proposals() {
-        decide_pre_upgrade_fred(true, true).await;
-        decide_pre_upgrade_fred(true, false).await;
-        decide_pre_upgrade_fred(false, true).await;
+        decide_pre_upgrade_fred(true, true, false).await;
+        decide_pre_upgrade_fred(true, false, false).await;
+        decide_pre_upgrade_fred(false, true, false).await;
+    }
+
+    /// WHY THIS TEST EXISTS (Task #13): an old accepted proposal cannot create a new Decision with unproven inline supplemental evidence.
+    /// Do not weaken or delete this assertion.
+    #[tokio::test]
+    async fn decision_gate_rejects_old_review_of_unproven_inline_supplement() {
+        decide_pre_upgrade_fred(false, true, true).await;
     }
 }

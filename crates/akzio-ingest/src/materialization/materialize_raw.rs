@@ -2,6 +2,22 @@
 // provider 数据在物化前获取和校验，调用方可先检查多资源完整性。authorize_request 每次都
 // 重新读取 Store 中本 Run 的 Need，验证资源和来源的授权。
 
+struct EvidenceMaterializationClock {
+    decision_cutoff: DateTime<Utc>,
+    sealed_at: DateTime<Utc>,
+    recorded_receipt_at: DateTime<Utc>,
+}
+
+impl EvidenceMaterializationClock {
+    fn current(now: DateTime<Utc>) -> Self {
+        Self {
+            decision_cutoff: now,
+            sealed_at: now,
+            recorded_receipt_at: now,
+        }
+    }
+}
+
 impl EvidenceRuntime {
     pub fn new(store: Store, allowed_sources: impl IntoIterator<Item = EvidenceSource>) -> Self {
         // 将允许的 EvidenceSource 收敛为集合；它只控制 adapter 能否被调用，不授予模型访问权。
@@ -67,8 +83,35 @@ impl EvidenceRuntime {
         // 重新授权当前 permit/Need 后以 completeness ppm 作为 Normalized provenance confidence，
         // 将之前已验证的 acquisition 转成 Raw→Normalized 两个待提交 Artifact。
         self.authorize_request(permit, need, request, request.source)?;
-        let confidence_ppm = acquired.quality.completeness_ppm;
-        self.materialize_acquired(permit, need, request, acquired, confidence_ppm, now)
+        self.materialize_acquired(
+            permit,
+            need,
+            request,
+            acquired,
+            EvidenceMaterializationClock::current(now),
+        )
+    }
+
+    /// Seal a newly retrieved response against an earlier decision cutoff using its real receipt time.
+    pub fn materialize_with_frozen_cutoff(
+        &self,
+        permit: &TaskWritePermit,
+        need: &ArtifactRef,
+        request: &EvidenceRequest,
+        acquired: AcquiredEvidence,
+        decision_cutoff: DateTime<Utc>,
+        sealed_at: DateTime<Utc>,
+    ) -> EvidenceRuntimeResult<EvidenceBundle> {
+        self.authorize_request(permit, need, request, request.source)?;
+        if sealed_at < decision_cutoff || sealed_at < acquired.observed_at {
+            return Err(EvidenceRuntimeError::TemporalContamination);
+        }
+        let clock = EvidenceMaterializationClock {
+            decision_cutoff,
+            sealed_at,
+            recorded_receipt_at: acquired.observed_at,
+        };
+        self.materialize_acquired(permit, need, request, acquired, clock)
     }
 
     fn authorize_request(

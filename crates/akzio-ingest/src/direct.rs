@@ -368,6 +368,46 @@ impl FredDirectTransport {
         Ok((request_url, public_url, kind))
     }
 
+    /// Verify historical observations from the original credential-free direct request.
+    pub(crate) fn verify_point_snapshot(
+        request: &EvidenceRequest,
+        acquired: &AcquiredEvidence,
+    ) -> Option<(chrono::NaiveDate, ContentHash)> {
+        let GovernedResource::Fred {
+            vintage: Some(vintage),
+            ..
+        } = GovernedResource::parse(request.source, &request.resource).ok()?
+        else {
+            return None;
+        };
+        let (_, public_url, _) = Self::request_for(&request.resource).ok()?;
+        if acquired.source_uri != public_url.as_str()
+            || acquired.media_type != "application/json"
+            || acquired.provenance.document_id.as_deref() != Some(request.resource.as_str())
+        {
+            return None;
+        }
+        let raw_hash = ContentHash::of_bytes(&acquired.raw);
+        if acquired.provenance.dedupe_key != format!("fred:{raw_hash}") {
+            return None;
+        }
+
+        let (checked, quality) = Self::normalize_response(&request.resource, &acquired.raw).ok()?;
+        if checked != acquired.normalized
+            || quality != acquired.quality
+            || crate::fred_series_direction_gap(&request.resource, &checked).is_some()
+        {
+            return None;
+        }
+        let row_quality = &checked["observation_quality"];
+        // A normal FRED missing marker can share a complete page with valid facts.
+        // A row rejected for any other reason leaves this vintage unproven.
+        let raw_rows = row_quality["raw_rows"].as_u64()?;
+        let usable_rows = row_quality["usable_rows"].as_u64()?;
+        let missing_rows = row_quality["missing_rows"].as_u64()?;
+        (usable_rows.checked_add(missing_rows) == Some(raw_rows)).then_some((vintage, raw_hash))
+    }
+
     /// Decode a FRED response against the same governed resource used for its request.
     pub fn normalize_response(
         resource: &str,

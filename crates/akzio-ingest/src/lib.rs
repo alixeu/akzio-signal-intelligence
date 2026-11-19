@@ -8,6 +8,7 @@
 // 负责把请求绑定到本 Run 的 EvidenceNeed、检查 cutoff/新鲜度并 stage CAS；Agent 只能通过
 // Context 读取封存后的 NormalizedEvidence，不能借此获得网络或 RawEvidence 权限。
 
+mod availability;
 mod direct;
 mod financial_content;
 mod fred_observations;
@@ -37,6 +38,10 @@ pub use runtime::{
     EvidenceProvenance, EvidenceQuality, EvidenceRequest, EvidenceRuntime, EvidenceRuntimeError,
     EvidenceRuntimeResult, EvidenceSource, EvidenceTimeBasis, FixtureEvidenceAdapter,
     GovernedResource, NativeWebFailureKind, NormalizedEvidencePayload,
+};
+
+pub use availability::{
+    EvidenceAvailabilityBasis, EvidenceAvailabilityProof, EvidenceAvailabilityUnknown,
 };
 
 /// US ETF session date, including UTC evening/day-boundary differences.

@@ -34,23 +34,40 @@ impl<'a> PaperExecution<'a> {
         task: &ClaimedAttempt,
         now: DateTime<Utc>,
     ) -> Result<TaskCompletion> {
-        let proposal = match self
+        let (proposal, accepted_review) = match self
             .daemon
             .store
             .final_proposal_review(&task.run_id, &task.node.task_id)?
         {
             // 审查通过时以 Review 绑定的精确 Proposal 为准；审查拒绝不能回退到旧提案，
             // 没有审查记录时才沿用任务的 DecisionProposal 终态输入。
-            Some((_, review)) if review.accepted() => review.proposal,
+            Some((artifact, review)) if review.accepted() => (
+                review.proposal,
+                Some(ArtifactRef {
+                    artifact_id: artifact.artifact_id,
+                    kind: artifact.kind,
+                }),
+            ),
             Some(_) => {
                 return Err(DaemonError::InvalidInput(
                     "final proposal review rejected; revision limit exhausted".into(),
                 ))
             }
-            None => self
-                .daemon
-                .terminal_input(task, ArtifactKind::DecisionProposal)?,
+            None => (
+                self.daemon
+                    .terminal_input(task, ArtifactKind::DecisionProposal)?,
+                None,
+            ),
         };
+        let unavailable = self.daemon.unavailable_supplemental_inputs(
+            task,
+            std::iter::once(proposal.clone()).chain(accepted_review),
+        )?;
+        if let Some(receipt) = unavailable.first() {
+            return Err(DaemonError::InvalidInput(format!(
+                "supplement_unavailable_at_t0: reviewed proposal depends on receipt {receipt}"
+            )));
+        }
         self.daemon.decision_runtime.decide(&DecisionGateInput {
             permit: task.permit.clone(),
             proposal,

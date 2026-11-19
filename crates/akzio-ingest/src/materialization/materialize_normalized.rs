@@ -10,7 +10,7 @@ impl EvidenceRuntime {
         permit: &TaskWritePermit,
         request: &EvidenceRequest,
         acquired: &AcquiredEvidence,
-        now: DateTime<Utc>,
+        clock: &EvidenceMaterializationClock,
     ) -> EvidenceRuntimeResult<Artifact> {
         // acquired.raw 是采集适配器保留的原始响应账本；ModelReviewed 新闻可同时
         // 包含 discovery 与 reviewer 的 provider 响应，它仍不是独立来源快照。
@@ -24,14 +24,14 @@ impl EvidenceRuntime {
             ArtifactProvenance {
                 source_family: request.source.as_str().to_owned(),
                 observed_at: Some(acquired.observed_at),
-                retrieved_at: now,
+                retrieved_at: clock.recorded_receipt_at,
                 source_uri: Some(acquired.source_uri.clone()),
                 confidence_ppm: 1_000_000,
                 producer_contract_hash: permit.contract_hash.clone(),
             },
             Some(permit.artifact_origin()),
             vec![],
-            now,
+            clock.sealed_at,
         )?)
     }
 
@@ -141,16 +141,16 @@ impl EvidenceRuntime {
         need: &ArtifactRef,
         request: &EvidenceRequest,
         acquired: AcquiredEvidence,
-        confidence_ppm: u32,
-        now: DateTime<Utc>,
+        clock: EvidenceMaterializationClock,
     ) -> EvidenceRuntimeResult<EvidenceBundle> {
         // 先计算 EvidenceTimeBasis 和 contamination certificate，再封 Raw、绑定新闻子 blob、
         // 按资源类型构造 quant/financial projection，最后创建 NormalizedEvidence 及其 lineage。
-        let time_basis = Self::validate_acquired_evidence(request, &acquired, now)?;
+        Self::validate_acquisition(&acquired, request, clock.sealed_at)?;
+        let time_basis = Self::time_basis(request, &acquired, clock.decision_cutoff)?;
         let contamination_certificate =
             EvidenceContaminationCertificate::for_time_basis(&time_basis)?;
         let mut normalized_value = acquired.normalized.clone();
-        let raw = self.materialize_raw(permit, request, &acquired, now)?;
+        let raw = self.materialize_raw(permit, request, &acquired, &clock)?;
         let raw_ref = ArtifactRef {
             artifact_id: raw.artifact_id.clone(),
             kind: ArtifactKind::RawEvidence,
@@ -163,8 +163,10 @@ impl EvidenceRuntime {
                 &acquired.provenance.citations,
             )?;
         }
+        let governed = GovernedResource::parse(request.source, &request.resource)?;
+        let availability_proof = crate::EvidenceAvailabilityProof::seal(request, &governed, &acquired);
         let quant_features = if matches!(
-            GovernedResource::parse(request.source, &request.resource)?,
+            governed,
             GovernedResource::AlpacaBars {
                 raw_prices: false,
                 ..
@@ -190,7 +192,7 @@ impl EvidenceRuntime {
                 &acquired.provenance,
                 request.source,
                 &request.resource,
-                now,
+                clock.decision_cutoff,
             )
         })
         .transpose()?;
@@ -204,6 +206,7 @@ impl EvidenceRuntime {
             observed_at: acquired.observed_at,
             time_basis,
             contamination_certificate,
+            availability_proof: Some(availability_proof),
             quant_features,
             financial_content,
             value: normalized_value,
@@ -219,14 +222,14 @@ impl EvidenceRuntime {
             ArtifactProvenance {
                 source_family: request.source.as_str().to_owned(),
                 observed_at: Some(acquired.observed_at),
-                retrieved_at: now,
+                retrieved_at: clock.recorded_receipt_at,
                 source_uri: Some(acquired.source_uri.clone()),
-                confidence_ppm,
+                confidence_ppm: acquired.quality.completeness_ppm,
                 producer_contract_hash: permit.contract_hash.clone(),
             },
             Some(permit.artifact_origin()),
             vec![raw_ref, need.clone()],
-            now,
+            clock.sealed_at,
         )?;
         Ok(EvidenceBundle { raw, normalized })
     }
@@ -388,6 +391,250 @@ fn binding_byte(binding: &Value, field: &str) -> EvidenceRuntimeResult<usize> {
 #[cfg(test)]
 mod live_snapshot_cutoff_tests {
     use super::*;
+    use akzio_domain::{ArtifactId, AttemptId, LeaseId, RunId, TaskId};
+    use serde_json::json;
+
+    use crate::{EvidenceAvailabilityBasis as Basis, EvidenceAvailabilityUnknown as Unknown};
+
+    fn with_test_store(test: impl FnOnce(&EvidenceRuntime, &TaskWritePermit)) {
+        let permit = TaskWritePermit {
+            run_id: RunId::new(),
+            task_id: TaskId::new(),
+            attempt_id: AttemptId::new(),
+            lease_id: LeaseId::new(),
+            epoch: 1,
+            contract_hash: None,
+        };
+        let path = std::env::temp_dir().join(format!("akzio-availability-{}", permit.run_id));
+        let runtime = EvidenceRuntime::new(Store::open(&path).unwrap(), []);
+        test(&runtime, &permit);
+        drop(runtime);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    fn request(source: EvidenceSource, resource: &str) -> EvidenceRequest {
+        EvidenceRequest {
+            source,
+            resource: resource.to_owned(),
+            max_age: Duration::days(7),
+            acquisition_mode: EvidenceAcquisitionMode::VerifiedSource,
+        }
+    }
+
+    fn fixture_capture(
+        request: &EvidenceRequest,
+        source_uri: &str,
+        observed_at: DateTime<Utc>,
+        normalized: Value,
+    ) -> AcquiredEvidence {
+        let raw = serde_json::to_vec(&normalized).unwrap();
+        AcquiredEvidence {
+            provenance: EvidenceProvenance {
+                document_id: Some(request.resource.clone()),
+                published_at: None,
+                observed_at,
+                revision: None,
+                source_uri: source_uri.to_owned(),
+                dedupe_key: format!(
+                    "{}:{}",
+                    request.source.as_str(),
+                    ContentHash::of_bytes(&raw)
+                ),
+                citations: vec![],
+            },
+            raw,
+            media_type: "application/json".to_owned(),
+            source_uri: source_uri.to_owned(),
+            observed_at,
+            normalized,
+            quality: EvidenceQuality::default(),
+        }
+    }
+
+    fn materialize_for_cutoff(
+        runtime: &EvidenceRuntime,
+        permit: &TaskWritePermit,
+        request: &EvidenceRequest,
+        acquired: AcquiredEvidence,
+        cutoff: DateTime<Utc>,
+    ) -> NormalizedEvidencePayload {
+        let original_raw = acquired.raw.clone();
+        let need = ArtifactRef {
+            artifact_id: ArtifactId(ContentHash::of_bytes(request.resource.as_bytes())),
+            kind: ArtifactKind::EvidenceNeed,
+        };
+        let bundle = runtime
+            .materialize_acquired(
+                permit,
+                &need,
+                request,
+                acquired,
+                EvidenceMaterializationClock::current(cutoff),
+            )
+            .unwrap();
+        assert_eq!(
+            runtime.store().read_blob(&bundle.raw.blob).unwrap(),
+            original_raw
+        );
+        let payload: NormalizedEvidencePayload =
+            serde_json::from_slice(&runtime.store().read_blob(&bundle.normalized.blob).unwrap())
+                .unwrap();
+        assert_eq!(payload.raw.artifact_id, bundle.raw.artifact_id);
+        payload
+    }
+
+    /// WHY THIS TEST EXISTS (Task #13): source dates cannot qualify a later recomputed or revised version.
+    /// Do not weaken or delete this assertion.
+    #[test]
+    fn availability_proof_distinguishes_receipt_from_bars_window_and_release_date() {
+        with_test_store(|runtime, permit| {
+            let cutoff = "2026-09-15T20:25:00Z".parse().unwrap();
+            let captured_at = cutoff + Duration::minutes(2);
+            let bars = request(EvidenceSource::Alpaca, "bars:QQQ:1d");
+            let uri = "https://data.alpaca.markets/v2/stocks/QQQ/bars?feed=sip&adjustment=all";
+            let capture = fixture_capture(
+                &bars,
+                uri,
+                captured_at,
+                json!({
+                    "market":"stocks", "decision_cutoff":cutoff,
+                    "bars":[{"t":"2026-09-15T04:00:00Z","o":10,"l":9,"h":12,"c":11,"v":5}],
+                    "session_closes":{"2026-09-15":"2026-09-15T20:00:00Z"},
+                    "content_available_at":"2026-09-15T20:20:00Z"
+                }),
+            );
+            let t0 = captured_at + Duration::seconds(1);
+            let timely = materialize_for_cutoff(runtime, permit, &bars, capture.clone(), t0);
+            assert_eq!(
+                timely.availability_at(captured_at),
+                Ok(Basis::Captured { captured_at })
+            );
+            assert_eq!(
+                timely.availability_at(t0),
+                Ok(Basis::Captured { captured_at })
+            );
+            let proof = serde_json::to_value(&timely).unwrap();
+            assert_eq!(
+                proof["availability_proof"]["bars"],
+                json!({
+                    "requested_cutoff":cutoff,"requested_feed":"sip","requested_adjustment":"all"
+                })
+            );
+            assert!(timely.time_basis.revision.is_none());
+            let mut revised = capture;
+            revised.normalized["bars"][0]["c"] = json!(12);
+            revised.raw = serde_json::to_vec(&revised.normalized).unwrap();
+            let late = materialize_for_cutoff(runtime, permit, &bars, revised, cutoff);
+            assert_eq!(
+                late.availability_at(cutoff),
+                Err(Unknown::LateCaptureWithoutVersion)
+            );
+            assert_eq!(
+                late.availability_at("2026-09-15T20:19:59Z".parse().unwrap()),
+                Err(Unknown::SourceTimeOutsideCutoff)
+            );
+
+            for (source, resource) in [
+                (EvidenceSource::NewsWeb, "query:qqq"),
+                (EvidenceSource::SecEdgar, "submissions:0001067839"),
+            ] {
+                let disclosure = request(source, resource);
+                let mut revised = fixture_capture(
+                    &disclosure,
+                    "https://example.com/revised",
+                    captured_at,
+                    json!({"document":"later revision"}),
+                );
+                revised.provenance.published_at = Some(cutoff - Duration::days(1));
+                revised.provenance.revision = Some("revision-2".to_owned());
+                let late = materialize_for_cutoff(runtime, permit, &disclosure, revised, cutoff);
+                assert_eq!(
+                    late.availability_at(cutoff),
+                    Err(Unknown::LateCaptureWithoutVersion)
+                );
+                assert_eq!(
+                    late.availability_at(t0),
+                    Ok(Basis::Captured { captured_at })
+                );
+            }
+            let mut unsupported = proof.clone();
+            unsupported["availability_proof"]["version"] = json!(2);
+            let unsupported: NormalizedEvidencePayload =
+                serde_json::from_value(unsupported).unwrap();
+            assert_eq!(
+                unsupported.availability_at(t0),
+                Err(Unknown::UnsupportedProofVersion)
+            );
+
+            let mut legacy = proof;
+            legacy.as_object_mut().unwrap().remove("availability_proof");
+            let legacy: NormalizedEvidencePayload = serde_json::from_value(legacy).unwrap();
+            assert_eq!(legacy.value, timely.value);
+            assert_eq!(legacy.availability_at(t0), Err(Unknown::MissingProof));
+        });
+    }
+
+    /// WHY THIS TEST EXISTS (Task #13): only a validated, complete direct FRED point vintage can backfill.
+    /// Do not weaken or delete this assertion.
+    #[test]
+    fn availability_proof_revalidates_original_fred_rows_and_request_before_sealing() {
+        with_test_store(|runtime, permit| {
+            let request = request(
+                EvidenceSource::Fred,
+                "series:DFII10:2026-09-01:2026-09-15:2026-09-15",
+            );
+            let uri = "https://api.stlouisfed.org/fred/series/observations?series_id=DFII10&file_type=json&observation_start=2026-09-01&observation_end=2026-09-15&realtime_start=2026-09-15&realtime_end=2026-09-15";
+            let cutoff = "2026-09-16T20:00:00Z".parse().unwrap();
+            let captured_at = cutoff + Duration::minutes(30);
+            let response = json!({
+                "realtime_start":"2026-09-15","realtime_end":"2026-09-15","count":2,"offset":0,"limit":1000,
+                "observations":[
+                    {"date":"2026-09-11","value":"1.25","realtime_start":"2026-09-15","realtime_end":"2026-09-15"},
+                    {"date":"2026-09-14","value":".","realtime_start":"2026-09-15","realtime_end":"2026-09-15"}
+                ]
+            });
+            let acquire = |uri, body| {
+                let mut capture = fixture_capture(&request, uri, captured_at, body);
+                (capture.normalized, capture.quality) =
+                    crate::FredDirectTransport::normalize_response(&request.resource, &capture.raw)
+                        .unwrap();
+                capture
+            };
+            let exact = acquire(uri, response.clone());
+            let qualified =
+                materialize_for_cutoff(runtime, permit, &request, exact.clone(), cutoff);
+            let vintage = "2026-09-15".parse().unwrap();
+            let basis = Ok(Basis::FredPointSnapshot { vintage });
+            assert_eq!(qualified.availability_at(cutoff), basis);
+            assert_eq!(
+                qualified.availability_at("2026-09-15T14:00:00Z".parse().unwrap()),
+                Err(Unknown::SourceTimeOutsideCutoff)
+            );
+            let restored: NormalizedEvidencePayload =
+                serde_json::from_slice(&serde_json::to_vec(&qualified).unwrap()).unwrap();
+            assert_eq!(restored.availability_at(cutoff), basis);
+
+            let wrong_series_uri = uri.replace("series_id=DFII10", "series_id=DFF");
+            let mut substituted = exact;
+            substituted.normalized["observations"][0]["value"] = json!("4.25");
+            let mut truncated = response.clone();
+            truncated["count"] = json!(3);
+            let mut current_row = response.clone();
+            current_row["observations"][1] = json!({"date":"2026-09-14","value":"2.25","realtime_start":"2026-09-16","realtime_end":"2026-09-16"});
+            for unproved in [
+                acquire(&wrong_series_uri, response),
+                substituted,
+                acquire(uri, truncated),
+                acquire(uri, current_row),
+            ] {
+                let payload = materialize_for_cutoff(runtime, permit, &request, unproved, cutoff);
+                assert_eq!(
+                    payload.availability_at(cutoff),
+                    Err(Unknown::FredPointSnapshotUnverified)
+                );
+            }
+        });
+    }
 
     #[test]
     fn receipt_time_requires_completed_snapshot_and_future_data_stays_blocked() {
