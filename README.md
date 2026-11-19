@@ -318,7 +318,7 @@ CI 还检查 Markdown 本地链接，并独立运行 audit 与 SBOM 生成；上
 - **收益口径**：从初始股数、现金、去重成交和费用重建执行后敞口，再按冻结敞口计算 Outcome。具有原基线报价与成交记录的新观察执行路径标注 `frozen_post_execution_exposure_v3`，分列价格效应、实施差额、初始估值差额和估算费用；旧 V2 与未观察执行的估计路径保留各自语义。实际账户 NAV 为 unavailable，因为没有后续订单与外部现金流完整账本。计价窗口内发现公司行动或无法确认一致价格口径时数值不可用；窗口外行动保留证据并允许早期阶段继续，不用 adjusted bar 猜测收益。
 - **成本与身份**：Decision production cost 从其依赖任务闭包重建，包含该路径失败/重试；Outcome/叙事成本单独累计，生命周期总成本为另一读数。Experience 分开记录原研究 Contract 集、Workflow revision 与 evaluator Contract，原 DecisionContext 保留模型、policy 与 execution lineage。
 - **学习资格**：市场窗口完整、12-slot 研究充分、复盘有效、风险真值已测量是独立条件。Rust-only T5 可以封存数值和 ModelUnavailable 复盘，不能据此晋升。`run repair-narrative <run-id>` 在原 Run 上有界补写叙事 revision，保留原数值 Outcome；重新进入原资格检查和 Evaluation 事务，条件不足保持当前状态。LessonProposal 必须带资产、horizon、排除条件和来源，只生成 Draft/quarantine。
-- **查询与兼容**：`run replay` 返回 execution、各阶段叙事、数值封存、学习状态和成本分项。当前 Store schema 18；v15 的 Run/kind Artifact 索引、v16 的历史隔离 Debug 调度记录和 v17 的 DecisionPolicy 安装/激活记录仍可读取，但不恢复 Debug 执行能力，也不改既有 CAS 或 Commitment。Domain schema 保持 10；研究 Contract 69、Prompt bundle 38、freshness candidate 70；Outcome Contract 63、Prompt bundle 35；Outcome metric V3（V2 仍可读取）、evaluation context v1，benchmark definition 仍为 1。旧缺失字段保留 unknown 语义，旧任务不自动换 Contract。升级与旧任务阻断规则见运行时契约。
+- **查询与兼容**：`run replay` 返回 execution、各阶段叙事、数值封存、学习状态和成本分项。当前 Store schema 19；v15 的 Run/kind Artifact 索引、v16 的历史隔离 Debug 调度记录和 v17 的 DecisionPolicy 安装/激活记录仍可读取，但不恢复 Debug 执行能力，也不改既有 CAS 或 Commitment。Domain schema 保持 10；研究 Contract 69、Prompt bundle 38、freshness candidate 70；Outcome Contract 63、Prompt bundle 35；Outcome metric V3（V2 仍可读取）、evaluation context v1，benchmark definition 仍为 1。旧缺失字段保留 unknown 语义，旧任务不自动换 Contract。升级与旧任务阻断规则见运行时契约。
 
 验证结果按每次任务的实际执行范围报告；fixture 检查不构成真实 LLM/Paper、跨交易日学习或生产压力验收。
 

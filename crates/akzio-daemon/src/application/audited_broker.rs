@@ -7,7 +7,7 @@ use akzio_domain::{PaperCancel, PaperCommitment, PaperReprice};
 use akzio_execution::{
     paper::{
         CommittedPaperBroker, PaperError, PaperExecution, PaperOrderReceipt,
-        PaperSubmissionAuthorization,
+        PaperSubmissionAuthorization, PaperSubmissionJournal,
     },
     ExecutionPlan,
 };
@@ -55,21 +55,23 @@ impl CommittedPaperBroker for AuditedPaperBroker {
     fn observe_existing_commitment<'a>(
         &'a self,
         commitment: &'a PaperCommitment,
+        journal: Option<&'a PaperSubmissionJournal<'a>>,
     ) -> Pin<Box<dyn Future<Output = akzio_execution::paper::Result<PaperExecution>> + Send + 'a>>
     {
-        self.inner.observe_existing_commitment(commitment)
+        self.inner.observe_existing_commitment(commitment, journal)
     }
     fn execute_commitment<'a>(
         &'a self,
         commitment: &'a PaperCommitment,
         plan: &'a ExecutionPlan,
         authorization: &'a PaperSubmissionAuthorization,
+        journal: &'a PaperSubmissionJournal<'a>,
     ) -> Pin<Box<dyn Future<Output = akzio_execution::paper::Result<PaperExecution>> + Send + 'a>>
     {
         Box::pin(async move {
             self.before_write("rust.broker.submit_attempt")?;
             self.inner
-                .execute_commitment(commitment, plan, authorization)
+                .execute_commitment(commitment, plan, authorization, journal)
                 .await
         })
     }
@@ -78,14 +80,17 @@ impl CommittedPaperBroker for AuditedPaperBroker {
         &'a self,
         commitment: &'a PaperCommitment,
         execution: &'a PaperExecution,
+        journal: &'a PaperSubmissionJournal<'a>,
     ) -> Pin<Box<dyn Future<Output = akzio_execution::paper::Result<PaperExecution>> + Send + 'a>>
     {
-        self.inner.reconcile_commitment(commitment, execution)
+        self.inner
+            .reconcile_commitment(commitment, execution, journal)
     }
 
     fn cancel_order<'a>(
         &'a self,
         intent: &'a PaperCancel,
+        journal: Option<&'a PaperSubmissionJournal<'a>>,
     ) -> Pin<Box<dyn Future<Output = akzio_execution::paper::Result<PaperOrderReceipt>> + Send + 'a>>
     {
         Box::pin(async move {
@@ -97,7 +102,7 @@ impl CommittedPaperBroker for AuditedPaperBroker {
             if self.logger.assert_available().is_ok() && !uncertain {
                 self.before_write("rust.broker.cancel_attempt")?;
             }
-            self.inner.cancel_order(intent).await
+            self.inner.cancel_order(intent, journal).await
         })
     }
 
@@ -105,11 +110,14 @@ impl CommittedPaperBroker for AuditedPaperBroker {
         &'a self,
         intent: &'a PaperReprice,
         authorization: &'a PaperSubmissionAuthorization,
+        journal: &'a PaperSubmissionJournal<'a>,
     ) -> Pin<Box<dyn Future<Output = akzio_execution::paper::Result<PaperOrderReceipt>> + Send + 'a>>
     {
         Box::pin(async move {
             self.before_write("rust.broker.replace_attempt")?;
-            self.inner.replace_order(intent, authorization).await
+            self.inner
+                .replace_order(intent, authorization, journal)
+                .await
         })
     }
 }
@@ -136,6 +144,7 @@ mod tests {
         fn observe_existing_commitment<'a>(
             &'a self,
             commitment: &'a PaperCommitment,
+            _journal: Option<&'a PaperSubmissionJournal<'a>>,
         ) -> Pin<Box<dyn Future<Output = akzio_execution::paper::Result<PaperExecution>> + Send + 'a>>
         {
             self.reads.fetch_add(1, Ordering::SeqCst);
@@ -152,6 +161,7 @@ mod tests {
             _: &'a PaperCommitment,
             _: &'a ExecutionPlan,
             _: &'a PaperSubmissionAuthorization,
+            _journal: &'a PaperSubmissionJournal<'a>,
         ) -> Pin<Box<dyn Future<Output = akzio_execution::paper::Result<PaperExecution>> + Send + 'a>>
         {
             panic!("logging failure must prevent new orders")
@@ -161,6 +171,7 @@ mod tests {
             &'a self,
             _: &'a PaperCommitment,
             _: &'a PaperExecution,
+            _journal: &'a PaperSubmissionJournal<'a>,
         ) -> Pin<Box<dyn Future<Output = akzio_execution::paper::Result<PaperExecution>> + Send + 'a>>
         {
             panic!("this test only observes existing IDs")
@@ -169,6 +180,7 @@ mod tests {
         fn cancel_order<'a>(
             &'a self,
             intent: &'a PaperCancel,
+            _journal: Option<&'a PaperSubmissionJournal<'a>>,
         ) -> Pin<
             Box<dyn Future<Output = akzio_execution::paper::Result<PaperOrderReceipt>> + Send + 'a>,
         > {
@@ -195,6 +207,7 @@ mod tests {
             &'a self,
             _: &'a PaperReprice,
             _: &'a PaperSubmissionAuthorization,
+            _journal: &'a PaperSubmissionJournal<'a>,
         ) -> Pin<
             Box<dyn Future<Output = akzio_execution::paper::Result<PaperOrderReceipt>> + Send + 'a>,
         > {
@@ -235,7 +248,7 @@ mod tests {
         ));
         assert_eq!(
             guarded
-                .observe_existing_commitment(&commitment)
+                .observe_existing_commitment(&commitment, None)
                 .await
                 .unwrap()
                 .plan_hash,
@@ -259,7 +272,7 @@ mod tests {
             created_at: Utc::now(),
         };
         assert_eq!(
-            guarded.cancel_order(&cancel).await.unwrap().status,
+            guarded.cancel_order(&cancel, None).await.unwrap().status,
             "canceled"
         );
         assert_eq!(inner.reads.load(Ordering::SeqCst), 1);

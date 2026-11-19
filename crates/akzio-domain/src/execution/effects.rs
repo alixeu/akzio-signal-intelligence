@@ -319,12 +319,53 @@ pub enum ReconciliationState {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaperUnsubmittedReason {
+    SubmissionWindowExpired,
+    BatchObservationOnly,
+    RunCancelled,
+}
+
+/// A reference to one authoritative per-order journal transition. The enclosing
+/// Reconciliation supplies the exact Commitment identity for the transition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnsubmittedPaperOrder {
+    pub asset: Asset,
+    pub client_order_id: String,
+    pub transition_index: u32,
+    pub reason: PaperUnsubmittedReason,
+    /// Present for the successor of a durable reprice intent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reprice: Option<ArtifactRef>,
+}
+
+impl UnsubmittedPaperOrder {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.client_order_id.trim().is_empty()
+            || self.transition_index == 0
+            || !Asset::EXECUTABLE.contains(&self.asset)
+            || self
+                .reprice
+                .as_ref()
+                .is_some_and(|reference| reference.kind != ArtifactKind::ExecutionReprice)
+        {
+            return Err(DomainError::EmptyField {
+                field: "reconciliation.unsubmitted_order",
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reconciliation {
     pub reconciliation_id: ReconciliationId,
     pub commitment: ArtifactRef,
     pub state: ReconciliationState,
     pub broker_receipts: Vec<ArtifactRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsubmitted_orders: Vec<UnsubmittedPaperOrder>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub achieved_target: Option<TargetPortfolio>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -333,7 +374,7 @@ pub struct Reconciliation {
 }
 
 impl Reconciliation {
-    // 校验 Commitment/receipt kind；Complete 必须有 receipt，成就组合和因子暴露要成对出现。
+    // 校验 Commitment、receipt 和未发凭证形状，成就组合和因子暴露要成对出现。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.reconciliation_id.0.trim().is_empty()
             || self.commitment.kind != ArtifactKind::ExecutionCommitment
@@ -346,7 +387,25 @@ impl Reconciliation {
                 field: "reconciliation",
             });
         }
-        if self.state == ReconciliationState::Complete && self.broker_receipts.is_empty() {
+        let mut witness_assets = BTreeSet::new();
+        let mut witness_ids = BTreeSet::new();
+        for witness in &self.unsubmitted_orders {
+            witness.validate()?;
+            if !witness_assets.insert(witness.asset)
+                || !witness_ids.insert(&witness.client_order_id)
+            {
+                return Err(DomainError::EmptyField {
+                    field: "reconciliation.duplicate_unsubmitted_order",
+                });
+            }
+        }
+        if self.state == ReconciliationState::Complete
+            && self.broker_receipts.is_empty()
+            && !self
+                .unsubmitted_orders
+                .iter()
+                .any(|order| order.reprice.is_none())
+        {
             return Err(DomainError::EmptyField {
                 field: "reconciliation.receipts",
             });
@@ -369,5 +428,369 @@ impl Reconciliation {
             }
         }
         Ok(())
+    }
+}
+
+/// Verify the identities of observed and proven-unsubmitted orders, then
+/// determine whether all original orders and durable reprices are closed.
+/// The caller loads the order evidence and checks journal proofs in the Store.
+pub fn reconciliation_state_for_paper_orders(
+    commitment_ref: &ArtifactRef,
+    commitment: &PaperCommitment,
+    receipts: &[OrderReceipt],
+    reprices: &BTreeMap<Asset, (ArtifactRef, PaperReprice)>,
+    unsubmitted_orders: &[UnsubmittedPaperOrder],
+) -> Result<ReconciliationState, DomainError> {
+    let invalid = || DomainError::InvalidBudget {
+        field: "reconciliation.order_closure",
+    };
+    if commitment_ref.kind != ArtifactKind::ExecutionCommitment {
+        return Err(invalid());
+    }
+    for (asset, (reference, reprice)) in reprices {
+        if reference.kind != ArtifactKind::ExecutionReprice
+            || reprice.commitment != *commitment_ref
+            || reprice.asset != *asset
+            || commitment.client_order_ids.get(asset) != Some(&reprice.prior_client_order_id)
+        {
+            return Err(invalid());
+        }
+    }
+    let mut covered_assets = BTreeSet::new();
+    let mut closed_successors = BTreeSet::new();
+    let mut receipt_ids = BTreeSet::new();
+    for receipt in receipts {
+        let original_order_id = commitment
+            .client_order_ids
+            .get(&receipt.asset)
+            .ok_or_else(invalid)?;
+        let is_successor = reprices.get(&receipt.asset).is_some_and(|(_, reprice)| {
+            reprice.replacement_client_order_id == receipt.client_order_id
+        });
+        if receipt.plan_hash != commitment.plan_hash
+            || (!is_successor && receipt.client_order_id != *original_order_id)
+            || !covered_assets.insert(receipt.asset)
+            || !receipt_ids.insert(receipt.client_order_id.as_str())
+        {
+            return Err(invalid());
+        }
+        if is_successor {
+            closed_successors.insert(receipt.asset);
+        }
+    }
+    for proof in unsubmitted_orders {
+        proof.validate()?;
+        if !receipt_ids.insert(&proof.client_order_id) {
+            return Err(invalid());
+        }
+        if let Some(reference) = &proof.reprice {
+            let (durable_ref, reprice) = reprices.get(&proof.asset).ok_or_else(invalid)?;
+            if reference != durable_ref
+                || proof.client_order_id != reprice.replacement_client_order_id
+                || !closed_successors.insert(proof.asset)
+            {
+                return Err(invalid());
+            }
+        } else if commitment.client_order_ids.get(&proof.asset) != Some(&proof.client_order_id)
+            || reprices.contains_key(&proof.asset)
+            || !covered_assets.insert(proof.asset)
+        {
+            return Err(invalid());
+        }
+    }
+    if closed_successors.len() == reprices.len()
+        && covered_assets.len() == commitment.client_order_ids.len()
+        && receipts
+            .iter()
+            .all(|receipt| receipt.state.is_final_without_successor())
+    {
+        Ok(ReconciliationState::Complete)
+    } else if receipts.iter().any(|receipt| {
+        matches!(
+            receipt.state,
+            OrderReceiptState::PartiallyFilled | OrderReceiptState::Filled
+        )
+    }) {
+        Ok(ReconciliationState::Partial)
+    } else {
+        Ok(ReconciliationState::Pending)
+    }
+}
+
+/// Aggregate the original and replacement observations in original order units.
+pub fn normalize_paper_replacement_receipt(
+    reprice: &PaperReprice,
+    prior: &OrderReceipt,
+    replacement: &OrderReceipt,
+) -> Result<OrderReceipt, DomainError> {
+    prior.validate()?;
+    replacement.validate()?;
+    if prior.asset != replacement.asset
+        || prior.asset != reprice.asset
+        || prior.client_order_id != reprice.prior_client_order_id
+        || prior.broker_order_id != reprice.prior_broker_order_id
+        || replacement.client_order_id != reprice.replacement_client_order_id
+        || prior.plan_hash != replacement.plan_hash
+    {
+        return Err(DomainError::InvalidBudget {
+            field: "paper_reprice.receipt",
+        });
+    }
+
+    // 两种 broker wire 语义分支：完整原数量要求 replacement 累计 filled 不倒退；
+    // 剩余数量只在 requested == prior.remaining 时才允许与 prior fill 相加。
+    if replacement.requested_quantity_micros == prior.requested_quantity_micros {
+        if replacement.filled_quantity_micros < prior.filled_quantity_micros {
+            return Err(DomainError::InvalidBudget {
+                field: "paper_reprice.receipt",
+            });
+        }
+        return Ok(replacement.clone());
+    }
+    if replacement.requested_quantity_micros != prior.remaining_quantity_micros {
+        return Err(DomainError::InvalidBudget {
+            field: "paper_reprice.receipt",
+        });
+    }
+
+    // 对“仅剩余量”形式进行 checked 累加并验证不超过原申请量；加权价缺失或算术溢出
+    // 会返回 RepriceMismatch，不生成半合并回执。
+    let filled_quantity_micros = prior
+        .filled_quantity_micros
+        .checked_add(replacement.filled_quantity_micros)
+        .ok_or(DomainError::InvalidBudget {
+            field: "paper_reprice.receipt",
+        })?;
+    if filled_quantity_micros > prior.requested_quantity_micros {
+        return Err(DomainError::InvalidBudget {
+            field: "paper_reprice.receipt",
+        });
+    }
+    let remaining_quantity_micros = prior.requested_quantity_micros - filled_quantity_micros;
+    let average_fill_price = weighted_fill_price(prior, replacement)?;
+    // 完全成交强制归 Filled；否则若先前已有成交且 successor 仍 Accepted，则合并状态
+    // 为 PartiallyFilled；其它终态沿用 Broker successor 状态。
+    let state = if remaining_quantity_micros == 0 {
+        OrderReceiptState::Filled
+    } else if filled_quantity_micros > 0 && replacement.state == OrderReceiptState::Accepted {
+        OrderReceiptState::PartiallyFilled
+    } else {
+        replacement.state
+    };
+    let merged = OrderReceipt {
+        requested_quantity_micros: prior.requested_quantity_micros,
+        filled_quantity_micros,
+        remaining_quantity_micros,
+        average_fill_price,
+        state,
+        ..replacement.clone()
+    };
+    merged.validate()?;
+    Ok(merged)
+}
+
+fn weighted_fill_price(
+    prior: &OrderReceipt,
+    replacement: &OrderReceipt,
+) -> Result<Option<MoneyMicros>, DomainError> {
+    // 以两段成交数量加权平均价格，零成交返回 None；缺少有成交段的 average price 或
+    // 乘加溢出都保持 RepriceMismatch，不能用零价填充。
+    // 输入只共享借用；total_quantity 为两段填充数量之和，溢出代表无法可信合并而报错。
+    let total_quantity = prior
+        .filled_quantity_micros
+        .checked_add(replacement.filled_quantity_micros)
+        .ok_or(DomainError::InvalidBudget {
+            field: "paper_reprice.receipt",
+        })?;
+    if total_quantity == 0 {
+        return Ok(None);
+    }
+    // 闭包按 receipt 借用计算 quantity×price 的 i128 贡献；零成交不要求价格，有成交缺价
+    // 返回 Err。两个 Result 由 `?` 顺序传播，再以总数量整除得到截尾整数均价。
+    let contribution = |receipt: &OrderReceipt| -> Result<i128, DomainError> {
+        if receipt.filled_quantity_micros == 0 {
+            return Ok(0);
+        }
+        let price = receipt
+            .average_fill_price
+            .ok_or(DomainError::InvalidBudget {
+                field: "paper_reprice.receipt",
+            })?;
+        i128::from(receipt.filled_quantity_micros)
+            .checked_mul(i128::from(price.0))
+            .ok_or(DomainError::InvalidBudget {
+                field: "paper_reprice.receipt",
+            })
+    };
+    let weighted = contribution(prior)?
+        .checked_add(contribution(replacement)?)
+        .and_then(|value| value.checked_div(i128::from(total_quantity)))
+        .and_then(|value| i64::try_from(value).ok())
+        .ok_or(DomainError::InvalidBudget {
+            field: "paper_reprice.receipt",
+        })?;
+    Ok(Some(MoneyMicros(weighted)))
+}
+
+#[cfg(test)]
+mod paper_reconciliation_serialization_tests {
+    use super::*;
+
+    fn fixture_ref(kind: ArtifactKind) -> ArtifactRef {
+        ArtifactRef {
+            artifact_id: crate::ArtifactId(ContentHash::of_bytes(format!("{kind:?}").as_bytes())),
+            kind,
+        }
+    }
+
+    /// WHY THIS TEST EXISTS (Task #30): Settlement requires coverage of each exact order, including any durable replacement.
+    /// Do not weaken or delete this assertion.
+    #[test]
+    fn paper_settlement_requires_disjoint_terminal_receipts_or_exact_journal_proofs() {
+        let now = Utc::now();
+        let commitment = PaperCommitment {
+            commitment_id: PaperCommitmentId::new(),
+            execution_context: fixture_ref(ArtifactKind::ExecutionContext),
+            plan_hash: ContentHash::of_bytes(b"frozen plan"),
+            broker_session: "2026-11-19".into(),
+            client_order_ids: [
+                (Asset::Qqq, "qqq-r0".into()),
+                (Asset::Soxx, "soxx-r0".into()),
+            ]
+            .into(),
+            created_at: now,
+        };
+        let receipt = OrderReceipt {
+            plan_hash: commitment.plan_hash.clone(),
+            asset: Asset::Qqq,
+            client_order_id: "qqq-r0".into(),
+            broker_order_id: "observed-broker-id".into(),
+            state: OrderReceiptState::Filled,
+            requested_quantity_micros: 1_000_000,
+            filled_quantity_micros: 1_000_000,
+            remaining_quantity_micros: 0,
+            average_fill_price: Some(MoneyMicros(1_000_000)),
+            broker_updated_at: now,
+            reason: None,
+            observed_at: now,
+        };
+        let receipts = std::slice::from_ref(&receipt);
+        let unsubmitted = UnsubmittedPaperOrder {
+            asset: Asset::Soxx,
+            client_order_id: "soxx-r0".into(),
+            transition_index: 1,
+            reason: PaperUnsubmittedReason::BatchObservationOnly,
+            reprice: None,
+        };
+        let originals = std::slice::from_ref(&unsubmitted);
+        let no_reprices = BTreeMap::new();
+        let state = |reprices: &BTreeMap<Asset, (ArtifactRef, PaperReprice)>,
+                     witnesses: &[UnsubmittedPaperOrder]| {
+            reconciliation_state_for_paper_orders(
+                &fixture_ref(ArtifactKind::ExecutionCommitment),
+                &commitment,
+                receipts,
+                reprices,
+                witnesses,
+            )
+        };
+        assert_eq!(
+            state(&no_reprices, &[]).unwrap(),
+            ReconciliationState::Partial
+        );
+        assert_eq!(
+            state(&no_reprices, originals).unwrap(),
+            ReconciliationState::Complete
+        );
+
+        let replacement = fixture_ref(ArtifactKind::ExecutionReprice);
+        let reprices = [(
+            Asset::Qqq,
+            (
+                replacement.clone(),
+                PaperReprice {
+                    schema_version: DOMAIN_SCHEMA_VERSION,
+                    reprice_id: PaperRepriceId::new(),
+                    commitment: fixture_ref(ArtifactKind::ExecutionCommitment),
+                    prior_receipt: fixture_ref(ArtifactKind::OrderReceipt),
+                    asset: Asset::Qqq,
+                    prior_client_order_id: "qqq-r0".into(),
+                    replacement_client_order_id: "qqq-r1".into(),
+                    prior_broker_order_id: "observed-broker-id".into(),
+                    replacement_limit_price: MoneyMicros(1_000_000),
+                    created_at: now,
+                },
+            ),
+        )]
+        .into();
+        assert_eq!(
+            state(&reprices, originals).unwrap(),
+            ReconciliationState::Partial
+        );
+        let successor_unsubmitted = UnsubmittedPaperOrder {
+            asset: Asset::Qqq,
+            client_order_id: "qqq-r1".into(),
+            reprice: Some(replacement),
+            ..unsubmitted.clone()
+        };
+        let wrong_ref = UnsubmittedPaperOrder {
+            reprice: Some(ArtifactRef {
+                artifact_id: crate::ArtifactId(ContentHash::of_bytes(b"other replacement")),
+                kind: ArtifactKind::ExecutionReprice,
+            }),
+            ..successor_unsubmitted.clone()
+        };
+        assert!(state(&reprices, &[unsubmitted.clone(), wrong_ref]).is_err());
+        assert_eq!(
+            state(&reprices, &[unsubmitted.clone(), successor_unsubmitted]).unwrap(),
+            ReconciliationState::Complete
+        );
+        let contradicting = UnsubmittedPaperOrder {
+            asset: Asset::Qqq,
+            client_order_id: "qqq-r0".into(),
+            ..unsubmitted.clone()
+        };
+        let wrong_original = UnsubmittedPaperOrder {
+            client_order_id: "other-soxx-r0".into(),
+            ..unsubmitted.clone()
+        };
+        assert!(state(&no_reprices, &[unsubmitted, contradicting]).is_err());
+        assert!(state(&no_reprices, &[wrong_original]).is_err());
+    }
+
+    /// WHY THIS TEST EXISTS (Task #30): A complete all-unsubmitted batch must carry its durable evidence without a fabricated broker receipt.
+    /// Do not weaken or delete this assertion.
+    #[test]
+    fn complete_reconciliation_can_retain_exact_never_submitted_evidence() {
+        let now = Utc::now();
+        let commitment = ArtifactRef {
+            artifact_id: crate::ArtifactId(crate::ContentHash::of_bytes(b"durable commitment")),
+            kind: ArtifactKind::ExecutionCommitment,
+        };
+        let witness = serde_json::json!({
+            "asset": Asset::Qqq,
+            "client_order_id": "original-qqq",
+            "transition_index": 1,
+            "reason": "batch_observation_only",
+        });
+        let mut wire = serde_json::json!({
+            "reconciliation_id": "reconciled-batch",
+            "commitment": commitment,
+            "state": "complete",
+            "broker_receipts": [],
+            "unsubmitted_orders": [witness],
+            "reconciled_at": now,
+        });
+        let complete: Reconciliation = serde_json::from_value(wire.clone()).unwrap();
+        complete.validate().unwrap();
+        assert_eq!(serde_json::to_value(complete).unwrap(), wire);
+
+        wire.as_object_mut().unwrap().remove("unsubmitted_orders");
+        let invalid: Reconciliation = serde_json::from_value(wire.clone()).unwrap();
+        assert!(invalid.validate().is_err());
+        wire["state"] = serde_json::json!("pending");
+        let legacy: Reconciliation = serde_json::from_value(wire.clone()).unwrap();
+        legacy.validate().unwrap();
+        assert_eq!(serde_json::to_value(legacy).unwrap(), wire);
     }
 }

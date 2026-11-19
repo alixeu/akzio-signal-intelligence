@@ -21,23 +21,16 @@ impl CommittedPaperBroker for AlpacaPaper {
     fn observe_existing_commitment<'a>(
         &'a self,
         commitment: &'a PaperCommitment,
+        journal: Option<&'a PaperSubmissionJournal<'a>>,
     ) -> Pin<Box<dyn Future<Output = Result<PaperExecution>> + Send + 'a>> {
         Box::pin(async move {
             let mut orders = Vec::new();
-            for client_id in commitment.client_order_ids.values() {
-                let successor = replacement_client_order_id(client_id);
-                if let Some(receipt) = self.lookup(&successor).await? {
-                    orders.push(PaperOrderReceipt {
-                        reused: true,
-                        reprice_count: 1,
-                        ..receipt
-                    });
-                } else if let Some(receipt) = self.lookup(client_id).await? {
-                    orders.push(PaperOrderReceipt {
-                        reused: true,
-                        reprice_count: 0,
-                        ..receipt
-                    });
+            for (asset, client_id) in &commitment.client_order_ids {
+                if let Some(receipt) = self
+                    .lookup_committed_receipt(*asset, client_id, journal)
+                    .await?
+                {
+                    orders.push(receipt);
                 }
             }
             Ok(PaperExecution {
@@ -51,6 +44,7 @@ impl CommittedPaperBroker for AlpacaPaper {
         commitment: &'a PaperCommitment,
         plan: &'a ExecutionPlan,
         authorization: &'a PaperSubmissionAuthorization,
+        journal: &'a PaperSubmissionJournal<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<PaperExecution>> + Send + 'a>> {
         // Box::pin 把借用 self/commitment/plan/authorization 的 async future 返回给调度器，
         // 生命周期覆盖整个 broker 请求，不复制大对象也不改变所有权；构造这个 Future
@@ -60,6 +54,7 @@ impl CommittedPaperBroker for AlpacaPaper {
             commitment,
             plan,
             authorization,
+            journal,
         ))
     }
 
@@ -67,27 +62,30 @@ impl CommittedPaperBroker for AlpacaPaper {
         &'a self,
         commitment: &'a PaperCommitment,
         execution: &'a PaperExecution,
+        journal: &'a PaperSubmissionJournal<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<PaperExecution>> + Send + 'a>> {
         // 对账同样只借用已有 execution，异步刷新不会重新生成 commitment；Future 的生命周期
         // 与两份输入引用一致，完成后输出一份新拥有的 PaperExecution。
         Box::pin(AlpacaPaper::reconcile_committed(
-            self, commitment, execution,
+            self, commitment, execution, journal,
         ))
     }
 
     fn cancel_order<'a>(
         &'a self,
         intent: &'a PaperCancel,
+        journal: Option<&'a PaperSubmissionJournal<'a>>,
     ) -> Pin<Box<dyn Future<Output = Result<PaperOrderReceipt>> + Send + 'a>> {
         // 取消 intent 自带原始 client/broker ID，由 reconcile 实现做 durable identity 校验；
         // await 驱动异步 DELETE/GET 路径，trait adapter 不自行创建 Tokio task。
-        Box::pin(AlpacaPaper::cancel_committed_order(self, intent))
+        Box::pin(AlpacaPaper::cancel_committed_order(self, intent, journal))
     }
 
     fn replace_order<'a>(
         &'a self,
         intent: &'a PaperReprice,
         authorization: &'a PaperSubmissionAuthorization,
+        journal: &'a PaperSubmissionJournal<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<PaperOrderReceipt>> + Send + 'a>> {
         // 替换 intent 还需 submission authorization，确保过期窗口不能产生新的 PATCH；
         // 返回的 Send Future 可被 worker 驱动，错误仍作为 Result 传回 dispatch。
@@ -95,6 +93,7 @@ impl CommittedPaperBroker for AlpacaPaper {
             self,
             intent,
             authorization,
+            journal,
         ))
     }
 }

@@ -16,8 +16,12 @@ use akzio_domain::{
     Artifact, ArtifactKind, ArtifactLifecycle, ArtifactRef, Asset, ContentHash, DomainError,
     ExecutionContext, OrderReceipt, OrderReceiptState, PaperCancel, PaperCancelId,
     PaperCancelReason, PaperCommitment, PaperReprice, RunPurpose, TaskWritePermit,
+    UnsubmittedPaperOrder,
 };
-use akzio_store::{DaemonLease, Store, StoreError};
+use akzio_store::{
+    DaemonLease, PaperSubmissionAdmission, PaperSubmissionAuthority, PaperSubmissionBatch,
+    PaperSubmissionState, PaperSubmissionStop, Store, StoreError,
+};
 use chrono::{DateTime, NaiveDate, Utc};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -62,6 +66,8 @@ pub enum PaperError {
     ApprovalPolicyMismatch,
     #[error("Alpaca Paper market is closed")]
     MarketClosed,
+    #[error("Alpaca Paper market session differs from the frozen order session")]
+    MarketSessionMismatch,
     #[error("broker response omitted {0}")]
     MissingField(&'static str),
     #[error("broker clock timestamp is invalid: {0}")]
@@ -80,12 +86,43 @@ pub enum PaperError {
     Frozen,
     #[error("Paper execution froze after observing order receipts")]
     FrozenAfterReceipts(PaperExecution),
+    #[error("the Paper order can only be observed after an earlier admission")]
+    SubmissionObservationOnly,
+    #[error("Paper submission journal: {0}")]
+    SubmissionJournal(#[source] StoreError),
+    #[error("Paper submission outcome is unknown for {client_order_id}: {source}")]
+    SubmissionResultUnknown {
+        client_order_id: String,
+        #[source]
+        source: Box<PaperError>,
+    },
+    #[error("Paper order {client_order_id} has an unusable broker receipt: {source}")]
+    BrokerReceiptUnavailable {
+        client_order_id: String,
+        source: Box<PaperError>,
+    },
     #[error("Paper execution freeze state is unavailable: {0}")]
     FreezeStateUnavailable(#[source] StoreError),
     #[error("Paper commitment plan hash does not match the submitted plan")]
     CommitmentPlanHashMismatch,
     #[error("Paper commitment client order ID does not match plan order for {0}")]
     CommitmentClientOrderMismatch(Asset),
+}
+
+impl PaperError {
+    fn unusable_receipt(client_order_id: &str, source: Self) -> Self {
+        Self::BrokerReceiptUnavailable {
+            client_order_id: client_order_id.to_owned(),
+            source: Box::new(source),
+        }
+    }
+
+    fn is_observation_unavailable(&self) -> bool {
+        matches!(
+            self,
+            Self::Transport { .. } | Self::Http { .. } | Self::BrokerReceiptUnavailable { .. }
+        )
+    }
 }
 
 pub type Result<T> = std::result::Result<T, PaperError>;
@@ -145,6 +182,117 @@ pub struct PaperExecution {
 mod submission_authorization;
 pub use submission_authorization::PaperSubmissionAuthorization;
 
+/// Capability for admitting an exact order and recording actual observations.
+/// Only a fenced dispatch for the original durable Commitment constructs it.
+pub struct PaperSubmissionJournal<'a> {
+    store: &'a Store,
+    input: &'a PaperDispatchInput,
+    commitment: &'a PaperCommitment,
+    journaled: bool,
+}
+
+impl PaperSubmissionJournal<'_> {
+    fn authority(&self) -> PaperSubmissionAuthority<'_> {
+        PaperSubmissionAuthority {
+            lease: &self.input.lease,
+            permit: &self.input.permit,
+            commitment: &self.input.commitment,
+        }
+    }
+
+    fn admit(&self, client_order_id: &str, expires_at: DateTime<Utc>) -> Result<()> {
+        match self
+            .store
+            .admit_paper_submission(&self.authority(), client_order_id, expires_at)
+        {
+            Ok(PaperSubmissionAdmission::Admitted) => Ok(()),
+            Ok(PaperSubmissionAdmission::ObserveOnly) => Err(PaperError::SubmissionObservationOnly),
+            Err(StoreError::ExecutionFrozen { .. }) => Err(PaperError::Frozen),
+            Err(error) => Err(PaperError::SubmissionJournal(error)),
+        }
+    }
+
+    fn ready_client_order_ids(&self) -> Result<std::collections::BTreeSet<String>> {
+        let Some(PaperSubmissionBatch::Journaled {
+            observation_only: false,
+            orders,
+            ..
+        }) = self
+            .store
+            .paper_submission_batch(&self.input.commitment)
+            .map_err(PaperError::SubmissionJournal)?
+        else {
+            return Ok(std::collections::BTreeSet::new());
+        };
+        Ok(orders
+            .into_iter()
+            .filter(|order| order.state == PaperSubmissionState::Ready)
+            .map(|order| order.client_order_id)
+            .collect())
+    }
+
+    fn replacement_for(&self, asset: Asset) -> Result<Option<String>> {
+        let Some(artifact) = self
+            .store
+            .reprice_for(&self.input.commitment, asset)
+            .map_err(PaperError::SubmissionJournal)?
+        else {
+            return Ok(None);
+        };
+        if !self
+            .store
+            .paper_effect_intent_recorded(&self.input.permit.run_id, &artifact.artifact_id)
+            .map_err(PaperError::SubmissionJournal)?
+        {
+            return Ok(None);
+        }
+        let reprice: PaperReprice = serde_json::from_slice(
+            &self
+                .store
+                .read_blob(&artifact.blob)
+                .map_err(PaperError::SubmissionJournal)?,
+        )
+        .map_err(|err| PaperError::InvalidCommitment(err.to_string()))?;
+        reprice.validate()?;
+        if reprice.commitment != self.input.commitment || reprice.asset != asset {
+            return Err(PaperError::InvalidCommitment(
+                "invalid durable reprice lineage".into(),
+            ));
+        }
+        Ok(Some(reprice.replacement_client_order_id))
+    }
+
+    fn record(&self, receipt: &PaperOrderReceipt) -> Result<()> {
+        let unavailable = |source| PaperError::unusable_receipt(&receipt.client_order_id, source);
+        let observed = paper_dispatch::broker_receipt(receipt, self.commitment, Utc::now())
+            .map_err(|error| unavailable(PaperError::InvalidCommitment(error.to_string())))?;
+        observed
+            .validate()
+            .map_err(|error| unavailable(error.into()))?;
+        if !self
+            .commitment
+            .client_order_ids
+            .get(&observed.asset)
+            .is_some_and(|original| {
+                observed.client_order_id == *original
+                    || observed.client_order_id == replacement_client_order_id(original)
+            })
+        {
+            return Err(unavailable(PaperError::CommitmentClientOrderMismatch(
+                observed.asset,
+            )));
+        }
+        self.store
+            .record_paper_submission_receipt(&self.authority(), &observed)
+            .map_err(|error| match error {
+                error @ StoreError::PaperReceiptConflict(_) => {
+                    unavailable(PaperError::SubmissionJournal(error))
+                }
+                error => PaperError::SubmissionJournal(error),
+            })
+    }
+}
+
 /// 已持久化 Commitment 的 Broker 接口；生产实现仅接受 Alpaca Paper endpoint。
 /// Trait 形状要求承诺和对应计划一起传入，但持久化身份仍由 Dispatch/Store 核验。
 // Trait 对象边界返回装箱 Future：`'a` 将 Future 的有效期约束在所有借入参数之内；
@@ -162,6 +310,7 @@ pub trait CommittedPaperBroker: Send + Sync {
     fn observe_existing_commitment<'a>(
         &'a self,
         _commitment: &'a PaperCommitment,
+        _journal: Option<&'a PaperSubmissionJournal<'a>>,
     ) -> Pin<Box<dyn Future<Output = Result<PaperExecution>> + Send + 'a>> {
         Box::pin(async {
             Err(PaperError::InvalidCommitment(
@@ -175,6 +324,7 @@ pub trait CommittedPaperBroker: Send + Sync {
         commitment: &'a PaperCommitment,
         plan: &'a ExecutionPlan,
         authorization: &'a PaperSubmissionAuthorization,
+        journal: &'a PaperSubmissionJournal<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<PaperExecution>> + Send + 'a>>;
 
     // 只刷新 commitment 已关联的 broker orders，不创建新的订单身份。
@@ -182,12 +332,14 @@ pub trait CommittedPaperBroker: Send + Sync {
         &'a self,
         commitment: &'a PaperCommitment,
         execution: &'a PaperExecution,
+        journal: &'a PaperSubmissionJournal<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<PaperExecution>> + Send + 'a>>;
 
     // 取消必须提供由 Rust/Store 生成并校验的 cancel intent。
     fn cancel_order<'a>(
         &'a self,
         intent: &'a PaperCancel,
+        journal: Option<&'a PaperSubmissionJournal<'a>>,
     ) -> Pin<Box<dyn Future<Output = Result<PaperOrderReceipt>> + Send + 'a>>;
 
     // 改价除 durable reprice intent 外还要有仍在有效期内的发送授权。
@@ -195,6 +347,7 @@ pub trait CommittedPaperBroker: Send + Sync {
         &'a self,
         intent: &'a PaperReprice,
         authorization: &'a PaperSubmissionAuthorization,
+        journal: &'a PaperSubmissionJournal<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<PaperOrderReceipt>> + Send + 'a>>;
 }
 
@@ -340,8 +493,16 @@ mod write_guard_tests {
 
             // A send attempt with this URL returns a builder error without network I/O.
             let result = match kind {
-                PaperWriteKind::Submit => paper.post_json(INVALID_ORDER_URL, Value::Null).await,
-                PaperWriteKind::Replace => paper.patch_json(INVALID_ORDER_URL, Value::Null).await,
+                PaperWriteKind::Submit => {
+                    paper
+                        .post_json(INVALID_ORDER_URL, Value::Null, || Ok(()))
+                        .await
+                }
+                PaperWriteKind::Replace => {
+                    paper
+                        .patch_json(INVALID_ORDER_URL, Value::Null, || Ok(()))
+                        .await
+                }
                 PaperWriteKind::Cancel => unreachable!(),
             };
             assert!(
@@ -381,11 +542,15 @@ mod write_guard_tests {
         let paper = freeze_test_client(store);
 
         assert!(matches!(
-            paper.post_json(INVALID_ORDER_URL, Value::Null).await,
+            paper
+                .post_json(INVALID_ORDER_URL, Value::Null, || Ok(()))
+                .await,
             Err(PaperError::FreezeStateUnavailable(StoreError::Json(_)))
         ));
         assert!(matches!(
-            paper.patch_json(INVALID_ORDER_URL, Value::Null).await,
+            paper
+                .patch_json(INVALID_ORDER_URL, Value::Null, || Ok(()))
+                .await,
             Err(PaperError::FreezeStateUnavailable(StoreError::Json(_)))
         ));
         assert!(matches!(
@@ -414,11 +579,13 @@ mod write_guard_tests {
         }));
         let url = "https://paper-api.alpaca.markets/v2/orders";
         assert!(matches!(
-            paper.post_json(url, serde_json::json!({})).await,
+            paper.post_json(url, serde_json::json!({}), || Ok(())).await,
             Err(PaperError::RunLogUnavailable(_))
         ));
         assert!(matches!(
-            paper.patch_json(url, serde_json::json!({})).await,
+            paper
+                .patch_json(url, serde_json::json!({}), || Ok(()))
+                .await,
             Err(PaperError::RunLogUnavailable(_))
         ));
         assert!(matches!(

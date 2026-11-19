@@ -122,6 +122,12 @@ akzio --config <config> calibration activate --store <store> --policy <policy-id
 
 Shell 的两个提交模式及原生查询/分享安全导出不会删除正式 Core、Store、Run、Commitment、报告或历史状态。需要独立备份/恢复时使用显式的 `store backup/restore` 原生命令，沿用原审批，不把分享安全 bundle 当成数据库备份。
 
+### Store 18 → 19 升级
+
+1. 暂停创建新 Run，用原 Store 18 Core 处理剩余任务。旧 Core 仍可认证访问时，运行 `akzio --config <config> store backup <独立的新备份目录>`，保存显示 `schema_version: 18` 的备份 manifest。通过同一 Core 的 `store restore <备份目录> <独立的恢复核验目录>` 核验快照可恢复及完整性。
+2. 停止所有连接正式 Store 的旧 Core、worker 和其他写入进程。确认没有 queued、leased 或 running 任务，并等待有效 daemon lease 释放或过期。迁移在 SQLite 事务内复核任务和 lease。
+3. 用获准的新版本 `akzio --config <config> daemon serve` 首次可写打开原 Store。启动成功后用原生 `store doctor` 检查完整性。保留升级前备份作为独立快照。升级后出现新的可能已提交订单时，继续在原 Store 按原 Run、Session 和确定性 ID 对账。
+
 旧 `evidence market-audit` 以 Debug purpose 创建证据图，已与 `evidence preflight` 一并退役，不能绕过私有 Run 日志生成无日志的真实采集或模型请求。离线采集与协议验证使用注入测试 adapters 的 Cargo 测试；真实证据只在获准的正式 PositionPlan/Paper 中取得，不以测试替代真实市场验证。
 
 ## 5. 完成与证据

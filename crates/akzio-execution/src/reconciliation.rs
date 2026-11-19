@@ -11,9 +11,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use akzio_domain::{
     AccountSnapshot, Artifact, ArtifactKind, ArtifactLifecycle, ArtifactRef, Asset, DomainError,
     ExecutionContext, ExecutionPlan, FactorExposure, LifecycleEventType, MoneyMicros, OrderReceipt,
-    OrderReceiptState, OrderSide, PaperCancel, PaperCommitment, PaperReprice, Reconciliation,
-    ReconciliationId, ReconciliationState, RunPurpose, TargetPortfolio, TaskStatus,
-    TaskWritePermit, WeightPpm,
+    OrderSide, PaperCancel, PaperCommitment, PaperReprice, Reconciliation, ReconciliationId,
+    ReconciliationState, RunPurpose, TargetPortfolio, TaskStatus, TaskWritePermit,
+    UnsubmittedPaperOrder, WeightPpm,
 };
 use akzio_store::{DaemonLease, Store, StoreError};
 use chrono::{DateTime, Utc};
@@ -48,6 +48,8 @@ pub enum ReconciliationError {
 
 pub type ReconciliationResult<T> = std::result::Result<T, ReconciliationError>;
 
+pub(super) type JournalReceiptSources = BTreeMap<String, (ArtifactRef, OrderReceipt)>;
+
 #[derive(Debug, Clone)]
 pub struct ReconciliationInput {
     pub permit: TaskWritePermit,
@@ -78,6 +80,15 @@ impl ReconciliationRuntime {
     pub fn reconcile(
         &self,
         input: &ReconciliationInput,
+    ) -> ReconciliationResult<ReconciliationOutput> {
+        self.reconcile_from_journal(input, Vec::new(), &JournalReceiptSources::new())
+    }
+
+    pub(super) fn reconcile_from_journal(
+        &self,
+        input: &ReconciliationInput,
+        unsubmitted_orders: Vec<UnsubmittedPaperOrder>,
+        journal_receipts: &JournalReceiptSources,
     ) -> ReconciliationResult<ReconciliationOutput> {
         // 输入→加载 Commitment/action artifacts→校验每个回执的 plan/client ID→合并
         // replacement→重建 achieved portfolio→生成 Receipt/Reconciliation Artifact。该方法
@@ -146,7 +157,25 @@ impl ReconciliationRuntime {
                 if let Some((_, reprice)) = reprices.get(&receipt.asset).filter(|(_, reprice)| {
                     reprice.replacement_client_order_id == receipt.client_order_id
                 }) {
-                    self.merge_reprice_receipt(reprice, receipt)
+                    if journal_receipts.contains_key(&receipt.client_order_id) {
+                        let (_, prior) = journal_receipts
+                            .get(&reprice.prior_client_order_id)
+                            .ok_or(ReconciliationError::RepriceMismatch)?;
+                        if !prior.state.is_final_without_successor()
+                            && prior.state != akzio_domain::OrderReceiptState::Replaced
+                        {
+                            // An independently live r0 remains open even if r1 is terminal.
+                            return Ok(prior.clone());
+                        }
+                        // Raw observations can temporarily disagree while the old order's
+                        // final fills catch up. Keeping r0 alone leaves the r1 barrier open.
+                        Ok(akzio_domain::normalize_paper_replacement_receipt(
+                            reprice, prior, receipt,
+                        )
+                        .unwrap_or_else(|_| prior.clone()))
+                    } else {
+                        self.merge_reprice_receipt(reprice, receipt)
+                    }
                 } else {
                     Ok(receipt.clone())
                 }
@@ -176,11 +205,17 @@ impl ReconciliationRuntime {
                 return Err(ReconciliationError::DuplicateReceipt(receipt.asset));
             }
             let mut source_refs = vec![input.commitment.clone()];
-            if let Some((reprice, _)) = reprices
+            if let Some((reference, _)) = journal_receipts.get(&receipt.client_order_id) {
+                source_refs.push(reference.clone());
+            }
+            if let Some((reference, reprice)) = reprices
                 .get(&receipt.asset)
                 .filter(|_| is_reprice_client_id)
             {
-                source_refs.push(reprice.clone());
+                source_refs.push(reference.clone());
+                if let Some((prior, _)) = journal_receipts.get(&reprice.prior_client_order_id) {
+                    source_refs.push(prior.clone());
+                }
             }
             if let Some((cancel, _)) = cancels.get(&receipt.asset) {
                 source_refs.push(cancel.clone());
@@ -204,14 +239,13 @@ impl ReconciliationRuntime {
                 kind: artifact.kind,
             })
             .collect::<Vec<_>>();
-        let state = reconciliation_state_with_reprices(
+        let state = akzio_domain::reconciliation_state_for_paper_orders(
+            &input.commitment,
             &commitment,
             &normalized_receipts,
-            &reprices
-                .values()
-                .map(|(_, reprice)| reprice.clone())
-                .collect::<Vec<_>>(),
-        );
+            &reprices,
+            &unsubmitted_orders,
+        )?;
         let (achieved_target, achieved_factor_exposure) =
             self.achieved_portfolio(&commitment, &normalized_receipts)?;
         // Reconciliation payload 固化当前计算状态、回执引用和基于成交重建的执行后敞口；
@@ -221,6 +255,7 @@ impl ReconciliationRuntime {
             commitment: input.commitment.clone(),
             state,
             broker_receipts: receipt_refs.clone(),
+            unsubmitted_orders,
             achieved_target: Some(achieved_target),
             achieved_factor_exposure: Some(achieved_factor_exposure),
             reconciled_at: input.now,
@@ -333,59 +368,8 @@ impl ReconciliationRuntime {
             self.load_expected(&reprice.prior_receipt, ArtifactKind::OrderReceipt)?;
         let prior: OrderReceipt =
             serde_json::from_slice(&self.store.read_blob(&prior_artifact.blob)?)?;
-        prior.validate()?;
-        if prior.asset != replacement.asset
-            || prior.asset != reprice.asset
-            || prior.client_order_id != reprice.prior_client_order_id
-            || prior.broker_order_id != reprice.prior_broker_order_id
-            || replacement.client_order_id != reprice.replacement_client_order_id
-            || prior.plan_hash != replacement.plan_hash
-        {
-            return Err(ReconciliationError::RepriceMismatch);
-        }
-
-        // 两种 broker wire 语义分支：完整原数量要求 replacement 累计 filled 不倒退；
-        // 剩余数量只在 requested == prior.remaining 时才允许与 prior fill 相加。
-        if replacement.requested_quantity_micros == prior.requested_quantity_micros {
-            if replacement.filled_quantity_micros < prior.filled_quantity_micros {
-                return Err(ReconciliationError::RepriceMismatch);
-            }
-            return Ok(replacement.clone());
-        }
-        if replacement.requested_quantity_micros != prior.remaining_quantity_micros {
-            return Err(ReconciliationError::RepriceMismatch);
-        }
-
-        // 对“仅剩余量”形式进行 checked 累加并验证不超过原申请量；加权价缺失或算术溢出
-        // 会返回 RepriceMismatch，不生成半合并回执。
-        let filled_quantity_micros = prior
-            .filled_quantity_micros
-            .checked_add(replacement.filled_quantity_micros)
-            .ok_or(ReconciliationError::RepriceMismatch)?;
-        if filled_quantity_micros > prior.requested_quantity_micros {
-            return Err(ReconciliationError::RepriceMismatch);
-        }
-        let remaining_quantity_micros = prior.requested_quantity_micros - filled_quantity_micros;
-        let average_fill_price = weighted_fill_price(&prior, replacement)?;
-        // 完全成交强制归 Filled；否则若先前已有成交且 successor 仍 Accepted，则合并状态
-        // 为 PartiallyFilled；其它终态沿用 Broker successor 状态。
-        let state = if remaining_quantity_micros == 0 {
-            OrderReceiptState::Filled
-        } else if filled_quantity_micros > 0 && replacement.state == OrderReceiptState::Accepted {
-            OrderReceiptState::PartiallyFilled
-        } else {
-            replacement.state
-        };
-        let merged = OrderReceipt {
-            requested_quantity_micros: prior.requested_quantity_micros,
-            filled_quantity_micros,
-            remaining_quantity_micros,
-            average_fill_price,
-            state,
-            ..replacement.clone()
-        };
-        merged.validate()?;
-        Ok(merged)
+        akzio_domain::normalize_paper_replacement_receipt(reprice, &prior, replacement)
+            .map_err(|_| ReconciliationError::RepriceMismatch)
     }
 
     fn achieved_portfolio(
@@ -532,86 +516,11 @@ impl ReconciliationRuntime {
     }
 }
 
-fn weighted_fill_price(
-    prior: &OrderReceipt,
-    replacement: &OrderReceipt,
-) -> ReconciliationResult<Option<MoneyMicros>> {
-    // 以两段成交数量加权平均价格，零成交返回 None；缺少有成交段的 average price 或
-    // 乘加溢出都保持 RepriceMismatch，不能用零价填充。
-    // 输入只共享借用；total_quantity 为两段填充数量之和，溢出代表无法可信合并而报错。
-    let total_quantity = prior
-        .filled_quantity_micros
-        .checked_add(replacement.filled_quantity_micros)
-        .ok_or(ReconciliationError::RepriceMismatch)?;
-    if total_quantity == 0 {
-        return Ok(None);
-    }
-    // 闭包按 receipt 借用计算 quantity×price 的 i128 贡献；零成交不要求价格，有成交缺价
-    // 返回 Err。两个 Result 由 `?` 顺序传播，再以总数量整除得到截尾整数均价。
-    let contribution = |receipt: &OrderReceipt| -> ReconciliationResult<i128> {
-        if receipt.filled_quantity_micros == 0 {
-            return Ok(0);
-        }
-        let price = receipt
-            .average_fill_price
-            .ok_or(ReconciliationError::RepriceMismatch)?;
-        i128::from(receipt.filled_quantity_micros)
-            .checked_mul(i128::from(price.0))
-            .ok_or(ReconciliationError::RepriceMismatch)
-    };
-    let weighted = contribution(prior)?
-        .checked_add(contribution(replacement)?)
-        .and_then(|value| value.checked_div(i128::from(total_quantity)))
-        .and_then(|value| i64::try_from(value).ok())
-        .ok_or(ReconciliationError::RepriceMismatch)?;
-    Ok(Some(MoneyMicros(weighted)))
-}
-
-fn reconciliation_state_with_reprices(
-    commitment: &PaperCommitment,
-    receipts: &[OrderReceipt],
-    reprices: &[PaperReprice],
-) -> ReconciliationState {
-    // 先要求所有 durable successor 都被观察，再判断回执数量与每个状态；原单终态但
-    // successor 未知时保留 Pending，防止把“取消原单”误报为整体完成。
-    // commitment/receipts/reprices 都只读借用；receipt_count 统计当前已观察项，successors
-    // 必须每个都有精确 r1 receipt，终态原单本身无法证明远端未接受 successor。
-    let receipt_count = receipts.len();
-    // A canceled/filled original cannot prove an uncertain replacement never
-    // reached the broker. Only observing its durable successor closes that gap.
-    let successors_observed = reprices.iter().all(|reprice| {
-        receipts.iter().any(|receipt| {
-            receipt.asset == reprice.asset
-                && receipt.client_order_id == reprice.replacement_client_order_id
-        })
-    });
-    // Complete 要求 successor 闭合、回执数等于 commitment order 数且全部无 successor 终态；
-    // 空回执为 Pending，任一部分/全部成交但尚未满足完整条件时为 Partial，其余保持 Pending。
-    if successors_observed
-        && receipt_count == commitment.client_order_ids.len()
-        && receipts
-            .iter()
-            .all(|receipt| receipt.state.is_final_without_successor())
-    {
-        ReconciliationState::Complete
-    } else if receipt_count == 0 {
-        ReconciliationState::Pending
-    } else if receipts.iter().any(|receipt| {
-        matches!(
-            receipt.state,
-            OrderReceiptState::PartiallyFilled | OrderReceiptState::Filled
-        )
-    }) {
-        ReconciliationState::Partial
-    } else {
-        ReconciliationState::Pending
-    }
-}
-
 // 仅测试构建使用：覆盖原单终态与 durable replacement successor 的状态边界。
 #[cfg(test)]
 mod recovery_tests {
     use super::*;
+    use akzio_domain::OrderReceiptState;
 
     #[test]
     fn terminal_original_does_not_settle_unknown_reprice_successor() {
@@ -660,23 +569,33 @@ mod recovery_tests {
         };
         receipt.validate().unwrap();
         reprice.validate().unwrap();
+        let commitment_ref = reference(ArtifactKind::ExecutionCommitment);
+        let reprices = [(
+            Asset::Qqq,
+            (reference(ArtifactKind::ExecutionReprice), reprice),
+        )]
+        .into();
+        let state = |receipts: &[OrderReceipt], reprices| {
+            akzio_domain::reconciliation_state_for_paper_orders(
+                &commitment_ref,
+                &commitment,
+                receipts,
+                reprices,
+                &[],
+            )
+            .unwrap()
+        };
+        let no_reprices = BTreeMap::new();
         assert_eq!(
-            reconciliation_state_with_reprices(&commitment, &[receipt.clone()], &[]),
+            state(std::slice::from_ref(&receipt), &no_reprices),
             ReconciliationState::Complete
         );
         assert_eq!(
-            reconciliation_state_with_reprices(
-                &commitment,
-                &[receipt.clone()],
-                std::slice::from_ref(&reprice),
-            ),
+            state(std::slice::from_ref(&receipt), &reprices),
             ReconciliationState::Pending
         );
         receipt.client_order_id = "order-r1".into();
         receipt.broker_order_id = "successor".into();
-        assert_eq!(
-            reconciliation_state_with_reprices(&commitment, &[receipt], &[reprice]),
-            ReconciliationState::Complete
-        );
+        assert_eq!(state(&[receipt], &reprices), ReconciliationState::Complete);
     }
 }

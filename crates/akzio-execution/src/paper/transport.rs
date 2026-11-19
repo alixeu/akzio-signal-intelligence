@@ -55,12 +55,18 @@ impl AlpacaPaper {
         self.response_json(url, response).await
     }
 
-    async fn post_json(&self, url: &str, body: Value) -> Result<Value> {
+    async fn post_json(
+        &self,
+        url: &str,
+        body: Value,
+        admit: impl FnOnce() -> Result<()>,
+    ) -> Result<Value> {
         // POST 不做自动重试；调用方必须已经完成 Commitment，网络不确定状态交给恢复查询。
         // body 所有权传入本 helper，但 reqwest 只借用它序列化本次请求；send 失败通过
         // `?` 返回，不保留本地重试循环，以免重复下单。
         let request = self.authorized(self.client.post(url).json(&body));
         self.before_write(PaperWriteKind::Submit)?;
+        admit()?;
         let response = request
             .send()
             .await
@@ -71,11 +77,17 @@ impl AlpacaPaper {
         self.response_json(url.to_owned(), response).await
     }
 
-    async fn patch_json(&self, url: &str, body: Value) -> Result<Value> {
+    async fn patch_json(
+        &self,
+        url: &str,
+        body: Value,
+        admit: impl FnOnce() -> Result<()>,
+    ) -> Result<Value> {
         // PATCH 同样是显式替换副作用，失败时原样返回，避免传输层隐式重复改单。
         // PATCH 与 POST 一样把 body 作为单次请求内容；发送结果未知时交给确定性 successor ID 恢复。
         let request = self.authorized(self.client.patch(url).json(&body));
         self.before_write(PaperWriteKind::Replace)?;
+        admit()?;
         let response = request
             .send()
             .await

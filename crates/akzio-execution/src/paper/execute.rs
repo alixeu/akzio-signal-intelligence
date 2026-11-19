@@ -13,6 +13,7 @@ impl AlpacaPaper {
         }
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .http1_only()
             .local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
             .connect_timeout(std::time::Duration::from_secs(15))
@@ -82,6 +83,7 @@ impl AlpacaPaper {
         commitment: &PaperCommitment,
         plan: &ExecutionPlan,
         authorization: &PaperSubmissionAuthorization,
+        journal: &PaperSubmissionJournal<'_>,
     ) -> Result<PaperExecution> {
         // 恢复路径先查替换订单和原订单，已存在的 broker effect 只作为 reused 事实保留；
         // 逐单二次检查授权/时段后才允许 POST。部分恢复遇到窗口失效会停止补发，但不会
@@ -97,33 +99,23 @@ impl AlpacaPaper {
                 .client_order_ids
                 .get(&order.asset)
                 .ok_or(PaperError::CommitmentClientOrderMismatch(order.asset))?;
-            let replacement_client_order_id = replacement_client_order_id(client_order_id);
-            let receipt = match self.lookup(&replacement_client_order_id).await? {
-                Some(receipt) => Some(PaperOrderReceipt {
-                    reused: true,
-                    reprice_count: 1,
-                    ..receipt
-                }),
-                None => self
-                    .lookup(client_order_id)
-                    .await?
-                    .map(|receipt| PaperOrderReceipt {
-                        reused: true,
-                        reprice_count: 0,
-                        ..receipt
-                    }),
-            };
+            let receipt = self
+                .lookup_committed_receipt(order.asset, client_order_id, Some(journal))
+                .await?;
             orders.push(receipt);
         }
+        let ready_ids = journal.ready_client_order_ids()?;
         for (index, order) in plan.orders.iter().enumerate() {
-            // 第二遍只对第一遍仍为 None 的订单考虑 POST；已找到回执的订单不重复提交。
+            // 第二遍只对第一遍仍不可见且持久化状态为 Ready 的订单考虑 POST。
             if orders[index].is_none() {
                 let client_order_id = commitment
                     .client_order_ids
                     .get(&order.asset)
                     .ok_or(PaperError::CommitmentClientOrderMismatch(order.asset))?;
-                // Lookup remains available after expiry. A partial recovery is
-                // evidence of existing effects, not permission to fill gaps.
+                if !ready_ids.contains(client_order_id) {
+                    continue;
+                }
+                // The final Store admission checks again after the audited transport guard.
                 // 在每个新订单前先检查计划发送窗口，读取最新交易 session/overnight 资格，
                 // 再复查时间窗口以缩短检查与 POST 之间的授权过期竞态。
                 let permission = match authorization.assert_current(&plan.plan_hash, Utc::now()) {
@@ -134,24 +126,13 @@ impl AlpacaPaper {
                     Err(error) => Err(error),
                 }
                 .and_then(|()| authorization.assert_current(&plan.plan_hash, Utc::now()));
-                if let Err(error) = permission {
-                    // 若已观察到任一外部订单效果，窗口关闭时停止补发并返回已知 receipts；
-                    // 只有全部为空时才将错误交给 caller。Partial PaperExecution 由 dispatch
-                    // 持久化进度并继续 reconcile，不等价于整个 commitment 已完成。
-                    if matches!(
-                        error,
-                        PaperError::SubmissionUnauthorized
-                            | PaperError::MarketClosed
-                            | PaperError::InvalidCommitment(_)
-                    ) && orders.iter().any(Option::is_some)
-                    {
-                        break;
-                    }
-                    return Err(error);
-                }
+                permission?;
                 // POST 的传输错误可能留下远端未知状态；本层不重试，下一次 dispatch 用同一
                 // client_order_id 查询恢复。
-                match self.submit_order(order, client_order_id, 0).await {
+                match self
+                    .submit_order(order, client_order_id, authorization, journal)
+                    .await
+                {
                     Ok(receipt) => orders[index] = Some(receipt),
                     Err(PaperError::Frozen) if orders.iter().any(Option::is_some) => {
                         return Err(PaperError::FrozenAfterReceipts(PaperExecution {
@@ -175,6 +156,7 @@ impl AlpacaPaper {
         &self,
         commitment: &PaperCommitment,
         execution: &PaperExecution,
+        journal: &PaperSubmissionJournal<'_>,
     ) -> Result<PaperExecution> {
         // 对已返回的 broker order 做只读刷新，并确认每个 client_order_id 是原始或唯一
         // durable replacement；不会因为对账缺数据而创建新的订单。
@@ -195,14 +177,20 @@ impl AlpacaPaper {
             {
                 return Err(PaperError::CommitmentClientOrderMismatch(asset));
             }
-            orders.push(
-                self.get_order(
+            if receipt.reprice_count > 0 {
+                if let Some(prior) = self.lookup(original).await? {
+                    journal.record(&prior)?;
+                }
+            }
+            let observed = self
+                .get_order(
                     &receipt.broker_order_id,
                     &receipt.client_order_id,
                     receipt.reprice_count,
                 )
-                .await?,
-            );
+                .await?;
+            journal.record(&observed)?;
+            orders.push(observed);
         }
         Ok(PaperExecution {
             plan_hash: execution.plan_hash.clone(),

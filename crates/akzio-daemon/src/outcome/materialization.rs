@@ -22,14 +22,22 @@ impl Daemon {
         let account: AccountSnapshot = self.read_artifact_payload(account_reference)?;
         let mut plan = None;
         let mut receipts = Vec::new();
-        if let OutcomeExecutionLineage::ReconciledPaper { reconciliation, .. } = &schedule.execution
+        let mut unsubmitted_orders = Vec::new();
+        if let OutcomeExecutionLineage::ReconciledPaper {
+            reconciliation,
+            commitment,
+            ..
+        } = &schedule.execution
         {
             let reconciliation: Reconciliation = self.read_artifact_payload(reconciliation)?;
-            if reconciliation.state != ReconciliationState::Complete {
+            if reconciliation.state != ReconciliationState::Complete
+                || &reconciliation.commitment != commitment
+            {
                 return Err(DaemonError::InvalidInput(
-                    "Outcome requires complete reconciliation".to_owned(),
+                    "Outcome requires complete reconciliation of its commitment".to_owned(),
                 ));
             }
+            unsubmitted_orders = reconciliation.unsubmitted_orders;
             let plan_reference = execution_context.execution_plan.as_ref().ok_or_else(|| {
                 DaemonError::InvalidInput("Outcome execution context has no plan".to_owned())
             })?;
@@ -51,11 +59,12 @@ impl Daemon {
                 (*asset, MoneyMicros((midpoint / 2) as i64))
             })
             .collect();
-        akzio_learning::realized_execution_at_prices(
+        akzio_learning::realized_execution_at_prices_with_unsubmitted(
             &account,
             &schedule.execution,
             plan.as_ref(),
             &receipts,
+            &unsubmitted_orders,
             self.paper.outcome_cost_model,
             &prices,
         )

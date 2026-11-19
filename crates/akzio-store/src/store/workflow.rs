@@ -12,7 +12,7 @@ include!("workflow/outputs.rs");
 include!("workflow/queries.rs");
 include!("workflow/helpers.rs");
 #[cfg(test)]
-mod retired_debug_execution_tests {
+pub(super) mod retired_debug_execution_tests {
     use super::*;
     use akzio_domain::{
         ArtifactLifecycle, ArtifactOrigin, ArtifactProvenance, FailureDisposition, RetryPolicy,
@@ -93,7 +93,7 @@ mod retired_debug_execution_tests {
         }
     }
 
-    fn formal_fixture() -> (Store, RunId, ArtifactId, PathBuf) {
+    pub(in crate::store) fn formal_fixture() -> (Store, RunId, ArtifactId, PathBuf) {
         let (store, workflow, root) = prepared_formal_fixture();
         store.commit_workflow(&workflow).unwrap();
         (

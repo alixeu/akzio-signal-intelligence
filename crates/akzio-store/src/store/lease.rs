@@ -316,33 +316,8 @@ impl Store {
         &self,
         run_id: &RunId,
     ) -> StoreResult<Option<(RuntimeManifest, PaperLaunchApproval)>> {
-        let row = {
-            let connection = self.connection()?;
-            connection
-                .query_row(
-                    "SELECT c.runtime_manifest_artifact_id, c.approval_artifact_id FROM rebuild_paper_approval_consumptions c JOIN rebuild_session_slots s ON s.session_key = c.session_key WHERE s.run_id = ?1",
-                    params![run_id.0],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                )
-                .optional()?
-        };
-        let Some((manifest_id, approval_id)) = row else {
-            return Ok(None);
-        };
-        let manifest_artifact = self.artifact(&ArtifactId(ContentHash::new(manifest_id)?))?;
-        let approval_artifact = self.artifact(&ArtifactId(ContentHash::new(approval_id)?))?;
-        let manifest: RuntimeManifest =
-            serde_json::from_slice(&self.read_blob(&manifest_artifact.blob)?)?;
-        let approval: PaperLaunchApproval =
-            serde_json::from_slice(&self.read_blob(&approval_artifact.blob)?)?;
-        manifest.validate()?;
-        approval.validate()?;
-        if approval.runtime_manifest.artifact_id != manifest_artifact.artifact_id
-            || approval.runtime_manifest_hash != manifest.manifest_hash()?
-        {
-            return Err(StoreError::InvalidSessionSlot(run_id.0.clone()));
-        }
-        Ok(Some((manifest, approval)))
+        let connection = self.connection()?;
+        paper_approval_for_run_with_connection(&connection, run_id)
     }
 
     /// Returns the frozen broker-session slot for one scheduler-owned Paper
@@ -366,4 +341,36 @@ impl Store {
             .transpose()?
             .flatten())
     }
+}
+
+pub(super) fn paper_approval_for_run_with_connection(
+    connection: &Connection,
+    run_id: &RunId,
+) -> StoreResult<Option<(RuntimeManifest, PaperLaunchApproval)>> {
+    let row = connection
+        .query_row(
+            "SELECT c.runtime_manifest_artifact_id, c.approval_artifact_id
+         FROM rebuild_paper_approval_consumptions c
+         JOIN rebuild_session_slots s ON s.session_key = c.session_key WHERE s.run_id = ?1",
+            params![run_id.0],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let Some((manifest_id, approval_id)) = row else {
+        return Ok(None);
+    };
+    let manifest_artifact = read_artifact(connection, &ArtifactId(ContentHash::new(manifest_id)?))?;
+    let approval_artifact = read_artifact(connection, &ArtifactId(ContentHash::new(approval_id)?))?;
+    let manifest: RuntimeManifest =
+        serde_json::from_slice(&blob::read_blob_with(connection, &manifest_artifact.blob)?)?;
+    let approval: PaperLaunchApproval =
+        serde_json::from_slice(&blob::read_blob_with(connection, &approval_artifact.blob)?)?;
+    manifest.validate()?;
+    approval.validate()?;
+    if approval.runtime_manifest.artifact_id != manifest_artifact.artifact_id
+        || approval.runtime_manifest_hash != manifest.manifest_hash()?
+    {
+        return Err(StoreError::InvalidSessionSlot(run_id.0.clone()));
+    }
+    Ok(Some((manifest, approval)))
 }

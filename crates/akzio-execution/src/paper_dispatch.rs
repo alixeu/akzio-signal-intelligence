@@ -1,6 +1,8 @@
 use super::*;
 use akzio_domain::{DecisionContext, PaperLaunchApproval, RuntimeManifest};
 
+use crate::reconciliation::JournalReceiptSources;
+
 // 文件导读：PaperDispatchRuntime 是“已持久化 Commitment → Broker effect → 对账”的异步
 // 调度层。它先验证 Paper run、debug broker policy、lease、permit 和 freeze，再记录
 // effect intent，之后才允许 execute_commitment；恢复时复用 intent/订单 ID，轮询回执，
@@ -69,7 +71,12 @@ pub enum PaperDispatchError {
 impl PaperDispatchError {
     fn during_frozen_reconciliation(self) -> Self {
         match self {
-            Self::Broker(error @ (PaperError::Transport { .. } | PaperError::Http { .. })) => {
+            Self::Broker(
+                error @ (PaperError::Transport { .. }
+                | PaperError::Http { .. }
+                | PaperError::BrokerReceiptUnavailable { .. }),
+            )
+            | Self::RecordedEffectObservationUnavailable(error) => {
                 Self::FrozenReconciliationUnavailable(error)
             }
             error => error,
@@ -217,7 +224,14 @@ impl PaperDispatchRuntime {
             plan: _,
         } = committed;
         let reconciliation_runtime = ReconciliationRuntime::new(self.store.clone());
-        if let Some(known) = &known {
+        let batch = self.store.paper_submission_batch(&input.commitment)?;
+        let journal = PaperSubmissionJournal {
+            store: &self.store,
+            input,
+            commitment: &commitment,
+            journaled: matches!(batch, Some(PaperSubmissionBatch::Journaled { .. })),
+        };
+        if let Some(known) = known.as_ref().filter(|_| !journal.journaled) {
             // The final write guard can stop a batch after real receipts have
             // arrived. Persist them before a lagging or unavailable read can
             // erase that evidence from this attempt.
@@ -242,24 +256,40 @@ impl PaperDispatchRuntime {
                 )?;
             }
         }
-        let mut execution = match broker.observe_existing_commitment(&commitment).await {
-            Err(error @ (PaperError::Transport { .. } | PaperError::Http { .. }))
-                if !may_cancel =>
-            {
-                return Err(PaperDispatchError::RecordedEffectObservationUnavailable(
-                    error,
-                ));
-            }
-            result => result?,
+        if let Some(batch) = &batch {
+            self.stop_unresolved_submission(&journal, batch)?;
+        }
+        let (mut execution, mut observation_error) = match broker
+            .observe_existing_commitment(&commitment, Some(&journal))
+            .await
+        {
+            Ok(execution) => (execution, None),
+            Err(error) if error.is_observation_unavailable() => (
+                PaperExecution {
+                    plan_hash: commitment.plan_hash.clone(),
+                    orders: Vec::new(),
+                },
+                Some(error),
+            ),
+            Err(error) => return Err(error.into()),
         };
         execution_is_settled(&commitment, &execution)?;
         if may_cancel {
             let actions = self.durable_order_actions(&input.commitment, &execution)?;
-            self.resume_existing_cancels(broker, input, &actions.cancels, &mut execution)
-                .await?;
+            match self
+                .resume_existing_cancels(broker, &journal, &actions.cancels, &mut execution)
+                .await
+            {
+                Ok(()) => {}
+                Err(PaperDispatchError::Broker(error)) if error.is_observation_unavailable() => {
+                    observation_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
         }
-        // Cancel confirmation is returned by the adapter. Use fresh receipts
-        // for protective actions, then restore known evidence missing from GET.
+        // Protective actions use only the fresh broker projection above. The
+        // durable receipts are read afterwards, including any observation saved
+        // by a protective cancel's recheck before it deferred.
         if let Some(known) = known {
             merge_known_receipts(&mut execution, known);
         }
@@ -280,12 +310,22 @@ impl PaperDispatchRuntime {
                 Utc::now(),
             )?;
         } else {
-            reconciliation_runtime.write_progress(
-                &input.lease,
-                &input.permit,
-                &reconciliation,
-                Utc::now(),
-            )?;
+            if journal.journaled
+                || observation_error.is_none()
+                || !reconciliation.receipts.is_empty()
+            {
+                reconciliation_runtime.write_progress(
+                    &input.lease,
+                    &input.permit,
+                    &reconciliation,
+                    Utc::now(),
+                )?;
+            }
+            if let Some(error) = observation_error {
+                return Err(PaperDispatchError::RecordedEffectObservationUnavailable(
+                    error,
+                ));
+            }
         }
         Ok(PaperDispatchOutput {
             commitment: commitment_artifact,
@@ -294,6 +334,47 @@ impl PaperDispatchRuntime {
             settled,
         })
     }
+    fn stop_unresolved_submission(
+        &self,
+        journal: &PaperSubmissionJournal<'_>,
+        batch: &PaperSubmissionBatch,
+    ) -> PaperDispatchResult<bool> {
+        let PaperSubmissionBatch::Journaled {
+            observation_only,
+            orders,
+            ..
+        } = batch
+        else {
+            return Ok(true);
+        };
+        if *observation_only {
+            return Ok(true);
+        }
+        let stop = if self
+            .store
+            .run_cancel_requested(&journal.input.permit.run_id)?
+        {
+            PaperSubmissionStop::RunCancelled
+        } else if let Some(order) = orders
+            .iter()
+            .find(|order| order.state == PaperSubmissionState::PossiblySubmitted)
+        {
+            PaperSubmissionStop::BatchObservationOnly {
+                client_order_id: &order.client_order_id,
+                transition_index: order.transition_index,
+            }
+        } else {
+            let proofs = self.store.retire_ready_paper_submissions(
+                &journal.authority(),
+                PaperSubmissionStop::SubmissionWindowExpired,
+            )?;
+            return Ok(!proofs.is_empty());
+        };
+        self.store
+            .retire_ready_paper_submissions(&journal.authority(), stop)?;
+        Ok(true)
+    }
+
     fn reconcile_known_execution(
         &self,
         runtime: &ReconciliationRuntime,
@@ -304,20 +385,94 @@ impl PaperDispatchRuntime {
         if execution.plan_hash != commitment.plan_hash {
             return Err(PaperDispatchError::BrokerPlanHashMismatch);
         }
-        let actions = self.durable_order_actions(&input.commitment, execution)?;
-        let receipts = execution
-            .orders
-            .iter()
-            .map(|receipt| broker_receipt(receipt, commitment, input.now))
-            .collect::<PaperDispatchResult<Vec<_>>>()?;
-        Ok(runtime.reconcile(&ReconciliationInput {
-            permit: input.permit.clone(),
-            commitment: input.commitment.clone(),
-            reprices: actions.reprices,
-            cancels: actions.cancels,
-            broker_receipts: receipts,
-            now: input.now,
-        })?)
+        execution_is_settled(commitment, execution)?;
+        let batch = self.store.paper_submission_batch(&input.commitment)?;
+        let mut sources = JournalReceiptSources::new();
+        if matches!(batch, Some(PaperSubmissionBatch::LegacyUnknown)) {
+            for (reference, receipt) in self
+                .store
+                .legacy_paper_submission_receipts(&input.commitment)?
+            {
+                sources.insert(receipt.client_order_id.clone(), (reference, receipt));
+            }
+        }
+        let orders = match batch {
+            Some(PaperSubmissionBatch::Journaled { orders, .. }) => orders,
+            _ if !sources.is_empty() => Vec::new(),
+            _ => {
+                let actions = self.durable_order_actions(&input.commitment, execution)?;
+                let broker_receipts = execution
+                    .orders
+                    .iter()
+                    .map(|receipt| broker_receipt(receipt, commitment, input.now))
+                    .collect::<PaperDispatchResult<Vec<_>>>()?;
+                return Ok(runtime.reconcile(&ReconciliationInput {
+                    permit: input.permit.clone(),
+                    commitment: input.commitment.clone(),
+                    reprices: actions.reprices,
+                    cancels: actions.cancels,
+                    broker_receipts,
+                    now: input.now,
+                })?);
+            }
+        };
+
+        let mut unsubmitted_orders = Vec::new();
+        for order in orders {
+            if let Some(reference) = order.receipt {
+                let artifact = self.load_expected(&reference, ArtifactKind::OrderReceipt)?;
+                let receipt = serde_json::from_slice(&self.store.read_blob(&artifact.blob)?)?;
+                sources.insert(order.client_order_id, (reference, receipt));
+            } else if order.state == PaperSubmissionState::ProvenUnsubmitted {
+                let reason = order.reason.ok_or_else(|| {
+                    StoreError::Integrity("Paper journal proof lacks retirement reason".into())
+                })?;
+                unsubmitted_orders.push(UnsubmittedPaperOrder {
+                    asset: order.asset,
+                    client_order_id: order.client_order_id,
+                    transition_index: order.transition_index,
+                    reason,
+                    reprice: order.reprice,
+                });
+            }
+        }
+        let mut actions = DurableOrderActions::default();
+        let mut broker_receipts = Vec::new();
+        for (asset, original) in &commitment.client_order_ids {
+            let mut successor = None;
+            if let Some(artifact) = self.store.reprice_for(&input.commitment, *asset)? {
+                if self
+                    .store
+                    .paper_effect_intent_recorded(&input.permit.run_id, &artifact.artifact_id)?
+                {
+                    let reprice: PaperReprice =
+                        serde_json::from_slice(&self.store.read_blob(&artifact.blob)?)?;
+                    reprice.validate()?;
+                    successor = sources.get(&reprice.replacement_client_order_id);
+                    actions.reprices.push(artifact_ref(&artifact));
+                }
+            }
+            if let Some(artifact) = self.store.cancel_for(&input.commitment, *asset)? {
+                actions.cancels.push(artifact_ref(&artifact));
+            }
+            // A successor needs the actual original observation to reconstruct fills.
+            if let Some(original) = sources.get(original) {
+                let (_, receipt) = successor.unwrap_or(original);
+                broker_receipts.push(receipt.clone());
+            }
+        }
+        Ok(runtime.reconcile_from_journal(
+            &ReconciliationInput {
+                permit: input.permit.clone(),
+                commitment: input.commitment.clone(),
+                reprices: actions.reprices,
+                cancels: actions.cancels,
+                broker_receipts,
+                now: input.now,
+            },
+            unsubmitted_orders,
+            &sources,
+        )?)
     }
 
     pub fn new(store: Store) -> Self {
@@ -406,6 +561,21 @@ impl PaperDispatchRuntime {
                 | PaperDispatchError::Store(StoreError::ExecutionFrozen { .. }),
             ) => None,
             Err(PaperDispatchError::Broker(PaperError::FrozenAfterReceipts(known))) => Some(known),
+            Err(PaperDispatchError::Broker(
+                PaperError::SubmissionObservationOnly
+                | PaperError::SubmissionResultUnknown { .. }
+                | PaperError::SubmissionUnauthorized
+                | PaperError::MarketClosed
+                | PaperError::MarketSessionMismatch
+                | PaperError::RunCancelled
+                | PaperError::Transport { .. }
+                | PaperError::Http { .. }
+                | PaperError::BrokerReceiptUnavailable { .. },
+            )) => {
+                return self
+                    .reconcile_recorded(broker, input, committed, None, true)
+                    .await;
+            }
             result => return result,
         };
         if !self.commitment_effect_recorded(input)? {
@@ -436,17 +606,26 @@ impl PaperDispatchRuntime {
         self.store.validate_task_permit(&input.permit)?;
         // 先在 Store 持久化 effect intent，再允许 Broker 写入；两个系统不是一个原子事务。
         // 若进程在此后崩溃/取消，Future 局部值会 Drop，但 Store intent 保留供下次恢复。
-        let recovered = self.store.record_paper_effect_intent(
-            &input.lease,
-            &input.permit,
-            &input.commitment,
-            input.now,
-        )?;
+        let journal = PaperSubmissionJournal {
+            store: &self.store,
+            input,
+            commitment,
+            journaled: true,
+        };
+        let batch = self
+            .store
+            .begin_paper_submission_batch(&journal.authority())?;
+        if self.stop_unresolved_submission(&journal, &batch)? {
+            return Err(PaperError::SubmissionObservationOnly.into());
+        }
+        let PaperSubmissionBatch::Journaled { recovered, .. } = batch else {
+            return Err(PaperError::SubmissionObservationOnly.into());
+        };
         self.failpoint.trigger_after_effect_intent();
         // Broker Future 在此 await 时执行；POST/查询发生后任何错误都向上返回，已记录的
         // intent 不回滚。后续 dispatch 通过同一 commitment/client ID 查询实际外部效果。
         let mut execution = broker
-            .execute_commitment(commitment, plan, authorization)
+            .execute_commitment(commitment, plan, authorization, &journal)
             .await?;
         if execution.plan_hash != commitment.plan_hash {
             return Err(PaperDispatchError::BrokerPlanHashMismatch);
@@ -454,16 +633,21 @@ impl PaperDispatchRuntime {
         self.ensure_unfrozen()
             .map_err(|error| error.with_frozen_receipts(&execution))?;
         // 执行回执必须与 plan_hash 相同；再从 Store 重建已有 reprice/cancel intents，并恢复它们。
-        let mut actions = self.durable_order_actions(&input.commitment, &execution)?;
-        self.resume_durable_order_actions(broker, input, &actions, authorization, &mut execution)
-            .await
-            .map_err(|error| error.with_frozen_receipts(&execution))?;
+        let actions = self.durable_order_actions(&input.commitment, &execution)?;
+        self.resume_durable_order_actions(
+            broker,
+            &journal,
+            &actions,
+            authorization,
+            &mut execution,
+        )
+        .await
+        .map_err(|error| error.with_frozen_receipts(&execution))?;
         // 完成可能阻塞的 Broker/action 阶段后重新校验 lease，再开始轮询对账；
         // lease 失效时拒绝提交新的持久化结果。
         self.store.validate_daemon_lease(&input.lease, Utc::now())?;
         execution = reconcile_until_settled(
-            &self.store,
-            &input.lease,
+            &journal,
             broker,
             commitment,
             &execution,
@@ -475,23 +659,9 @@ impl PaperDispatchRuntime {
         }
         self.ensure_unfrozen()
             .map_err(|error| error.with_frozen_receipts(&execution))?;
-        // 将 adapter receipt 映射成领域 OrderReceipt；未知状态/资产/client ID 错误会阻断
-        // reconciliation，不把 broker accepted 解释为成交完成。
-        let broker_receipts = execution
-            .orders
-            .iter()
-            .map(|receipt| broker_receipt(receipt, commitment, input.now))
-            .collect::<PaperDispatchResult<Vec<_>>>()?;
         let reconciliation_runtime = ReconciliationRuntime::new(self.store.clone());
-        actions = self.durable_order_actions(&input.commitment, &execution)?;
-        let mut reconciliation = reconciliation_runtime.reconcile(&ReconciliationInput {
-            permit: input.permit.clone(),
-            commitment: input.commitment.clone(),
-            reprices: actions.reprices.clone(),
-            cancels: actions.cancels.clone(),
-            broker_receipts,
-            now: input.now,
-        })?;
+        let mut reconciliation =
+            self.reconcile_known_execution(&reconciliation_runtime, input, commitment, &execution)?;
         // settled 由领域 ReconciliationState::Complete 决定，而不是 dispatch 返回 Ok、
         // HTTP accepted 或短轮询超时。
         let mut settled = self.reconciliation_is_settled(&reconciliation)?;
@@ -512,7 +682,7 @@ impl PaperDispatchRuntime {
             )?;
             self.act_on_stale_orders(
                 broker,
-                input,
+                &journal,
                 plan,
                 authorization,
                 &reconciliation,
@@ -522,28 +692,19 @@ impl PaperDispatchRuntime {
             .map_err(|error| error.with_frozen_receipts(&execution))?;
             // action 后只做零时长的即时刷新，避免在同一 stale 分支再次等待；结果仍可能未 settled。
             execution = reconcile_until_settled(
-                &self.store,
-                &input.lease,
+                &journal,
                 broker,
                 commitment,
                 &execution,
                 std::time::Duration::ZERO,
             )
             .await?;
-            actions = self.durable_order_actions(&input.commitment, &execution)?;
-            let broker_receipts = execution
-                .orders
-                .iter()
-                .map(|receipt| broker_receipt(receipt, commitment, input.now))
-                .collect::<PaperDispatchResult<Vec<_>>>()?;
-            reconciliation = reconciliation_runtime.reconcile(&ReconciliationInput {
-                permit: input.permit.clone(),
-                commitment: input.commitment.clone(),
-                reprices: actions.reprices.clone(),
-                cancels: actions.cancels.clone(),
-                broker_receipts,
-                now: input.now,
-            })?;
+            reconciliation = self.reconcile_known_execution(
+                &reconciliation_runtime,
+                input,
+                commitment,
+                &execution,
+            )?;
             settled = self.reconciliation_is_settled(&reconciliation)?;
         }
         // Complete 才把 progress 和原 Paper effect 一起结算；否则只写可恢复 progress。
@@ -611,14 +772,37 @@ impl PaperDispatchRuntime {
         Ok(actions)
     }
 
+    fn begin_reprice_submission(
+        &self,
+        journal: &PaperSubmissionJournal<'_>,
+        reference: &ArtifactRef,
+    ) -> PaperDispatchResult<Option<bool>> {
+        let recovered = self
+            .store
+            .paper_effect_intent_recorded(&journal.input.permit.run_id, &reference.artifact_id)?;
+        match self
+            .store
+            .begin_paper_reprice_submission(&journal.authority(), reference)
+        {
+            Ok(order) => Ok(order
+                .filter(|order| order.state == PaperSubmissionState::Ready)
+                .map(|_| recovered)),
+            Err(StoreError::PaperEffectAlreadySettled(id)) if id == reference.artifact_id => {
+                Ok(None)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     async fn resume_durable_order_actions<B: CommittedPaperBroker + ?Sized>(
         &self,
         broker: &B,
-        input: &PaperDispatchInput,
+        journal: &PaperSubmissionJournal<'_>,
         actions: &DurableOrderActions,
         authorization: &PaperSubmissionAuthorization,
         execution: &mut PaperExecution,
     ) -> PaperDispatchResult<()> {
+        let input = journal.input;
         // 每个 reprice/cancel 都先 record effect intent，再调用 Broker，成功后 settle effect；
         // 已结算 intent 只恢复读取结果，未授权的 replacement 保留 pending 并继续风险降低路径。
         // 异步 Future 顺序处理已有 intents；reference/authorization/execution 都借用传入对象，
@@ -628,24 +812,11 @@ impl PaperDispatchRuntime {
             let artifact = self.load_expected(reference, ArtifactKind::ExecutionReprice)?;
             let intent: PaperReprice =
                 serde_json::from_slice(&self.store.read_blob(&artifact.blob)?)?;
-            // effect 已结算时 Store 返回明确 sentinel，None 表示只恢复后续 receipt，不再调用 Broker；
-            // 新 intent 则 Some(recovered) 允许执行尚未确认的外部替换。
-            let recovered = match self.store.record_paper_effect_intent(
-                &input.lease,
-                &input.permit,
-                reference,
-                Utc::now(),
-            ) {
-                Ok(recovered) => Some(recovered),
-                Err(StoreError::PaperEffectAlreadySettled(id)) if id == reference.artifact_id => {
-                    None
-                }
-                Err(error) => return Err(error.into()),
-            };
+            let recovered = self.begin_reprice_submission(journal, reference)?;
             if let Some(recovered) = recovered {
                 self.store.validate_daemon_lease(&input.lease, Utc::now())?;
                 // 授权过期只跳过 reprice 并继续下一类风险降低 cancel；intent 保持未结算供恢复。
-                let receipt = match broker.replace_order(&intent, authorization).await {
+                let receipt = match broker.replace_order(&intent, authorization, journal).await {
                     Ok(receipt) => receipt,
                     // Keep the uncertain intent pending, preserve known receipts,
                     // and allow the risk-reducing cancellation path below.
@@ -665,17 +836,18 @@ impl PaperDispatchRuntime {
                 replace_execution_receipt(execution, receipt)?;
             }
         }
-        self.resume_existing_cancels(broker, input, &actions.cancels, execution)
+        self.resume_existing_cancels(broker, journal, &actions.cancels, execution)
             .await
     }
 
     async fn resume_existing_cancels<B: CommittedPaperBroker + ?Sized>(
         &self,
         broker: &B,
-        input: &PaperDispatchInput,
+        journal: &PaperSubmissionJournal<'_>,
         cancels: &[ArtifactRef],
         execution: &mut PaperExecution,
     ) -> PaperDispatchResult<()> {
+        let input = journal.input;
         // A protective cancellation needs a Store-vetted, already committed
         // intent. It must remain possible when the log or submission window
         // fails, and must not even receive a reprice/submission authorization.
@@ -698,7 +870,7 @@ impl PaperDispatchRuntime {
             };
             if let Some(recovered) = recovered {
                 self.store.validate_daemon_lease(&input.lease, Utc::now())?;
-                let receipt = broker.cancel_order(&intent).await?;
+                let receipt = broker.cancel_order(&intent, Some(journal)).await?;
                 self.store.validate_daemon_lease(&input.lease, Utc::now())?;
                 self.store.settle_paper_effect(
                     &input.lease,
@@ -751,12 +923,13 @@ impl PaperDispatchRuntime {
     async fn act_on_stale_orders<B: CommittedPaperBroker + ?Sized>(
         &self,
         broker: &B,
-        input: &PaperDispatchInput,
+        journal: &PaperSubmissionJournal<'_>,
         plan: &ExecutionPlan,
         authorization: &PaperSubmissionAuthorization,
         reconciliation: &ReconciliationOutput,
         execution: &mut PaperExecution,
     ) -> PaperDispatchResult<()> {
+        let input = journal.input;
         // 从当前 execution 筛出超过 grace 的 Regular 未终态订单，最多创建一次 repricing，
         // 后续只允许取消或继续对账；reprice 使用冻结 plan price，不追逐市场价格。
         // 此 async Future 由 dispatch await 驱动；候选快照只含可取消且超过 grace 的 cloned
@@ -801,15 +974,21 @@ impl PaperDispatchRuntime {
             }
             // 找到 Reconciliation 已保存的该资产 prior receipt 作为新 intent 的 lineage；
             // 失败解析项被过滤，最终缺失时明确报 ReplacementWithoutIntent。
-            let prior_receipt = reconciliation
-                .receipts
-                .iter()
-                .find_map(|artifact| {
-                    let payload: OrderReceipt =
-                        serde_json::from_slice(&self.store.read_blob(&artifact.blob).ok()?).ok()?;
-                    (payload.asset == asset).then(|| artifact_ref(artifact))
-                })
-                .ok_or(PaperDispatchError::ReplacementWithoutIntent(asset))?;
+            let prior_receipt = reconciliation.receipts.iter().find_map(|artifact| {
+                let payload: OrderReceipt =
+                    serde_json::from_slice(&self.store.read_blob(&artifact.blob).ok()?).ok()?;
+                (payload.asset == asset
+                    && payload.client_order_id == receipt.client_order_id
+                    && payload.broker_order_id == receipt.broker_order_id
+                    && payload.broker_updated_at == receipt.broker_updated_at
+                    && !payload.state.is_final_without_successor())
+                .then(|| artifact_ref(artifact))
+            });
+            let Some(prior_receipt) = prior_receipt else {
+                // A lagging GET cannot authorize a new action against an order whose
+                // durable observation has already advanced to another identity or state.
+                continue;
+            };
             let state = receipt_state(&receipt.status)?;
             // 仅 Accepted/PartiallyFilled 可尝试一次 frozen-plan-price reprice；其它可取消状态、
             // 超过次数、已有 intent 或授权失效都会落入下方 cancel 路径。
@@ -865,16 +1044,13 @@ impl PaperDispatchRuntime {
                 let reference = artifact_ref(&committed.artifact);
                 let durable_payload: PaperReprice =
                     serde_json::from_slice(&self.store.read_blob(&committed.artifact.blob)?)?;
-                // durable reprice intent 保存后才登记 effect intent、校验 lease 并调用 Broker PATCH；
-                // 外部 PATCH 与随后 settle 是分开的步骤，崩溃后由 successor 查询恢复。
-                let recovered = self.store.record_paper_effect_intent(
-                    &input.lease,
-                    &input.permit,
-                    &reference,
-                    Utc::now(),
-                )?;
+                let Some(recovered) = self.begin_reprice_submission(journal, &reference)? else {
+                    continue;
+                };
                 self.store.validate_daemon_lease(&input.lease, Utc::now())?;
-                let replacement = match broker.replace_order(&durable_payload, authorization).await
+                let replacement = match broker
+                    .replace_order(&durable_payload, authorization, journal)
+                    .await
                 {
                     Ok(receipt) => receipt,
                     Err(PaperError::SubmissionUnauthorized) => continue,
@@ -931,7 +1107,7 @@ impl PaperDispatchRuntime {
                 Utc::now(),
             )?;
             self.store.validate_daemon_lease(&input.lease, Utc::now())?;
-            let canceled = broker.cancel_order(&durable_payload).await?;
+            let canceled = broker.cancel_order(&durable_payload, Some(journal)).await?;
             self.store.validate_daemon_lease(&input.lease, Utc::now())?;
             self.store.settle_paper_effect(
                 &input.lease,
@@ -1215,8 +1391,7 @@ fn replace_execution_receipt(
 }
 
 async fn reconcile_until_settled<B: CommittedPaperBroker + ?Sized>(
-    store: &Store,
-    lease: &DaemonLease,
+    journal: &PaperSubmissionJournal<'_>,
     broker: &B,
     commitment: &PaperCommitment,
     submitted: &PaperExecution,
@@ -1228,10 +1403,14 @@ async fn reconcile_until_settled<B: CommittedPaperBroker + ?Sized>(
     // timeout=0 时仍先执行一轮 lease 校验和 Broker reconcile，再判断是否到期。
     let deadline = tokio::time::Instant::now() + settlement_timeout;
     loop {
-        store.validate_daemon_lease(lease, Utc::now())?;
+        journal
+            .store
+            .validate_daemon_lease(&journal.input.lease, Utc::now())?;
         // 当前 iteration 顺序为校验 lease→await 只读 reconcile→检查终态/截止时间；
         // broker 或 lease 错误立即返回，不在本函数持锁等待。
-        let execution = broker.reconcile_commitment(commitment, submitted).await?;
+        let execution = broker
+            .reconcile_commitment(commitment, submitted, journal)
+            .await?;
         if execution_is_settled(commitment, &execution)? || tokio::time::Instant::now() >= deadline
         {
             return Ok(execution);
@@ -1277,7 +1456,7 @@ pub(super) fn execution_is_settled(
     })
 }
 
-fn broker_receipt(
+pub(super) fn broker_receipt(
     receipt: &PaperOrderReceipt,
     commitment: &PaperCommitment,
     observed_at: DateTime<Utc>,
@@ -1382,6 +1561,7 @@ mod safety_only_tests {
         fn observe_existing_commitment<'a>(
             &'a self,
             _: &'a PaperCommitment,
+            _journal: Option<&'a PaperSubmissionJournal<'a>>,
         ) -> Pin<Box<dyn Future<Output = crate::paper::Result<PaperExecution>> + Send + 'a>>
         {
             panic!("unrecorded effect must never query the broker")
@@ -1392,6 +1572,7 @@ mod safety_only_tests {
             _: &'a PaperCommitment,
             _: &'a ExecutionPlan,
             _: &'a PaperSubmissionAuthorization,
+            _journal: &'a PaperSubmissionJournal<'a>,
         ) -> Pin<Box<dyn Future<Output = crate::paper::Result<PaperExecution>> + Send + 'a>>
         {
             panic!("safety-only path must never submit an order")
@@ -1401,6 +1582,7 @@ mod safety_only_tests {
             &'a self,
             _: &'a PaperCommitment,
             _: &'a PaperExecution,
+            _journal: &'a PaperSubmissionJournal<'a>,
         ) -> Pin<Box<dyn Future<Output = crate::paper::Result<PaperExecution>> + Send + 'a>>
         {
             panic!("unrecorded effect must never reconcile")
@@ -1409,6 +1591,7 @@ mod safety_only_tests {
         fn cancel_order<'a>(
             &'a self,
             _: &'a PaperCancel,
+            _journal: Option<&'a PaperSubmissionJournal<'a>>,
         ) -> Pin<Box<dyn Future<Output = crate::paper::Result<PaperOrderReceipt>> + Send + 'a>>
         {
             panic!("unrecorded effect must never cancel")
@@ -1418,6 +1601,7 @@ mod safety_only_tests {
             &'a self,
             _: &'a PaperReprice,
             _: &'a PaperSubmissionAuthorization,
+            _journal: &'a PaperSubmissionJournal<'a>,
         ) -> Pin<Box<dyn Future<Output = crate::paper::Result<PaperOrderReceipt>> + Send + 'a>>
         {
             panic!("safety-only path must never reprice")
@@ -1532,12 +1716,19 @@ mod safety_only_tests {
         fn observe_existing_commitment<'a>(
             &'a self,
             commitment: &'a PaperCommitment,
+            journal: Option<&'a PaperSubmissionJournal<'a>>,
         ) -> Pin<Box<dyn Future<Output = crate::paper::Result<PaperExecution>> + Send + 'a>>
         {
             self.observations.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 match self.lookup {
-                    FrozenLookup::Visible => Ok(self.existing_execution(commitment)),
+                    FrozenLookup::Visible => {
+                        let execution = self.existing_execution(commitment);
+                        if let Some(journal) = journal {
+                            journal.record(&execution.orders[0])?;
+                        }
+                        Ok(execution)
+                    }
                     FrozenLookup::Missing => Ok(PaperExecution {
                         plan_hash: commitment.plan_hash.clone(),
                         orders: vec![],
@@ -1566,6 +1757,7 @@ mod safety_only_tests {
             commitment: &'a PaperCommitment,
             _: &'a ExecutionPlan,
             _: &'a PaperSubmissionAuthorization,
+            journal: &'a PaperSubmissionJournal<'a>,
         ) -> Pin<Box<dyn Future<Output = crate::paper::Result<PaperExecution>> + Send + 'a>>
         {
             Box::pin(async move {
@@ -1579,15 +1771,18 @@ mod safety_only_tests {
                         symbol: "SOXX".into(),
                         ..qqq.clone()
                     };
+                    journal.record(&qqq)?;
+                    journal.record(&soxx)?;
                     return Ok(PaperExecution {
                         plan_hash: commitment.plan_hash.clone(),
                         orders: vec![qqq, soxx],
                     });
                 }
+                let execution = self.existing_execution(commitment);
+                journal.record(&execution.orders[0])?;
                 self.store
                     .write_freeze_state(true, "freeze during broker I/O", Utc::now())
                     .unwrap();
-                let execution = self.existing_execution(commitment);
                 if self.freeze_at_write_admission {
                     return Err(PaperError::FrozenAfterReceipts(execution));
                 }
@@ -1599,6 +1794,7 @@ mod safety_only_tests {
             &'a self,
             _: &'a PaperCommitment,
             execution: &'a PaperExecution,
+            _journal: &'a PaperSubmissionJournal<'a>,
         ) -> Pin<Box<dyn Future<Output = crate::paper::Result<PaperExecution>> + Send + 'a>>
         {
             assert!(
@@ -1611,6 +1807,7 @@ mod safety_only_tests {
         fn cancel_order<'a>(
             &'a self,
             intent: &'a PaperCancel,
+            journal: Option<&'a PaperSubmissionJournal<'a>>,
         ) -> Pin<Box<dyn Future<Output = crate::paper::Result<PaperOrderReceipt>> + Send + 'a>>
         {
             if self.freeze_during_cancel {
@@ -1626,7 +1823,11 @@ mod safety_only_tests {
                         .write_freeze_state(true, "freeze after first stale action", Utc::now())
                         .unwrap();
                 }
-                Ok(Self::observed_order(intent.created_at, "canceled"))
+                let receipt = Self::observed_order(intent.created_at, "canceled");
+                if let Some(journal) = journal {
+                    journal.record(&receipt)?;
+                }
+                Ok(receipt)
             })
         }
 
@@ -1634,6 +1835,7 @@ mod safety_only_tests {
             &'a self,
             _: &'a PaperReprice,
             _: &'a PaperSubmissionAuthorization,
+            _journal: &'a PaperSubmissionJournal<'a>,
         ) -> Pin<Box<dyn Future<Output = crate::paper::Result<PaperOrderReceipt>> + Send + 'a>>
         {
             panic!("frozen dispatch must not create a replacement")
@@ -1741,7 +1943,10 @@ mod safety_only_tests {
             assert_eq!(broker.account_checks.load(Ordering::SeqCst), 1);
             let receipts = store
                 .run_artifacts_by_kind(&input.permit.run_id, ArtifactKind::OrderReceipt)
-                .unwrap();
+                .unwrap()
+                .into_iter()
+                .filter(|artifact| artifact.producer == "execution.submission_receipt")
+                .collect::<Vec<_>>();
             assert_eq!(receipts.len(), 1, "{output:?}");
             let receipt: OrderReceipt =
                 serde_json::from_slice(&store.read_blob(&receipts[0].blob).unwrap()).unwrap();
@@ -1837,7 +2042,11 @@ mod safety_only_tests {
         let commitment: PaperCommitment =
             serde_json::from_slice(&store.read_blob(&commitment.blob).unwrap()).unwrap();
         store
-            .record_paper_effect_intent(&input.lease, &input.permit, &input.commitment, input.now)
+            .begin_paper_submission_batch(&PaperSubmissionAuthority {
+                lease: &input.lease,
+                permit: &input.permit,
+                commitment: &input.commitment,
+            })
             .unwrap();
         let mut broker = FreezeDuringExecution {
             store: store.clone(),

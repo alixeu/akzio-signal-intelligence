@@ -46,7 +46,7 @@ use thiserror::Error;
 const DATABASE_FILE: &str = "akzio.sqlite3";
 const EXPORT_DATABASE_FILE: &str = "akzio-export.sqlite3";
 const POST_TERMINAL_WORKER_RECIPE_ID: &str = akzio_domain::LEARNING_OUTCOME_WORKER_RECIPE_ID;
-const STORE_SCHEMA_VERSION: u32 = 18;
+const STORE_SCHEMA_VERSION: u32 = 19;
 const BLOB_ENCODING_IDENTITY: &str = "identity";
 const BLOB_ENCODING_ZSTD: &str = "zstd";
 const BLOB_ENCODING_SLICE_V1: &str = "slice-v1";
@@ -144,6 +144,8 @@ pub enum StoreError {
     ExecutionFrozen { reason: String },
     #[error("invalid Paper effect artifact {0}")]
     InvalidPaperEffect(ArtifactId),
+    #[error("new Paper broker observation for {0} conflicts with its durable receipt")]
+    PaperReceiptConflict(String),
     #[error("lifecycle event {event_type} requires task, attempt and artifact lineage")]
     InvalidLifecycleEventShape { event_type: String },
     #[error("Paper effect {0} has no durable intent")]

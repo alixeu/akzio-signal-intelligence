@@ -242,15 +242,19 @@ impl PaperSubmissionAuthorization {
     pub(super) fn assert_current(&self, plan_hash: &ContentHash, now: DateTime<Utc>) -> Result<()> {
         // 新 Broker effect 前的最后一道时间/身份检查；恢复读取不调用这个方法，因此过期
         // 后仍能查找并保存已发生的订单效果。
-        // 计划身份必须相同且 now 落在含端点区间；None window 经 is_some_and 直接判失败。
-        if self.plan_hash != *plan_hash
-            || !self
-                .window
-                .is_some_and(|(start, end)| start <= now && now <= end)
-        {
-            return Err(PaperError::SubmissionUnauthorized);
-        }
-        Ok(())
+        // 计划身份必须相同且 now 落在含端点区间；缺少发送窗口时直接拒绝。
+        self.current_deadline(plan_hash, now).map(|_| ())
+    }
+
+    pub(super) fn current_deadline(
+        &self,
+        plan_hash: &ContentHash,
+        now: DateTime<Utc>,
+    ) -> Result<DateTime<Utc>> {
+        self.window
+            .filter(|(start, end)| self.plan_hash == *plan_hash && *start <= now && now <= *end)
+            .map(|(_, end)| end)
+            .ok_or(PaperError::SubmissionUnauthorized)
     }
 
     pub(super) fn assert_replacement_current(&self, now: DateTime<Utc>) -> Result<()> {

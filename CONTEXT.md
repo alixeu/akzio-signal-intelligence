@@ -69,7 +69,7 @@ These are separate statuses. A valid numeric T5 can coexist with ModelUnavailabl
 A bounded proposal includes assets, horizons, recommended behavior, exclusion conditions and evidence references. It produces Draft/quarantine material only. Legacy free text is retained for reading but is not promoted into an all-assets lesson.
 
 **Versions and Verification**:
-Domain schema 10; Store schema 18; research Contract 69 / Prompt bundle 38 / freshness candidate 70; Outcome Contract 63 / Prompt bundle 35; Outcome metric basis v3; evaluation context v1; benchmark definition v1 unchanged. See [runtime contract](docs/agent-runtime-contract.md) for compatibility and [development workflow](docs/development-workflow.md) for verification boundaries.
+Domain schema 10; Store schema 19; research Contract 69 / Prompt bundle 38 / freshness candidate 70; Outcome Contract 63 / Prompt bundle 35; Outcome metric basis v3; evaluation context v1; benchmark definition v1 unchanged. See [runtime contract](docs/agent-runtime-contract.md) for compatibility and [development workflow](docs/development-workflow.md) for verification boundaries.
 
 Follow-up invariants: claims/critiques accept at most 12 grounds (four single-asset price, four single-asset news, one shared macro is a legal minimum). Context minimum sets precede optional allocation. Contract 69 research, including final proposal review, uses direct structured submission for Paper, PositionPlan and Shadow; only Outcome retains two-phase submission with a persisted Draft memo. Per-stage retries reset only at committed retrospective events; fenced lease release also runs on cancellation. Narrative repair reuses the sealed Outcome and enters the ordinary eligibility/consumption transaction.
 

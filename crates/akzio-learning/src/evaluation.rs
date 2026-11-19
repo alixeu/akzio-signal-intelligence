@@ -21,8 +21,9 @@ use akzio_domain::{
     OutcomeCostModel, OutcomeExecutionLineage, OutcomeHorizon, OutcomeNavPoint,
     OutcomeOrderCostAttribution, OutcomeSchedule, OutcomeWindow, PolicyState, PolicySubject,
     PolicyTransition, PolicyTransitionId, Retrospective, RetrospectiveDraft, RetrospectiveStatus,
-    RiskGroundTruthAssessment, RunPurpose, TargetPortfolio, TaskWritePermit, TopologyId, WeightPpm,
-    DOMAIN_SCHEMA_VERSION, FORECAST_CALIBRATION_BIN_COUNT, OUTCOME_BENCHMARK_DEFINITION_VERSION,
+    RiskGroundTruthAssessment, RunPurpose, TargetPortfolio, TaskWritePermit, TopologyId,
+    UnsubmittedPaperOrder, WeightPpm, DOMAIN_SCHEMA_VERSION, FORECAST_CALIBRATION_BIN_COUNT,
+    OUTCOME_BENCHMARK_DEFINITION_VERSION,
 };
 use akzio_store::{
     DaemonLease, PolicyEvaluationCommit, PolicyHead, ShadowPairCompletion, ShadowPairWriteResult,
@@ -303,6 +304,28 @@ pub fn realized_execution_at_prices(
     cost_model: OutcomeCostModel,
     prices: &BTreeMap<Asset, MoneyMicros>,
 ) -> EvaluationRuntimeResult<RealizedExecution> {
+    realized_execution_at_prices_with_unsubmitted(
+        account,
+        execution,
+        plan,
+        receipts,
+        &[],
+        cost_model,
+        prices,
+    )
+}
+
+/// Reconstruct actual fills after the caller validated the exact durable journal
+/// witnesses for any planned orders that were never admitted to the broker.
+pub fn realized_execution_at_prices_with_unsubmitted(
+    account: &AccountSnapshot,
+    execution: &OutcomeExecutionLineage,
+    plan: Option<&ExecutionPlan>,
+    receipts: &[OrderReceipt],
+    unsubmitted_orders: &[UnsubmittedPaperOrder],
+    cost_model: OutcomeCostModel,
+    prices: &BTreeMap<Asset, MoneyMicros>,
+) -> EvaluationRuntimeResult<RealizedExecution> {
     // account/lineage/plan/receipts/prices 都以借用读取，cost_model 按值消费。
     // 返回的是基于传入冻结价格与终态成交重建的结果；无效任一 receipt 会拒绝整个 Outcome，
     // 本计算不写 Store，也不包含成交后的账户再平衡。
@@ -474,13 +497,39 @@ pub fn realized_execution_at_prices(
                 ));
             }
         }
+        // The caller has verified the exact journal transitions. Proofs cover
+        // unsubmitted originals, or close a successor for an observed original.
+        // Neither creates a fill or order-cost attribution.
+        let mut witness_assets = BTreeSet::new();
+        let mut witness_ids = BTreeSet::new();
+        for witness in unsubmitted_orders {
+            witness.validate()?;
+            if !witness_assets.insert(witness.asset)
+                || !witness_ids.insert(&witness.client_order_id)
+                || seen_receipts.contains_key(&witness.client_order_id)
+            {
+                return Err(EvaluationError::InvalidMaterialization(
+                    "conflicting unsubmitted order evidence",
+                ));
+            }
+            let covers_plan_order = if witness.reprice.is_some() {
+                seen_assets.contains(&witness.asset)
+            } else {
+                plan.orders.iter().any(|order| order.asset == witness.asset)
+                    && seen_assets.insert(witness.asset)
+            };
+            if !covers_plan_order {
+                return Err(EvaluationError::InvalidMaterialization(
+                    "unsubmitted order does not match execution plan",
+                ));
+            }
+        }
         if seen_assets.len() != plan.orders.len() {
-            // 每个 plan order 都必须有一个唯一终态回执；若缺回执，当前局部重建结果不会返回。
             return Err(EvaluationError::InvalidMaterialization(
-                "missing terminal receipt",
+                "missing terminal receipt or unsubmitted order evidence",
             ));
         }
-    } else if plan.is_some() || !receipts.is_empty() {
+    } else if plan.is_some() || !receipts.is_empty() || !unsubmitted_orders.is_empty() {
         return Err(EvaluationError::InvalidMaterialization(
             "NoOrder contains fills",
         ));
@@ -645,3 +694,140 @@ use metrics::{
     portfolio_return_ppm, price, reference, require_canonical_purpose, return_ppm, stable_id,
     validate_prices,
 };
+
+#[cfg(test)]
+mod paper_fill_accounting_tests {
+    use super::*;
+    use akzio_domain::{FactorExposure, OrderIntent, OrderReceiptState, PaperUnsubmittedReason};
+
+    /// WHY THIS TEST EXISTS (Task #30): A terminal fill plus a proven never-sent sibling must account only for actual trades.
+    /// Do not weaken or delete this assertion.
+    #[test]
+    fn realized_execution_accounts_for_only_receipts_when_a_sibling_was_never_submitted() {
+        let now = Utc::now();
+        let session = "2026-11-19";
+        let hash = ContentHash::of_bytes(b"paper outcome fixture");
+        let artifact = |kind| ArtifactRef {
+            artifact_id: akzio_domain::ArtifactId(hash.clone()),
+            kind,
+        };
+        let lineage = OutcomeExecutionLineage::ReconciledPaper {
+            commitment: artifact(ArtifactKind::ExecutionCommitment),
+            reconciliation: artifact(ArtifactKind::Reconciliation),
+            execution_verdict: artifact(ArtifactKind::ExecutionVerdict),
+        };
+        let account = AccountSnapshot {
+            schema_version: DOMAIN_SCHEMA_VERSION,
+            broker_session: session.into(),
+            observed_at: now,
+            equity: MoneyMicros(100_000_000),
+            buying_power: MoneyMicros(100_000_000),
+            day_turnover: MoneyMicros(0),
+            active: true,
+            trading_blocked: false,
+            positions: BTreeMap::new(),
+            external_positions: BTreeSet::new(),
+            open_order_ids: BTreeSet::new(),
+        };
+        let target = TargetPortfolio::zeroed();
+        let mut plan = ExecutionPlan {
+            schema_version: DOMAIN_SCHEMA_VERSION,
+            decision_context: artifact(ArtifactKind::DecisionContext),
+            account_snapshot: artifact(ArtifactKind::NormalizedEvidence),
+            quote_snapshot: artifact(ArtifactKind::NormalizedEvidence),
+            market_clock_snapshot: artifact(ArtifactKind::NormalizedEvidence),
+            policy_hash: hash.clone(),
+            maximum_total_notional: MoneyMicros(40_000_000),
+            factor_exposure: FactorExposure::from_target(&target).unwrap(),
+            target,
+            orders: [Asset::Qqq, Asset::Soxx]
+                .into_iter()
+                .map(|asset| OrderIntent {
+                    extended_hours: false,
+                    asset,
+                    side: OrderSide::Buy,
+                    notional: MoneyMicros(20_000_000),
+                    limit_price: MoneyMicros(20_000_000),
+                })
+                .collect(),
+            gross_exposure_ppm: 0,
+            net_exposure_ppm: 0,
+            turnover_ppm: 0,
+            broker_session: session.into(),
+            created_at: now,
+            plan_hash: hash,
+        };
+        plan.refresh_hash().unwrap();
+        let receipt = OrderReceipt {
+            plan_hash: plan.plan_hash.clone(),
+            asset: Asset::Qqq,
+            client_order_id: "qqq-r0".into(),
+            broker_order_id: "broker-qqq".into(),
+            state: OrderReceiptState::Filled,
+            requested_quantity_micros: 1_000_000,
+            filled_quantity_micros: 1_000_000,
+            remaining_quantity_micros: 0,
+            average_fill_price: Some(MoneyMicros(20_000_000)),
+            broker_updated_at: now,
+            reason: None,
+            observed_at: now,
+        };
+        let proof = UnsubmittedPaperOrder {
+            asset: Asset::Soxx,
+            client_order_id: "soxx-r0".into(),
+            transition_index: 1,
+            reason: PaperUnsubmittedReason::BatchObservationOnly,
+            reprice: None,
+        };
+        let cost = OutcomeCostModel {
+            transaction_cost_ppm: 1_000,
+            slippage_ppm: 0,
+        };
+        let prices = Asset::EXECUTABLE
+            .into_iter()
+            .map(|asset| (asset, MoneyMicros(20_000_000)))
+            .collect();
+        let receipts = std::slice::from_ref(&receipt);
+        assert!(realized_execution_at_prices(
+            &account,
+            &lineage,
+            Some(&plan),
+            receipts,
+            cost,
+            &prices
+        )
+        .is_err());
+        let actual = realized_execution_at_prices_with_unsubmitted(
+            &account,
+            &lineage,
+            Some(&plan),
+            receipts,
+            std::slice::from_ref(&proof),
+            cost,
+            &prices,
+        )
+        .unwrap();
+        assert_eq!(actual.quantities[&Asset::Qqq], 1_000_000);
+        assert_eq!(actual.quantities[&Asset::Soxx], 0);
+        assert_eq!(actual.cash, MoneyMicros(79_980_000));
+        assert_eq!(actual.metrics.turnover_ppm, 200_000);
+        assert_eq!(actual.metrics.transaction_cost_ppm, 200);
+        assert_eq!(actual.metrics.order_cost_attributions.len(), 1);
+        assert_eq!(actual.metrics.order_cost_attributions[0].asset, Asset::Qqq);
+        let conflict = UnsubmittedPaperOrder {
+            asset: Asset::Qqq,
+            client_order_id: "qqq-r0".into(),
+            ..proof
+        };
+        assert!(realized_execution_at_prices_with_unsubmitted(
+            &account,
+            &lineage,
+            Some(&plan),
+            receipts,
+            &[conflict],
+            cost,
+            &prices,
+        )
+        .is_err());
+    }
+}

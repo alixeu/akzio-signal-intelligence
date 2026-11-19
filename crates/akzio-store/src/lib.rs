@@ -14,6 +14,10 @@ pub use crate::store::{
     RunCheckpoint, RunControlView, RunEventPage, RunEventView, RunInspection,
 };
 
+pub use crate::store::{
+    PaperSubmissionAdmission, PaperSubmissionAuthority, PaperSubmissionBatch, PaperSubmissionOrder,
+    PaperSubmissionState, PaperSubmissionStop,
+};
 // 其余导出包含显式提交输入、提交结果及重建后的持久化投影；具体授权仍由 Store 方法核验。
 // `StoreResult as Result` 只重命名公开路径，不改写 `Result<T, StoreError>` 的错误传播语义。
 pub use crate::store::{

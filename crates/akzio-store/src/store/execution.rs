@@ -635,6 +635,14 @@ impl Store {
                 effect.artifact_id.clone(),
             ));
         }
+        if effect.kind == ArtifactKind::ExecutionCommitment
+            && matches!(
+                paper_submissions::paper_submission_batch_with_connection(&transaction, effect)?,
+                Some(paper_submissions::PaperSubmissionBatch::Journaled { .. })
+            )
+        {
+            return Err(StoreError::InvalidPaperEffect(effect.artifact_id.clone()));
+        }
         append_event(
             &transaction,
             &permit.run_id,
@@ -685,6 +693,13 @@ impl Store {
                 effect.artifact_id.clone(),
             ));
         }
+        paper_submissions::settle_journaled_reprice_effects(
+            &transaction,
+            permit,
+            effect,
+            artifacts,
+            now,
+        )?;
         commit_attempt_transaction_with_effect(
             &transaction,
             permit,

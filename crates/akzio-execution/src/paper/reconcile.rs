@@ -51,9 +51,7 @@ impl AlpacaPaper {
         if !authorization.matches_session(&clock.session, broker_session)
             || order.extended_hours != clock.session.kind.extended_hours()
         {
-            return Err(PaperError::InvalidCommitment(
-                "unsubmitted order belongs to a different trading session".to_owned(),
-            ));
+            return Err(PaperError::MarketSessionMismatch);
         }
         // 只有 Overnight 额外查资产资格；GET 失败传播为 Err，资格不满足映射 Closed，
         // 两种情况都阻断新单，但不撤销此前已存在的 broker receipt。
@@ -101,27 +99,69 @@ impl AlpacaPaper {
             return Err(PaperError::Http { url, status, body });
         }
         let value = parse_value(&body);
-        Ok(Some(receipt_from_value(
+        receipt_from_value(
             value,
             client_order_id,
             false,
             reprice_count_from_client_order_id(client_order_id),
-        )?))
+        )
+        .map(Some)
+        .map_err(|error| PaperError::unusable_receipt(client_order_id, error))
+    }
+
+    async fn lookup_committed_receipt(
+        &self,
+        asset: Asset,
+        original: &str,
+        journal: Option<&PaperSubmissionJournal<'_>>,
+    ) -> Result<Option<PaperOrderReceipt>> {
+        let mut original_receipt = self.lookup(original).await?;
+        if let Some(receipt) = &mut original_receipt {
+            receipt.reused = true;
+            receipt.reprice_count = 0;
+            if let Some(journal) = journal {
+                journal.record(receipt)?;
+            }
+        }
+        if let Some(journal) = journal {
+            if let Some(successor) = journal.replacement_for(asset)? {
+                if let Some(mut receipt) = self.lookup(&successor).await? {
+                    receipt.reused = true;
+                    receipt.reprice_count = 1;
+                    journal.record(&receipt)?;
+                    return Ok(Some(receipt));
+                }
+            }
+        }
+        Ok(original_receipt)
     }
 
     async fn submit_order(
         &self,
         order: &OrderIntent,
         client_order_id: &str,
-        reprice_count: u8,
+        authorization: &PaperSubmissionAuthorization,
+        journal: &PaperSubmissionJournal<'_>,
     ) -> Result<PaperOrderReceipt> {
         // 只在上层完成授权复核后发送一次 POST，并立即把 broker 返回解析成带原始 client ID 的 receipt。
         // `order_request` 先在内存中完成数量/价格编码；post_json 内部不重试，网络结果不确定
         // 时由上层下次按同一 durable client ID 查询恢复。
         let url = self.url("/v2/orders");
         let body = order_request(order, client_order_id)?;
-        let value = self.post_json(&url, body).await?;
-        receipt_from_value(value, client_order_id, false, reprice_count)
+        let value = self
+            .post_json(&url, body, || {
+                let deadline =
+                    authorization.current_deadline(&journal.commitment.plan_hash, Utc::now())?;
+                journal.admit(client_order_id, deadline)
+            })
+            .await
+            .map_err(|error| uncertain_order_result(client_order_id, error))?;
+        let receipt = receipt_from_value(value, client_order_id, false, 0)
+            .map_err(|error| uncertain_submission_result(client_order_id, error))?;
+        journal
+            .record(&receipt)
+            .map_err(|error| uncertain_order_result(client_order_id, error))?;
+        Ok(receipt)
     }
 
     async fn get_order(
@@ -136,27 +176,57 @@ impl AlpacaPaper {
         let value = self
             .get_json(&format!("/v2/orders/{broker_order_id}"))
             .await?;
-        receipt_from_value(value, client_order_id, false, reprice_count)
+        let receipt = receipt_from_value(value, client_order_id, false, reprice_count)
+            .map_err(|error| PaperError::unusable_receipt(client_order_id, error))?;
+        if receipt.broker_order_id != broker_order_id {
+            return Err(PaperError::unusable_receipt(
+                client_order_id,
+                PaperError::InvalidCommitment("broker order lookup changed identity".into()),
+            ));
+        }
+        Ok(receipt)
     }
 
-    async fn cancel_committed_order(&self, intent: &PaperCancel) -> Result<PaperOrderReceipt> {
+    async fn lookup_action_order(
+        &self,
+        client_order_id: &str,
+        broker_order_id: &str,
+    ) -> Result<PaperOrderReceipt> {
+        let receipt = self.lookup(client_order_id).await?.ok_or_else(|| {
+            PaperError::unusable_receipt(
+                client_order_id,
+                PaperError::MissingField("durable action broker order"),
+            )
+        })?;
+        if receipt.broker_order_id != broker_order_id {
+            return Err(PaperError::unusable_receipt(
+                client_order_id,
+                PaperError::InvalidCommitment(
+                    "broker order does not match the durable action".into(),
+                ),
+            ));
+        }
+        Ok(receipt)
+    }
+
+    async fn cancel_committed_order(
+        &self,
+        intent: &PaperCancel,
+        journal: Option<&PaperSubmissionJournal<'_>>,
+    ) -> Result<PaperOrderReceipt> {
         // 取消先查原订单并处理终态/pending_cancel/replaced 分支；只有可取消的 durable 原单
         // 才执行 DELETE，随后再 GET 确认 broker 状态。
         // intent.validate 先做纯领域身份检查；随后 lookup/DELETE/GET 顺序执行，错误按 `?`
         // 返回，上层 effect intent 若未 settle 会留待恢复，而不是在此伪造取消成功。
         intent.validate()?;
-        let existing = self.lookup(&intent.client_order_id).await?.ok_or_else(|| {
-            PaperError::InvalidCommitment(
-                "cancel intent order is not visible by durable client order ID".to_owned(),
-            )
-        })?;
-        if existing.broker_order_id != intent.broker_order_id {
-            return Err(PaperError::InvalidCommitment(
-                "cancel intent broker order ID does not match lookup".to_owned(),
-            ));
-        }
+        let existing = self
+            .lookup_action_order(&intent.client_order_id, &intent.broker_order_id)
+            .await?;
         // 已终态或 pending_cancel 时返回 reused receipt，避免重复 DELETE；replaced 说明应由
         // durable successor 处理，因此不取消已替换的旧 broker order。
+        if let Some(journal) = journal {
+            journal.record(&existing)?;
+        }
         if broker_status_is_final_without_successor(&existing.status) {
             return Ok(PaperOrderReceipt {
                 reused: true,
@@ -170,8 +240,13 @@ impl AlpacaPaper {
             });
         }
         if existing.status.eq_ignore_ascii_case("replaced") {
-            return Err(PaperError::InvalidCommitment(
-                "replaced order must be canceled through its durable successor".to_owned(),
+            // r0 was observed but can no longer be canceled. Keep the intent open
+            // and let the recorded-effect path continue observing the durable r1.
+            return Err(PaperError::unusable_receipt(
+                &intent.client_order_id,
+                PaperError::InvalidCommitment(
+                    "the protective cancel targets an already replaced order".into(),
+                ),
             ));
         }
         let url = self.url(&format!("/v2/orders/{}", intent.broker_order_id));
@@ -184,24 +259,31 @@ impl AlpacaPaper {
                     || status == StatusCode::UNPROCESSABLE_ENTITY => {}
             Err(error) => return Err(error),
         }
-        self.get_order(
-            &intent.broker_order_id,
-            &intent.client_order_id,
-            reprice_count_from_client_order_id(&intent.client_order_id),
-        )
-        .await
+        let observed = self
+            .get_order(
+                &intent.broker_order_id,
+                &intent.client_order_id,
+                reprice_count_from_client_order_id(&intent.client_order_id),
+            )
+            .await?;
+        if let Some(journal) = journal {
+            journal.record(&observed)?;
+        }
+        Ok(observed)
     }
 
     async fn replace_committed_order(
         &self,
         intent: &PaperReprice,
         authorization: &PaperSubmissionAuthorization,
+        journal: &PaperSubmissionJournal<'_>,
     ) -> Result<PaperOrderReceipt> {
         // 替换先复用已存在 successor，再两次检查授权与 prior order 状态，最后 PATCH 并用
         // r1 client ID 解析回执；替换中的不确定状态不会盲目再发。
         // 先验证 intent，再优先查确定性的 successor：已存在时作为 reused 事实返回，不再 PATCH。
         intent.validate()?;
         if let Some(existing) = self.lookup(&intent.replacement_client_order_id).await? {
+            journal.record(&existing)?;
             return Ok(PaperOrderReceipt {
                 reused: true,
                 ..existing
@@ -211,31 +293,16 @@ impl AlpacaPaper {
         // 不再次改单，防止未知状态下创建新的外部效果。
         authorization.assert_replacement_current(Utc::now())?;
         let prior = self
-            .lookup(&intent.prior_client_order_id)
-            .await?
-            .ok_or_else(|| {
-                PaperError::InvalidCommitment(
-                    "replace intent prior order is not visible by durable client order ID"
-                        .to_owned(),
-                )
-            })?;
-        if prior.broker_order_id != intent.prior_broker_order_id {
-            return Err(PaperError::InvalidCommitment(
-                "replace intent broker order ID does not match lookup".to_owned(),
-            ));
-        }
-        if broker_status_is_final_without_successor(&prior.status) {
-            return Err(PaperError::InvalidCommitment(
-                "cannot replace a terminal broker order".to_owned(),
-            ));
-        }
-        if matches!(
-            prior.status.trim().to_ascii_lowercase().as_str(),
-            "pending_replace" | "replaced"
-        ) {
-            return Err(PaperError::InvalidCommitment(
-                "replacement is in flight but deterministic successor is not visible".to_owned(),
-            ));
+            .lookup_action_order(&intent.prior_client_order_id, &intent.prior_broker_order_id)
+            .await?;
+        journal.record(&prior)?;
+        if broker_status_is_final_without_successor(&prior.status)
+            || matches!(
+                prior.status.trim().to_ascii_lowercase().as_str(),
+                "pending_replace" | "replaced"
+            )
+        {
+            return Err(PaperError::SubmissionObservationOnly);
         }
         authorization.assert_replacement_current(Utc::now())?;
         let url = self.url(&format!("/v2/orders/{}", intent.prior_broker_order_id));
@@ -247,8 +314,36 @@ impl AlpacaPaper {
                     "limit_price": money_string(intent.replacement_limit_price),
                     "client_order_id": intent.replacement_client_order_id,
                 }),
+                || {
+                    let deadline = authorization
+                        .current_deadline(&journal.commitment.plan_hash, Utc::now())?;
+                    journal.admit(&intent.replacement_client_order_id, deadline)
+                },
             )
-            .await?;
-        receipt_from_value(value, &intent.replacement_client_order_id, false, 1)
+            .await
+            .map_err(|error| uncertain_order_result(&intent.replacement_client_order_id, error))?;
+        let receipt = receipt_from_value(value, &intent.replacement_client_order_id, false, 1)
+            .map_err(|error| {
+                uncertain_submission_result(&intent.replacement_client_order_id, error)
+            })?;
+        journal
+            .record(&receipt)
+            .map_err(|error| uncertain_order_result(&intent.replacement_client_order_id, error))?;
+        Ok(receipt)
+    }
+}
+
+fn uncertain_order_result(client_order_id: &str, error: PaperError) -> PaperError {
+    if error.is_observation_unavailable() {
+        uncertain_submission_result(client_order_id, error)
+    } else {
+        error
+    }
+}
+
+fn uncertain_submission_result(client_order_id: &str, error: PaperError) -> PaperError {
+    PaperError::SubmissionResultUnknown {
+        client_order_id: client_order_id.to_owned(),
+        source: Box::new(error),
     }
 }

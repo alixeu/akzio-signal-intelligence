@@ -14,7 +14,7 @@
 
 ## RunControl 与 checkpoint
 
-Store 18 使用唯一的 `rebuild_run_controls` SQL head。普通运行默认为 continuous；旧 Debug 的 pause/step/resume/retry/abort 历史 head 保留 revision CAS、精确 task permit 与身份以供只读审计，但不再提供创建或控制入口。`RunControlStatus` 与旧 `DebugStatus` 保持 wire 解码兼容。控制状态与业务 WorkflowStatus 分开：控制结束不代表研究成功、Paper 成交或 Outcome 封存。
+Store 18 引入统一的 `rebuild_run_controls` SQL head。普通运行默认为 continuous；旧 Debug 的 pause/step/resume/retry/abort 历史 head 保留 revision CAS、精确 task permit 与身份以供只读审计，但不再提供创建或控制入口。`RunControlStatus` 与旧 `DebugStatus` 保持 wire 解码兼容。控制状态与业务 WorkflowStatus 分开：控制结束不代表研究成功、Paper 成交或 Outcome 封存。
 
 `RuntimeCheckpoint` 是独立、仅 RunScoped 的 CAS 类型。图创建、任务边界、暂停、重试/延期、取消及 Outcome 入队等事件在同一 SQLite 事务内追加 checkpoint。记录包含 graph 引用、被覆盖的 event cursor、control revision、可用的 runtime identity、task/attempt、触发事件及来源 Artifact。checkpoint 自身通过 `runtime.checkpoint_saved` 进入同一个 journal，不另建状态文件或第二份权威 state。
 
@@ -64,3 +64,9 @@ akzio --config <正式配置> run journal <run-id> --after 0 --limit 100
 升级沿用原阻断条件：queued/leased/running 任务或有效 daemon lease 都会阻断；仅停止进程不代表可迁移。应先用旧版本处理既有工作与 lease，再升级。`Store::open_existing` 保持只读，不隐式迁移；旧 Store 需要明确的写模式初始化路径，不能通过只读检查命令升级。
 
 Paper 的 `PaperSubmissionAuthorization`、审批消费、先持久化 Commitment、client order ID 与恢复协议保持原边界。PositionPlan 在 Decision 后结束，Blueprint 或 checkpoint 不授予执行权限。
+
+## Store 18 → 19
+
+迁移在同一 SQLite 事务创建空的逐单提交账本并发布 Store 19。升级前已有 effect intent 的批次保留 `LegacyUnknown` 状态，并按原账户及原始或已授权的替换 ID 查询。新版在原 Run 和 Commitment 下逐单追加核验通过的实际回执，供后续 Attempt 恢复。旧批次仍缺逐单提交证明。原单查询返回 404 时状态仍未知。即使已查到替换单终态，也须有原单独立终态或 `Replaced` 的可核验证据才能结算。旧 CAS、Commitment 和 effect intent 保留原记录。
+
+新版只读打开、备份和恢复均支持 Store 18 和 19，备份 manifest 记录实际快照版本。进入 19 需要明确的可写打开。旧版二进制重新打开 Store 19 会拒绝，升级应先按[开发 Workflow](development-workflow.md#store-18--19-升级)停止所有旧写入者。

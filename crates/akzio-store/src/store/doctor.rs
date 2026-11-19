@@ -10,6 +10,7 @@ impl Store {
     // Store 内 Mutex 排斥同一实例写入，不保证跨实例/进程的所有多语句检查来自同一时点。
     pub fn verify_integrity(&self) -> StoreResult<()> {
         let connection = self.connection()?;
+        verify_readable_store_schema(&connection, self.root())?;
         // SQLite quick_check 与每个 durable BLOB 的编码、依赖链、长度及 hash 先行检查。
         let quick_check =
             connection.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))?;

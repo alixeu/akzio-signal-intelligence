@@ -715,7 +715,9 @@ impl<'a> PaperExecution<'a> {
         {
             Ok(output) => output,
             Err(
-                PaperDispatchError::Frozen | PaperDispatchError::FrozenReconciliationUnavailable(_),
+                PaperDispatchError::Frozen
+                | PaperDispatchError::FrozenReconciliationUnavailable(_)
+                | PaperDispatchError::RecordedEffectObservationUnavailable(_),
             ) => {
                 return Ok(TaskCompletion::DeferredUntil(
                     Utc::now() + Duration::seconds(30),
@@ -756,7 +758,7 @@ impl<'a> PaperExecution<'a> {
             DaemonError::Unavailable("read-only Paper broker is unavailable".into())
         })?;
         let lease = self.daemon.paper.scheduler.active_lease(now)?;
-        let output = self
+        let output = match self
             .daemon
             .paper_dispatch_runtime
             .reconcile_existing_only(
@@ -768,7 +770,16 @@ impl<'a> PaperExecution<'a> {
                     now,
                 },
             )
-            .await?;
+            .await
+        {
+            Ok(output) => output,
+            Err(PaperDispatchError::RecordedEffectObservationUnavailable(_)) => {
+                return Ok(TaskCompletion::DeferredUntil(
+                    Utc::now() + Duration::seconds(30),
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        };
         Ok(if output.settled {
             TaskCompletion::Committed
         } else {

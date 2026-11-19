@@ -33,8 +33,8 @@ impl Store {
 
     /// Open an already initialized Store Root without creating directories or
     /// mutating the SQLite schema. Read-only CLI commands must use this seam.
-    // 只读打开既有数据库文件，并要求 metadata.schema_version 精确等于当前版本；
-    // 这里不创建目录、不运行 initialize/migration，但会为当前连接准备 TEMP staging 表。
+    // 只读打开既有数据库，兼容 v18 与当前版本；不创建目录、不运行 initialize/migration。
+    // 当前版本必须带有逐单 journal 表，旧版只读打开不会创建这些表。
     pub fn open_existing(root: impl AsRef<Path>) -> StoreResult<Self> {
         let root = root.as_ref().to_path_buf();
         let database = root.join(DATABASE_FILE);
@@ -52,17 +52,7 @@ impl Store {
         }
 
         let connection = Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        let version = connection
-            .query_row(
-                "SELECT value FROM rebuild_metadata WHERE key = 'schema_version'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        let expected_version = STORE_SCHEMA_VERSION.to_string();
-        if version.as_deref() != Some(expected_version.as_str()) {
-            return Err(StoreError::IncompatibleStoreRoot(root));
-        }
+        verify_readable_store_schema(&connection, &root)?;
         blob::initialize_staging(&connection)?;
 
         Ok(Self {
@@ -146,6 +136,137 @@ mod tests {
             .is_some()
     }
 
+    fn relabel_as_legacy(root: &Path, version: &str) {
+        let connection = Connection::open(root.join(DATABASE_FILE)).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE rebuild_paper_submission_transitions;
+                 DROP TABLE rebuild_paper_submission_batches;",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE rebuild_metadata SET value = ?1 WHERE key = 'schema_version'",
+                [version],
+            )
+            .unwrap();
+    }
+
+    fn assert_no_submission_tables(root: &Path) {
+        let connection =
+            Connection::open_with_flags(root.join(DATABASE_FILE), OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        assert!(!migration::table_exists(&connection, "rebuild_paper_submission_batches").unwrap());
+        assert!(
+            !migration::table_exists(&connection, "rebuild_paper_submission_transitions").unwrap()
+        );
+    }
+
+    /// WHY THIS TEST EXISTS (Task #30): Old read-only Stores and their snapshots
+    /// keep v18. A writable upgrade adds an empty authoritative journal without
+    /// manufacturing order admission evidence or rewriting existing payloads.
+    /// Do not weaken or delete this assertion.
+    #[test]
+    fn legacy_read_and_backup_preserve_version_before_writable_upgrade() {
+        let root = scratch_root("submission-v18");
+        let backup18 = scratch_root("submission-v18-backup");
+        let backup19 = scratch_root("submission-v19-backup");
+        let store = Store::open(&root).unwrap();
+        let original = store
+            .write_freeze_state(true, "fixture", Utc::now())
+            .unwrap();
+        let original_payload = store.read_blob(&original.blob).unwrap();
+        drop(store);
+        relabel_as_legacy(&root, "18");
+        let v18_before = fs::read(root.join(DATABASE_FILE)).unwrap();
+        let legacy = Store::open_existing(&root).unwrap();
+        legacy.verify_integrity().unwrap();
+        assert_eq!(legacy.backup_to(&backup18).unwrap().schema_version, 18);
+        assert_eq!(schema_version(&backup18).as_deref(), Some("18"));
+        assert_eq!(legacy.artifact(&original.artifact_id).unwrap(), original);
+        drop(legacy);
+        assert_eq!(fs::read(root.join(DATABASE_FILE)).unwrap(), v18_before);
+        assert_no_submission_tables(&root);
+
+        let migrated = Store::open(&root).unwrap();
+        assert_eq!(schema_version(&root).as_deref(), Some("19"));
+        assert_eq!(migrated.artifact(&original.artifact_id).unwrap(), original);
+        assert_eq!(
+            migrated.read_blob(&original.blob).unwrap(),
+            original_payload
+        );
+        let empty = migrated
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM rebuild_paper_submission_batches)
+                    AND NOT EXISTS(SELECT 1 FROM rebuild_paper_submission_transitions)",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap();
+        assert!(empty);
+        assert_eq!(migrated.backup_to(&backup19).unwrap().schema_version, 19);
+        assert_eq!(schema_version(&backup19).as_deref(), Some("19"));
+        for root in [&backup18, &backup19] {
+            Store::open_existing(root)
+                .unwrap()
+                .verify_integrity()
+                .unwrap();
+        }
+    }
+
+    /// WHY THIS TEST EXISTS (Task #30): Failed version publication must leave
+    /// the old version and neither journal table, so a retry starts from v18.
+    /// Do not weaken or delete this assertion.
+    #[test]
+    fn failed_version_publication_rolls_back_new_schema() {
+        let root = scratch_root("submission-upgrade-rollback");
+        drop(Store::open(&root).unwrap());
+        relabel_as_legacy(&root, "18");
+        let connection = Connection::open(root.join(DATABASE_FILE)).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_version_publication BEFORE UPDATE ON rebuild_metadata
+                 WHEN NEW.key = 'schema_version'
+                 BEGIN SELECT RAISE(ABORT, 'injected schema version write failure'); END;",
+            )
+            .unwrap();
+        assert!(matches!(Store::open(&root), Err(StoreError::Sql(_))));
+        assert_eq!(schema_version(&root).as_deref(), Some("18"));
+        assert_no_submission_tables(&root);
+        connection
+            .execute_batch("DROP TRIGGER fail_version_publication")
+            .unwrap();
+        Store::open(&root).unwrap().verify_integrity().unwrap();
+    }
+
+    /// WHY THIS TEST EXISTS (Task #30): Recreating a lost v19 journal could
+    /// erase proof of an admitted order. Opens and Doctor must fail closed.
+    /// Do not weaken or delete this assertion.
+    #[test]
+    fn missing_current_journal_is_not_recreated() {
+        let root = scratch_root("submission-missing-journal");
+        let store = Store::open(&root).unwrap();
+        Connection::open(root.join(DATABASE_FILE))
+            .unwrap()
+            .execute_batch("DROP TABLE rebuild_paper_submission_transitions;")
+            .unwrap();
+        assert!(matches!(
+            store.verify_integrity(),
+            Err(StoreError::Integrity(_))
+        ));
+        assert!(matches!(
+            Store::open_existing(&root),
+            Err(StoreError::Integrity(_))
+        ));
+        assert!(matches!(Store::open(&root), Err(StoreError::Integrity(_))));
+        let connection = Connection::open(root.join(DATABASE_FILE)).unwrap();
+        assert!(
+            !migration::table_exists(&connection, "rebuild_paper_submission_transitions").unwrap()
+        );
+    }
+
     /// 本 fixture 先创建当前表，再模拟旧 v16 标签和缺失的可重建索引；
     /// 仅验证这种组合能重新标记，不断言所有历史 v16 库都已经有当前表。
     #[test]
@@ -156,20 +277,12 @@ mod tests {
         store.verify_integrity().unwrap();
         drop(store);
 
-        // Reproduce a root left behind by the previous binary: current tables,
-        // an older label, and the rebuildable index dropped.
-        {
-            let connection = Connection::open(root.join(DATABASE_FILE)).unwrap();
-            connection
-                .execute(
-                    "UPDATE rebuild_metadata SET value = '16' WHERE key = 'schema_version'",
-                    [],
-                )
-                .unwrap();
-            connection
-                .execute_batch("DROP INDEX IF EXISTS rebuild_artifacts_run_kind;")
-                .unwrap();
-        }
+        // Reproduce the legacy label and drop the rebuildable index.
+        relabel_as_legacy(&root, "16");
+        Connection::open(root.join(DATABASE_FILE))
+            .unwrap()
+            .execute_batch("DROP INDEX IF EXISTS rebuild_artifacts_run_kind;")
+            .unwrap();
         assert_eq!(schema_version(&root).as_deref(), Some("16"));
         assert!(!index_exists(&root, "rebuild_artifacts_run_kind"));
 
@@ -218,21 +331,96 @@ mod tests {
             .unwrap()
             .unwrap();
         drop(store);
-        {
-            let connection = Connection::open(root.join(DATABASE_FILE)).unwrap();
-            connection
-                .execute(
-                    "UPDATE rebuild_metadata SET value = '16' WHERE key = 'schema_version'",
-                    [],
-                )
-                .unwrap();
-        }
+        relabel_as_legacy(&root, "18");
 
         assert!(matches!(
             Store::open(&root),
             Err(StoreError::DebugControl(_))
         ));
-        assert_eq!(schema_version(&root).as_deref(), Some("16"));
+        assert_eq!(schema_version(&root).as_deref(), Some("18"));
+        assert_no_submission_tables(&root);
+    }
+
+    /// WHY THIS TEST EXISTS (Task #30): Queued v18 work blocks the upgrade even
+    /// after the previous daemon's lease has gone away.
+    /// Do not weaken or delete this assertion.
+    #[test]
+    fn queued_work_blocks_the_journal_upgrade_without_a_daemon_lease() {
+        let root = scratch_root("submission-queued-work");
+        let store = Store::open(&root).unwrap();
+        let now = Utc::now();
+        let run_id = RunId::new();
+        let node = WorkflowNode {
+            spec: None,
+            task_id: TaskId::new(),
+            recipe_id: TaskRecipeId::new("gate.reconcile").unwrap(),
+            contract_hash: None,
+            objective: "offline queued work fixture".into(),
+            dependencies: vec![],
+            input_artifacts: vec![],
+            priority: 1,
+            budget: TaskBudget {
+                max_input_tokens: 1,
+                max_output_tokens: 1,
+                max_wall_time_secs: 1,
+                max_tool_calls: akzio_domain::budget::ToolCallLimit::Limited(0),
+            },
+            retry: RetryPolicy::none(),
+            on_failure: FailureDisposition::FailRun,
+            parent_task_id: None,
+        };
+        let graph = WorkflowGraph {
+            definition_version: None,
+            schema_version: DOMAIN_SCHEMA_VERSION,
+            topology_id: "submission-upgrade-fixture".into(),
+            nodes: vec![node.clone()],
+            agent_budgets: Default::default(),
+        };
+        let artifact = Artifact::new(
+            ArtifactKind::WorkflowGraph,
+            store.stage_json(&graph).unwrap(),
+            "runtime.workflow",
+            ArtifactLifecycle::RunScoped,
+            ArtifactProvenance {
+                source_family: "akzio.runtime".into(),
+                observed_at: None,
+                retrieved_at: now,
+                source_uri: None,
+                confidence_ppm: 1_000_000,
+                producer_contract_hash: None,
+            },
+            Some(ArtifactOrigin {
+                run_id: Some(run_id.clone()),
+                task_id: None,
+                attempt_id: None,
+                contract_hash: None,
+            }),
+            vec![],
+            now,
+        )
+        .unwrap();
+        store
+            .commit_workflow(&WorkflowCommit {
+                run: StoredRun {
+                    run_id,
+                    purpose: RunPurpose::Paper,
+                    topology_id: graph.topology_id,
+                    graph_artifact_id: artifact.artifact_id.clone(),
+                    created_at: now,
+                },
+                graph: artifact,
+                nodes: vec![node],
+            })
+            .unwrap();
+        drop(store);
+        relabel_as_legacy(&root, "18");
+
+        assert!(matches!(
+            Store::open(&root),
+            Err(StoreError::DebugControl(_))
+        ));
+        assert_eq!(schema_version(&root).as_deref(), Some("18"));
+        assert_no_submission_tables(&root);
     }
 
     /// An unknown future label is refused rather than relabelled downward.

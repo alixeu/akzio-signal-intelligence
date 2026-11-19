@@ -24,6 +24,7 @@ mod lease;
 mod lesson;
 mod maintenance;
 mod migration;
+mod paper_submissions;
 mod release;
 mod research_quality;
 mod research_review;
@@ -40,6 +41,10 @@ pub use debug_bundle::{DebugBundleIntegrity, DebugBundleManifest, DebugBundleRaw
 pub use decision_policy::{DecisionPolicyDescriptor, StoredDecisionPolicy};
 pub use lesson::{LessonRevalidationScan, LessonUsage, LessonWriteResult, StoredLesson};
 pub use maintenance::MaintenanceLeaseDeferral;
+pub use paper_submissions::{
+    PaperSubmissionAdmission, PaperSubmissionAuthority, PaperSubmissionBatch, PaperSubmissionOrder,
+    PaperSubmissionState, PaperSubmissionStop,
+};
 pub use research_review::{ResearchAudit, ResearchAuditRecord};
 
 // include! 在编译期把这些源文件内容放入当前模块：它们可直接访问这里的私有类型与导入，

@@ -176,7 +176,7 @@ DecisionProposal (LLM: Forecast + research_allocation)
        ↓ 
 [ExecutionGate (Rust)]   -> 校验账户资金、最新报价、流动性、审批令牌 -> 产出 ExecutionVerdict
        ↓ 
-[PaperCommitment (Rust)] -> 写入确定性 client_order_id 到 SQLite -> 调用 Alpaca Paper API -> Reconciliation
+[PaperCommitment (Rust)] -> 持久化 Commitment 和确定性 client_order_id -> Store 逐单提交账本 -> Alpaca Paper API -> Reconciliation
 ```
 
 1. **DecisionGate 默认 Fail-Closed**：
@@ -186,7 +186,8 @@ DecisionProposal (LLM: Forecast + research_allocation)
    - 只有通过原审批和所有 ExecutionGate blocker 检查后才进入 Allocator：当前为空仓时产生 `NoExecutableOrder`，已有多头仓位时才可能生成归零卖单；缺 approval 的冷启动不进入 Allocator，也不会触发清仓。
 2. **ExecutionGate 与幂等 Commitment**：
    - 正式 scheduler 在 SQL 没有 active policy 时创建不绑定 approval 的 canonical Paper run，以积累未来真实校准标签；已有 active policy 时仍要求原审批。未校准 Paper 冷启动没有 approval 时，pre-trade safety 返回无评估，不作安全断言，也不以缺 manifest 抛错阻断 verdict。原 `UnqualifiedRuntime` blocker 保留，跳过 allocation/plan closure，形成持久化 `NoOrder`；PaperCommit/Reconcile 在获取执行 lease 或访问 Broker 前短路。Evaluate 仍可生成 `OutcomeExecutionLineage::NoOrder` 的 OutcomeSchedule，无需 ExecutionCommitment。此语义不扩张任何执行权限；真实密封仍要求完整 baseline 与四资产共同完成的真实 T+1/T+3/T+5 Session，policy 必须由 operator 显式 inspect、validate、activate。
-   - 严禁直接提交订单。必须在判定 `Accepted` 后，先生成带确定性 `client_order_id` 的 `ExecutionCommitment` 并持久化至 SQLite，随后才发起 Alpaca API 请求。崩溃恢复时依据相同 ID 幂等恢复。
+   - `Accepted` 后先将带确定性 `client_order_id` 的 canonical `ExecutionCommitment` 绑定原 Run / Session。Store 在记录 effect intent 的同一事务登记原始订单 ID；获准的替换 ID 随原替换 effect intent 登记。每个 ID 只有在带 lease 和 Attempt 校验的 SQLite 事务提交 `Ready → PossiblySubmitted` 后，才可发起一次对应的 Alpaca Paper POST 或 PATCH。实际回执按 ID 持久化后才推进下一笔写入。
+   - 恢复发现 `PossiblySubmitted` 时，停止整批新增提交和替换，按原账户和已登记 ID 查询。404 或暂不可采纳的券商读回保持待观察，保留已核验回执并继续查询同一 ID。已记录的保护性取消仍须通过原审批及回执检查。只有仍处于 `Ready` 的 ID 可以在持久化 Run 取消、冻结提交上界已过，或批次因其他 ID 状态不明停止提交时，记录 `ProvenUnsubmitted`。暂时休市时保留待定状态。
 3. **无订单仍须评估**：
    - 即使 ExecutionGate 产出 `NoOrder`，系统的预测意图仍由 `Evaluate` 生成 `OutcomeSchedule`，并在后续 T+1/T+3/T+5 持续跟踪其实际市场表现。
 
@@ -194,7 +195,7 @@ DecisionProposal (LLM: Forecast + research_allocation)
 
 ## 8. 统一 CAS 存储映射规范
 
-系统严禁建立针对业务模型的平铺表格（无 `claims`, `forecasts`, `orders` 等表），完全统一至内容寻址存储 (CAS)：
+业务产物统一保存至内容寻址存储 (CAS)。SQL 表保存调度、审批、执行状态与 CAS 引用。
 
 | 存储表名 | 存储内容与职责 | 关键字段 / 索引 |
 |---|---|---|
@@ -206,6 +207,7 @@ DecisionProposal (LLM: Forecast + research_allocation)
 | `rebuild_attempts` | 任务单次尝试的执行状态与重试记录 | `attempt_id`, `task_id`, `status`, `error_json` |
 | `rebuild_attempt_outputs`| 成功 Attempt 产生的正式输出映射 | `attempt_id`, `artifact_id` |
 | `rebuild_session_slots` | Paper 交易 Session 的排他性原子插槽 | `session_key`, `run_id`, `commitment_artifact_id` |
+| `rebuild_paper_submission_batches`, `rebuild_paper_submission_transitions` | 绑定 Commitment 和 effect intent，逐 ID 追加状态、实际回执的 CAS 引用与未提交依据 | `commitment_artifact_id`, `client_order_id`, `transition_index`, `receipt_artifact_id` |
 | `rebuild_policy_*` | T+5 封存后的评估记录、经验回放与转移头 | `rebuild_policy_evaluations`, `rebuild_policy_transitions` |
 | `rebuild_decision_policy_*` | 冻结 DecisionPolicy 的不可变 CAS 索引、激活历史与单例 active head；JSON 正文仍在 `rebuild_blobs` | `policy_hash`, `artifact_id`, `activation_id`, `previous_policy_hash` |
 | `rebuild_lesson_*` | 学习演化生成的 Lesson 与隔离证据 | `rebuild_lesson_heads`, `rebuild_lesson_events` |
@@ -220,10 +222,10 @@ DecisionProposal (LLM: Forecast + research_allocation)
 - Outcome Draft 最多使用总输出的一半和 70% 时限；必须先有已持久化 Draft memo 才能进入 Submit；首轮预算不足以完成两阶段时明确拒绝，不跳过 Draft。恢复与阶段切换不能重置预算。新 Contract 的完整 Schema、role Prompt 和 Rust 验证必须同步。
 - 40 项证据逐项留状态：前置 EvidenceGate 将六项 ExecutionSafety 标记 deferred_to_execution 且不采集；ExecutionGate 原 refresh_execution_snapshots 即时获取并继续 fail closed。研究和增强数据失败保留成功项与缺口。新鲜度看内容可用时间，日线以交易所收盘（美东 DST/提前收盘）加 20 分钟余量判断；不以下载时间或 UTC 日期替代 Session。
 - 每个 Outcome 是同 Run 的 post-terminal 工作；先检查未完成阶段再调用模型，迟到补跑按各阶段自己的 cutoff 截断事实。每 Outcome 租约单写，争用 Deferred；完成、报错及取消时按 epoch 释放租约。Deferred 不进入失败预算，已提交的阶段事件为下一阶段建立独立额度；Outcome 重试从 30 秒指数退避，最多 5 分钟。Worker 对 Session/Outcome 进行服务保留或单 Worker 交错。
-- 执行后持仓按数量和现金重建，Receipt 去重并验证实际成交。Outcome 是冻结执行后敞口（metric v3），不代表真实后续账户 NAV；按当前阶段实际计价窗口检查公司行动，窗口内无调整账本则不可用，禁止推测调整因子。
+- 有逐单账本的正式 `Reconciliation` 完成时，Store 校验同一 Commitment 的每个原始及已登记替换 ID 都有实际终态回执或可核验的 `ProvenUnsubmitted` 记录。已存在替换单时，原单的最新回执须独立确认终态或 `Replaced`，再按两单的原始回执合并成交。未提交记录只证明对账覆盖。执行后持仓按已验证并去重的实际成交数量和现金重建，成交成本也取实际成交。Outcome 是冻结执行后敞口（metric v3），不代表真实后续账户 NAV；按当前阶段实际计价窗口检查公司行动，窗口内无调整账本则不可用，禁止推测调整因子。
 - Decision 生产成本取依赖任务闭包；Outcome/叙事成本与生命周期总成本分开。Experience 保留 producer Run/Contracts/Workflow revision 与 evaluator Contract。行情完整、研究充分、叙事有效（结构合格的 T5 Retrospective，不做独立语义质量评分）、风险真值已测量分别记录。缺失风险真值继续为 None，不得填满分。
 - Rust-only T5 不取得学习资格。叙事修复在原 Run 上提交可追溯 revision，保留原数值 CAS；修复后复用密封 Outcome，经原资格检查幂等补评估；不得直接写入 Proven。LessonProposal 显式声明资产、horizon、排除条件与证据，只有 Draft/quarantine 权限。
-- 当前版本：Domain schema 10（兼容可选字段）；Store 18；WorkflowDefinition 1；研究 Contract 69 / Prompt bundle 38 / freshness candidate 70；Outcome Contract 63 / Prompt bundle 35，metric `frozen_post_execution_exposure_v3`；evaluation context 1；benchmark definition 1。旧未知口径和 v2 数据不自动改标 v3。
+- 当前版本：Domain schema 10（兼容可选字段）；Store 19；WorkflowDefinition 1；研究 Contract 69 / Prompt bundle 38 / freshness candidate 70；Outcome Contract 63 / Prompt bundle 35，metric `frozen_post_execution_exposure_v3`；evaluation context 1；benchmark definition 1。旧未知口径和 v2 数据不自动改标 v3。
 - v14→v15 迁移只新增 Run/kind 表达式索引。旧 Contract 的未完成任务会在写新 Store 版本前阻断升级；旧任务哈希不改写，旧 CAS/Commitment 不改写。停止旧 worker 并合法处理旧任务之后再升级。RuntimeIdentity 与旧审批不自动复用。
 - Canary 密封/多 subject 评估的中间进度保存在 CAS、事件和评估账本；只有随 Attempt 成功一并提交的产物进入 `rebuild_attempt_outputs`。等待或中断不撤回已完成 subject，不把未完成 Attempt 发布成成功输出。
 

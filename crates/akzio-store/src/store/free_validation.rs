@@ -92,28 +92,43 @@ fn assert_no_active_work_before_upgrade(connection: &Connection) -> StoreResult<
         )?;
     }
     if blocked {
-        return Err(StoreError::DebugControl(
-            "stop old workers and drain active leases before Store 18 migration".into(),
-        ));
+        return Err(StoreError::DebugControl(format!(
+            "stop old workers and drain active leases before Store {STORE_SCHEMA_VERSION} migration"
+        )));
     }
     Ok(())
+}
+
+fn read_store_schema_version(connection: &Connection) -> StoreResult<Option<String>> {
+    Ok(connection
+        .query_row(
+            "SELECT value FROM rebuild_metadata WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+fn verify_readable_store_schema(connection: &Connection, root: &Path) -> StoreResult<u32> {
+    let version = read_store_schema_version(connection)?;
+    match version.as_deref() {
+        Some("18") => Ok(18),
+        Some(version) if version == STORE_SCHEMA_VERSION.to_string() => {
+            verify_paper_submission_schema(connection)?;
+            Ok(STORE_SCHEMA_VERSION)
+        }
+        _ => Err(StoreError::IncompatibleStoreRoot(root.to_path_buf())),
+    }
 }
 
 // 为新建/升级 Store 创建或校验 rebuild_* 表、索引，并在 Immediate 事务中写入当前 metadata.schema_version。
 // metadata anchor 表先于此事务确保存在；v13/v14 的两段历史迁移则由上方分阶段完成。
 fn initialize(connection: &mut Connection, root: &Path) -> StoreResult<()> {
-    // 先在事务外确保 metadata 表并读取旧 version，拒绝结构标签不相容或仍有旧 worker 的 Store；
-    // 13/14 的历史迁移先单独提交到 v15，再进入下方 DDL Immediate 事务。
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS rebuild_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
     )?;
-    let version = connection
-        .query_row(
-            "SELECT value FROM rebuild_metadata WHERE key = 'schema_version'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
+    let version = read_store_schema_version(connection)?;
+    let current_version = STORE_SCHEMA_VERSION.to_string();
     if version.is_some()
         && !table_has_column(
             connection,
@@ -123,29 +138,29 @@ fn initialize(connection: &mut Connection, root: &Path) -> StoreResult<()> {
     {
         return Err(StoreError::IncompatibleStoreRoot(root.to_path_buf()));
     }
-    // The upgrade block runs before any migration touches the schema.
-    // `migrate_v13_to_v14` drops and rebuilds five tables with foreign keys
-    // disabled, so checking afterwards could only report a conflict the
-    // migration had already acted on.
-    if version.as_deref().is_some_and(|v| v != "18") {
-        assert_no_active_work_before_upgrade(connection)?;
-    }
-    match version.as_deref() {
-        None | Some("14") | Some("15") | Some("16") | Some("17") | Some("18") => {}
-        Some("13") => migration::migrate_v13_to_v14(connection, root)?,
-        Some(_) => {
-            return Err(StoreError::IncompatibleStoreRoot(PathBuf::from(
-                DATABASE_FILE,
-            )));
-        }
-    }
-    // Runs before the schema batch below, because that batch commits
-    // `schema_version = 18` and this step still requires the v14 label. Its own
-    // Contract-upgrade blockers keep a v14 root readable by the prior binary.
+    // The historical v13/v14 migrations manage their own transactions. Check
+    // for active work before either migration touches the schema.
     if matches!(version.as_deref(), Some("13" | "14")) {
+        assert_no_active_work_before_upgrade(connection)?;
+        if version.as_deref() == Some("13") {
+            migration::migrate_v13_to_v14(connection, root)?;
+        }
         migration::migrate_v14_to_v15(connection)?;
     }
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // Re-read the version and check active work under the same write lock as
+    // the new ledger and version label.
+    let version = read_store_schema_version(&transaction)?;
+    match version.as_deref() {
+        None => {}
+        Some(version) if version == current_version => {
+            verify_paper_submission_schema(&transaction)?;
+        }
+        Some("15" | "16" | "17" | "18") => {
+            assert_no_active_work_before_upgrade(&transaction)?;
+        }
+        Some(_) => return Err(StoreError::IncompatibleStoreRoot(root.to_path_buf())),
+    }
     // 旧 Task 表可能缺 node_spec_json，只在列缺失时 ALTER；随后批量 CREATE IF NOT EXISTS 保持既有行不重写。
     if migration::table_exists(&transaction, "rebuild_tasks")? && !table_has_column(&transaction, "rebuild_tasks", "node_spec_json")? {
         transaction.execute_batch("ALTER TABLE rebuild_tasks ADD COLUMN node_spec_json TEXT;")?;
@@ -520,31 +535,58 @@ CREATE INDEX IF NOT EXISTS rebuild_artifacts_run_kind
     )? {
         return Err(StoreError::IncompatibleStoreRoot(root.to_path_buf()));
     }
-    // The version label is written in the same transaction as the schema it
-    // describes. Committing the tables first would let a crash leave a v18
-    // database still labelled v15/v16, which `Store::open_existing` rejects
-    // outright, stranding every read-only seam on a structurally valid Store.
-    //
-    // The shared control migration changes SQL heads only; no CAS,
-    // Commitment or hash is rewritten. Old workers reject v18 on reopen rather
-    // than silently ignoring the active policy head.
-    match version.as_deref() {
-        None => {
-            transaction.execute(
-                "INSERT INTO rebuild_metadata (key, value) VALUES ('schema_version', ?1)",
-                params![STORE_SCHEMA_VERSION.to_string()],
-            )?;
-        }
-        Some("18") => {}
-        Some(_) => {
-            transaction.execute(
-                "UPDATE rebuild_metadata SET value = ?1 WHERE key = 'schema_version'",
-                params![STORE_SCHEMA_VERSION.to_string()],
-            )?;
+    // Publish the empty ledger and the writable version together. A current
+    // Store with a missing ledger is an integrity error, never reinitialized.
+    if version.as_deref() != Some(current_version.as_str()) {
+        create_paper_submission_schema(&transaction)?;
+        transaction.execute(
+            "INSERT INTO rebuild_metadata (key, value) VALUES ('schema_version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![current_version],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn create_paper_submission_schema(transaction: &Transaction<'_>) -> StoreResult<()> {
+    // Previous effects have no admission proof. Do not backfill Ready rows.
+    transaction.execute_batch(
+        "CREATE TABLE rebuild_paper_submission_batches (
+            commitment_artifact_id TEXT NOT NULL PRIMARY KEY REFERENCES rebuild_artifacts(artifact_id),
+            run_id TEXT NOT NULL REFERENCES rebuild_runs(run_id),
+            effect_intent_cursor INTEGER NOT NULL UNIQUE REFERENCES rebuild_events(event_id),
+            stop_reason TEXT CHECK (length(trim(stop_reason)) > 0)
+         );
+         CREATE TABLE rebuild_paper_submission_transitions (
+            commitment_artifact_id TEXT NOT NULL REFERENCES rebuild_paper_submission_batches(commitment_artifact_id),
+            client_order_id TEXT NOT NULL CHECK (length(trim(client_order_id)) > 0),
+            transition_index INTEGER NOT NULL CHECK (transition_index >= 0),
+            asset TEXT NOT NULL CHECK (asset IN ('TQQQ', 'QQQ', 'SOXX', 'SOXL')),
+            reprice_artifact_id TEXT REFERENCES rebuild_artifacts(artifact_id),
+            state TEXT NOT NULL CHECK (state IN ('ready', 'possibly_submitted', 'observed', 'terminal', 'proven_unsubmitted')),
+            daemon_lease_epoch INTEGER NOT NULL CHECK (daemon_lease_epoch > 0),
+            attempt_id TEXT NOT NULL REFERENCES rebuild_attempts(attempt_id),
+            receipt_artifact_id TEXT REFERENCES rebuild_artifacts(artifact_id),
+            reason TEXT CHECK (length(trim(reason)) > 0),
+            recorded_at TEXT NOT NULL,
+            PRIMARY KEY (commitment_artifact_id, client_order_id, transition_index),
+            CHECK ((state IN ('observed', 'terminal')) = (receipt_artifact_id IS NOT NULL)),
+            CHECK ((state = 'proven_unsubmitted') = (reason IS NOT NULL))
+         );",
+    )?;
+    Ok(())
+}
+
+fn verify_paper_submission_schema(connection: &Connection) -> StoreResult<()> {
+    for table in [
+        "rebuild_paper_submission_batches",
+        "rebuild_paper_submission_transitions",
+    ] {
+        if !migration::table_exists(connection, table)? {
+            return Err(StoreError::Integrity(format!("missing Paper submission table {table}")));
         }
     }
-    // schema DDL 与当前 label 同一事务提交；迁移前的 v13/v14 步骤不与这段 DDL 共用该事务。
-    transaction.commit()?;
     Ok(())
 }
 

@@ -283,7 +283,7 @@ impl Store {
             source,
         })?;
         Ok(BackupManifest {
-            schema_version: STORE_SCHEMA_VERSION,
+            schema_version: verify_readable_store_schema(&snapshot, &target)?,
             database_hash: ContentHash::of_bytes(&database_content),
             database_bytes,
             blob_count,

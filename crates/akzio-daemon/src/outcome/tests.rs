@@ -459,3 +459,204 @@ async fn narrative_repair_uses_the_frozen_repair_node() {
     assert!(matches!(completion, TaskCompletion::Committed));
     assert_complete_narrative(&daemon, &repair, &schedule, OutcomeHorizon::T5);
 }
+
+/// WHY THIS TEST EXISTS (Task #30): The Daemon must materialize a complete mixed Paper reconciliation from exact CAS, attributing cost and quantity only to actual fills.
+/// Do not weaken or delete this assertion.
+#[tokio::test]
+async fn outcome_materializes_actual_fill_but_no_cost_for_proven_unsent_order() {
+    use akzio_domain::{
+        FactorExposure, OrderIntent, OrderReceipt, OrderReceiptState, OrderSide, PaperCommitment,
+        PaperCommitmentId, PaperUnsubmittedReason, ReconciliationId, TargetPortfolio,
+        UnsubmittedPaperOrder,
+    };
+
+    let (daemon, _, schedule_artifact, task) = scheduled().await;
+    let mut schedule: OutcomeSchedule = daemon
+        .read_artifact_payload(&reference(&schedule_artifact))
+        .unwrap();
+    let mut context: ExecutionContext = daemon
+        .read_artifact_payload(&schedule.execution_context)
+        .unwrap();
+    let account_reference = context.account_snapshot.clone().unwrap();
+    let quote_reference = context.quote_snapshot.clone().unwrap();
+    let account: AccountSnapshot = daemon.read_artifact_payload(&account_reference).unwrap();
+    let quotes: QuoteSnapshot = daemon.read_artifact_payload(&quote_reference).unwrap();
+    let quote = &quotes.quotes[&Asset::Qqq];
+    let price = MoneyMicros((quote.bid.0 + quote.ask.0) / 2);
+    let now = Utc::now();
+    let persist = |artifact: Artifact| {
+        daemon
+            .store
+            .write_task_artifact(
+                &task.permit,
+                &artifact,
+                LifecycleEventType::ArtifactCommitted,
+                now,
+            )
+            .unwrap();
+        reference(&artifact)
+    };
+    let target = TargetPortfolio::zeroed();
+    let mut plan = akzio_domain::ExecutionPlan {
+        schema_version: akzio_domain::DOMAIN_SCHEMA_VERSION,
+        decision_context: context.decision_context.clone(),
+        account_snapshot: account_reference,
+        quote_snapshot: quote_reference,
+        market_clock_snapshot: context.market_clock_snapshot.clone().unwrap(),
+        policy_hash: ContentHash::of_bytes(b"outcome policy fixture"),
+        maximum_total_notional: MoneyMicros(price.0 * 2),
+        factor_exposure: FactorExposure::from_target(&target).unwrap(),
+        target,
+        orders: [Asset::Qqq, Asset::Soxx]
+            .into_iter()
+            .map(|asset| OrderIntent {
+                asset,
+                side: OrderSide::Buy,
+                notional: price,
+                limit_price: price,
+                extended_hours: false,
+            })
+            .collect(),
+        gross_exposure_ppm: 0,
+        net_exposure_ppm: 0,
+        turnover_ppm: 0,
+        broker_session: account.broker_session.clone(),
+        created_at: now,
+        plan_hash: ContentHash::of_bytes(b"outcome plan fixture"),
+    };
+    plan.refresh_hash().unwrap();
+    let plan_reference = persist(artifact(
+        &daemon,
+        &task.permit,
+        ArtifactKind::ExecutionPlan,
+        ArtifactLifecycle::Canonical,
+        &plan,
+        vec![
+            context.decision_context.clone(),
+            plan.account_snapshot.clone(),
+            plan.quote_snapshot.clone(),
+            plan.market_clock_snapshot.clone(),
+        ],
+    ));
+    context.execution_plan = Some(plan_reference.clone());
+    context.plan_hash = Some(plan.plan_hash.clone());
+    schedule.execution_context = persist(artifact(
+        &daemon,
+        &task.permit,
+        ArtifactKind::ExecutionContext,
+        ArtifactLifecycle::Canonical,
+        &context,
+        vec![schedule.execution_context.clone(), plan_reference],
+    ));
+    let execution_verdict = persist(artifact(
+        &daemon,
+        &task.permit,
+        ArtifactKind::ExecutionVerdict,
+        ArtifactLifecycle::Canonical,
+        &akzio_domain::ExecutionVerdict::Accepted {
+            execution_context: schedule.execution_context.clone(),
+        },
+        vec![schedule.execution_context.clone()],
+    ));
+    let commitment = persist(artifact(
+        &daemon,
+        &task.permit,
+        ArtifactKind::ExecutionCommitment,
+        ArtifactLifecycle::Canonical,
+        &PaperCommitment {
+            commitment_id: PaperCommitmentId::new(),
+            execution_context: schedule.execution_context.clone(),
+            plan_hash: plan.plan_hash.clone(),
+            broker_session: account.broker_session,
+            client_order_ids: [
+                (Asset::Qqq, "offline-first".into()),
+                (Asset::Soxx, "offline-unsent".into()),
+            ]
+            .into(),
+            created_at: now,
+        },
+        vec![
+            schedule.execution_context.clone(),
+            execution_verdict.clone(),
+        ],
+    ));
+    let receipt = persist(artifact(
+        &daemon,
+        &task.permit,
+        ArtifactKind::OrderReceipt,
+        ArtifactLifecycle::Canonical,
+        &OrderReceipt {
+            plan_hash: plan.plan_hash,
+            asset: Asset::Qqq,
+            client_order_id: "offline-first".into(),
+            broker_order_id: "offline-order".into(),
+            state: OrderReceiptState::Filled,
+            requested_quantity_micros: 1_000_000,
+            filled_quantity_micros: 1_000_000,
+            remaining_quantity_micros: 0,
+            average_fill_price: Some(price),
+            broker_updated_at: now,
+            reason: None,
+            observed_at: now,
+        },
+        vec![commitment.clone()],
+    ));
+    let reconciliation = persist(artifact(
+        &daemon,
+        &task.permit,
+        ArtifactKind::Reconciliation,
+        ArtifactLifecycle::Canonical,
+        &Reconciliation {
+            reconciliation_id: ReconciliationId::new(),
+            commitment: commitment.clone(),
+            state: ReconciliationState::Complete,
+            broker_receipts: vec![receipt.clone()],
+            unsubmitted_orders: vec![UnsubmittedPaperOrder {
+                asset: Asset::Soxx,
+                client_order_id: "offline-unsent".into(),
+                transition_index: 1,
+                reason: PaperUnsubmittedReason::RunCancelled,
+                reprice: None,
+            }],
+            achieved_target: None,
+            achieved_factor_exposure: None,
+            reconciled_at: now,
+        },
+        vec![commitment.clone(), receipt],
+    ));
+    schedule.execution = OutcomeExecutionLineage::ReconciledPaper {
+        execution_verdict: execution_verdict.clone(),
+        commitment,
+        reconciliation: reconciliation.clone(),
+    };
+    let realized = daemon.realized_execution(&schedule, &context).unwrap();
+    let initial = |asset| {
+        account
+            .positions
+            .get(&asset)
+            .map_or(0, |position| position.quantity_micros)
+    };
+    assert_eq!(
+        realized.quantities[&Asset::Qqq],
+        initial(Asset::Qqq) + 1_000_000
+    );
+    assert_eq!(realized.quantities[&Asset::Soxx], initial(Asset::Soxx));
+    assert_eq!(realized.metrics.order_cost_attributions.len(), 1);
+    assert_eq!(
+        realized.metrics.order_cost_attributions[0].asset,
+        Asset::Qqq
+    );
+    let incorrect_commitment = ArtifactRef {
+        artifact_id: akzio_domain::ArtifactId(ContentHash::of_bytes(b"another commitment")),
+        kind: ArtifactKind::ExecutionCommitment,
+    };
+    schedule.execution = OutcomeExecutionLineage::ReconciledPaper {
+        execution_verdict,
+        commitment: incorrect_commitment,
+        reconciliation,
+    };
+    assert!(matches!(
+        daemon.realized_execution(&schedule, &context),
+        Err(DaemonError::InvalidInput(_))
+    ));
+}
