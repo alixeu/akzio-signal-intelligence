@@ -4,10 +4,35 @@
 // Artifact 与 task 终态一起交给 Store；PaperCommitment 只持久化承诺。上游快照可有
 // 只读 Broker/行情 I/O；订单写请求与对账由后续 Dispatch/Reconcile 路径负责。
 struct AllocatedPlanRisk {
+    before_target: akzio_domain::TargetPortfolio,
     full_fill_target: akzio_domain::TargetPortfolio,
     projected_drawdown_ppm: u32,
     risk_increasing: bool,
     exceeds_frozen_limits: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct FillWeightBounds {
+    lower: u32,
+    upper: u32,
+}
+
+impl FillWeightBounds {
+    fn enclose(numerator: i128, denominator: i128) -> Option<Self> {
+        if numerator < 0 || denominator <= 0 {
+            return None;
+        }
+        let lower = u32::try_from(numerator / denominator).ok()?;
+        let upper = lower.checked_add(u32::from(numerator % denominator != 0))?;
+        (upper <= akzio_domain::WeightPpm::SCALE).then_some(Self { lower, upper })
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct AssetFillWeights {
+    before: FillWeightBounds,
+    after: FillWeightBounds,
+    sold: FillWeightBounds,
 }
 
 impl ExecutionRuntime {
@@ -416,25 +441,37 @@ impl ExecutionRuntime {
         Ok(self.assess_fill_corners(input, plan, &envelope.policy))
     }
 
-    fn wire_fill_weight(
+    fn frozen_fill_weights(
         input: &AllocationInput,
-        order: &crate::OrderIntent,
-    ) -> Option<crate::WeightPpm> {
+        asset: akzio_domain::Asset,
+        order: Option<&crate::OrderIntent>,
+    ) -> Option<AssetFillWeights> {
         let equity = i128::from(input.account.equity.0);
         if equity <= 0 {
             return None;
         }
-        let (held, market_value) =
-            input
-                .account
-                .positions
-                .get(&order.asset)
-                .map_or((0, 0), |position| {
-                    (
-                        i128::from(position.quantity_micros),
-                        i128::from(position.market_value.0),
-                    )
-                });
+        let (held, market_value) = input
+            .account
+            .positions
+            .get(&asset)
+            .map_or((0, 0), |position| {
+                (
+                    i128::from(position.quantity_micros),
+                    i128::from(position.market_value.0),
+                )
+            });
+        let scale = i128::from(akzio_domain::WeightPpm::SCALE);
+        if (held, market_value) != (0, 0) && !(held > 0 && market_value > 0) {
+            return None;
+        }
+        let before = FillWeightBounds::enclose(market_value.checked_mul(scale)?, equity)?;
+        let Some(order) = order else {
+            return Some(AssetFillWeights {
+                before,
+                after: before,
+                sold: FillWeightBounds::default(),
+            });
+        };
         let quantity = i128::from(crate::paper::order_quantity_millionths(order).ok()?);
         let shares = match order.side {
             crate::OrderSide::Buy => held.checked_add(quantity)?,
@@ -443,27 +480,83 @@ impl ExecutionRuntime {
         if shares < 0 {
             return None;
         }
-        // Revalue held assets at frozen market_value/quantity. With no held
-        // shares, use the validated frozen quote midpoint. Retain the rational
-        // mark until the final ppm division, so every rounded partial fill lies
-        // between the no-fill and full-fill ppm weights.
-        let scale = i128::from(crate::WeightPpm::SCALE);
-        let weight = if held > 0 && market_value > 0 {
-            market_value
-                .checked_mul(shares)?
-                .checked_mul(scale)?
-                .checked_div(held.checked_mul(equity)?)?
-        } else if held == 0 && market_value == 0 {
-            let quote = input.quotes.quotes.get(&order.asset)?;
-            quote.validate().ok()?;
-            let twice_mark = i128::from(quote.bid.0) + i128::from(quote.ask.0);
-            // Millionth shares and ppm weights cancel their common scale.
-            shares.checked_mul(twice_mark)?.checked_div(2 * equity)?
+
+        // Held assets use the frozen account mark (market value / held shares).
+        // A new holding uses the midpoint of the validated frozen quote.
+        let (numerator, denominator) = if held > 0 {
+            (market_value.checked_mul(scale)?, held.checked_mul(equity)?)
         } else {
-            return None;
+            let quote = input.quotes.quotes.get(&asset)?;
+            quote.validate().ok()?;
+            // Millionth shares and ppm weights cancel their common scale.
+            (
+                i128::from(quote.bid.0) + i128::from(quote.ask.0),
+                2 * equity,
+            )
         };
-        let weight = u32::try_from(weight).ok()?;
-        (weight <= crate::WeightPpm::SCALE).then_some(crate::WeightPpm(weight))
+        let after = FillWeightBounds::enclose(numerator.checked_mul(shares)?, denominator)?;
+        let sold = if order.side == crate::OrderSide::Sell {
+            FillWeightBounds::enclose(numerator.checked_mul(quantity)?, denominator)?
+        } else {
+            FillWeightBounds::default()
+        };
+        Some(AssetFillWeights {
+            before,
+            after,
+            sold,
+        })
+    }
+
+    fn sales_can_increase_variance(
+        fills: &[AssetFillWeights; akzio_domain::Asset::EXECUTABLE.len()],
+        risk_model: &crate::PortfolioRiskModel,
+    ) -> Option<bool> {
+        use akzio_domain::Asset;
+
+        // For each full/no-fill corner, bound the change directly:
+        // variance(after) - variance(before) = -soldᵀ Σ (after + before).
+        // An unfilled asset has identically zero sold weight. Bounding the two
+        // variances separately would lose that cancellation and can incorrectly
+        // classify a proven reduction as an increase even at the no-fill corner.
+        // The symmetric covariance certificate makes variance convex in fills,
+        // so the change at these corners bounds every partial sale as well.
+        // All linear risks have unsigned coefficients and decrease with sales.
+        let covariance = &risk_model.covariance_ppm_squared;
+        for mask in 1..(1 << fills.len()) {
+            let mut upper_change = 0_i128;
+            for (i, left) in Asset::EXECUTABLE.iter().enumerate() {
+                if mask & (1 << i) == 0 || fills[i].sold.upper == 0 {
+                    continue;
+                }
+                let mut lower_gradient = 0_i128;
+                for (j, right) in Asset::EXECUTABLE.iter().enumerate() {
+                    let coefficient = i128::from(*covariance.get(left)?.get(right)?);
+                    let before = fills[j].before;
+                    let after = if mask & (1 << j) == 0 {
+                        before
+                    } else {
+                        fills[j].after
+                    };
+                    let sum = if coefficient < 0 {
+                        before.upper + after.upper
+                    } else {
+                        before.lower + after.lower
+                    };
+                    lower_gradient += coefficient * i128::from(sum);
+                }
+                let sold = fills[i].sold;
+                let weight = if lower_gradient < 0 {
+                    sold.upper
+                } else {
+                    sold.lower
+                };
+                upper_change -= lower_gradient * i128::from(weight);
+            }
+            if upper_change > 0 {
+                return Some(true);
+            }
+        }
+        Some(false)
     }
 
     fn assess_fill_corners(
@@ -472,8 +565,7 @@ impl ExecutionRuntime {
         plan: &crate::ExecutionPlan,
         policy: &crate::DecisionPolicy,
     ) -> Option<AllocatedPlanRisk> {
-        use crate::allocation::target_after_orders;
-        use akzio_domain::{Asset, WeightPpm};
+        use akzio_domain::{Asset, TargetPortfolio, WeightPpm};
 
         let unique_assets = plan
             .orders
@@ -495,59 +587,70 @@ impl ExecutionRuntime {
             .0
             .min(mandate.maximum_gross_exposure.0)
             .min(WeightPpm::SCALE - mandate.minimum_cash_reserve.0);
-        let before_target = target_after_orders(&input.account, &[]).ok()?;
-        let endpoints = plan
-            .orders
-            .iter()
-            .map(|order| Some((order.asset, Self::wire_fill_weight(input, order)?)))
-            .collect::<Option<Vec<_>>>()?;
-        let before = policy.fill_risk(&before_target).ok()?;
-        let mut exceeds_frozen_limits = !policy
-            .fits_fill_target(&before_target, &before, negative_terms, gross_limit)
-            .ok()?;
-        let mut risk_increasing = plan
+
+        let mut fills = [AssetFillWeights::default(); Asset::EXECUTABLE.len()];
+        let mut before_target = TargetPortfolio::zeroed();
+        let mut full_fill_target = TargetPortfolio::zeroed();
+        let mut upper_target = TargetPortfolio::zeroed();
+        for (index, asset) in Asset::EXECUTABLE.into_iter().enumerate() {
+            let order = plan.orders.iter().find(|order| order.asset == asset);
+            let weights = Self::frozen_fill_weights(input, asset, order)?;
+            fills[index] = weights;
+            before_target
+                .weights
+                .insert(asset, WeightPpm(weights.before.upper));
+            full_fill_target
+                .weights
+                .insert(asset, WeightPpm(weights.after.upper));
+            upper_target.weights.insert(
+                asset,
+                WeightPpm(weights.before.upper.max(weights.after.upper)),
+            );
+        }
+        // The nonnegative linear risks use the componentwise upper point.
+        // Variance can increase at mixed corners when covariance is negative.
+        // The certified PSD matrix bounds it at the vertices of the enclosing
+        // box, including the fractional weight of every asset with no order.
+        let has_buy = plan
             .orders
             .iter()
             .any(|order| order.side == crate::OrderSide::Buy);
-        let mut maximum_shortfall = before.expected_shortfall_ppm;
-        let mut full_fill_target = before_target.clone();
-        let mut full_shortfall = before.expected_shortfall_ppm;
-
-        // Frozen equity and non-negative long positions yield a box in weight
-        // space, with at most one independently fillable order per asset. Gross,
-        // beta, tail and gap aggregate linearly, and certified variance is convex.
-        // Every interior risk is bounded by these at most sixteen vertices.
-        let all = (1 << endpoints.len()) - 1;
-        for mask in 1..=all {
-            let mut target = before_target.clone();
-            for (index, (asset, weight)) in endpoints.iter().enumerate() {
-                if (mask & (1 << index)) != 0 {
-                    target.weights.insert(*asset, *weight);
-                }
+        let risk_increasing =
+            has_buy || Self::sales_can_increase_variance(&fills, &policy.portfolio_risk_model)?;
+        let mut risk = policy.fill_risk(&upper_target).ok()?;
+        let mut corner = upper_target.clone();
+        for mask in 0..(1 << fills.len()) - 1 {
+            for (index, asset) in Asset::EXECUTABLE.into_iter().enumerate() {
+                let AssetFillWeights { before, after, .. } = fills[index];
+                let weight = if mask & (1 << index) == 0 {
+                    before.lower.min(after.lower)
+                } else {
+                    before.upper.max(after.upper)
+                };
+                corner.weights.insert(asset, WeightPpm(weight));
             }
-            let risk = policy.fill_risk(&target).ok()?;
-            risk_increasing |= risk.increases_over(&before);
-            maximum_shortfall = maximum_shortfall.max(risk.expected_shortfall_ppm);
-            exceeds_frozen_limits |= !policy
-                .fits_fill_target(&target, &risk, negative_terms, gross_limit)
-                .ok()?;
-            if mask == all {
-                full_fill_target = target;
-                full_shortfall = risk.expected_shortfall_ppm;
-            }
+            risk.variance_numerator = risk
+                .variance_numerator
+                .max(policy.fill_variance_numerator(&corner).ok()?);
         }
-        // Tiny partial buys can approach any sell-only or no-fill corner. A
-        // corrective sale is exempt from its pre-existing limit breaches only
-        // when no fill combination increases risk above the frozen account.
+        let exceeds_frozen_limits = risk_increasing
+            && !policy
+                .fits_fill_target(&upper_target, &risk, negative_terms, gross_limit)
+                .ok()?;
+        let projected_drawdown_ppm = if risk_increasing {
+            risk.expected_shortfall_ppm
+        } else {
+            policy
+                .fill_risk(&full_fill_target)
+                .ok()?
+                .expected_shortfall_ppm
+        };
         Some(AllocatedPlanRisk {
+            before_target,
             full_fill_target,
-            projected_drawdown_ppm: if risk_increasing {
-                maximum_shortfall
-            } else {
-                full_shortfall
-            },
+            projected_drawdown_ppm,
             risk_increasing,
-            exceeds_frozen_limits: risk_increasing && exceeds_frozen_limits,
+            exceeds_frozen_limits,
         })
     }
 
@@ -579,22 +682,25 @@ impl ExecutionRuntime {
             self.gate_policy
                 .blockers_for(&wire_exposure, plan.turnover_ppm),
         );
-        let mut mandate = self.gate_policy.assess_mandate(
-            &input.account,
+        use akzio_domain::{MandateActionType, MandateViolation, WeightPpm};
+
+        // Use the same upper rounding on both portfolios. Mixing rounding
+        // directions can make a proven reduction appear to increase gross.
+        let mandate_policy = &self.gate_policy.mandate;
+        let mut mandate = mandate_policy.assess(
+            &risk.before_target,
             &risk.full_fill_target,
-            risk.projected_drawdown_ppm,
-            plan.turnover_ppm,
+            WeightPpm(risk.projected_drawdown_ppm),
+            WeightPpm(plan.turnover_ppm),
         );
-        if risk.risk_increasing
-            && self
-                .gate_policy
-                .mandate
-                .prohibited_actions
-                .contains(&akzio_domain::MandateActionType::IncreaseRisk)
+        let prohibited = &mandate_policy.prohibited_actions;
+        // Every formed plan trades, even when a share delta is below one ppm.
+        if prohibited.contains(&MandateActionType::Trade)
+            || (risk.risk_increasing && prohibited.contains(&MandateActionType::IncreaseRisk))
         {
             mandate
                 .violations
-                .insert(akzio_domain::MandateViolation::ProhibitedAction);
+                .insert(MandateViolation::ProhibitedAction);
         }
         if !mandate.permitted() {
             blockers.insert(HardBlocker::MandateViolation);

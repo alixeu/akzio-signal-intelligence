@@ -396,6 +396,63 @@ mod allocated_risk_tests {
         assert_eq!(blockers, BTreeSet::from([HardBlocker::InvalidProvenance]));
     }
 
+    /// WHY THIS TEST EXISTS (Task #3): Fractional corrective sales must clear
+    /// an IncreaseRisk prohibition, and sub-ppm trades still obey a Trade prohibition.
+    /// Do not weaken or delete this assertion.
+    #[test]
+    fn fractional_corrective_sale_obeys_mandate_action_prohibitions() {
+        use akzio_domain::{MandateActionType, MandateViolation};
+
+        let mut runtime = runtime(150_000);
+        let now = fixtures::now();
+        let frozen = policy_with_positive_calibration_bin(now);
+        install_policy(&runtime.store, &frozen, now);
+        let mut allocation = allocation_input(
+            &frozen,
+            BTreeMap::from([(
+                Asset::Qqq,
+                Position {
+                    quantity_micros: 1_000_007,
+                    market_value: MoneyMicros(100_000_700),
+                },
+            )]),
+            &[(Asset::Qqq, 100_000)],
+        );
+        allocation.account.equity = MoneyMicros(1_000_000_000);
+        let quote = allocation.quotes.quotes.get_mut(&Asset::Qqq).unwrap();
+        quote.bid = MoneyMicros(101_000_000);
+        quote.ask = MoneyMicros(101_000_001);
+        let plan = allocate(&runtime, &allocation);
+        assert_eq!(plan.orders.len(), 1);
+        assert_eq!(plan.orders[0].side, crate::OrderSide::Sell);
+        // Marked weight falls from 100000.7 to 100000.1 ppm. Both ceils
+        // are identical, and either exceeds the baseline floor of 100000.
+        assert_eq!(
+            crate::paper::order_quantity_millionths(&plan.orders[0]).unwrap(),
+            6
+        );
+        let evidence = pretrade(now);
+        runtime.gate_policy.mandate.prohibited_actions =
+            BTreeSet::from([MandateActionType::IncreaseRisk]);
+        let mut blockers = BTreeSet::new();
+        let (mandate, safety) = runtime
+            .assess_allocated_plan(&allocation, &plan, Some(&evidence), &mut blockers)
+            .unwrap();
+        assert!(!safety.unwrap().risk_increasing);
+        assert!(mandate.unwrap().permitted(), "{blockers:?}");
+        assert!(blockers.is_empty(), "{blockers:?}");
+
+        runtime.gate_policy.mandate.prohibited_actions = BTreeSet::from([MandateActionType::Trade]);
+        let (mandate, _) = runtime
+            .assess_allocated_plan(&allocation, &plan, Some(&evidence), &mut blockers)
+            .unwrap();
+        assert_eq!(
+            mandate.unwrap().violations,
+            BTreeSet::from([MandateViolation::ProhibitedAction])
+        );
+        assert_eq!(blockers, BTreeSet::from([HardBlocker::MandateViolation]));
+    }
+
     /// WHY THIS TEST EXISTS (Task #3): Selling one side of a negative-covariance
     /// hedge can increase portfolio risk and requires the new-risk safety checks.
     /// Do not weaken or delete this assertion.
@@ -575,6 +632,412 @@ mod allocated_risk_tests {
                 "{case}"
             );
         }
+    }
+
+    fn reserve_approved_execution(
+        store: &Store,
+        policy_hash: &ContentHash,
+        now: DateTime<Utc>,
+    ) -> TaskWritePermit {
+        use akzio_domain::{
+            ArtifactOrigin, FailureDisposition, ModelQualificationEvidence,
+            ModelQualificationReport, PaperApprovalScope, PaperLaunchApproval, RetryPolicy,
+            RuntimeManifest, TaskBudget, TaskId, TaskRecipeId, WorkflowGraph, WorkflowNode,
+            WorkflowProposal, DOMAIN_SCHEMA_VERSION,
+        };
+        use akzio_store::{SessionReservation, StoredRun, TaskWorkload, WorkflowCommit};
+
+        let expires_at = now + Duration::minutes(10);
+        let run_id = RunId::new();
+        let topology_id = "execution-risk-fixture";
+        let run_origin = ArtifactOrigin {
+            run_id: Some(run_id.clone()),
+            task_id: None,
+            attempt_id: None,
+            contract_hash: None,
+        };
+        let provenance = ArtifactProvenance {
+            source_family: "fixture".into(),
+            observed_at: None,
+            retrieved_at: now,
+            source_uri: None,
+            confidence_ppm: WeightPpm::SCALE,
+            producer_contract_hash: None,
+        };
+        let stage = |kind, blob, producer, lifecycle, origin, sources| {
+            Artifact::new(
+                kind,
+                blob,
+                producer,
+                lifecycle,
+                provenance.clone(),
+                origin,
+                sources,
+                now,
+            )
+            .unwrap()
+        };
+        let node = WorkflowNode {
+            spec: None,
+            task_id: TaskId::new(),
+            recipe_id: TaskRecipeId::new("gate.execution").unwrap(),
+            contract_hash: None,
+            objective: "Evaluate frozen Paper execution evidence offline".into(),
+            dependencies: vec![],
+            input_artifacts: vec![],
+            priority: 1,
+            budget: TaskBudget {
+                max_input_tokens: 1,
+                max_output_tokens: 1,
+                max_wall_time_secs: 60,
+                max_tool_calls: akzio_domain::budget::ToolCallLimit::Limited(0),
+            },
+            retry: RetryPolicy::none(),
+            on_failure: FailureDisposition::FailRun,
+            parent_task_id: None,
+        };
+        let graph = stage(
+            ArtifactKind::WorkflowGraph,
+            store
+                .stage_json(&WorkflowGraph {
+                    definition_version: None,
+                    schema_version: DOMAIN_SCHEMA_VERSION,
+                    topology_id: topology_id.into(),
+                    nodes: vec![node.clone()],
+                    agent_budgets: Default::default(),
+                })
+                .unwrap(),
+            "runtime.workflow",
+            ArtifactLifecycle::RunScoped,
+            Some(run_origin.clone()),
+            vec![],
+        );
+        let hash = ContentHash::of_bytes(b"offline execution risk fixture");
+        let components = [("default".to_owned(), hash.clone())].into();
+        let bundle_hash = akzio_domain::runtime_component_bundle_hash(&components).unwrap();
+        let manifest: RuntimeManifest = serde_json::from_value(serde_json::json!({
+            "schema_version": DOMAIN_SCHEMA_VERSION,
+            "code_revision": "fixture", "rust_toolchain": "1.96.0",
+            "experiment_profile": "paper-engineering",
+            "model_capability_hashes": components, "model_capability_bundle_hash": bundle_hash,
+            "governance_component_hashes": components, "governance_bundle_hash": bundle_hash,
+            "cargo_lock_hash": hash, "config_hash": hash,
+            "provider_id": "fixture", "model_id": "fixture",
+            "prompt_hash": hash, "contract_hash": hash, "topology_hash": hash,
+            "decision_policy_hash": policy_hash,
+            "execution_policy_hash": crate::paper::paper_execution_policy_hash().unwrap(),
+            "evaluation_policy_hash": hash,
+            "market_data_feed": "iex", "broker_account_id": "offline-account",
+            "maximum_notional": 500_000_000,
+            "allowed_session_start": now.date_naive(), "allowed_session_end": now.date_naive(),
+            "expires_at": expires_at, "created_at": now,
+        }))
+        .unwrap();
+        let manifest_artifact = stage(
+            ArtifactKind::RuntimeManifest,
+            store.stage_json(&manifest).unwrap(),
+            "runtime.manifest",
+            ArtifactLifecycle::Canonical,
+            None,
+            vec![],
+        );
+        let evidence_ref = |kind| ArtifactRef {
+            artifact_id: akzio_domain::ArtifactId(hash.clone()),
+            kind,
+        };
+        let evaluation = evidence_ref(ArtifactKind::Evaluation);
+        let mut qualification = ModelQualificationReport {
+            key: manifest.runtime_identity().qualification_key().unwrap(),
+            behavior_fingerprint: hash.clone(),
+            evidence: ModelQualificationEvidence {
+                frozen_context_manifest: evidence_ref(ArtifactKind::ContextManifest),
+                replay_evaluation: evaluation.clone(),
+                adversarial_evaluation: evaluation.clone(),
+                execution_simulation_evaluation: evaluation.clone(),
+                shadow_evaluation: evaluation.clone(),
+                canary_evaluation: evaluation,
+            },
+            replay_passed: true,
+            adversarial_passed: true,
+            execution_simulation_passed: true,
+            shadow_passed: true,
+            canary_passed: true,
+            critical_regressions: 0,
+            approved_by: "fixture".into(),
+            qualified_at: now,
+            expires_at,
+            report_hash: hash.clone(),
+        };
+        qualification.report_hash = qualification.unsigned_hash();
+        let manifest_ref = artifact_ref(&manifest_artifact);
+        let mut approval = PaperLaunchApproval {
+            schema_version: DOMAIN_SCHEMA_VERSION,
+            operator_identity: "fixture".into(),
+            runtime_manifest: manifest_ref.clone(),
+            runtime_manifest_hash: manifest.manifest_hash().unwrap(),
+            scope: PaperApprovalScope::Canary,
+            reason: "offline execution risk regression".into(),
+            behavior_bundle_hash: None,
+            approved_at: now,
+            expires_at,
+            qualification,
+            mandate: Default::default(),
+            approval_hash: hash,
+        };
+        approval.approval_hash = approval.unsigned_hash().unwrap();
+        let approval = stage(
+            ArtifactKind::PaperLaunchApproval,
+            store.stage_json(&approval).unwrap(),
+            "operator.paper_approval",
+            ArtifactLifecycle::Canonical,
+            None,
+            vec![manifest_ref],
+        );
+        let proposal = stage(
+            ArtifactKind::WorkflowProposal,
+            store
+                .stage_json(&WorkflowProposal {
+                    schema_version: DOMAIN_SCHEMA_VERSION,
+                    topology_id: topology_id.into(),
+                    tasks: Default::default(),
+                    stop_reason: None,
+                })
+                .unwrap(),
+            "runtime.paper_provisioning",
+            ArtifactLifecycle::RunScoped,
+            Some(run_origin),
+            vec![],
+        );
+        let reservation = SessionReservation {
+            session_key: now.date_naive().to_string(),
+            workflow: WorkflowCommit {
+                run: StoredRun {
+                    run_id,
+                    purpose: RunPurpose::Paper,
+                    topology_id: topology_id.into(),
+                    graph_artifact_id: graph.artifact_id.clone(),
+                    created_at: now,
+                },
+                graph,
+                nodes: vec![node],
+            },
+            setup_artifacts: vec![],
+            reserved_at: now,
+        };
+        let lease = store
+            .acquire_daemon_lease("scheduler", "fixture", now, expires_at)
+            .unwrap()
+            .unwrap();
+        store
+            .reserve_paper_session_with_approval(
+                &lease,
+                &reservation,
+                &proposal,
+                &manifest_artifact,
+                &approval,
+            )
+            .unwrap();
+        store
+            .claim_next_task_for_workload(
+                "fixture",
+                now,
+                Duration::minutes(1),
+                TaskWorkload::Session,
+            )
+            .unwrap()
+            .unwrap()
+            .permit
+    }
+
+    /// WHY THIS TEST EXISTS (Task #3): A SOXX buy can fill before the QQQ sell,
+    /// taking gross exposure to 350000.6 ppm against the frozen 350000 ppm cap.
+    /// Do not weaken or delete this assertion.
+    #[test]
+    fn evaluate_blocks_sub_ppm_gross_excess_from_buy_before_sale() {
+        use akzio_domain::{
+            ClaimStance, DecisionValidity, EvidenceGround, HorizonDecisionTrace,
+            InvestmentLogicTrace, LifecycleEventType, ResearchClaim, DOMAIN_SCHEMA_VERSION,
+        };
+
+        let now = Utc::now();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/execution-risk-tests")
+            .join(RunId::new().0);
+        let store = Store::open(root).unwrap();
+        let runtime =
+            ExecutionRuntime::new(store.clone(), Default::default(), Default::default()).unwrap();
+        let mut frozen = policy_with_positive_calibration_bin(now);
+        frozen.max_gross_weight = WeightPpm(350_000);
+        let policy_hash = install_policy(&store, &frozen, now);
+        let permit = reserve_approved_execution(&store, &policy_hash, now);
+        let mut account = fixtures::account(
+            now,
+            BTreeMap::from([(
+                Asset::Qqq,
+                Position {
+                    quantity_micros: 1_250_000,
+                    market_value: MoneyMicros(125_000_600),
+                },
+            )]),
+        );
+        account.equity = MoneyMicros(1_000_000_000);
+        account.buying_power = account.equity;
+        let broker_session = now.date_naive().to_string();
+        let mut quotes = fixtures::quotes(now, 99_999_999, 100_000_001);
+        let quote = quotes.quotes[&Asset::Tqqq];
+        quotes.quotes = BTreeMap::from([(Asset::Qqq, quote), (Asset::Soxx, quote)]);
+        let mut clock = fixtures::clock(now);
+        account.broker_session = broker_session.clone();
+        quotes.broker_session = broker_session.clone();
+        clock.broker_session = broker_session;
+
+        let persist = |kind, blob, sources| {
+            let lifecycle = match kind {
+                ArtifactKind::ContextManifest | ArtifactKind::Claim => ArtifactLifecycle::RunScoped,
+                _ => ArtifactLifecycle::Canonical,
+            };
+            let artifact = Artifact::new(
+                kind,
+                blob,
+                "fixture.execution",
+                lifecycle,
+                crate::trusted_execution_provenance(&permit, now),
+                Some(permit.artifact_origin()),
+                sources,
+                now,
+            )
+            .unwrap();
+            store
+                .write_task_artifact(
+                    &permit,
+                    &artifact,
+                    LifecycleEventType::ArtifactCommitted,
+                    now,
+                )
+                .unwrap();
+            artifact_ref(&artifact)
+        };
+        let manifest = persist(
+            ArtifactKind::ContextManifest,
+            store
+                .stage_json(&ContextManifestPayload {
+                    schema_version: DOMAIN_SCHEMA_VERSION,
+                    contract_hash: ContentHash::of_bytes(b"gate fixture synth contract"),
+                    selections: vec![],
+                    quarantined: vec![],
+                    total_bytes: 0,
+                    projected_bytes: None,
+                    estimated_tokens: 0,
+                    input_hash: ContentHash::of_bytes(b"execution risk evidence"),
+                })
+                .unwrap(),
+            vec![],
+        );
+        let snapshot = |blob| persist(ArtifactKind::NormalizedEvidence, blob, vec![]);
+        let quotes = snapshot(store.stage_json(&quotes).unwrap());
+        let claim = persist(
+            ArtifactKind::Claim,
+            store
+                .stage_json(&ResearchClaim {
+                    schema_version: DOMAIN_SCHEMA_VERSION,
+                    topic: "SOXX".into(),
+                    statement: "Shift the target to SOXX".into(),
+                    horizon: DecisionHorizon::T1,
+                    stance: ClaimStance::Bullish,
+                    materiality_ppm: WeightPpm::SCALE,
+                    confidence_ppm: WeightPpm::SCALE,
+                    grounds: vec![EvidenceGround {
+                        evidence: quotes.clone(),
+                        support: "Frozen executable SOXX quote".into(),
+                        role: Default::default(),
+                        assets: BTreeSet::from([Asset::Soxx]),
+                        domain: None,
+                    }],
+                    evidence_gaps: vec![],
+                })
+                .unwrap(),
+            vec![quotes.clone()],
+        );
+        let mut decision = fixtures::decision_context(now, 0);
+        decision.decision_policy_hash = policy_hash;
+        decision.portfolio_risk.risk_model_hash = Some(
+            content_hash_json(&serde_json::to_value(&frozen.portfolio_risk_model).unwrap())
+                .unwrap(),
+        );
+        decision
+            .target
+            .weights
+            .insert(Asset::Soxx, WeightPpm(225_225));
+        decision.run_id = permit.run_id.clone();
+        decision.claims = vec![claim.clone()];
+        decision.validity = Some(DecisionValidity {
+            evidence_cutoff: now,
+            generated_at: now,
+            valid_until: now + Duration::seconds(60),
+            maximum_execution_delay_ms: 60_000,
+            market_state_hash: manifest.artifact_id.0.clone(),
+        });
+        decision.horizon_trace = Some(HorizonDecisionTrace {
+            sleeves: vec![],
+            conflicts: vec![],
+        });
+        decision.investment_logic = Some(InvestmentLogicTrace {
+            observed_events: vec![],
+            accepted_premises: vec![claim.clone()],
+            rejected_premises: vec![],
+            alternatives_considered: vec![],
+            selected_action_hash: content_hash_json(
+                &serde_json::to_value(&decision.target).unwrap(),
+            )
+            .unwrap(),
+            invalidation_conditions: vec!["Quote expires".into()],
+            quality: Default::default(),
+            consensus_diversity: None,
+            stage_latencies: Default::default(),
+        });
+        let input = ExecutionGateInput {
+            decision_context: persist(
+                ArtifactKind::DecisionContext,
+                store.stage_json(&decision).unwrap(),
+                vec![manifest, claim],
+            ),
+            account_snapshot: Some(snapshot(store.stage_json(&account).unwrap())),
+            quote_snapshot: Some(quotes),
+            market_clock_snapshot: Some(snapshot(store.stage_json(&clock).unwrap())),
+            quote_validation_error: None,
+            pretrade_safety: Some(pretrade(now)),
+            permit,
+            now,
+        };
+        let output = runtime.evaluate(&input).unwrap();
+        let plan: crate::ExecutionPlan = runtime
+            .read_payload(
+                output
+                    .execution_plan
+                    .as_ref()
+                    .expect("the allocation must be assessed"),
+            )
+            .unwrap();
+        assert_eq!(plan.orders.len(), 2);
+        for (asset, side, qty, limit_price) in [
+            (Asset::Qqq, crate::OrderSide::Sell, "1.250000", "99.900000"),
+            (Asset::Soxx, crate::OrderSide::Buy, "2.250000", "100.100000"),
+        ] {
+            let order = plan
+                .orders
+                .iter()
+                .find(|order| order.asset == asset)
+                .unwrap();
+            assert_eq!(order.side, side);
+            let request = crate::paper::order_request(order, "wire-risk-fixture").unwrap();
+            assert_eq!(request["qty"], qty);
+            assert_eq!(request["limit_price"], limit_price);
+        }
+        let verdict: ExecutionVerdict = runtime.read_payload(&output.verdict).unwrap();
+        let ExecutionVerdict::NoOrder { no_order } = verdict else {
+            panic!("the 350000.6 ppm buy-before-sale corner must be rejected, got {verdict:?}");
+        };
+        assert_eq!(no_order.blockers, [HardBlocker::FactorLimit]);
     }
 
     /// WHY THIS TEST EXISTS (Task #3): A protected sell limit can remove more

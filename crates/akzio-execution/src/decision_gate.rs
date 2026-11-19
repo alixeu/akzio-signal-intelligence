@@ -376,13 +376,6 @@ pub(crate) struct FillRisk {
 }
 
 impl FillRisk {
-    pub fn increases_over(&self, before: &Self) -> bool {
-        self.variance_numerator > before.variance_numerator
-            || self.beta_ppm > before.beta_ppm
-            || self.expected_shortfall_ppm > before.expected_shortfall_ppm
-            || self.gap_loss_ppm > before.gap_loss_ppm
-    }
-
     pub fn within_volatility_limit(&self, limit_ppm: u32, negative_terms: u128) -> bool {
         let limit = u128::from(limit_ppm);
         let historical_variance_upper =
@@ -995,7 +988,11 @@ impl DecisionPolicy {
         Ok((rounded, numerator))
     }
 
-    fn weighted_linear_risks(&self, target: &TargetPortfolio) -> Result<[u32; 3], DomainError> {
+    fn weighted_linear_risks(
+        &self,
+        target: &TargetPortfolio,
+        round_up: bool,
+    ) -> Result<[u32; 3], DomainError> {
         let aggregate = |selector: fn(&AssetRiskCalibration) -> u32| {
             Asset::EXECUTABLE
                 .into_iter()
@@ -1012,12 +1009,17 @@ impl DecisionPolicy {
                     Ok::<_, DomainError>(sum.saturating_add(weight.saturating_mul(value)))
                 })
         };
-        // 汇总值除以 ppm scale 后窄化为 u32；超范围明确返回错误，不静默截断。
+        // Execution rounds the exact linear sum up to enforce integer caps.
+        // Decision retains its historical reported ppm values.
         let scaled = |value: u128| {
-            u32::try_from(value / u128::from(WeightPpm::SCALE)).map_err(|_| {
-                DomainError::InvalidBudget {
-                    field: "portfolio_risk_assessment",
-                }
+            let scale = u128::from(WeightPpm::SCALE);
+            let ppm = if round_up {
+                value.div_ceil(scale)
+            } else {
+                value / scale
+            };
+            u32::try_from(ppm).map_err(|_| DomainError::InvalidBudget {
+                field: "portfolio_risk_assessment",
             })
         };
         Ok([
@@ -1027,14 +1029,20 @@ impl DecisionPolicy {
         ])
     }
 
-    pub(crate) fn fill_risk(&self, target: &TargetPortfolio) -> Result<FillRisk, DomainError> {
+    pub(crate) fn fill_variance_numerator(
+        &self,
+        target: &TargetPortfolio,
+    ) -> Result<u128, DomainError> {
         let (_, numerator) = self.weighted_variance(target)?;
-        let variance_numerator =
-            u128::try_from(numerator).map_err(|_| DomainError::InvalidBudget {
-                field: "portfolio_risk_model.variance",
-            })?;
+        u128::try_from(numerator).map_err(|_| DomainError::InvalidBudget {
+            field: "portfolio_risk_model.variance",
+        })
+    }
+
+    pub(crate) fn fill_risk(&self, target: &TargetPortfolio) -> Result<FillRisk, DomainError> {
+        let variance_numerator = self.fill_variance_numerator(target)?;
         let [beta_ppm, expected_shortfall_ppm, gap_loss_ppm] =
-            self.weighted_linear_risks(target)?;
+            self.weighted_linear_risks(target, true)?;
         Ok(FillRisk {
             variance_numerator,
             beta_ppm,
@@ -1055,7 +1063,7 @@ impl DecisionPolicy {
             });
         }
         let [beta_ppm, expected_shortfall_ppm, gap_loss_ppm] =
-            self.weighted_linear_risks(target)?;
+            self.weighted_linear_risks(target, false)?;
         // 风险计算可能从多处收集同一资产，排序并去重后再写入快照，确保审计值稳定。
         liquidity_binding_assets.sort();
         liquidity_binding_assets.dedup();
@@ -1348,6 +1356,29 @@ pub(crate) mod decision_trace_tests {
                 max_leveraged_holding_days: 5,
             },
         }
+    }
+
+    /// WHY THIS TEST EXISTS (Task #3): An exact linear fill risk above an integer
+    /// cap must be rejected while historical Decision ppm reports retain their rounding.
+    /// Do not weaken or delete this assertion.
+    #[test]
+    fn fill_risk_rounds_linear_cap_inputs_up_without_changing_decision_reports() {
+        let mut policy = policy_with_positive_calibration_bin(Utc::now());
+        policy.max_portfolio_beta_ppm = 25_000;
+        let mut target = TargetPortfolio::zeroed();
+        target.weights.insert(Asset::Qqq, WeightPpm(250_001));
+        let decision = policy.assess_target(&target, vec![]).unwrap();
+        assert_eq!(decision.beta_ppm, Some(25_000));
+        assert_eq!(decision.expected_shortfall_ppm, Some(2_500));
+        assert_eq!(decision.gap_loss_ppm, Some(2_500));
+
+        let fill = policy.fill_risk(&target).unwrap();
+        assert_eq!(fill.beta_ppm, 25_001);
+        assert_eq!(fill.expected_shortfall_ppm, 2_501);
+        assert_eq!(fill.gap_loss_ppm, 2_501);
+        assert!(!policy
+            .fits_fill_target(&target, &fill, 0, WeightPpm::SCALE)
+            .unwrap());
     }
 
     fn neutral_forecasts(valid_until: DateTime<Utc>) -> Vec<Forecast> {
