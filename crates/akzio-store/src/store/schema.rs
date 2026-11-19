@@ -71,6 +71,25 @@ impl Store {
         })
     }
 
+    /// Run a synchronous read against one SQLite snapshot on a dedicated read-only connection.
+    /// The transaction is pinned by the first read. No Store mutex is held across the callback.
+    pub fn with_read_snapshot<T, E: From<StoreError>>(
+        &self,
+        read: impl FnOnce(&Self) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let snapshot = Self::open_existing(self.root())?;
+        snapshot
+            .connection()?
+            .execute_batch("BEGIN DEFERRED")
+            .map_err(StoreError::from)?;
+        let result = read(&snapshot);
+        let close = snapshot.connection().and_then(|connection| {
+            connection.execute_batch("ROLLBACK")?;
+            Ok(())
+        });
+        result.and_then(|value| close.map(|()| value).map_err(E::from))
+    }
+
     /// Open an initialized Store Root read-only, or initialize it when the
     /// database does not exist yet. Existing Stores are never migrated through
     /// this seam.

@@ -106,10 +106,14 @@ impl Daemon {
     pub(crate) fn replay_report(&self, run_id: &RunId) -> Result<ReplayReport> {
         // 只从 durable workflow 和 lifecycle health 生成计数投影；Failed/Cancelled 也属于
         // terminal_task_count，不等于成功节点或成功 Run。
-        let snapshot = self.workflow.replay_run(run_id)?;
-        let lifecycle = Some(self.store.run_lifecycle_health(run_id)?);
+        let (snapshot, lifecycle) =
+            self.workflow.with_replayed_run(run_id, |snapshot, store| {
+                #[cfg(test)]
+                replay_tests::before_lifecycle();
+                Ok((snapshot, store.run_lifecycle_health(run_id)?))
+            })?;
         Ok(ReplayReport {
-            lifecycle,
+            lifecycle: Some(lifecycle),
             run_id: snapshot.run.run_id,
             purpose: snapshot.run.purpose,
             status: snapshot.status,
@@ -169,5 +173,117 @@ impl Daemon {
         // 被取消的在途请求已撤销或订单已补偿。
         self.store.write_freeze_state(frozen, reason, Utc::now())?;
         self.health()
+    }
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::sync::mpsc::{channel, RecvTimeoutError};
+
+    thread_local! {
+        static BEFORE_LIFECYCLE: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn before_lifecycle() {
+        if let Some(write) = BEFORE_LIFECYCLE.with(|hook| hook.borrow_mut().take()) {
+            write();
+        }
+    }
+
+    /// WHY THIS TEST EXISTS (Task #21): A concurrent journal append must not mix Replay's event cursor with a newer lifecycle state.
+    /// Do not weaken or delete this assertion.
+    #[tokio::test]
+    async fn replay_report_uses_one_watermark_during_a_journal_append() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/replay-snapshot-tests")
+            .join(RunId::new().0);
+        let daemon = Daemon::with_model(
+            DaemonConfig {
+                agent_budget: Default::default(),
+                research_settings: Default::default(),
+                outcome_processing: false,
+                store_root: root.clone(),
+                http_token: "replay-fixture-token".into(),
+                worker_count: 1,
+                auto_paper: false,
+                market_data_feed: None,
+                outcome_cost_model: akzio_domain::OutcomeCostModel {
+                    transaction_cost_ppm: 0,
+                    slippage_ppm: 0,
+                },
+                decision_policy: Default::default(),
+                runtime_identity_hash: None,
+                historical_evaluation_condition: None,
+                model_knowledge_cutoff: None,
+                run_log: None,
+            },
+            crate::fixture_model_client(),
+        )
+        .unwrap();
+        let run = daemon
+            .launch_formal_run(RunPurpose::PositionPlan, "replay-snapshot-fixture")
+            .await
+            .unwrap()
+            .run_id;
+        let before = daemon.replay_report(&run).unwrap();
+        assert_eq!(before.status, WorkflowStatus::Queued);
+        let writer = Store::open(&root).unwrap();
+        let (start, read_has_replayed) = channel();
+        let (completed, writer_finished) = channel();
+        let writer_run = run.clone();
+        let writer = std::thread::spawn(move || {
+            read_has_replayed.recv().unwrap();
+            let log = writer
+                .record_run_log_status(&writer_run, "T0", "opened", &serde_json::json!({}))
+                .unwrap();
+            let claimed = writer
+                .claim_next_task_for_workload(
+                    "replay-snapshot-writer",
+                    Utc::now(),
+                    Duration::minutes(1),
+                    akzio_store::TaskWorkload::Any,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(claimed.run_id, writer_run);
+            let _ = completed.send(());
+            log.artifact_id
+        });
+        BEFORE_LIFECYCLE.with(|hook| {
+            hook.replace(Some(Box::new(move || {
+                start.send(()).unwrap();
+                // Rollback-journal SQLite can wait to commit until the read snapshot is released.
+                match writer_finished.recv_timeout(std::time::Duration::from_secs(1)) {
+                    Ok(()) | Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => panic!("concurrent writer failed"),
+                }
+            })));
+        });
+        let during = daemon.replay_report(&run);
+        BEFORE_LIFECYCLE.with(|hook| drop(hook.take()));
+        let writer_result = writer.join();
+        let during = during.unwrap();
+        let log_id = writer_result.unwrap();
+        assert_eq!(during.event_cursor, before.event_cursor);
+        assert_eq!(during.revision, before.revision);
+        assert_eq!(during.status, WorkflowStatus::Queued);
+        assert_eq!(
+            during.lifecycle.unwrap().execution_status,
+            WorkflowStatus::Queued,
+            "lifecycle and replay must read the same watermark"
+        );
+
+        let after = daemon.replay_report(&run).unwrap();
+        assert!(after.event_cursor > during.event_cursor);
+        assert_eq!(after.status, WorkflowStatus::Running);
+        assert_eq!(after.lifecycle.unwrap().execution_status, after.status);
+        assert!(daemon
+            .store
+            .events_after(&run, during.event_cursor, 100)
+            .unwrap()
+            .iter()
+            .any(|event| event.artifact_id.as_ref() == Some(&log_id)));
     }
 }

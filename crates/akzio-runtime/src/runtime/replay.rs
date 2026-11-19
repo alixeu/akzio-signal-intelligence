@@ -41,6 +41,26 @@ impl WorkflowRuntime {
     }
 
     pub fn replay_run(&self, run_id: &RunId) -> RuntimeResult<WorkflowSnapshot> {
+        self.with_replayed_run(run_id, |snapshot, _| Ok(snapshot))
+    }
+
+    /// Validate Replay and read its companion projection at the same event cursor and revision.
+    pub fn with_replayed_run<T>(
+        &self,
+        run_id: &RunId,
+        project: impl FnOnce(WorkflowSnapshot, &Store) -> Result<T, StoreError>,
+    ) -> RuntimeResult<T> {
+        self.store.with_read_snapshot(|store| {
+            let runtime = Self {
+                store: store.clone(),
+                ..self.clone()
+            };
+            let snapshot = runtime.replay_snapshot(run_id)?;
+            Ok(project(snapshot, store)?)
+        })
+    }
+
+    fn replay_snapshot(&self, run_id: &RunId) -> RuntimeResult<WorkflowSnapshot> {
         // reduce→revision→snapshot 三段都成功才返回；明确的不一致记为
         // ReplayDiverged，Store/JSON/Domain 读取或校验错误仍可原类型传播。
         let replay = self.reduce_history(run_id)?;

@@ -178,6 +178,14 @@ impl WorkflowRuntime {
                 }
                 replay.cancel_requested = true;
             }
+            LifecycleEventType::RunLogStatusChanged => {
+                let artifact_id = event.artifact_id.as_ref().ok_or_else(|| {
+                    Self::replay_error(run_id, "run.log.status_changed is missing its artifact id")
+                })?;
+                let artifact = self.store.artifact(artifact_id)?;
+                Self::validate_run_log_status_envelope(run_id, event, &artifact)?;
+                self.store.read_blob(&artifact.blob)?;
+            }
             LifecycleEventType::SchedulerSnapshotNeedCreated
             | LifecycleEventType::SchedulerWorkflowProposalCreated => {
                 self.reduce_session_setup_event(run_id, event)?;
@@ -345,6 +353,36 @@ impl WorkflowRuntime {
         Ok(())
     }
 
+    // 归档状态是 Run 级审计事实。核对 CAS 和原始 Run 身份后只推进事件游标。
+    fn validate_run_log_status_envelope(
+        run_id: &RunId,
+        event: &StoredEvent,
+        artifact: &Artifact,
+    ) -> RuntimeResult<()> {
+        artifact.validate()?;
+        let valid_origin = artifact.origin.as_ref().is_some_and(|origin| {
+            origin.run_id.as_ref() == Some(run_id)
+                && origin.task_id.is_none()
+                && origin.attempt_id.is_none()
+                && origin.contract_hash.is_none()
+        });
+        if event.task_id.is_some()
+            || event.attempt_id.is_some()
+            || event.artifact_id.as_ref() != Some(&artifact.artifact_id)
+            || artifact.kind != ArtifactKind::SemanticDetail
+            || artifact.lifecycle != ArtifactLifecycle::RunScoped
+            || artifact.producer != "run.log.status"
+            || artifact.provenance.source_family != "akzio.run_log"
+            || !valid_origin
+        {
+            return Err(Self::replay_error(
+                run_id,
+                "run.log.status_changed references an invalid Run log artifact",
+            ));
+        }
+        Ok(())
+    }
+
     /// The scheduler freezes a session's `EvidenceNeed`s and `WorkflowProposal`
     /// while it reserves the slot, before any task row exists, so these facts
     /// are run-level and touch no replayed task state. Replay still checks the
@@ -492,6 +530,63 @@ impl WorkflowRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WHY THIS TEST EXISTS (Task #21): Replay of a Run log event still rejects foreign log artifacts and mismatched CAS identities.
+    /// Do not weaken or delete this assertion.
+    #[test]
+    fn run_log_event_rejects_foreign_or_mismatched_artifact() {
+        let run_id = RunId::new();
+        let now = Utc::now();
+        let artifact = Artifact::new(
+            ArtifactKind::SemanticDetail,
+            akzio_domain::BlobRef {
+                hash: ContentHash::of_bytes(b"{}"),
+                media_type: "application/json".into(),
+                bytes: 2,
+            },
+            "run.log.status",
+            ArtifactLifecycle::RunScoped,
+            ArtifactProvenance {
+                source_family: "akzio.run_log".into(),
+                observed_at: None,
+                retrieved_at: now,
+                source_uri: None,
+                confidence_ppm: 1_000_000,
+                producer_contract_hash: None,
+            },
+            Some(ArtifactOrigin {
+                run_id: Some(RunId::new()),
+                task_id: None,
+                attempt_id: None,
+                contract_hash: None,
+            }),
+            vec![],
+            now,
+        )
+        .unwrap();
+        let mut event = StoredEvent {
+            cursor: 1,
+            run_id: run_id.clone(),
+            task_id: None,
+            attempt_id: None,
+            event_type: LifecycleEventType::RunLogStatusChanged.as_str().into(),
+            artifact_id: Some(artifact.artifact_id.clone()),
+            created_at: now,
+        };
+        assert!(matches!(
+            WorkflowRuntime::validate_run_log_status_envelope(&run_id, &event, &artifact),
+            Err(RuntimeError::ReplayDiverged { .. })
+        ));
+
+        event.run_id = artifact.origin.as_ref().unwrap().run_id.clone().unwrap();
+        event.artifact_id = Some(akzio_domain::ArtifactId(ContentHash::of_bytes(
+            b"another CAS id",
+        )));
+        assert!(matches!(
+            WorkflowRuntime::validate_run_log_status_envelope(&event.run_id, &event, &artifact),
+            Err(RuntimeError::ReplayDiverged { .. })
+        ));
+    }
 
     #[test]
     fn debug_record_envelope_rejects_foreign_origin_and_source() {
