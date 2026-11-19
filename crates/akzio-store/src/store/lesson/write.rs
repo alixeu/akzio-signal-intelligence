@@ -149,14 +149,14 @@ impl Store {
     pub(super) fn record_lesson_evidence_with_transaction(
         &self,
         transaction: &rusqlite::Transaction<'_>,
-        records: &[LessonEvidence],
+        records: Vec<(&LessonEvidence, StoreResult<()>)>,
         now: DateTime<Utc>,
     ) -> StoreResult<u64> {
         // 借用 PolicyEvaluation 的 Transaction 与记录切片；不会开连接或 commit。
         // 每条记录验证时间、head 与三个 ArtifactRef，按 lesson/context/outcome 唯一键幂等；
         // 返回新增行数，后续外层 evaluation 失败时本批插入也回滚。
         let mut inserted = 0_u64;
-        for record in records {
+        for (record, presentation) in records {
             record.validate()?;
             if record.recorded_at > now {
                 return Err(StoreError::InvalidLearningCommit(
@@ -246,6 +246,11 @@ impl Store {
                 }
                 continue;
             }
+            presentation?;
+            let outcome_artifact = read_artifact(transaction, &record.outcome.artifact_id)?;
+            let outcome: akzio_domain::Outcome =
+                self.read_artifact_payload_with_connection(transaction, &outcome_artifact)?;
+            record.validate_sealed_outcome_metrics(&outcome)?;
             transaction.execute(
             "INSERT INTO rebuild_lesson_evidence (evidence_id, lesson_id, lesson_artifact_id, decision_context_artifact_id, outcome_artifact_id, attribution, metrics_json, recorded_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
@@ -385,8 +390,8 @@ impl Store {
         Ok(lessons)
     }
 
-    // Usage 是 Artifact.source_refs 对 Lesson Artifact 的反向计数，ContextManifest 与 DecisionContext
-    // 分两次读取；latest_used_at 取两类已持久 Artifact 的最大 created_at，不代表用户实际查看过。
+    /// Count v71 requests with a verified presentation and formal Decisions that applied it.
+    /// Legacy reference counts remain observable separately from verified usage.
     pub fn lesson_usage(&self, lesson_id: &LessonId) -> StoreResult<LessonUsage> {
         let lesson = self
             .lesson(lesson_id)?
@@ -399,19 +404,56 @@ impl Store {
             &lesson.artifact.artifact_id,
             Some(ArtifactKind::DecisionContext),
         )?;
-        let latest_used_at = manifests
-            .iter()
-            .chain(decisions.iter())
-            .map(|artifact| artifact.created_at)
-            .max();
-        Ok(LessonUsage {
-            context_manifests: manifests.len() as u64,
-            decision_contexts: decisions.len() as u64,
-            latest_used_at,
-        })
+        let reference = ArtifactRef {
+            artifact_id: lesson.artifact.artifact_id,
+            kind: ArtifactKind::Lesson,
+        };
+        let mut usage = LessonUsage {
+            context_manifests: 0,
+            decision_contexts: 0,
+            latest_used_at: None,
+            legacy_manifest_refs: 0,
+            legacy_decision_refs: 0,
+        };
+        for manifest in manifests {
+            let payload: ContextManifestPayload =
+                serde_json::from_slice(&self.read_blob(&manifest.blob)?)?;
+            if !self.has_lesson_presentation_contract(&payload.contract_hash)? {
+                usage.legacy_manifest_refs += 1;
+                continue;
+            }
+            let proposals = self.artifacts_referencing(
+                &manifest.artifact_id,
+                Some(ArtifactKind::DecisionProposal),
+            )?;
+            for proposal in proposals {
+                if self.proposal_lesson_presentation(&proposal, &manifest)?
+                    .is_some_and(|shown| shown.contains(&reference))
+                {
+                    usage.context_manifests += 1;
+                    usage.latest_used_at = usage.latest_used_at.max(Some(proposal.created_at));
+                    break;
+                }
+            }
+        }
+        for decision in decisions {
+            match self.decision_lesson_presentation(&decision)? {
+                None => usage.legacy_decision_refs += 1,
+                Some(shown) if shown.contains(&reference) => {
+                    let context: akzio_domain::DecisionContext =
+                        serde_json::from_slice(&self.read_blob(&decision.blob)?)?;
+                    if context.applied_learning_refs.contains(&reference) {
+                        usage.decision_contexts += 1;
+                        usage.latest_used_at = usage.latest_used_at.max(Some(decision.created_at));
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(usage)
     }
 
-    /// Move every Active Lesson whose verifier validity or actual usage budget
+    /// Move every Active Lesson whose verifier validity or governance usage budget
     /// has elapsed to a new immutable Contested revision. This scan never runs
     /// a verifier and never reactivates a Lesson. Repeated scans are idempotent
     /// because only current Active heads are eligible.
@@ -453,9 +495,7 @@ impl Store {
                 ))
             })?;
             let usage = self.lesson_usage(&lesson_id)?;
-            let usage_count = usage
-                .context_manifests
-                .saturating_add(usage.decision_contexts);
+            let usage_count = usage.governance_count();
             let validity_due = governance.valid_until.is_some_and(|until| now > until)
                 || governance.quarantine_reason.is_some()
                 || governance.contradiction_count > 0
@@ -467,7 +507,7 @@ impl Store {
                 )
             } else if usage_due {
                 format!(
-                    "[revalidation_due:usage_budget] actual usage_count={usage_count} reached max_usage_before_revalidation={}",
+                    "[revalidation_due:usage_budget] governance usage_count={usage_count} reached max_usage_before_revalidation={}",
                     governance.max_usage_before_revalidation
                 )
             } else {
@@ -761,5 +801,158 @@ impl Store {
             self.read_lesson_artifact(transaction, reference)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod lesson_evidence_tests {
+    use super::*;
+    use akzio_domain::{LessonGovernance, LessonScope, Outcome, OutcomeId};
+    use serde_json::json;
+
+    /// WHY THIS TEST EXISTS (Task #34): the Store must reject forged utility and calibration before any first LessonEvidence insertion.
+    /// Do not weaken or delete this assertion.
+    #[test]
+    fn first_lesson_evidence_insert_checks_the_sealed_outcome_and_rolls_back() {
+        let store = Store::open(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/lesson-evidence-tests")
+                .join(RunId::new().0),
+        )
+        .unwrap();
+        let now = Utc::now();
+        let stage = |kind, payload: &Value, sources| {
+            Artifact::new(
+                kind,
+                store.stage_json(payload).unwrap(),
+                "learning.lesson.evidence.fixture",
+                ArtifactLifecycle::Canonical,
+                ArtifactProvenance {
+                    source_family: "akzio.learning".into(),
+                    observed_at: None,
+                    retrieved_at: now,
+                    source_uri: None,
+                    confidence_ppm: 1_000_000,
+                    producer_contract_hash: None,
+                },
+                None,
+                sources,
+                now,
+            )
+            .unwrap()
+        };
+        let reference = |artifact: &Artifact| ArtifactRef {
+            artifact_id: artifact.artifact_id.clone(),
+            kind: artifact.kind,
+        };
+        let market = stage(
+            ArtifactKind::SemanticDetail,
+            &json!({"fixture":"market"}),
+            vec![],
+        );
+        let lesson = Lesson {
+            schema_version: DOMAIN_SCHEMA_VERSION,
+            lesson_id: LessonId("sealed-metric-fixture".into()),
+            origin: LessonOrigin::Operator,
+            lifecycle: LessonLifecycle::Active,
+            title: "Outcome metric evidence".into(),
+            statement: "Confirm exact realized utility.".into(),
+            rationale: "Test the first persisted measurement.".into(),
+            recommended_behavior: "Read the sealed Outcome metrics.".into(),
+            exclusions: vec![],
+            scope: LessonScope {
+                assets: [Asset::Qqq].into(),
+                ..Default::default()
+            },
+            source_refs: vec![reference(&market)],
+            supersedes: vec![],
+            conflicts_with: vec![],
+            confidence_ppm: 1_000_000,
+            authored_by: Some("fixture author".into()),
+            approved_by: Some("fixture reviewer".into()),
+            created_at: now,
+            updated_at: now,
+            governance: Some(LessonGovernance::operator_reviewed(now)),
+        };
+        let lesson = store.write_lesson(&lesson, &market, now).unwrap().lesson;
+        let context = stage(
+            ArtifactKind::DecisionContext,
+            &json!({"fixture":"decision"}),
+            vec![],
+        );
+        let schedule = stage(
+            ArtifactKind::OutcomeSchedule,
+            &json!({"fixture":"schedule"}),
+            vec![reference(&context)],
+        );
+        let outcome = Outcome {
+            schema_version: DOMAIN_SCHEMA_VERSION,
+            outcome_id: OutcomeId("sealed-metric-fixture".into()),
+            schedule: reference(&schedule),
+            market_evidence: vec![reference(&market)],
+            metric_basis: None,
+            windows: OutcomeHorizon::ALL.into_iter().zip([1_i64, 3, 5]).map(|(horizon, value)| {
+                serde_json::from_value(json!({"horizon":horizon, "observed_trading_day":
+                    now.date_naive() - chrono::Duration::days(7 - value), "portfolio_return_ppm":value,
+                    "benchmark_return_ppm":0, "transaction_cost_ppm":0, "slippage_ppm":0, "utility_ppm":value})).unwrap()
+            }).collect(),
+            sealed_at: Some(now),
+        };
+        let outcomes = stage(
+            ArtifactKind::Outcome,
+            &json!(outcome),
+            vec![reference(&schedule), reference(&market)],
+        );
+        {
+            let mut connection = store.connection().unwrap();
+            let tx = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            for artifact in [&context, &schedule, &outcomes] {
+                insert_artifact(&tx, artifact).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let record = LessonEvidence {
+            schema_version: DOMAIN_SCHEMA_VERSION,
+            lesson_id: lesson.lesson.lesson_id,
+            lesson_artifact: reference(&lesson.artifact),
+            decision_context: reference(&context),
+            outcome: reference(&outcomes),
+            attribution: LessonAttribution::Applied,
+            utility_ppm_by_horizon: [1, 3, 5],
+            calibration_ppm_by_horizon: [None; 3],
+            recorded_at: now,
+        };
+        let insert = |record: &LessonEvidence| -> StoreResult<u64> {
+            let mut connection = store.connection()?;
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // Presentation proof is computed by the outer writer. Exercise its
+            // real insertion path with that precondition already satisfied.
+            let inserted =
+                store.record_lesson_evidence_with_transaction(&tx, vec![(record, Ok(()))], now)?;
+            tx.commit()?;
+            Ok(inserted)
+        };
+        let wrong_utility = LessonEvidence {
+            utility_ppm_by_horizon: [2, 3, 5],
+            ..record.clone()
+        };
+        let invented_calibration = LessonEvidence {
+            calibration_ppm_by_horizon: [Some(0), None, None],
+            ..record.clone()
+        };
+        for invalid in [&wrong_utility, &invented_calibration] {
+            assert!(matches!(
+                insert(invalid),
+                Err(StoreError::Domain(DomainError::InvalidBudget {
+                    field: "lesson_evidence.outcome_metrics",
+                }))
+            ));
+            assert!(store.lesson_evidence(&record.lesson_id).unwrap().is_empty());
+        }
+        assert_eq!(insert(&record).unwrap(), 1);
+        assert_eq!(insert(&record).unwrap(), 0);
+        assert_eq!(store.lesson_evidence(&record.lesson_id).unwrap(), [record]);
     }
 }

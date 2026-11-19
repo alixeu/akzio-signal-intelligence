@@ -42,11 +42,13 @@ impl ContextBroker {
     /// document. Full source bytes remain bounded by max_source_bytes and
     /// compact projection bytes consume max_bytes. Range reads are available
     /// only when the caller's Contract exposes the Outcome tool.
-    fn projection_budget(&self, artifact: &Artifact) -> ContextResult<(u64, u32)> {
-        // 输入：Artifact 的借用；输出：projection 字节数和估算 token 数，底层读取/序列化失败经 Result 返回。
+    fn projection_budget(
+        &self,
+        artifact: &Artifact,
+        lesson_bodies: bool,
+    ) -> ContextResult<(u64, u32)> {
         // source blob bytes 与模型收到的 compact projection bytes 分开计算，调用方随后分别比较 source/Context 上限。
-        let value = self.document_value(artifact)?;
-        let projection = compact_governed_projection(artifact.kind, value);
+        let projection = self.projected_document(artifact, lesson_bodies)?;
         let bytes = u64::try_from(serde_json::to_vec(&projection)?.len())
             .map_err(|_| ContextError::BudgetExceeded)?;
         Ok((bytes, estimate_tokens_from_bytes(bytes)))
@@ -302,6 +304,7 @@ impl ContextBroker {
                 .then_with(|| left.artifact_id.cmp(&right.artifact_id))
         });
         let policy = &child_contract.context;
+        let lesson_bodies = presents_lesson_bodies(child_contract);
         let mut selections = Vec::with_capacity(allowed.len());
         let mut total_bytes = 0_u64;
         let mut projected_bytes = 0_u64;
@@ -317,7 +320,7 @@ impl ContextBroker {
             if !self.overlay_is_eligible(&artifact)? {
                 continue;
             }
-            let (projected, tokens) = self.projection_budget(&artifact)?;
+            let (projected, tokens) = self.projection_budget(&artifact, lesson_bodies)?;
             // source bytes 衡量原始 CAS，projected bytes 衡量模型视图，tokens 是估算值；三者同时受 child policy 约束。
             let next_source_bytes = total_bytes.saturating_add(artifact.blob.bytes);
             let next_projected_bytes = projected_bytes.saturating_add(projected);
@@ -344,6 +347,17 @@ impl ContextBroker {
                 projected_bytes: Some(projected),
                 trust: context_trust(artifact.kind),
             });
+        }
+        if lesson_bodies {
+            self.omit_incomplete_lesson_groups(
+                &mut selections,
+                &mut total_bytes,
+                &mut estimated_tokens,
+            )?;
+            projected_bytes = selections
+                .iter()
+                .filter_map(|selection| selection.projected_bytes)
+                .sum();
         }
         if selections.len() < usize::from(policy.min_artifacts)
             || (child_contract.purpose.as_str() == RESEARCH_CRITIC_RECIPE_ID
@@ -571,14 +585,14 @@ impl ContextBroker {
             });
             if let Some(artifact) = candidates.iter().find(|a| {
                 // `find` 闭包用 projection_budget 计算试算值；错误在此处变成保守的 MAX，使该候选无法突破预算。
-                let (projected, estimated) = self.projection_budget(a).unwrap_or((u64::MAX, u32::MAX));
+                let (projected, estimated) = self.projection_budget(a, false).unwrap_or((u64::MAX, u32::MAX));
                 source_bytes.saturating_add(a.blob.bytes) <= Self::source_budget(policy)
                     && projected_bytes.saturating_add(projected) <= policy.max_bytes
                     && tokens.saturating_add(estimated) <= policy.max_tokens
                     && selected.len() < usize::from(policy.max_artifacts)
             }) {
                 // Some 表示本组找到预算内候选；None 只跳过该组，不把缺少一个 domain 误报为全局选择成功。
-                let (projected, estimated) = self.projection_budget(artifact)?;
+                let (projected, estimated) = self.projection_budget(artifact, false)?;
                 source_bytes += artifact.blob.bytes;
                 projected_bytes += projected;
                 tokens += estimated;

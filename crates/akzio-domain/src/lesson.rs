@@ -9,8 +9,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ArtifactKind, ArtifactRef, Asset, ContentHash, DecisionHorizon, DomainError, LessonId,
-    DOMAIN_SCHEMA_VERSION,
+    ArtifactKind, ArtifactRef, Asset, ContentHash, DecisionHorizon, DomainError, LessonId, Outcome,
+    OutcomeHorizon, DOMAIN_SCHEMA_VERSION,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -266,6 +266,19 @@ pub struct Lesson {
 }
 
 impl Lesson {
+    /// Full semantics of the v71 Synthesizer Lesson body.
+    pub fn synthesizer_projection(&self) -> serde_json::Value {
+        serde_json::json!({
+            "projection_version": 1,
+            "title": self.title,
+            "statement": self.statement,
+            "recommended_behavior": self.recommended_behavior,
+            "scope": self.scope,
+            "exclusions": self.exclusions,
+            "conflicts_with": self.conflicts_with,
+        })
+    }
+
     // 校验 Lesson 内容、引用边界、来源/生命周期/审批和治理 quarantine 约束。
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.schema_version != DOMAIN_SCHEMA_VERSION
@@ -441,6 +454,35 @@ impl LessonEvidence {
         {
             return Err(DomainError::InvalidBudget {
                 field: "lesson_evidence.calibration_ppm",
+            });
+        }
+        Ok(())
+    }
+
+    /// Read the three utility values from a sealed Outcome in T+1/T+3/T+5 order.
+    pub fn sealed_outcome_utility(outcome: &Outcome) -> Result<[i64; 3], DomainError> {
+        outcome.validate_sealed()?;
+        let mut utility = [0; 3];
+        for (value, horizon) in utility.iter_mut().zip(OutcomeHorizon::ALL) {
+            let window = outcome
+                .windows
+                .iter()
+                .find(|window| window.horizon == horizon)
+                .ok_or(DomainError::InvalidBudget {
+                    field: "outcome.windows",
+                })?;
+            *value = window.utility_ppm;
+        }
+        Ok(utility)
+    }
+
+    /// A single sealed Outcome supplies utility. Calibration requires a cohort.
+    pub fn validate_sealed_outcome_metrics(&self, outcome: &Outcome) -> Result<(), DomainError> {
+        if self.utility_ppm_by_horizon != Self::sealed_outcome_utility(outcome)?
+            || self.calibration_ppm_by_horizon != [None; 3]
+        {
+            return Err(DomainError::InvalidBudget {
+                field: "lesson_evidence.outcome_metrics",
             });
         }
         Ok(())

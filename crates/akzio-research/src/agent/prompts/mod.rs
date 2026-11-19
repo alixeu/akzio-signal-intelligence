@@ -12,6 +12,8 @@ pub(super) use phases::*;
 pub(super) const SHARED_GOVERNANCE_PROMPT: &str = include_str!("shared.md");
 pub(super) const ANALYST_FRESHNESS_GUIDANCE: &str = "\n\n候选 freshness v21：使用 Rust 的 time_basis.available_at、latest_completed_session 和 decision cutoff 评估内容新鲜度。检索时间本身绝不是新鲜度证明。将过期或缺失的覆盖报告为有范围的 evidence_gaps。\n";
 
+pub(super) const SYNTHESIZER_LESSON_PROJECTION_GUIDANCE: &str = "\n仅以下发了完整 lesson_projection 正文的 Lesson 作为可选研究参考。遵守资产、期限、市场状态、阶段、排除条件及显式冲突。每个已呈现的 Lesson 在 applied_learning_refs 或 rejected_learning_refs 中恰好声明一次。只有元数据或未呈现的 Lesson 不填写。Lesson 不替代方向证据、审查或执行授权。\n";
+
 pub(super) fn role_prompt(purpose: &str) -> ResearchResult<String> {
     // purpose 是安装 Contract 的稳定身份，只能命中当前允许的角色；未知值返回
     // 错误而不是读取任意路径。include_str! 的 Markdown 字节由 prompt registry 冻结，

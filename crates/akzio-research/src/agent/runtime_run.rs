@@ -982,6 +982,25 @@ impl AgentRuntime {
                         &validation_contract,
                         &validation_arguments,
                     )?;
+                    if validation_contract.version == akzio_domain::SYNTHESIZER_LESSON_PROJECTION_CONTRACT_VERSION
+                        && validation_contract.purpose.as_str() == RESEARCH_SYNTHESIZER_RECIPE_ID
+                    {
+                        let submit = accepted_synthesizer_submit.as_ref().ok_or_else(|| {
+                            ResearchError::InvalidOutput("missing accepted Synthesizer Submit provenance".to_owned())
+                        })?;
+                        let presented = validation_runtime.store.presented_lessons_for_result_turn(
+                            &validation_manifest.artifact,
+                            &validation_permit.artifact_origin(),
+                            &submit.result_turn,
+                            &submit.accepted_turn,
+                        )?;
+                        let draft: akzio_domain::DecisionDraft = serde_json::from_value(validation_arguments["result"].clone())?;
+                        if draft.applied_learning_refs.iter().chain(&draft.rejected_learning_refs)
+                            .any(|reference| reference.kind == ArtifactKind::Lesson && !presented.contains(reference))
+                        {
+                            return Err(ResearchError::InvalidOutput("Lesson was not presented to the result-producing Submit".to_owned()));
+                        }
+                    }
                     let (output, deliberation_note) = validation_runtime.extract_deliberation(
                         &validation_permit,
                         &validation_contract,

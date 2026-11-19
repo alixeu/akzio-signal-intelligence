@@ -359,6 +359,9 @@ pub struct DecisionContext {
     pub applied_learning_refs: Vec<ArtifactRef>,
     #[serde(default)]
     pub rejected_learning_refs: Vec<ArtifactRef>,
+    /// Selected Lesson versions without a full body in the result-producing request.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unpresented_lesson_refs: Vec<ArtifactRef>,
     pub material_conflicts: Vec<MaterialConflict>,
     pub hard_blockers: Vec<HardBlocker>,
     pub soft_warnings: Vec<SoftWarning>,
@@ -567,6 +570,15 @@ impl DecisionContext {
         {
             return Err(DomainError::EmptyField {
                 field: "decision_context.references",
+            });
+        }
+        if self.unpresented_lesson_refs.iter().any(|reference| {
+            reference.kind != ArtifactKind::Lesson
+                || self.applied_learning_refs.contains(reference)
+                || self.rejected_learning_refs.contains(reference)
+        }) {
+            return Err(DomainError::EmptyField {
+                field: "decision_context.unpresented_lesson_refs",
             });
         }
         // applied 与 rejected 必须是不同分类；同一引用不能同时声称已应用和已拒绝。

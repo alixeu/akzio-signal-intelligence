@@ -77,6 +77,28 @@ impl ActiveResearchCatalogue {
         self.install_candidate(store, &active.contract.contract_hash, &candidate, now)
     }
 
+    pub fn install_synthesizer_lesson_projection_candidate(
+        &self,
+        store: &Store,
+        now: DateTime<Utc>,
+    ) -> ResearchResult<InstalledContract> {
+        let active = self
+            .contracts
+            .contracts()
+            .find(|installed| installed.contract.purpose.as_str() == RESEARCH_SYNTHESIZER_RECIPE_ID)
+            .ok_or(ResearchError::MissingActiveContract(
+                RESEARCH_SYNTHESIZER_RECIPE_ID,
+            ))?;
+        let mut candidate = active.contract.clone();
+        candidate.version = akzio_domain::SYNTHESIZER_LESSON_PROJECTION_CONTRACT_VERSION;
+        candidate.prompt.version = candidate.version;
+        let mut role = store.read_blob(&candidate.prompt.role)?;
+        role.extend_from_slice(prompts::SYNTHESIZER_LESSON_PROJECTION_GUIDANCE.as_bytes());
+        candidate.prompt.role = store.stage_bytes(&role, "text/plain")?;
+        candidate.contract_hash = candidate.expected_hash()?;
+        self.install_candidate(store, &active.contract.contract_hash, &candidate, now)
+    }
+
     pub fn install_analyst_freshness_candidate(
         &self,
         store: &Store,

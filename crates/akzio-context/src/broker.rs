@@ -142,6 +142,7 @@ include!("context_broker/coverage.rs");
 include!("context_broker/selection.rs");
 include!("context_broker/grants.rs");
 include!("context_broker/materialization.rs");
+include!("context_broker/lesson_projection.rs");
 include!("context_broker/reads.rs");
 include!("context_broker/policy.rs");
 include!("context_broker/helpers.rs");

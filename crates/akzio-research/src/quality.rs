@@ -100,6 +100,24 @@ fn attempt_with_contract(
     objective: &str,
     candidate: Option<&ContentHash>,
 ) -> Result<(AgentRuntime, ClaimedAttempt)> {
+    attempt_with_contract_and_lease(
+        store,
+        catalogue,
+        role,
+        objective,
+        candidate,
+        Duration::minutes(10),
+    )
+}
+
+fn attempt_with_contract_and_lease(
+    store: &Store,
+    catalogue: crate::ContractCatalogue,
+    role: &str,
+    objective: &str,
+    candidate: Option<&ContentHash>,
+    lease_duration: Duration,
+) -> Result<(AgentRuntime, ClaimedAttempt)> {
     let now = Utc::now();
     let installed = match candidate {
         Some(hash) => catalogue.get(hash)?,
@@ -204,7 +222,7 @@ fn attempt_with_contract(
         .claim_next_task_for_workload(
             "research-quality",
             Utc::now(),
-            Duration::minutes(10),
+            lease_duration,
             TaskWorkload::Any,
         )?
         .ok_or_else(|| ResearchError::InvalidOutput("quality task unavailable".into()))?;
@@ -1829,6 +1847,846 @@ mod offline_quality_tests {
                 serde_json::from_slice(&store.read_blob(&claim.blob).unwrap()).unwrap();
             assert_eq!(persisted["grounds"][0]["fact"], fact);
             assert!(claim.source_refs.contains(&reference(&evidence)));
+        }
+    }
+
+    fn store_lesson(
+        store: &Store,
+        source: &Artifact,
+        slug: &str,
+        exclusions: Vec<String>,
+        conflicts_with: Vec<ArtifactRef>,
+    ) -> akzio_store::StoredLesson {
+        store_lesson_with_governance(
+            store,
+            source,
+            slug,
+            exclusions,
+            conflicts_with,
+            LessonGovernance::operator_reviewed(source.created_at),
+        )
+    }
+
+    fn store_lesson_with_governance(
+        store: &Store,
+        source: &Artifact,
+        slug: &str,
+        exclusions: Vec<String>,
+        conflicts_with: Vec<ArtifactRef>,
+        governance: LessonGovernance,
+    ) -> akzio_store::StoredLesson {
+        let now = source.created_at;
+        let lesson = Lesson {
+            schema_version: DOMAIN_SCHEMA_VERSION,
+            lesson_id: LessonId(slug.to_owned()),
+            origin: LessonOrigin::Operator,
+            lifecycle: LessonLifecycle::Active,
+            title: format!("Lesson {slug}"),
+            statement: format!("Scope the price review ({slug})."),
+            rationale: "private operational rationale".to_owned(),
+            recommended_behavior: format!("Check the matching horizon ({slug})."),
+            exclusions,
+            scope: LessonScope {
+                assets: [Asset::Qqq].into(),
+                horizons: [DecisionHorizon::T1].into(),
+                decision_stages: [RESEARCH_SYNTHESIZER_RECIPE_ID.to_owned()].into(),
+                ..Default::default()
+            },
+            source_refs: vec![reference(source)],
+            supersedes: vec![],
+            conflicts_with,
+            confidence_ppm: 1_000_000,
+            authored_by: Some("lesson fixture author".to_owned()),
+            approved_by: Some("lesson fixture approver".to_owned()),
+            created_at: now,
+            updated_at: now,
+            governance: Some(governance),
+        };
+        store.write_lesson(&lesson, source, now).unwrap().lesson
+    }
+
+    async fn synthesizer_request(
+        store: &Store,
+        catalogue: crate::ContractCatalogue,
+        contract_hash: &ContentHash,
+    ) -> (Value, ContextManifestPayload) {
+        let (runtime, claimed) = attempt_with_contract(
+            store,
+            catalogue,
+            RESEARCH_SYNTHESIZER_RECIPE_ID,
+            "Check how the model receives scoped Lessons.",
+            Some(contract_hash),
+        )
+        .unwrap();
+        // The normal Submit serializer and trace writer run with an offline response.
+        // The fixture response is intentionally not an accepted proposal.
+        let fixture = ModelClientAdapter::with_debug(
+            ModelClient::fixture_sequence([json!({
+                "output":[{"type":"message","content":[{"type":"output_text","text":"fixture only"}]}],
+                "usage":{"input_tokens":40,"output_tokens":10}
+            })]),
+            true,
+        );
+        let evidence = persist(
+            store,
+            &claimed.permit,
+            ArtifactKind::NormalizedEvidence,
+            "quality.synthesizer.neutral_evidence",
+            &json!({"resource":"bars:QQQ:1d", "source":"alpaca", "value":{"observation":"No directional signal."}}),
+            vec![],
+        ).unwrap();
+        let result = runtime
+            .run(
+                &claimed.permit,
+                &claimed.node,
+                [reference(&evidence)],
+                &fixture,
+                Utc::now(),
+            )
+            .await;
+        assert!(result.is_err());
+        let (turn, trace) = store
+            .recent_artifacts_by_kind(ArtifactKind::AgentTurn, 12)
+            .unwrap()
+            .into_iter()
+            .filter(|artifact| artifact.origin.as_ref() == Some(&claimed.permit.artifact_origin()))
+            .map(|artifact| {
+                let trace: Value =
+                    serde_json::from_slice(&store.read_blob(&artifact.blob).unwrap()).unwrap();
+                (artifact, trace)
+            })
+            .find(|(_, trace)| {
+                trace["lifecycle"]["status"] == "completed"
+                    && trace["domain_request"]["continuation"].is_null()
+            })
+            .unwrap_or_else(|| panic!("Synthesizer did not dispatch a fresh request: {result:?}"));
+        let request = trace["domain_request"].clone();
+        assert_eq!(request["phase"], "submit");
+        assert_eq!(request["tools"], json!([]));
+        let provider_request = &trace["response"]["model_debug"]["request"];
+        let provider_input: Value =
+            serde_json::from_str(provider_request["input"].as_str().unwrap()).unwrap();
+        assert_eq!(provider_input["context"], request["context"]);
+        assert_eq!(
+            provider_input["context_manifest"],
+            request["manifest_artifact_id"]
+        );
+        assert_eq!(provider_request["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(provider_request["tools"][0]["name"], "submit_result");
+        let manifest_id: ArtifactId =
+            serde_json::from_value(request["manifest_artifact_id"].clone()).unwrap();
+        assert!(turn
+            .source_refs
+            .iter()
+            .any(|reference| reference.artifact_id == manifest_id));
+        let manifest = store.artifact(&manifest_id).unwrap();
+        let payload = serde_json::from_slice(&store.read_blob(&manifest.blob).unwrap()).unwrap();
+        store
+            .commit_attempt(&claimed.permit, &[], TaskStatus::Failed, Utc::now())
+            .unwrap();
+        (request, payload)
+    }
+
+    /// WHY THIS TEST EXISTS (Task #34): v69's historical references still exhaust its Lesson budget without claiming model presentation.
+    /// Do not weaken or delete this assertion.
+    #[tokio::test]
+    async fn legacy_lesson_references_preserve_recall_and_contestation_budget() {
+        let root = OwnedExperiment(
+            std::env::temp_dir().join(format!("akzio-legacy-lesson-budget-{}", RunId::new())),
+        );
+        let store = Store::open(&root.0).unwrap();
+        let now = Utc::now();
+        let source = Artifact::new(
+            ArtifactKind::SemanticDetail,
+            store
+                .stage_json(&json!({"source":"legacy governance fixture"}))
+                .unwrap(),
+            "operator.lesson.source",
+            ArtifactLifecycle::Canonical,
+            ArtifactProvenance {
+                source_family: "akzio.operator".into(),
+                observed_at: None,
+                retrieved_at: now,
+                source_uri: None,
+                confidence_ppm: 1_000_000,
+                producer_contract_hash: None,
+            },
+            None,
+            vec![],
+            now,
+        )
+        .unwrap();
+        let governance = LessonGovernance {
+            max_usage_before_revalidation: 2,
+            ..LessonGovernance::operator_reviewed(now)
+        };
+        let lesson = store_lesson_with_governance(
+            &store,
+            &source,
+            "legacy-budget",
+            vec![],
+            vec![],
+            governance,
+        );
+        let catalogue = ActiveResearchCatalogue::install(&store, now).unwrap();
+        let purpose = ContractPurpose::new(RESEARCH_SYNTHESIZER_RECIPE_ID).unwrap();
+        let active = store.active_contract(&purpose).unwrap().unwrap().contract;
+        assert_eq!((active.version, active.prompt.version), (69, 38));
+        for count in 1..=2 {
+            let (request, manifest) =
+                synthesizer_request(&store, catalogue.contracts.clone(), &active.contract_hash)
+                    .await;
+            assert!(manifest
+                .selections
+                .iter()
+                .any(|selection| selection.artifact == reference(&lesson.artifact)));
+            assert!(!request["context"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["class"] == "lesson_projection"));
+            let usage = store.lesson_usage(&lesson.lesson.lesson_id).unwrap();
+            assert_eq!((usage.context_manifests, usage.decision_contexts), (0, 0));
+            assert_eq!(
+                (usage.legacy_manifest_refs, usage.legacy_decision_refs),
+                (count, 0)
+            );
+            assert!(usage.latest_used_at.is_none());
+            if count == 1 {
+                assert_eq!(
+                    store
+                        .contest_lessons_due_for_revalidation(Utc::now())
+                        .unwrap()
+                        .contested,
+                    0
+                );
+            }
+        }
+        let (_, manifest) =
+            synthesizer_request(&store, catalogue.contracts, &active.contract_hash).await;
+        assert!(!manifest
+            .selections
+            .iter()
+            .any(|selection| selection.artifact == reference(&lesson.artifact)));
+        assert_eq!(
+            store
+                .contest_lessons_due_for_revalidation(Utc::now())
+                .unwrap()
+                .contested,
+            1
+        );
+        let current = store.lesson(&lesson.lesson.lesson_id).unwrap().unwrap();
+        assert_eq!(
+            (current.revision, current.lesson.lifecycle),
+            (2, LessonLifecycle::Contested)
+        );
+        assert_eq!(
+            store
+                .contest_lessons_due_for_revalidation(Utc::now())
+                .unwrap()
+                .contested,
+            0
+        );
+    }
+
+    /// WHY THIS TEST EXISTS (Task #34): a real Submit request must show full Lesson constraints or omit the group.
+    /// Do not weaken or delete this assertion.
+    #[tokio::test]
+    async fn synthesizer_request_projects_complete_lesson_groups_with_exact_budget() {
+        let root =
+            OwnedExperiment(std::env::temp_dir().join(format!("akzio-lesson-{}", RunId::new())));
+        let store = Store::open(&root.0).unwrap();
+        let now = Utc::now();
+        let source = Artifact::new(
+            ArtifactKind::SemanticDetail,
+            store
+                .stage_json(&json!({"source":"operator fixture"}))
+                .unwrap(),
+            "operator.lesson.source",
+            ArtifactLifecycle::Canonical,
+            ArtifactProvenance {
+                source_family: "akzio.operator".to_owned(),
+                observed_at: None,
+                retrieved_at: now,
+                source_uri: None,
+                confidence_ppm: 1_000_000,
+                producer_contract_hash: None,
+            },
+            None,
+            vec![],
+            now,
+        )
+        .unwrap();
+        let a = store_lesson(
+            &store,
+            &source,
+            "a",
+            vec![
+                "skip early close".to_owned(),
+                format!(
+                    "{}unless the venue reopens",
+                    "require corroboration; ".repeat(80)
+                ),
+            ],
+            vec![],
+        );
+        let b = store_lesson(
+            &store,
+            &source,
+            "b",
+            vec!["skip a trading halt".to_owned()],
+            vec![reference(&a.artifact)],
+        );
+        let c = store_lesson(&store, &source, "c", vec![], vec![]);
+        let big_exclusion = format!(
+            "{}when the final venue is unknown",
+            "require verified price; ".repeat(11_000)
+        );
+        let d = store_lesson(
+            &store,
+            &source,
+            "d",
+            vec![big_exclusion],
+            vec![reference(&c.artifact)],
+        );
+
+        let catalogue = ActiveResearchCatalogue::install(&store, now).unwrap();
+        let purpose = ContractPurpose::new(RESEARCH_SYNTHESIZER_RECIPE_ID).unwrap();
+        let active = store.active_contract(&purpose).unwrap().unwrap().contract;
+        let candidate = catalogue
+            .install_synthesizer_lesson_projection_candidate(&store, now)
+            .unwrap();
+        assert_eq!(
+            store.active_contract(&purpose).unwrap().unwrap().contract,
+            active
+        );
+        assert_eq!(
+            candidate.contract.prompt.version,
+            SYNTHESIZER_LESSON_PROJECTION_CONTRACT_VERSION
+        );
+        assert_eq!(
+            candidate.contract.prompt.governance,
+            active.prompt.governance
+        );
+        assert_eq!(candidate.contract.context, active.context);
+        let revised = catalogue
+            .contracts
+            .with_installed_candidate(candidate.clone())
+            .unwrap();
+        let (request, manifest) =
+            synthesizer_request(&store, revised, &candidate.contract.contract_hash).await;
+        let context = request["context"].as_array().unwrap();
+        let lesson_bodies = context
+            .iter()
+            .filter(|entry| entry["class"] == "lesson_projection")
+            .collect::<Vec<_>>();
+        assert_eq!(lesson_bodies.len(), 2);
+        for (stored, expected_conflicts) in [(&a, vec![]), (&b, vec![reference(&a.artifact)])] {
+            let id = json!(stored.artifact.artifact_id);
+            let body = lesson_bodies
+                .iter()
+                .find(|entry| entry["metadata"]["document_id"] == id)
+                .unwrap();
+            assert_eq!(
+                body["value"],
+                json!({"projection_version":1,"title":stored.lesson.title,
+                "statement":stored.lesson.statement,"recommended_behavior":stored.lesson.recommended_behavior,
+                "scope":stored.lesson.scope,"exclusions":stored.lesson.exclusions,"conflicts_with":expected_conflicts})
+            );
+            let selection = manifest
+                .selections
+                .iter()
+                .find(|selection| selection.artifact.artifact_id == stored.artifact.artifact_id)
+                .unwrap();
+            let actual_bytes = serde_json::to_vec(&body["value"]).unwrap().len() as u64;
+            assert_eq!(selection.projected_bytes, Some(actual_bytes));
+            assert_eq!(
+                selection.estimated_tokens,
+                estimate_tokens_from_bytes(actual_bytes)
+            );
+            assert_eq!(selection.artifact.kind, ArtifactKind::Lesson);
+        }
+        for omitted in [&c, &d] {
+            assert!(!manifest
+                .selections
+                .iter()
+                .any(|selection| selection.artifact.artifact_id == omitted.artifact.artifact_id));
+        }
+
+        let (old_request, old_manifest) =
+            synthesizer_request(&store, catalogue.contracts, &active.contract_hash).await;
+        assert!(!old_request["context"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["class"] == "lesson_projection"));
+        assert!(old_manifest
+            .selections
+            .iter()
+            .any(|selection| selection.artifact.artifact_id == a.artifact.artifact_id));
+        assert_eq!(
+            store.lesson(&a.lesson.lesson_id).unwrap().unwrap().lesson,
+            a.lesson
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    enum LessonReplayMutation {
+        RemoveBody,
+        ChangeItemType,
+    }
+
+    struct LessonSubmitModel {
+        adapter: ModelClientAdapter,
+        replay_mutation: Option<LessonReplayMutation>,
+    }
+
+    impl AgentModel for LessonSubmitModel {
+        fn capability_snapshot(&self) -> ModelCapabilitySnapshot {
+            self.adapter.capability_snapshot()
+        }
+
+        fn turn<'a>(&'a self, request: AgentModelRequest) -> BoxFuture<'a, Result<AgentModelTurn>> {
+            Box::pin(async move {
+                let fresh = request.continuation.is_none();
+                let mut turn = self.adapter.turn(request).await?;
+                if let Some(mutation) = self.replay_mutation.filter(|_| fresh) {
+                    let mut replay = serde_json::to_value(&turn.continuation)?;
+                    let first = &mut replay["items"][0];
+                    match mutation {
+                        LessonReplayMutation::RemoveBody => {
+                            let mut input: Value =
+                                serde_json::from_str(first["content"].as_str().unwrap())?;
+                            input["context"]
+                                .as_array_mut()
+                                .unwrap()
+                                .retain(|item| item["class"] != "lesson_projection");
+                            first["content"] = json!(serde_json::to_string(&input)?);
+                        }
+                        LessonReplayMutation::ChangeItemType => {
+                            first["type"] = json!("function_call_output");
+                        }
+                    }
+                    // Leave fixture_input intact. Attribution must inspect the actual replay instead.
+                    turn.continuation = serde_json::from_value(replay)?;
+                }
+                Ok(turn)
+            })
+        }
+    }
+
+    struct InterruptAfterSubmitRejection;
+
+    impl akzio_model::ModelAuditSink for InterruptAfterSubmitRejection {
+        fn record_model(
+            &self,
+            _context: &akzio_model::ModelAuditContext,
+            kind: &str,
+            _payload: Value,
+        ) -> std::result::Result<(), String> {
+            if kind == "rust.agent.submit_rejected" {
+                return Err("interrupt after durable SubmitRejected".into());
+            }
+            Ok(())
+        }
+    }
+
+    /// WHY THIS TEST EXISTS (Task #34): only the exact accepted Submit carrying the full body can count as a Lesson presentation.
+    /// Do not weaken or delete this assertion.
+    #[tokio::test]
+    async fn accepted_synthesizer_submit_authorizes_only_presented_lesson_usage() {
+        verify_synthesizer_lesson_usage(&[
+            "omitted",
+            "forged_replay",
+            "wrong_item_type",
+            "unused",
+            "fresh",
+            "retry",
+            "repair",
+        ])
+        .await;
+    }
+
+    /// WHY THIS TEST EXISTS (Task #34): a retried Attempt must verify the full user input replayed from the previous Manifest.
+    /// Do not weaken or delete this assertion.
+    #[tokio::test]
+    async fn cross_attempt_continuation_keeps_the_presented_lesson() {
+        verify_synthesizer_lesson_usage(&["recovered_retry"]).await;
+    }
+
+    /// WHY THIS TEST EXISTS (Task #34): a recovered metadata repair must bind the original result and the new accepted Turn.
+    /// Do not weaken or delete this assertion.
+    #[tokio::test]
+    async fn cross_attempt_metadata_repair_keeps_the_result_lesson() {
+        verify_synthesizer_lesson_usage(&["recovered_repair"]).await;
+    }
+
+    async fn verify_synthesizer_lesson_usage(cases: &[&str]) {
+        let root = OwnedExperiment(
+            std::env::temp_dir().join(format!("akzio-lesson-submit-{}", RunId::new())),
+        );
+        let store = Store::open(&root.0).unwrap();
+        let now = Utc::now();
+        let source = Artifact::new(
+            ArtifactKind::SemanticDetail,
+            store
+                .stage_json(&json!({"source":"lesson fixture"}))
+                .unwrap(),
+            "operator.lesson.source",
+            ArtifactLifecycle::Canonical,
+            ArtifactProvenance {
+                source_family: "akzio.operator".to_owned(),
+                observed_at: None,
+                retrieved_at: now,
+                source_uri: None,
+                confidence_ppm: 1_000_000,
+                producer_contract_hash: None,
+            },
+            None,
+            vec![],
+            now,
+        )
+        .unwrap();
+        let visible = store_lesson(
+            &store,
+            &source,
+            "shown",
+            vec!["exclude early closes".to_owned()],
+            vec![],
+        );
+        let hidden = store_lesson(
+            &store,
+            &source,
+            "omitted",
+            vec!["restatement ".repeat(22_000)],
+            vec![],
+        );
+        let catalogue = ActiveResearchCatalogue::install(&store, now).unwrap();
+        let candidate = catalogue
+            .install_synthesizer_lesson_projection_candidate(&store, now)
+            .unwrap();
+        let catalogue = catalogue
+            .contracts
+            .with_installed_candidate(candidate.clone())
+            .unwrap();
+        let mut accepted_presentations = 0;
+        for &case in cases {
+            let lesson = if case == "omitted" { &hidden } else { &visible };
+            let lease_duration = if case == "recovered_repair" {
+                Duration::seconds(5)
+            } else {
+                Duration::minutes(10)
+            };
+            let (mut runtime, mut claimed) = attempt_with_contract_and_lease(
+                &store,
+                catalogue.clone(),
+                RESEARCH_SYNTHESIZER_RECIPE_ID,
+                "Synthetic accepted Submit with no directional signal.",
+                Some(&candidate.contract.contract_hash),
+                lease_duration,
+            )
+            .unwrap();
+            let closes = (1..=8)
+                .map(|day| {
+                    (
+                        format!("2030-01-{day:02}"),
+                        json!(format!("2030-01-{day:02}T21:00:00Z")),
+                    )
+                })
+                .collect::<serde_json::Map<_, _>>();
+            let calendars: Vec<_> = Asset::EXECUTABLE
+                .into_iter()
+                .map(|asset| {
+                    let calendar = persist(
+                        &store,
+                        &claimed.permit,
+                        ArtifactKind::NormalizedEvidence,
+                        "evidence.normalize",
+                        &json!({"source":"alpaca","resource":format!("bars:{}:1d",asset.symbol()),
+                        "value":{"forecast_session_closes":closes}}),
+                        vec![],
+                    )
+                    .unwrap();
+                    reference(&calendar)
+                })
+                .collect();
+            let (mut draft, _) = case_material(0, &calendars[0]);
+            draft["evidence"] = json!([]);
+            draft["hard_blockers"] = json!(["missing_evidence"]);
+            for forecast in draft["forecasts"].as_array_mut().unwrap() {
+                let thesis = forecast["thesis"].as_object_mut().unwrap();
+                thesis.remove("thesis_valid_until");
+                thesis.remove("expected_holding_period_days");
+            }
+            for basis in draft["numeric_basis"].as_array_mut().unwrap() {
+                basis["inputs"] = json!([{"artifact_id":calendars[0].artifact_id}]);
+            }
+            draft["applied_learning_refs"] = json!([{"artifact_id":lesson.artifact.artifact_id}]);
+            let deliberation = json!({"selected_path":"Conservative research allocation.","alternatives":[],
+                "alternative_match_ppm":[],"uncertainties":[],"uncertainty_weight_ppm":[],
+                "basis_artifact_ids":[calendars[0].artifact_id],"confidence_ppm":1_000_000});
+            let arguments = json!({"result":draft,"deliberation":deliberation});
+            let response = |call_id, arguments: &Value| {
+                json!({
+                    "output":[{"type":"function_call","name":"submit_result","call_id":call_id,
+                        "arguments":serde_json::to_string(arguments).unwrap()}],
+                    "usage":{"input_tokens":400,"output_tokens":1000},
+                })
+            };
+            let mut initial = arguments.clone();
+            let mut correction = arguments.clone();
+            if matches!(
+                case,
+                "retry" | "recovered_retry" | "forged_replay" | "wrong_item_type" | "unused"
+            ) {
+                initial["result"]["hard_blockers"] = json!([]);
+            } else if matches!(case, "repair" | "recovered_repair") {
+                initial["deliberation"]["confidence_ppm"] = json!(999_000);
+                correction = json!({"deliberation": arguments["deliberation"]});
+            }
+            if case == "unused" {
+                correction["result"]["applied_learning_refs"] = json!([]);
+            }
+            let fixture = LessonSubmitModel {
+                adapter: ModelClientAdapter::new(ModelClient::fixture_sequence([
+                    response("lesson-submit", &initial),
+                    response("lesson-retry", &correction),
+                ])),
+                replay_mutation: match case {
+                    "forged_replay" | "unused" => Some(LessonReplayMutation::RemoveBody),
+                    "wrong_item_type" => Some(LessonReplayMutation::ChangeItemType),
+                    _ => None,
+                },
+            };
+            let mut previous = None;
+            if matches!(case, "recovered_retry" | "recovered_repair") {
+                let context = akzio_model::ModelAuditContext {
+                    run_id: claimed.run_id.0.clone(),
+                    phase: "research".into(),
+                    task_id: Some(claimed.permit.task_id.0.clone()),
+                    attempt_id: Some(claimed.permit.attempt_id.0.clone()),
+                    call_id: None,
+                    retry_index: None,
+                };
+                let result = akzio_model::RUN_AUDIT_SINK
+                    .scope(
+                        std::sync::Arc::new(InterruptAfterSubmitRejection),
+                        akzio_model::MODEL_AUDIT_CONTEXT.scope(
+                            context,
+                            runtime.run(
+                                &claimed.permit,
+                                &claimed.node,
+                                calendars.clone(),
+                                &fixture,
+                                Utc::now(),
+                            ),
+                        ),
+                    )
+                    .await;
+                assert!(
+                    matches!(result, Err(ResearchError::RunLogUnavailable(message))
+                    if message == "interrupt after durable SubmitRejected")
+                );
+                let events = store
+                    .attempt_events(
+                        &claimed.run_id,
+                        &claimed.permit.task_id,
+                        &claimed.permit.attempt_id,
+                    )
+                    .unwrap();
+                let turns = events
+                    .iter()
+                    .filter(|event| {
+                        event.lifecycle_kind().unwrap() == LifecycleEventType::AgentTurnCompleted
+                    })
+                    .collect::<Vec<_>>();
+                let [turn] = turns.as_slice() else {
+                    panic!("expected one durable original Turn");
+                };
+                let original = store.artifact(turn.artifact_id.as_ref().unwrap()).unwrap();
+                assert!(events.iter().any(|event| event.lifecycle_kind().unwrap()
+                    == LifecycleEventType::StageAcceptanceRecorded));
+                let now = Utc::now();
+                let (claim_time, relation_kind) = if case == "recovered_retry" {
+                    assert!(matches!(
+                        store.retry_task(&claimed.permit, now, now).unwrap(),
+                        akzio_store::RetryTaskResult::Requeued
+                    ));
+                    (now, AttemptRelationKind::Retry)
+                } else {
+                    let active = store
+                        .workflow_snapshot(&claimed.run_id)
+                        .unwrap()
+                        .tasks
+                        .into_iter()
+                        .find_map(|task| task.active_attempt)
+                        .unwrap();
+                    assert_eq!(active.permit, claimed.permit);
+                    if let Ok(wait) =
+                        (active.lease_until + Duration::milliseconds(5) - Utc::now()).to_std()
+                    {
+                        tokio::time::sleep(wait).await;
+                    }
+                    let recovery_time = Utc::now();
+                    assert_eq!(store.recover_expired_tasks(recovery_time).unwrap(), 1);
+                    (recovery_time, AttemptRelationKind::Recovery)
+                };
+                let next = store
+                    .claim_next_task_for_workload(
+                        "research-quality-recovered",
+                        claim_time,
+                        Duration::minutes(10),
+                        TaskWorkload::Any,
+                    )
+                    .unwrap()
+                    .unwrap();
+                let relation = store
+                    .attempt_relation(&next.permit.attempt_id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(relation.relation, relation_kind);
+                assert_eq!(relation.parent_attempt_id, claimed.permit.attempt_id);
+                assert_eq!(next.run_id, claimed.run_id);
+                assert_eq!(next.permit.task_id, claimed.permit.task_id);
+                assert_eq!(next.permit.contract_hash, claimed.permit.contract_hash);
+                previous = Some(original);
+                claimed = next;
+                runtime =
+                    AgentRuntime::new(store.clone(), catalogue.clone(), Duration::minutes(10));
+            }
+            let proposal = runtime
+                .run(
+                    &claimed.permit,
+                    &claimed.node,
+                    calendars,
+                    &fixture,
+                    Utc::now(),
+                )
+                .await;
+            if matches!(case, "omitted" | "forged_replay" | "wrong_item_type") {
+                let error = proposal.expect_err(case);
+                assert!(
+                    matches!(&error, ResearchError::InvalidOutput(message) if
+                    if case != "omitted" {
+                        message == "Lesson was not presented to the result-producing Submit"
+                    } else {
+                        message.contains("allowed enum value") || message.contains("outside this attempt's Manifest")
+                    }),
+                    "{case}: {error:?}"
+                );
+                assert_eq!(
+                    store
+                        .lesson_usage(&lesson.lesson.lesson_id)
+                        .unwrap()
+                        .context_manifests,
+                    0
+                );
+                store
+                    .commit_attempt(&claimed.permit, &[], TaskStatus::Failed, Utc::now())
+                    .unwrap();
+                continue;
+            }
+            let proposal = proposal.unwrap_or_else(|error| panic!("{case}: {error:?}"));
+            let note = proposal
+                .source_refs
+                .iter()
+                .find(|reference| reference.kind == ArtifactKind::DeliberationNote)
+                .unwrap();
+            let note = store.artifact(&note.artifact_id).unwrap();
+            let note: Value =
+                serde_json::from_slice(&store.read_blob(&note.blob).unwrap()).unwrap();
+            let submit = &note["accepted_synthesizer_submit"];
+            let result_turn: ArtifactRef =
+                serde_json::from_value(submit["result_turn"].clone()).unwrap();
+            let accepted_turn: ArtifactRef =
+                serde_json::from_value(submit["accepted_turn"].clone()).unwrap();
+            let trace = |reference: &ArtifactRef| -> Value {
+                let turn = store.artifact(&reference.artifact_id).unwrap();
+                serde_json::from_slice(&store.read_blob(&turn.blob).unwrap()).unwrap()
+            };
+            if matches!(case, "retry" | "recovered_retry" | "unused") {
+                let request = &trace(&result_turn)["domain_request"];
+                assert_eq!(request["context"], json!([]));
+                assert_eq!(request["continuation"]["items"][0]["role"], "user");
+            }
+            if let Some(original) = previous {
+                let original_ref = reference(&original);
+                let original_input = &trace(&original_ref)["domain_request"];
+                let accepted_input = &trace(&accepted_turn)["domain_request"];
+                assert_ne!(
+                    original_input["manifest_artifact_id"],
+                    accepted_input["manifest_artifact_id"]
+                );
+                for key in ["read_grant_identity", "context_materialization_identity"] {
+                    assert!(original_input[key].is_string());
+                    assert_eq!(original_input[key], accepted_input[key]);
+                }
+                if case == "recovered_repair" {
+                    assert_eq!(result_turn, original_ref);
+                } else {
+                    let input: Value = serde_json::from_str(
+                        accepted_input["continuation"]["items"][0]["content"]
+                            .as_str()
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        input["context_manifest"],
+                        original_input["manifest_artifact_id"]
+                    );
+                    assert_eq!(input["context"], original_input["context"]);
+                    assert_eq!(input["objective"], original_input["objective"]);
+                }
+            }
+            if matches!(case, "repair" | "recovered_repair") {
+                assert_ne!(result_turn, accepted_turn);
+                assert_eq!(
+                    trace(&accepted_turn)["domain_request"]["context"][0]["type"],
+                    "deliberation_repair"
+                );
+            } else {
+                assert_eq!(result_turn, accepted_turn);
+            }
+            let manifest_ref = proposal
+                .source_refs
+                .iter()
+                .find(|reference| reference.kind == ArtifactKind::ContextManifest)
+                .unwrap();
+            let manifest = store.artifact(&manifest_ref.artifact_id).unwrap();
+            assert_eq!(
+                store
+                    .lesson_usage(&lesson.lesson.lesson_id)
+                    .unwrap()
+                    .context_manifests,
+                accepted_presentations
+            );
+            store
+                .commit_attempt(
+                    &claimed.permit,
+                    std::slice::from_ref(&proposal),
+                    TaskStatus::Succeeded,
+                    Utc::now(),
+                )
+                .unwrap();
+            let expected = if case == "unused" {
+                Default::default()
+            } else {
+                accepted_presentations += 1;
+                [reference(&lesson.artifact)].into()
+            };
+            assert_eq!(
+                store
+                    .proposal_lesson_presentation(&proposal, &manifest)
+                    .unwrap(),
+                Some(expected)
+            );
+            assert_eq!(
+                store
+                    .lesson_usage(&lesson.lesson.lesson_id)
+                    .unwrap()
+                    .context_manifests,
+                accepted_presentations
+            );
         }
     }
 

@@ -123,6 +123,14 @@ impl Store {
         }
         let schedule =
             self.read_outcome_schedule_with_connection(connection, &outcome, &[RunPurpose::Paper])?;
+        if commit.lesson_evidence.iter().any(|record| {
+            record.outcome.artifact_id != commit.outcome.artifact_id
+                || record.decision_context != schedule.decision_context
+        }) {
+            return Err(StoreError::InvalidLearningCommit(
+                "lesson_evidence.outcome_lineage",
+            ));
+        }
         let final_retrospective: akzio_domain::Retrospective =
             self.read_artifact_payload_with_connection(connection, &commit.final_retrospective)?;
         final_retrospective.validate()?;

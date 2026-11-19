@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 
 use akzio_domain::{
     ArtifactKind, ArtifactRef, DecisionContext, Lesson, LessonAttribution, LessonEvidence, Outcome,
-    OutcomeHorizon, DOMAIN_SCHEMA_VERSION,
+    DOMAIN_SCHEMA_VERSION,
 };
 
 use crate::{EvaluationError, EvaluationRuntime, EvaluationRuntimeResult};
@@ -22,15 +22,8 @@ use crate::{EvaluationError, EvaluationRuntime, EvaluationRuntimeResult};
 // 不是因果证明；Applied/Rejected 都保留，拒绝 Lesson 的 Outcome 也不是反事实收益。
 
 impl EvaluationRuntime {
-    /// Build one record per Lesson the decision took a position on.
-    ///
-    /// The upstream DecisionGate requires attribution for each manifest Lesson;
-    /// this public helper only reads the supplied DecisionContext, so it does
-    /// not re-prove that manifest closure or the supplied Outcome's CAS origin.
-    /// Experience and CandidatePolicy references are skipped, not Lessons.
-    // 本方法只从传入且经 context.validate 的 Applied/Rejected Lesson 引用构造观察记录；
-    // context 本身不在此与 Store 正文比对。Outcome 阶段应调用下方按 ArtifactRef
-    // 回读 Store 的入口，避免把调用方内存中的 context 当成已持久化事实。
+    /// Build records for verified Lesson presentations that the formal Decision
+    /// explicitly applied or rejected. Earlier selections have no presentation proof.
     pub fn lesson_evidence_from_decision(
         &self,
         decision_context: &ArtifactRef,
@@ -39,12 +32,8 @@ impl EvaluationRuntime {
         outcome: &Outcome,
         recorded_at: DateTime<Utc>,
     ) -> EvaluationRuntimeResult<Vec<LessonEvidence>> {
-        // 只有 sealed Outcome 才能同时提供 T+1/T+3/T+5 utility；Lesson 的应用/拒绝归因
-        // 已由 DecisionContext 强制写入，因此这里按 manifest 中的 Lesson 引用逐条读取。
         context.validate()?;
-        // Only a sealed outcome carries all three windows, and canonical
-        // learning is defined on sealed outcomes alone.
-        outcome.validate_sealed()?;
+        let utility_ppm_by_horizon = LessonEvidence::sealed_outcome_utility(outcome)?;
         if decision_context.kind != ArtifactKind::DecisionContext
             || outcome_artifact.kind != ArtifactKind::Outcome
         {
@@ -53,7 +42,25 @@ impl EvaluationRuntime {
             ));
         }
 
-        let utility_ppm_by_horizon = Self::by_horizon(outcome, |window| window.utility_ppm, 0);
+        let decision = self.store.artifact(&decision_context.artifact_id)?;
+        let persisted: DecisionContext =
+            serde_json::from_slice(&self.store.read_blob(&decision.blob)?)?;
+        if &persisted != context {
+            return Err(EvaluationError::InvalidMaterialization(
+                "lesson attribution context mismatch",
+            ));
+        }
+        if !context
+            .applied_learning_refs
+            .iter()
+            .chain(&context.rejected_learning_refs)
+            .any(|reference| reference.kind == ArtifactKind::Lesson)
+        {
+            return Ok(Vec::new());
+        }
+        let Some(presented) = self.store.decision_lesson_presentation(&decision)? else {
+            return Ok(Vec::new());
+        };
         // Calibration is a cohort statistic, not a property of one sealed
         // decision. The Outcome reference retained on this record is the
         // explicit provenance path to each horizon's ForecastScore; an
@@ -69,10 +76,9 @@ impl EvaluationRuntime {
             (LessonAttribution::Applied, &context.applied_learning_refs),
             (LessonAttribution::Rejected, &context.rejected_learning_refs),
         ] {
-            for reference in references
-                .iter()
-                .filter(|reference| reference.kind == ArtifactKind::Lesson)
-            {
+            for reference in references.iter().filter(|reference| {
+                reference.kind == ArtifactKind::Lesson && presented.contains(reference)
+            }) {
                 // read_lesson 再次从 Store 验证 kind、BLOB 与 Lesson schema；Experience 或
                 // CandidatePolicy 虽然也有 outcome lineage，但不属于 Lesson evidence。
                 let lesson = self.read_lesson(reference)?;
@@ -120,28 +126,6 @@ impl EvaluationRuntime {
             outcome,
             recorded_at,
         )
-    }
-
-    fn by_horizon<T: Copy>(
-        outcome: &Outcome,
-        project: impl Fn(&akzio_domain::OutcomeWindow) -> T,
-        fallback: T,
-    ) -> [T; 3] {
-        // T: Copy 允许将 fallback 写入三个固定槽位；project 是静态分发的 Fn 闭包，
-        // 按窗口映射数值且只借用 outcome，不会捕获或改变 Outcome 状态。
-        // 固定数组槽位与 OutcomeHorizon::ALL 对齐；缺失窗口使用调用方给定 fallback，
-        // 但 sealed 校验会在上层拒绝不完整 Outcome。
-        let mut values = [fallback; 3];
-        for (index, horizon) in OutcomeHorizon::ALL.into_iter().enumerate() {
-            if let Some(window) = outcome
-                .windows
-                .iter()
-                .find(|window| window.horizon == horizon)
-            {
-                values[index] = project(window);
-            }
-        }
-        values
     }
 
     // 从 Store 取 Artifact、读 BLOB、反序列化并执行 Lesson::validate；任何一步 Err

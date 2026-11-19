@@ -38,7 +38,8 @@ impl DecisionRuntime {
         // DecisionGate 独立校验引用闭包和语义，不能把模型提案本身当作正式 Decision。
         let draft: DecisionDraft = serde_json::from_slice(&self.store.read_blob(&proposal.blob)?)?;
         draft.validate()?;
-        self.validate_draft_closure(&draft, &selected)?;
+        let presented_lessons = self.store.proposal_lesson_presentation(&proposal, &manifest)?;
+        self.validate_draft_closure(&draft, &selected, presented_lessons.as_ref())?;
         let raw_research_plan =
             draft
                 .research_allocation
@@ -523,6 +524,11 @@ impl DecisionRuntime {
             policy_influences,
             applied_learning_refs: draft.applied_learning_refs.clone(),
             rejected_learning_refs: draft.rejected_learning_refs.clone(),
+            unpresented_lesson_refs: presented_lessons.as_ref().map_or_else(Vec::new, |presented| {
+                selected.difference(presented)
+                    .filter(|reference| reference.kind == ArtifactKind::Lesson)
+                    .cloned().collect()
+            }),
             material_conflicts: draft.material_conflicts.clone(),
             hard_blockers: hard_blockers.into_iter().collect(),
             soft_warnings: soft_warnings.into_iter().collect(),

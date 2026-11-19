@@ -463,6 +463,7 @@ pub(crate) mod tests {
             policy_influences: Vec::new(),
             applied_learning_refs: Vec::new(),
             rejected_learning_refs: Vec::new(),
+            unpresented_lesson_refs: Vec::new(),
             material_conflicts: Vec::new(),
             hard_blockers: Vec::new(),
             soft_warnings: Vec::new(),

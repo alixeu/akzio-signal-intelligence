@@ -31,6 +31,7 @@ impl ContextBroker {
             stable_read_grant_identity(&manifest.grant, &manifest.payload.input_hash)?;
         let mut ledger = Vec::with_capacity(manifest.payload.selections.len());
         let mut must_read = Vec::new();
+        let lesson_bodies = presents_lesson_bodies(contract);
         for selection in &manifest.payload.selections {
             // `selection` 是 Manifest 中的借用；按 artifact_id 回到已验证 grant 读取拥有所有权的 Artifact，避免把未选文档带入视图。
             // 本次同步物化已验证完整的不可变 CAS 闭包；逐项继续核验 live permit、
@@ -45,7 +46,11 @@ impl ContextBroker {
             if artifact.kind != selection.artifact.kind {
                 return Err(ContextError::InvalidManifestClosure);
             }
-            let must_read_class = must_read_class(selection, &artifact);
+            let must_read_class = if artifact.kind == ArtifactKind::Lesson && lesson_bodies {
+                Some("lesson_projection")
+            } else {
+                must_read_class(selection, &artifact)
+            };
             let metadata = ContextDocumentMetadata {
                 document_id: artifact.artifact_id.clone(),
                 kind: artifact.kind,
@@ -63,10 +68,7 @@ impl ContextBroker {
                 // must_read 只放受控 projection；原始 CAS 文档仍由 grant 和显式读取工具
                 // 管理。研究角色在新 Contract 下没有读取工具，所以 projection 会附带
                 // “原文未开放”的边界提示，而不伪装成完整事实。
-                let mut value = compact_governed_projection(
-                    artifact.kind,
-                    self.document_value(&artifact)?,
-                );
+                let mut value = self.projected_document(&artifact, lesson_bodies)?;
                 if contract.version >= 65 && matches!(contract.purpose.as_str(), akzio_domain::RESEARCH_ANALYST_RECIPE_ID | akzio_domain::RESEARCH_CRITIC_RECIPE_ID | akzio_domain::RESEARCH_SYNTHESIZER_RECIPE_ID | akzio_domain::RESEARCH_PROPOSAL_REVIEWER_RECIPE_ID) {
                     projection_only_guidance(&mut value);
                 }

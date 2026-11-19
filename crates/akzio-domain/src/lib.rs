@@ -116,6 +116,8 @@ pub const RESEARCH_PLANNER_RECIPE_ID: &str = "research.planner";
 pub const RESEARCH_ANALYST_RECIPE_ID: &str = "research.analyst";
 pub const RESEARCH_CRITIC_RECIPE_ID: &str = "research.critic";
 pub const RESEARCH_SYNTHESIZER_RECIPE_ID: &str = "research.synthesizer";
+/// Synthesizer candidate with fully presented, scoped Lesson projections.
+pub const SYNTHESIZER_LESSON_PROJECTION_CONTRACT_VERSION: u32 = 71;
 pub const LEARNING_OUTCOME_WORKER_RECIPE_ID: &str = "learning.outcome_worker";
 pub const GOVERNED_EVIDENCE_SOURCE_FAMILIES: [&str; 4] =
     ["alpaca", "sec_edgar", "fred", "news_web"];

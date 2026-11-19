@@ -30,6 +30,13 @@ impl Store {
             self.ensure_lesson_tables()?;
         }
 
+        // Presentation depends only on completed Attempts and immutable artifacts.
+        // Read it before taking the write connection, then require it on new ledger rows.
+        let lesson_proofs = commit
+            .lesson_evidence
+            .iter()
+            .map(|record| (record, self.validate_lesson_evidence_presentation(record)))
+            .collect::<Vec<_>>();
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(lease) = lease {
@@ -69,7 +76,7 @@ impl Store {
             }
             self.record_lesson_evidence_with_transaction(
                 &transaction,
-                &commit.lesson_evidence,
+                lesson_proofs,
                 commit.completed_at,
             )?;
             let policy_head = read_policy_head(&transaction, &commit.subject)?;
@@ -192,7 +199,7 @@ impl Store {
 
         self.record_lesson_evidence_with_transaction(
             &transaction,
-            &commit.lesson_evidence,
+            lesson_proofs,
             commit.completed_at,
         )?;
 

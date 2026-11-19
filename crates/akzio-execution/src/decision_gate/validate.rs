@@ -256,6 +256,7 @@ impl DecisionRuntime {
         &self,
         draft: &DecisionDraft,
         selected: &BTreeSet<ArtifactRef>,
+        presented_lessons: Option<&BTreeSet<ArtifactRef>>,
     ) -> DecisionGateResult<()> {
         // 把 draft 中 claims、critiques、evidence、research allocation 和 learning/conflict
         // 引用逐一限制在 Manifest selected 集合；对 selected 的 Lesson/Experience 还要求
@@ -289,13 +290,18 @@ impl DecisionRuntime {
                 ));
             }
         }
-        // Manifest 选中的 Lesson/Experience 即使未被 draft 的其它字段引用，也必须明确
-        // applied 或 rejected；这是学习归因，不是隐式应用学习结果。
+        // v71 requires a disposition only for a Lesson shown to the result-producing Submit.
+        if let Some(presented) = presented_lessons {
+            for reference in draft.applied_learning_refs.iter().chain(&draft.rejected_learning_refs) {
+                if reference.kind == ArtifactKind::Lesson && !presented.contains(reference) {
+                    return Err(DecisionGateError::UnpresentedLesson(reference.artifact_id.clone()));
+                }
+            }
+        }
         for reference in selected.iter().filter(|reference| {
-            matches!(
-                reference.kind,
-                ArtifactKind::Lesson | ArtifactKind::Experience
-            )
+            reference.kind == ArtifactKind::Experience
+                || (reference.kind == ArtifactKind::Lesson
+                    && presented_lessons.is_none_or(|presented| presented.contains(reference)))
         }) {
             if !draft.applied_learning_refs.contains(reference)
                 && !draft.rejected_learning_refs.contains(reference)

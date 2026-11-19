@@ -4,6 +4,8 @@
 use super::*;
 use akzio_domain::{OutcomeWindow, RetrospectiveStatus};
 
+const REGRESSION_SESSION: &str = "2026-10-09";
+
 struct RegressionSession(String);
 
 impl BrokerSessionClock for RegressionSession {
@@ -78,14 +80,22 @@ fn install_execution_snapshots(daemon: &mut Daemon, baseline: NaiveDate, now: Da
 }
 
 async fn scheduled() -> (Daemon, RunId, Artifact, ClaimedAttempt) {
-    scheduled_with_calendar("2026-10-09".parse().unwrap(), None).await
+    scheduled_with_calendar(REGRESSION_SESSION.parse().unwrap(), None).await
 }
 
 async fn scheduled_with_calendar(
     baseline: NaiveDate,
     closes: Option<&BTreeMap<NaiveDate, DateTime<Utc>>>,
 ) -> (Daemon, RunId, Artifact, ClaimedAttempt) {
-    let (daemon, id) = run_paper_with_calendar(baseline, closes).await;
+    schedule_daemon(daemon(), baseline, closes).await
+}
+
+async fn schedule_daemon(
+    daemon: Daemon,
+    baseline: NaiveDate,
+    closes: Option<&BTreeMap<NaiveDate, DateTime<Utc>>>,
+) -> (Daemon, RunId, Artifact, ClaimedAttempt) {
+    let (daemon, id) = run_paper_with_calendar(daemon, baseline, closes).await;
     let schedule = daemon.store.outcome_schedule_for_run(&id).unwrap().unwrap();
     daemon
         .store
@@ -96,10 +106,10 @@ async fn scheduled_with_calendar(
 }
 
 async fn run_paper_with_calendar(
+    mut daemon: Daemon,
     baseline: NaiveDate,
     closes: Option<&BTreeMap<NaiveDate, DateTime<Utc>>>,
 ) -> (Daemon, RunId) {
-    let mut daemon = daemon();
     let now = Utc::now();
     install_execution_snapshots(&mut daemon, baseline, now);
     if let Some(closes) = closes {
@@ -359,7 +369,7 @@ async fn expired_frozen_calendar_outcome_submit_does_not_publish_a_proposal() {
         let hour = if offset == 0 { 21 } else { 20 };
         (day, day.and_hms_opt(hour, 0, 0).unwrap().and_utc())
     }));
-    let (daemon, id) = run_paper_with_calendar(baseline, Some(&closes)).await;
+    let (daemon, id) = run_paper_with_calendar(daemon(), baseline, Some(&closes)).await;
     assert_eq!(
         daemon.store.research_session_key(&id).unwrap(),
         baseline.to_string()
@@ -650,25 +660,18 @@ fn assert_complete_narrative(
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn outcome_worker_uses_frozen_node_for_every_narrative_stage() {
-    let (mut daemon, id, schedule_artifact, mut task) = scheduled().await;
-    let before_seal = daemon.observer_run_detail(&id).unwrap().operator_report;
-    assert_eq!(before_seal["execution"]["status"], "no_order");
-    assert_eq!(before_seal["execution"]["planned_order_count"], 0);
-    assert_eq!(before_seal["execution"]["observed_receipt_count"], 0);
-    assert!(!before_seal["execution"]["blockers"]
-        .as_array()
-        .unwrap()
-        .is_empty());
-    assert!(before_seal["outcome"].is_null());
+async fn seal_outcome(
+    daemon: &mut Daemon,
+    schedule_artifact: &Artifact,
+    mut task: ClaimedAttempt,
+) -> Artifact {
     let schedule: OutcomeSchedule =
         serde_json::from_slice(&daemon.store.read_blob(&schedule_artifact.blob).unwrap()).unwrap();
-    install_bars(&mut daemon, Utc::now());
+    install_bars(daemon, Utc::now());
     install_narratives(
-        &mut daemon,
+        daemon,
         &schedule,
-        &schedule_artifact,
+        schedule_artifact,
         &OutcomeHorizon::ALL,
         &[],
     );
@@ -678,7 +681,7 @@ async fn outcome_worker_uses_frozen_node_for_every_narrative_stage() {
             .execute_outcome_worker(&task, Utc::now())
             .await
             .unwrap();
-        assert_complete_narrative(&daemon, &task, &schedule, horizon);
+        assert_complete_narrative(daemon, &task, &schedule, horizon);
         if horizon == OutcomeHorizon::T5 {
             assert!(matches!(completion, TaskCompletion::Committed));
         } else {
@@ -689,10 +692,26 @@ async fn outcome_worker_uses_frozen_node_for_every_narrative_stage() {
                 .defer_task(&task.permit, ready_at, Utc::now())
                 .unwrap();
             tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
-            task = claim_outcome(&daemon);
+            task = claim_outcome(daemon);
         }
     }
-    let outcome_artifact = daemon.store.outcome_for_run(&id).unwrap().unwrap();
+    daemon.store.outcome_for_run(&task.run_id).unwrap().unwrap()
+}
+
+/// WHY THIS TEST EXISTS (Task #34): The shared seal fixture must use the frozen Outcome node at every narrative stage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outcome_worker_uses_frozen_node_for_every_narrative_stage() {
+    let (mut daemon, id, schedule_artifact, task) = scheduled().await;
+    let before_seal = daemon.observer_run_detail(&id).unwrap().operator_report;
+    assert_eq!(before_seal["execution"]["status"], "no_order");
+    assert_eq!(before_seal["execution"]["planned_order_count"], 0);
+    assert_eq!(before_seal["execution"]["observed_receipt_count"], 0);
+    assert!(!before_seal["execution"]["blockers"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(before_seal["outcome"].is_null());
+    let outcome_artifact = seal_outcome(&mut daemon, &schedule_artifact, task).await;
     let outcome: Outcome =
         serde_json::from_slice(&daemon.store.read_blob(&outcome_artifact.blob).unwrap()).unwrap();
     outcome.validate_sealed().unwrap();
@@ -713,6 +732,296 @@ async fn outcome_worker_uses_frozen_node_for_every_narrative_stage() {
         .as_array()
         .unwrap()
         .contains(&serde_json::json!(OutcomeHorizon::T5)));
+}
+
+fn write_scoped_lesson(store: &Store, id: &str, exclusion: String) -> akzio_store::StoredLesson {
+    let now = Utc::now();
+    let source = Artifact::new(
+        ArtifactKind::SemanticDetail,
+        store
+            .stage_json(&serde_json::json!({"operator_review":id}))
+            .unwrap(),
+        "operator.lesson.source",
+        ArtifactLifecycle::Canonical,
+        ArtifactProvenance {
+            source_family: "akzio.operator".into(),
+            observed_at: None,
+            retrieved_at: now,
+            source_uri: None,
+            confidence_ppm: 1_000_000,
+            producer_contract_hash: None,
+        },
+        None,
+        vec![],
+        now,
+    )
+    .unwrap();
+    let lesson = Lesson {
+        schema_version: DOMAIN_SCHEMA_VERSION,
+        lesson_id: LessonId(id.into()),
+        origin: LessonOrigin::Operator,
+        lifecycle: LessonLifecycle::Active,
+        title: format!("QQQ review {id}"),
+        statement: "Check the timing of the QQQ price review.".into(),
+        rationale: "Operator review of the fixture's QQQ price evidence.".into(),
+        recommended_behavior: "Confirm the QQQ close before the T1 review.".into(),
+        exclusions: vec![exclusion],
+        scope: LessonScope {
+            assets: [Asset::Qqq].into(),
+            horizons: [DecisionHorizon::T1].into(),
+            decision_stages: [akzio_domain::RESEARCH_SYNTHESIZER_RECIPE_ID.into()].into(),
+            ..Default::default()
+        },
+        source_refs: vec![reference(&source)],
+        supersedes: vec![],
+        conflicts_with: vec![],
+        confidence_ppm: 1_000_000,
+        authored_by: Some("offline fixture author".into()),
+        approved_by: Some("offline fixture reviewer".into()),
+        created_at: now,
+        updated_at: now,
+        governance: Some(akzio_domain::LessonGovernance::operator_reviewed(now)),
+    };
+    store.write_lesson(&lesson, &source, now).unwrap().lesson
+}
+
+fn use_lesson_candidate(
+    daemon: &mut Daemon,
+    applied: &ArtifactRef,
+) -> akzio_research::InstalledContract {
+    let now = Utc::now();
+    let active = ActiveResearchCatalogue::install(&daemon.store, now).unwrap();
+    let candidate = active
+        .install_synthesizer_lesson_projection_candidate(&daemon.store, now)
+        .unwrap();
+    let (mut recipes, terminals) = akzio_runtime::rust_terminal_recipes().unwrap();
+    // Freeze the installed candidate hash in this fixture's graph. The normal
+    // active catalogue still serves the Store and the other research roles.
+    recipes.extend(active.contracts.contracts().map(|install| {
+        let id = akzio_domain::TaskRecipeId::new(install.contract.purpose.as_str()).unwrap();
+        let mut recipe = active.recipes.recipe(&id).unwrap().clone();
+        if install.contract.purpose == candidate.contract.purpose {
+            recipe.contract_hash = Some(candidate.contract.contract_hash.clone());
+        }
+        recipe
+    }));
+    let recipes = akzio_runtime::RecipeCatalogue::new(
+        recipes,
+        terminals,
+        akzio_research::ACTIVE_RESEARCH_MAX_NODES,
+    )
+    .unwrap();
+    daemon.workflow = WorkflowRuntime::new(daemon.store.clone(), recipes);
+    daemon.paper.scheduler = PaperScheduler::new(
+        daemon.store.clone(),
+        daemon.workflow.clone(),
+        "offline-lesson-scheduler".into(),
+    )
+    .unwrap()
+    .with_store_executor(daemon.store_executor.clone())
+    .with_market_data_feed(Some(AlpacaMarketDataFeed::Sip))
+    .with_run_log(daemon.run_log.clone());
+    daemon.agents = AgentRuntime::new(
+        daemon.store.clone(),
+        active
+            .contracts
+            .with_installed_candidate(candidate.clone())
+            .unwrap(),
+        Duration::minutes(5),
+    )
+    .with_store_executor(daemon.store_executor.clone());
+
+    let ModelClient::FixtureByPurposePhase(templates) = fixture_model_client() else {
+        panic!("the research fixture must supply role-specific Submit responses");
+    };
+    let mut templates = (*templates).clone();
+    let response = &mut templates
+        .get_mut(candidate.contract.purpose.as_str())
+        .unwrap()[1];
+    let arguments = &mut response["output"][0]["arguments"];
+    let mut submit: serde_json::Value = serde_json::from_str(arguments.as_str().unwrap()).unwrap();
+    submit["result"]["applied_learning_refs"] =
+        serde_json::json!([{"artifact_id": applied.artifact_id}]);
+    *arguments = serde_json::Value::String(submit.to_string());
+    daemon.model = ModelClientAdapter::new(ModelClient::fixture_by_purpose_phase(templates));
+    candidate
+}
+
+fn install_stale_research_inputs(daemon: &mut Daemon) {
+    // Submit every mandatory Need. Stale supplementary sources leave room in
+    // the Synthesizer's bounded projection while the four price calendars and
+    // the execution baseline still come from the ordinary offline adapters.
+    let mut sources = FixtureEvidence::new();
+    let stale = Utc::now() - Duration::days(365);
+    for need in akzio_domain::paper_session_evidence_needs(REGRESSION_SESSION) {
+        if need.resource.starts_with("bars:")
+            || need.criticality() == akzio_domain::EvidenceCriticality::ExecutionSafety
+        {
+            continue;
+        }
+        let source = evidence_source(&need.source_family).unwrap();
+        let response = debug_fixture_evidence(source, &need.resource, stale);
+        sources
+            .entry(source)
+            .or_default()
+            .insert(need.resource, response);
+    }
+    daemon.fixture_evidence = Arc::new(sources);
+}
+
+/// WHY THIS TEST EXISTS (Task #34): a Lesson must accompany the exact accepted v71 Submit
+/// before a formal Decision can apply it and a sealed Outcome can record its use.
+/// A scoped Lesson that exceeds the projection budget must leave neither record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_the_lesson_presented_to_the_accepted_submit_reaches_decision_and_outcome() {
+    let mut daemon = daemon();
+    let store = daemon.store.clone();
+    let shown = write_scoped_lesson(&store, "shown", "Skip early closes.".into());
+    let omitted = write_scoped_lesson(
+        &store,
+        "oversized",
+        "Require verified prices. ".repeat(11_000),
+    );
+    let shown_ref = reference(&shown.artifact);
+    let candidate = use_lesson_candidate(&mut daemon, &shown_ref);
+    assert_eq!(candidate.contract.version, 71);
+    assert!(omitted.lesson.exclusions[0].len() as u64 > candidate.contract.context.max_bytes);
+
+    install_stale_research_inputs(&mut daemon);
+    let (mut daemon, run_id, schedule, task) =
+        schedule_daemon(daemon, REGRESSION_SESSION.parse().unwrap(), None).await;
+    let proposals = store
+        .run_artifacts_by_kind(&run_id, ArtifactKind::DecisionProposal)
+        .unwrap();
+    let [proposal] = proposals.as_slice() else {
+        panic!("expected one accepted Synthesizer proposal");
+    };
+    assert_eq!(
+        proposal.provenance.producer_contract_hash.as_ref(),
+        Some(&candidate.contract.contract_hash)
+    );
+    let manifest_ref = proposal
+        .source_refs
+        .iter()
+        .find(|source| source.kind == ArtifactKind::ContextManifest)
+        .unwrap();
+    let manifest = store.artifact(&manifest_ref.artifact_id).unwrap();
+    assert_eq!(
+        store
+            .proposal_lesson_presentation(proposal, &manifest)
+            .unwrap(),
+        Some([shown_ref.clone()].into()),
+    );
+    assert!(!manifest.source_refs.contains(&reference(&omitted.artifact)));
+    let coverage = store
+        .run_artifacts_by_kind(&run_id, ArtifactKind::SemanticDetail)
+        .unwrap()
+        .into_iter()
+        .find(|artifact| {
+            artifact.producer == "context.coverage" && artifact.source_refs.contains(manifest_ref)
+        })
+        .expect("the accepted Submit manifest has a coverage audit");
+    let coverage: serde_json::Value = daemon.read_artifact_payload(&reference(&coverage)).unwrap();
+    let omitted_id = serde_json::json!(omitted.artifact.artifact_id);
+    let exclusion = coverage["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["artifact_id"] == omitted_id)
+        .expect("the scoped oversized Lesson reached projection budgeting");
+    assert_eq!(exclusion["exclusion_reason"], "projection_byte_budget");
+    let draft: akzio_domain::DecisionDraft =
+        daemon.read_artifact_payload(&reference(proposal)).unwrap();
+    assert_eq!(
+        draft.applied_learning_refs.as_slice(),
+        std::slice::from_ref(&shown_ref),
+    );
+    assert!(draft.rejected_learning_refs.is_empty());
+
+    let reviews = store
+        .run_artifacts_by_kind(&run_id, ArtifactKind::ProposalReview)
+        .unwrap();
+    let [review] = reviews.as_slice() else {
+        panic!("expected one ProposalReviewer result");
+    };
+    let review: akzio_domain::ProposalReview =
+        daemon.read_artifact_payload(&reference(review)).unwrap();
+    assert!(review.authorizes(&reference(proposal), &proposal.blob.hash));
+
+    let contexts = store
+        .run_artifacts_by_kind(&run_id, ArtifactKind::DecisionContext)
+        .unwrap();
+    let [context_artifact] = contexts.as_slice() else {
+        panic!("expected one committed DecisionContext");
+    };
+    let outcome_schedule: OutcomeSchedule =
+        daemon.read_artifact_payload(&reference(&schedule)).unwrap();
+    let decision: Decision = daemon
+        .read_artifact_payload(&outcome_schedule.decision)
+        .unwrap();
+    assert_eq!(decision.decision_context, reference(context_artifact));
+    assert_eq!(decision.targets, akzio_domain::TargetPortfolio::zeroed());
+    let context: DecisionContext = daemon
+        .read_artifact_payload(&decision.decision_context)
+        .unwrap();
+    assert_eq!(
+        context.applied_learning_refs.as_slice(),
+        std::slice::from_ref(&shown_ref),
+    );
+    assert!(context.rejected_learning_refs.is_empty());
+    assert!(context.unpresented_lesson_refs.is_empty());
+    assert_eq!(
+        store
+            .decision_lesson_presentation(context_artifact)
+            .unwrap(),
+        Some([shown_ref.clone()].into())
+    );
+
+    let usage = store.lesson_usage(&shown.lesson.lesson_id).unwrap();
+    assert_eq!((usage.context_manifests, usage.decision_contexts), (1, 1));
+    let usage = store.lesson_usage(&omitted.lesson.lesson_id).unwrap();
+    assert_eq!((usage.context_manifests, usage.decision_contexts), (0, 0));
+    assert!(usage.latest_used_at.is_none());
+
+    let outcome = seal_outcome(&mut daemon, &schedule, task).await;
+    let sealed: Outcome = daemon.read_artifact_payload(&reference(&outcome)).unwrap();
+    sealed.validate_sealed().unwrap();
+    let evidence = store.lesson_evidence(&shown.lesson.lesson_id).unwrap();
+    let [record] = evidence.as_slice() else {
+        panic!("expected the EvaluationRuntime to persist exactly one LessonEvidence record");
+    };
+    assert_eq!(record.lesson_artifact, shown_ref);
+    assert_eq!(record.decision_context, reference(context_artifact));
+    assert_eq!(record.outcome, reference(&outcome));
+    assert_eq!(record.attribution, akzio_domain::LessonAttribution::Applied);
+    record.validate_sealed_outcome_metrics(&sealed).unwrap();
+    let mut wrong_utility = record.clone();
+    wrong_utility.utility_ppm_by_horizon[0] ^= 1;
+    assert!(wrong_utility
+        .validate_sealed_outcome_metrics(&sealed)
+        .is_err());
+    let mut invented_calibration = record.clone();
+    invented_calibration.calibration_ppm_by_horizon[0] = Some(0);
+    assert!(invented_calibration
+        .validate_sealed_outcome_metrics(&sealed)
+        .is_err());
+    assert!(store
+        .lesson_evidence(&omitted.lesson.lesson_id)
+        .unwrap()
+        .is_empty());
+    let active = store
+        .active_contract(&candidate.contract.purpose)
+        .unwrap()
+        .unwrap();
+    let installation = store
+        .contract_installation(&candidate.contract.contract_hash)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        installation.baseline_contract_hash.as_ref(),
+        Some(&active.contract.contract_hash)
+    );
+    assert!(installation.activated_at.is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

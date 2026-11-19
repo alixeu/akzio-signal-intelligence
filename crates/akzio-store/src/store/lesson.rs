@@ -5,9 +5,10 @@
 use super::*;
 
 use akzio_domain::{
-    Artifact, ArtifactKind, ArtifactLifecycle, ArtifactRef, LessonAttribution, LessonEvidence,
-    LessonGovernance, LessonOrigin,
+    content_hash_json, Artifact, ArtifactKind, ArtifactLifecycle, ArtifactRef,
+    ContextManifestPayload, LessonAttribution, LessonEvidence, LessonGovernance, LessonOrigin,
 };
+use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct LessonEvidenceMetrics {
@@ -91,6 +92,19 @@ pub struct LessonUsage {
     pub context_manifests: u64,
     pub decision_contexts: u64,
     pub latest_used_at: Option<DateTime<Utc>>,
+    pub legacy_manifest_refs: u64,
+    pub legacy_decision_refs: u64,
+}
+
+impl LessonUsage {
+    /// Keep prior-version reference counts in the recall and revalidation
+    /// budget without reporting them as verified model presentation.
+    pub fn governance_count(&self) -> u64 {
+        self.context_manifests
+            .saturating_add(self.decision_contexts)
+            .saturating_add(self.legacy_manifest_refs)
+            .saturating_add(self.legacy_decision_refs)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -104,3 +118,4 @@ mod derivation;
 include!("lesson/write.rs");
 include!("lesson/queries_verify.rs");
 include!("lesson/helpers.rs");
+include!("lesson/presentation.rs");

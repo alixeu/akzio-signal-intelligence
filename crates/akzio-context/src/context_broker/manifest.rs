@@ -311,7 +311,11 @@ impl ContextBroker {
             self.assert_context_permitted(&contract.context, &artifact)?;
             self.assert_context_run(permit, &artifact)?;
             let legacy_tokens = estimate_tokens_from_bytes(artifact.blob.bytes);
-            let (_, projected_tokens) = self.projection_budget(&artifact)?;
+            let lesson_body = presents_lesson_bodies(contract) && artifact.kind == ArtifactKind::Lesson;
+            let (projected_size, projected_tokens) = self.projection_budget(&artifact, lesson_body)?;
+            if lesson_body && selection.projected_bytes != Some(projected_size) {
+                return Err(ContextError::InvalidManifestClosure);
+            }
             let expected_tokens = if selection.projected_bytes.is_some() {
                 projected_tokens
             } else {
@@ -421,6 +425,7 @@ impl ContextBroker {
         // Manifest + ReadGrant，不代表研究提案已通过、更不代表 Decision/Execution。
         contract.validate()?;
         let policy = &contract.context;
+        let lesson_bodies = presents_lesson_bodies(contract);
         let mut seen = BTreeSet::new();
         let mut candidate_refs = candidates.into_iter().collect::<Vec<_>>();
         if contract.purpose.as_str() == RESEARCH_SYNTHESIZER_RECIPE_ID {
@@ -433,6 +438,11 @@ impl ContextBroker {
         // Lesson/Experience 是从 Store 召回的辅助上下文；召回审计与重验建议都是
         // RunScoped 观察，不能把学习材料写成已激活的 CandidatePolicy。
         self.suggest_lesson_revalidation(permit, &learning, &candidate_refs, now)?;
+        let recalled_lessons = learning
+            .iter()
+            .filter(|reference| reference.kind == ArtifactKind::Lesson)
+            .map(|reference| reference.artifact_id.clone())
+            .collect::<BTreeSet<_>>();
         candidate_refs.extend(learning);
         let artifacts = candidate_refs
             .into_iter()
@@ -454,6 +464,13 @@ impl ContextBroker {
                         .contains(&artifact.provenance.source_family))
             {
                 exclusion_reasons.insert(artifact.artifact_id.clone(), "contract_or_source_excluded");
+                continue;
+            }
+            if lesson_bodies
+                && artifact.kind == ArtifactKind::Lesson
+                && !recalled_lessons.contains(&artifact.artifact_id)
+            {
+                exclusion_reasons.insert(artifact.artifact_id.clone(), "lesson_recall_ineligible");
                 continue;
             }
             if self.overlay_is_eligible(&artifact)? {
@@ -571,7 +588,7 @@ impl ContextBroker {
         for artifact in artifacts {
             // 必需输入优先但仍受三类预算和 Artifact 数量上限约束；可选材料超限时跳过，
             // 必需材料超限则返回 MissingRequiredInput，避免形成看似成功但闭包不完整的上下文。
-            let (projected, tokens) = self.projection_budget(&artifact)?;
+            let (projected, tokens) = self.projection_budget(&artifact, lesson_bodies)?;
             let next_source_bytes = total_bytes.saturating_add(artifact.blob.bytes);
             let next_projected_bytes = projected_bytes.saturating_add(projected);
             let next_tokens = estimated_tokens.saturating_add(tokens);
@@ -637,12 +654,22 @@ impl ContextBroker {
                 exclusion_reasons.insert(artifact.artifact_id.clone(), "overlay_changed_before_grant");
                 continue;
             }
-            let (projected, tokens) = self.projection_budget(&artifact)?;
+            let (projected, tokens) = self.projection_budget(&artifact, lesson_bodies)?;
             total_bytes = total_bytes.saturating_add(artifact.blob.bytes);
             estimated_tokens = estimated_tokens.saturating_add(tokens);
             selection.estimated_tokens = tokens;
             selection.projected_bytes = Some(projected);
             revalidated.push(selection);
+        }
+        if lesson_bodies {
+            let omitted = self.omit_incomplete_lesson_groups(
+                &mut revalidated,
+                &mut total_bytes,
+                &mut estimated_tokens,
+            )?;
+            exclusion_reasons.extend(
+                omitted.into_iter().map(|id| (id, "lesson_conflict_group_incomplete")),
+            );
         }
         let selections = revalidated;
         if selections.len() < usize::from(policy.min_artifacts) {
@@ -787,9 +814,7 @@ impl ContextBroker {
                     continue;
                 }
                 let usage = self.store.lesson_usage(&stored.lesson.lesson_id)?;
-                let usage_count = usage
-                    .context_manifests
-                    .saturating_add(usage.decision_contexts);
+                let usage_count = usage.governance_count();
                 if !stored
                     .lesson
                     .is_retrievable(now, usage_count, &scope.regimes)

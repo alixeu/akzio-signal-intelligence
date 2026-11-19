@@ -66,6 +66,8 @@ pub enum DecisionGateError {
     InvalidPolicyInfluence(ArtifactId),
     #[error("learning artifact {0} was selected but not explicitly applied or rejected")]
     MissingLearningAttribution(ArtifactId),
+    #[error("Lesson {0} was not presented to the result-producing Submit")]
+    UnpresentedLesson(ArtifactId),
 }
 
 pub type DecisionGateResult<T> = std::result::Result<T, DecisionGateError>;
