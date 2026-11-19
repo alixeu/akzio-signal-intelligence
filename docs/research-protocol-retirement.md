@@ -1,13 +1,13 @@
 # 研究协议统一与旧链路退休
 
-活动研究主干为 Evidence → T1/T3/T5 Analyst → T1/T3/T5 Critic → Synthesizer → Decision。PositionPlan 在 Decision 后结束；Paper 继续既有 ExecutionGate、PaperCommit、Reconcile、OutcomeSchedule 和 Outcome 流程。Shadow 的研究角色使用相同提交协议。
+Paper 和 PositionPlan 的研究主干依次为 EvidenceGate、T1/T3/T5 Analyst 与 Critic、受控补采和受影响期限重跑、有界 Synthesizer 与 ProposalReviewer 修订，最终由 DecisionGate 处理通过审查的提案。PositionPlan 在 Decision 后结束。Paper 继续经过 ExecutionGate、PaperCommit、Reconcile 和 Evaluate，创建 OutcomeSchedule 后进入后续 Outcome 阶段。完整拓扑见[运行时契约](agent-runtime-contract.md#51-有界补采与终稿审查)。
 
 ## 协议与冻结身份
 
-- 研究 Contract **69**、PromptBundle **38**、Analyst freshness candidate **70**。研究请求从 Submit 开始，仅提供授权 projections 和 `submit_result`，输出 `result + deliberation`。
+- 活动研究 Contract **69** / PromptBundle **38**。正式 Core 启动时将 Analyst freshness **70** 安装为候选，由 Shadow 按冻结哈希选择。Synthesizer Lesson **71** 与 Analyst 事实 **72** 须显式安装并选择对应哈希。Paper、PositionPlan 和 Shadow 的 Analyst、Critic、Synthesizer、ProposalReviewer 均从 Submit 开始，使用授权投影和 `submit_result`，输出 `result + deliberation`。
 - Outcome 保持 Contract **63**、PromptBundle **35**；Contract 哈希为 `c9556a7ca9000cd06b96e385876013e3ce06a330fb4d01a473a43ef2db067ddf`。Draft、受控读取、Submit、阶段恢复和累计预算继续保留。
 - 引用闭包、方向资格、补采约束、Rust 日历绑定及冻结 result 的 deliberation 修复继续由 Rust 管理。研究角色的旧 Draft 指导、分阶段预算、reasoning 覆盖和整段压缩重提分支已删除。
-- t1/t3/t5 明确表示基准 Session 后第 1/3/5 个共同完成的交易 Session。研究反馈报告 deliberation 数组长度和权重总和的实际错误；Synthesizer wire Schema 要求保留全部已选 Claim/Critique，包括受限期限，并区分零仓位理由与非零仓位支持条件。重试恢复重建与原请求相同的拒绝反馈，不改变累计预算或历史记录。
+- 带日历标记的 t1/t3/t5 指冻结基准之后第 1/3/5 个计划交易 Session。Outcome 等到对应收盘加 20 分钟和四资产日线齐备。无日历标记的历史 Outcome 保留原有阶段采集口径，新校准将其标记为 `label_timing_unknown`。研究反馈报告 deliberation 数组长度和权重总和的实际错误；Synthesizer wire Schema 要求保留全部已选 Claim/Critique，包括受限期限，并区分零仓位理由与非零仓位支持条件。重试恢复重建与原请求相同的拒绝反馈，不改变累计预算或历史记录。
 - Policy 与 Synthesizer Contract 的身份必须匹配。新 Contract 不复制、改写或激活旧 Policy；既有 preflight、显式校准与激活流程继续生效。
 
 实现见 [运行时协议选择](../crates/akzio-research/src/agent/runtime_run.rs)、[活动 Contract](../crates/akzio-research/src/agent/catalogue.rs)、[请求构建](../crates/akzio-research/src/agent/prompts/phases.rs) 和 [Policy preflight](../crates/akzio-cli/src/cli/calibration.rs)。
@@ -19,7 +19,7 @@
 | CLI | `run fixture-debug`、`run paper-dry-run`、`run submit`、完整 `debug` 命令组、`evidence market-audit` / `evidence preflight` 及旧 `read-range-probe` 实验参数 | 正式 PositionPlan/Paper、只读 replay/export |
 | HTTP | 通用 POST `/runs` 创建路由、`SubmitRequest`、`fixture_controller` 与 `read_range_probe` 字段 | 正式 Paper/PositionPlan 创建与控制；未知字段明确拒绝 |
 | App | 新运行的 fixture 开关、Planner 模型路由、当前演示的 Planner 节点与角色卡 | 历史 Planner / PaperDryRun 标签与布局解码 |
-| 活动注册 | Planner Contract、recipe、catalogue 必选项、模型路由及预算配置 | Analyst、Critic、Synthesizer、Outcome |
+| 活动注册 | Planner Contract、recipe、catalogue 必选项、模型路由及预算配置 | Analyst、Critic、Synthesizer、ProposalReviewer、Outcome |
 | Prompt / Schema | Planner 角色正文、Planner Draft 与 EvidenceNeed 输出 Schema、旧研究 Draft 拼接 | 研究结构化提交、Outcome 两阶段、当前补采请求 Schema |
 | Workflow | Planner 启动 bootstrap、模型 Proposal 扩图、Store workflow patch 写入口、旧空图 retry | Rust 固定提案编译；PositionPlan retry 经正式准备流程 |
 | 模块 | 原 `runtime/planner/` 模块 | 共享 lowering、校验和证据编译迁至 `runtime/compilation/` |
@@ -33,7 +33,7 @@
 
 历史 CAS、事件、Contract、哈希、Commitment、Policy 激活记录及必要 wire 字段不改写。`RunPurpose::Debug` 与 `PaperDryRun`、Planner Artifact/事件/角色类型、旧预算值及旧 Contract 能力边界只供历史解码、展示、只读导出与完整性校验；不得创建新的 Debug-purpose 证据图。
 
-退休身份按旧 purpose、Planner 节点或研究 Contract 版本识别。启动升级预检列出未完成 Run/Task 与有效 lease，不取消、不改状态、不释放 lease；任务领取、resume、retry、step 和 fork 返回 `legacy_workflow_retired`。检查视图不会把退休节点标为可执行。
+退役身份按旧 purpose、隔离标记、Planner 节点或研究 Contract 版本识别。正式 Worker 在查询时排除旧 Debug、PaperDryRun 和隔离 Store 的任务，选中的任务还须通过 Store 的退役检查。现存 `run retry` 在重试前检查原 Run：旧 Debug 或隔离 Store 对应 `debug_control_retired`，其他退役研究图对应 `legacy_workflow_retired`。旧独立 Debug 的 resume、step 和 fork 入口已移除。启动升级预检列出未完成 Run/Task 与有效 lease，保留原状态及 lease。检查视图保留退役状态。
 
 历史 replay 从持久化事件、图修订和冻结 Contract 校验，不依赖活动 Planner recipe。旧版本的特殊能力迁移规则只在历史完整性检查中使用，不再用于当前激活入口。
 

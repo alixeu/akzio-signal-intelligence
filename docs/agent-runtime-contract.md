@@ -6,31 +6,29 @@
 
 ## 当前研究与证据规则
 
-当前 Contract、PromptBundle 与 freshness candidate 版本见 [catalogue.rs](../crates/akzio-research/src/agent/catalogue.rs)；历史冻结对象继续按原身份验证。以下描述当前行为，不是历史验收记录。
+活动版本和阶段见[研究提交与 Outcome 协议](#52-研究提交与-outcome-协议)。历史对象按原身份验证，退役范围和升级阻断见[研究协议与退役清单](research-protocol-retirement.md#历史兼容与执行阻断)。
 
-非中性预测要求同资产、同期限、同方向的 Claim 支撑；非零多头研究配置要求对应看多依据、正预期收益和相关引用；显式现金仍合法。旧 proposal 不按新规则重新解释，旧未完成任务继续阻断升级，旧 CAS 和哈希不改写。模型 route、reasoning 与预算没有随这次升级修改。
+非中性预测要求同资产、同期限、同方向的 Claim 支撑。非零多头研究配置要求对应看多依据、正预期收益和相关引用。显式现金仍合法。
 
-仅新研究角色的默认累计输出上限改为 1000000，可由既有角色配置下调；Outcome 默认 4000 不变。输入、ContextPolicy、工具、墙钟、重试和模型 route 不随之扩大。旧任务、预算及哈希保持冻结，未完成旧任务仍经原升级阻断规则处理。配置与单请求上限语义见 [Agent Budget 配置](agent-budget-configuration.md)。
+研究输出显式声明 `EvidenceGap.retriable`。可重查的阻断缺口必须携带受控请求，补采和 Analyst/Critic 重跑额度跨恢复保持。补采无新增合格事实时保留缺口。正式 PositionPlan 缺 active Policy 时仍由 Rust DecisionGate 校验研究提案，保留合格的 `research_plan.validated`，正式目标为零。已安装 Policy 必须匹配当前 Synthesizer 模型和 Contract。
 
-新指导仅压缩重复说明，保留全部必需字段、事实、数值和引用；沿用 Contract 49 引入的输出预算及单请求上限，不扩大任何资源额度。已冻结的 Contract 49 与更早版本保留原指导、预算和哈希；未完成旧任务及有效 lease 仍通过原升级机制阻断切换。
+Alpaca 股票研究捕获先核验资产，保留市场时钟、交易日历、请求的 IEX/SIP feed、snapshot/quote/trade 及各自时间戳。允许省略 feed 的调整后研究日线使用供应商默认流，保留 feed 未知。原始 Outcome 日线和期权依赖的股票快照仍要求明确的股票 feed。日线在交易所收盘 20 分钟后才具备发布时间条件。期权捕获默认显式 indicative，不自动切换 OPRA；到期范围最多 30 天、行权价为截止前标的成交价（或完整日线）的 90%-110%、最多 4 页及 512 合约，缺 quote 时最多 6 次、每次 100 合约批量请求；明确权限拒绝后停止补采。按 OCC 合并 contracts 的 dated open interest；缺失保持 unknown。IV/Greeks 没有独立 provider 时间戳时明确为 unknown，不能借用 quote/retrieval 时间。覆盖率和截断状态随 NormalizedEvidence 投影保留；原始请求账本随 RawEvidence 保存。休市旧数据不标为实时。
 
-新输出显式声明 EvidenceGap.retriable；可重查的阻断缺口必须携带受控请求。一次补采及最多一次 Analyst 重跑的额度跨恢复保持；第二次仍无事实时保留缺口。既有冻结 Contract、CAS 和哈希不变，未完成任务继续阻断升级。旧隔离 Debug PositionPlan 的预检仅供历史解码；正式 Core 缺 active policy 时按默认 fail-closed Policy 完成 Decision，已安装 policy 仍须严格匹配当前模型及 Synthesizer Contract。
+`forecast_calendar` 冻结未来计划收盘，`bar_session_coverage` 保存本次日线请求范围的计划收盘、实际返回和缺失日期。模型紧凑投影省略这两个原始元数据字段。新版日线滚动特征使用最新一段连续的已证交易日。缺少所需交易日时相应统计量留空，252 日收益至少需要 253 根连续收盘价。
 
-Alpaca 股票研究捕获先核验资产，保留市场时钟、交易日历、显式 IEX/SIP 请求、snapshot/quote/trade 及各自时间戳；收盘日线沿用交易所 Session close + 20 分钟可用性规则。期权捕获默认显式 indicative，不自动切换 OPRA；到期范围最多 30 天、行权价为截止前标的成交价（或完整日线）的 90%-110%、最多 4 页及 512 合约，缺 quote 时最多 6 次、每次 100 合约批量请求；明确权限拒绝后停止补采。按 OCC 合并 contracts 的 dated open interest；缺失保持 unknown。IV/Greeks 没有独立 provider 时间戳时明确为 unknown，不能借用 quote/retrieval 时间。覆盖率和截断状态随 NormalizedEvidence 投影保留；原始请求账本随 RawEvidence 保存。休市旧数据不标为实时。
+方向资格由同一个 Claim 的正式 price/macro grounds、精确资产/期限、对应 Critique 对这两类 grounds 的当前权威核验和无 slot blocker 共同决定；Context matrix、Submit 与 DecisionGate 共用该规则。Critic 新 evidence 和 deliberation 不能补齐 Claim。模型不填写 expiry/holding period，Rust 从四资产共同的 Alpaca 计划交易日历计算；日历元数据不构成未来价格事实。原 12 forecasts、allocation 守恒、引用闭包仍强制校验。阶段审计记录 provider、parse_validate、persist_stage 耗时，含 structured/draft/submit 标识及 revision。结构化修复显式记录原始调用引用、前后 result 哈希和差异路径；仅修复 deliberation 时切换为只含 deliberation 的修复 Schema，缩减为该元数据和校验错误上下文；Rust 从原始 AgentTurn 冻结并复用 result，模型不能再次提交 result。越权重写 result 会直接拒绝。恢复核对完整提交和元数据修复的各自工具哈希，累计预算保持不变。
 
-新 PositionPlan 的 Analyst/Critic/Synthesizer 直接提交结构化 result + deliberation，Rust 校验后持久化；没有 Draft 或第二次格式化模型调用。其他 purpose 与旧冻结 Contract 保留原阶段协议。新的方向资格由同一个 Claim 的正式 price/macro grounds、精确资产/期限、对应 Critique 对这两类 grounds 的当前权威核验和无 slot blocker 共同决定；Context matrix、Submit 与 DecisionGate 共用该规则。Critic 新 evidence 和 deliberation 不能补齐 Claim。模型不填写 expiry/holding period，Rust 从四资产共同的 Alpaca 计划交易日历计算；日历元数据不构成未来价格事实。原 12 forecasts、allocation 守恒、引用闭包仍强制校验。阶段审计记录 provider、parse_validate、persist_stage 耗时，含 structured/draft/submit 标识及 revision。结构化修复显式记录原始调用引用、前后 result 哈希和差异路径；仅修复 deliberation 时切换为只含 deliberation 的修复 Schema，缩减为该元数据和校验错误上下文；Rust 从原始 AgentTurn 冻结并复用 result，模型不能再次提交 result。越权重写 result 会直接拒绝。恢复核对完整提交和元数据修复的各自工具哈希，累计预算保持不变。
+正式 Shell 和原生 CLI 入口见[正式运行与历史 Debug 退役](#12-正式运行日志与历史-debug-退役)。
 
-正式 Shell 入口的 `position-plan|paper` 调用 Rust `run start --auto-serve`；复用已有、具备私有日志能力的 canonical Core，或在所选端口明确未监听时启动相同配置的正式 Core 并等待 ready，之后才以一次 `POST /runs` 提交显式 purpose，不等待 Run 完成。端口占用、认证错误、隔离 Store 或版本不匹配不能触发第二个 Core；脚本不会自动改写 `auto_paper`、审批或 Policy。首次缺 active policy 的 PositionPlan 仍由 Rust DecisionGate 校验研究提案，保留合格 `research_plan.validated`，正式目标强制为零；它在 Decision 后结束，没有 Outcome。Paper 冷启动另走原 NoOrder 与 OutcomeSchedule 路径，不由 PositionPlan 自动切换。旧隔离 Debug Session 不再取得执行控制入口；原脚本 `--research-only` 入口已移除。不得伪造或自动激活校准 policy。旧 Python 自动等待、ZIP 和 `--keep-artifacts` 不再提供；正式 Core 的新私有阶段 ZIP 与按需分享安全 Rust 导出是两种不同产物。
+Context 对 Invesco JSON holdings 也应用精确权重排序和 12 行投影；期权保留完整聚合、时间与覆盖字段，样例缩为前两项并记录省略数。相同任务的 Retry/Recovery 只复用精确来源、相同 Contract 和相同内容的历史期权投影，仍签发当前 Attempt 的新 ReadGrant，不放宽恢复身份校验。研究角色的 Context 描述明确没有读取工具。
 
-共享治理与 Analyst/Critic/Synthesizer 正文不再规定阶段，实际请求构建器按 Contract 与角色选择研究单次结构化协议或 Outcome 两阶段协议；旧冻结正文、CAS 与 Contract 不重写，原升级阻断继续生效。Context 对 Invesco JSON holdings 也应用精确权重排序和 12 行投影；期权保留完整聚合、时间与覆盖字段，样例缩为前两项并记录省略数。相同任务的 Retry/Recovery 只复用精确来源、相同 Contract 和相同内容的历史期权投影，仍签发当前 Attempt 的新 ReadGrant，不放宽恢复身份校验。研究角色的 Context 描述明确没有读取工具。
+分享安全 bundle 支持经过同一脱敏器处理的 UTF-8 文本和完整 NDJSON 记录；无权限时不导出 RawEvidence 内的 provider 明细。搜索审计从已持久化的 discovery/reviewer provider 响应提取 action/source，不从文章、摘要或模型自述推断；缺失审计显示 unknown/null，搜索发生与来源核验仍是不同事实。研究完整性与导出完整性分别记录。
 
-分享安全 bundle 支持经过同一脱敏器处理的 UTF-8 文本和完整 NDJSON 记录；无权限时不导出 RawEvidence 内的 provider 明细。搜索审计从已持久化的 discovery/reviewer provider 响应提取 action/source，不从文章、摘要或模型自述推断；缺失审计显示 unknown/null，搜索发生与来源核验仍是不同事实。研究不完整与导出完整性独立记录；历史隔离 Debug PositionPlan 不恢复 Decision，正式 PositionPlan 则以零目标完成 fail-closed Decision。
+当前研究的 Claim/Critique wire grounds Schema 按 Rust 读取的 Manifest 证据资产范围绑定 `anyOf` 分支。单资产新闻只能声明对应资产，共享宏观仍可声明合法的多资产范围。按相同 scope 合并 ID，避免逐文档展开 Schema。Rust 在恢复 kind 和执行业务校验前验证同一个 bound wire Schema。
 
-新 PositionPlan 的 Claim/Critique wire grounds Schema 按 Rust 读取的 Manifest 证据资产范围绑定 anyOf 分支，单资产新闻不能同时声明另一资产；共享宏观仍可声明其合法多资产范围。按相同 scope 合并 ID，避免逐文档展开 Schema。Rust 在恢复 kind 和执行原业务校验前也验证同一个 bound wire Schema，不能仅依赖 provider。新 Run 的 Analyst/Critic 默认 Attempt 时限由 120s 调整为 180s，Synthesizer 保持 180s；原冻结 Contract/Run 的序列化预算不改，累计调用用量与未知用量阻断继续生效。
+当前研究提交对未 source-verified 的 news 仅接受描述性 ground，不接受其 supporting_ref；source scope 和 citation 完整性不再代替来源验证。补采建议在提交时校验类型化业务意图，Rust 再绑定冻结资源和时间窗口，并使用与 adapter 相同的 GovernedResource 解析器。旧 CAS/Contract 不重写，未完成任务的升级阻断保留。
 
-当前研究发布使用 Contract 69 / Prompt bundle 38（freshness candidate 70）；Outcome 保持 Contract 63 / Prompt bundle 35。新研究提交对未 source-verified 的 news 仅接受描述性 ground，不接受其 supporting_ref；source scope 和 citation 完整性不再代替来源验证。补采建议在提交时校验类型化业务意图，Rust 再绑定冻结资源和时间窗口，并使用与 adapter 相同的 GovernedResource 解析器。旧 CAS/Contract 不重写，未完成任务的升级阻断保留。
-
-新闻复核仅规范化已列明的 utm 跟踪参数，不推断重定向或合并不同业务 URL；逐事实验证并记录 URL 绑定与失败原因，有效事实与失败项可同时保留，model_reviewed 不升级为 source_verified。Context 在必需闭包之后优先覆盖价格、新闻、宏观和事件日历，再分配期权背景；24 项及字节预算不扩张。无读取工具的 PositionPlan 投影明确原文未开放。缺失 Policy 的旧隔离 Debug PositionPlan 只保留历史检查，不恢复 Decision/控制入口；正式 PositionPlan 始终使用原 DecisionGate。
+新闻复核仅规范化已列明的 utm 跟踪参数，不推断重定向或合并不同业务 URL；逐事实验证并记录 URL 绑定与失败原因，有效事实与失败项可同时保留，model_reviewed 不升级为 source_verified。Context 在必需闭包之后优先覆盖价格、新闻、宏观和事件日历，再分配期权背景；24 项及字节预算不扩张。研究投影明确告知角色只可使用已提供的材料。
 
 导出将研究 AgentTurn、采集 provider 响应、hosted web 操作、含 action.sources 的操作以及来源复核失败分别计数。reasoning effort 优先读取 telemetry，否则读取已保存的实际 provider request；未保存不推断。上下文导出列出本包内未选中的证据，不将其解释为在当时 cutoff 已可用。数值依据是模型估计说明，不代表 Critic 已审查具体数值或 Policy 已校准。
 
@@ -47,7 +45,7 @@ Alpaca 股票研究捕获先核验资产，保留市场时钟、交易日历、�
 ## 2. 权威与数据边界
 
 - **Rust 唯一权威**：Rust 是系统状态、授权、Task Contract、模型预算、Workflow Gates、持久化存储、学习迁移和执行策略的唯一权威。
-- **统一 CAS 存储权威**：`V2Store` (底层存储于 SQLite `.akzio/store/akzio.sqlite3`) 是系统唯一持久化权威。严禁增加改变语义的并行 JSON 状态、文件缓存，或绕过 `akzio-store` 直接写 SQLite。
+- **统一 CAS 存储权威**由 `akzio-store` 提供，SQLite 位于 `<store_root>/akzio.sqlite3`。正式配置与仓库 fixture 的路径见[正式运行与历史 Debug 退役](#12-正式运行日志与历史-debug-退役)。严禁增加改变语义的并行 JSON 状态、文件缓存，或绕过 `akzio-store` 直接写 SQLite。
 - **溯源保留**：Evidence、Claim、Critique、DecisionProposal、Decision、Execution、Outcome 和 Memory 必须完整保留 provenance、时间戳、版本与有效 `source_refs`。
 - **受控上下文沙箱**：`akzio-context` 是 Agent 任务获取投研资料的唯一通道。模型代码严禁获取任意本地文件系统、Raw Evidence、底层 SQLite 或实盘/交易凭据的访问权。
 - **Git 干净边界**：生成的 Store Root、BLOB、socket、报告、认证凭据 (`.daemon-token`) 和本地配置覆盖不得提交至 Git。
@@ -61,18 +59,19 @@ Alpaca 股票研究捕获先核验资产，保留市场时钟、交易日历、�
 
 ```text
 时间轴 A (交易日 Session T0)：
-  每个美股交易日开市时，由 Scheduler 独占触发一次完整的 Paper 投研与下单决策 Run。
+  Paper 调度器按实际可交易 Session 排他预约。启用自动调度或收到正式手动请求时，可创建或复用该 Session 的 Paper Run。
   [EvidenceGate] -> [Analyst/Critic × 3] -> [Supplement + affected reruns] -> [Synthesizer/ProposalReviewer] -> [DecisionGate] -> [ExecutionGate] -> [PaperCommit] -> [Reconcile] -> [Evaluate] -> 创建 [OutcomeSchedule]
 
 时间轴 B (跨交易日 T+1 / T+3 / T+5 评估)：
-  每个历史完成的 Paper Run 拥有专属的 OutcomeSchedule，在独立的交易 Session 里被唤醒评估：
+  Paper Run 的 Evaluate 产生 OutcomeSchedule 后，同一 Run 的后续阶段按各自交易日窗口处理：
   - T+1 交易日：计算第一窗口收益与指标，生成 T1 阶段复盘 (Partial Outcome, RunScoped)
   - T+3 交易日：计算第二窗口收益与指标，生成 T3 阶段复盘 (Partial Outcome, RunScoped)
   - T+5 交易日：计算第三窗口收益，密封最终 Outcome (Sealed)，生成 T5 复盘；只有研究、风险真值和叙事均合格时才允许学习评估
 ```
 
 - **并行推进机制**：在交易日 Session $S_n$ 中，系统可以同时执行当天 Run 的 T0 投研，以及历史 Run A 的 T+5 评估、Run B 的 T+3 评估和 Run C 的 T+1 评估。
-- **交易日对齐规则**：T+1、T+3、T+5 严格按**四只 ETF 共同完成的实际交易 Session 数**计算，周末与休市日不计入。
+- **交易日对齐**。带冻结日历的 Run 按四资产一致的交易所日历取 T0 严格之后第 1、3、5 个计划 Session。Paper 的 T0 取持久化 Session slot，包括隔夜场次。PositionPlan 取 EvidenceGate 的期权 Need 冻结日期，可能是周末。Shadow 核对 canary 预约与父 Paper slot 的一致性。预测到期为对应 Session 的精确 UTC 收盘，包含提前收盘及美东 DST。
+- **Outcome 窗口**。Outcome 沿 `OutcomeSchedule`、`DecisionContext` 和已接受的 `ContextManifest` 读取同一日历。日历 v1 的发布时间固定为交易所收盘加 20 分钟。每个窗口须等到该时刻，并要求截至该窗口的每个计划 Session 均有四资产日线，日线收盘时间须与冻结值一致。原定日缺数据时继续等待该日，后续交易日不能补位。无日历标记的历史 Outcome 保留原有读取和阶段采集口径。
 
 ---
 
@@ -95,17 +94,22 @@ Alpaca 股票研究捕获先核验资产，保留市场时钟、交易日历、�
 
 ### 5.1 智能体拓扑与阶段分工
 
-| 阶段 / 智能体 | 角色与说明 | 调用模型 | 预算限制 (Token/时限/Tools) | 核心产物 |
+| 阶段或角色 | 职责 | 配置模型路由 | 新 Run 默认 Task input / output / Attempt 时限 | 核心产物 |
 |---|---|---|---|---|
-| **首轮 T0** | Rust 编译固定研究拓扑 | - | - | 确定性 WorkflowProposal |
-| **Analyst Agent** | 评估市场证据，输出结构化主张 (Claim) 与局限 | `gpt-5.6-luna` (high) | 1M in / 1M out / 180s / Submit | `ArtifactKind::Claim` |
-| **Structured Critic** | 对 Analyst Claim 独立审查与交叉验证 | `gpt-5.6-sol` (high) | 1M in / 1M out / 180s / Submit | `ArtifactKind::Critique` |
-| **Synthesizer Agent** | 综合证据与审查，生成 12 项 Forecast 及四资产+现金研究分配提案 | `gpt-5.6-luna` (high) | 1M in / 1M out / 180s / Submit | `ArtifactKind::DecisionProposal` |
-| **Outcome Worker** | T+1/T+3/T+5 阶段产出质性归因复盘 | `gpt-5.6-luna` (medium) | 1M in / 4k out / 180s / 受控读取与 Submit | `RetrospectiveDraft` |
+| **T0 编译** | Rust 编译固定研究拓扑 | — | — | `WorkflowProposal` |
+| **Analyst** | 按期限评估证据并声明主张和缺口 | `research.analyst` | 1M / 1M / 180s | `Claim` |
+| **Critic** | 独立核验对应 Analyst 的 Claim | `research.critic` | 1M / 1M / 180s | `Critique` |
+| **Synthesizer** | 综合有效证据和审查，生成 12 项预测及四资产和现金的分配提案 | `research.synthesizer` | 1M / 1M / 180s | `DecisionProposal` |
+| **ProposalReviewer** | 独立审查每份提案的数值依据和分配 | 继承 Critic 的有效路由 | 继承 Critic（默认 1M / 1M / 180s） | `ProposalReview` |
+| **Outcome Worker** | 在 Paper 的 T+1/T+3/T+5 阶段产出定性复盘 | `learning.outcome_worker` | 1M / 4k / 180s | `RetrospectiveDraft` |
 
-上表预算为新 Run 的默认冻结值，配置覆盖及累计用量语义见 [Agent Budget 配置](agent-budget-configuration.md)。工具预算不改变 Contract 授权。
+Core 按角色读取 `[model.routes]`，未配置该角色时使用 `[model]`。ProposalReviewer 使用 Critic 的有效模型和 reasoning 配置。仓库的 fixture 示例和正式配置模板都声明 `gpt-5.6-luna`、`reasoning_effort = "low"`，且未设置角色路由。实例实际路由以解析后的配置为准，CLI 支持 `AKZIO_MODEL_ROUTES_JSON` 覆盖路由表。参见 [CLI 模型配置解析](../crates/akzio-cli/src/cli/identity.rs)、[Core 路由选择](../crates/akzio-daemon/src/lib.rs)、[fixture 示例](../config/akzio.toml)和[正式配置模板](../config/akzio.observatory.toml)。
 
-正式 Paper 默认拓扑包含按 T1/T3/T5 分工的三个 Analyst/Critic 对，Synthesizer 直接依赖全部 Claim 和 Critic 路径。单 Claim 协议保留，预算按任务累计。任一 Critic NoOutput 不得切断 Claim 血缘。
+上表是新 Run 在配置覆盖前的有效预算。运行时对每个字段按角色覆盖、全局覆盖、代码默认值的优先级解析，再冻结到图和任务。ProposalReviewer 继承 Critic 的解析后预算。默认只读工具次数为 `unlimited`，实际工具首先由 Contract 和阶段授权。Token 按 Task 累计，180s 是单 Attempt 墙钟。参见 [Agent Budget 配置](agent-budget-configuration.md#冻结与执行)。
+
+活动 Contract 对象本身序列化 `versioned_contract_budget`。Analyst、Critic 和 ProposalReviewer 是 48k input / 1M output / 4 次 / 120s，Synthesizer 是 48k / 1M / 2 次 / 120s，Outcome Worker 是 12k / 4k / 2 次 / 180s。该字段用于冻结 Contract 身份。新任务按 `default_agent_budget` 与配置覆盖解析有效预算，研究角色即使有次数额度也只提供 `submit_result`。参见[预算定义与解析](../crates/akzio-domain/src/budget.rs)。
+
+Paper 与 PositionPlan 的 T0 先并行运行三个 T1/T3/T5 Analyst/Critic 对。T1/T3/T5 使用第 3 节的交易 Session 契约定义，每个 Claim 只覆盖一个期限。Synthesizer 依赖有效 Claim 与 Critic 路径，Critic 的 `NoOutput` 仍须保留 Claim 血缘。随后由 ProposalReviewer 审查，Rust DecisionGate 消费通过审查的提案。
 
 ### 5.1 有界补采与终稿审查
 
@@ -113,7 +117,7 @@ Alpaca 股票研究捕获先核验资产，保留市场时钟、交易日历、�
 
 Analyst/Critic 提交 news、price、macro 类型化意图、资产或受支持序列及目的，Rust 从 Run 冻结的 EvidenceNeed 绑定资源、窗口和 cutoff。只有可重试的实质性方向阻断缺口进入全 Run 一轮、最多八个去重资源的补采；四资产新闻展开为四条。请求开始在 I/O 前持久化；恢复保留已耗额度，未知完成状态不重发。处置记录包含合并、影响不足、额度耗尽、非法协议、采集失败和无新增事实。只有新增合格事实才重跑受影响期限的 Analyst/Critic 各一次；Rust 选择有效 revision，不混用原结论，不开启第二轮。
 
-独立 `research.proposal_reviewer` 继承 Critic 的模型路由与有效单任务预算，在 Run 创建时冻结。输入包含完整提案、有效 Claim/Critique、numeric_basis 和关键反证。numeric_basis 恰好覆盖 12 个 forecast、四资产与现金共 17 项，说明输入、单位、方法、假设与不确定性；配置说明仓位、重叠风险与现金理由。ProposalReview 逐项通过/拒绝并给出原因，由 Rust 绑定精确 proposal Artifact、内容哈希、Manifest 和 Contract；任何内容变化都需新 Review。拒绝意见进入下一次 Synthesizer；通过后跳过剩余修订。耗尽、上下文不足或审查失败明确阻断 Decision。结构化格式修复与业务提案修订独立计数，恢复不重置预算。
+每个提案修订节点单独冻结任务预算。ProposalReviewer 的输入包含完整提案、有效 Claim/Critique、numeric_basis 和关键反证。numeric_basis 恰好覆盖 12 个 forecast、四资产与现金共 17 项，说明输入、单位、方法、假设与不确定性；配置说明仓位、重叠风险与现金理由。ProposalReview 逐项通过/拒绝并给出原因，由 Rust 绑定精确 proposal Artifact、内容哈希、Manifest 和 Contract；任何内容变化都需新 Review。拒绝意见进入下一次 Synthesizer；通过后跳过剩余修订。耗尽、上下文不足或审查失败明确阻断 Decision。结构化格式修复与业务提案修订独立计数，恢复不重置预算。
 
 Context 的必需集合包括有效 Claim/Critique、已审 grounds、numeric_basis 引用和反证，先于可选背景；24 项上限不变，关键材料放不下即报覆盖缺口。创建 Manifest 时持久化候选覆盖记录；导出时才出现的证据只能标记存在，不能回推历史可用性。Rust 输出研究进度、审查状态、revision 与 Decision 阻断；脚本与 Observer 只读接口展示该投影，workflow 原状态保留。审查通过只证明依据与推理被审查，SQL active Policy、适配和风险 Gate 独立生效，不生成或自动激活 Policy。Outcome 协议与历史哈希不变。
 
@@ -123,20 +127,23 @@ Contract 69 的拒绝 assessment 必须有 1–3 个类型化 issues；通过项
 
 运行时提示词按功能所有权维护，统一索引见 [提示词所有权与验证](prompt-ownership.md)。治理与角色仍通过冻结 PromptBundle/CAS 读取；动态 Schema、权限、预算、引用绑定及 Gate 由 Rust 决定。
 
-Contract **69** / PromptBundle **38** 的 Analyst、Critic、Synthesizer 在 Paper、PositionPlan 和 Shadow 一律从 Submit 开始，只提供授权 projections 和 `submit_result`，提交 `result + deliberation`。没有独立 Draft、备忘录续传或读取/搜索工具。Rust 保留方向资格、引用闭包、补采约束、交易日历绑定和仅 deliberation 修复机制。freshness candidate 为 **70**。
+活动研究 Contract **69** / PromptBundle **38** 覆盖 Analyst、Critic、Synthesizer 和 ProposalReviewer。Paper、PositionPlan、Shadow 的四个研究角色从 Submit 开始，使用授权投影，通过 `submit_result` 提交 `result + deliberation`。请求只提供提交工具。Rust 校验方向资格、引用闭包和补采约束，绑定交易日历并处理仅限 deliberation 的修复。Analyst freshness candidate 的 Contract 和 PromptBundle 均为 **70**。指定该候选的 Shadow 只替换 Analyst 的冻结 Contract 引用。Analyst 事实候选使用 Contract **72**，沿用 PromptBundle **38**。Rust 验证非空事实来自实际呈现、满足原 cutoff 的授权证据。无法证明时保留 `fact: null`。Synthesizer Lesson 候选使用 Contract / PromptBundle **71**。这两个候选均须显式安装并由运行冻结候选哈希，活动研究版本仍为 **69** / **38**。参见[活动目录及候选](../crates/akzio-research/src/agent/catalogue.rs)和[阶段选择](../crates/akzio-research/src/agent/runtime_run.rs)。
 
-Outcome 保持 Contract **63** / PromptBundle **35** 及冻结哈希，继续 Draft → 受控读取 → Submit。其 ToolCall 先持久化再执行，ToolResult 随后持久化；恢复不重置预算，也不跳过已要求的 Draft。
+经接受的新 Synthesizer 提案通过 `accepted_synthesizer_submit` 记录原 `result` 的 Turn、最终接受的 Submit Turn 及对应哈希。仅修复 deliberation 时，两者可以来自不同 Turn。可取得的已配置 Responses 路由、端点摘要和 provider 回报的模型名随完成的调用保存，用于核对该次调用。provider 侧不可变版本和资格仍需独立证明，校准沿用既有 provider、model 与 Contract 过滤。
 
-Planner 活动 Contract、配方及扩图能力已退休。旧 purpose 和 Artifact 类型仅供历史解码、展示、导出和完整性审计。旧研究任务的领取、继续、重试和 fork 返回 `legacy_workflow_retired`；升级预检列出未完成任务及有效 lease，不自动取消或释放。
+Outcome Worker 使用冻结的 Contract **63** / PromptBundle **35**。Draft 可按授权读取上下文，Rust 持久化 Draft memo 后进入 Submit。只读 ToolCall 在执行前持久化，读取结果或受控失败可随后持久化为 ToolResult。恢复复用冻结的预算和阶段约束。Outcome Draft 使用配置的 reasoning，Submit 请求的 reasoning 由运行时设为 `low`。参见 [Outcome Contract 注册](../crates/akzio-research/src/agent/errors_catalogue.rs)。
+
+历史上的 PositionPlan 专用结构化路径、旧研究 Draft 和 Contract 49 引入的输出预算规则按各自原版本解读。原冻结正文、预算、CAS 和哈希保持其历史身份。Planner 的活动 Contract、配方及扩图能力已退休，旧 purpose 和 Artifact 类型仅供历史解码、展示、导出和完整性审计。正式 Worker 不执行退役任务。现存 `run retry` 受退役检查约束，旧独立 Debug 的 resume、step 和 fork 入口已移除。升级预检列出未完成任务及有效 lease，保留原阻断。参见[历史兼容与执行阻断](research-protocol-retirement.md#历史兼容与执行阻断)和[输出与单请求边界](agent-budget-configuration.md#输出与单请求边界)。
 
 ### 5.3 严格受控的 5 个只读工具
 
-Agent 严禁暴露 `web_search`、`shell`、`http_request`、`file_read`、`sql` 或交易执行工具。只有 Outcome Draft 可使用以下 5 个只读 Context Tool；四个研究角色只提供 `submit_result`：
-1. `read_document(artifact_id)`: 读取当前 Manifest 授权的完整规范化文档；超过 32 KiB 时显式要求改用 read_range，不静默截断。
-2. `read_range(artifact_id, start_byte, end_byte)`: 切片读取，单次上限 32 KiB。
-3. `search_context(query, max_results)`: **非向量/语义搜索**，底层实现为小写子串包含匹配（`text.to_lowercase().contains(&needle)`）。提示词必须指导模型输入简短关键字（如 `TQQQ`, `VIXCLS`），避免长句子。
-4. `read_claim_evidence(artifact_id)`: 读取 Claim 及其 Grounds 引用且已授权的标准化证据，不开放 RawEvidence。
-5. `compare_sources(artifact_ids)`: 对比 2～4 个已授权数据源的时间与内容。
+只有 Outcome Draft 在剩余工具额度内可使用以下五个只读 Context 工具。每次读取须通过当前 Attempt 的 `ReadGrant`、Contract 和 Manifest 校验。Agent 权限严格限定于协议所列工具，禁止通用 `web_search`、`shell`、`http_request`、`file_read`、`sql` 和交易执行权限。参见[工具 Schema](../crates/akzio-research/src/agent/schemas.rs)和 [Context 读取验证](../crates/akzio-context/src/context_broker/reads.rs)。
+
+1. `read_document(artifact_id)` 读取已授权的完整文档。超过 32 KiB 时要求改用 `read_range`。
+2. `read_range(artifact_id, start_byte, end_byte)` 读取已授权文档的半开字节区间 `[start_byte, end_byte)`，单次最多 32 KiB，区间须落在有效 UTF-8 边界上。
+3. `search_context(query, max_results)` 在当前 Manifest 所选文档中做大小写不敏感的子串匹配。查询为 1–256 个字符，结果数为 1–16。
+4. `read_claim_evidence(artifact_id)` 读取已授权的 Claim 及其 Grounds 中已授权的规范化证据。`RawEvidence` 不在授权范围内。
+5. `compare_sources(artifact_ids)` 并列返回 2–4 个不同的已授权来源的时间与受控投影。
 
 ### 5.4 各 Agent 行为与约束不变量
 
@@ -158,12 +165,13 @@ Agent 严禁暴露 `web_search`、`shell`、`http_request`、`file_read`、`sql`
 
 ## 6. 证据采集与 Context 隔离
 
-- **40 项固化证据需求**：Rust 在每个 Paper Session 确定性生成 40 个唯一 `EvidenceNeed`（包含 Broker 账户/持仓/报单状态、四资产向前 400 天/至少 252 根日线、14 天新闻 VerifiedSource、FRED 宏观序列 `DFF`/`DFII10`/`VIXCLS`、杠杆 ETF 损耗条款等）。
+- **40 项固化证据需求**：Rust 在每个 Paper Session 确定性生成 40 个唯一 `EvidenceNeed`（包含 Broker 账户/持仓/报单状态、四资产向前 400 天、每资产请求至多 252 根日线、14 天 `news:*`、FRED 宏观序列 `DFF`/`DFII10`/`VIXCLS`、杠杆 ETF 损耗条款等）。
+- **新闻与发行方证据的采集模式**由 Rust 的 `evidence_acquisition_mode` 决定。`news:*` 使用 `ModelReviewed`。发行方直采的 `research:*` 使用 `VerifiedSource`，其中 `research:earnings_event_calendar:*` 仍使用 `ModelReviewed`。参见[采集策略](../crates/akzio-domain/src/workflow.rs)和[新闻证据](news-evidence.md)。
 - **Context 限制与隔离**：
   - 每个 Agent 的 `ContextManifest` 顶层上限为 **24 个 Artifact**。
   - 普通 Agent 上下文限制 128 KiB，Synthesizer 限制 192 KiB。
   - 严禁向模型注入 `RawEvidence`，必须经过 Rust 标准化为 `NormalizedEvidence`。
-- **Lesson 查询范围**：`ContextQueryScope` 由 Rust 根据已核验的冻结节点生成；资产为当前四 ETF 研究全集，期限取 `NodeSpec`，Synthesizer / ProposalReviewer 显式覆盖 T1/T3/T5，阶段使用完整 recipe ID。查询维度为空表示未知，只匹配该维度未限定的 Lesson，不表示任意匹配。市场状态只取通过原来源、Contract、Run 和类型校验的 DecisionTime RegimeSnapshot；正文字符串、标签与 ExPost 快照不能提供范围。实际召回仍受原 Contract 限制，当前研究链只有 Synthesizer 允许 Lesson。历史节点复用既有只读 NodeSpec 适配器，不改写历史 Artifact；子任务沿用父 Manifest 的权限收缩，不额外扩大召回。最终查询范围保存在 `learning.retrieval.audit` 中。
+- **Lesson 查询范围**：`ContextQueryScope` 由 Rust 根据已核验的冻结节点生成；资产为当前四 ETF 研究全集，期限取 `NodeSpec`，Synthesizer / ProposalReviewer 显式覆盖 T1/T3/T5，阶段使用完整 recipe ID。查询维度为空表示未知，只匹配该维度未限定的 Lesson，不表示任意匹配。市场状态只取通过原来源、Contract、Run 和类型校验的 DecisionTime RegimeSnapshot；正文字符串、标签与 ExPost 快照不能提供范围。实际召回仍受原 Contract 限制，当前研究链只有 Synthesizer 允许 Lesson。历史节点复用既有只读 NodeSpec 适配器，不改写历史 Artifact；子任务沿用父 Manifest 的权限收缩，不额外扩大召回。最终查询范围保存在 `learning.retrieval.audit` 中。v71 候选以原始 `result` 和已接受 Submit 的证据核验归因。只有预算内完整下发的 Lesson 可以计入，只有元数据的条目不计。
 
 ---
 
@@ -182,7 +190,9 @@ DecisionProposal (LLM: Forecast + research_allocation)
 1. **DecisionGate 默认 Fail-Closed**：
    - 若 Store 没有已激活且通过验证的 `DecisionPolicy`，Rust 默认校准样本为零，**目标组合头寸强制为 0**。canonical Store 数据库不存在时由 Rust Store 初始化 schema，初始化不会生成或激活 policy；已有 canonical Store 在 PositionPlan 引导阶段只读打开。运行时只读取 SQL Store 中的 CAS Artifact、激活历史和 active head；旧文件路径兼容字段与 JSON 文件导入链路已移除。operator 将风险限制写入 SQL，collect 从 canonical Outcome 生成 SQL dataset，build 生成 SQL 候选 policy；inspect、validate、activate 均按 Store Artifact ID 操作，生成候选不会自动更新 active head。
    - 这只阻断执行侧 `Decision.targets`；有合格证据的非零 `research_plan.validated` 必须保留，并明确 `execution_status=blocked` 或 PositionPlan 的 `not_applicable`，不得冒充可执行目标。
-   - 校准 `collect` 只接受非隔离 canonical Store 的真实 Paper Decision/Outcome，并要求有效 Synthesizer 模型的发布日期、知识截止日期及显式风险限制。readiness 的 Store 资格与成熟度不代表候选存在或可激活；隔离 Debug 的运行报告 `isolated_debug_store`，不计入成熟样本。等待、复制或修改 purpose 不能赋予隔离运行或历史模拟数据正式校准资格。
+   - `calibration collect` 只接受非隔离 canonical Store 的实际 Paper Decision/Outcome，并要求配置 Synthesizer 模型发布日期、知识截止日期及显式风险限制。带 `--cohort`、训练范围或 `--contract-hash` 的 `calibration readiness` 与 `collect` 共享同一候选过滤。默认选择活动 Synthesizer Contract，可用 `--contract-hash` 指定已安装的 Synthesizer Contract。`--training-start` 与 `--training-end` 接受 RFC3339。Decision 必须在窗口内，每个已证标签的实际可用时间必须不晚于训练截止，两个边界均包含等值。查询按 Decision 时间和 Artifact ID 翻页，扫描截断时 `collect` 阻断 Dataset 写入。无范围的 readiness 报告成熟度和缺口。`isolated_debug_store` 的运行不计入样本。
+   - `venue_calendar_and_observed_bars_v1` 要求目标日线的实际收件不早于冻结 Session 收盘加 20 分钟。合格标签时间取该发布门槛与四资产基准和目标日线实际收件时间中的最大值。早期部分 Outcome 只有在同一 Schedule、同一窗口及四资产两端价格均与密封结果一致时，才能证明更早的可用时间。未指定训练截止时，`collect` 取入选标签的最晚时间。无日历标记的旧 Outcome 可读取，新增校准报告标记其 `label_timing_unknown`。
+   - 风险样本使用同一已知 feed 的原始价格。每只资产都须证明两根日线属于同一请求覆盖中的相邻计划 Session，两端收盘加 20 分钟和四资产收件时间均须在训练截止内。缺失计划 Session 时该日两侧不拼接跨日收益。风险面按这些相邻收益估计，`build` 再校验冻结日历与收件时间。成熟度报告本身不授予 Dataset 或 Policy 资格。
    - 只有通过原审批和所有 ExecutionGate blocker 检查后才进入 Allocator：当前为空仓时产生 `NoExecutableOrder`，已有多头仓位时才可能生成归零卖单；缺 approval 的冷启动不进入 Allocator，也不会触发清仓。
 2. **ExecutionGate 与幂等 Commitment**：
    - 正式 scheduler 在 SQL 没有 active policy 时创建不绑定 approval 的 canonical Paper run，以积累未来真实校准标签；已有 active policy 时仍要求原审批。未校准 Paper 冷启动没有 approval 时，pre-trade safety 返回无评估，不作安全断言，也不以缺 manifest 抛错阻断 verdict。原 `UnqualifiedRuntime` blocker 保留，跳过 allocation/plan closure，形成持久化 `NoOrder`；PaperCommit/Reconcile 在获取执行 lease 或访问 Broker 前短路。Evaluate 仍可生成 `OutcomeExecutionLineage::NoOrder` 的 OutcomeSchedule，无需 ExecutionCommitment。此语义不扩张任何执行权限；真实密封仍要求完整 baseline 与四资产共同完成的真实 T+1/T+3/T+5 Session，policy 必须由 operator 显式 inspect、validate、activate。
@@ -224,8 +234,8 @@ DecisionProposal (LLM: Forecast + research_allocation)
 - 每个 Outcome 是同 Run 的 post-terminal 工作；先检查未完成阶段再调用模型，迟到补跑按各阶段自己的 cutoff 截断事实。每 Outcome 租约单写，争用 Deferred；完成、报错及取消时按 epoch 释放租约。Deferred 不进入失败预算，已提交的阶段事件为下一阶段建立独立额度；Outcome 重试从 30 秒指数退避，最多 5 分钟。Worker 对 Session/Outcome 进行服务保留或单 Worker 交错。
 - 有逐单账本的正式 `Reconciliation` 完成时，Store 校验同一 Commitment 的每个原始及已登记替换 ID 都有实际终态回执或可核验的 `ProvenUnsubmitted` 记录。已存在替换单时，原单的最新回执须独立确认终态或 `Replaced`，再按两单的原始回执合并成交。未提交记录只证明对账覆盖。执行后持仓按已验证并去重的实际成交数量和现金重建，成交成本也取实际成交。Outcome 是冻结执行后敞口（metric v3），不代表真实后续账户 NAV；按当前阶段实际计价窗口检查公司行动，窗口内无调整账本则不可用，禁止推测调整因子。
 - Decision 生产成本取依赖任务闭包；Outcome/叙事成本与生命周期总成本分开。Experience 保留 producer Run/Contracts/Workflow revision 与 evaluator Contract。行情完整、研究充分、叙事有效（结构合格的 T5 Retrospective，不做独立语义质量评分）、风险真值已测量分别记录。缺失风险真值继续为 None，不得填满分。
-- Rust-only T5 不取得学习资格。叙事修复在原 Run 上提交可追溯 revision，保留原数值 CAS；修复后复用密封 Outcome，经原资格检查幂等补评估；不得直接写入 Proven。LessonProposal 显式声明资产、horizon、排除条件与证据，只有 Draft/quarantine 权限。
-- 当前版本：Domain schema 10（兼容可选字段）；Store 19；WorkflowDefinition 1；研究 Contract 69 / Prompt bundle 38 / freshness candidate 70；Outcome Contract 63 / Prompt bundle 35，metric `frozen_post_execution_exposure_v3`；evaluation context 1；benchmark definition 1。旧未知口径和 v2 数据不自动改标 v3。
+- Rust-only T5 不取得学习资格。叙事修复在原 Run 上提交可追溯 revision，保留原数值 CAS；修复后复用密封 Outcome，经原资格检查幂等补评估；不得直接写入 Proven。LessonProposal 显式声明资产、horizon、排除条件与证据，只有 Draft/quarantine 权限。恢复可从已提交 Evaluation 幂等补写缺失 Draft。单条冲突保留原记录，同批其他合格 Draft 可以继续。
+- 当前版本包括 Domain schema 10（兼容可选字段）、Store 19、WorkflowDefinition 1、evaluation context 1 和 benchmark definition 1。研究与 Outcome Contract 见[阶段协议](#52-研究提交与-outcome-协议)。Outcome metric 为 `frozen_post_execution_exposure_v3`，旧未知口径和 v2 数据保留各自版本。Store 升级见[开发 Workflow](development-workflow.md#store-18--19-升级)。
 - v14→v15 迁移只新增 Run/kind 表达式索引。旧 Contract 的未完成任务会在写新 Store 版本前阻断升级；旧任务哈希不改写，旧 CAS/Commitment 不改写。停止旧 worker 并合法处理旧任务之后再升级。RuntimeIdentity 与旧审批不自动复用。
 - Canary 密封/多 subject 评估的中间进度保存在 CAS、事件和评估账本；只有随 Attempt 成功一并提交的产物进入 `rebuild_attempt_outputs`。等待或中断不撤回已完成 subject，不把未完成 Attempt 发布成成功输出。
 
@@ -237,8 +247,10 @@ DecisionProposal (LLM: Forecast + research_allocation)
 ## 12. 正式运行日志与历史 Debug 退役
 
 - 独立 Debug Core、CLI/App 控制与可操作 fixture 服务已退役。Store 16–18 的历史身份、事件、RunControl 与 checkpoint 继续读取和验证；旧隔离标记不可移除，旧 Run 不得恢复执行或升级成 canonical 校准/学习样本。旧有效 lease 与 Contract 升级阻断保持。
-- 正式 PositionPlan 与 Paper 使用原图、模型路由、预算、审批和 Gate。`paper` 仍使用真实 Alpaca Paper API，非 Paper endpoint 在 HTTP I/O 前拒绝。TradingSession 使用真实 Clock/交易日历；Closed 延期后刷新账户、报价和 Clock 并重跑 Gate；accepted/new/partially_filled 不等于成交。
-- 正式 Core 在 `~/.akzio/log/YYYYMMDD/` 为 T0、T1、T3、T5 分别发布不可覆盖的私有 ZIP；启动阶段真实模型探测有独立 ZIP。LLM 请求、响应和 Rust/Store 流程记录只作脱敏审计，不代替 Store 唯一业务权威，也不授予 Agent 新的读取权限。
-- 日志写入/归档异常独立于 provider 和业务错误；阻止新模型调用、订单及改价，保留已记录 Paper effect 的只读对账及受控保护性撤单。持久业务成功不因 ZIP 失败改写，未知外部调用不盲重发或重置预算。详见[运行日志](run-log.md)和[历史 Debug 退役说明](debug-control.md)。
+- Shell 入口为 `bash scripts/run_core.sh [--config FILE] position-plan|paper`。默认配置为 `~/.akzio/config.toml`，`--config FILE` 放在模式前，相对路径按调用者目录解析。脚本通过 `cargo run --locked -p akzio-cli` 调用当前源码的 `akzio --config FILE run start --purpose position-plan|paper --auto-serve`。它先核验已有 canonical Core，只有在所选回环端口明确未监听时才可能用同一配置启动 `daemon serve` 并等候 ready。正式提交只发一次 `POST /runs`，返回 Run ID 表示提交或复用已被确认。`unknown_after_post` 须先查原提交。PositionPlan 按原提交给出的候选 Run ID 查询，Paper 可通过 `akzio run submission REQUEST_ID` 查询绑定的 Session 和 Run。见[正式运行与 Core 生命周期](development-workflow.md#4-正式运行与-core-生命周期)。
+- 原生 `run`、`daemon`、`store` 的 `--config` 位于子命令前。原生 CLI 默认配置路径为相对路径 `config/akzio.toml`，对应仓库中使用 `.akzio/store` 的 fixture 示例。正式命令显式指定正式配置，例如 `akzio --config "$HOME/.akzio/config.toml" run detail RUN_ID`。正式客户端要求绝对 `daemon.store_root`，常用位置为 `$HOME/.akzio/store`，认证 token 位于该 Store Root 下。`run detail` 查看 Observer 投影，`run replay` 读取持久化过程，`store doctor` 检查 Store，`store backup TARGET` 和 `store restore SOURCE TARGET` 处理备份恢复。见[原生命令定义](../crates/akzio-cli/src/main.rs)和[正式客户端配置验证](../crates/akzio-cli/src/formal_run.rs)。
+- Paper 沿用正式审批和 Gate。`paper` 仍使用真实 Alpaca Paper API，非 Paper endpoint 在 HTTP I/O 前拒绝。TradingSession 使用真实 Clock/交易日历；Closed 延期后刷新账户、报价和 Clock 并重跑 Gate；`accepted` 和 `new` 表示订单已受理。`partially_filled` 的已核验成交量计入对账，其余数量仍需继续观察或取得终态证明。
+- 自动启动的 Core 进程日志在 Store Root 的同级 `logs/core-*.log`，常用路径为 `~/.akzio/logs/`。正式阶段日志则在 `~/.akzio/log/YYYYMMDD/` 发布不可覆盖的私有 ZIP。PositionPlan 和 Paper 都归档 T0，Paper 还按各已提交的 T1/T3/T5 阶段分别归档，启动阶段的模型探测有独立 ZIP。运行状态以 Store 为准，ZIP 用于私有审计。`run export-bundle RUN_ID /NEW/ABS/DIR` 可生成分享安全快照目录，独立于私有阶段 ZIP 和 Store 备份。见[运行日志](run-log.md)和[正式运行与 Core 生命周期](development-workflow.md#4-正式运行与-core-生命周期)。
+- 日志写入/归档异常独立于 provider 和业务错误；阻止新模型调用、订单及改价，保留已记录 Paper effect 的只读对账及受控保护性撤单。持久业务成功不因 ZIP 失败改写，未知外部调用不盲重发或重置预算。详见[运行日志](run-log.md)和[历史 Debug 退役说明](debug-control.md)。旧 Shell 的 `--research-only`、`--keep-artifacts`、Python 自动等待与自动 ZIP 属于已退役入口。
 
-研究与执行边界：现有 `RunPurpose::PositionPlan` 表示 research + Decision / target position plan，无 ExecutionGate、PaperCommit、Reconcile 或 Evaluate；`RunPurpose::Paper` 使用同一 `approved_research_proposal` 三组 T1/T3/T5 Analyst/Critic 和 Synthesizer，再进入原执行链。没有新增 RunMode。Paper 的 account / positions / open_orders / fills / quotes / clock Need 保留 scheduler identity 与 provenance，前置只记录 Deferred，执行时才刷新。PositionPlan 执行显示 N/A；旧 Debug control 和 Broker policy 仅供历史身份读取。补充研究保留冻结 Session 日期及原 future-data/cutoff 校验，不再要求市场当前开放。NewsWeb acquisition purpose mapping 和 policy hash 未改，缺失或未验证的方向证据不得变成有效 grounds。
+研究与执行边界：现有 `RunPurpose::PositionPlan` 表示 research + Decision / target position plan，无 ExecutionGate、PaperCommit、Reconcile 或 Evaluate；`RunPurpose::Paper` 使用同一 `approved_research_proposal`，由 Analyst、Critic、Synthesizer 和 ProposalReviewer 完成研究，再进入执行链。通过 Evaluate 创建 OutcomeSchedule 后，Outcome Worker 在同一 Run 的后续阶段复盘。Shadow 是实验编译用途，其研究角色使用相同提交协议。Paper 的 account / positions / open_orders / fills / quotes / clock Need 保留 scheduler identity 与 provenance，前置只记录 Deferred，执行时才刷新。PositionPlan 执行显示 N/A；旧 Debug control 和 Broker policy 仅供历史身份读取。补充研究保留冻结 Session 日期及原 future-data/cutoff 校验，不再要求市场当前开放。NewsWeb acquisition purpose mapping 和 policy hash 未改，缺失或未验证的方向证据不得变成有效 grounds。
