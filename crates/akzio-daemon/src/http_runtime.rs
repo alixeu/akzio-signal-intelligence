@@ -21,11 +21,9 @@ struct JournalQuery {
 async fn http_workflow_blueprint(
     State(daemon): State<Arc<Daemon>>,
     Query(query): Query<BlueprintQuery>,
-    headers: HeaderMap,
 ) -> std::result::Result<Json<akzio_domain::WorkflowBlueprint>, StatusCode> {
     // Blueprint 只调用与执行相同的 compiler，返回 deterministic graph projection；它不写
     // Store、不创建 EvidenceNeed/Run，也不探测模型或 broker。
-    authorize(&daemon, &headers)?;
     if !matches!(
         query.purpose,
         RunPurpose::PositionPlan | RunPurpose::Paper | RunPurpose::Shadow
@@ -50,11 +48,9 @@ async fn http_workflow_blueprint(
 async fn http_run_inspection(
     State(daemon): State<Arc<Daemon>>,
     Path(run_id): Path<String>,
-    headers: HeaderMap,
 ) -> std::result::Result<Json<akzio_store::RunInspection>, StatusCode> {
     // Inspection 通过 StoreExecutor 读取 checkpoint/allowed_actions；runtime identity 不匹配
     // 时 daemon 只收紧动作，不能由 HTTP client 自行恢复权限。
-    authorize(&daemon, &headers)?;
     let operation = daemon.clone();
     daemon
         .store_executor
@@ -84,11 +80,9 @@ async fn http_run_journal(
     State(daemon): State<Arc<Daemon>>,
     Path(run_id): Path<String>,
     Query(query): Query<JournalQuery>,
-    headers: HeaderMap,
 ) -> std::result::Result<Json<akzio_store::RunEventPage>, StatusCode> {
     // Journal 以 after/limit/task/attempt 做只读分页；非法范围在访问 Store 前拒绝，避免
     // 把大范围日志扫描当成运行控制。
-    authorize(&daemon, &headers)?;
     if query.after < 0 || query.limit.is_some_and(|limit| !(1..=500).contains(&limit)) {
         return Err(StatusCode::BAD_REQUEST);
     }

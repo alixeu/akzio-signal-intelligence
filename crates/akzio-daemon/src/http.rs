@@ -1,12 +1,17 @@
 //! Authenticated loopback HTTP transport.
 
-// 文件导读：HTTP transport 为 CLI 提供认证的回环接口。正式运行入口校验 native-client
-// 与 canonical Store，SSE 按 Run 发送 reasoning 与生命周期事件。
+// 文件导读：HTTP transport 为 CLI 提供认证的回环接口。统一验证 native client，
+// 各 handler 保留领域权限检查。SSE 按 Run 发送 reasoning 与生命周期事件。
 // Rust 机制：Axum extractor/Router 宏把 Path/Query/Json/State 组合成 handler；SSE 用
 // `async_stream::stream!` 生成 Stream，`select!` 同时监听 broadcast、poll 和 shutdown；
 // generic `run_store_operation<T, F>` 以 `Send + 'static` 闭包跨 StoreExecutor 线程。
 
 use super::*;
+use axum::{
+    extract::{MatchedPath, Request},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+};
 include!("http_runtime.rs");
 include!("http_launch.rs");
 use crate::observer::ObserverRunDetail;
@@ -65,74 +70,141 @@ struct StoreLessonTransitionRequest {
     reason: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalOperation {
+    Read,
+    Launch,
+    Control,
+    Maintenance,
+    Export,
+}
+
 impl Daemon {
-    // Router 只注册控制面路径；状态权限在每个 handler 的 authorize 和 runtime/Store
-    // 调用中再次校验，路由存在本身不代表任何业务动作已授权。
     pub fn router(&self) -> Router {
-        Router::new()
-            .route("/runs", post(http_launch_run))
-            .route("/health", get(http_health))
-            .route("/ready", get(http_ready))
-            .route("/v1/observer/runs/{run_id}", get(http_observer_run))
-            .route("/v1/workflows/blueprint", get(http_workflow_blueprint))
-            .route(
+        use LocalOperation::{Control, Export, Launch, Maintenance, Read};
+
+        let daemon = Arc::new(self.clone());
+        let routes = [
+            ("/health", get(http_health), Read),
+            ("/ready", get(http_ready), Read),
+            ("/v1/observer/runs/{run_id}", get(http_observer_run), Read),
+            (
+                "/v1/workflows/blueprint",
+                get(http_workflow_blueprint),
+                Read,
+            ),
+            (
                 "/v1/observer/runs/{run_id}/inspection",
                 get(http_run_inspection),
-            )
-            .route("/v1/observer/runs/{run_id}/journal", get(http_run_journal))
-            .route("/runs/{run_id}/events", get(http_events))
-            .route("/runs/{run_id}/trajectory", get(http_trajectory))
-            .route("/runs/{run_id}/retrospectives", get(http_retrospectives))
-            .route("/runs/{run_id}/replay", get(http_replay))
-            .route("/runs/{run_id}/cancel", post(http_cancel))
-            .route("/runs/{run_id}/retry", post(http_retry))
-            .route(
-                "/runs/{run_id}/repair-narrative",
-                post(http_repair_narrative),
-            )
-            .route("/control/freeze", post(http_freeze))
-            .route("/control/unfreeze", post(http_unfreeze))
-            .route("/control/paper-approval", post(http_paper_approval))
-            .route("/control/canary/stage", post(http_canary_stage))
-            .route("/control/canary/status", get(http_canary_status))
-            .route("/control/canary/resume", post(http_canary_resume))
-            .route("/control/store/doctor", get(http_store_doctor))
-            .route("/control/store/inventory", get(http_store_inventory))
-            .route("/control/store/metrics", get(http_store_metrics))
-            .route("/control/store/executor", get(http_store_executor))
-            .route("/control/store/alerts", get(http_store_alerts))
-            .route(
+                Read,
+            ),
+            (
+                "/v1/observer/runs/{run_id}/journal",
+                get(http_run_journal),
+                Read,
+            ),
+            ("/runs/{run_id}/events", get(http_events), Read),
+            ("/runs/{run_id}/trajectory", get(http_trajectory), Read),
+            (
+                "/runs/{run_id}/retrospectives",
+                get(http_retrospectives),
+                Read,
+            ),
+            ("/runs/{run_id}/replay", get(http_replay), Read),
+            ("/control/canary/status", get(http_canary_status), Read),
+            ("/control/store/inventory", get(http_store_inventory), Read),
+            ("/control/store/metrics", get(http_store_metrics), Read),
+            ("/control/store/executor", get(http_store_executor), Read),
+            ("/control/store/alerts", get(http_store_alerts), Read),
+            (
                 "/control/store/session/{session_key}",
                 get(http_store_session),
-            )
-            .route(
+                Read,
+            ),
+            (
                 "/control/store/release-evidence/{run_id}",
                 get(http_store_release_evidence),
-            )
-            .route("/control/store/backup", post(http_store_backup))
-            .route("/control/store/restore", post(http_store_restore))
-            .route("/control/store/export-run", post(http_store_export_run))
-            .route(
-                "/control/store/export-run-bundle",
-                post(http_store_export_run_bundle),
-            )
-            .route(
-                "/control/store/export-debug-bundle",
-                post(http_store_export_debug_bundle),
-            )
-            .route("/control/store/events/{run_id}", get(http_store_events))
-            .route("/control/store/lessons", get(http_store_lessons))
-            .route("/control/store/lessons/add", post(http_store_lesson_add))
-            .route("/control/store/lessons/{lesson_id}", get(http_store_lesson))
-            .route(
+                Read,
+            ),
+            (
+                "/control/store/events/{run_id}",
+                get(http_store_events),
+                Read,
+            ),
+            ("/control/store/lessons", get(http_store_lessons), Read),
+            (
+                "/control/store/lessons/{lesson_id}",
+                get(http_store_lesson),
+                Read,
+            ),
+            (
                 "/control/store/lessons/{lesson_id}/usage",
                 get(http_store_lesson_usage),
-            )
-            .route(
+                Read,
+            ),
+            ("/runs", post(http_launch_run), Launch),
+            ("/runs/{run_id}/cancel", post(http_cancel), Control),
+            ("/runs/{run_id}/retry", post(http_retry), Control),
+            (
+                "/runs/{run_id}/repair-narrative",
+                post(http_repair_narrative),
+                Control,
+            ),
+            ("/control/freeze", post(http_freeze), Control),
+            ("/control/unfreeze", post(http_unfreeze), Control),
+            (
+                "/control/paper-approval",
+                post(http_paper_approval),
+                Control,
+            ),
+            ("/control/canary/stage", post(http_canary_stage), Control),
+            ("/control/canary/resume", post(http_canary_resume), Control),
+            (
+                "/control/store/lessons/add",
+                post(http_store_lesson_add),
+                Control,
+            ),
+            (
                 "/control/store/lessons/{lesson_id}/transition",
                 post(http_store_lesson_transition),
-            )
-            .with_state(Arc::new(self.clone()))
+                Control,
+            ),
+            ("/control/store/doctor", get(http_store_doctor), Maintenance),
+            (
+                "/control/store/backup",
+                post(http_store_backup),
+                Maintenance,
+            ),
+            (
+                "/control/store/restore",
+                post(http_store_restore),
+                Maintenance,
+            ),
+            (
+                "/control/store/export-run",
+                post(http_store_export_run),
+                Export,
+            ),
+            (
+                "/control/store/export-run-bundle",
+                post(http_store_export_run_bundle),
+                Export,
+            ),
+            (
+                "/control/store/export-debug-bundle",
+                post(http_store_export_debug_bundle),
+                Export,
+            ),
+        ];
+        let mut router = Router::new();
+        for (path, method, operation) in routes {
+            let guard = middleware::from_fn_with_state(
+                (Arc::clone(&daemon), operation),
+                require_native_client,
+            );
+            router = router.route(path, method.route_layer(guard));
+        }
+        router.with_state(daemon)
     }
 
     pub async fn serve_http(
@@ -204,11 +276,9 @@ async fn wait_for_stream_shutdown(shutdown: &Option<axum::Extension<watch::Recei
 
 async fn http_health(
     State(daemon): State<Arc<Daemon>>,
-    headers: HeaderMap,
 ) -> std::result::Result<Json<DaemonHealth>, StatusCode> {
     // Health 是认证只读投影；StoreExecutor 保证读取与维护/heartbeat 的串行边界，health
     // 中的 scheduler/Policy 状态不是某个 Run 的完成证明。
-    authorize(&daemon, &headers)?;
     let operation = daemon.clone();
     run_daemon_store_operation(daemon.store_executor.clone(), move || operation.health())
         .await
@@ -218,11 +288,9 @@ async fn http_health(
 
 async fn http_ready(
     State(daemon): State<Arc<Daemon>>,
-    headers: HeaderMap,
 ) -> std::result::Result<Json<DaemonHealth>, StatusCode> {
     // Ready 在 health 之外检查 Paper broker 注入；SERVICE_UNAVAILABLE 只说明服务当前不可
     // 运行，不把某次 readiness 变成 Paper approval 或 execution authorization。
-    authorize(&daemon, &headers)?;
     let operation = daemon.clone();
     run_daemon_store_operation(daemon.store_executor.clone(), move || operation.ready())
         .await
@@ -236,10 +304,8 @@ async fn http_ready(
 async fn http_observer_run(
     State(daemon): State<Arc<Daemon>>,
     Path(run_id): Path<String>,
-    headers: HeaderMap,
 ) -> std::result::Result<Json<ObserverRunDetail>, StatusCode> {
     // Run detail 是只读审计投影，MissingRun 映射 404；它不 claim task、不重跑模型。
-    authorize(&daemon, &headers)?;
     let run_id = RunId(run_id);
     let operation = daemon.clone();
     let operation_run_id = run_id.clone();
@@ -261,7 +327,6 @@ async fn http_events(
     State(daemon): State<Arc<Daemon>>,
     Path(run_id): Path<String>,
     Query(query): Query<EventQuery>,
-    headers: HeaderMap,
     shutdown: Option<axum::Extension<watch::Receiver<bool>>>,
 ) -> std::result::Result<
     Sse<impl futures::Stream<Item = std::result::Result<Event, Infallible>>>,
@@ -269,7 +334,6 @@ async fn http_events(
 > {
     // Run SSE 过滤同一 run_id 的 reasoning/event；poll 与 stream shutdown 并发竞争，连接
     // 关闭不会取消或回滚已经持久化的 task/commitment。
-    authorize(&daemon, &headers)?;
     let run_id = RunId(run_id);
     let mut cursor = query.after.unwrap_or(0);
     let mut reasoning_events = daemon.reasoning_events.subscribe();
@@ -336,11 +400,9 @@ async fn http_events(
 async fn http_replay(
     State(daemon): State<Arc<Daemon>>,
     Path(run_id): Path<String>,
-    headers: HeaderMap,
 ) -> std::result::Result<Json<ReplayReport>, StatusCode> {
     // Replay 读取 workflow/lifecycle/cursor 事实；terminal_task_count 只表示 task 状态，
     // 不跨越到 Paper fill 或 Outcome seal。
-    authorize(&daemon, &headers)?;
     let operation = daemon.clone();
     run_daemon_store_operation(daemon.store_executor.clone(), move || {
         operation.replay_report(&RunId(run_id))
@@ -353,10 +415,8 @@ async fn http_replay(
 async fn http_trajectory(
     State(daemon): State<Arc<Daemon>>,
     Path(run_id): Path<String>,
-    headers: HeaderMap,
 ) -> std::result::Result<Json<Vec<TrajectoryEntry>>, StatusCode> {
     // 按 Run 读取已持久化的 trajectory；executor/Store 错误映射为 500。
-    authorize(&daemon, &headers)?;
     let operation = daemon.clone();
     run_daemon_store_operation(daemon.store_executor.clone(), move || {
         operation.trajectory(&RunId(run_id))
@@ -369,11 +429,9 @@ async fn http_trajectory(
 async fn http_retrospectives(
     State(daemon): State<Arc<Daemon>>,
     Path(run_id): Path<String>,
-    headers: HeaderMap,
 ) -> std::result::Result<Json<Vec<RetrospectiveView>>, StatusCode> {
     // 返回 daemon 对 Paper purpose 校验后的叙事集合；PositionPlan 等目的会按 daemon 规则
     // 返回空集合而不是触发 Outcome 处理。
-    authorize(&daemon, &headers)?;
     let operation = daemon.clone();
     run_daemon_store_operation(daemon.store_executor.clone(), move || {
         operation.retrospectives(&RunId(run_id))
@@ -386,11 +444,9 @@ async fn http_retrospectives(
 async fn http_cancel(
     State(daemon): State<Arc<Daemon>>,
     Path(run_id): Path<String>,
-    headers: HeaderMap,
 ) -> std::result::Result<Json<RunCancellationResponse>, StatusCode> {
     // Cancel 只请求 TaskRuntime 按取消规则关闭可取消任务；已完成 Artifact/订单/Outcome
     // 不被 HTTP handler 删除或改写。
-    authorize(&daemon, &headers)?;
     let run_id = RunId(run_id);
     daemon
         .request_cancel(&run_id, "operator cancellation request")
@@ -407,11 +463,9 @@ async fn http_cancel(
 async fn http_retry(
     State(daemon): State<Arc<Daemon>>,
     Path(run_id): Path<String>,
-    headers: HeaderMap,
 ) -> std::result::Result<Json<RunRetryResponse>, StatusCode> {
     // Retry 的可执行 purpose、terminal status 和 Debug/Paper 限制由 daemon 检查；返回新
     // RunId 表示新研究图已发布，不是旧 Run 重新完成。
-    authorize(&daemon, &headers)?;
     let source_run_id = RunId(run_id);
     let operation = daemon.clone();
     let operation_run_id = source_run_id.clone();
@@ -448,12 +502,10 @@ fn invalid_input_or_conflict(error: DaemonError) -> StatusCode {
 
 async fn http_freeze(
     State(daemon): State<Arc<Daemon>>,
-    headers: HeaderMap,
     Json(request): Json<FreezeRequest>,
 ) -> std::result::Result<Json<DaemonHealth>, StatusCode> {
     // Freeze/unfreeze 写入 durable FreezeState 后再返回 health；冻结是调度控制，不等于
     // 取消已有 Paper order 或改变已 sealed Outcome。
-    authorize(&daemon, &headers)?;
     let operation = daemon.clone();
     run_daemon_store_operation(daemon.store_executor.clone(), move || {
         operation.set_freeze(true, request.reason)
@@ -465,11 +517,9 @@ async fn http_freeze(
 
 async fn http_unfreeze(
     State(daemon): State<Arc<Daemon>>,
-    headers: HeaderMap,
     Json(request): Json<FreezeRequest>,
 ) -> std::result::Result<Json<DaemonHealth>, StatusCode> {
     // 解冻与 freeze 共用持久化状态写入；这里只传递操作意图，不撤回此前的 task/订单副作用。
-    authorize(&daemon, &headers)?;
     let operation = daemon.clone();
     run_daemon_store_operation(daemon.store_executor.clone(), move || {
         operation.set_freeze(false, request.reason)
@@ -481,12 +531,10 @@ async fn http_unfreeze(
 
 async fn http_paper_approval(
     State(daemon): State<Arc<Daemon>>,
-    headers: HeaderMap,
     Json(request): Json<PaperApprovalRequest>,
 ) -> std::result::Result<Json<PaperApprovalResponse>, StatusCode> {
     // approval handler 只调用身份、资格、账户和 manifest 持久化流程；approval accepted
     // 仍必须经过 Decision/ExecutionGate，不能直接触发 Paper submission。
-    authorize(&daemon, &headers)?;
     daemon
         .approve_paper(request)
         .await
@@ -496,11 +544,9 @@ async fn http_paper_approval(
 
 async fn http_canary_stage(
     State(daemon): State<Arc<Daemon>>,
-    headers: HeaderMap,
     Json(spec): Json<akzio_domain::CanaryCampaignSpec>,
 ) -> std::result::Result<Json<akzio_store::CanaryCampaignHead>, StatusCode> {
     // Canary stage 只写入 campaign manifest/lease 绑定，candidate 仍不能绕过 active policy。
-    authorize(&daemon, &headers)?;
     let operation = daemon.clone();
     run_daemon_store_operation(daemon.store_executor.clone(), move || {
         operation.stage_canary_campaign(spec)
@@ -512,10 +558,8 @@ async fn http_canary_stage(
 
 async fn http_canary_status(
     State(daemon): State<Arc<Daemon>>,
-    headers: HeaderMap,
 ) -> std::result::Result<Json<Option<akzio_store::CanaryCampaignHead>>, StatusCode> {
     // Status 是只读 projection；None 表示没有 active campaign，不代表可以直接执行 candidate。
-    authorize(&daemon, &headers)?;
     let operation = daemon.clone();
     run_daemon_store_operation(daemon.store_executor.clone(), move || {
         operation.canary_status()
@@ -527,12 +571,10 @@ async fn http_canary_status(
 
 async fn http_canary_resume(
     State(daemon): State<Arc<Daemon>>,
-    headers: HeaderMap,
     Json(request): Json<CanaryResumeRequest>,
 ) -> std::result::Result<Json<akzio_store::CanaryCampaignHead>, StatusCode> {
     // Resume 由 scheduler lease 和 campaign identity fencing；返回 head 不是 paired Outcome
     // 已完成，也不是 candidate 已晋升。
-    authorize(&daemon, &headers)?;
     let operation = daemon.clone();
     run_daemon_store_operation(daemon.store_executor.clone(), move || {
         operation.resume_canary_campaign(&request.campaign_id)
@@ -544,10 +586,8 @@ async fn http_canary_resume(
 
 async fn http_store_doctor(
     State(daemon): State<Arc<Daemon>>,
-    headers: HeaderMap,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
     // Doctor 走 maintenance 通道，独立于普通 task queue；完整性通过只说明 CAS/索引可读。
-    authorize(&daemon, &headers)?;
     run_store_maintenance(
         daemon.maintenance(),
         StoreMaintenanceKind::Doctor,
@@ -559,10 +599,8 @@ async fn http_store_doctor(
 
 async fn http_store_inventory(
     State(daemon): State<Arc<Daemon>>,
-    headers: HeaderMap,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
     // Inventory 是只读 Store 统计，禁止客户端把返回数量当成有效样本或 Policy readiness。
-    authorize(&daemon, &headers)?;
     store_json(Ok(run_store_operation(
         daemon.store_executor.clone(),
         "store.inventory",
@@ -573,10 +611,8 @@ async fn http_store_inventory(
 
 async fn http_store_metrics(
     State(daemon): State<Arc<Daemon>>,
-    headers: HeaderMap,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
     // Metrics 读取队列/lease/告警观察，不修改状态。
-    authorize(&daemon, &headers)?;
     store_json(Ok(run_store_operation(
         daemon.store_executor.clone(),
         "store.metrics",
@@ -587,19 +623,15 @@ async fn http_store_metrics(
 
 async fn http_store_executor(
     State(daemon): State<Arc<Daemon>>,
-    headers: HeaderMap,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
     // Executor telemetry 展示队列和维护状态；queued/completed operation 不等同业务完成。
-    authorize(&daemon, &headers)?;
     Ok(Json(store_executor_json(&daemon.store_executor)))
 }
 
 async fn http_store_alerts(
     State(daemon): State<Arc<Daemon>>,
-    headers: HeaderMap,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
     // Alerts 从同一 Store metrics 读取，保留 fail-closed 诊断而不清除历史事件。
-    authorize(&daemon, &headers)?;
     let metrics = run_store_operation(daemon.store_executor.clone(), "store.alerts", |store| {
         store.metrics(Utc::now())
     })
@@ -610,10 +642,8 @@ async fn http_store_alerts(
 async fn http_store_session(
     State(daemon): State<Arc<Daemon>>,
     Path(session_key): Path<String>,
-    headers: HeaderMap,
 ) -> std::result::Result<Json<Option<akzio_store::SessionSlot>>, StatusCode> {
     // Session 查询返回 reservation/commitment 投影；None 不能被 CLI 当成可直接下单。
-    authorize(&daemon, &headers)?;
     run_store_operation(
         daemon.store_executor.clone(),
         "store.session",
@@ -625,11 +655,9 @@ async fn http_store_session(
 
 async fn http_store_release_evidence(
     State(daemon): State<Arc<Daemon>>,
-    headers: HeaderMap,
     Path(run_id): Path<String>,
 ) -> std::result::Result<Json<akzio_domain::ReleaseEvidenceBundle>, StatusCode> {
     // Release evidence 生成脱敏 bundle/hash；导出完整性与 Run/订单/Outcome 业务状态分开。
-    authorize(&daemon, &headers)?;
     run_store_operation(
         daemon.store_executor.clone(),
         "store.release_evidence",
@@ -646,11 +674,9 @@ async fn http_store_release_evidence(
 
 async fn http_store_backup(
     State(daemon): State<Arc<Daemon>>,
-    headers: HeaderMap,
     Json(request): Json<StoreBackupRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
     // Backup 是显式 maintenance 写入外部 target 的操作，完成只说明备份事务返回成功。
-    authorize(&daemon, &headers)?;
     store_json(Ok(run_store_maintenance(
         daemon.maintenance(),
         StoreMaintenanceKind::Backup,
@@ -661,12 +687,10 @@ async fn http_store_backup(
 
 async fn http_store_restore(
     State(daemon): State<Arc<Daemon>>,
-    headers: HeaderMap,
     Json(request): Json<StoreRestoreRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
     // Restore 同样串行经过 maintenance；目标数据库的完整性由结果/Doctor 验证，不在 handler
     // 中推断原 Run 或 Policy 已恢复可执行。
-    authorize(&daemon, &headers)?;
     store_json(Ok(run_store_maintenance(
         daemon.maintenance(),
         StoreMaintenanceKind::Restore,
@@ -680,11 +704,9 @@ async fn http_store_restore(
 
 async fn http_store_export_run(
     State(daemon): State<Arc<Daemon>>,
-    headers: HeaderMap,
     Json(request): Json<StoreExportRunRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
     // Run export 只读已有 Artifact，并由 Store 脱敏策略控制 raw model；导出成功不是运行成功。
-    authorize(&daemon, &headers)?;
     store_json(Ok(run_store_operation(
         daemon.store_executor.clone(),
         "store.export_run",
@@ -701,11 +723,9 @@ async fn http_store_export_run(
 
 async fn http_store_export_debug_bundle(
     State(daemon): State<Arc<Daemon>>,
-    headers: HeaderMap,
     Json(request): Json<StoreExportDebugBundleRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
     // Debug bundle 是分享用诊断投影，不重跑节点、不调用模型、不发送 broker 请求。
-    authorize(&daemon, &headers)?;
     store_json(Ok(run_store_operation(
         daemon.store_executor.clone(),
         "store.export_debug_bundle",
@@ -716,12 +736,10 @@ async fn http_store_export_debug_bundle(
 
 async fn http_store_export_run_bundle(
     State(daemon): State<Arc<Daemon>>,
-    headers: HeaderMap,
     Json(request): Json<StoreExportDebugBundleRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
     // The ordinary Run exporter is read-only and share-safe. Its Store guard
     // rejects isolated/Debug identity even when the HTTP caller is authorized.
-    authorize(&daemon, &headers)?;
     store_json(Ok(run_store_operation(
         daemon.store_executor.clone(),
         "store.export_run_bundle",
@@ -733,10 +751,8 @@ async fn http_store_export_run_bundle(
 async fn http_store_lessons(
     State(daemon): State<Arc<Daemon>>,
     Query(query): Query<StoreLessonListQuery>,
-    headers: HeaderMap,
 ) -> std::result::Result<Json<Vec<serde_json::Value>>, StatusCode> {
     // Lesson list 只过滤/展示 Store 生命周期；limit 是读取边界，不创建或激活 Lesson。
-    authorize(&daemon, &headers)?;
     let lifecycle = query
         .lifecycle
         .map(|value| {
@@ -760,12 +776,10 @@ async fn http_store_lessons(
 
 async fn http_store_lesson_add(
     State(daemon): State<Arc<Daemon>>,
-    headers: HeaderMap,
     Json(input): Json<LessonInput>,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
     // Add 先把原始 operator input 作为 source Artifact，再由 Store 写 Lesson Draft，保证
     // source_refs/provenance 完整；Draft 不等于 Active、Policy 或执行规则。
-    authorize(&daemon, &headers)?;
     if input.authored_by.trim().is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -850,10 +864,8 @@ async fn http_store_lesson_add(
 async fn http_store_lesson(
     State(daemon): State<Arc<Daemon>>,
     Path(lesson_id): Path<String>,
-    headers: HeaderMap,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
     // Lesson detail 是只读的 artifact/revision 投影。
-    authorize(&daemon, &headers)?;
     let lesson = run_store_operation(
         daemon.store_executor.clone(),
         "store.lesson",
@@ -867,10 +879,8 @@ async fn http_store_lesson(
 async fn http_store_lesson_usage(
     State(daemon): State<Arc<Daemon>>,
     Path(lesson_id): Path<String>,
-    headers: HeaderMap,
 ) -> std::result::Result<Json<LessonUsage>, StatusCode> {
     // Usage 读取 lesson 的预算/引用事实，不消耗或刷新使用次数。
-    authorize(&daemon, &headers)?;
     run_store_operation(
         daemon.store_executor.clone(),
         "store.lesson.usage",
@@ -883,12 +893,10 @@ async fn http_store_lesson_usage(
 async fn http_store_lesson_transition(
     State(daemon): State<Arc<Daemon>>,
     Path(lesson_id): Path<String>,
-    headers: HeaderMap,
     Json(request): Json<StoreLessonTransitionRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
     // Transition 把 actor/reason 送入 Store lifecycle gate；HTTP 成功只表示该状态转移已
     // 通过持久化校验，不代表它已影响 Decision/Execution。
-    authorize(&daemon, &headers)?;
     let lesson = run_store_operation(
         daemon.store_executor.clone(),
         "store.lesson.transition",
@@ -1047,6 +1055,47 @@ where
     })
 }
 
+async fn require_native_client(
+    State((daemon, operation)): State<(Arc<Daemon>, LocalOperation)>,
+    route: MatchedPath,
+    request: Request,
+    next: Next,
+) -> Response {
+    let admission = authorize(&daemon, request.headers()).and_then(|()| {
+        if native_client_headers(request.headers()) {
+            Ok(())
+        } else {
+            Err(StatusCode::FORBIDDEN)
+        }
+    });
+    if let Err(status) = admission {
+        if operation == LocalOperation::Launch {
+            // Existing clients may parse the launch-specific JSON response.
+            let error = if status == StatusCode::UNAUTHORIZED {
+                "authenticated_native_client_required"
+            } else {
+                "native_client_required"
+            };
+            return (status, Json(serde_json::json!({"error": error}))).into_response();
+        }
+        return status.into_response();
+    }
+
+    let method = request.method().clone();
+    let response = next.run(request).await;
+    if operation != LocalOperation::Read {
+        tracing::info!(
+            subject = "authenticated_loopback_client",
+            ?operation,
+            method = %method,
+            route = route.as_str(),
+            status = response.status().as_u16(),
+            "Local HTTP operation completed"
+        );
+    }
+    response
+}
+
 fn authorize(daemon: &Daemon, headers: &HeaderMap) -> std::result::Result<(), StatusCode> {
     // 认证只接受精确 header 值；失败不泄露 token 对比细节，也不触发 Store/模型 I/O。
     headers
@@ -1068,10 +1117,8 @@ async fn http_store_events(
     State(daemon): State<Arc<Daemon>>,
     Path(run_id): Path<String>,
     Query(query): Query<StoreEventsQuery>,
-    headers: HeaderMap,
 ) -> std::result::Result<Json<Vec<StoreEventView>>, StatusCode> {
     // Store events 是分页只读查询，after/limit 只限制投影，不推进 cursor。
-    authorize(&daemon, &headers)?;
     run_store_operation(
         daemon.store_executor.clone(),
         "store.events",
@@ -1100,11 +1147,9 @@ async fn http_store_events(
 async fn http_repair_narrative(
     State(daemon): State<Arc<Daemon>>,
     Path(run_id): Path<String>,
-    headers: HeaderMap,
 ) -> std::result::Result<Json<serde_json::Value>, StatusCode> {
     // Repair handler 只入队 sealed T5 narrative repair task；返回 task_id 不是 repair 已执行
     // 或 learning 已通过的证明。
-    authorize(&daemon, &headers)?;
     let operation = daemon.clone();
     run_daemon_store_operation(daemon.store_executor.clone(), move || {
         operation.ensure_run_log_ready()?;

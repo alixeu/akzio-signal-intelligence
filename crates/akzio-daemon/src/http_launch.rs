@@ -2,7 +2,7 @@
 // 它拒绝浏览器来源和隔离 Debug Core；PositionPlan 在 Decision 后结束，Paper 只返回
 // scheduler reservation 的 RunId。返回 RunId/HTTP 成功不等于模型完成、Decision 通过、
 // Paper submission、fill 或 Outcome 成熟。
-// Rust 机制：Axum `State/Json/HeaderMap` extractor 取得请求；闭包 move 进 StoreExecutor
+// Rust 机制：Axum `State/Json` extractor 取得请求；闭包 move 进 StoreExecutor
 // 取得原子 commit；`match` 穷举 RunPurpose，`Option` 表示 scheduler 尚未创建 slot。
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -29,40 +29,32 @@ fn run_http_error(error: DaemonError) -> (StatusCode, Json<serde_json::Value>) {
 
 async fn http_launch_run(
     State(daemon): State<Arc<Daemon>>,
-    headers: HeaderMap,
     Json(request): Json<RunLaunchRequest>,
 ) -> RunHttpResult {
-    // 认证和浏览器来源检查先于业务动作；PositionPlan 用 StoreExecutor 提交新图，
-    // Paper 只向 scheduler 请求真实 session slot，二者均不会在 handler 内直接跑 worker。
-    authorize(&daemon, &headers).map_err(|status| {
-        (status, Json(serde_json::json!({"error":"authenticated_native_client_required"})))
-    })?;
-    if !native_client_headers(&headers) {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"error":"native_client_required"})),
-        ));
-    }
-    let submission = daemon.submit_formal_run(request.purpose, "http").await
-    .map_err(|error| match error {
-        crate::launch::FormalRunLaunchError::Rejected(error) => run_http_error(error),
-        crate::launch::FormalRunLaunchError::NotSubmitted { run_id, .. } => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error":"not_submitted",
-                "submission_status":"not_submitted",
-                "run_id":run_id,
-            })),
-        ),
-        crate::launch::FormalRunLaunchError::Unknown { run_id, .. } => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error":"unknown_after_post",
-                "submission_status":"unknown_after_post",
-                "run_id":run_id,
-            })),
-        ),
-    })?;
+    // PositionPlan 用 StoreExecutor 提交新图，Paper 向 scheduler 请求真实 session slot。
+    // 两者均不在 handler 内直接跑 worker。
+    let submission = daemon
+        .submit_formal_run(request.purpose, "http")
+        .await
+        .map_err(|error| match error {
+            crate::launch::FormalRunLaunchError::Rejected(error) => run_http_error(error),
+            crate::launch::FormalRunLaunchError::NotSubmitted { run_id, .. } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error":"not_submitted",
+                    "submission_status":"not_submitted",
+                    "run_id":run_id,
+                })),
+            ),
+            crate::launch::FormalRunLaunchError::Unknown { run_id, .. } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error":"unknown_after_post",
+                    "submission_status":"unknown_after_post",
+                    "run_id":run_id,
+                })),
+            ),
+        })?;
     // 保留已有 REST wire shape。
     Ok(Json(serde_json::json!({"run_id":submission.run_id})))
 }
@@ -488,6 +480,186 @@ mod formal_launch_tests {
         assert_eq!(attempt.contract_hash, origin.contract_hash);
         assert_eq!(attempt.context_manifest.as_ref(), Some(&review.manifest));
         assert!(attempt.outputs.contains(approved));
+    }
+
+    /// WHY THIS TEST EXISTS (Task #22): Workflow reads and controls must share
+    /// the native client checks before handlers can read or modify the Store.
+    /// Do not weaken or delete this assertion.
+    #[tokio::test]
+    async fn workflow_routes_require_the_same_native_client() {
+        let daemon = fixture();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stop, receiver) = watch::channel(false);
+        let service = daemon.clone();
+        let server =
+            tokio::spawn(async move { service.serve_http_listener(listener, receiver).await });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let export_target = daemon
+            .store
+            .root()
+            .parent()
+            .unwrap()
+            .join(format!("denied-export-{}", RunId::new().0));
+        let cases = [
+            (
+                "/v1/workflows/blueprint?purpose=position_plan",
+                None,
+                StatusCode::OK,
+            ),
+            (
+                "/v1/observer/runs/missing/inspection",
+                None,
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "/v1/observer/runs/missing/journal?limit=1",
+                None,
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "/runs",
+                Some(serde_json::json!({"purpose":"position_plan"})),
+                StatusCode::OK,
+            ),
+            (
+                "/control/freeze",
+                Some(serde_json::json!({"reason":"fixture freeze"})),
+                StatusCode::OK,
+            ),
+            (
+                "/control/paper-approval",
+                Some(serde_json::json!({})),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                "/control/canary/resume",
+                Some(serde_json::json!({})),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                "/control/store/export-run-bundle",
+                Some(serde_json::json!({"run_id":"missing","target":export_target})),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ];
+        let request = |path, body: &Option<Value>| {
+            let url = format!("http://{address}{path}");
+            match body {
+                Some(value) => client.post(url).json(value),
+                None => client.get(url),
+            }
+        };
+        for (path, body, _) in &cases {
+            let base = request(path, body);
+            let rejected = [
+                (base.try_clone().unwrap(), StatusCode::UNAUTHORIZED),
+                (
+                    base.try_clone()
+                        .unwrap()
+                        .header("x-akzio-token", "wrong-fixture-token"),
+                    StatusCode::UNAUTHORIZED,
+                ),
+                (
+                    base.try_clone().unwrap().header("origin", "null"),
+                    StatusCode::UNAUTHORIZED,
+                ),
+                (
+                    base.try_clone()
+                        .unwrap()
+                        .header("x-akzio-token", "test-formal-token")
+                        .header("origin", "http://127.0.0.1"),
+                    StatusCode::FORBIDDEN,
+                ),
+                (
+                    base.header("x-akzio-token", "test-formal-token")
+                        .header("sec-fetch-site", "same-origin"),
+                    StatusCode::FORBIDDEN,
+                ),
+            ];
+            for (candidate, expected) in rejected {
+                assert_eq!(candidate.send().await.unwrap().status(), expected, "{path}");
+            }
+        }
+        assert!(daemon.store.recent_workflows(1).unwrap().is_empty());
+        assert!(!daemon.health().unwrap().frozen);
+        assert!(!export_target.exists());
+
+        for (path, body, expected) in &cases {
+            let response = request(path, body)
+                .header("x-akzio-token", "test-formal-token")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), *expected, "{path}");
+        }
+        assert_eq!(daemon.store.recent_workflows(2).unwrap().len(), 1);
+        assert!(daemon.health().unwrap().frozen);
+        assert!(!export_target.exists());
+        let blueprint = client
+            .get(format!(
+                "http://{address}/v1/workflows/blueprint?purpose=position_plan"
+            ))
+            .header("x-akzio-token", "test-formal-token")
+            .header("sec-fetch-site", "none")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(blueprint.status(), StatusCode::OK);
+
+        let shadow_id = RunId::new();
+        let definition = daemon
+            .workflow
+            .research_definition("approved-research")
+            .unwrap();
+        let shadow_graph = daemon
+            .workflow
+            .lower(RunPurpose::Shadow, &definition.proposal)
+            .unwrap();
+        let shadow = daemon
+            .workflow
+            .prepare_workflow_commit(
+                shadow_id.clone(),
+                RunPurpose::Shadow,
+                shadow_graph,
+                Utc::now(),
+            )
+            .unwrap();
+        daemon.store.commit_workflow(&shadow).unwrap();
+        let rejected_export = client
+            .post(format!("http://{address}/control/store/export-run-bundle"))
+            .header("x-akzio-token", "test-formal-token")
+            .json(&serde_json::json!({"run_id": shadow_id, "target": export_target}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rejected_export.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!export_target.exists());
+
+        let malformed = client
+            .post(format!("http://{address}/runs"))
+            .header("content-type", "application/json")
+            .body("{")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(malformed.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            malformed.json::<Value>().await.unwrap()["error"],
+            "authenticated_native_client_required"
+        );
+        let wrong_method = client
+            .get(format!("http://{address}/runs"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong_method.status(), StatusCode::METHOD_NOT_ALLOWED);
+        stop.send(true).unwrap();
+        server.await.unwrap().unwrap();
     }
 
     #[tokio::test]

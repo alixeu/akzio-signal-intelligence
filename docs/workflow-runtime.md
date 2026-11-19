@@ -22,9 +22,20 @@ Store 18 使用唯一的 `rebuild_run_controls` SQL head。普通运行默认为
 
 Provider retry、预算失败、交易时段延期仍按既有语义执行，没有强改为人工 Paused。查看 inspection、checkpoint 或 journal 不会创建事件或释放任务。普通运行的 `allowed_actions` 为空，本次没有新增 canonical Store 的调试控制权限。
 
+## 回环 HTTP 权限
+
+Core 只监听回环地址。已注册的 HTTP 路由共用同一入口检查，主体是持有当前 Core token 的本地原生客户端。请求须提供精确 token，缺失或不匹配时返回 `401`。有 `Origin` 的请求，以及 `Sec-Fetch-Site` 存在且值有别于 `none` 的请求，均返回 `403`。原生 CLI 可以省略这两个请求头。
+
+| 路由用途 | 请求与审计边界 |
+| --- | --- |
+| 只读查询 | Health、Ready、Workflow Blueprint、Run inspection、journal、events 及 Store 查询沿用各自的只读范围。 |
+| 正式启动与控制 | `/runs`、取消、重试、叙事修复、审批、冻结及 Canary 控制继续由各自的运行时和 Store 检查授权。 |
+| 维护与导出 | `doctor`、备份、恢复和导出继续走现有 Store 操作。分享用 Run Bundle 保留范围限制与脱敏。 |
+
+通过入口检查的启动、控制、维护与导出会记录主体类别、操作类别、HTTP 方法、路由模板和返回状态。该 HTTP 记录使用注册模板，避免写入请求头、请求体、实际路径参数和私有资料。审批、冻结等持久证据仍由各自的业务流程写入。
+
 ## 只读检查入口
 
-所有 HTTP 入口复用 loopback 认证与现有 Origin 检查：
 
 | 接口 | 内容 |
 | --- | --- |
