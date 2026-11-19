@@ -29,17 +29,21 @@ pub use official::OfficialInstrumentEvidenceTransport;
 pub use paper_decode::{
     common_bar_dates, decode_paper_account, decode_paper_account_components, decode_paper_clock,
     decode_paper_quotes, parse_daily_bars, parse_money_micros, parse_scheduled_daily_bars,
-    provider_money, PaperDecodeError, PaperDecodeResult,
+    parse_venue_daily_bars, provider_money, PaperDecodeError, PaperDecodeResult,
 };
-pub use quant_features::{QuantFeatureSnapshot, QUANT_FEATURE_FORMULA_VERSION};
+pub use quant_features::{
+    DailyFeatureCoverage, QuantFeatureSnapshot, Return252dUnavailable,
+    QUANT_FEATURE_FORMULA_VERSION,
+};
 pub use runtime::validate_outcome_price_window;
 pub use runtime::{
     model_native_web_evidence_transport, validate_daily_bar_payload, AcquiredEvidence,
     AlpacaMarketDataFeed, AlpacaOptionDataFeed, AlpacaPaperEvidenceTransport, AsyncEvidenceAdapter,
-    EvidenceAdapterError, EvidenceBundle, EvidenceCitation, EvidenceContaminationCertificate,
-    EvidenceProvenance, EvidenceQuality, EvidenceRequest, EvidenceRuntime, EvidenceRuntimeError,
-    EvidenceRuntimeResult, EvidenceSource, EvidenceTimeBasis, FixtureEvidenceAdapter,
-    GovernedResource, NativeWebFailureKind, NormalizedEvidencePayload,
+    BarAdjustment, BarSessionCoverage, EvidenceAdapterError, EvidenceBundle, EvidenceCitation,
+    EvidenceContaminationCertificate, EvidenceProvenance, EvidenceQuality, EvidenceRequest,
+    EvidenceRuntime, EvidenceRuntimeError, EvidenceRuntimeResult, EvidenceSource,
+    EvidenceTimeBasis, FixtureEvidenceAdapter, GovernedResource, NativeWebFailureKind,
+    NormalizedEvidencePayload,
 };
 
 pub use availability::{

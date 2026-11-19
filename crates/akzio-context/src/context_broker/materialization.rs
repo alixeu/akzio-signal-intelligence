@@ -529,6 +529,7 @@ fn compact_governed_projection(kind: ArtifactKind, value: Value) -> Value {
             }
             object.remove("session_closes");
             object.remove("forecast_calendar");
+            object.remove("bar_session_coverage");
             compact_fund_holdings(object);
         }
         let mut projected = serde_json::json!({"projection_version":1,"source":value["source"],
@@ -1361,8 +1362,14 @@ mod fund_holdings_projection_tests {
         let mut with_calendar = value;
         with_calendar["value"]["forecast_calendar"] = serde_json::json!({"version":1,
             "availability_lag_minutes":20,"session_closes":{"2026-11-27":"2026-11-27T18:00:00Z"}});
-        let projection = compact_governed_projection(ArtifactKind::NormalizedEvidence, with_calendar);
+        let projection = compact_governed_projection(ArtifactKind::NormalizedEvidence, with_calendar.clone());
         assert_eq!(serde_json::to_vec(&projection).unwrap(), serde_json::to_vec(&previous).unwrap());
+
+        with_calendar["value"]["bar_session_coverage"] = serde_json::json!({"version":1,
+            "expected_closes":{"2026-11-25":"2026-11-25T21:00:00Z"},
+            "observed_dates":["2026-11-25"],"missing_dates":[]});
+        let with_both = compact_governed_projection(ArtifactKind::NormalizedEvidence, with_calendar);
+        assert_eq!(serde_json::to_vec(&with_both).unwrap(), serde_json::to_vec(&previous).unwrap());
     }
 
     /// Non-holdings evidence must not be reshaped by the holdings bound.

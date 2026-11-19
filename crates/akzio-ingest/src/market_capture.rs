@@ -108,13 +108,11 @@ impl AlpacaPaperEvidenceTransport {
         &self,
         symbol: &str,
         cutoff: DateTime<Utc>,
+        feed: Option<AlpacaMarketDataFeed>,
         ledger: &mut Vec<Value>,
     ) -> Result<Value, EvidenceAdapterError> {
-        // 股票证据来自显式选择的 Alpaca feed；先验证资产状态，再采集 clock、calendar 和各市场组件。
-        let feed = self
-            .market_data_feed
-            .ok_or_else(|| invalid("explicit equity feed required"))?
-            .as_str();
+        // 先验证资产，再用调用方选定的 feed 采集。研究日线允许省略 feed，由供应商决定。
+        let feed = feed.map(AlpacaMarketDataFeed::as_str);
         let asset_url = Url::parse(&format!("{}/v2/assets/{symbol}", self.base_url))
             .map_err(|_| invalid("asset URL"))?;
         let asset = self.capture_get(asset_url, ledger).await?;
@@ -152,11 +150,14 @@ impl AlpacaPaperEvidenceTransport {
             ("trades/latest", "latest_trade", Some("trade")),
         ] {
             // snapshot、latest quote、latest trade 走不同 provider 端点；统一在这里按 cutoff 过滤并保留各自错误。
-            let url = Url::parse_with_params(
-                &format!("{}/v2/stocks/{symbol}/{path}", self.market_data_url),
-                &[("feed", feed)],
-            )
+            let mut url = Url::parse(&format!(
+                "{}/v2/stocks/{symbol}/{path}",
+                self.market_data_url
+            ))
             .map_err(|_| invalid("stock URL"))?;
+            if let Some(feed) = feed {
+                url.query_pairs_mut().append_pair("feed", feed);
+            }
             match self.capture_get(url, ledger).await {
                 Ok(payload) => {
                     let mut value = envelope.map_or(payload.clone(), |key| payload[key].clone());
@@ -206,9 +207,12 @@ impl AlpacaPaperEvidenceTransport {
         else {
             return Err(invalid("option resource"));
         };
+        let feed = self
+            .market_data_feed
+            .ok_or_else(|| invalid("explicit equity feed required"))?;
         let mut ledger = Vec::new();
         let stock = self
-            .capture_stock(asset.symbol(), cutoff, &mut ledger)
+            .capture_stock(asset.symbol(), cutoff, Some(feed), &mut ledger)
             .await?;
         let price = stock
             .pointer("/latest_trade/p")

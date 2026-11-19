@@ -9,16 +9,19 @@
 use akzio_domain::{
     Artifact, ArtifactId, ArtifactKind, ArtifactLifecycle, ArtifactProvenance, ArtifactRef,
     Decision, DecisionContext, DecisionHorizon, MoneyMicros, Outcome, OutcomeHorizon,
-    OutcomeSchedule,
+    OutcomeSchedule, ALPACA_DAILY_BAR_AVAILABILITY_LAG_MINUTES,
+};
+use akzio_execution::calibration::{
+    HistoricalRiskCalendar, HistoricalRiskFeed, HistoricalRiskPair, ADJACENT_SESSION_RISK_VERSION,
 };
 use akzio_execution::{
-    HistoricalForecastProvenance, HistoricalForecastSample, HistoricalPricePoint,
-    HistoricalPriceSeries, OfflineCalibrationInput, OfflineRiskLimits,
-    build_offline_decision_policy,
+    build_offline_decision_policy, HistoricalForecastProvenance, HistoricalForecastSample,
+    HistoricalPricePoint, HistoricalPriceSeries, OfflineCalibrationInput, OfflineRiskLimits,
 };
 use akzio_ingest::{
-    parse_scheduled_daily_bars, EvidenceSource, ForecastCalendars, GovernedResource,
-    NormalizedEvidencePayload, ScheduledSession,
+    parse_scheduled_daily_bars, parse_venue_daily_bars, BarAdjustment, BarSessionCoverage,
+    EvidenceSource, ForecastCalendars, GovernedResource, NormalizedEvidencePayload,
+    ScheduledSession,
 };
 use chrono::DateTime;
 
@@ -1069,6 +1072,19 @@ mod calibration_readiness_tests {
             closes[4].date_naive(),
         ];
         let observed_at = days[3].and_hms_opt(21, 43, 0).unwrap().and_utc();
+        let baseline_close = days[0].and_time(closes[4].time()).and_utc();
+        let mut expected_closes = scheduled.clone();
+        expected_closes.insert(days[0], baseline_close);
+        let observed_closes: BTreeMap<_, _> = days
+            .iter()
+            .map(|day| (*day, expected_closes[day]))
+            .collect();
+        let missing_dates: Vec<_> = expected_closes
+            .keys()
+            .filter(|date| !observed_closes.contains_key(date))
+            .copied()
+            .collect();
+
         let need = stage(
             ArtifactKind::EvidenceNeed,
             ArtifactLifecycle::RunScoped,
@@ -1093,6 +1109,24 @@ mod calibration_readiness_tests {
                 observed_at - chrono::Duration::minutes(19)
             };
             let bars = days.map(|day| json!({"t": day, "c": "100"}));
+            let uri = "fixture://cohort/bars?limit=252&adjustment=raw&feed=iex";
+            let calendar_source = "fixture://cohort/calendar";
+            let mut value = json!({"bars":bars, "session_closes":observed_closes});
+            if marked {
+                value["symbol"] = json!(asset.symbol());
+                value["feed"] = json!("iex");
+                value["decision_cutoff"] = json!(received_at);
+                value["price_basis"] = json!("raw_requires_stage_action_check");
+                value["request_url"] = json!(uri);
+                value["calendar_source"] = json!(calendar_source);
+                value["bar_session_coverage"] = json!({
+                    "version":1, "expected_closes":expected_closes,
+                    "observed_dates":days, "missing_dates":missing_dates,
+                    "outside_window_dates":[], "feed":"iex", "adjustment":"raw",
+                    "provider_revision":null, "calendar_source":calendar_source,
+                    "cutoff":received_at, "requested_limit":252, "provider_has_more":false
+                });
+            }
             market_evidence.push(stage(ArtifactKind::NormalizedEvidence, ArtifactLifecycle::RunScoped, json!({
                 "schema_version": DOMAIN_SCHEMA_VERSION, "source": "alpaca", "resource": format!("bars:{}:1d:{}:252:raw:{}", asset.symbol(), days[0], days[3]),
                 "need": reference(&need), "raw": reference(&raw), "observed_at": received_at,
@@ -1100,8 +1134,8 @@ mod calibration_readiness_tests {
                     "decision_clock": {"decision_cutoff": received_at}},
                 "contamination_certificate": {"available_at_or_before_cutoff": true, "event_at_or_before_cutoff": true,
                     "release_at_or_before_cutoff": true, "retrieval_at_or_after_availability": true, "vintage_at_or_before_cutoff": true},
-                "provenance": {"observed_at": received_at, "source_uri": "fixture://cohort/bars", "dedupe_key": asset.symbol(), "citations": []},
-                "quality": akzio_ingest::EvidenceQuality::default(), "value": {"bars": bars, "session_closes": scheduled},
+                "provenance": {"observed_at": received_at, "source_uri": uri, "dedupe_key": asset.symbol(), "citations": []},
+                "quality": akzio_ingest::EvidenceQuality::default(), "value": value,
             }), vec![reference(&need), reference(&raw)], &worker.permit, observed_at));
         }
         for evidence in std::iter::once(&need)
@@ -1382,6 +1416,23 @@ knowledge_cutoff = "2025-01-01"
                     cutoff.parse::<DateTime<Utc>>().unwrap()
                 );
                 assert_eq!(dataset.input.forecasts.len(), 12);
+                assert_eq!(collect["scan"]["common_price_points"], 4);
+                assert_eq!(collect["scan"]["proven_adjacent_risk_returns"], 1);
+                assert_eq!(
+                    dataset.input.algorithm_version,
+                    ADJACENT_SESSION_RISK_VERSION
+                );
+                let calendar = dataset.input.raw_price_coverage.as_ref().unwrap();
+                assert_eq!(calendar.feed, HistoricalRiskFeed::Iex);
+                assert_eq!(calendar.source_evidence.len(), 4);
+                let (previous, pair) = calendar.adjacent_sessions.first_key_value().unwrap();
+                assert_eq!(*previous, current_at.date_naive());
+                assert_eq!(
+                    pair.following_date,
+                    current_at.date_naive().succ_opt().unwrap()
+                );
+                assert_eq!(pair.evidence_received_at, dataset.input.training_end);
+
                 assert!(dataset
                     .input
                     .forecasts
@@ -1805,10 +1856,219 @@ struct CollectedCalibrationCandidate {
     decision_artifact: akzio_domain::Artifact,
     decision: Decision,
     outcome_ref: ArtifactRef,
+    outcome: Outcome,
     labels: CalibrationLabels,
     provider_id: String,
     model_id: String,
     contract_hash: ContentHash,
+}
+
+type RiskPairReceipts = BTreeMap<(NaiveDate, NaiveDate), DateTime<Utc>>;
+
+#[derive(Default)]
+struct CalibrationRiskCoverage {
+    feed: Option<HistoricalRiskFeed>,
+    expected_closes: BTreeMap<NaiveDate, DateTime<Utc>>,
+    expected_pairs: BTreeSet<(NaiveDate, NaiveDate)>,
+    pairs_by_asset: BTreeMap<Asset, RiskPairReceipts>,
+    prices: BTreeMap<Asset, BTreeMap<NaiveDate, MoneyMicros>>,
+    price_conflicts: Vec<serde_json::Value>,
+    sources: BTreeSet<ArtifactId>,
+    excluded: BTreeMap<ArtifactId, &'static str>,
+    conflicts: BTreeMap<ArtifactId, String>,
+}
+
+impl CalibrationRiskCoverage {
+    fn observe_outcome(
+        &mut self,
+        store: &Store,
+        outcome: &Outcome,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<()> {
+        for reference in &outcome.market_evidence {
+            if reference.kind != ArtifactKind::NormalizedEvidence
+                || self.sources.contains(&reference.artifact_id)
+                || self.excluded.contains_key(&reference.artifact_id)
+                || self.conflicts.contains_key(&reference.artifact_id)
+            {
+                continue;
+            }
+            let artifact = store.artifact(&reference.artifact_id)?;
+            let payload: NormalizedEvidencePayload =
+                serde_json::from_slice(&store.read_blob(&artifact.blob)?)?;
+            let (asset, limit) =
+                match akzio_ingest::GovernedResource::parse(payload.source, &payload.resource) {
+                    Ok(akzio_ingest::GovernedResource::AlpacaBars {
+                        asset,
+                        limit,
+                        raw_prices: true,
+                        ..
+                    }) => (asset, limit),
+                    _ => continue,
+                };
+            match self.observe_source(asset, limit, &payload, start, end) {
+                Ok(None) => {
+                    self.sources.insert(reference.artifact_id.clone());
+                }
+                Ok(Some(reason)) => {
+                    self.excluded.insert(reference.artifact_id.clone(), reason);
+                }
+                Err(error) => {
+                    self.conflicts
+                        .insert(reference.artifact_id.clone(), error.to_string());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn observe_source(
+        &mut self,
+        asset: Asset,
+        limit: u16,
+        payload: &NormalizedEvidencePayload,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Option<&'static str>> {
+        let Some(coverage) = BarSessionCoverage::read(&payload.value)? else {
+            return Ok(Some("calendar_coverage_unknown"));
+        };
+        let bars = parse_venue_daily_bars(&payload.value)?;
+        let received_at = payload.time_basis.retrieved_at;
+        if coverage.adjustment != BarAdjustment::Raw
+            || coverage.requested_limit != limit
+            || coverage.cutoff != payload.time_basis.decision_clock.decision_cutoff
+            || received_at != payload.observed_at
+            || received_at < coverage.cutoff
+            || payload.value["symbol"].as_str() != Some(asset.symbol())
+            || coverage.provider_revision != payload.provenance.revision
+            || payload.value["request_url"].as_str() != Some(payload.provenance.source_uri.as_str())
+            || !bars.keys().eq(&coverage.observed_dates)
+            || bars.values().any(|close| close.0 <= 0)
+        {
+            bail!("raw bar prices and frozen source coverage disagree for {asset}");
+        }
+        if received_at > end {
+            return Ok(Some("received_after_training_end"));
+        }
+        let publication_lag = chrono::Duration::minutes(ALPACA_DAILY_BAR_AVAILABILITY_LAG_MINUTES);
+        let closes = coverage
+            .expected_closes
+            .iter()
+            .filter(|(date, close)| {
+                **date >= start.date_naive()
+                    && close
+                        .checked_add_signed(publication_lag)
+                        .is_some_and(|at| at <= end)
+            })
+            .map(|(&date, &close)| (date, close))
+            .collect::<Vec<_>>();
+        if closes.is_empty() {
+            return Ok(Some("outside_training_window"));
+        }
+        let feed = match coverage.feed {
+            Some(AlpacaMarketDataFeed::Iex) => HistoricalRiskFeed::Iex,
+            Some(AlpacaMarketDataFeed::Sip) => HistoricalRiskFeed::Sip,
+            None => return Ok(Some("market_data_feed_unknown")),
+        };
+        if self.feed.is_some_and(|existing| existing != feed) {
+            bail!(
+                "raw historical price feed conflicts: {:?} and {feed:?}",
+                self.feed
+            );
+        }
+        for &(date, close) in &closes {
+            if self
+                .expected_closes
+                .get(&date)
+                .is_some_and(|existing| *existing != close)
+            {
+                bail!("raw historical exchange close conflicts on {date}");
+            }
+        }
+        let certified_prices = closes
+            .iter()
+            .filter_map(|(date, _)| bars.get(date).map(|price| (*date, *price)));
+        let prices = self.prices.entry(asset).or_default();
+        for (date, price) in certified_prices.clone() {
+            if let Some(existing) = prices.get(&date).filter(|existing| **existing != price) {
+                self.price_conflicts.push(serde_json::json!({
+                    "asset": asset, "date": date,
+                    "existing_close_micros": existing, "incoming_close_micros": price,
+                }));
+                bail!("raw historical prices conflict for {asset} on {date}");
+            }
+        }
+        prices.extend(certified_prices);
+        self.feed = Some(feed);
+        self.expected_closes.extend(closes.iter().copied());
+        let expected_pairs = closes.windows(2).map(|pair| (pair[0].0, pair[1].0));
+        self.expected_pairs.extend(expected_pairs.clone());
+        let pairs = self.pairs_by_asset.entry(asset).or_default();
+        for pair in expected_pairs
+            .filter(|(first, second)| bars.contains_key(first) && bars.contains_key(second))
+        {
+            pairs
+                .entry(pair)
+                .and_modify(|receipt| *receipt = (*receipt).min(received_at))
+                .or_insert(received_at);
+        }
+        Ok(None)
+    }
+
+    fn calendar_conflicts(&self) -> Vec<(NaiveDate, NaiveDate, NaiveDate)> {
+        use std::ops::Bound::Excluded;
+        self.expected_pairs
+            .iter()
+            .filter_map(|&(first, second)| {
+                let (&intervening, _) = self
+                    .expected_closes
+                    .range((Excluded(first), Excluded(second)))
+                    .next()?;
+                Some((first, intervening, second))
+            })
+            .collect()
+    }
+
+    fn calendar(&self) -> Option<HistoricalRiskCalendar> {
+        // Intersect witnessed edges. Separate request windows cannot create a
+        // synthetic edge. The last of four earliest eligible receipts is the
+        // first time the raw four-asset return could be used.
+        let dates = self.expected_closes.keys();
+        let adjacent_sessions = dates
+            .clone()
+            .zip(dates.skip(1))
+            .filter_map(|(&first, &second)| {
+                let mut evidence_received_at = DateTime::<Utc>::MIN_UTC;
+                for asset in Asset::EXECUTABLE {
+                    let receipt = self.pairs_by_asset.get(&asset)?.get(&(first, second))?;
+                    evidence_received_at = evidence_received_at.max(*receipt);
+                }
+                Some((
+                    first,
+                    HistoricalRiskPair {
+                        following_date: second,
+                        evidence_received_at,
+                    },
+                ))
+            })
+            .collect();
+        Some(HistoricalRiskCalendar {
+            version: 1,
+            feed: self.feed?,
+            expected_closes: self.expected_closes.clone(),
+            adjacent_sessions,
+            source_evidence: self
+                .sources
+                .iter()
+                .map(|id| ArtifactRef {
+                    artifact_id: id.clone(),
+                    kind: ArtifactKind::NormalizedEvidence,
+                })
+                .collect(),
+        })
+    }
 }
 
 struct CalibrationCohort {
@@ -2083,6 +2343,7 @@ fn select_calibration_cohort(
                 artifact_id: outcome_artifact.artifact_id,
                 kind: ArtifactKind::Outcome,
             },
+            outcome,
             labels,
             provider_id: identity.provider_id,
             model_id: identity.model_id,
@@ -2142,13 +2403,12 @@ fn collect_calibration_report(
             .max()
     });
     let mut samples = Vec::new();
-    let mut panel = BTreeMap::<Asset, BTreeMap<NaiveDate, MoneyMicros>>::new();
     let collected_runs: Vec<_> = selected
         .iter()
         .map(|candidate| candidate.run_id.0.clone())
         .collect();
     let mut sample_counts = BTreeMap::<String, usize>::new();
-    let mut price_conflicts = Vec::new();
+    let mut risk = CalibrationRiskCoverage::default();
     // 每个候选贡献完整的 4×3 forecast 集和可合并的日线价格；窗口外数据不进入训练面板，
     // 同一资产/日期的不同收盘价则保留冲突并阻断写入。
     for candidate in &selected {
@@ -2181,31 +2441,8 @@ fn collect_calibration_report(
                 },
             });
         }
-        for (asset, bars) in &candidate.labels.bars {
-            for (date, bar) in bars {
-                let price = &bar.price;
-                if actual_start.is_some_and(|start| *date < start.date_naive())
-                    || actual_end.is_some_and(|end| *date > end.date_naive())
-                {
-                    continue;
-                }
-                match panel.entry(*asset).or_default().entry(*date) {
-                    std::collections::btree_map::Entry::Occupied(existing) => {
-                        if *existing.get() != *price {
-                            price_conflicts.push(serde_json::json!({
-                                "run_id": candidate.run_id,
-                                "asset": asset,
-                                "date": date,
-                                "existing_close_micros": existing.get(),
-                                "incoming_close_micros": price,
-                            }));
-                        }
-                    }
-                    std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert(*price);
-                    }
-                }
-            }
+        if let (Some(start), Some(end)) = (actual_start, actual_end) {
+            risk.observe_outcome(&store, &candidate.outcome, start, end)?;
         }
     }
     samples.sort_by(|left, right| {
@@ -2214,21 +2451,39 @@ fn collect_calibration_report(
             .then_with(|| left.asset.cmp(&right.asset))
             .then_with(|| left.horizon.cmp(&right.horizon))
     });
-    // 每只资产各建日期集合，再 reduce 求交集；只有四资产共同有收盘价的日期才进入
-    // 协方差价格面。无集合时 unwrap_or_default 给空集，后面的 enough_prices 会阻断。
-    let common_dates = panel
-        .values()
-        .map(|bars| bars.keys().copied().collect::<BTreeSet<_>>())
-        .reduce(|left, right| left.intersection(&right).copied().collect())
-        .unwrap_or_default();
+    let common_price_points = risk
+        .expected_closes
+        .keys()
+        .filter(|date| {
+            Asset::EXECUTABLE.iter().all(|asset| {
+                risk.prices
+                    .get(asset)
+                    .is_some_and(|bars| bars.contains_key(date))
+            })
+        })
+        .count();
+    let calendar_conflicts = risk.calendar_conflicts();
+    let raw_price_coverage = risk.calendar();
+    let mut dates_for_risk = BTreeSet::new();
+    if let Some(coverage) = &raw_price_coverage {
+        dates_for_risk.extend(
+            coverage
+                .adjacent_sessions
+                .iter()
+                .flat_map(|(&first, pair)| [first, pair.following_date]),
+        );
+    }
+    let adjacent_return_count = raw_price_coverage
+        .as_ref()
+        .map_or(0, |coverage| coverage.adjacent_sessions.len());
     let price_series = Asset::EXECUTABLE
         .into_iter()
         .map(|asset| HistoricalPriceSeries {
             asset,
-            points: common_dates
+            points: dates_for_risk
                 .iter()
                 .filter_map(|date| {
-                    panel
+                    risk.prices
                         .get(&asset)?
                         .get(date)
                         .map(|price| HistoricalPricePoint {
@@ -2249,12 +2504,7 @@ fn collect_calibration_report(
         .values()
         .all(|count| *count >= usize::try_from(min_samples).unwrap_or(usize::MAX))
         && sample_counts.len() == Asset::EXECUTABLE.len() * DecisionHorizon::ALL.len();
-    let enough_prices = price_series.iter().all(|series| {
-        series.points.len()
-            >= usize::try_from(min_samples)
-                .unwrap_or(usize::MAX)
-                .saturating_add(1)
-    });
+    let enough_prices = adjacent_return_count >= usize::try_from(min_samples).unwrap_or(usize::MAX);
     let status = if !scan.truncated
         && scope.contract_hash.is_some()
         && actual_start.is_some()
@@ -2263,7 +2513,8 @@ fn collect_calibration_report(
         && samples.len() >= required_forecast_samples
         && enough_forecasts
         && enough_prices
-        && price_conflicts.is_empty()
+        && risk.conflicts.is_empty()
+        && calendar_conflicts.is_empty()
     {
         "ready_for_build"
     } else {
@@ -2277,7 +2528,7 @@ fn collect_calibration_report(
         let input = OfflineCalibrationInput {
             schema_version: 1,
             policy_version: format!("offline_historical_v3:{CALIBRATION_LABEL_TIMING}"),
-            algorithm_version: "offline_historical_risk_v1".to_owned(),
+            algorithm_version: ADJACENT_SESSION_RISK_VERSION.to_owned(),
             provider_id: scope.provider_id.clone(),
             model_id: scope.model_id.clone(),
             model_version_hash: scope.model_version_hash.clone(),
@@ -2293,6 +2544,7 @@ fn collect_calibration_report(
             source_runs: collected_runs.clone(),
             forecasts: samples,
             price_series,
+            raw_price_coverage,
             risk_limits,
         };
         let canonical_input_hash = content_hash_json(&serde_json::to_value(&input)?)?;
@@ -2337,7 +2589,9 @@ fn collect_calibration_report(
             "selected_run_ids": collected_runs,
             "collected_forecast_samples": sample_counts.values().sum::<usize>(),
             "sample_counts": sample_counts,
-            "common_price_points": common_dates.len(),
+            "common_price_points": common_price_points,
+            "proven_adjacent_risk_returns": adjacent_return_count,
+            "raw_risk_feed": risk.feed,
         },
         "identity": identity,
         "label_proofs": label_proofs,
@@ -2345,7 +2599,10 @@ fn collect_calibration_report(
             "min_samples": min_samples,
             "enough_forecasts": enough_forecasts,
             "enough_prices": enough_prices,
-            "price_conflicts": price_conflicts,
+            "price_conflicts": risk.price_conflicts,
+            "raw_risk_excluded_sources": risk.excluded,
+            "raw_risk_coverage_conflicts": risk.conflicts,
+            "raw_risk_calendar_conflicts": calendar_conflicts,
             "skipped_runs": skipped,
         },
         "next_step": if status == "ready_for_build" {
@@ -2515,7 +2772,6 @@ struct CalibrationLabel {
 }
 
 struct CalibrationLabels {
-    bars: CalibrationBars,
     horizons: BTreeMap<DecisionHorizon, CalibrationLabel>,
 }
 
@@ -2637,7 +2893,7 @@ fn calibration_labels(
             }
         }
     }
-    Ok(CalibrationLabels { bars, horizons })
+    Ok(CalibrationLabels { horizons })
 }
 
 fn has_outcome_window(outcome: &Outcome, horizon: OutcomeHorizon, date: NaiveDate) -> bool {
@@ -2742,4 +2998,170 @@ fn observed_label_time(
                         .then_some(latest.max(observation.retrieved_at))
                 })
         })
+}
+
+#[cfg(test)]
+mod risk_calendar_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn raw_bar_payload(
+        asset: Asset,
+        feed: &str,
+        scheduled: &[(&str, u32)],
+        missing: Option<&str>,
+    ) -> NormalizedEvidencePayload {
+        let cutoff: DateTime<Utc> = "2026-12-02T00:00:00Z".parse().unwrap();
+        let expected_closes = scheduled
+            .iter()
+            .map(|(date, hour)| {
+                let date = NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap();
+                (date, date.and_hms_opt(*hour, 0, 0).unwrap().and_utc())
+            })
+            .collect::<BTreeMap<_, _>>();
+        let (mut observed_closes, missing_dates) = (
+            expected_closes.clone(),
+            missing.into_iter().collect::<Vec<_>>(),
+        );
+        if let Some(date) = missing {
+            observed_closes.remove(&NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap());
+        }
+        let bars = observed_closes
+            .keys()
+            .map(|date| json!({"t":format!("{}T02:00:00Z", date.succ_opt().unwrap()), "c":100}))
+            .collect::<Vec<_>>();
+        let uri = format!("fixture://alpaca/bars?limit=252&adjustment=raw&feed={feed}");
+        let id = ContentHash::of_bytes(b"risk-calendar-fixture");
+        serde_json::from_value(json!({
+            "schema_version":akzio_domain::DOMAIN_SCHEMA_VERSION,
+            "source":"alpaca", "resource":format!("bars:{asset}:1d:2026-11-25:252:raw:2026-12-01"),
+            "need":{"artifact_id":id,"kind":"evidence_need"}, "raw":{"artifact_id":id,"kind":"raw_evidence"},
+            "observed_at":cutoff,
+            "time_basis":{"available_at":cutoff,"retrieved_at":cutoff,"decision_clock":{"decision_cutoff":cutoff}},
+            "contamination_certificate":{"available_at_or_before_cutoff":true,"event_at_or_before_cutoff":true,"release_at_or_before_cutoff":true,"retrieval_at_or_after_availability":true,"vintage_at_or_before_cutoff":true},
+            "provenance":{"source_uri":uri,"observed_at":cutoff,"dedupe_key":"fixture","citations":[]},
+            "quality":{"completeness_ppm":1_000_000,"citations_complete":true,"normalized":true},
+            "value":{"symbol":asset.symbol(),"bars":bars,"session_closes":observed_closes,"feed":feed,"price_basis":"raw_requires_stage_action_check","request_url":uri,"decision_cutoff":cutoff,"calendar_source":"fixture://alpaca/calendar",
+                "bar_session_coverage":{
+                    "version":1,"expected_closes":expected_closes,
+                    "observed_dates":observed_closes.keys().collect::<Vec<_>>(),"missing_dates":missing_dates,
+                    "outside_window_dates":[],"feed":feed,"adjustment":"raw","provider_revision":null,
+                    "calendar_source":"fixture://alpaca/calendar","cutoff":cutoff,"requested_limit":252,"provider_has_more":false
+                }
+            }
+        })).unwrap()
+    }
+
+    /// WHY THIS TEST EXISTS (Task #33): Later receipt of a bar cannot contribute
+    /// to an explicitly earlier risk training cutoff, even after market close.
+    #[test]
+    fn risk_window_excludes_closes_received_after_training_end() {
+        let mut proof = CalibrationRiskCoverage::default();
+        let start = "2026-11-25T00:00:00Z".parse().unwrap();
+        let scheduled = [("2026-11-30", 21), ("2026-12-01", 21)];
+        let source = raw_bar_payload(Asset::Qqq, "iex", &scheduled, None);
+        for end in ["2026-12-01T21:05:00Z", "2026-12-01T21:21:00Z"] {
+            assert_eq!(
+                proof
+                    .observe_source(Asset::Qqq, 252, &source, start, end.parse().unwrap())
+                    .unwrap(),
+                Some("received_after_training_end")
+            );
+            assert!(proof.calendar().is_none());
+        }
+        assert_eq!(
+            proof
+                .observe_source(Asset::Qqq, 252, &source, start, source.observed_at)
+                .unwrap(),
+            None
+        );
+        assert_eq!(proof.prices[&Asset::Qqq].len(), 2);
+    }
+
+    /// WHY THIS TEST EXISTS (Task #33): The CLI must preserve source feed and
+    /// reject conflicts before fitting, even when the numerical closes agree.
+    #[test]
+    fn risk_prices_require_consistent_feed_and_witnessed_exchange_adjacency() {
+        let mut proof = CalibrationRiskCoverage::default();
+        let start = "2026-11-25T00:00:00Z".parse().unwrap();
+        let end = "2026-12-02T00:00:00Z".parse().unwrap();
+        let scheduled = [
+            ("2026-11-25", 21),
+            ("2026-11-27", 18),
+            ("2026-11-30", 21),
+            ("2026-12-01", 21),
+        ];
+        for asset in Asset::EXECUTABLE {
+            let source = raw_bar_payload(
+                asset,
+                "iex",
+                &scheduled,
+                (asset == Asset::Qqq).then_some("2026-11-27"),
+            );
+            assert_eq!(
+                proof
+                    .observe_source(asset, 252, &source, start, end)
+                    .unwrap(),
+                None
+            );
+        }
+        let calendar = proof.calendar().unwrap();
+        assert_eq!(calendar.feed, HistoricalRiskFeed::Iex);
+        assert_eq!(calendar.adjacent_sessions.len(), 1);
+        assert_eq!(
+            calendar
+                .adjacent_sessions
+                .first_key_value()
+                .unwrap()
+                .0
+                .to_string(),
+            "2026-11-30"
+        );
+        let sip = raw_bar_payload(Asset::Qqq, "sip", &scheduled, None);
+        assert!(proof
+            .observe_source(Asset::Qqq, 252, &sip, start, end)
+            .unwrap_err()
+            .to_string()
+            .contains("feed conflicts"));
+        let mut shifted_close = scheduled;
+        shifted_close[1].1 = 21;
+        let shifted = raw_bar_payload(Asset::Qqq, "iex", &shifted_close, None);
+        assert!(proof
+            .observe_source(Asset::Qqq, 252, &shifted, start, end)
+            .unwrap_err()
+            .to_string()
+            .contains("close conflicts"));
+        let contradictory = raw_bar_payload(Asset::Qqq, "iex", &[scheduled[0], scheduled[2]], None);
+        assert_eq!(
+            proof
+                .observe_source(Asset::Qqq, 252, &contradictory, start, end)
+                .unwrap(),
+            None
+        );
+        assert_eq!(proof.calendar_conflicts().len(), 1);
+        let mut unknown = raw_bar_payload(Asset::Qqq, "iex", &scheduled, None);
+        let uri = unknown.provenance.source_uri.replace("&feed=iex", "");
+        unknown.provenance.source_uri = uri.clone();
+        unknown.value["request_url"] = json!(uri);
+        unknown.value["feed"] = serde_json::Value::Null;
+        unknown.value["bar_session_coverage"]["feed"] = serde_json::Value::Null;
+        assert_eq!(
+            proof
+                .observe_source(Asset::Qqq, 252, &unknown, start, end)
+                .unwrap(),
+            Some("market_data_feed_unknown")
+        );
+        let mut legacy = raw_bar_payload(Asset::Qqq, "iex", &scheduled, None);
+        legacy
+            .value
+            .as_object_mut()
+            .unwrap()
+            .remove("bar_session_coverage");
+        assert_eq!(
+            proof
+                .observe_source(Asset::Qqq, 252, &legacy, start, end)
+                .unwrap(),
+            Some("calendar_coverage_unknown")
+        );
+    }
 }

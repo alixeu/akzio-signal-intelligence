@@ -459,18 +459,17 @@ mod live_snapshot_cutoff_tests {
         cutoff: DateTime<Utc>,
     ) -> NormalizedEvidencePayload {
         let original_raw = acquired.raw.clone();
+        let clock = EvidenceMaterializationClock {
+            decision_cutoff: cutoff,
+            sealed_at: cutoff.max(acquired.observed_at),
+            recorded_receipt_at: acquired.observed_at,
+        };
         let need = ArtifactRef {
             artifact_id: ArtifactId(ContentHash::of_bytes(request.resource.as_bytes())),
             kind: ArtifactKind::EvidenceNeed,
         };
         let bundle = runtime
-            .materialize_acquired(
-                permit,
-                &need,
-                request,
-                acquired,
-                EvidenceMaterializationClock::current(cutoff),
-            )
+            .materialize_acquired(permit, &need, request, acquired, clock)
             .unwrap();
         assert_eq!(
             runtime.store().read_blob(&bundle.raw.blob).unwrap(),
@@ -491,7 +490,9 @@ mod live_snapshot_cutoff_tests {
             let cutoff = "2026-09-15T20:25:00Z".parse().unwrap();
             let captured_at = cutoff + Duration::minutes(2);
             let bars = request(EvidenceSource::Alpaca, "bars:QQQ:1d");
-            let uri = "https://data.alpaca.markets/v2/stocks/QQQ/bars?feed=sip&adjustment=all";
+            let uri = "https://data.alpaca.markets/v2/stocks/QQQ/bars?feed=sip&adjustment=all&limit=1";
+            let closes = json!({"2026-09-15":"2026-09-15T20:00:00Z"});
+            let calendar_uri = "https://paper-api.alpaca.markets/v2/calendar";
             let capture = fixture_capture(
                 &bars,
                 uri,
@@ -499,12 +500,20 @@ mod live_snapshot_cutoff_tests {
                 json!({
                     "market":"stocks", "decision_cutoff":cutoff,
                     "bars":[{"t":"2026-09-15T04:00:00Z","o":10,"l":9,"h":12,"c":11,"v":5}],
-                    "session_closes":{"2026-09-15":"2026-09-15T20:00:00Z"},
-                    "content_available_at":"2026-09-15T20:20:00Z"
+                    "session_closes":closes, "content_available_at":"2026-09-15T20:20:00Z",
+                    "feed":"sip", "price_basis":"adjusted_research", "request_url":uri,
+                    "calendar_source":calendar_uri,
+                    "bar_session_coverage":{
+                        "version":1, "expected_closes":closes, "observed_dates":["2026-09-15"],
+                        "missing_dates":[], "outside_window_dates":[], "feed":"sip",
+                        "adjustment":"all", "provider_revision":null, "calendar_source":calendar_uri,
+                        "cutoff":cutoff, "requested_limit":1, "provider_has_more":false
+                    }
                 }),
             );
             let t0 = captured_at + Duration::seconds(1);
-            let timely = materialize_for_cutoff(runtime, permit, &bars, capture.clone(), t0);
+            // Keep the coverage frozen at the request cutoff and qualify the sealed capture at T0.
+            let timely = materialize_for_cutoff(runtime, permit, &bars, capture.clone(), cutoff);
             assert_eq!(
                 timely.availability_at(captured_at),
                 Ok(Basis::Captured { captured_at })
@@ -514,6 +523,10 @@ mod live_snapshot_cutoff_tests {
                 Ok(Basis::Captured { captured_at })
             );
             let proof = serde_json::to_value(&timely).unwrap();
+            assert_eq!(
+                proof["quant_features"]["formula_version"],
+                crate::QUANT_FEATURE_FORMULA_VERSION
+            );
             assert_eq!(
                 proof["availability_proof"]["bars"],
                 json!({

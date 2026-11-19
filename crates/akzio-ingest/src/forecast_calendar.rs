@@ -1,15 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound::{Excluded, Unbounded};
 
-use akzio_domain::{ArtifactKind, ArtifactRef, Asset, ContextManifestPayload};
+use akzio_domain::{
+    ArtifactKind, ArtifactRef, Asset, ContextManifestPayload,
+    ALPACA_DAILY_BAR_AVAILABILITY_LAG_MINUTES,
+};
 use akzio_store::Store;
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{EvidenceAdapterError, EvidenceRuntimeResult, EvidenceSource, GovernedResource};
-
-pub(crate) const BAR_AVAILABILITY_LAG_MINUTES: i64 = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScheduledSession {
@@ -152,7 +153,7 @@ impl ForecastCalendars {
         let mut common = None;
         for (asset, calendar) in &self.scheduled {
             if calendar.version != 1
-                || calendar.availability_lag_minutes != BAR_AVAILABILITY_LAG_MINUTES
+                || calendar.availability_lag_minutes != ALPACA_DAILY_BAR_AVAILABILITY_LAG_MINUTES
             {
                 return Err(invalid_calendar(
                     "unsupported forecast calendar version or publication lag",

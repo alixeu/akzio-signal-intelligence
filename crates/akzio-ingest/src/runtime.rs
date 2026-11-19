@@ -531,13 +531,14 @@ fn valid_primary_document(value: &str) -> bool {
 /// payloads may still use a minimal close-only shape, but provider data must
 /// carry a timestamped, positive and internally consistent daily bar.
 pub fn validate_daily_bar_payload(value: &Value) -> Result<(), EvidenceRuntimeError> {
-    // 逐 bar 验证 timestamp 严格递增、UTC 日期唯一、OHLCV 为正且 high/low
+    // 逐 bar 验证 timestamp 严格递增、日期唯一、OHLCV 为正且 high/low
     // 包含 open/close；交易所 Session 与可用性另由 calendar/cutoff 路径约束。
     let bars = value
         .get("bars")
         .and_then(Value::as_array)
         .filter(|bars| !bars.is_empty())
         .ok_or(EvidenceRuntimeError::InvalidAcquisition)?;
+    let use_venue_dates = value.get("bar_session_coverage").is_some();
     let mut dates = BTreeSet::new();
     let mut previous_timestamp = None;
     for bar in bars {
@@ -552,7 +553,11 @@ pub fn validate_daily_bar_payload(value: &Value) -> Result<(), EvidenceRuntimeEr
             return Err(EvidenceRuntimeError::InvalidAcquisition);
         }
         previous_timestamp = Some(timestamp);
-        let date = timestamp.date_naive();
+        let date = if use_venue_dates {
+            crate::market_session_day(timestamp.with_timezone(&Utc))
+        } else {
+            timestamp.date_naive()
+        };
         if matches!(date.weekday(), Weekday::Sat | Weekday::Sun) || !dates.insert(date) {
             return Err(EvidenceRuntimeError::InvalidAcquisition);
         }
@@ -806,7 +811,7 @@ pub(crate) fn governed_source_uri_is_safe(source_uri: &str) -> bool {
 #[path = "adapters.rs"]
 mod adapters;
 pub(crate) use adapters::classify_evidence_response;
-pub use adapters::validate_outcome_price_window;
+pub use adapters::{validate_outcome_price_window, BarAdjustment, BarSessionCoverage};
 pub use adapters::{
     AlpacaMarketDataFeed, AlpacaOptionDataFeed, AlpacaPaperEvidenceTransport, AsyncEvidenceAdapter,
     EvidenceAdapterError, FixtureEvidenceAdapter, NativeWebFailureKind,

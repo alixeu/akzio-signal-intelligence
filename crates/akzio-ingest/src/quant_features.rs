@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::runtime::{
-    validate_daily_bar_payload, EvidenceRuntimeError, EvidenceRuntimeResult, EvidenceSource,
-    GovernedResource,
+    validate_daily_bar_payload, BarAdjustment, BarSessionCoverage, EvidenceRuntimeError,
+    EvidenceRuntimeResult, EvidenceSource, GovernedResource,
 };
 
 // 文件导读：QuantFeatureSnapshot 只从一个已治理、升序、OHLCV 完整的 Alpaca 日线 payload
@@ -15,9 +15,37 @@ use crate::runtime::{
 // 与 gap；feature snapshot 的版本和 sample window 会随 NormalizedEvidence 保存，不能被
 // 后续模型自行重算或拿下载时间替代可用时间。
 
-pub const QUANT_FEATURE_FORMULA_VERSION: &str = "akzio.quant.daily.v1";
+pub const QUANT_FEATURE_FORMULA_VERSION: &str = "akzio.quant.daily.v2";
+const LEGACY_QUANT_FEATURE_FORMULA_VERSION: &str = "akzio.quant.daily.v1";
+const CLOSES_FOR_252D_RETURN: usize = 253;
 const PARTS_PER_MILLION: i128 = 1_000_000;
 const ANNUAL_TRADING_DAYS: f64 = 252.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Return252dUnavailable {
+    Requires253Closes,
+    MissingExpectedSessions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DailyFeatureCoverage {
+    pub expected_count: usize,
+    pub consecutive_latest_count: usize,
+    pub return_252d_unavailable: Option<Return252dUnavailable>,
+}
+
+impl DailyFeatureCoverage {
+    fn return_252d_unavailable(&self) -> Option<Return252dUnavailable> {
+        if self.expected_count < CLOSES_FOR_252D_RETURN {
+            Some(Return252dUnavailable::Requires253Closes)
+        } else if self.consecutive_latest_count < CLOSES_FOR_252D_RETURN {
+            Some(Return252dUnavailable::MissingExpectedSessions)
+        } else {
+            None
+        }
+    }
+}
 
 /// Point-in-time deterministic features computed only from one governed,
 /// ascending, OHLCV-valid Alpaca daily-bar payload.
@@ -31,6 +59,8 @@ pub struct QuantFeatureSnapshot {
     pub sample_start: NaiveDate,
     pub sample_end: NaiveDate,
     pub sample_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_coverage: Option<DailyFeatureCoverage>,
     pub return_1d_ppm: Option<i64>,
     pub return_3d_ppm: Option<i64>,
     pub return_5d_ppm: Option<i64>,
@@ -43,8 +73,8 @@ pub struct QuantFeatureSnapshot {
     pub realized_volatility_60d_ppm: Option<u64>,
     /// Arithmetic mean of the latest 14 true ranges, in price micros.
     pub atr_14d_price_micros: Option<u64>,
-    /// Peak-to-trough drawdown over the complete current payload.
-    pub maximum_drawdown_ppm: u32,
+    /// Peak-to-trough drawdown when the full expected window is covered.
+    pub maximum_drawdown_ppm: Option<u32>,
     /// Arithmetic mean of close * volume over the latest 20 bars.
     pub average_dollar_volume_20d_micros: Option<u64>,
     /// Latest open versus the previous close.
@@ -61,32 +91,57 @@ impl QuantFeatureSnapshot {
             .feed
             .as_deref()
             .is_none_or(|feed| matches!(feed, "iex" | "sip"));
-        if self.formula_version != QUANT_FEATURE_FORMULA_VERSION
-            || !matches!(
-                GovernedResource::parse(EvidenceSource::Alpaca, &self.source_resource),
-                Ok(GovernedResource::AlpacaBars { .. })
-            )
-            || self.adjustment != "all"
+        let (consecutive_count, full_window) =
+            match (&*self.formula_version, &self.session_coverage) {
+                (LEGACY_QUANT_FEATURE_FORMULA_VERSION, None) => (count, true),
+                (QUANT_FEATURE_FORMULA_VERSION, Some(coverage))
+                    if coverage.consecutive_latest_count > 0
+                        && coverage.consecutive_latest_count <= count
+                        && count <= coverage.expected_count
+                        && (count != coverage.expected_count
+                            || coverage.consecutive_latest_count == count)
+                        && coverage.return_252d_unavailable
+                            == coverage.return_252d_unavailable() =>
+                {
+                    (
+                        coverage.consecutive_latest_count,
+                        count == coverage.expected_count,
+                    )
+                }
+                _ => return Err(EvidenceRuntimeError::InvalidAcquisition),
+            };
+        if !matches!(
+            GovernedResource::parse(EvidenceSource::Alpaca, &self.source_resource),
+            Ok(GovernedResource::AlpacaBars { .. })
+        ) || self.adjustment != "all"
             || !valid_feed
             || count == 0
             || self.sample_start > self.sample_end
-            || self.available_at.date_naive() != self.sample_end
-            || self.maximum_drawdown_ppm > 1_000_000
-            || !return_is_valid(self.return_1d_ppm, count >= 2)
-            || !return_is_valid(self.return_3d_ppm, count >= 4)
-            || !return_is_valid(self.return_5d_ppm, count >= 6)
-            || !return_is_valid(self.return_20d_ppm, count >= 21)
-            || !return_is_valid(self.return_60d_ppm, count >= 61)
-            || !return_is_valid(self.return_252d_ppm, count >= 253)
-            || self.realized_volatility_20d_ppm.is_some() != (count >= 21)
-            || self.realized_volatility_60d_ppm.is_some() != (count >= 61)
-            || self.atr_14d_price_micros.is_some() != (count >= 15)
+            || (if self.session_coverage.is_some() {
+                crate::market_session_day(self.available_at)
+            } else {
+                self.available_at.date_naive()
+            }) != self.sample_end
+            || self.maximum_drawdown_ppm.is_some() != full_window
+            || self.maximum_drawdown_ppm.is_some_and(|v| v > 1_000_000)
+            || !return_is_valid(self.return_1d_ppm, consecutive_count >= 2)
+            || !return_is_valid(self.return_3d_ppm, consecutive_count >= 4)
+            || !return_is_valid(self.return_5d_ppm, consecutive_count >= 6)
+            || !return_is_valid(self.return_20d_ppm, consecutive_count >= 21)
+            || !return_is_valid(self.return_60d_ppm, consecutive_count >= 61)
+            || !return_is_valid(
+                self.return_252d_ppm,
+                consecutive_count >= CLOSES_FOR_252D_RETURN,
+            )
+            || self.realized_volatility_20d_ppm.is_some() != (consecutive_count >= 21)
+            || self.realized_volatility_60d_ppm.is_some() != (consecutive_count >= 61)
+            || self.atr_14d_price_micros.is_some() != (consecutive_count >= 15)
             || self.atr_14d_price_micros.is_some_and(|value| value == 0)
-            || self.average_dollar_volume_20d_micros.is_some() != (count >= 20)
+            || self.average_dollar_volume_20d_micros.is_some() != (consecutive_count >= 20)
             || self
                 .average_dollar_volume_20d_micros
                 .is_some_and(|value| value == 0)
-            || !return_is_valid(self.latest_gap_ppm, count >= 2)
+            || !return_is_valid(self.latest_gap_ppm, consecutive_count >= 2)
         {
             return Err(EvidenceRuntimeError::InvalidAcquisition);
         }
@@ -113,12 +168,14 @@ pub(crate) fn build_quant_feature_snapshot(
     // 输入→资源/日线形状校验→按 production session_closes 或受控 fixture cutoff 确认
     // available_at→解析 bars→逐项计算特征→validate。任何未来数据、未知 query metadata
     // 或非 finite 数值都在返回前 fail closed。
-    if !matches!(
-        GovernedResource::parse(EvidenceSource::Alpaca, source_resource),
-        Ok(GovernedResource::AlpacaBars { .. })
-    ) {
+    let GovernedResource::AlpacaBars {
+        raw_prices: false,
+        limit,
+        ..
+    } = GovernedResource::parse(EvidenceSource::Alpaca, source_resource)?
+    else {
         return Err(EvidenceRuntimeError::InvalidRequest);
-    }
+    };
     validate_daily_bar_payload(value)?;
     let bars = parse_bars(value)?;
     // Provider calendar metadata governs production daily bars. A UTC date
@@ -147,6 +204,42 @@ pub(crate) fn build_quant_feature_snapshot(
         return Err(EvidenceRuntimeError::TemporalContamination);
     }
     let (adjustment, feed) = source_metadata(source_uri)?;
+    let session_coverage = if let Some(coverage) = BarSessionCoverage::read(value)? {
+        if coverage.adjustment != BarAdjustment::All
+            || coverage.cutoff != decision_clock.decision_cutoff
+            || (!source_uri.starts_with("fixture://") && coverage.requested_limit != limit)
+            || value["request_url"].as_str() != Some(source_uri)
+            || coverage.feed.map(|feed| feed.as_str()) != feed.as_deref()
+            || !bars
+                .iter()
+                .map(|bar| crate::market_session_day(bar.timestamp))
+                .eq(coverage.observed_dates.iter().copied())
+            || coverage
+                .expected_closes
+                .last_key_value()
+                .map(|(date, _)| date)
+                != coverage.observed_dates.last()
+        {
+            return Err(EvidenceRuntimeError::InvalidAcquisition);
+        }
+        let mut features = DailyFeatureCoverage {
+            expected_count: coverage.expected_closes.len(),
+            consecutive_latest_count: coverage
+                .expected_closes
+                .keys()
+                .rev()
+                .zip(coverage.observed_dates.iter().rev())
+                .take_while(|(expected, actual)| expected == actual)
+                .count(),
+            return_252d_unavailable: None,
+        };
+        features.return_252d_unavailable = features.return_252d_unavailable();
+        Some(features)
+    } else if source_uri.starts_with("fixture://") {
+        None
+    } else {
+        return Err(EvidenceRuntimeError::InvalidAcquisition);
+    };
     let first = bars
         .first()
         .ok_or(EvidenceRuntimeError::InvalidAcquisition)?;
@@ -155,27 +248,49 @@ pub(crate) fn build_quant_feature_snapshot(
         .ok_or(EvidenceRuntimeError::InvalidAcquisition)?;
     let sample_count =
         u32::try_from(bars.len()).map_err(|_| EvidenceRuntimeError::InvalidAcquisition)?;
+    let trailing = &bars[bars.len()
+        - session_coverage
+            .as_ref()
+            .map_or(bars.len(), |coverage| coverage.consecutive_latest_count)..];
+    let drawdown = session_coverage
+        .as_ref()
+        .is_none_or(|coverage| coverage.expected_count == bars.len())
+        .then(|| maximum_drawdown_ppm(&bars))
+        .transpose()?;
+    let session_date = |bar: &DailyBar| {
+        if session_coverage.is_some() {
+            crate::market_session_day(bar.timestamp)
+        } else {
+            bar.timestamp.date_naive()
+        }
+    };
     let snapshot = QuantFeatureSnapshot {
-        formula_version: QUANT_FEATURE_FORMULA_VERSION.to_owned(),
+        formula_version: if session_coverage.is_some() {
+            QUANT_FEATURE_FORMULA_VERSION
+        } else {
+            LEGACY_QUANT_FEATURE_FORMULA_VERSION
+        }
+        .to_owned(),
         source_resource: source_resource.to_owned(),
         adjustment,
         feed,
         available_at,
-        sample_start: first.timestamp.date_naive(),
-        sample_end: last.timestamp.date_naive(),
+        sample_start: session_date(first),
+        sample_end: session_date(last),
         sample_count,
-        return_1d_ppm: trailing_return_ppm(&bars, 1)?,
-        return_3d_ppm: trailing_return_ppm(&bars, 3)?,
-        return_5d_ppm: trailing_return_ppm(&bars, 5)?,
-        return_20d_ppm: trailing_return_ppm(&bars, 20)?,
-        return_60d_ppm: trailing_return_ppm(&bars, 60)?,
-        return_252d_ppm: trailing_return_ppm(&bars, 252)?,
-        realized_volatility_20d_ppm: realized_volatility_ppm(&bars, 20)?,
-        realized_volatility_60d_ppm: realized_volatility_ppm(&bars, 60)?,
-        atr_14d_price_micros: atr_price_micros(&bars, 14)?,
-        maximum_drawdown_ppm: maximum_drawdown_ppm(&bars)?,
-        average_dollar_volume_20d_micros: average_dollar_volume_micros(&bars, 20)?,
-        latest_gap_ppm: latest_gap_ppm(&bars)?,
+        session_coverage,
+        return_1d_ppm: trailing_return_ppm(trailing, 1)?,
+        return_3d_ppm: trailing_return_ppm(trailing, 3)?,
+        return_5d_ppm: trailing_return_ppm(trailing, 5)?,
+        return_20d_ppm: trailing_return_ppm(trailing, 20)?,
+        return_60d_ppm: trailing_return_ppm(trailing, 60)?,
+        return_252d_ppm: trailing_return_ppm(trailing, 252)?,
+        realized_volatility_20d_ppm: realized_volatility_ppm(trailing, 20)?,
+        realized_volatility_60d_ppm: realized_volatility_ppm(trailing, 60)?,
+        atr_14d_price_micros: atr_price_micros(trailing, 14)?,
+        maximum_drawdown_ppm: drawdown,
+        average_dollar_volume_20d_micros: average_dollar_volume_micros(trailing, 20)?,
+        latest_gap_ppm: latest_gap_ppm(trailing)?,
     };
     snapshot.validate()?;
     Ok(snapshot)
@@ -389,4 +504,104 @@ fn finite_nonnegative_ppm(value: f64) -> EvidenceRuntimeResult<u64> {
 fn return_is_valid(value: Option<i64>, expected: bool) -> bool {
     // 只允许与样本数量匹配的可选收益，并拒绝小于或等于 -100% 的值。
     value.is_some() == expected && value.is_none_or(|value| value > -1_000_000)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Datelike, Duration, Weekday};
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    fn count_fixture(expected_count: u16, omit: Option<usize>) -> QuantFeatureSnapshot {
+        let cutoff: DateTime<Utc> = "2026-01-10T06:00:00Z".parse().unwrap();
+        let dates = (1..400)
+            .map(|days| cutoff.date_naive() - Duration::days(days))
+            .filter(|date| !matches!(date.weekday(), Weekday::Sat | Weekday::Sun))
+            .take(usize::from(expected_count))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>();
+        let last_close = dates
+            .last()
+            .unwrap()
+            .and_hms_opt(21, 0, 0)
+            .unwrap()
+            .and_utc();
+        let expected_closes = dates
+            .iter()
+            .map(|date| (*date, date.and_hms_opt(21, 0, 0).unwrap().and_utc()))
+            .collect::<BTreeMap<_, _>>();
+        let mut observed_closes = expected_closes.clone();
+        let missing_dates = omit.map_or_else(Vec::new, |index| {
+            observed_closes.remove(&dates[index]);
+            vec![dates[index]]
+        });
+        let bars = dates.iter().enumerate().filter(|(index, _)| Some(*index) != omit).map(|(index, date)| {
+            let price = 100 + index;
+            json!({"t":format!("{}T02:00:00Z", date.succ_opt().unwrap()), "o":price, "h":price + 1, "l":price - 1, "c":price, "v":1000})
+        }).collect::<Vec<_>>();
+        let source =
+            format!("fixture://alpaca/bars?adjustment=all&feed=iex&limit={expected_count}");
+        let value = json!({"bars":bars, "session_closes":observed_closes,
+            "feed":"iex", "price_basis":"adjusted_research", "request_url":source,
+            "content_available_at":last_close + Duration::minutes(20), "decision_cutoff":cutoff,
+            "calendar_source":"fixture://alpaca/calendar",
+            "bar_session_coverage":{
+                "version":1, "expected_closes":expected_closes,
+                "observed_dates":observed_closes.keys().collect::<Vec<_>>(), "missing_dates":missing_dates,
+                "outside_window_dates":[], "feed":"iex", "adjustment":"all", "provider_revision":null,
+                "calendar_source":"fixture://alpaca/calendar", "cutoff":cutoff, "requested_limit":expected_count,
+                "provider_has_more":false
+            }
+        });
+        build_quant_feature_snapshot(
+            &value,
+            "bars:QQQ:1d",
+            &source,
+            &DecisionClock {
+                decision_cutoff: cutoff,
+            },
+        )
+        .unwrap()
+    }
+
+    /// WHY THIS TEST EXISTS (Task #33): Exactly 252 closes cannot produce 252
+    /// returns. At 253, use the first/last closes and never bridge a calendar gap.
+    #[test]
+    fn daily_feature_windows_count_consecutive_exchange_closes() {
+        let capped = count_fixture(252, None);
+        assert_eq!(capped.return_252d_ppm, None);
+        assert_eq!(capped.sample_end.to_string(), "2026-01-09");
+        assert_eq!(
+            capped.session_coverage.unwrap().return_252d_unavailable,
+            Some(Return252dUnavailable::Requires253Closes)
+        );
+        let full = count_fixture(253, None);
+        assert_eq!(full.return_252d_ppm, Some(2_520_000));
+        assert_eq!(full.session_coverage.unwrap().return_252d_unavailable, None);
+        let gap = count_fixture(253, Some(250));
+        assert_eq!(gap.return_252d_ppm, None);
+        assert_eq!(gap.return_3d_ppm, None);
+        assert_eq!(gap.return_1d_ppm, Some(2849));
+        assert_eq!(gap.maximum_drawdown_ppm, None);
+        assert_eq!(
+            gap.session_coverage.unwrap().return_252d_unavailable,
+            Some(Return252dUnavailable::MissingExpectedSessions)
+        );
+    }
+
+    /// WHY THIS TEST EXISTS (Task #33): Existing daily v1 snapshots retain their
+    /// serialized interpretation when exchange-calendar coverage was unavailable.
+    #[test]
+    fn legacy_daily_formula_deserializes_without_claiming_coverage() {
+        let mut saved = serde_json::to_value(count_fixture(252, None)).unwrap();
+        saved["formula_version"] = json!(LEGACY_QUANT_FEATURE_FORMULA_VERSION);
+        saved.as_object_mut().unwrap().remove("session_coverage");
+        let legacy: QuantFeatureSnapshot = serde_json::from_value(saved.clone()).unwrap();
+        assert_eq!(legacy.session_coverage, None);
+        assert!(legacy.validate().is_ok());
+        assert_eq!(serde_json::to_value(legacy).unwrap(), saved);
+    }
 }

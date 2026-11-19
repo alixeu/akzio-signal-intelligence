@@ -1646,7 +1646,7 @@ mod paper_session;
 #[path = "session_bars.rs"]
 mod session_bars;
 pub(crate) use session_bars::classify_evidence_response;
-pub use session_bars::validate_outcome_price_window;
+pub use session_bars::{validate_outcome_price_window, BarAdjustment, BarSessionCoverage};
 
 #[cfg(test)]
 mod alpaca_redirect_tests {

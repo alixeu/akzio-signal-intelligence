@@ -37,6 +37,9 @@ pub fn parse_daily_bars(
     // 优先解析 bars 数组；没有 bars 时的单值 close 沿用 observed_at 的 UTC 日期
     // 兼容分支，它不等于四资产共同 Session 的证明。每根 bar 的日期必须可解析且
     // 唯一，BTreeMap 只负责确定性排序，后续共同日期仍需四资产交集。
+    if value.get("bar_session_coverage").is_some() {
+        return parse_venue_daily_bars(value);
+    }
     let Some(items) = value.get("bars").and_then(Value::as_array) else {
         let close = value
             .get("close")
@@ -75,8 +78,10 @@ pub fn parse_scheduled_daily_bars(
     Ok(bars)
 }
 
-// Read explicit dates in the same exchange timezone as Alpaca ingestion.
-fn parse_venue_daily_bars(value: &Value) -> PaperDecodeResult<BTreeMap<NaiveDate, MoneyMicros>> {
+/// Read explicit daily-bar dates in the same exchange timezone as Alpaca ingestion.
+pub fn parse_venue_daily_bars(
+    value: &Value,
+) -> PaperDecodeResult<BTreeMap<NaiveDate, MoneyMicros>> {
     let bars = value
         .get("bars")
         .and_then(Value::as_array)

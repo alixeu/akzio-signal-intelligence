@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use akzio_domain::{
     content_hash_json, ArtifactKind, ArtifactRef, Asset, ContentHash, DecisionHorizon, DomainError,
-    WeightPpm,
+    WeightPpm, ALPACA_DAILY_BAR_AVAILABILITY_LAG_MINUTES,
 };
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
@@ -167,6 +167,77 @@ impl OfflineRiskLimits {
     }
 }
 
+pub const ADJACENT_SESSION_RISK_VERSION: &str = "offline_historical_risk_v2";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HistoricalRiskFeed {
+    Iex,
+    Sip,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoricalRiskPair {
+    pub following_date: NaiveDate,
+    /// Latest of the four qualifying asset receipts for this return.
+    pub evidence_received_at: DateTime<Utc>,
+}
+
+/// Frozen raw Alpaca close coverage. Each pair was observed in consecutive
+/// expected exchange sessions for all four assets on the same feed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoricalRiskCalendar {
+    pub version: u32,
+    pub feed: HistoricalRiskFeed,
+    pub expected_closes: BTreeMap<NaiveDate, DateTime<Utc>>,
+    pub adjacent_sessions: BTreeMap<NaiveDate, HistoricalRiskPair>,
+    pub source_evidence: Vec<ArtifactRef>,
+}
+
+impl HistoricalRiskCalendar {
+    fn validate(&self, training_end: DateTime<Utc>) -> OfflineCalibrationResult<()> {
+        if self.version != 1
+            || self.source_evidence.is_empty()
+            || self
+                .source_evidence
+                .iter()
+                .any(|source| source.kind != ArtifactKind::NormalizedEvidence)
+            || self
+                .expected_closes
+                .iter()
+                .any(|(date, close)| close.date_naive() != *date)
+            || self.adjacent_sessions.iter().any(|(first, pair)| {
+                let second = &pair.following_date;
+                !self.expected_closes.contains_key(first)
+                    || self
+                        .expected_closes
+                        .range((std::ops::Bound::Excluded(first), std::ops::Bound::Unbounded))
+                        .next()
+                        .map(|(date, _)| date)
+                        != Some(second)
+            })
+        {
+            return Err(OfflineCalibrationError::RiskUnavailable(
+                "invalid frozen raw price session coverage".to_owned(),
+            ));
+        }
+        let publication_lag = chrono::Duration::minutes(ALPACA_DAILY_BAR_AVAILABILITY_LAG_MINUTES);
+        if self.adjacent_sessions.values().any(|pair| {
+            let close = self.expected_closes[&pair.following_date];
+            pair.evidence_received_at > training_end
+                || close
+                    .checked_add_signed(publication_lag)
+                    .is_none_or(|available_at| available_at > pair.evidence_received_at)
+        }) {
+            return Err(OfflineCalibrationError::RiskUnavailable(
+                "risk price publication or evidence receipt falls outside the training cutoff"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OfflineCalibrationInput {
     pub schema_version: u32,
@@ -184,6 +255,8 @@ pub struct OfflineCalibrationInput {
     pub source_runs: Vec<String>,
     pub forecasts: Vec<HistoricalForecastSample>,
     pub price_series: Vec<HistoricalPriceSeries>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_price_coverage: Option<HistoricalRiskCalendar>,
     pub risk_limits: OfflineRiskLimits,
 }
 
@@ -466,18 +539,15 @@ fn validate_input(
             .ok_or_else(|| {
                 OfflineCalibrationError::RiskUnavailable(format!("missing {asset} price series"))
             })?;
-        if series.points.len() < input.min_samples as usize + 1
-            || series.points.windows(2).any(|pair| {
-                pair[0].observed_at >= pair[1].observed_at
-                    || pair[0].close_micros <= 0
-                    || pair[1].close_micros <= 0
-            })
-            || series.points.iter().any(|point| {
-                point.observed_at < input.training_start.date_naive()
-                    || point.observed_at > input.training_end.date_naive()
-                    || point.close_micros <= 0
-            })
-        {
+        if series.points.windows(2).any(|pair| {
+            pair[0].observed_at >= pair[1].observed_at
+                || pair[0].close_micros <= 0
+                || pair[1].close_micros <= 0
+        }) || series.points.iter().any(|point| {
+            point.observed_at < input.training_start.date_naive()
+                || point.observed_at > input.training_end.date_naive()
+                || point.close_micros <= 0
+        }) {
             return Err(OfflineCalibrationError::RiskUnavailable(format!(
                 "{asset} price series is incomplete or outside the training window"
             )));
@@ -713,7 +783,7 @@ fn fit_risk_model(
     Ok((
         calibrations,
         PortfolioRiskModel {
-            version: "offline_historical_risk_v1".to_owned(),
+            version: ADJACENT_SESSION_RISK_VERSION.to_owned(),
             sample_count: returns.values().next().map_or(0, Vec::len) as u32,
             covariance_ppm_squared,
             max_expected_shortfall_ppm: input.risk_limits.max_expected_shortfall_ppm,
@@ -726,10 +796,24 @@ fn fit_risk_model(
 fn common_returns(
     input: &OfflineCalibrationInput,
 ) -> OfflineCalibrationResult<BTreeMap<Asset, Vec<f64>>> {
-    // 以日期为键合并各资产收盘价，只保留四资产都存在的日期，再按相邻价格计算 ppm 收益；
-    // 这样 covariance 不会因不同资产缺日而错位。
-    // 两层有序 map 按日期/资产关联收盘价；price_series 与 points 都只共享借用，重复日期
-    // 的 insert 会覆盖同一资产值，但 validate_input 已拒绝各 series 内日期重复/逆序。
+    let calendar = input.raw_price_coverage.as_ref().ok_or_else(|| {
+        OfflineCalibrationError::RiskUnavailable(
+            "frozen raw price session coverage is unknown".to_owned(),
+        )
+    })?;
+    calendar.validate(input.training_end)?;
+    if input.algorithm_version != ADJACENT_SESSION_RISK_VERSION {
+        return Err(OfflineCalibrationError::RiskUnavailable(
+            "frozen raw price data requires the adjacent-session risk algorithm".to_owned(),
+        ));
+    }
+    if calendar.expected_closes.iter().any(|(date, close)| {
+        *date < input.training_start.date_naive() || *close > input.training_end
+    }) {
+        return Err(OfflineCalibrationError::RiskUnavailable(
+            "frozen exchange sessions fall outside the training window".to_owned(),
+        ));
+    }
     let mut by_date = BTreeMap::<NaiveDate, BTreeMap<Asset, i64>>::new();
     for series in &input.price_series {
         for point in &series.points {
@@ -739,32 +823,36 @@ fn common_returns(
                 .insert(series.asset, point.close_micros);
         }
     }
-    // 日期只在具备四个资产键时保留，BTreeMap 迭代自然按日期升序；prices.windows(2)
-    // 根据相邻共同日期产生 ppm 收益，资产间数组因此可按相同索引配对。
-    let dates = by_date
+    let returns = calendar
+        .adjacent_sessions
         .iter()
-        .filter(|(_, prices)| prices.len() == Asset::EXECUTABLE.len())
-        .map(|(date, _)| *date)
+        .filter_map(|(first, pair)| {
+            let start = by_date.get(first)?;
+            let end = by_date.get(&pair.following_date)?;
+            (start.len() == Asset::EXECUTABLE.len() && end.len() == Asset::EXECUTABLE.len())
+                .then_some((start, end))
+        })
         .collect::<Vec<_>>();
-    let mut output = BTreeMap::new();
-    for asset in Asset::EXECUTABLE {
-        let prices = dates
-            .iter()
-            .map(|date| by_date[date][&asset] as f64)
-            .collect::<Vec<_>>();
-        let values = prices
-            .windows(2)
-            .map(|pair| (pair[1] - pair[0]) * 1_000_000.0 / pair[0])
-            .collect::<Vec<_>>();
-        if values.len() < input.min_samples as usize {
-            return Err(OfflineCalibrationError::RiskUnavailable(format!(
-                "common price panel has {} returns, need {}",
-                values.len(),
-                input.min_samples
-            )));
-        }
-        output.insert(asset, values);
+    if returns.len() < input.min_samples as usize {
+        return Err(OfflineCalibrationError::RiskUnavailable(format!(
+            "common price panel has {} proven adjacent returns, need {}",
+            returns.len(),
+            input.min_samples
+        )));
     }
+    let output = Asset::EXECUTABLE
+        .into_iter()
+        .map(|asset| {
+            let values = returns
+                .iter()
+                .map(|(start, end)| {
+                    let start = start[&asset] as f64;
+                    (end[&asset] as f64 - start) * 1_000_000.0 / start
+                })
+                .collect();
+            (asset, values)
+        })
+        .collect();
     Ok(output)
 }
 
@@ -878,14 +966,39 @@ mod tests {
         // 波动序列只是测试输入，不是实盘 bars 或正式 Outcome。
         let points = (0..61)
             .map(|index| HistoricalPricePoint {
-                observed_at: training_start.date_naive() + chrono::Duration::days(index),
+                // The independently frozen fixture calendar skips a holiday at index 10.
+                observed_at: training_start.date_naive()
+                    + chrono::Duration::days(index + i64::from(index >= 10)),
                 close_micros: 1_000_000 + index * 1_000 + if index % 2 == 0 { 2_000 } else { 0 },
             })
             .collect::<Vec<_>>();
+        let expected_closes = points
+            .iter()
+            .map(|point| {
+                let day = point.observed_at;
+                (day, day.and_hms_opt(21, 0, 0).unwrap().and_utc())
+            })
+            .collect();
+        let adjacent_sessions = points
+            .windows(2)
+            .map(|pair| {
+                let following_date = pair[1].observed_at;
+                (
+                    pair[0].observed_at,
+                    HistoricalRiskPair {
+                        following_date,
+                        evidence_received_at: following_date
+                            .and_hms_opt(21, 20, 0)
+                            .unwrap()
+                            .and_utc(),
+                    },
+                )
+            })
+            .collect();
         OfflineCalibrationInput {
             schema_version: 1,
             policy_version: "test-policy".to_owned(),
-            algorithm_version: "offline_historical_test_v1".to_owned(),
+            algorithm_version: ADJACENT_SESSION_RISK_VERSION.to_owned(),
             provider_id: "fixture".to_owned(),
             model_id: "gpt-test".to_owned(),
             model_version_hash: ContentHash::of_bytes(b"gpt-test"),
@@ -904,6 +1017,18 @@ mod tests {
                     points: points.clone(),
                 })
                 .collect(),
+            raw_price_coverage: Some(HistoricalRiskCalendar {
+                version: 1,
+                feed: HistoricalRiskFeed::Iex,
+                expected_closes,
+                adjacent_sessions,
+                source_evidence: vec![ArtifactRef {
+                    artifact_id: akzio_domain::ArtifactId(ContentHash::of_bytes(
+                        b"calendar-bars-test",
+                    )),
+                    kind: ArtifactKind::NormalizedEvidence,
+                }],
+            }),
             risk_limits: OfflineRiskLimits {
                 min_confidence_ppm: 250_000,
                 max_gross_weight_ppm: 500_000,
@@ -921,6 +1046,80 @@ mod tests {
                 daily_reset_decay_ppm: 0,
             },
         }
+    }
+
+    /// WHY THIS TEST EXISTS (Task #33): Risk fitting must not substitute the
+    /// next observed close for a missing expected exchange session.
+    #[test]
+    fn offline_policy_uses_only_proven_adjacent_sessions() {
+        let mut input = fixture_input();
+        let frozen_at = input.training_end + chrono::Duration::days(1);
+        input.price_series[0].points.remove(15);
+        let artifact = build_offline_decision_policy(&input, frozen_at).unwrap();
+        assert_eq!(artifact.policy.portfolio_risk_model.sample_count, 58);
+        for series in &mut input.price_series {
+            series.points = series
+                .points
+                .iter()
+                .cloned()
+                .enumerate()
+                .filter_map(|(index, point)| (index % 2 == 0).then_some(point))
+                .collect();
+        }
+        assert!(matches!(build_offline_decision_policy(&input, frozen_at),
+            Err(OfflineCalibrationError::RiskUnavailable(ref message)) if message.contains("proven adjacent returns")));
+    }
+
+    /// WHY THIS TEST EXISTS (Task #33): A frozen dataset cannot fit returns
+    /// whose price publication or latest asset receipt exceeds training policy.
+    #[test]
+    fn offline_policy_rejects_future_risk_receipts() {
+        let mut input = fixture_input();
+        let frozen_at = input.training_end + chrono::Duration::days(1);
+        let training_end = input.training_end;
+        let calendar = input.raw_price_coverage.as_mut().unwrap();
+        let first = *calendar.adjacent_sessions.first_key_value().unwrap().0;
+        let pair = &calendar.adjacent_sessions[&first];
+        let premature =
+            calendar.expected_closes[&pair.following_date] + chrono::Duration::minutes(5);
+        let valid = pair.evidence_received_at;
+        for received_at in [premature, training_end + chrono::Duration::seconds(1)] {
+            input
+                .raw_price_coverage
+                .as_mut()
+                .unwrap()
+                .adjacent_sessions
+                .get_mut(&first)
+                .unwrap()
+                .evidence_received_at = received_at;
+            assert!(matches!(build_offline_decision_policy(&input, frozen_at),
+                Err(OfflineCalibrationError::RiskUnavailable(ref message)) if message.contains("publication or evidence receipt")));
+        }
+        input
+            .raw_price_coverage
+            .as_mut()
+            .unwrap()
+            .adjacent_sessions
+            .get_mut(&first)
+            .unwrap()
+            .evidence_received_at = valid;
+        assert!(build_offline_decision_policy(&input, frozen_at).is_ok());
+    }
+
+    /// WHY THIS TEST EXISTS (Task #33): Old datasets remain inspectable without
+    /// making absent exchange calendar provenance eligible for another fit.
+    #[test]
+    fn legacy_calibration_input_is_readable_but_risk_cannot_be_rebuilt() {
+        let mut input = fixture_input();
+        input.raw_price_coverage = None;
+        input.algorithm_version = "offline_historical_risk_v1".to_owned();
+        let serialized = serde_json::to_value(&input).unwrap();
+        assert!(serialized.get("raw_price_coverage").is_none());
+        let legacy = serde_json::from_value::<OfflineCalibrationInput>(serialized).unwrap();
+        assert_eq!(legacy, input);
+        let frozen_at = input.training_end + chrono::Duration::days(1);
+        assert!(matches!(build_offline_decision_policy(&legacy, frozen_at),
+            Err(OfflineCalibrationError::RiskUnavailable(ref message)) if message.contains("coverage is unknown")));
     }
 
     #[test]

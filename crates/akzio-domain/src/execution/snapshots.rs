@@ -136,6 +136,9 @@ impl MarketClockSnapshot {
     }
 }
 
+/// Conservative publication lag used for completed Alpaca equity daily bars.
+pub const ALPACA_DAILY_BAR_AVAILABILITY_LAG_MINUTES: i64 = 20;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecisionClock {
     pub decision_cutoff: DateTime<Utc>,
