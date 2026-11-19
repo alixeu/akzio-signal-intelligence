@@ -110,6 +110,13 @@ struct State {
     uncertain_runs: BTreeSet<String>,
 }
 
+struct CoreStoreLog {
+    identity: String,
+    // Archive workers can outlive a dropped supervisor future. Their logger
+    // keeps Core ownership until they have finished touching the Store and logs.
+    _lock: File,
+}
+
 /// The interface is intentionally small: append an observed event, or seal a
 /// stage. Synchronous writes prevent silently losing records on a dropped
 /// broadcast receiver or an asynchronous writer task.
@@ -118,6 +125,7 @@ pub struct RunLogger {
     core_session: String,
     state: Mutex<State>,
     store: OnceLock<Store>,
+    core_store: Option<CoreStoreLog>,
     #[cfg(test)]
     fail_once: Mutex<Option<&'static str>>,
 }
@@ -132,19 +140,37 @@ impl std::fmt::Debug for RunLogger {
 }
 
 impl RunLogger {
-    pub fn open() -> Result<Arc<Self>> {
+    pub fn open(store_root: &Path) -> Result<Arc<Self>> {
         // HOME may be overridden by a launcher; use the effective OS user's
         // home so an environment variable cannot redirect private Run logs.
         let root = effective_user_home()?.join(".akzio").join("log");
+        Self::open_at(root, store_root)
+    }
+
+    fn open_at(root: PathBuf, store_root: &Path) -> Result<Arc<Self>> {
+        let store_root = canonical_store_root(store_root)?;
+        let core_store = CoreStoreLog {
+            identity: canonical_store_log_identity(&store_root),
+            _lock: lock_core_store(&store_root)?,
+        };
         ensure_private_directory(&root)?;
         Ok(Arc::new(Self {
             root,
             core_session: Uuid::new_v4().to_string(),
             state: Mutex::new(State::default()),
             store: OnceLock::new(),
+            core_store: Some(core_store),
             #[cfg(test)]
             fail_once: Mutex::new(None),
         }))
+    }
+
+    fn inflight_dir(&self, day: &Path) -> PathBuf {
+        let mut inflight = day.join(".inflight");
+        if let Some(owner) = &self.core_store {
+            inflight.push(&owner.identity);
+        }
+        inflight
     }
 
     #[cfg(test)]
@@ -155,6 +181,7 @@ impl RunLogger {
             core_session: Uuid::new_v4().to_string(),
             state: Mutex::new(State::default()),
             store: OnceLock::new(),
+            core_store: None,
             fail_once: Mutex::new(None),
         })
     }
@@ -165,6 +192,12 @@ impl RunLogger {
                 return Err(unavailable("Run logger cannot be rebound to another Store"));
             }
             return Ok(());
+        }
+        if let Some(owner) = &self.core_store {
+            let store_root = canonical_store_root(store.root())?;
+            if owner.identity != canonical_store_log_identity(&store_root) {
+                return Err(unavailable("Run logger does not own this Store"));
+            }
         }
         let uncertain = store
             .uncertain_run_log_ids()
@@ -219,6 +252,8 @@ impl RunLogger {
     /// A corrupt/ambiguous orphan blocks startup before any new model I/O.
     pub fn recover_orphans(&self, store: &Store) -> Result<usize> {
         self.attach_store(store.clone())?;
+        let legacy_identity = store_log_identity(store.root());
+        let canonical_identity = canonical_store_log_identity(&canonical_store_root(store.root())?);
         let mut count = 0;
         for date_entry in fs::read_dir(&self.root).map_err(|e| unavailable(e.to_string()))? {
             let date_entry = date_entry.map_err(|e| unavailable(e.to_string()))?;
@@ -233,23 +268,41 @@ impl RunLogger {
                 continue;
             }
             ensure_private_directory(&inflight)?;
-            for entry in fs::read_dir(&inflight).map_err(|e| unavailable(e.to_string()))? {
+            let flat_entries = fs::read_dir(&inflight).map_err(|e| unavailable(e.to_string()))?;
+            let owned_dir = self.inflight_dir(&day_dir);
+            let owned_entries = if owned_dir != inflight
+                && owned_dir
+                    .try_exists()
+                    .map_err(|e| unavailable(e.to_string()))?
+            {
+                ensure_private_directory(&owned_dir)?;
+                Some(fs::read_dir(&owned_dir).map_err(|e| unavailable(e.to_string()))?)
+            } else {
+                None
+            };
+            for entry in flat_entries.chain(owned_entries.into_iter().flatten()) {
                 let entry = entry.map_err(|e| unavailable(e.to_string()))?;
                 let source = entry.path();
+                let legacy = source.parent() == Some(inflight.as_path());
+                if legacy
+                    && entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| ContentHash::new(name).is_ok())
+                    && entry
+                        .file_type()
+                        .map_err(|e| unavailable(e.to_string()))?
+                        .is_dir()
+                {
+                    // Only the owner scans the entries inside a Store directory.
+                    continue;
+                }
                 if source.extension().and_then(|value| value.to_str()) != Some("jsonl") {
                     return Err(unavailable("unexpected unfinished Run log file"));
                 }
-                let metadata =
-                    fs::symlink_metadata(&source).map_err(|e| unavailable(e.to_string()))?;
-                if !metadata.is_file() || metadata.file_type().is_symlink() {
-                    return Err(unavailable("inflight Run log is not a regular file"));
-                }
-                let mut first = Vec::new();
-                BufReader::new(open_regular_file(&source)?)
-                    .read_until(b'\n', &mut first)
-                    .map_err(|e| unavailable(e.to_string()))?;
-                let entry: Value =
-                    serde_json::from_slice(&first).map_err(|e| unavailable(e.to_string()))?;
+                let Some(entry) = read_inflight_header(&source, legacy)? else {
+                    continue;
+                };
                 let string_field = |key: &str| -> Result<String> {
                     entry[key]
                         .as_str()
@@ -278,15 +331,14 @@ impl RunLogger {
                     .parse::<DateTime<Utc>>()
                     .map_err(|e| unavailable(e.to_string()))?;
                 let source_store_identity = entry["store_identity"].as_str().map(str::to_owned);
-                if source_store_identity
-                    .as_deref()
-                    .is_some_and(|identity| identity != store_log_identity(store))
-                {
-                    // Other formal Stores share this user's private log root.
-                    // Leave their still-open segments untouched for their own
-                    // Core rather than treating them as corrupt or sealing
-                    // an actively written stage.
-                    continue;
+                if legacy {
+                    if source_store_identity.as_deref().is_some_and(|identity| {
+                        identity != legacy_identity && identity != canonical_identity
+                    }) {
+                        continue;
+                    }
+                } else if source_store_identity.as_deref() != Some(canonical_identity.as_str()) {
+                    return Err(unavailable("inflight Run log has the wrong Store identity"));
                 }
                 let inspection = inspect_source(&source)?;
                 let mut segment = Segment {
@@ -822,7 +874,15 @@ impl RunLogger {
         let key = (context.run_id.clone(), context.phase.clone());
         if !state.segments.contains_key(&key) {
             let previous = self.previous_archive(&context.run_id, &context.phase)?;
-            let store_identity = self.store.get().map(store_log_identity);
+            let store_identity = self
+                .core_store
+                .as_ref()
+                .map(|owner| owner.identity.clone())
+                .or_else(|| {
+                    self.store
+                        .get()
+                        .map(|store| store_log_identity(store.root()))
+                });
             let start_event_cursor = if context.phase == "startup" {
                 0
             } else if let Some(store) = self.store.get() {
@@ -835,7 +895,7 @@ impl RunLogger {
             };
             let local_now = Local::now();
             let local_date = local_now.format("%Y%m%d").to_string();
-            let dir = self.root.join(&local_date).join(".inflight");
+            let dir = self.inflight_dir(&self.root.join(&local_date));
             ensure_private_directory(&dir)?;
             let id = Uuid::new_v4().to_string();
             let source = dir.join(format!("{}-{}-{id}.jsonl", key.0, key.1));
@@ -1247,15 +1307,22 @@ impl RunLogger {
                 "Run ZIP identity or content changed before cleanup",
             ));
         }
-        let source = receipt
-            .path
-            .parent()
-            .ok_or_else(|| unavailable("archive has no parent"))?
-            .join(".inflight")
-            .join(format!(
-                "{}-{}-{}.jsonl",
-                receipt.run_id, receipt.phase, receipt.segment_id
-            ));
+        let name = format!(
+            "{}-{}-{}.jsonl",
+            receipt.run_id, receipt.phase, receipt.segment_id
+        );
+        let scoped = self.inflight_dir(day).join(&name);
+        let flat = day.join(".inflight").join(name);
+        let source = match fs::symlink_metadata(&scoped) {
+            Ok(_) => {
+                if scoped != flat && flat.try_exists().map_err(|e| unavailable(e.to_string()))? {
+                    return Err(unavailable("ambiguous inflight Run log location"));
+                }
+                scoped
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => flat,
+            Err(error) => return Err(unavailable(error.to_string())),
+        };
         ensure_private_directory(
             source
                 .parent()
@@ -1322,13 +1389,19 @@ fn effective_user_home() -> Result<PathBuf> {
     }
 }
 
-fn store_log_identity(store: &Store) -> String {
-    // A non-secret fingerprint separates independent canonical Store Roots
-    // sharing the same ~/.akzio/log directory. Never serialize the full
-    // configured path or database into a private Run archive.
-    ContentHash::of_bytes(store.root().to_string_lossy().as_bytes())
-        .as_str()
-        .to_owned()
+fn canonical_store_root(root: &Path) -> Result<PathBuf> {
+    root.canonicalize()
+        .map_err(|error| unavailable(format!("resolve Core Store Root: {error}")))
+}
+
+fn canonical_store_log_identity(root: &Path) -> String {
+    // Use the resolved path for new logs so alias spellings share ownership.
+    ContentHash::of_bytes(root.as_os_str().as_encoded_bytes()).to_string()
+}
+
+fn store_log_identity(root: &Path) -> String {
+    // Keep the historical flat-file fingerprint for the configured path.
+    ContentHash::of_bytes(root.to_string_lossy().as_bytes()).to_string()
 }
 
 fn validate_log_identity(run_id: &str, phase: &str) -> Result<()> {
@@ -1494,8 +1567,35 @@ fn parse_checksums(source: &str) -> Result<BTreeMap<String, ContentHash>> {
     Ok(checksums)
 }
 
+fn read_inflight_header(source: &Path, legacy: bool) -> Result<Option<Value>> {
+    let file = if legacy {
+        // A different Store owner can remove its flat segment after enumeration.
+        let Some(file) = open_regular_file_if_present(source)? else {
+            return Ok(None);
+        };
+        file
+    } else {
+        open_regular_file(source)?
+    };
+    let mut first = Vec::new();
+    BufReader::new(file)
+        .read_until(b'\n', &mut first)
+        .map_err(|error| unavailable(error.to_string()))?;
+    serde_json::from_slice(&first)
+        .map(Some)
+        .map_err(|error| unavailable(error.to_string()))
+}
+
 fn open_regular_file(path: &Path) -> Result<File> {
-    let meta = fs::symlink_metadata(path).map_err(|error| unavailable(error.to_string()))?;
+    open_regular_file_if_present(path)?.ok_or_else(|| unavailable("Run log file is missing"))
+}
+
+fn open_regular_file_if_present(path: &Path) -> Result<Option<File>> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(unavailable(error.to_string())),
+    };
     if !meta.is_file() || meta.file_type().is_symlink() {
         return Err(unavailable("Run log path is not a regular file"));
     }
@@ -1513,9 +1613,11 @@ fn open_regular_file(path: &Path) -> Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW);
     }
-    let file = options
-        .open(path)
-        .map_err(|error| unavailable(error.to_string()))?;
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(unavailable(error.to_string())),
+    };
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -1526,7 +1628,7 @@ fn open_regular_file(path: &Path) -> Result<File> {
             return Err(unavailable("Run log file changed during secure open"));
         }
     }
-    Ok(file)
+    Ok(Some(file))
 }
 
 /// A record may be large; only a single NDJSON record is held at once. The
@@ -1666,6 +1768,50 @@ fn unavailable(message: impl Into<String>) -> RunLogError {
     RunLogError::Unavailable(message.into())
 }
 
+fn lock_core_store(store_root: &Path) -> Result<File> {
+    // Keep this file across restarts so all contenders lock the same inode.
+    let path = store_root.join(".core.lock");
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(unavailable("Core lock path is not a regular file"));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(unavailable(format!("inspect Core lock: {error}"))),
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| unavailable(format!("open Core lock: {error}")))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| unavailable(format!("inspect open Core lock: {error}")))?;
+    if !metadata.is_file() {
+        return Err(unavailable("Core lock is not a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            return Err(unavailable("Core lock file is not private (expected 0600)"));
+        }
+    }
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(fs::TryLockError::WouldBlock) => Err(unavailable("Store already has an active Core")),
+        Err(fs::TryLockError::Error(error)) => {
+            Err(unavailable(format!("acquire Core lock: {error}")))
+        }
+    }
+}
+
 fn create_private_file(path: &Path) -> Result<File> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -1694,9 +1840,25 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
                     use std::os::unix::fs::DirBuilderExt;
                     builder.mode(0o700);
                 }
-                builder
-                    .create(&ancestor)
-                    .map_err(|e| unavailable(e.to_string()))?;
+                if let Err(error) = builder.create(&ancestor) {
+                    if error.kind() != io::ErrorKind::AlreadyExists {
+                        return Err(unavailable(error.to_string()));
+                    }
+                    let metadata = fs::symlink_metadata(&ancestor)
+                        .map_err(|error| unavailable(error.to_string()))?;
+                    if !metadata.is_dir() {
+                        return Err(unavailable("log path contains a symlink or non-directory"));
+                    }
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        if metadata.permissions().mode() & 0o077 != 0 {
+                            return Err(unavailable(
+                                "concurrently created log directory is not private",
+                            ));
+                        }
+                    }
+                }
             }
             Err(error) => return Err(unavailable(error.to_string())),
         }
@@ -1821,6 +1983,7 @@ mod tests {
                 core_session: Uuid::new_v4().to_string(),
                 state: Mutex::new(State::default()),
                 store: OnceLock::new(),
+                core_store: None,
                 fail_once: Mutex::new(None),
             }
         }
@@ -2896,6 +3059,143 @@ mod tests {
         );
         drop(logger);
         assert_eq!(root.logger().recover_orphans(&store).unwrap(), 1);
+    }
+
+    /// WHY THIS TEST EXISTS (Task #6): A second Core must leave the first Core's live audit alone until its Store lock is released.
+    /// Do not weaken or delete this assertion.
+    #[test]
+    fn only_the_store_owner_can_recover_its_run_logs() {
+        let root = TestRoot::new();
+        let log_root = root.0.join("log");
+        let store_root = root.0.join("first-store");
+        Store::prepare_root(&store_root).unwrap();
+        let first = RunLogger::open_at(log_root.clone(), &store_root).unwrap();
+        let store = Store::open(store_root).unwrap();
+        let other_store = Store::open(root.0.join("other-store")).unwrap();
+        assert_eq!(first.recover_orphans(&store).unwrap(), 0);
+        let scope = ModelAuditContext::startup(first.core_session());
+        first.record(&scope, "llm.request", json!({})).unwrap();
+
+        let alias = store.root().join("..").join("first-store");
+        let rejected_log_root = root.0.join("rejected-log");
+        let duplicate = RunLogger::open_at(rejected_log_root.clone(), &alias).unwrap_err();
+        assert!(duplicate
+            .to_string()
+            .contains("Store already has an active Core"));
+        assert!(!rejected_log_root.exists());
+
+        let other = RunLogger::open_at(log_root.clone(), other_store.root()).unwrap();
+        assert_eq!(other.recover_orphans(&other_store).unwrap(), 0);
+        first.record(&scope, "core.probe", json!({})).unwrap();
+        let archive_owner = first.clone();
+        drop(first);
+        assert!(RunLogger::open_at(log_root.clone(), &alias).is_err());
+        drop(archive_owner);
+
+        let replacement = RunLogger::open_at(log_root, store.root()).unwrap();
+        assert_eq!(replacement.recover_orphans(&store).unwrap(), 1);
+    }
+
+    /// WHY THIS TEST EXISTS (Task #6): A foreign Core must not mistake a just-created segment for a corrupt orphan.
+    /// Do not weaken or delete this assertion.
+    #[test]
+    fn foreign_store_does_not_read_a_segment_before_its_first_record() {
+        let root = TestRoot::new();
+        let log_root = root.0.join("log");
+        let store = Store::open(root.0.join("first-store")).unwrap();
+        let other_store = Store::open(root.0.join("other-store")).unwrap();
+        let first = RunLogger::open_at(log_root.clone(), store.root()).unwrap();
+        first.recover_orphans(&store).unwrap();
+        let scope = ModelAuditContext::startup(first.core_session());
+        first.record(&scope, "llm.request", json!({})).unwrap();
+        let source = first.state.lock().unwrap().segments[&(scope.run_id, scope.phase)]
+            .source
+            .clone();
+        let first_record = fs::read(&source).unwrap();
+        // Reproduce the disk state between creating the file and writing its first line.
+        File::create(&source).unwrap();
+
+        let other = RunLogger::open_at(log_root.clone(), other_store.root()).unwrap();
+        let recovered = std::thread::spawn(move || other.recover_orphans(&other_store));
+        assert_eq!(recovered.join().unwrap().unwrap(), 0);
+        drop(first);
+
+        let alias_store = Store::open(store.root().join("..").join("first-store")).unwrap();
+        let replacement = RunLogger::open_at(log_root, alias_store.root()).unwrap();
+        assert!(replacement.recover_orphans(&alias_store).is_err());
+        fs::write(&source, first_record).unwrap();
+        assert_eq!(replacement.recover_orphans(&alias_store).unwrap(), 1);
+        assert!(!source.exists());
+
+        // The old flat layout and its configured-path fingerprint still work.
+        let legacy = root.logger();
+        legacy.attach_store(alias_store.clone()).unwrap();
+        let legacy_scope = ModelAuditContext::startup(legacy.core_session());
+        legacy
+            .record(&legacy_scope, "core.startup", json!({}))
+            .unwrap();
+        drop(legacy);
+        assert_eq!(replacement.recover_orphans(&alias_store).unwrap(), 1);
+    }
+
+    /// WHY THIS TEST EXISTS (Task #6): Concurrent Store owners must be able to create the same private log directory.
+    /// Do not weaken or delete this assertion.
+    #[test]
+    fn independent_cores_can_create_the_shared_log_directories_concurrently() {
+        let root = TestRoot::new();
+        let first = Store::open(root.0.join("first-store")).unwrap();
+        let second = Store::open(root.0.join("second-store")).unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        for startup in 0..8 {
+            let log_root = root.0.join(format!("log-{startup}"));
+            let start = |store: &Store| {
+                barrier.wait();
+                let logger = RunLogger::open_at(log_root.clone(), store.root());
+                barrier.wait();
+                let logger = logger.unwrap();
+                logger.attach_store(store.clone()).unwrap();
+                let scope = ModelAuditContext::startup(logger.core_session());
+                logger.record(&scope, "core.startup", json!({})).unwrap();
+            };
+            std::thread::scope(|threads| {
+                let first_start = threads.spawn(|| start(&first));
+                let second_start = threads.spawn(|| start(&second));
+                first_start.join().unwrap();
+                second_start.join().unwrap();
+            });
+        }
+    }
+
+    /// WHY THIS TEST EXISTS (Task #6): The owner may confirm a legacy segment after another Store has listed it.
+    /// Do not weaken or delete this assertion.
+    #[test]
+    fn legacy_inflight_header_can_disappear_during_other_store_recovery() {
+        let root = TestRoot::new();
+        let log_root = root.0.join("log");
+        let store = Store::open(root.0.join("owner-store")).unwrap();
+        let other_store = Store::open(root.0.join("other-store")).unwrap();
+        let old = root.logger();
+        old.attach_store(store.clone()).unwrap();
+        let scope = ModelAuditContext::startup(old.core_session());
+        old.record(&scope, "core.startup", json!({})).unwrap();
+        let source = old.state.lock().unwrap().segments[&(scope.run_id, scope.phase)]
+            .source
+            .clone();
+        drop(old);
+
+        let other = RunLogger::open_at(log_root.clone(), other_store.root()).unwrap();
+        assert_eq!(other.recover_orphans(&other_store).unwrap(), 0);
+        let listed = fs::read_dir(source.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path == &source)
+            .unwrap();
+        let owner = RunLogger::open_at(log_root, store.root()).unwrap();
+        assert_eq!(owner.recover_orphans(&store).unwrap(), 1);
+        assert!(!listed.exists());
+
+        assert!(read_inflight_header(&listed, true).unwrap().is_none());
+        assert!(read_inflight_header(&listed, false).is_err());
     }
 
     #[test]

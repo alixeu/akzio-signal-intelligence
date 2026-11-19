@@ -5,14 +5,19 @@
 use super::*;
 
 impl Store {
+    /// Prepare the private Store Root without opening or migrating its database.
+    pub fn prepare_root(root: &Path) -> StoreResult<()> {
+        fs::create_dir_all(root).map_err(|source| StoreError::Io {
+            path: root.to_path_buf(),
+            source,
+        })?;
+        secure_directory(root)
+    }
+
     // 新建或升级入口先建立 SQLite 连接并打开 foreign_keys，再把 staging、嵌入 BLOB 索引和文件权限补齐。
     pub fn open(root: impl AsRef<Path>) -> StoreResult<Self> {
         let root = root.as_ref().to_path_buf();
-        fs::create_dir_all(&root).map_err(|source| StoreError::Io {
-            path: root.clone(),
-            source,
-        })?;
-        secure_directory(&root)?;
+        Self::prepare_root(&root)?;
         let database = root.join(DATABASE_FILE);
         let mut connection = Connection::open(&database)?;
         connection.pragma_update(None, "foreign_keys", "ON")?;

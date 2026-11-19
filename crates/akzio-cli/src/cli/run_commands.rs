@@ -145,8 +145,9 @@ fn enforce_daemon_token_permissions(_path: &std::path::Path) -> Result<()> {
 }
 
 async fn serve(config: &Config, config_path: &Path) -> Result<()> {
-    let run_log = akzio_daemon::RunLogger::open()
-        .context("正式 Core 启动需要私有运行日志目录")?;
+    Store::prepare_root(&config.daemon.store_root)?;
+    let run_log = akzio_daemon::RunLogger::open(&config.daemon.store_root)
+        .context("acquire formal Core ownership and open private Run logs")?;
     let recovery_store = Store::open(&config.daemon.store_root)?;
     if recovery_store.debug_environment()?.is_some() {
         bail!("正式 Core 拒绝使用旧隔离 Debug Store；未发起模型或交易 I/O");
