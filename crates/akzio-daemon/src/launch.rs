@@ -12,6 +12,12 @@ pub(crate) struct FormalRunSubmission {
 pub(crate) enum FormalRunLaunchError {
     #[error(transparent)]
     Rejected(#[from] DaemonError),
+    #[error("Paper Run {run_id} was reserved but its submission audit could not be recorded. Inspect the original Run/Session")]
+    NotSubmitted {
+        run_id: RunId,
+        #[source]
+        error: Box<DaemonError>,
+    },
     #[error(
         "Run submission may have been committed; inspect the original Run/Session before retrying"
     )]
@@ -128,15 +134,7 @@ impl Daemon {
                     .scheduler
                     .tick(&clock, &self.paper_workflow_source(), Utc::now())
                     .await
-                    .map_err(|error| match error {
-                        SchedulerError::SubmissionUnknown { run_id, error } => {
-                            FormalRunLaunchError::Unknown {
-                                run_id,
-                                error: Box::new((*error).into()),
-                            }
-                        }
-                        error => FormalRunLaunchError::Rejected(error.into()),
-                    })?
+                    .map_err(classify_scheduler_error)?
                     .ok_or_else(|| {
                         DaemonError::InvalidInput(
                             "Paper 暂未启动：请检查交易时段、当前审批及校准状态；未创建订单".into(),
@@ -176,5 +174,77 @@ impl Daemon {
             }
         }
         Ok(FormalRunSubmission { run_id })
+    }
+}
+
+/// Classify a scheduler failure for the HTTP/CLI launch boundary.
+///
+/// A post-reservation run-log failure retains the reserved RunId.
+fn classify_scheduler_error(error: SchedulerError) -> FormalRunLaunchError {
+    match error {
+        SchedulerError::SubmissionUnknown { run_id, error } => FormalRunLaunchError::Unknown {
+            run_id,
+            error: Box::new((*error).into()),
+        },
+        SchedulerError::RunLogUnavailableAfterReservation { run_id, error } => {
+            let scheduler_error = SchedulerError::RunLogUnavailableAfterReservation {
+                run_id: run_id.clone(),
+                error,
+            };
+            FormalRunLaunchError::NotSubmitted {
+                run_id,
+                error: Box::new(scheduler_error.into()),
+            }
+        }
+        error => FormalRunLaunchError::Rejected(error.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_log_failure_after_reservation_is_not_submitted() {
+        let error = SchedulerError::RunLogUnavailableAfterReservation {
+            run_id: RunId("run-log".to_owned()),
+            error: crate::RunLogError::Unavailable("injected".to_owned()),
+        };
+        match classify_scheduler_error(error) {
+            FormalRunLaunchError::NotSubmitted { run_id, error } => {
+                assert_eq!(run_id.0, "run-log");
+                assert!(matches!(
+                    *error,
+                    DaemonError::Scheduler(
+                        SchedulerError::RunLogUnavailableAfterReservation { .. }
+                    )
+                ));
+            }
+            other => panic!("expected NotSubmitted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn submission_unknown_stays_unknown() {
+        let error = SchedulerError::SubmissionUnknown {
+            run_id: Some(RunId("run-unknown".to_owned())),
+            error: Box::new(SchedulerError::InvalidOwner),
+        };
+        match classify_scheduler_error(error) {
+            FormalRunLaunchError::Unknown { run_id, .. } => {
+                assert_eq!(run_id.map(|id| id.0), Some("run-unknown".to_owned()));
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deterministic_scheduler_rejection_is_rejected() {
+        match classify_scheduler_error(SchedulerError::InvalidOwner) {
+            FormalRunLaunchError::Rejected(error) => {
+                assert!(matches!(error, DaemonError::Scheduler(_)));
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
     }
 }

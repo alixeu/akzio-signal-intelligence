@@ -300,7 +300,9 @@ impl PaperScheduler {
                     &canary_reservation,
                 )
             })
-            .await??;
+            .await
+            .map_err(SchedulerError::during_reservation)?
+            .map_err(SchedulerError::during_reservation)?;
         Ok(Some(parent))
     }
 }

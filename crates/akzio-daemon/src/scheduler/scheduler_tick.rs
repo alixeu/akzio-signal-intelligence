@@ -7,6 +7,27 @@
 
 use super::*;
 
+impl SchedulerError {
+    // The Store distinguishes commit or readback errors from preflight failures.
+    // An interrupted executor at this boundary may also have completed the write.
+    pub(super) fn during_reservation(error: impl Into<Self>) -> Self {
+        let error = error.into();
+        let run_id = match &error {
+            Self::Store(StoreError::SessionReservationUnknown { run_id, .. })
+            | Self::Runtime(RuntimeError::Store(StoreError::SessionReservationUnknown {
+                run_id,
+                ..
+            })) => Some(run_id.clone()),
+            Self::Runtime(RuntimeError::StoreExecutor(_)) => None,
+            _ => return error,
+        };
+        Self::SubmissionUnknown {
+            run_id,
+            error: Box::new(error),
+        }
+    }
+}
+
 impl PaperScheduler {
     pub async fn tick<C, P>(
         &self,
@@ -60,13 +81,7 @@ impl PaperScheduler {
                 return Ok(None);
             }
             if campaign.status.is_level() {
-                return self
-                    .tick_canary(&campaign, &session_key, clock, now)
-                    .await
-                    .map_err(|error| SchedulerError::SubmissionUnknown {
-                        run_id: None,
-                        error: Box::new(error),
-                    });
+                return self.tick_canary(&campaign, &session_key, clock, now).await;
             }
         }
         // A first canonical research session must be able to earn its future
@@ -220,42 +235,30 @@ impl PaperScheduler {
         let workflow = self.workflow.clone();
         let reservation = self
             .store_executor
-            .execute(move |store| {
-                let result = match binding {
-                    Some((runtime_manifest, approval)) => workflow
-                        .reserve_paper_session_with_inputs_for_run_approved(
-                            &lease,
-                            run_id,
-                            &session_key,
-                            &proposal,
-                            &setup_artifacts,
-                            &runtime_manifest,
-                            &approval,
-                            now,
-                        ),
-                    None => workflow.reserve_paper_session_with_inputs_for_run(
+            .execute(move |_| match binding {
+                Some((runtime_manifest, approval)) => workflow
+                    .reserve_paper_session_with_inputs_for_run_approved(
                         &lease,
                         run_id,
                         &session_key,
                         &proposal,
                         &setup_artifacts,
+                        &runtime_manifest,
+                        &approval,
                         now,
                     ),
-                };
-                result.map_err(|error| SchedulerError::SubmissionUnknown {
-                    run_id: store
-                        .session_slot(&session_key)
-                        .ok()
-                        .flatten()
-                        .map(|slot| slot.workflow.run.run_id),
-                    error: Box::new(error.into()),
-                })
+                None => workflow.reserve_paper_session_with_inputs_for_run(
+                    &lease,
+                    run_id,
+                    &session_key,
+                    &proposal,
+                    &setup_artifacts,
+                    now,
+                ),
             })
             .await
-            .map_err(|error| SchedulerError::SubmissionUnknown {
-                run_id: None,
-                error: Box::new(error.into()),
-            })??;
+            .map_err(SchedulerError::during_reservation)?
+            .map_err(SchedulerError::during_reservation)?;
         if reservation.newly_reserved {
             if let Some(logger) = &self.run_log {
                 logger
@@ -272,12 +275,44 @@ impl PaperScheduler {
                         serde_json::json!({"purpose":"paper","source":"scheduler",
                         "session_key":reservation.slot.session_key}),
                     )
-                    .map_err(|error| SchedulerError::SubmissionUnknown {
-                        run_id: Some(reservation.slot.workflow.run.run_id.clone()),
-                        error: Box::new(error.into()),
+                    .map_err(|error| SchedulerError::RunLogUnavailableAfterReservation {
+                        run_id: reservation.slot.workflow.run.run_id.clone(),
+                        error,
                     })?;
             }
         }
         Ok(Some(reservation))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reservation_commit_or_readback_failure_retains_run_id() {
+        let run_id = RunId("run-1".to_owned());
+        let readback_failed = || StoreError::SessionReservationUnknown {
+            run_id: run_id.clone(),
+            error: Box::new(StoreError::MissingRun(run_id.clone())),
+        };
+        for error in [
+            SchedulerError::Store(readback_failed()),
+            SchedulerError::Runtime(RuntimeError::Store(readback_failed())),
+        ] {
+            assert!(matches!(
+                SchedulerError::during_reservation(error),
+                SchedulerError::SubmissionUnknown { run_id: Some(id), .. } if id == run_id
+            ));
+        }
+    }
+
+    #[test]
+    fn reservation_validation_failure_is_rejected() {
+        let error = RuntimeError::Store(StoreError::InvalidSessionSlot("session".to_owned()));
+        assert!(matches!(
+            SchedulerError::during_reservation(error),
+            SchedulerError::Runtime(RuntimeError::Store(StoreError::InvalidSessionSlot(_)))
+        ));
     }
 }

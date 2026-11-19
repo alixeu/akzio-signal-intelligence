@@ -317,6 +317,8 @@ impl RunPurpose {
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     Pending,
+    /// 历史兼容值：当前活动路径由 `claim_next_task` 直接写 `Running`，不产生
+    /// `Leased`；保留该值只为解码既有记录与审计，不得据此推断有活跃 lease。
     Leased,
     Running,
     Succeeded,
@@ -341,8 +343,12 @@ pub enum WorkflowStatus {
     Queued,
     Leased,
     Running,
+    /// 历史/保留值：当前 Store 状态刷新与 replay 不写入该值；读取方不得把它
+    /// 当作活动状态或 Decision 完成证据。
     DecisionCompleted,
     Completed,
+    /// 历史/保留值：当前 Store 状态刷新与 replay 不写入该值；拒绝执行的事实
+    /// 以 ExecutionVerdict/终态 Artifact 为准，不能由该枚举推断。
     CompletedWithExecutionRejection,
     Failed,
     Cancelled,

@@ -180,12 +180,42 @@ fn build_execution_plan(
         let notional = MoneyMicros(
             i64::try_from(delta.unsigned_abs()).map_err(|_| ExecutionError::NewNotionalExceeded)?,
         );
+        let limit_price = protected_limit_price(quote, side, policy.limit_protection_bps);
+        let notional = match side {
+            OrderSide::Buy => notional,
+            OrderSide::Sell => {
+                let position_quantity = account
+                    .positions
+                    .get(&asset)
+                    .map_or(0, |position| position.quantity_micros);
+                let price = i128::from(limit_price.0);
+                let scaled_notional = i128::from(position_quantity) * price;
+                // Round up to represent the held quantity after the broker floors
+                // notional * 1_000_000 / price. Below $1, rounding up can skip past
+                // that quantity, so also require the result to be strictly below
+                // the notional for one more microshare.
+                let rounded_notional = (scaled_notional + 999_999) / 1_000_000;
+                let maximum_safe_notional = (scaled_notional + price - 1) / 1_000_000;
+                let sell_notional = i128::from(notional.0)
+                    .min(rounded_notional)
+                    .min(maximum_safe_notional);
+                let sell_notional = i64::try_from(sell_notional)
+                    .map_err(|_| ExecutionError::NewNotionalExceeded)?;
+                if sell_notional.saturating_mul(1_000_000) < limit_price.0 {
+                    continue;
+                }
+                MoneyMicros(sell_notional)
+            }
+        };
+        if notional.0 <= 0 {
+            continue;
+        }
         orders.push(OrderIntent {
             extended_hours: input.clock.trading_session().extended_hours(),
             asset,
             side,
             notional,
-            limit_price: protected_limit_price(quote, side, policy.limit_protection_bps),
+            limit_price,
         });
     }
 
@@ -392,4 +422,232 @@ fn target_after_orders(
         .validate_universe()
         .map_err(|_| ExecutionError::InvalidPolicy)?;
     Ok(achieved)
+}
+
+#[cfg(test)]
+mod tests {
+    use akzio_domain::{
+        ArtifactId, ArtifactKind, DecisionId, PortfolioRiskAssessment, Position, Quote, RunId,
+        DOMAIN_SCHEMA_VERSION,
+    };
+    use chrono::TimeZone;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use super::*;
+
+    const BROKER_SESSION: &str = "2026-11-04";
+
+    fn now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 11, 4, 15, 0, 0)
+            .single()
+            .expect("fixed timestamp")
+    }
+
+    fn reference(kind: ArtifactKind) -> ArtifactRef {
+        ArtifactRef {
+            artifact_id: ArtifactId(ContentHash::new("a".repeat(64)).expect("valid hash")),
+            kind,
+        }
+    }
+
+    fn decision_context(now: DateTime<Utc>, weight: u32) -> DecisionContext {
+        let mut target = TargetPortfolio::zeroed();
+        target.weights.insert(Asset::Tqqq, WeightPpm(weight));
+        DecisionContext {
+            schema_version: DOMAIN_SCHEMA_VERSION,
+            decision_id: DecisionId::new(),
+            run_id: RunId::new(),
+            claims: vec![reference(ArtifactKind::Claim)],
+            critiques: Vec::new(),
+            evidence: Vec::new(),
+            policy_influences: Vec::new(),
+            applied_learning_refs: Vec::new(),
+            rejected_learning_refs: Vec::new(),
+            material_conflicts: Vec::new(),
+            hard_blockers: Vec::new(),
+            soft_warnings: Vec::new(),
+            decision_policy_hash: ContentHash::new("b".repeat(64)).expect("valid hash"),
+            behavior_bundle_hash: None,
+            portfolio_risk: PortfolioRiskAssessment {
+                risk_model_hash: Some(ContentHash::new("c".repeat(64)).expect("valid hash")),
+                calibrated_assets: 4,
+                covariance_sample_count: 252,
+                ex_ante_volatility_ppm: Some(1_000),
+                beta_ppm: Some(1_000),
+                expected_shortfall_ppm: Some(1_000),
+                gap_loss_ppm: Some(1_000),
+                liquidity_binding_assets: Vec::new(),
+                leveraged_holding_limit_days: 0,
+            },
+            target,
+            created_at: now,
+            validity: None,
+            horizon_trace: None,
+            investment_logic: None,
+            asset_eligibility: BTreeMap::new(),
+            runtime_trace: None,
+            research_plan: None,
+        }
+    }
+
+    fn account(now: DateTime<Utc>, positions: BTreeMap<Asset, Position>) -> AccountSnapshot {
+        AccountSnapshot {
+            schema_version: DOMAIN_SCHEMA_VERSION,
+            broker_session: BROKER_SESSION.to_owned(),
+            observed_at: now,
+            equity: MoneyMicros(100_000_000),
+            buying_power: MoneyMicros(100_000_000),
+            day_turnover: MoneyMicros::ZERO,
+            active: true,
+            trading_blocked: false,
+            positions,
+            external_positions: BTreeSet::new(),
+            open_order_ids: BTreeSet::new(),
+        }
+    }
+
+    fn quotes(now: DateTime<Utc>, bid: i64, ask: i64) -> QuoteSnapshot {
+        QuoteSnapshot {
+            feed: None,
+            schema_version: DOMAIN_SCHEMA_VERSION,
+            broker_session: BROKER_SESSION.to_owned(),
+            observed_at: now,
+            quotes: BTreeMap::from([(
+                Asset::Tqqq,
+                Quote {
+                    bid: MoneyMicros(bid),
+                    ask: MoneyMicros(ask),
+                    observed_at: now,
+                },
+            )]),
+        }
+    }
+
+    fn clock(now: DateTime<Utc>) -> MarketClockSnapshot {
+        MarketClockSnapshot {
+            session: None,
+            schema_version: DOMAIN_SCHEMA_VERSION,
+            broker_session: BROKER_SESSION.to_owned(),
+            is_open: true,
+            observed_at: now,
+        }
+    }
+
+    fn input(
+        now: DateTime<Utc>,
+        decision_context: DecisionContext,
+        account: AccountSnapshot,
+        quotes: QuoteSnapshot,
+        clock: MarketClockSnapshot,
+    ) -> AllocationInput {
+        AllocationInput {
+            decision_context_ref: reference(ArtifactKind::DecisionContext),
+            decision_context,
+            account_snapshot_ref: reference(ArtifactKind::ExecutionContext),
+            account,
+            quote_snapshot_ref: reference(ArtifactKind::ExecutionContext),
+            quotes,
+            market_clock_snapshot_ref: reference(ArtifactKind::ExecutionContext),
+            clock,
+            now,
+        }
+    }
+
+    #[test]
+    fn sell_quantity_is_capped_at_fractional_position_quantity() {
+        let now = now();
+        // 1.5 shares at a $50.05 mark, bid $50.00. Without a quantity cap the
+        // protected $49.95 sell limit produces ~1.503 shares.
+        let mut positions = BTreeMap::new();
+        positions.insert(
+            Asset::Tqqq,
+            Position {
+                quantity_micros: 1_500_000,
+                market_value: MoneyMicros(75_075_000),
+            },
+        );
+        let input = input(
+            now,
+            decision_context(now, 0),
+            account(now, positions),
+            quotes(now, 50_000_000, 50_100_000),
+            clock(now),
+        );
+
+        let plan = AllocationRuntime::new(ExecutionPolicy::default())
+            .expect("valid policy")
+            .allocate_with_limit(&input, MoneyMicros(100_000_000))
+            .expect("sell-only plan");
+
+        assert_eq!(plan.orders.len(), 1);
+        let order = &plan.orders[0];
+        assert_eq!(order.side, OrderSide::Sell);
+        assert_eq!(order.limit_price, MoneyMicros(49_950_000));
+        let quantity_millionths = order.notional.0 * 1_000_000 / order.limit_price.0;
+        assert!(
+            quantity_millionths <= 1_500_000,
+            "sell quantity {quantity_millionths} exceeds position 1500000"
+        );
+    }
+
+    #[test]
+    fn sell_cap_handles_microshare_rounding_and_large_positions() {
+        let now = now();
+        for (quantity, value, bid, ask, expected_notional, expected_quantity) in [
+            (1, 50, 50_000_000, 50_100_000, 50, 1),
+            (3, 2, 400_000, 400_100, 1, 2),
+            (i64::MAX, 50, 50_000_000, 50_100_000, 50, 1),
+        ] {
+            let positions = BTreeMap::from([(
+                Asset::Tqqq,
+                Position {
+                    quantity_micros: quantity,
+                    market_value: MoneyMicros(value),
+                },
+            )]);
+            let input = input(
+                now,
+                decision_context(now, 0),
+                account(now, positions),
+                quotes(now, bid, ask),
+                clock(now),
+            );
+
+            let plan = AllocationRuntime::new(ExecutionPolicy::default())
+                .expect("valid policy")
+                .allocate_with_limit(&input, MoneyMicros(100_000_000))
+                .expect("sell-only plan");
+            assert_eq!(plan.orders.len(), 1);
+            let order = &plan.orders[0];
+            assert_eq!(order.side, OrderSide::Sell);
+            assert_eq!(order.notional, MoneyMicros(expected_notional));
+            assert_eq!(
+                order.notional.0.saturating_mul(1_000_000) / order.limit_price.0,
+                expected_quantity,
+            );
+        }
+    }
+
+    #[test]
+    fn buy_notional_is_not_capped_by_position_quantity() {
+        let now = now();
+        let input = input(
+            now,
+            decision_context(now, WeightPpm::SCALE),
+            account(now, BTreeMap::new()),
+            quotes(now, 49_900_000, 50_000_000),
+            clock(now),
+        );
+
+        let plan = AllocationRuntime::new(ExecutionPolicy::default())
+            .expect("valid policy")
+            .allocate_with_limit(&input, MoneyMicros(100_000_000))
+            .expect("buy-only plan");
+
+        assert_eq!(plan.orders.len(), 1);
+        let order = &plan.orders[0];
+        assert_eq!(order.side, OrderSide::Buy);
+        // Full target delta remains, even though the account holds no shares.
+        assert_eq!(order.notional, MoneyMicros(100_000_000));
+    }
 }

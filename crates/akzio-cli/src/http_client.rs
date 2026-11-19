@@ -8,6 +8,8 @@
 
 use super::*;
 
+const DEFAULT_JSON_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub(crate) struct ControlApiClient {
     base_url: Url,
     client: Client,
@@ -79,11 +81,23 @@ impl ControlApiClient {
     }
 
     // 驱动已构造的 HTTP Future，先拒绝非成功状态，再把响应 body 消费为拥有型 T。
+    // 普通 JSON 控制面调用有默认整体上限，避免 daemon 半死时无限等待；正式 Run 的
+    // 长操作使用 `json_with_timeout` 显式覆盖。SSE 走独立的无限流路径。
     pub(crate) async fn json<T: DeserializeOwned>(&self, request: RequestBuilder) -> Result<T> {
+        self.json_with_timeout(request, DEFAULT_JSON_TIMEOUT).await
+    }
+
+    // 与 `json` 相同，但由调用方声明整体超时；`timeout` 覆盖 connect、发送和读取 body。
+    pub(crate) async fn json_with_timeout<T: DeserializeOwned>(
+        &self,
+        request: RequestBuilder,
+        timeout: Duration,
+    ) -> Result<T> {
         // 泛型 T: DeserializeOwned 要求结果拥有解码后的数据，不借用即将被释放的
         // HTTP body。`send().await?` 驱动网络请求；第二个 await 再消费 body。
         // 先验状态码，避免把错误页误当成功的业务 JSON。
         let response = request
+            .timeout(timeout)
             .send()
             .await
             .context("call loopback HTTP control API")?;
@@ -323,10 +337,12 @@ impl ControlApiClient {
     }
 
     // 请求 daemon 将 Store 备份到明确目标路径；备份的文件副作用发生在服务端。
+    // 备份可能随 Store 体积增长而超过普通查询上限，使用显式长操作超时。
     pub(crate) async fn store_backup(&self, target: &Path) -> Result<serde_json::Value> {
-        self.json(
+        self.json_with_timeout(
             self.request(Method::POST, self.endpoint(&["control", "store", "backup"]))
                 .json(&serde_json::json!({ "target": target })),
+            Duration::from_secs(300),
         )
         .await
     }
@@ -337,12 +353,13 @@ impl ControlApiClient {
         source: &Path,
         target: &Path,
     ) -> Result<serde_json::Value> {
-        self.json(
+        self.json_with_timeout(
             self.request(
                 Method::POST,
                 self.endpoint(&["control", "store", "restore"]),
             )
             .json(&serde_json::json!({ "source": source, "target": target })),
+            Duration::from_secs(300),
         )
         .await
     }
@@ -354,7 +371,7 @@ impl ControlApiClient {
         target: &Path,
         include_raw_model: bool,
     ) -> Result<serde_json::Value> {
-        self.json(
+        self.json_with_timeout(
             self.request(
                 Method::POST,
                 self.endpoint(&["control", "store", "export-run"]),
@@ -364,6 +381,7 @@ impl ControlApiClient {
                 "target": target,
                 "include_raw_model": include_raw_model,
             })),
+            Duration::from_secs(300),
         )
         .await
     }
@@ -459,5 +477,27 @@ mod sse_tests {
     #[test]
     fn malformed_complete_sse_line_is_rejected() {
         assert!(sse_lines(&mut Vec::new(), b"data: \xff\n").is_err());
+    }
+
+    // 控制面接受连接但不返回响应时，JSON 调用必须由显式整体超时中止；
+    // 旧实现没有该上限，会一直等待到 daemon 或操作系统放弃连接。
+    #[tokio::test]
+    async fn json_timeout_bounds_a_stalled_control_api() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_secs(5));
+        });
+        let client = ControlApiClient::new(address, "test-token".to_owned()).unwrap();
+        let started = std::time::Instant::now();
+        let result: Result<serde_json::Value> = client
+            .json_with_timeout(
+                client.request(Method::GET, client.endpoint(&["health"])),
+                Duration::from_millis(100),
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 }

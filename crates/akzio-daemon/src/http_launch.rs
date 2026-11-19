@@ -46,6 +46,14 @@ async fn http_launch_run(
     let submission = daemon.submit_formal_run(request.purpose, "http").await
     .map_err(|error| match error {
         crate::launch::FormalRunLaunchError::Rejected(error) => run_http_error(error),
+        crate::launch::FormalRunLaunchError::NotSubmitted { run_id, .. } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error":"not_submitted",
+                "submission_status":"not_submitted",
+                "run_id":run_id,
+            })),
+        ),
         crate::launch::FormalRunLaunchError::Unknown { run_id, .. } => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({

@@ -192,10 +192,9 @@ where
 async fn require_formal_ready(client: &ControlApiClient) -> Result<()> {
     // 有意读取最小 JSON 投影；旧版 Core 缺字段时明确拒绝，不用默认值推断 canonical。
     let ready: serde_json::Value = client
-        .json(
-            client
-                .request(Method::GET, client.endpoint(&["ready"]))
-                .timeout(Duration::from_secs(10)),
+        .json_with_timeout(
+            client.request(Method::GET, client.endpoint(&["ready"])),
+            Duration::from_secs(10),
         )
         .await
         .context("正式 Core 无法通过 /ready；请先启动对应 Core，未提交 Run")?;
@@ -225,6 +224,16 @@ async fn start(client: &ControlApiClient, purpose: FormalPurpose) -> Result<serd
         .map_err(|_| anyhow::anyhow!(AMBIGUOUS))?;
     let status = response.status();
     if status.is_server_error() {
+        // 只读取稳定状态字段；不回显服务端正文，避免 token/provider 文本进入终端。
+        let body: serde_json::Value = response.json().await.unwrap_or_default();
+        if let Some(run_id) = body["run_id"]
+            .as_str()
+            .filter(|id| !id.trim().is_empty() && body["submission_status"] == "not_submitted")
+        {
+            bail!(
+                "RUN_SUBMISSION=not_submitted (HTTP {status})；Core 已预约 Run {run_id:?}，但写入提交日志失败；请先 run replay 查询原 Run"
+            );
+        }
         bail!("{AMBIGUOUS} (HTTP {status})");
     }
     if !status.is_success() {
@@ -313,13 +322,12 @@ pub(crate) async fn execute(command: &RunCommand, config_path: &Path) -> Result<
         RunCommand::Detail { run_id } => {
             require_formal_ready(&client).await?;
             let detail: serde_json::Value = client
-                .json(
-                    client
-                        .request(
-                            Method::GET,
-                            client.endpoint(&["v1", "observer", "runs", run_id]),
-                        )
-                        .timeout(Duration::from_secs(30)),
+                .json_with_timeout(
+                    client.request(
+                        Method::GET,
+                        client.endpoint(&["v1", "observer", "runs", run_id]),
+                    ),
+                    Duration::from_secs(30),
                 )
                 .await?;
             if detail["workflow"]["run"]["run_id"].as_str() != Some(run_id.as_str()) {
@@ -331,14 +339,14 @@ pub(crate) async fn execute(command: &RunCommand, config_path: &Path) -> Result<
         RunCommand::ExportBundle { run_id, target } => {
             require_formal_ready(&client).await?;
             let manifest: serde_json::Value = client
-                .json(
+                .json_with_timeout(
                     client
                         .request(
                             Method::POST,
                             client.endpoint(&["control", "store", "export-run-bundle"]),
                         )
-                        .timeout(Duration::from_secs(300))
                         .json(&serde_json::json!({ "run_id": run_id, "target": target })),
+                    Duration::from_secs(300),
                 )
                 .await
                 .context("导出未确认；不自动重试，请检查目标目录。原 Run 不受影响")?;
@@ -673,10 +681,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn known_not_submitted_is_not_relabelled_unknown_after_post() {
+        let core = Core::new(vec![
+            Some((200, READY)),
+            Some((
+                503,
+                r#"{"error":"not_submitted","submission_status":"not_submitted","run_id":"run-1"}"#,
+            )),
+        ]);
+        let error = start(&core.client(), FormalPurpose::Paper)
+            .await
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("RUN_SUBMISSION=not_submitted"),
+            "{message}"
+        );
+        assert!(!message.contains("unknown_after_post"), "{message}");
+        assert!(message.contains("run-1"), "{message}");
+        assert_eq!(core.requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
     async fn ambiguous_submission_is_never_retried_or_relabelled_not_started() {
         for reply in [
             None,
             Some((500, r#"{"error":"private-test-token"}"#)),
+            Some((503, r#"{"submission_status":"not_submitted","run_id":" "}"#)),
             Some((200, r#"{"run_id":"#)),
             Some((200, "{}")),
             Some((200, r#"{"run_id":" "}"#)),

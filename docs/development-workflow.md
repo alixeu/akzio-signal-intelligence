@@ -54,6 +54,8 @@ cargo test --workspace --locked
 
 已有 Core 时不重复启动；没有服务时自动启动的 Core 将在脚本返回后独立运行，以便处理未来 Outcome。默认配置、Store/token 和新启动日志都在 `~/.akzio/`：分别为 `config.toml`、`store/` 与 `logs/core-*.log`。日志目录设为仅用户可进入，日志文件仅用户可读写；每次启动使用新日志，不覆盖已有 `logs/core.log`，不再写仓库 `.akzio/`。若显式指定另一正式配置，日志跟随其 Store Root 的父目录下的 `logs/`。PID 和日志路径从 `CORE_STARTED_PID`、`CORE_LOG` 输出。若启动前模型能力探测、凭据、Policy/Contract 或 Paper 配置失败，会在 ready 前退出并提示查看日志，不会提交 Run；启动等待有界（最多五分钟），超时后 Core 可能仍在启动，不能盲目重发。脚本自启的 Core 应用同配置的原生 `run replay/detail` 查询。正式客户端只读原配置和指定 Store 的 token，要求绝对 Store Root、回环地址及一致的 `AKZIO_STORE_ROOT`，禁止代理、认证重定向及 HTTP 自动重试；通过 `/ready` 核对 canonical Store、私有日志可用性和分享安全导出能力，再向 `POST /runs` 提交一次 purpose。客户端不复制/修改配置、Store 或 Policy，不把 PositionPlan 自动切换为 Paper。若 `auto_paper=true` 且尚无 Core，PositionPlan 拒绝自动启动以避免间接开启 Paper scheduler；脚本不改此配置。`unknown_after_post` 表示可能已经创建 Run，必须先查询原 Run/Session，不能直接重试。隔离 Debug 实验命令已退役，不再通过其他入口恢复。
 
+如果 Paper Run 已预约，但提交日志写入失败，HTTP 与 CLI 会报告 `not_submitted` 并提供原 Run ID。先查询该 Run 或 Session 的实际状态。
+
 `/ready` 提供 `store_scope`、`run_log_ready` 和 `formal_run_bundle_supported` 供客户端在提交前核对；旧版 Core 须更新并重启。认证的 `POST /control/store/export-run-bundle` 只导出 canonical Paper/PositionPlan 的分享安全快照到新目录，不回写 Store，也不向隔离 Debug Run 开放；历史 Debug bundle 的只读导出仍单独保留。
 
 缺 active DecisionPolicy 时，正式 PositionPlan 仍通过 Rust DecisionGate 形成可审查的研究分配与**全零正式目标仓位**，在 Decision 后结束，不产生 ExecutionVerdict 或 Outcome；证据不足时研究分配也可能为现金/阻断。已安装 Policy 的模型与 Contract 不匹配仍由正式 Core 拒绝或由原 Gate fail closed，客户端不补造或激活 Policy。`paper` 的冷启动由正式 scheduler 自动判断，无需单独模式。两者在 T0 都包含 T1/T3/T5 预测，只有 Paper 安排后续跨交易日评估。日常通过原生 `akzio --config <config> run detail RUN_ID` 查看有界 Observer JSON；开发诊断可用 `run replay` 读取持久化生命周期，`run retrospectives` 读取已保存复盘。研究提案、正式目标、ExecutionVerdict、订单提交、成交与 OutcomeSchedule 仍分别核对；投影缺失不等于零订单或真实成交。

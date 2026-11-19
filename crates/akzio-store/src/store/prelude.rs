@@ -126,6 +126,12 @@ pub enum StoreError {
     SchedulerFenced(String),
     #[error("invalid daemon lease {0}")]
     InvalidDaemonLease(String),
+    #[error("Paper session reservation result is unknown for run {run_id}")]
+    SessionReservationUnknown {
+        run_id: RunId,
+        #[source]
+        error: Box<StoreError>,
+    },
     #[error("invalid Paper session slot {0}")]
     InvalidSessionSlot(String),
     #[error("Paper session {0} already has a different commitment")]
@@ -191,6 +197,15 @@ pub enum StoreError {
     InvalidBackup(PathBuf),
     #[error("raw model export requires a legacy Debug run or a matching isolated DebugSession, got {0:?}")]
     RawModelExportNotAllowed(RunPurpose),
+}
+
+impl StoreError {
+    fn session_reservation_unknown(run_id: RunId, error: impl Into<Self>) -> Self {
+        Self::SessionReservationUnknown {
+            run_id,
+            error: Box::new(error.into()),
+        }
+    }
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;

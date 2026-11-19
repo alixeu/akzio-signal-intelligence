@@ -19,7 +19,7 @@ mod retired_debug_execution_tests {
         TaskBudget, TaskRecipeId, WorkflowGraph, DOMAIN_SCHEMA_VERSION,
     };
 
-    fn formal_fixture() -> (Store, RunId, ArtifactId, std::path::PathBuf) {
+    fn prepared_formal_fixture() -> (Store, WorkflowCommit, PathBuf) {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/retired-debug-execution-tests")
             .join(RunId::new().0);
@@ -75,21 +75,73 @@ mod retired_debug_execution_tests {
             now,
         )
         .unwrap();
-        let graph_id = artifact.artifact_id.clone();
-        store
-            .commit_workflow(&WorkflowCommit {
-                run: StoredRun {
-                    run_id: run_id.clone(),
-                    purpose: RunPurpose::Paper,
-                    topology_id: graph.topology_id,
-                    graph_artifact_id: graph_id.clone(),
-                    created_at: now,
-                },
-                graph: artifact,
-                nodes: vec![node],
-            })
+        let workflow = WorkflowCommit {
+            run: StoredRun {
+                run_id,
+                purpose: RunPurpose::Paper,
+                topology_id: graph.topology_id,
+                graph_artifact_id: artifact.artifact_id.clone(),
+                created_at: now,
+            },
+            graph: artifact,
+            nodes: vec![node],
+        };
+        (store, workflow, root)
+    }
+
+    fn formal_fixture() -> (Store, RunId, ArtifactId, PathBuf) {
+        let (store, workflow, root) = prepared_formal_fixture();
+        store.commit_workflow(&workflow).unwrap();
+        (
+            store,
+            workflow.run.run_id,
+            workflow.run.graph_artifact_id,
+            root,
+        )
+    }
+
+    #[test]
+    fn paper_reservation_readback_failure_preserves_committed_run_id() {
+        let (store, workflow, root) = prepared_formal_fixture();
+        let run_id = workflow.run.run_id.clone();
+        let now = Utc::now();
+        let reservation = SessionReservation {
+            session_key: now.date_naive().to_string(),
+            workflow,
+            setup_artifacts: vec![],
+            reserved_at: now,
+        };
+        let lease = store
+            .acquire_daemon_lease("scheduler", "fixture", now, now + Duration::minutes(1))
+            .unwrap()
             .unwrap();
-        (store, run_id, graph_id, root)
+        let fenced = DaemonLease {
+            epoch: lease.epoch + 1,
+            ..lease.clone()
+        };
+        assert!(matches!(
+            store.reserve_session_slot(&fenced, &reservation),
+            Err(StoreError::SchedulerFenced(_))
+        ));
+        store
+            .connection()
+            .unwrap()
+            .execute_batch(
+                "CREATE TEMP TRIGGER break_slot_readback AFTER INSERT ON rebuild_session_slots
+                 BEGIN
+                   UPDATE rebuild_session_slots SET reserved_at = 'invalid timestamp'
+                   WHERE session_key = NEW.session_key;
+                 END;",
+            )
+            .unwrap();
+        assert!(matches!(
+            store.reserve_session_slot(&lease, &reservation),
+            Err(StoreError::SessionReservationUnknown { run_id: existing, .. })
+                if existing == run_id
+        ));
+        assert_eq!(store.run_purpose(&run_id).unwrap(), RunPurpose::Paper);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

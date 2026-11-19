@@ -205,16 +205,13 @@ impl Store {
         Self::commit_canary_session_transaction(&transaction, reservation)?;
         // Paper slot/setup、parent graph、三张 Shadow graph 与 reservation 共用这一提交点；
         // 任一写入失败由 Transaction Drop 回滚本批行，不把部分 workflow 留作成功 reservation。
-        transaction.commit()?;
+        let run_id = &parent.workflow.run.run_id;
+        transaction
+            .commit()
+            .map_err(|error| StoreError::session_reservation_unknown(run_id.clone(), error))?;
         drop(connection);
         // 提交后再读取 slot，避免在仍持有 Store 连接时调用会再次获取连接的查询。
-        let slot = self
-            .session_slot(&parent.session_key)?
-            .ok_or_else(|| StoreError::Integrity("session slot missing after commit".to_owned()))?;
-        Ok(SessionSlotReservation {
-            slot,
-            newly_reserved: true,
-        })
+        self.read_reserved_session_slot(&parent.session_key, run_id.clone(), true)
     }
 
     pub fn canary_session(

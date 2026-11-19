@@ -234,21 +234,20 @@ impl Store {
             self.read_blob(&artifact.blob)?;
         }
 
-        let newly_reserved = {
+        let (run_id, newly_reserved) = {
             let mut connection = self.connection()?;
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             assert_daemon_lease(&transaction, lease, reservation.reserved_at)?;
-            let exists = transaction
+            let existing_run = transaction
                 .query_row(
-                    "SELECT 1 FROM rebuild_session_slots WHERE session_key = ?1",
+                    "SELECT run_id FROM rebuild_session_slots WHERE session_key = ?1",
                     params![reservation.session_key],
-                    |row| row.get::<_, i64>(0),
+                    |row| row.get(0).map(RunId),
                 )
                 .optional()?;
-            if exists.is_some() {
-                transaction.commit()?;
-                false
+            let (run_id, newly_reserved) = if let Some(run_id) = existing_run {
+                (run_id, false)
             } else {
                 for artifact in &reservation.setup_artifacts {
                     insert_artifact(&transaction, artifact)?;
@@ -272,17 +271,14 @@ impl Store {
                         reservation.reserved_at.to_rfc3339(),
                     ],
                 )?;
-                transaction.commit()?;
-                true
-            }
+                (reservation.workflow.run.run_id.clone(), true)
+            };
+            transaction
+                .commit()
+                .map_err(|error| StoreError::session_reservation_unknown(run_id.clone(), error))?;
+            (run_id, newly_reserved)
         };
-        let slot = self
-            .session_slot(&reservation.session_key)?
-            .ok_or_else(|| StoreError::Integrity("session slot disappeared".to_owned()))?;
-        Ok(SessionSlotReservation {
-            slot,
-            newly_reserved,
-        })
+        self.read_reserved_session_slot(&reservation.session_key, run_id, newly_reserved)
     }
 
     // 由 slot 行读取 graph Artifact/CAS payload，再恢复 Paper WorkflowCommit 快照。

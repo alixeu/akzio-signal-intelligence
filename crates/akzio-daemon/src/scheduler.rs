@@ -43,6 +43,12 @@ pub enum SchedulerError {
         #[source]
         error: Box<SchedulerError>,
     },
+    #[error("Run log unavailable after Paper session reservation (run_id: {run_id})")]
+    RunLogUnavailableAfterReservation {
+        run_id: RunId,
+        #[source]
+        error: crate::RunLogError,
+    },
     #[error(transparent)]
     RunLogUnavailable(#[from] crate::RunLogError),
     #[error(transparent)]
