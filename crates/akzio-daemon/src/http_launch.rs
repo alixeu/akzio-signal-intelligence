@@ -344,6 +344,152 @@ mod formal_launch_tests {
         server.await.unwrap().unwrap();
     }
 
+    /// WHY THIS TEST EXISTS (Task #12): Decision lineage must identify the exact approved revision even when its research inputs include a rejected review.
+    /// Do not weaken or delete this assertion.
+    #[tokio::test]
+    async fn decision_lineage_binds_the_review_that_approved_the_final_revision() {
+        use akzio_domain::{
+            Decision, ProposalReview, RESEARCH_PROPOSAL_REVIEWER_RECIPE_ID,
+            RESEARCH_SYNTHESIZER_RECIPE_ID,
+        };
+        use akzio_model::ModelClient;
+        use serde_json::{json, Value};
+
+        let mut daemon = (*fixture()).clone();
+        let ModelClient::FixtureByPurposePhase(templates) = crate::fixture_model_client() else {
+            panic!("expected purpose-scoped research fixture responses");
+        };
+        let mut first = (*templates).clone();
+        let reviewer = &mut first.get_mut(RESEARCH_PROPOSAL_REVIEWER_RECIPE_ID).unwrap()[1];
+        let mut arguments: Value =
+            serde_json::from_str(reviewer["output"][0]["arguments"].as_str().unwrap()).unwrap();
+        let cash = arguments["result"]["assessments"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|assessment| assessment["scope"] == "allocation.cash")
+            .unwrap();
+        cash["accepted"] = json!(false);
+        cash["rationale"] = json!("The cash basis should explain how the residual is calculated.");
+        cash["issues"] = json!([{
+            "category": "estimate_basis_mismatch",
+            "field_path": "numeric_basis.allocation.cash.method",
+            "correction_criterion": "State that cash equals total weight minus the invested weights.",
+            "evidence_refs": []
+        }]);
+        reviewer["output"][0]["arguments"] = json!(arguments.to_string());
+        daemon.model = crate::ModelClientAdapter::new(ModelClient::fixture_by_purpose_phase(first));
+
+        let run = daemon
+            .launch_formal_run(RunPurpose::PositionPlan, "decision-lineage-fixture")
+            .await
+            .unwrap()
+            .run_id;
+        let store = &daemon.store;
+        let artifacts = |kind| store.run_artifacts_by_kind(&run, kind).unwrap();
+        for _ in 0..32 {
+            assert!(daemon.run_one("decision-lineage-fixture").await.unwrap());
+            if !artifacts(ArtifactKind::ProposalReview).is_empty() {
+                break;
+            }
+        }
+        let [rejected]: [_; 1] = artifacts(ArtifactKind::ProposalReview).try_into().unwrap();
+        let first_review: ProposalReview =
+            serde_json::from_slice(&store.read_blob(&rejected.blob).unwrap()).unwrap();
+        assert!(!first_review.accepted());
+        assert!(artifacts(ArtifactKind::Decision).is_empty());
+
+        let mut revised = (*templates).clone();
+        let synthesizer = &mut revised.get_mut(RESEARCH_SYNTHESIZER_RECIPE_ID).unwrap()[1];
+        let mut arguments: Value =
+            serde_json::from_str(synthesizer["output"][0]["arguments"].as_str().unwrap()).unwrap();
+        let basis = arguments["result"]["numeric_basis"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|basis| basis["scope"] == "allocation.cash")
+            .unwrap();
+        basis["method"] = json!("Cash equals total portfolio weight minus the invested weights.");
+        synthesizer["output"][0]["arguments"] = json!(arguments.to_string());
+        daemon.model =
+            crate::ModelClientAdapter::new(ModelClient::fixture_by_purpose_phase(revised));
+        for _ in 0..32 {
+            if !daemon.run_one("decision-lineage-fixture").await.unwrap() {
+                break;
+            }
+        }
+
+        assert_eq!(artifacts(ArtifactKind::DecisionProposal).len(), 2);
+        let reviews = artifacts(ArtifactKind::ProposalReview);
+        assert_eq!(reviews.len(), 2);
+        let approved = reviews
+            .iter()
+            .find(|review| review.artifact_id != rejected.artifact_id)
+            .unwrap();
+        let [decision]: [_; 1] = artifacts(ArtifactKind::Decision).try_into().unwrap();
+        let payload: Decision =
+            serde_json::from_slice(&store.read_blob(&decision.blob).unwrap()).unwrap();
+        assert!(decision.source_refs.contains(&payload.decision_context));
+        let context = store
+            .artifact(&payload.decision_context.artifact_id)
+            .unwrap();
+        let review_sources = context
+            .source_refs
+            .iter()
+            .filter(|source| source.kind == ArtifactKind::ProposalReview)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            review_sources
+                .iter()
+                .map(|source| &source.artifact_id)
+                .collect::<Vec<_>>(),
+            vec![&approved.artifact_id],
+            "only the authorizing review belongs on the DecisionContext"
+        );
+
+        let review: ProposalReview = daemon.read_artifact_payload(review_sources[0]).unwrap();
+        assert!(review.accepted());
+        assert!(decision.source_refs.contains(&review.proposal));
+        let proposal = store.artifact(&review.proposal.artifact_id).unwrap();
+        assert_eq!(review.proposal_hash, proposal.blob.hash);
+        assert_ne!(review.proposal, first_review.proposal);
+        assert_ne!(review.proposal_hash, first_review.proposal_hash);
+        assert!(proposal
+            .source_refs
+            .iter()
+            .filter(|source| source.kind == ArtifactKind::ContextManifest)
+            .any(|source| {
+                let manifest = store.artifact(&source.artifact_id).unwrap();
+                manifest.source_refs.iter().any(|source| {
+                    source.kind == ArtifactKind::ProposalReview
+                        && source.artifact_id == rejected.artifact_id
+                })
+            }));
+        assert!(approved.source_refs.contains(&review.proposal));
+        assert!(approved.source_refs.contains(&review.manifest));
+        assert_eq!(approved.producer, "agent.research.proposal_reviewer");
+        let origin = approved.origin.as_ref().unwrap();
+        assert_eq!(origin.run_id.as_ref(), Some(&run));
+        let task_id = origin.task_id.as_ref().unwrap();
+        let workflow = store.workflow_snapshot(&run).unwrap();
+        let reviewer = workflow
+            .tasks
+            .iter()
+            .find(|task| &task.node.task_id == task_id)
+            .unwrap();
+        assert_eq!(
+            reviewer.node.recipe_id.as_str(),
+            RESEARCH_PROPOSAL_REVIEWER_RECIPE_ID
+        );
+        assert_eq!(reviewer.node.execution_spec().proposal_revision, Some(1));
+        let attempt = store.current_succeeded_attempt(&run, task_id).unwrap();
+        assert_eq!(origin.attempt_id.as_ref(), Some(&attempt.attempt_id));
+        assert_eq!(origin.contract_hash.as_ref(), Some(&review.contract_hash));
+        assert_eq!(attempt.contract_hash, origin.contract_hash);
+        assert_eq!(attempt.context_manifest.as_ref(), Some(&review.manifest));
+        assert!(attempt.outputs.contains(approved));
+    }
+
     #[tokio::test]
     async fn canonical_paper_cold_start_schedules_outcome_without_broker_writes() {
         let daemon = fixture();

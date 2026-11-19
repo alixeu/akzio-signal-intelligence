@@ -59,16 +59,25 @@ impl DecisionRuntime {
         if installed.contract.version < akzio_domain::DIRECTION_BOUND_RESEARCH_CONTRACT_VERSION {
             return Err(DecisionGateError::UnsupportedProposalContract);
         }
-        if installed.contract.version >= akzio_domain::REVIEWED_RESEARCH_CONTRACT_VERSION {
-            // 新版数值依据和终稿 Review 都必须在决定前可验证；Review 还要授权当前
-            // proposal ArtifactRef 与 blob hash，缺失/拒绝会作为 Gate 错误结束本次任务。
-            akzio_domain::validate_numeric_bases(&draft.numeric_basis)?;
-            let (_, review) = self.store.final_proposal_review(&input.permit.run_id, &input.permit.task_id)?
-                .ok_or(DecisionGateError::ProposalReviewRequired)?;
-            if !review.authorizes(&input.proposal, &proposal.blob.hash) {
-                return Err(DecisionGateError::ProposalReviewRequired);
-            }
-        }
+        let authorizing_review =
+            if installed.contract.version >= akzio_domain::REVIEWED_RESEARCH_CONTRACT_VERSION {
+                // 新版数值依据和终稿 Review 都必须在决定前可验证；Review 还要授权当前
+                // proposal ArtifactRef 与 blob hash，缺失/拒绝会作为 Gate 错误结束本次任务。
+                akzio_domain::validate_numeric_bases(&draft.numeric_basis)?;
+                let (artifact, review) = self
+                    .store
+                    .final_proposal_review(&input.permit.run_id, &input.permit.task_id)?
+                    .ok_or(DecisionGateError::ProposalReviewRequired)?;
+                if !review.authorizes(&input.proposal, &proposal.blob.hash) {
+                    return Err(DecisionGateError::ProposalReviewRequired);
+                }
+                Some(ArtifactRef {
+                    artifact_id: artifact.artifact_id,
+                    kind: ArtifactKind::ProposalReview,
+                })
+            } else {
+                None
+            };
         // map 闭包为每个 Claim 做 Store kind 校验、CAS 解码和领域 validate；collect 到
         // Result<Vec<_>> 时才实际遍历，并在任一错误处短路整批加载。
         let claim_records = draft
@@ -516,12 +525,18 @@ impl DecisionRuntime {
             RunPurpose::Paper => ArtifactLifecycle::Canonical,
             _ => ArtifactLifecycle::RunScoped,
         };
-        // context 的 lineage 明确包含 proposal、唯一 manifest 和 selected 闭包；
-        // quarantined 内容不列为模型有效证据，祖先 Manifest 已由递归校验其自身来源。
-        let mut context_sources = Vec::with_capacity(selected.len() + 2);
+        // 直接的 ProposalReview 来源只记录实际授权的审查；提案修订参考的审查仍可沿
+        // Synthesizer Manifest 追溯。Quarantined 证据也只保留在 Manifest 的来源中。
+        let mut context_sources = Vec::with_capacity(selected.len() + 3);
         context_sources.push(input.proposal.clone());
         context_sources.push(manifest_ref.clone());
-        context_sources.extend(selected.iter().cloned());
+        context_sources.extend(
+            selected
+                .iter()
+                .filter(|reference| reference.kind != ArtifactKind::ProposalReview)
+                .cloned(),
+        );
+        context_sources.extend(authorizing_review);
         let decision_context = self.artifact(
             ArtifactKind::DecisionContext,
             "decision.context",
