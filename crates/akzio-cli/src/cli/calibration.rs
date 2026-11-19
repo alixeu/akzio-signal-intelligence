@@ -24,10 +24,12 @@ fn handle_calibration(command: &CalibrationCommand, config_path: &Path) -> Resul
     // 打开 Store。Readiness/Inspect/Validate 只读已有库；Preflight 的 Store::open
     // 可创建或迁移 scratch，Bootstrap 在目标库激活源 Policy，不能归到只读一组。
     match command {
-        CalibrationCommand::Readiness { store, min_samples } => {
-            // u32 实现 Copy，`*min_samples` 复制值而不移动借用中的命令。
-            calibration_readiness(store, *min_samples, config_path)
-        }
+        CalibrationCommand::Readiness {
+            store,
+            min_samples,
+            cohort,
+            scope,
+        } => calibration_readiness(store, *min_samples, config_path, *cohort, scope),
         CalibrationCommand::Preflight { scratch } => {
             // 不启动模型或执行链；但 open 会初始化/迁移 scratch，若 Policy 已就绪，
             // decision_policy_preflight 内的 catalogue helper 也可能写入 Contract 安装。
@@ -156,16 +158,8 @@ fn handle_calibration(command: &CalibrationCommand, config_path: &Path) -> Resul
             store,
             risk_limits,
             min_samples,
-            training_start,
-            training_end,
-        } => collect_calibration_dataset(
-            store,
-            risk_limits,
-            *min_samples,
-            training_start.as_deref(),
-            training_end.as_deref(),
-            config_path,
-        ),
+            scope,
+        } => print_json(&collect_calibration_report(store, risk_limits, *min_samples, scope, config_path)?),
         CalibrationCommand::Validate { store, policy } => {
             // Validate 只对指定 CAS Artifact 做严格解码和能力判断，不写 active head。
             let store = Store::open_existing(store)?;
@@ -337,15 +331,63 @@ fn calibration_readiness_gap(rows: &[serde_json::Value], min_samples: u32) -> se
     })
 }
 
-fn calibration_readiness(store_path: &Path, min_samples: u32, config_path: &Path) -> Result<()> {
-    // 保持命令边界简单：完整报告由只读的 readiness_report 生成后直接打印。
-    print_json(&calibration_readiness_report(store_path, min_samples, config_path)?)
+const CALIBRATION_SCAN_LIMIT: usize = 500;
+const CALIBRATION_PAGE_SIZE: usize = 128;
+
+struct CalibrationDecisionScan {
+    artifacts: Vec<Artifact>,
+    truncated: bool,
+}
+
+fn scan_calibration_decisions(
+    store: &Store,
+    window: (Option<DateTime<Utc>>, Option<DateTime<Utc>>),
+) -> Result<CalibrationDecisionScan> {
+    let mut artifacts: Vec<Artifact> = Vec::new();
+    while artifacts.len() <= CALIBRATION_SCAN_LIMIT {
+        let before = artifacts
+            .last()
+            .map(|artifact| (artifact.created_at, &artifact.artifact_id));
+        let limit = CALIBRATION_PAGE_SIZE.min(CALIBRATION_SCAN_LIMIT + 1 - artifacts.len());
+        let page = store.calibration_decision_page(window, before, limit)?;
+        let exhausted = page.len() < limit;
+        artifacts.extend(page);
+        if exhausted {
+            break;
+        }
+    }
+    let truncated = artifacts.len() > CALIBRATION_SCAN_LIMIT;
+    artifacts.truncate(CALIBRATION_SCAN_LIMIT);
+    Ok(CalibrationDecisionScan {
+        artifacts,
+        truncated,
+    })
+}
+
+fn calibration_readiness(
+    store_path: &Path,
+    min_samples: u32,
+    config_path: &Path,
+    cohort: bool,
+    scope: &CalibrationScopeArgs,
+) -> Result<()> {
+    let scoped = cohort
+        || scope.training_start.is_some()
+        || scope.training_end.is_some()
+        || scope.contract_hash.is_some();
+    print_json(&calibration_readiness_report(
+        store_path,
+        min_samples,
+        config_path,
+        scoped.then_some(scope),
+    )?)
 }
 
 fn calibration_readiness_report(
     store_path: &Path,
     min_samples: u32,
     config_path: &Path,
+    cohort: Option<&CalibrationScopeArgs>,
 ) -> Result<serde_json::Value> {
     // Readiness 只打开既有 Store，扫描有限数量的 canonical Paper Decision，并把
     // 隔离 Debug 运行明确排除在正式校准之外；它不会创建样本、候选 Policy 或 active head。
@@ -380,31 +422,59 @@ fn calibration_readiness_report(
             Err(_) => "invalid_store_policy_or_identity".to_owned(),
         }
     };
-    let artifacts = store.recent_artifacts_by_kind(ArtifactKind::Decision, 500)?;
-    let mut rows = Vec::new();
-    let mut seen = BTreeSet::new();
-    // 每个 Run 只取一个 Decision 作为 readiness 入口；重复 Decision 或非 Paper purpose
-    // 不进入成熟度统计，单个 Run 的细节由 calibration_run_readiness 继续校验。
-    for artifact in &artifacts {
-        let Some(run_id) = artifact
-            .origin
-            .as_ref()
-            .and_then(|origin| origin.run_id.as_ref())
-        else {
-            continue;
-        };
-        if store.run_purpose(run_id)? != RunPurpose::Paper || !seen.insert(run_id.clone()) {
-            continue;
+    let (scan, rows, cohort_report) = if let Some(requested) = cohort.filter(|_| !isolated) {
+        let scope = calibration_cohort(&store, config_path, requested)?;
+        let CalibrationSelection {
+            scan,
+            selected,
+            skipped,
+        } = select_calibration_cohort(&store, &scope)?;
+        let selected_run_ids: Vec<_> = selected.iter().map(|candidate| &candidate.run_id).collect();
+        let mut rows: Vec<_> = selected
+            .iter()
+            .map(|candidate| {
+                serde_json::json!({
+                    "status": "sealed", "run_id": candidate.run_id,
+                    "decision_artifact_id": candidate.decision_artifact.artifact_id,
+                })
+            })
+            .collect();
+        rows.extend(skipped.iter().cloned().map(|mut row| {
+            row["status"] = serde_json::json!("excluded");
+            row
+        }));
+        let mut summary = scope.identity_report();
+        summary["selected_run_ids"] = serde_json::to_value(selected_run_ids)?;
+        summary["excluded_decisions"] = serde_json::to_value(skipped.len())?;
+        (scan, rows, Some(summary))
+    } else {
+        let scan = scan_calibration_decisions(&store, (None, None))?;
+        let mut rows = Vec::new();
+        let mut seen = BTreeSet::new();
+        // 每个 Run 只取一个 Decision 作为 readiness 入口；重复 Decision 或非 Paper purpose
+        // 不进入成熟度统计，单个 Run 的细节由 calibration_run_readiness 继续校验。
+        for artifact in &scan.artifacts {
+            let Some(run_id) = artifact
+                .origin
+                .as_ref()
+                .and_then(|origin| origin.run_id.as_ref())
+            else {
+                continue;
+            };
+            if !seen.insert(run_id.clone()) {
+                continue;
+            }
+            let mut row = if isolated {
+                serde_json::json!({"status":"blocked", "reason":"isolated_debug_store",
+                    "detail":"Debug and simulated runs cannot become canonical calibration samples by waiting or completing Outcome."})
+            } else {
+                calibration_run_readiness(&store, artifact, run_id)?
+            };
+            row["run_id"] = serde_json::to_value(run_id)?;
+            rows.push(row);
         }
-        let mut row = if isolated {
-            serde_json::json!({"status":"blocked", "reason":"isolated_debug_store",
-                "detail":"Debug and simulated runs cannot become canonical calibration samples by waiting or completing Outcome."})
-        } else {
-            calibration_run_readiness(&store, artifact, run_id)?
-        };
-        row["run_id"] = serde_json::to_value(run_id)?;
-        rows.push(row);
-    }
+        (scan, rows, None)
+    };
     let mut stored_artifacts = Vec::new();
     // 展示最近少量校准 Artifact 便于 operator 找到后续命令的输入 ID；这是观察窗口，
     // 不是对 Store 中不存在的 Artifact 的推断。
@@ -421,6 +491,8 @@ fn calibration_readiness_report(
     let mut gap = calibration_readiness_gap(&rows, min_samples);
     if isolated {
         gap["next_step"] = serde_json::json!("use_canonical_store");
+    } else if cohort.is_some() && scan.truncated {
+        gap["next_step"] = serde_json::json!("narrow_training_window");
     }
     Ok(serde_json::json!({
         "store":store_path, "decision_policy_status":policy_status,
@@ -432,8 +504,9 @@ fn calibration_readiness_report(
         "policy_status_scope":"configured_model_and_persisted_active_contract",
         "activation_requires_operator":true,
         "operator_sequence":"collect -> build -> inspect -> validate -> activate; inspect, validate and activate must be explicitly performed by the operator",
-        "scan_limit":500, "decisions_scanned":artifacts.len(),
-        "scan_limit_reached":artifacts.len() == 500,
+        "scan_limit":CALIBRATION_SCAN_LIMIT, "decisions_scanned":scan.artifacts.len(),
+        "scan_limit_reached":scan.truncated,
+        "cohort":cohort_report,
         "gap":gap, "runs":rows
     }))
 }
@@ -527,7 +600,7 @@ fn calibration_run_readiness(
 mod calibration_readiness_tests {
     use super::*;
 
-    use akzio_domain::WeightPpm;
+    use akzio_domain::{RunPurpose, WeightPpm};
     use akzio_execution::{ForecastCalibrationScope, AssetRiskCalibration, FrozenForecastCalibration, ForecastCalibrationBin, PortfolioRiskModel};
 
     // Canonical empty Store is not a source of fabricated mature Outcomes.
@@ -538,12 +611,609 @@ mod calibration_readiness_tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../.akzio/policy-readiness-tests").join(RunId::new().0);
         let store = Store::open(&path).unwrap();
-        let canonical = calibration_readiness_report(&path, 30, Path::new("unused.toml")).unwrap();
+        let canonical = calibration_readiness_report(&path, 30, Path::new("unused.toml"), None).unwrap();
         assert_eq!(canonical["calibration_eligible"], true);
         assert_eq!(canonical["gap"]["next_step"], "collect_real_outcomes");
         assert_eq!(canonical["gap"]["mature_runs"], 0);
         assert!(store.debug_environment().unwrap().is_none());
         assert!(store.active_decision_policy().unwrap().is_none());
+    }
+
+    fn calibration_fixture_attempt(
+        store: &Store,
+        purpose: RunPurpose,
+    ) -> akzio_store::ClaimedAttempt {
+        use akzio_domain::{
+            ArtifactOrigin, FailureDisposition, RetryPolicy, TaskBudget, TaskId, TaskRecipeId,
+            WorkflowGraph, WorkflowNode, DOMAIN_SCHEMA_VERSION,
+        };
+        let run_id = RunId::new();
+        let now = Utc::now();
+        let node = WorkflowNode {
+            spec: None,
+            task_id: TaskId::new(),
+            recipe_id: TaskRecipeId::new("gate.decision").unwrap(),
+            contract_hash: None,
+            objective: "offline calibration selection fixture".into(),
+            dependencies: vec![],
+            input_artifacts: vec![],
+            priority: 1,
+            budget: TaskBudget {
+                max_input_tokens: 1,
+                max_output_tokens: 1,
+                max_wall_time_secs: 1,
+                max_tool_calls: akzio_domain::budget::ToolCallLimit::Limited(0),
+            },
+            retry: RetryPolicy::none(),
+            on_failure: FailureDisposition::FailRun,
+            parent_task_id: None,
+        };
+        let graph = WorkflowGraph {
+            definition_version: None,
+            schema_version: DOMAIN_SCHEMA_VERSION,
+            topology_id: "offline-calibration-selection-fixture".into(),
+            nodes: vec![node],
+            agent_budgets: Default::default(),
+        };
+        let provenance = ArtifactProvenance {
+            source_family: "akzio.runtime".into(),
+            observed_at: None,
+            retrieved_at: now,
+            source_uri: None,
+            confidence_ppm: 1_000_000,
+            producer_contract_hash: None,
+        };
+        let graph_artifact = Artifact::new(
+            ArtifactKind::WorkflowGraph,
+            store.stage_json(&graph).unwrap(),
+            "runtime.workflow",
+            ArtifactLifecycle::RunScoped,
+            provenance.clone(),
+            Some(ArtifactOrigin {
+                run_id: Some(run_id.clone()),
+                task_id: None,
+                attempt_id: None,
+                contract_hash: None,
+            }),
+            vec![],
+            now,
+        )
+        .unwrap();
+        store
+            .commit_workflow(&akzio_store::WorkflowCommit {
+                run: StoredRun {
+                    run_id: run_id.clone(),
+                    purpose,
+                    topology_id: graph.topology_id,
+                    graph_artifact_id: graph_artifact.artifact_id.clone(),
+                    created_at: now,
+                },
+                graph: graph_artifact,
+                nodes: graph.nodes,
+            })
+            .unwrap();
+        store
+            .claim_next_task_for_workload(
+                "calibration-test",
+                now,
+                chrono::Duration::minutes(1),
+                akzio_store::TaskWorkload::Any,
+            )
+            .unwrap()
+            .unwrap()
+    }
+
+    fn calibration_fixture_decision(decided_at: DateTime<Utc>, context: ArtifactRef) -> Decision {
+        use akzio_domain::{Forecast, ForecastThesis, TargetPortfolio, DOMAIN_SCHEMA_VERSION};
+        Decision {
+            schema_version: DOMAIN_SCHEMA_VERSION,
+            decision_context: context,
+            summary: "Synthetic calibration decision".into(),
+            targets: TargetPortfolio::zeroed(),
+            confidence_ppm: 0,
+            forecasts: Asset::EXECUTABLE
+                .into_iter()
+                .flat_map(|asset| {
+                    DecisionHorizon::ALL
+                        .into_iter()
+                        .map(move |horizon| Forecast {
+                            asset,
+                            horizon,
+                            positive_return_probability_ppm: 500_000,
+                            expected_return_ppm: 0,
+                            thesis: Some(ForecastThesis {
+                                thesis_valid_until: decided_at + chrono::Duration::days(30),
+                                expected_holding_period_days: horizon.trading_days(),
+                                exit_condition: "Review after the horizon".into(),
+                                invalidation_conditions: vec!["New evidence".into()],
+                            }),
+                        })
+                })
+                .collect(),
+            research_plan: None,
+            created_at: decided_at,
+        }
+    }
+
+    fn commit_calibration_fixture_decisions(
+        store: &Store,
+        purpose: RunPurpose,
+        decided_at: DateTime<Utc>,
+        count: usize,
+    ) -> RunId {
+        let attempt = calibration_fixture_attempt(store, purpose);
+        let mut decision = calibration_fixture_decision(
+            decided_at,
+            ArtifactRef {
+                artifact_id: ArtifactId(ContentHash::of_bytes(
+                    b"unused context for maturity report",
+                )),
+                kind: ArtifactKind::DecisionContext,
+            },
+        );
+        let provenance = ArtifactProvenance {
+            source_family: "akzio.runtime".into(),
+            observed_at: None,
+            retrieved_at: decided_at,
+            source_uri: None,
+            confidence_ppm: 1_000_000,
+            producer_contract_hash: None,
+        };
+        let lifecycle = if purpose == RunPurpose::Paper {
+            ArtifactLifecycle::Canonical
+        } else {
+            ArtifactLifecycle::RunScoped
+        };
+        let artifacts: Vec<_> = (0..count)
+            .map(|index| {
+                decision.summary = format!("Synthetic calibration decision {index}");
+                Artifact::new(
+                    ArtifactKind::Decision,
+                    store.stage_json(&decision).unwrap(),
+                    "decision.bound",
+                    lifecycle,
+                    provenance.clone(),
+                    Some(attempt.permit.artifact_origin()),
+                    vec![],
+                    decided_at,
+                )
+                .unwrap()
+            })
+            .collect();
+        store
+            .commit_attempt(
+                &attempt.permit,
+                &artifacts,
+                akzio_domain::TaskStatus::Succeeded,
+                Utc::now(),
+            )
+            .unwrap();
+        attempt.run_id
+    }
+
+    /// WHY THIS TEST EXISTS (Task #11): PositionPlan decisions used to fill the recent scan before Paper selection, hiding older committed calibration candidates.
+    /// Do not weaken or delete this assertion.
+    #[test]
+    fn calibration_readiness_does_not_lose_paper_decisions_to_position_plan_history() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/calibration-selection-tests")
+            .join(RunId::new().0);
+        let store = Store::open(&path).unwrap();
+        let decision_at = parse_calibration_time("2026-06-01T15:00:00Z", "fixture").unwrap();
+        let paper = commit_calibration_fixture_decisions(&store, RunPurpose::Paper, decision_at, 1);
+        commit_calibration_fixture_decisions(
+            &store,
+            RunPurpose::PositionPlan,
+            decision_at + chrono::Duration::days(1),
+            501,
+        );
+        let report =
+            calibration_readiness_report(&path, 30, Path::new("unused.toml"), None).unwrap();
+        assert_eq!(report["runs"][0]["run_id"], serde_json::json!(paper));
+        assert_eq!(report["decisions_scanned"], 1);
+        assert_eq!(report["scan_limit_reached"], false);
+    }
+
+    /// WHY THIS TEST EXISTS (Task #11): A full page with tied timestamps must advance by Artifact ID, while window filtering precedes the limit and actual truncation requires a lookahead row.
+    /// Do not weaken or delete this assertion.
+    #[test]
+    fn calibration_pagination_preserves_ties_and_reports_actual_truncation() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/calibration-selection-tests")
+            .join(RunId::new().0);
+        let store = Store::open(&path).unwrap();
+        let decided_at = parse_calibration_time("2026-06-01T15:00:00.123Z", "fixture").unwrap();
+        let window = (Some(decided_at), Some(decided_at));
+        commit_calibration_fixture_decisions(&store, RunPurpose::Paper, decided_at, 500);
+        commit_calibration_fixture_decisions(
+            &store,
+            RunPurpose::Paper,
+            decided_at + chrono::Duration::seconds(1),
+            1,
+        );
+        let page = scan_calibration_decisions(&store, window).unwrap();
+        assert_eq!(page.artifacts.len(), 500);
+        assert!(!page.truncated);
+        assert!(page
+            .artifacts
+            .windows(2)
+            .all(|pair| pair[0].artifact_id > pair[1].artifact_id));
+        commit_calibration_fixture_decisions(&store, RunPurpose::Paper, decided_at, 1);
+        assert!(
+            scan_calibration_decisions(&store, window)
+                .unwrap()
+                .truncated
+        );
+    }
+
+    fn commit_calibration_fixture_outcome(
+        store: &Store,
+        decided_at: DateTime<Utc>,
+        model_id: &str,
+        contract_hash: &ContentHash,
+    ) -> RunId {
+        use akzio_domain::{
+            HardBlocker, OutcomeExecutionLineage, TaskStatus, DOMAIN_SCHEMA_VERSION,
+        };
+        use serde_json::json;
+
+        let attempt = calibration_fixture_attempt(store, RunPurpose::Paper);
+        let run_id = attempt.run_id.clone();
+        let now = Utc::now();
+        let stage = |kind,
+                     lifecycle,
+                     payload: serde_json::Value,
+                     sources,
+                     permit: &akzio_domain::TaskWritePermit,
+                     at| {
+            Artifact::new(
+                kind,
+                store.stage_json(&payload).unwrap(),
+                "calibration.fixture",
+                lifecycle,
+                ArtifactProvenance {
+                    source_family: "akzio.runtime".into(),
+                    observed_at: Some(at),
+                    retrieved_at: at,
+                    source_uri: None,
+                    confidence_ppm: 1_000_000,
+                    producer_contract_hash: permit.contract_hash.clone(),
+                },
+                Some(permit.artifact_origin()),
+                sources,
+                at,
+            )
+            .unwrap()
+        };
+        let reference = |artifact: &Artifact| ArtifactRef {
+            artifact_id: artifact.artifact_id.clone(),
+            kind: artifact.kind,
+        };
+        let turn = stage(
+            ArtifactKind::AgentTurn,
+            ArtifactLifecycle::RunScoped,
+            json!({
+                "request": {"purpose": "research.synthesizer"},
+                "capability_snapshot": {"provider_id": OPENAI_RESPONSES_PROVIDER_ID},
+                "response": {"telemetry": {"actual_model": model_id}},
+                "contract_hash": contract_hash,
+            }),
+            vec![],
+            &attempt.permit,
+            decided_at,
+        );
+        let context = stage(
+            ArtifactKind::DecisionContext,
+            ArtifactLifecycle::Canonical,
+            json!({
+                "schema_version": DOMAIN_SCHEMA_VERSION, "decision_id": akzio_domain::DecisionId::new(),
+                "run_id": run_id, "claims": [], "critiques": [], "evidence": [], "policy_influences": [],
+                "material_conflicts": [], "hard_blockers": [HardBlocker::MissingEvidence], "soft_warnings": [],
+                "decision_policy_hash": ContentHash::of_bytes(b"fixture-policy"),
+                "target": akzio_domain::TargetPortfolio::zeroed(), "created_at": decided_at,
+            }),
+            vec![reference(&turn)],
+            &attempt.permit,
+            decided_at,
+        );
+        let decision = stage(
+            ArtifactKind::Decision,
+            ArtifactLifecycle::Canonical,
+            json!(calibration_fixture_decision(
+                decided_at,
+                reference(&context)
+            )),
+            vec![reference(&context)],
+            &attempt.permit,
+            decided_at,
+        );
+        let execution = stage(
+            ArtifactKind::ExecutionContext,
+            ArtifactLifecycle::Canonical,
+            json!({
+                "schema_version": DOMAIN_SCHEMA_VERSION, "run_id": run_id, "decision_context": reference(&context),
+                "frozen": false, "created_at": decided_at,
+            }),
+            vec![reference(&context)],
+            &attempt.permit,
+            decided_at,
+        );
+        let verdict = stage(
+            ArtifactKind::ExecutionVerdict,
+            ArtifactLifecycle::Canonical,
+            json!({
+                "verdict": "no_order", "no_order": {"execution_context": reference(&execution),
+                    "blockers": [HardBlocker::MissingEvidence], "created_at": decided_at},
+            }),
+            vec![reference(&execution)],
+            &attempt.permit,
+            decided_at,
+        );
+        let schedule = OutcomeSchedule {
+            schema_version: DOMAIN_SCHEMA_VERSION,
+            outcome_id: akzio_domain::OutcomeId::new(),
+            decision: reference(&decision),
+            decision_context: reference(&context),
+            execution_context: reference(&execution),
+            execution: OutcomeExecutionLineage::NoOrder {
+                execution_verdict: reference(&verdict),
+            },
+            baseline_trading_day: decided_at.date_naive(),
+            created_at: decided_at,
+        };
+        let schedule_artifact = stage(
+            ArtifactKind::OutcomeSchedule,
+            ArtifactLifecycle::Canonical,
+            json!(&schedule),
+            vec![
+                reference(&decision),
+                reference(&context),
+                reference(&execution),
+                reference(&verdict),
+            ],
+            &attempt.permit,
+            decided_at,
+        );
+        store
+            .commit_attempt(
+                &attempt.permit,
+                &[
+                    turn,
+                    context,
+                    decision,
+                    execution,
+                    verdict,
+                    schedule_artifact.clone(),
+                ],
+                TaskStatus::Succeeded,
+                now,
+            )
+            .unwrap();
+        assert_eq!(store.ensure_pending_outcome_workers(now).unwrap(), 1);
+        let worker = store
+            .claim_next_task_for_workload(
+                "calibration-outcome-fixture",
+                now,
+                chrono::Duration::minutes(1),
+                akzio_store::TaskWorkload::Outcome,
+            )
+            .unwrap()
+            .unwrap();
+        let days = [0, 1, 3, 7]
+            .map(|offset| schedule.baseline_trading_day + chrono::Duration::days(offset));
+        let observed_at = session_close_time(days[3]);
+        let need = stage(
+            ArtifactKind::EvidenceNeed,
+            ArtifactLifecycle::RunScoped,
+            json!({}),
+            vec![],
+            &worker.permit,
+            observed_at,
+        );
+        let raw = stage(
+            ArtifactKind::RawEvidence,
+            ArtifactLifecycle::RunScoped,
+            json!({}),
+            vec![],
+            &worker.permit,
+            observed_at,
+        );
+        let mut market_evidence = Vec::new();
+        for asset in Asset::EXECUTABLE {
+            let bars = days.map(|day| json!({"t": day, "c": "100"}));
+            market_evidence.push(stage(ArtifactKind::NormalizedEvidence, ArtifactLifecycle::RunScoped, json!({
+                "schema_version": DOMAIN_SCHEMA_VERSION, "source": "alpaca", "resource": format!("bars:{}:1d", asset.symbol()),
+                "need": reference(&need), "raw": reference(&raw), "observed_at": observed_at,
+                "time_basis": {"available_at": observed_at, "retrieved_at": observed_at,
+                    "decision_clock": {"decision_cutoff": observed_at}},
+                "contamination_certificate": {"available_at_or_before_cutoff": true, "event_at_or_before_cutoff": true,
+                    "release_at_or_before_cutoff": true, "retrieval_at_or_after_availability": true, "vintage_at_or_before_cutoff": true},
+                "provenance": {"observed_at": observed_at, "source_uri": "fixture://cohort/bars", "dedupe_key": asset.symbol(), "citations": []},
+                "quality": akzio_ingest::EvidenceQuality::default(), "value": {"bars": bars},
+            }), vec![reference(&need), reference(&raw)], &worker.permit, observed_at));
+        }
+        for evidence in std::iter::once(&need)
+            .chain(std::iter::once(&raw))
+            .chain(&market_evidence)
+        {
+            store
+                .write_task_artifact(
+                    &worker.permit,
+                    evidence,
+                    akzio_domain::LifecycleEventType::ArtifactCommitted,
+                    now,
+                )
+                .unwrap();
+        }
+        let evidence_refs: Vec<_> = market_evidence.iter().map(reference).collect();
+        let windows: Vec<_> = OutcomeHorizon::ALL.into_iter().zip(&days[1..]).map(|(horizon, day)| json!({
+            "horizon": horizon, "observed_trading_day": day, "portfolio_return_ppm": 0, "benchmark_return_ppm": 0,
+            "transaction_cost_ppm": 0, "slippage_ppm": 0, "utility_ppm": 0,
+        })).collect();
+        let outcome = stage(
+            ArtifactKind::Outcome,
+            ArtifactLifecycle::Canonical,
+            json!({
+                "schema_version": DOMAIN_SCHEMA_VERSION, "outcome_id": schedule.outcome_id, "schedule": reference(&schedule_artifact),
+                "market_evidence": evidence_refs, "windows": windows, "sealed_at": observed_at,
+            }),
+            std::iter::once(reference(&schedule_artifact))
+                .chain(evidence_refs)
+                .collect(),
+            &worker.permit,
+            observed_at,
+        );
+        store
+            .commit_outcomes(&worker.permit, &[outcome], now)
+            .unwrap();
+        run_id
+    }
+
+    /// WHY THIS TEST EXISTS (Task #11): Scoped readiness and collect must select the same exact Paper IDs, even with a former active Contract and a later decision outside the training window.
+    /// Do not weaken or delete this assertion.
+    #[test]
+    fn calibration_readiness_and_collect_share_the_requested_cohort() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/calibration-selection-tests")
+            .join(RunId::new().0);
+        for command in [
+            vec!["akzio", "calibration", "readiness", "--store", "store"],
+            vec![
+                "akzio",
+                "calibration",
+                "readiness",
+                "--store",
+                "store",
+                "--cohort",
+                "--contract-hash",
+                "contract",
+            ],
+            vec![
+                "akzio",
+                "calibration",
+                "collect",
+                "--store",
+                "store",
+                "--risk-limits",
+                "risk",
+                "--training-end",
+                "2026-06-30T23:59:59Z",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(command).is_ok());
+        }
+        let store = Store::open(&path).unwrap();
+        let config_path = path.join("cohort-fixture.toml");
+        fs::write(
+            &config_path,
+            r#"
+[daemon]
+store_root = "unused"
+http_addr = "127.0.0.1:0"
+[execution]
+assets = ["TQQQ", "QQQ", "SOXX", "SOXL"]
+[model]
+provider = "openai_responses"
+base_url = "http://127.0.0.1:0/v1"
+model = "calibration-fixture"
+api_key = "offline-test"
+release_date = "2025-01-01"
+knowledge_cutoff = "2025-01-01"
+"#,
+        )
+        .unwrap();
+        let now = Utc::now();
+        akzio_research::ActiveResearchCatalogue::install(&store, now).unwrap();
+        let purpose =
+            akzio_domain::ContractPurpose::new(akzio_domain::RESEARCH_SYNTHESIZER_RECIPE_ID)
+                .unwrap();
+        let mut active = store.active_contract(&purpose).unwrap().unwrap().contract;
+        let historical_hash = active.contract_hash.clone();
+        active.version += 1;
+        active.contract_hash = active.expected_hash().unwrap();
+        store
+            .install_canonical_contract_upgrade(&historical_hash, &active, now)
+            .unwrap();
+        let mut config = read_config_file(&config_path).unwrap();
+        resolve_model_configuration(&mut config).unwrap();
+        let (model, _) = configured_synthesizer_identity(config.model.as_ref().unwrap()).unwrap();
+        let historical_at = parse_calibration_time("2026-06-01T15:00:00Z", "fixture").unwrap();
+        let current_at = historical_at + chrono::Duration::days(7);
+        let historical =
+            commit_calibration_fixture_outcome(&store, historical_at, &model, &historical_hash);
+        let current =
+            commit_calibration_fixture_outcome(&store, current_at, &model, &active.contract_hash);
+        commit_calibration_fixture_outcome(
+            &store,
+            current_at + chrono::Duration::days(40),
+            &model,
+            &active.contract_hash,
+        );
+        commit_calibration_fixture_outcome(
+            &store,
+            current_at + chrono::Duration::days(19),
+            &model,
+            &active.contract_hash,
+        );
+        commit_calibration_fixture_decisions(&store, RunPurpose::PositionPlan, current_at, 501);
+        let risk = serde_json::from_value::<OfflineRiskLimits>(serde_json::json!({
+            "min_confidence_ppm": 250000, "max_gross_weight_ppm": 500000, "maximum_execution_delay_ms": 300000,
+            "minimum_process_quality_ppm": 900000, "min_probability_edge_ppm": 50000, "max_brier_score_ppm": 250000,
+            "target_annualized_volatility_ppm": 300000, "max_portfolio_beta_ppm": 2000000, "max_expected_shortfall_ppm": 500000,
+            "max_gap_loss_ppm": 500000, "max_capital_weight_ppm": 500000, "liquidity_weight_cap_ppm": 500000,
+            "max_leveraged_holding_days": 1, "daily_reset_decay_ppm": 0,
+        })).unwrap();
+        let limits = persist_calibration_artifact(
+            &store,
+            ArtifactKind::CalibrationRiskLimits,
+            &risk,
+            vec![],
+            now,
+        )
+        .unwrap();
+        for (scope, expected) in [
+            (None, current),
+            (Some(historical_hash.to_string()), historical),
+        ] {
+            let requested = CalibrationScopeArgs {
+                training_start: Some("2026-06-01T15:00:00Z".into()),
+                training_end: Some("2026-06-30T23:59:59Z".into()),
+                contract_hash: scope,
+            };
+            let readiness =
+                calibration_readiness_report(&path, 30, &config_path, Some(&requested)).unwrap();
+            let collect = collect_calibration_report(
+                &path,
+                limits.artifact_id.0.as_str(),
+                30,
+                &requested,
+                &config_path,
+            )
+            .unwrap();
+            assert_eq!(readiness["decisions_scanned"], 3);
+            assert_eq!(collect["scan"]["decision_artifacts_considered"], 3);
+            assert_eq!(readiness["cohort"]["excluded_decisions"], 2);
+            let exclusions = collect["gaps"]["skipped_runs"].as_array().unwrap();
+            assert!(exclusions
+                .iter()
+                .any(|row| row["reason"] == "contract_identity_mismatch"));
+            assert_eq!(
+                readiness["cohort"]["active_contract_hash"],
+                serde_json::json!(active.contract_hash)
+            );
+            assert_eq!(
+                readiness["cohort"]["active_contract_hash"],
+                collect["identity"]["active_contract_hash"]
+            );
+            assert_eq!(
+                readiness["cohort"]["selected_run_ids"],
+                serde_json::json!([expected])
+            );
+            assert_eq!(
+                readiness["cohort"]["selected_run_ids"],
+                collect["scan"]["selected_run_ids"]
+            );
+        }
     }
 
     // 组装仅供身份比较测试的结构有效 Policy；合成数值不会写入或激活 Store。
@@ -797,6 +1467,7 @@ struct CollectedCalibrationCandidate {
     decision_artifact: akzio_domain::Artifact,
     decision: Decision,
     outcome: Outcome,
+    outcome_artifact_id: ArtifactId,
     schedule: OutcomeSchedule,
     bars: BTreeMap<Asset, BTreeMap<NaiveDate, MoneyMicros>>,
     provider_id: String,
@@ -804,25 +1475,42 @@ struct CollectedCalibrationCandidate {
     contract_hash: ContentHash,
 }
 
-fn collect_calibration_dataset(
-    store_path: &Path,
-    risk_limits_id: &str,
-    min_samples: u32,
-    training_start: Option<&str>,
-    training_end: Option<&str>,
-    config_path: &Path,
-) -> Result<()> {
-    // Collect 从 canonical Store 中筛选已封存、身份一致且四资产/三期限标签完整的
-    // Paper Run，组装一个可复现的数据集；只有全部门槛满足时才写 CalibrationDataset，
-    // 本函数从不直接生成或激活 DecisionPolicy。
-    if min_samples == 0 {
-        bail!("calibration collect requires min_samples > 0");
+struct CalibrationCohort {
+    provider_id: String,
+    model_id: String,
+    model_version_hash: ContentHash,
+    active_contract_hash: Option<ContentHash>,
+    contract_hash: Option<ContentHash>,
+    window: (Option<DateTime<Utc>>, Option<DateTime<Utc>>),
+}
+
+impl CalibrationCohort {
+    fn identity_report(&self) -> serde_json::Value {
+        serde_json::json!({
+            "provider_id": self.provider_id,
+            "model_id": self.model_id,
+            "model_route": "research.synthesizer",
+            "configured_model_version_hash": self.model_version_hash,
+            "contract_hash": self.contract_hash,
+            "active_contract_hash": self.active_contract_hash,
+            "requested_training_start": self.window.0,
+            "requested_training_end": self.window.1,
+        })
     }
-    let config = load_config(config_path).context("load model identity for calibration collect")?;
+}
+
+fn calibration_cohort(
+    store: &Store,
+    config_path: &Path,
+    requested: &CalibrationScopeArgs,
+) -> Result<CalibrationCohort> {
+    let mut config =
+        read_config_file(config_path).context("load configured calibration cohort identity")?;
+    resolve_model_configuration(&mut config)?;
     let model_config = config
         .model
         .as_ref()
-        .context("calibration collect requires [model] configuration")?;
+        .context("calibration cohort requires [model] configuration")?;
     let synthesizer_route = model_config.routes.get("research.synthesizer");
     if synthesizer_route
         .and_then(|route| route.release_date.as_ref())
@@ -834,64 +1522,69 @@ fn collect_calibration_dataset(
             .is_none()
     {
         bail!(
-            "calibration collect requires release_date and knowledge_cutoff for the effective research.synthesizer route"
+            "calibration cohort requires release_date and knowledge_cutoff for the effective research.synthesizer route"
         );
     }
     let (model_id, model_version_hash) = configured_synthesizer_identity(model_config)?;
     let provider_id = model_config.provider_identity().as_str().to_owned();
-    let store = Store::open_existing(store_path)?;
-    if store.debug_environment()?.is_some() {
-        bail!("calibration requires a canonical Store");
-    }
-    // 风险限制必须来自 Store 中 operator 已写入的 canonical Artifact，不能由本次
-    // collect 的参数或默认值隐式补齐。
-    let risk_artifact =
-        calibration_artifact(&store, risk_limits_id, ArtifactKind::CalibrationRiskLimits)?;
-    let risk_limits: OfflineRiskLimits =
-        serde_json::from_slice(&store.read_blob(&risk_artifact.blob)?)?;
-    risk_limits.validate()?;
-    let requested_start = training_start
+    let purpose = akzio_domain::ContractPurpose::new(akzio_domain::RESEARCH_SYNTHESIZER_RECIPE_ID)?;
+    let active_contract_hash = store
+        .active_contract(&purpose)?
+        .map(|entry| entry.contract.contract_hash);
+    let contract_hash = if let Some(raw) = &requested.contract_hash {
+        let hash = ContentHash::new(raw.clone())?;
+        let contract = store
+            .contract_installation(&hash)?
+            .context("calibration Contract is not installed")?;
+        if contract.contract.purpose != purpose {
+            bail!("calibration Contract must serve research.synthesizer");
+        }
+        Some(hash)
+    } else {
+        active_contract_hash.clone()
+    };
+    let start = requested
+        .training_start
+        .as_deref()
         .map(|value| parse_calibration_time(value, "training_start"))
         .transpose()?;
-    let requested_end = training_end
+    let end = requested
+        .training_end
+        .as_deref()
         .map(|value| parse_calibration_time(value, "training_end"))
         .transpose()?;
-    // Option<Result<T,E>>::transpose() 得到 Result<Option<T>,E>：未提供边界保留 None，
-    // 提供但解析失败则由 ? 向上返回；zip 只有两端均为 Some 才比较先后。
-    if requested_start
-        .zip(requested_end)
-        .is_some_and(|(start, end)| start > end)
-    {
+    if start.zip(end).is_some_and(|(start, end)| start > end) {
         bail!("calibration training_start must not be after training_end");
     }
+    Ok(CalibrationCohort {
+        provider_id,
+        model_id,
+        model_version_hash,
+        active_contract_hash,
+        contract_hash,
+        window: (start, end),
+    })
+}
 
-    let decision_artifacts = store
-        .recent_artifacts_by_kind(ArtifactKind::Decision, 500)
-        .context("scan recent Decision artifacts for calibration collect")?;
+struct CalibrationSelection {
+    scan: CalibrationDecisionScan,
+    selected: Vec<CollectedCalibrationCandidate>,
+    skipped: Vec<serde_json::Value>,
+}
+
+fn select_calibration_cohort(
+    store: &Store,
+    scope: &CalibrationCohort,
+) -> Result<CalibrationSelection> {
+    let scan = scan_calibration_decisions(store, scope.window)?;
     let mut skipped = Vec::new();
     let mut candidates = Vec::new();
-    // 先从最近最多 500 份 Decision 扫描，再按 Paper/canonical/完整标签筛选；
-    // 一般候选缺陷记 skipped，Store 查询类错误仍由 ? 阻断整个 collect。
-    // 历史 AgentTurn 在下方核 provider/model/Contract，model_version_hash 则由本次
-    // 有效配置生成并写入样本，不等于逐 turn 核实其全部日期和路由字段。
-    for decision_artifact in decision_artifacts.iter().cloned() {
-        let Some(run_id) = decision_artifact
+    for decision_artifact in scan.artifacts.iter().cloned() {
+        let run_id = decision_artifact
             .origin
             .as_ref()
             .and_then(|origin| origin.run_id.clone())
-        else {
-            continue;
-        };
-        if store.run_purpose(&run_id)? != RunPurpose::Paper {
-            continue;
-        }
-        if decision_artifact.lifecycle != ArtifactLifecycle::Canonical {
-            skipped.push(serde_json::json!({
-                "run_id": run_id,
-                "reason": "decision_not_canonical",
-            }));
-            continue;
-        }
+            .context("committed calibration decision has no Run origin")?;
         let decision: Decision = match serde_json::from_slice(
             &store.read_blob(&decision_artifact.blob)?,
         ) {
@@ -901,6 +1594,10 @@ fn collect_calibration_dataset(
                 continue;
             }
         };
+        if decision.created_at != decision_artifact.created_at {
+            skipped.push(serde_json::json!({"run_id":run_id,"reason":"decision_time_mismatch"}));
+            continue;
+        }
         if let Err(error) = decision.validate() {
             skipped.push(serde_json::json!({"run_id":run_id,"reason":"decision_invalid","detail":error.to_string()}));
             continue;
@@ -921,6 +1618,17 @@ fn collect_calibration_dataset(
                 continue;
             }
         };
+        if context_artifact.kind != ArtifactKind::DecisionContext
+            || context.run_id != run_id
+            || !decision_artifact
+                .source_refs
+                .contains(&decision.decision_context)
+        {
+            skipped.push(
+                serde_json::json!({"run_id":run_id,"reason":"decision_context_lineage_mismatch"}),
+            );
+            continue;
+        }
         if let Err(error) = context.validate() {
             skipped.push(serde_json::json!({"run_id":run_id,"reason":"decision_context_invalid","detail":error.to_string()}));
             continue;
@@ -946,13 +1654,14 @@ fn collect_calibration_dataset(
             skipped.push(serde_json::json!({"run_id":run_id,"reason":"outcome_not_sealed","detail":error.to_string()}));
             continue;
         }
-        let schedule_artifact = match store.artifact(&outcome.schedule.artifact_id) {
-            Ok(value) => value,
-            Err(error) => {
-                skipped.push(serde_json::json!({"run_id":run_id,"reason":"schedule_missing","detail":error.to_string()}));
-                continue;
-            }
+        let Some(schedule_artifact) = store.outcome_schedule_for_run(&run_id)? else {
+            skipped.push(serde_json::json!({"run_id":run_id,"reason":"schedule_missing"}));
+            continue;
         };
+        if outcome.schedule.artifact_id != schedule_artifact.artifact_id {
+            skipped.push(serde_json::json!({"run_id":run_id,"reason":"outcome_schedule_mismatch"}));
+            continue;
+        }
         let schedule: OutcomeSchedule = match serde_json::from_slice(
             &store.read_blob(&schedule_artifact.blob)?,
         ) {
@@ -973,24 +1682,44 @@ fn collect_calibration_dataset(
             continue;
         }
         let Some(identity) =
-            synthesizer_identity_for_decision(&store, &decision_artifact, &decision, &run_id)?
+            synthesizer_identity_for_decision(store, &decision_artifact, &decision, &run_id)?
         else {
             skipped
                 .push(serde_json::json!({"run_id":run_id,"reason":"synthesizer_identity_missing"}));
             continue;
         };
-        if identity.provider_id != provider_id || identity.model_id != model_id {
+        if identity.provider_id != scope.provider_id || identity.model_id != scope.model_id {
             skipped.push(serde_json::json!({
                 "run_id":run_id,
                 "reason":"model_identity_mismatch",
-                "expected_model":model_id,
+                "expected_model":scope.model_id,
                 "actual_model":identity.model_id,
-                "expected_provider":provider_id,
+                "expected_provider":scope.provider_id,
                 "actual_provider":identity.provider_id,
             }));
             continue;
         }
-        let bars = match outcome_bars(&store, &outcome) {
+        if scope.contract_hash.as_ref() != Some(&identity.contract_hash) {
+            skipped.push(serde_json::json!({"run_id":run_id,"reason":"contract_identity_mismatch", "actual_contract_hash": identity.contract_hash}));
+            continue;
+        }
+        if scope
+            .window
+            .0
+            .is_some_and(|start| decision.created_at < start)
+            || scope.window.1.is_some_and(|end| {
+                decision.created_at > end
+                    || outcome
+                        .windows
+                        .iter()
+                        .any(|window| session_close_time(window.observed_trading_day) > end)
+            })
+        {
+            skipped
+                .push(serde_json::json!({"run_id":run_id,"reason":"training_window_incomplete"}));
+            continue;
+        }
+        let bars = match outcome_bars(store, &outcome) {
             Ok(value) => value,
             Err(error) => {
                 skipped.push(serde_json::json!({"run_id":run_id,"reason":"outcome_bars_unusable","detail":error.to_string()}));
@@ -1006,6 +1735,7 @@ fn collect_calibration_dataset(
             decision_artifact,
             decision,
             outcome,
+            outcome_artifact_id: outcome_artifact.artifact_id,
             schedule,
             bars,
             provider_id: identity.provider_id,
@@ -1014,23 +1744,44 @@ fn collect_calibration_dataset(
         });
     }
     candidates.sort_by(|left, right| left.run_id.cmp(&right.run_id));
+    Ok(CalibrationSelection {
+        scan,
+        selected: candidates,
+        skipped,
+    })
+}
 
-    // 排序后以第一个候选的 Synthesizer Contract 为本次组别，其余排除；不是挑样本
-    // 最多的组，也不是自动选择 Store 当前 active Contract，后续 activate 还会重验。
-    let contract_hash = candidates
-        .first()
-        .map(|candidate| candidate.contract_hash.clone());
-    let mut selected = Vec::new();
-    for candidate in candidates {
-        if contract_hash.as_ref() == Some(&candidate.contract_hash) {
-            selected.push(candidate);
-        } else {
-            skipped.push(serde_json::json!({
-                "run_id": candidate.run_id,
-                "reason": "contract_identity_mismatch",
-            }));
-        }
+fn collect_calibration_report(
+    store_path: &Path,
+    risk_limits_id: &str,
+    min_samples: u32,
+    requested: &CalibrationScopeArgs,
+    config_path: &Path,
+) -> Result<serde_json::Value> {
+    // Collect 从 canonical Store 中筛选已封存、身份一致且四资产/三期限标签完整的
+    // Paper Run，组装一个可复现的数据集；只有全部门槛满足时才写 CalibrationDataset，
+    // 本函数从不直接生成或激活 DecisionPolicy。
+    if min_samples == 0 {
+        bail!("calibration collect requires min_samples > 0");
     }
+    let store = Store::open_existing(store_path)?;
+    if store.debug_environment()?.is_some() {
+        bail!("calibration requires a canonical Store");
+    }
+    // 风险限制必须来自 Store 中 operator 已写入的 canonical Artifact，不能由本次
+    // collect 的参数或默认值隐式补齐。
+    let risk_artifact =
+        calibration_artifact(&store, risk_limits_id, ArtifactKind::CalibrationRiskLimits)?;
+    let risk_limits: OfflineRiskLimits =
+        serde_json::from_slice(&store.read_blob(&risk_artifact.blob)?)?;
+    risk_limits.validate()?;
+    let scope = calibration_cohort(&store, config_path, requested)?;
+    let CalibrationSelection {
+        scan,
+        selected,
+        skipped,
+    } = select_calibration_cohort(&store, &scope)?;
+    let (requested_start, requested_end) = scope.window;
     let actual_start = requested_start.or_else(|| {
         selected
             .iter()
@@ -1046,51 +1797,42 @@ fn collect_calibration_dataset(
     });
     let mut samples = Vec::new();
     let mut panel = BTreeMap::<Asset, BTreeMap<NaiveDate, MoneyMicros>>::new();
-    let mut collected_runs = Vec::new();
+    let collected_runs: Vec<_> = selected
+        .iter()
+        .map(|candidate| candidate.run_id.0.clone())
+        .collect();
     let mut sample_counts = BTreeMap::<String, usize>::new();
     let mut price_conflicts = Vec::new();
     // 每个候选贡献完整的 4×3 forecast 集和可合并的日线价格；窗口外数据不进入训练面板，
     // 同一资产/日期的不同收盘价则保留冲突并阻断写入。
     for candidate in &selected {
-        let Some(start) = actual_start else { continue };
-        let Some(end) = actual_end else { continue };
-        let mut candidate_samples = Vec::new();
         for forecast in &candidate.decision.forecasts {
             let window_horizon = match forecast.horizon {
                 DecisionHorizon::T1 => OutcomeHorizon::T1,
                 DecisionHorizon::T3 => OutcomeHorizon::T3,
                 DecisionHorizon::T5 => OutcomeHorizon::T5,
             };
-            let Some(window) = candidate
+            let window = candidate
                 .outcome
                 .windows
                 .iter()
                 .find(|window| window.horizon == window_horizon)
-            else {
-                continue;
-            };
-            let Some(base) = candidate
+                .context("selected calibration window missing")?;
+            let base = candidate
                 .bars
                 .get(&forecast.asset)
                 .and_then(|bars| bars.get(&candidate.schedule.baseline_trading_day))
-            else {
-                continue;
-            };
-            let Some(future) = candidate
+                .context("selected calibration baseline bar missing")?;
+            let future = candidate
                 .bars
                 .get(&forecast.asset)
                 .and_then(|bars| bars.get(&window.observed_trading_day))
-            else {
-                continue;
-            };
+                .context("selected calibration realized bar missing")?;
             let realized_at = session_close_time(window.observed_trading_day);
-            if candidate.decision.created_at < start
-                || candidate.decision.created_at > end
-                || realized_at > end
-            {
-                continue;
-            }
-            candidate_samples.push(HistoricalForecastSample {
+            *sample_counts
+                .entry(format!("{}:{:?}", forecast.asset, forecast.horizon))
+                .or_default() += 1;
+            samples.push(HistoricalForecastSample {
                 source_run_id: candidate.run_id.0.clone(),
                 asset: forecast.asset,
                 horizon: forecast.horizon,
@@ -1102,7 +1844,7 @@ fn collect_calibration_dataset(
                 provenance: HistoricalForecastProvenance {
                     provider_id: candidate.provider_id.clone(),
                     model_id: candidate.model_id.clone(),
-                    model_version_hash: model_version_hash.clone(),
+                    model_version_hash: scope.model_version_hash.clone(),
                     route: "research.synthesizer".to_owned(),
                     contract_hash: candidate.contract_hash.clone(),
                     source_decision: ArtifactRef {
@@ -1113,26 +1855,6 @@ fn collect_calibration_dataset(
                     forecast_cutoff: candidate.decision.created_at,
                 },
             });
-        }
-        if candidate_samples.len() != Asset::EXECUTABLE.len() * DecisionHorizon::ALL.len() {
-            skipped.push(serde_json::json!({
-                "run_id": candidate.run_id,
-                "reason": "training_window_excludes_complete_forecast_set",
-                "sample_count": candidate_samples.len(),
-            }));
-            continue;
-        }
-        for (key, count) in
-            candidate_samples
-                .iter()
-                .fold(BTreeMap::<String, usize>::new(), |mut counts, sample| {
-                    *counts
-                        .entry(format!("{}:{:?}", sample.asset, sample.horizon))
-                        .or_default() += 1;
-                    counts
-                })
-        {
-            *sample_counts.entry(key).or_default() += count;
         }
         for (asset, bars) in &candidate.bars {
             for (date, price) in bars {
@@ -1159,8 +1881,6 @@ fn collect_calibration_dataset(
                 }
             }
         }
-        samples.extend(candidate_samples);
-        collected_runs.push(candidate.run_id.0.clone());
     }
     samples.sort_by(|left, right| {
         left.source_run_id
@@ -1168,8 +1888,6 @@ fn collect_calibration_dataset(
             .then_with(|| left.asset.cmp(&right.asset))
             .then_with(|| left.horizon.cmp(&right.horizon))
     });
-    collected_runs.sort();
-    collected_runs.dedup();
     // 每只资产各建日期集合，再 reduce 求交集；只有四资产共同有收盘价的日期才进入
     // 协方差价格面。无集合时 unwrap_or_default 给空集，后面的 enough_prices 会阻断。
     let common_dates = panel
@@ -1211,7 +1929,8 @@ fn collect_calibration_dataset(
                 .unwrap_or(usize::MAX)
                 .saturating_add(1)
     });
-    let status = if contract_hash.is_some()
+    let status = if !scan.truncated
+        && scope.contract_hash.is_some()
         && actual_start.is_some()
         && actual_end.is_some()
         && !samples.is_empty()
@@ -1233,11 +1952,12 @@ fn collect_calibration_dataset(
             schema_version: 1,
             policy_version: "offline_historical_v2".to_owned(),
             algorithm_version: "offline_historical_risk_v1".to_owned(),
-            provider_id: provider_id.clone(),
-            model_id: model_id.clone(),
-            model_version_hash,
+            provider_id: scope.provider_id.clone(),
+            model_id: scope.model_id.clone(),
+            model_version_hash: scope.model_version_hash.clone(),
             model_route: "research.synthesizer".to_owned(),
-            contract_hash: contract_hash
+            contract_hash: scope
+                .contract_hash
                 .clone()
                 .expect("samples have contract identity"),
             regime: "all".to_owned(),
@@ -1253,28 +1973,26 @@ fn collect_calibration_dataset(
         input_hash = Some(canonical_input_hash);
         dataset_input = Some(input);
     }
+    let mut identity = scope.identity_report();
+    identity["training_start"] = serde_json::to_value(actual_start)?;
+    identity["training_end"] = serde_json::to_value(actual_end)?;
     let mut report = serde_json::json!({
         "status": status,
         "source_store": store_path,
         "risk_limits_artifact": risk_artifact.artifact_id,
         "input_hash": input_hash,
         "scan": {
-            "decision_artifacts_considered": decision_artifacts.len(),
-            "scan_limit": 500,
-            "may_be_truncated": decision_artifacts.len() == 500,
+            "decision_artifacts_considered": scan.artifacts.len(),
+            "scan_limit": CALIBRATION_SCAN_LIMIT,
+            "may_be_truncated": scan.truncated,
+            "excluded_decisions": skipped.len(),
             "matured_runs": collected_runs.len(),
+            "selected_run_ids": collected_runs,
             "collected_forecast_samples": sample_counts.values().sum::<usize>(),
             "sample_counts": sample_counts,
             "common_price_points": common_dates.len(),
         },
-        "identity": {
-            "provider_id": provider_id,
-            "model_id": model_id,
-            "model_route": "research.synthesizer",
-            "contract_hash": contract_hash,
-            "training_start": actual_start,
-            "training_end": actual_end,
-        },
+        "identity": identity,
         "gaps": {
             "min_samples": min_samples,
             "enough_forecasts": enough_forecasts,
@@ -1284,6 +2002,8 @@ fn collect_calibration_dataset(
         },
         "next_step": if status == "ready_for_build" {
             "akzio calibration build --store <store> --dataset <dataset-artifact-id>"
+        } else if scan.truncated {
+            "narrow the training window to scan the full cohort"
         } else {
             "collect additional canonical Paper outcomes; no policy was built"
         },
@@ -1296,19 +2016,14 @@ fn collect_calibration_dataset(
             kind: ArtifactKind::CalibrationRiskLimits,
         }];
         for candidate in &selected {
-            if collected_runs.contains(&candidate.run_id.0) {
-                sources.push(ArtifactRef {
-                    artifact_id: candidate.decision_artifact.artifact_id.clone(),
-                    kind: ArtifactKind::Decision,
-                });
-                let outcome = store
-                    .outcome_for_run(&candidate.run_id)?
-                    .context("selected Outcome disappeared")?;
-                sources.push(ArtifactRef {
-                    artifact_id: outcome.artifact_id,
-                    kind: ArtifactKind::Outcome,
-                });
-            }
+            sources.push(ArtifactRef {
+                artifact_id: candidate.decision_artifact.artifact_id.clone(),
+                kind: ArtifactKind::Decision,
+            });
+            sources.push(ArtifactRef {
+                artifact_id: candidate.outcome_artifact_id.clone(),
+                kind: ArtifactKind::Outcome,
+            });
         }
         let write_store = Store::open(store_path)?;
         let stored = persist_calibration_artifact(
@@ -1324,7 +2039,7 @@ fn collect_calibration_dataset(
         report["dataset_artifact"] = serde_json::to_value(stored.artifact_id)?;
         write_store.verify_integrity()?;
     }
-    print_json(&report)
+    Ok(report)
 }
 
 fn parse_calibration_time(value: &str, field: &str) -> Result<DateTime<Utc>> {
@@ -1521,14 +2236,18 @@ fn candidate_has_all_labels(
         let Some(asset_bars) = bars.get(&forecast.asset) else {
             return Err(format!("missing {} bar series", forecast.asset));
         };
-        if !asset_bars.contains_key(&schedule.baseline_trading_day)
-            || !asset_bars.contains_key(&window.observed_trading_day)
-        {
+        let Some((base, future)) = asset_bars
+            .get(&schedule.baseline_trading_day)
+            .zip(asset_bars.get(&window.observed_trading_day))
+        else {
             return Err(format!(
                 "missing {} baseline or {:?} realized session bar",
                 forecast.asset, horizon
             ));
-        }
+        };
+        relative_return_ppm(*base, *future).map_err(|error| {
+            format!("{} {:?} realized return is invalid: {error}", forecast.asset, horizon)
+        })?;
     }
     Ok(())
 }

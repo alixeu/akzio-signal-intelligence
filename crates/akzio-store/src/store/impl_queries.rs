@@ -91,6 +91,58 @@ impl Store {
             .collect()
     }
 
+    /// Page through committed canonical decisions of Paper Runs by immutable
+    /// creation time and Artifact ID. Window bounds are inclusive.
+    pub fn calibration_decision_page(
+        &self,
+        window: (Option<DateTime<Utc>>, Option<DateTime<Utc>>),
+        before: Option<(DateTime<Utc>, &ArtifactId)>,
+        limit: usize,
+    ) -> StoreResult<Vec<Artifact>> {
+        let connection = self.connection()?;
+        let (start, end) = window;
+        let (cursor_time, cursor_id) = before
+            .map(|(time, id)| (Some(time.to_rfc3339()), Some(id.0.as_str())))
+            .unwrap_or_default();
+        let mut statement = connection.prepare(
+            r#"SELECT a.artifact_id
+                 FROM rebuild_runs AS r
+                 JOIN rebuild_artifacts AS a ON json_extract(a.origin_json, '$.run_id') = r.run_id
+                 JOIN rebuild_attempt_outputs AS o
+                   ON o.artifact_id = a.artifact_id
+                  AND o.attempt_id = json_extract(a.origin_json, '$.attempt_id')
+                  AND o.task_id = json_extract(a.origin_json, '$.task_id')
+                 JOIN rebuild_events AS e ON e.event_id = o.event_id AND e.run_id = r.run_id
+                  AND e.task_id = o.task_id AND e.attempt_id = o.attempt_id
+                  AND e.artifact_id = a.artifact_id AND e.event_type = 'artifact.committed'
+                 JOIN rebuild_attempts AS attempt
+                   ON attempt.attempt_id = o.attempt_id AND attempt.task_id = o.task_id
+                  AND attempt.run_id = r.run_id AND attempt.status = 'succeeded'
+                 JOIN rebuild_tasks AS task ON task.task_id = o.task_id AND task.run_id = r.run_id
+                  AND task.status = 'succeeded' AND task.recipe_id = 'gate.decision'
+                WHERE r.purpose = 'paper' AND a.kind = 'decision' AND a.lifecycle = 'canonical'
+                  AND (?1 IS NULL OR a.created_at >= ?1)
+                  AND (?2 IS NULL OR a.created_at <= ?2)
+                  AND (?3 IS NULL OR (a.created_at, a.artifact_id) < (?3, ?4))
+                ORDER BY a.created_at DESC, a.artifact_id DESC LIMIT ?5"#,
+        )?;
+        let ids = statement
+            .query_map(
+                params![
+                    start.map(|time| time.to_rfc3339()),
+                    end.map(|time| time.to_rfc3339()),
+                    cursor_time,
+                    cursor_id,
+                    limit.clamp(1, 500) as i64,
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| read_artifact(&connection, &ArtifactId(ContentHash::new(id)?)))
+            .collect()
+    }
+
     // 使用调用方连接恢复指定 revision，避免事务内再次获取 Store Mutex。
     // run_id+revision 是 SQL 双键；缺少 revision 返回结构化 MissingWorkflowRevision。
     fn workflow_revision_with_connection(

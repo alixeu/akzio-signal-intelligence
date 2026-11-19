@@ -22,7 +22,7 @@ use akzio_daemon::{
 use akzio_domain::{
     content_hash_json, Asset, CanaryCampaignSpec, ContentHash, ExperimentCondition,
     LessonLifecycle, ModelQualificationReport, OutcomeCostModel, ReleaseEvidenceBundle, RunId,
-    RunPurpose, RuntimeIdentity,
+    RuntimeIdentity,
 };
 use akzio_execution::{
     paper::{AlpacaPaper, PaperError, PaperWriteKind},
@@ -100,6 +100,11 @@ enum CalibrationCommand {
         store: PathBuf,
         #[arg(long, default_value_t = 30)]
         min_samples: u32,
+        /// Evaluate the same model and Contract cohort as collect.
+        #[arg(long)]
+        cohort: bool,
+        #[command(flatten)]
+        scope: CalibrationScopeArgs,
     },
     Preflight {
         #[arg(long)]
@@ -120,10 +125,8 @@ enum CalibrationCommand {
         risk_limits: String,
         #[arg(long, default_value_t = 30)]
         min_samples: u32,
-        #[arg(long)]
-        training_start: Option<String>,
-        #[arg(long)]
-        training_end: Option<String>,
+        #[command(flatten)]
+        scope: CalibrationScopeArgs,
     },
     /// Fit a stored dataset and persist a candidate policy without activating it.
     Build {
@@ -158,6 +161,19 @@ enum CalibrationCommand {
         #[arg(long)]
         policy: String,
     },
+}
+
+#[derive(Debug, clap::Args)]
+struct CalibrationScopeArgs {
+    /// Inclusive RFC3339 lower bound for decisions.
+    #[arg(long)]
+    training_start: Option<String>,
+    /// Inclusive RFC3339 upper bound for decisions and realized labels.
+    #[arg(long)]
+    training_end: Option<String>,
+    /// Select an installed historical Synthesizer Contract by exact hash.
+    #[arg(long)]
+    contract_hash: Option<String>,
 }
 
 #[derive(Debug, clap::Args)]
