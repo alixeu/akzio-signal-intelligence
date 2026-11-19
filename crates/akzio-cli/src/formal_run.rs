@@ -364,6 +364,7 @@ mod tests {
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     };
+    use tokio::net::TcpSocket;
 
     // 本地 HTTP 协议替身，不构造 Rust daemon/Store、模型或 Alpaca 客户端。
     // None 表示服务端收到请求后断连，用来验证提交不确定时不自动重试。
@@ -484,11 +485,26 @@ mod tests {
         (root, config)
     }
 
+    async fn reserve_core_port() -> (tokio::net::TcpStream, std::net::TcpStream) {
+        // An established connection keeps its source port out of the ephemeral
+        // allocator and refuses new connections until the mock starts listening.
+        // A bound but unconnected socket can time out on the cold-start probe.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = TcpSocket::new_v4().unwrap();
+        // Permit an explicit listener to take over while the source is live.
+        socket.set_reuseaddr(true).unwrap();
+        let reservation = socket
+            .connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        (reservation, peer)
+    }
+
     #[tokio::test]
     async fn missing_core_launches_once_waits_for_authenticated_ready_then_submits_once() {
-        let port = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = port.local_addr().unwrap();
-        drop(port);
+        let (reservation, _peer) = reserve_core_port().await;
+        let address = reservation.local_addr().unwrap();
         let (root, config) = test_config(address);
         // 首次启动时 Store/token 尚不存在；由 Core 启动过程创建后才允许认证 /ready。
         fs::remove_file(config.daemon.store_root.join(".daemon-token")).unwrap();
@@ -585,11 +601,16 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// WHY THIS TEST EXISTS (Task #29): The cold probe must reach the
+    /// auto-Paper guard while the fixture still owns its loopback port.
+    /// Do not weaken or delete this assertion.
     #[tokio::test]
     async fn starting_position_plan_cannot_enable_an_auto_paper_daemon() {
-        let port = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = port.local_addr().unwrap();
-        drop(port);
+        let (reservation, _peer) = reserve_core_port().await;
+        let address = reservation.local_addr().unwrap();
+        // A fresh socket cannot bind the reserved source as an unused port.
+        let bind_error = TcpSocket::new_v4().unwrap().bind(address).unwrap_err();
+        assert_eq!(bind_error.kind(), std::io::ErrorKind::AddrInUse);
         let (root, mut config) = test_config(address);
         config.daemon.auto_paper = Some(true);
         let mut launches = 0;
@@ -605,16 +626,18 @@ mod tests {
         .await
         .err()
         .unwrap();
-        assert!(format!("{error:#}").contains("auto_paper=true"));
+        assert!(
+            format!("{error:#}").contains("auto_paper=true"),
+            "{error:#}"
+        );
         assert_eq!(launches, 0);
         fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
     async fn failed_core_startup_never_submits_a_run() {
-        let port = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = port.local_addr().unwrap();
-        drop(port);
+        let (reservation, _peer) = reserve_core_port().await;
+        let address = reservation.local_addr().unwrap();
         let (root, config) = test_config(address);
         let mut launches = 0;
         let error = ensure_formal_core(
@@ -629,8 +652,8 @@ mod tests {
         .await
         .err()
         .unwrap();
-        assert_eq!(launches, 1);
-        assert!(error.to_string().contains("CORE_LOG"));
+        assert_eq!(launches, 1, "{error:#}");
+        assert!(error.to_string().contains("CORE_LOG"), "{error:#}");
         fs::remove_dir_all(root).unwrap();
     }
 
