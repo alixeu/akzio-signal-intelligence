@@ -690,7 +690,9 @@ fn debug_fixture_evidence(
             serde_json::json!({
                 "realtime_start": vintage.to_string(),
                 "realtime_end": vintage.to_string(),
-                "observations": [{ "date": vintage.to_string(), "value": "1.0" }]
+                "count": 1, "offset": 0, "limit": 1000,
+                "observations": [{ "date": vintage.to_string(), "value": "1.0",
+                    "realtime_start": vintage.to_string(), "realtime_end": vintage.to_string() }]
             })
         }
         _ => serde_json::json!({ "resource": resource, "fixture": true }),

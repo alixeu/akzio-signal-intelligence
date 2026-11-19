@@ -92,7 +92,16 @@ fn fact_value(payload: &Value) -> Value {
             json!({"bars":payload["value"]["bars"],"feed":payload["value"]["feed"],"adjustment":payload["value"]["adjustment"]})
         }
         r if r.starts_with("series:") => {
-            json!({"observations":payload["value"]["observations"],"units":payload["value"]["units"]})
+            // Both sides passed the row gate. Compare the actual known date/value pairs so
+            // removing legacy missing markers does not look like a newly acquired fact.
+            let observations = payload["value"]["observations"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|row| row["value"].as_str().is_some_and(|value| value != "."))
+                .map(|row| json!([row["date"], row["value"]]))
+                .collect::<Vec<_>>();
+            json!({"observations":observations,"units":payload["value"]["units"]})
         }
         _ => Value::Null,
     }
@@ -392,9 +401,19 @@ impl Daemon {
                                             .pointer("/value/source_document/source_verified")
                                             == Some(&Value::Bool(true)));
                                 if verified
+                                    && akzio_ingest::fred_series_direction_gap(
+                                        &key,
+                                        &payload["value"],
+                                    )
+                                    .is_none()
                                     && available.is_some_and(|t| t.with_timezone(&Utc) <= cutoff)
                                     && !original.iter().any(|v| {
                                         v["resource"] == payload["resource"]
+                                            && akzio_ingest::fred_series_direction_gap(
+                                                &key,
+                                                &v["value"],
+                                            )
+                                            .is_none()
                                             && fact_value(v) == fact_value(&payload)
                                     })
                                 {

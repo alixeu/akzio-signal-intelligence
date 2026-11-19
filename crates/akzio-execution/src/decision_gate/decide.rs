@@ -80,7 +80,7 @@ impl DecisionRuntime {
             };
         // map 闭包为每个 Claim 做 Store kind 校验、CAS 解码和领域 validate；collect 到
         // Result<Vec<_>> 时才实际遍历，并在任一错误处短路整批加载。
-        let claim_records = draft
+        let mut claim_records = draft
             .claims
             .iter()
             .map(|reference| {
@@ -91,22 +91,9 @@ impl DecisionRuntime {
                 Ok((artifact, claim))
             })
             .collect::<DecisionGateResult<Vec<_>>>()?;
-        // 下面克隆 payload 形成便于按索引与 draft 引用 zip 的临时 owned Vec；Artifact 与
-        // claim_records 仍保留完整 provenance，克隆不代表新增或持久化 Claim。
-        let claims = claim_records
-            .iter()
-            .map(|(_, claim)| claim.clone())
-            .collect::<Vec<_>>();
-        if installed.contract.version < akzio_domain::STRUCTURED_RESEARCH_CONTRACT_VERSION {
-            // 旧于单次结构化提交协议的已冻结 Contract 仍走兼容语义检查；新 Contract 的
-            // slots/eligibility 会由下面对应的新校验器处理。
-            validate_decision_evidence_sufficiency(&draft, &claims)
-                .map_err(|_| DecisionGateError::InsufficientClaimEvidence)?;
-        }
-
         // Critique 同样逐项解码；target 必须指向当前 draft 选中的 Claim，防止外部审查
         // 被拼接进本次 proposal。collect 失败时不会得到部分可用的 critiques。
-        let critique_records = draft
+        let mut critique_records = draft
             .critiques
             .iter()
             .map(|reference| {
@@ -122,8 +109,42 @@ impl DecisionRuntime {
                 Ok((artifact, critique))
             })
             .collect::<DecisionGateResult<Vec<_>>>()?;
-        // 保留完整 critique Artifact records 供 provenance 检查，同时提取 payload 副本供
-        // 纯领域资格函数读取；这些克隆只存在于内存。
+        // An accepted pre-upgrade Review can still cite unusable FRED rows.
+        // Requalify the decoded payloads before any directional checks; the
+        // persisted artifacts and their source refs preserve the original review.
+        let unqualified = self.unqualified_directional_evidence(
+            claim_records
+                .iter()
+                .flat_map(|(_, claim)| &claim.grounds)
+                .chain(
+                    critique_records
+                        .iter()
+                        .flat_map(|(_, critique)| &critique.grounds),
+                ),
+            &selected,
+        )?;
+        for (_, claim) in &mut claim_records {
+            demote_unqualified_grounds(&mut claim.grounds, &unqualified);
+        }
+        for (_, critique) in &mut critique_records {
+            demote_unqualified_grounds(&mut critique.grounds, &unqualified);
+            critique
+                .supporting_refs
+                .retain(|reference| !unqualified.contains(&reference.evidence));
+            if critique.verification_status == ClaimVerificationStatus::Supported
+                && critique.supporting_refs.is_empty()
+            {
+                critique.verification_status = ClaimVerificationStatus::NotEnoughInformation;
+            }
+        }
+        let claims = claim_records
+            .iter()
+            .map(|(_, claim)| claim.clone())
+            .collect::<Vec<_>>();
+        if installed.contract.version < akzio_domain::STRUCTURED_RESEARCH_CONTRACT_VERSION {
+            validate_decision_evidence_sufficiency(&draft, &claims)
+                .map_err(|_| DecisionGateError::InsufficientClaimEvidence)?;
+        }
         let critiques = critique_records
             .iter()
             .map(|(_, critique)| critique.clone())
@@ -978,6 +999,20 @@ impl DecisionRuntime {
             return Err(DecisionGateError::InvalidProposalProvenance);
         }
         Ok(contract_hash.clone())
+    }
+}
+
+fn demote_unqualified_grounds(
+    grounds: &mut [akzio_domain::EvidenceGround],
+    unqualified: &BTreeSet<ArtifactRef>,
+) {
+    for ground in grounds
+        .iter_mut()
+        .filter(|g| unqualified.contains(&g.evidence))
+    {
+        ground.role = akzio_domain::EvidenceGroundRole::Descriptive;
+        ground.domain = None;
+        ground.assets.clear();
     }
 }
 

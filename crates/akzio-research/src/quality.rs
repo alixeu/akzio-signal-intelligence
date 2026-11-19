@@ -28,7 +28,7 @@ const CASE_COUNT: usize = 12;
 
 // 在当前隔离 Attempt 的 permit 下保存一份实验 Artifact：payload 只借用用于序列化，
 // refs 被移动进 Artifact；单次调用成功表示该 Artifact 已由 Store 写入，不表示整个 case 完成。
-fn persist(
+pub(crate) fn persist(
     store: &Store,
     permit: &TaskWritePermit,
     kind: ArtifactKind,
@@ -39,12 +39,12 @@ fn persist(
     // 质量记录也走 Artifact + task permit；测试 Run 不配置 Broker、Decision 或
     // Outcome，不能获得正式校准和 Paper 执行资格。
     let now = Utc::now();
-    let family = if kind == ArtifactKind::NormalizedEvidence {
-        "alpaca"
-    } else if matches!(kind, ArtifactKind::DecisionProposal | ArtifactKind::Claim) {
-        "akzio.agent"
-    } else {
-        "akzio.runtime"
+    let family = match kind {
+        ArtifactKind::NormalizedEvidence => payload["source"].as_str().unwrap_or("alpaca"),
+        ArtifactKind::DecisionProposal | ArtifactKind::Claim | ArtifactKind::Critique => {
+            "akzio.agent"
+        }
+        _ => "akzio.runtime",
     };
     let artifact = Artifact::new(
         kind,
@@ -82,7 +82,11 @@ fn reference(artifact: &Artifact) -> ArtifactRef {
 
 // 安装活动研究 Contract，在一次性 Store 建 synthetic PositionPlan Run 并领取
 // 指定角色的 Task；`[quality_repair]` 预置两个修订节点，不创建 Debug 控制。
-fn attempt(store: &Store, role: &str, objective: &str) -> Result<(AgentRuntime, ClaimedAttempt)> {
+pub(crate) fn attempt(
+    store: &Store,
+    role: &str,
+    objective: &str,
+) -> Result<(AgentRuntime, ClaimedAttempt)> {
     // 每个 case 固定自己的 Run、Task 和预算。修改本地配置不会
     // 改写已提交 graph；恢复时仍以 Store 中的 Attempt 消耗为准。
     let now = Utc::now();
@@ -235,7 +239,7 @@ impl AgentModel for CountedModel<'_> {
 
 // 根据 0..12 的固定编号生成 proposal 与“应拒绝 scope”标签；案例只是人为合成的已知矛盾，
 // 不是对未来收益或真实证据真值的判断。
-fn case_material(index: usize, evidence: &ArtifactRef) -> (Value, Vec<String>) {
+pub(crate) fn case_material(index: usize, evidence: &ArtifactRef) -> (Value, Vec<String>) {
     // 两层迭代器先为每项可执行资产生成 t1/t3/t5，再由 collect 立即消费为 12 项 Vec；
     // move 闭包取得当前 asset，horizon 字符串仍是静态枚举值。
     let forecasts: Vec<_> = Asset::EXECUTABLE.into_iter().flat_map(|asset| ["t1","t3","t5"].into_iter()

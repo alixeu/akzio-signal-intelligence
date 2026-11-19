@@ -4,6 +4,48 @@
 // Experience 都在 Decision 事务前拒绝。
 
 impl DecisionRuntime {
+    fn unqualified_directional_evidence<'a>(
+        &self,
+        grounds: impl Iterator<Item = &'a akzio_domain::EvidenceGround>,
+        selected: &BTreeSet<ArtifactRef>,
+    ) -> DecisionGateResult<BTreeSet<ArtifactRef>> {
+        use akzio_domain::{EvidenceGroundRole, ResearchShard};
+
+        let mut checked = BTreeSet::new();
+        let mut unqualified = BTreeSet::new();
+        for ground in grounds.filter(|ground| {
+            ground.role == EvidenceGroundRole::Directional
+                && ground.evidence.kind == ArtifactKind::NormalizedEvidence
+        }) {
+            if !selected.contains(&ground.evidence) {
+                if ground.domain == Some(ResearchShard::Macro) {
+                    unqualified.insert(ground.evidence.clone());
+                }
+                continue;
+            }
+            if !checked.insert(&ground.evidence) {
+                continue;
+            }
+            let artifact =
+                self.load_expected(&ground.evidence, ArtifactKind::NormalizedEvidence)?;
+            if artifact.provenance.source_family != "fred" {
+                continue;
+            }
+            let payload: serde_json::Value =
+                serde_json::from_slice(&self.store.read_blob(&artifact.blob)?)?;
+            if payload["resource"].as_str().is_none_or(|resource| {
+                akzio_domain::fred_observations::fred_series_direction_gap(
+                    resource,
+                    &payload["value"],
+                )
+                .is_some()
+            }) {
+                unqualified.insert(ground.evidence.clone());
+            }
+        }
+        Ok(unqualified)
+    }
+
     fn validate_manifest(
         &self,
         manifest: &Artifact,

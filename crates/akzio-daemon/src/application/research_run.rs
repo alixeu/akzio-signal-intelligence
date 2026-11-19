@@ -251,6 +251,11 @@ impl<'a> ResearchRun<'a> {
 
         let actual = payloads
             .iter()
+            .filter(|payload| {
+                payload.source != EvidenceSource::Fred
+                    || akzio_ingest::fred_series_direction_gap(&payload.resource, &payload.value)
+                        .is_none()
+            })
             .map(|payload| (payload.source.as_str(), payload.resource.as_str()))
             .collect::<BTreeSet<_>>();
         let blockers = akzio_domain::instrument_evidence_requirements_for_session(&session_key)

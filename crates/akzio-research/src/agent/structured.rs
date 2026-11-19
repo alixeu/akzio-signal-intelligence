@@ -86,7 +86,13 @@ fn bind_ground_scope_schema(store: &Store, manifest: &ContextManifest, schema: &
         if !allowed.contains(&json!(selection.artifact.artifact_id)) { continue; }
         let artifact = store.artifact(&selection.artifact.artifact_id)?;
         let payload: Value = serde_json::from_slice(&store.read_blob(&artifact.blob)?)?;
-        let scope = if contract_version >= 63 && !news_source_verified(&payload) { BTreeSet::new() } else { evidence_asset_scope(&payload)?.unwrap_or_default() };
+        let scope = if (contract_version >= 63 && !news_source_verified(&payload))
+            || fred_series_ground_gap(&payload).is_some()
+        {
+            BTreeSet::new()
+        } else {
+            evidence_asset_scope(&payload)?.unwrap_or_default()
+        };
         let scope = scope.iter()
             .map(|asset| asset.symbol().to_owned()).collect::<Vec<_>>();
         groups.entry(scope).or_default().push(json!(selection.artifact.artifact_id));

@@ -1715,4 +1715,362 @@ mod formal_launch_tests {
         assert_eq!(report.exporter_version, "run-bundle-v1");
         assert!(!report.raw_model_access.allowed);
     }
+
+    fn fred_gate_fixture_ref(artifact: &akzio_domain::Artifact) -> akzio_domain::ArtifactRef {
+        akzio_domain::ArtifactRef {
+            artifact_id: artifact.artifact_id.clone(),
+            kind: artifact.kind,
+        }
+    }
+
+    fn fred_gate_fixture_artifact<T: serde::Serialize>(
+        daemon: &Daemon,
+        permit: &akzio_domain::TaskWritePermit,
+        kind: akzio_domain::ArtifactKind,
+        producer: &str,
+        payload: &T,
+        sources: Vec<akzio_domain::ArtifactRef>,
+    ) -> akzio_domain::Artifact {
+        use akzio_domain::*;
+        let now = Utc::now();
+        Artifact::new(
+            kind,
+            daemon.store.stage_json(payload).unwrap(),
+            producer,
+            ArtifactLifecycle::RunScoped,
+            ArtifactProvenance {
+                source_family: if kind == ArtifactKind::ContextManifest {
+                    "akzio.context"
+                } else {
+                    "akzio.agent"
+                }
+                .into(),
+                observed_at: None,
+                retrieved_at: now,
+                source_uri: None,
+                confidence_ppm: 1_000_000,
+                producer_contract_hash: permit.contract_hash.clone(),
+            },
+            Some(permit.artifact_origin()),
+            sources,
+            now,
+        )
+        .unwrap()
+    }
+
+    fn fred_gate_fixture_manifest(
+        daemon: &Daemon,
+        permit: &akzio_domain::TaskWritePermit,
+        producer: &str,
+        inputs: &[&akzio_domain::Artifact],
+    ) -> akzio_domain::Artifact {
+        use akzio_domain::*;
+        let selections = inputs
+            .iter()
+            .map(|artifact| ContextSelection {
+                artifact: fred_gate_fixture_ref(artifact),
+                reason: "prior accepted input".into(),
+                estimated_tokens: estimate_tokens_from_bytes(artifact.blob.bytes),
+                projected_bytes: None,
+                trust: if artifact.kind == ArtifactKind::NormalizedEvidence {
+                    ContextTrust::UntrustedEvidence
+                } else {
+                    ContextTrust::GovernedArtifact
+                },
+            })
+            .collect::<Vec<_>>();
+        let manifest = ContextManifestPayload {
+            schema_version: DOMAIN_SCHEMA_VERSION,
+            contract_hash: permit.contract_hash.clone().unwrap(),
+            input_hash: manifest_input_hash(&selections).unwrap(),
+            total_bytes: inputs.iter().map(|a| a.blob.bytes).sum(),
+            projected_bytes: None,
+            estimated_tokens: selections.iter().map(|s| s.estimated_tokens).sum(),
+            selections,
+            quarantined: Vec::new(),
+        };
+        fred_gate_fixture_artifact(
+            daemon,
+            permit,
+            ArtifactKind::ContextManifest,
+            producer,
+            &manifest,
+            inputs.iter().map(|a| fred_gate_fixture_ref(a)).collect(),
+        )
+    }
+
+    async fn decide_pre_upgrade_fred(weak: bool, directional: bool) {
+        use akzio_domain::*;
+        use akzio_ingest::{EvidenceSource, NormalizedEvidencePayload};
+        let mut daemon = fixture();
+        let daemon = Arc::get_mut(&mut daemon).unwrap();
+        let now = Utc::now();
+        let session = now
+            .with_timezone(&chrono_tz::America::New_York)
+            .date_naive()
+            .to_string();
+        let (plan, setup) = daemon
+            .prepare_position_plan(RunId::new(), &session, now)
+            .unwrap();
+        let fred = setup
+            .iter()
+            .map(|a| {
+                serde_json::from_slice::<EvidenceNeed>(&daemon.store.read_blob(&a.blob).unwrap())
+                    .unwrap()
+            })
+            .find(|need| need.resource.starts_with("series:DFII10:"))
+            .unwrap();
+        let mut response = crate::debug_fixture_evidence(EvidenceSource::Fred, &fred.resource, now);
+        if weak {
+            response.normalized["observations"][0]["value"] = serde_json::json!(".");
+        }
+        response.raw = serde_json::to_vec(&response.normalized).unwrap();
+        Arc::make_mut(&mut daemon.fixture_evidence)
+            .entry(EvidenceSource::Fred)
+            .or_default()
+            .insert(fred.resource, response);
+        daemon
+            .store
+            .commit_position_plan(&plan, &setup, daemon.startup_decision_policy_hash.as_ref())
+            .unwrap();
+        let (mut price, mut macro_series, mut claim, mut critique, mut proposal): (
+            Option<Artifact>,
+            _,
+            _,
+            _,
+            _,
+        ) = Default::default();
+
+        for _ in 0..40 {
+            let task = daemon
+                .store
+                .claim_next_task_for_workload(
+                    "reviewed-fred-fixture",
+                    Utc::now(),
+                    chrono::Duration::minutes(5),
+                    akzio_store::TaskWorkload::Session,
+                )
+                .unwrap()
+                .expect("fixture task remains queued");
+            let spec = task.node.execution_spec();
+            let build = |kind, producer, value: &serde_json::Value, sources| {
+                fred_gate_fixture_artifact(daemon, &task.permit, kind, producer, value, sources)
+            };
+            let artifacts = match task.node.recipe_id.as_str() {
+                "gate.evidence" => {
+                    let artifacts = daemon.acquire_evidence(&task, now).await.unwrap();
+                    for artifact in &artifacts {
+                        if artifact.kind == ArtifactKind::NormalizedEvidence {
+                            let p: NormalizedEvidencePayload = serde_json::from_slice(
+                                &daemon.store.read_blob(&artifact.blob).unwrap(),
+                            )
+                            .unwrap();
+                            if p.resource.starts_with("bars:QQQ:") {
+                                price = Some(artifact.clone());
+                            }
+                            if p.resource.starts_with("series:DFII10:") {
+                                assert!(p.value.get("observation_quality").is_none());
+                                macro_series = Some(artifact.clone());
+                            }
+                        }
+                    }
+                    artifacts
+                }
+                RESEARCH_ANALYST_RECIPE_ID
+                    if spec.horizon == Some(DecisionHorizon::T1)
+                        && spec.research_round != Some(1) =>
+                {
+                    let price = fred_gate_fixture_ref(price.as_ref().unwrap());
+                    let fred = fred_gate_fixture_ref(macro_series.as_ref().unwrap());
+                    let mut value = akzio_research::fixture_claim_output();
+                    value["horizon"] = serde_json::json!("t1");
+                    value["stance"] = serde_json::json!("bullish");
+                    value["grounds"] = serde_json::json!([
+                        {"evidence":price,"role":"directional","domain":"price_market_structure","assets":["QQQ"],"support":"price direction"},
+                        {"evidence":fred,"role":"directional","domain":"macro","assets":["QQQ"],"support":"macro direction"}
+                    ]);
+                    let output = build(
+                        ArtifactKind::Claim,
+                        "agent.research.analyst",
+                        &value,
+                        vec![price, fred],
+                    );
+                    claim = Some(output.clone());
+                    vec![output]
+                }
+                RESEARCH_CRITIC_RECIPE_ID
+                    if spec.horizon == Some(DecisionHorizon::T1)
+                        && spec.research_round != Some(1) =>
+                {
+                    let claim = fred_gate_fixture_ref(claim.as_ref().unwrap());
+                    let price = fred_gate_fixture_ref(price.as_ref().unwrap());
+                    let fred = fred_gate_fixture_ref(macro_series.as_ref().unwrap());
+                    let mut value = akzio_research::fixture_critique_output();
+                    value["target"] = serde_json::json!(claim);
+                    let claim_payload: ResearchClaim =
+                        daemon.read_artifact_payload(&claim).unwrap();
+                    value["grounds"] = serde_json::json!(claim_payload.grounds);
+                    value["verification_status"] = serde_json::json!("supported");
+                    value["supporting_refs"] = serde_json::json!([
+                        {"evidence":price,"authority":"official","temporal_validity":"valid_at_decision_cutoff"},
+                        {"evidence":fred,"authority":"official","temporal_validity":"valid_at_decision_cutoff"}
+                    ]);
+                    let output = build(
+                        ArtifactKind::Critique,
+                        "agent.research.critic",
+                        &value,
+                        vec![claim, price, fred],
+                    );
+                    critique = Some(output.clone());
+                    vec![output]
+                }
+                RESEARCH_SYNTHESIZER_RECIPE_ID if spec.proposal_revision == Some(0) => {
+                    let inputs = [
+                        price.as_ref().unwrap(),
+                        macro_series.as_ref().unwrap(),
+                        claim.as_ref().unwrap(),
+                        critique.as_ref().unwrap(),
+                    ];
+                    let [price, fred, claim, critique] = inputs.map(fred_gate_fixture_ref);
+                    let manifest = fred_gate_fixture_manifest(
+                        daemon,
+                        &task.permit,
+                        "context.research.synthesizer",
+                        &inputs,
+                    );
+                    let forecasts = Asset::EXECUTABLE.into_iter().flat_map(|asset| DecisionHorizon::ALL.into_iter().map(move |horizon| {
+                        let active = directional && asset == Asset::Qqq && horizon == DecisionHorizon::T1;
+                        serde_json::json!({"asset":asset,"horizon":horizon,"positive_return_probability_ppm":if active {700_000} else {500_000},
+                            "expected_return_ppm":if active {10_000} else {0},"thesis":{"thesis_valid_until":now+chrono::Duration::days(i64::from(horizon.trading_days())),
+                                "expected_holding_period_days":horizon.trading_days(),"exit_condition":"exit at assigned horizon","invalidation_conditions":["reversal"]}})
+                    })).collect::<Vec<_>>();
+                    let allocations = Asset::EXECUTABLE.into_iter().map(|asset| serde_json::json!({"asset":asset,"target_weight_ppm":0,
+                        "supporting_horizons":[],"evidence_refs":[],"rationale":"cash by fixture design","abstention_reason":"no allocation"})).collect::<Vec<_>>();
+                    let numeric_basis = proposal_review_keys().into_iter().map(|scope|serde_json::json!({"scope":scope,"inputs":[price],
+                        "units":"ppm","method":"fixture arithmetic","assumptions":"assumptions recorded","uncertainty":"uncertain"})).collect::<Vec<_>>();
+                    let value = serde_json::json!({"summary":"reviewed pre-upgrade proposal","confidence_ppm":500_000,
+                        "numeric_basis":numeric_basis,"forecasts":forecasts,"research_allocation":{"cash_weight_ppm":1000000,"allocations":allocations},
+                        "claims":[claim],"critiques":[critique],"evidence":[price,fred],"material_conflicts":[],"hard_blockers":[],"soft_warnings":[]});
+                    let output = build(
+                        ArtifactKind::DecisionProposal,
+                        "agent.research.synthesizer",
+                        &value,
+                        vec![
+                            fred_gate_fixture_ref(&manifest),
+                            price,
+                            fred,
+                            claim,
+                            critique,
+                        ],
+                    );
+                    proposal = Some(output.clone());
+                    vec![manifest, output]
+                }
+                RESEARCH_PROPOSAL_REVIEWER_RECIPE_ID if spec.proposal_revision == Some(0) => {
+                    let proposal = proposal.as_ref().unwrap();
+                    let manifest = fred_gate_fixture_manifest(
+                        daemon,
+                        &task.permit,
+                        "context.research.proposal_reviewer",
+                        &[proposal],
+                    );
+                    let p_ref = fred_gate_fixture_ref(proposal);
+                    let m_ref = fred_gate_fixture_ref(&manifest);
+                    let assessments = proposal_review_keys()
+                        .into_iter()
+                        .map(|scope| {
+                            serde_json::json!({"scope":scope,"accepted":true,
+                        "rationale":"accepted before upgrade","evidence_refs":[],"issues":[]})
+                        })
+                        .collect::<Vec<_>>();
+                    let value = serde_json::json!({"proposal":p_ref,"proposal_hash":proposal.blob.hash,"manifest":m_ref,
+                        "contract_hash":task.permit.contract_hash,"assessments":assessments});
+                    let review = build(
+                        ArtifactKind::ProposalReview,
+                        "agent.research.proposal_reviewer",
+                        &value,
+                        vec![p_ref, m_ref],
+                    );
+                    vec![manifest, review]
+                }
+                "gate.decision" => {
+                    let proposal = fred_gate_fixture_ref(proposal.as_ref().unwrap());
+                    let (_, review) = daemon
+                        .store
+                        .final_proposal_review(&task.run_id, &task.node.task_id)
+                        .unwrap()
+                        .unwrap();
+                    assert!(review.accepted());
+                    let decision = akzio_execution::DecisionRuntime::new(
+                        daemon.store.clone(),
+                        akzio_execution::DecisionPolicy::default(),
+                    )
+                    .unwrap()
+                    .decide(&akzio_execution::DecisionGateInput {
+                        permit: task.permit,
+                        proposal,
+                        now: Utc::now(),
+                    });
+                    if weak && directional {
+                        assert!(
+                            matches!(
+                                decision,
+                                Err(akzio_execution::DecisionGateError::InsufficientClaimEvidence)
+                            ),
+                            "{decision:?}"
+                        );
+                        assert!(daemon
+                            .store
+                            .run_artifacts_by_kind(&task.run_id, ArtifactKind::Decision)
+                            .unwrap()
+                            .is_empty());
+                    } else {
+                        let decision = decision.unwrap();
+                        for input in [
+                            macro_series.as_ref().unwrap(),
+                            claim.as_ref().unwrap(),
+                            critique.as_ref().unwrap(),
+                        ] {
+                            assert!(decision
+                                .decision_context
+                                .source_refs
+                                .contains(&fred_gate_fixture_ref(input)));
+                            assert_eq!(
+                                daemon.store.artifact(&input.artifact_id).unwrap().blob,
+                                input.blob
+                            );
+                        }
+                        let frozen: Decision = daemon
+                            .read_artifact_payload(&fred_gate_fixture_ref(&decision.decision))
+                            .unwrap();
+                        assert_eq!(
+                            frozen.forecasts.iter().any(|f| !f.is_neutral()),
+                            directional
+                        );
+                    }
+                    return;
+                }
+                _ => Vec::new(),
+            };
+            let status = if artifacts.is_empty() {
+                TaskStatus::Skipped
+            } else {
+                TaskStatus::Succeeded
+            };
+            daemon
+                .store
+                .commit_attempt(&task.permit, &artifacts, status, Utc::now())
+                .unwrap();
+        }
+        panic!("fixture did not reach DecisionGate");
+    }
+
+    /// WHY THIS TEST EXISTS (Task #15): a pre-upgrade accepted Review cannot authorize a new directional Decision with unusable FRED evidence.
+    /// Do not weaken or delete this assertion.
+    #[tokio::test]
+    async fn decision_gate_requalifies_fred_in_pre_upgrade_reviewed_proposals() {
+        decide_pre_upgrade_fred(true, true).await;
+        decide_pre_upgrade_fred(true, false).await;
+        decide_pre_upgrade_fred(false, true).await;
+    }
 }

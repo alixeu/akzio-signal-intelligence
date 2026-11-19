@@ -10,6 +10,7 @@
 
 mod direct;
 mod financial_content;
+mod fred_observations;
 mod news;
 mod official;
 mod paper_decode;
@@ -17,6 +18,7 @@ mod prompts;
 mod quant_features;
 pub mod runtime;
 
+pub use akzio_domain::fred_observations::fred_series_direction_gap;
 pub use akzio_domain::EvidenceAcquisitionMode;
 pub use direct::{FredDirectTransport, SecEdgarDirectTransport};
 pub use news::{configured_news_evidence_transport, configured_news_evidence_transport_with_audit};

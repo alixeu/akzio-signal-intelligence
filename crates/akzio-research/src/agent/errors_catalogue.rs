@@ -517,28 +517,40 @@ fn research_output_source_refs(
     // 任一 serde/Store/Domain/引用错误经 ResearchResult 传播，成功只表示引用闭包合法。
     let refs = match kind {
         ArtifactKind::Claim => {
-            let claim: ResearchClaim = serde_json::from_value(output.clone()).map_err(|error| {
+            let mut claim: ResearchClaim = serde_json::from_value(output.clone()).map_err(|error| {
                 ResearchError::InvalidOutput(format!("invalid Claim payload: {error}"))
             })?;
             validate_claim_submission(&claim)?;
             if contract_version >= 63 { validate_supplemental_resources(&claim.evidence_gaps)?; }
-            validate_claim_ground_scopes(store, &claim, manifest, contract_version)?;
+            validate_claim_ground_scopes(
+                store,
+                &mut claim.grounds,
+                manifest,
+                contract_version,
+                ClaimGroundValidation::NewSubmission,
+            )?;
             claim.source_refs()
         }
         ArtifactKind::Critique => {
-            let critique: ResearchCritique =
+            let mut critique: ResearchCritique =
                 serde_json::from_value(output.clone()).map_err(|error| {
                     ResearchError::InvalidOutput(format!("invalid Critique payload: {error}"))
                 })?;
             validate_critique_submission(&critique)?;
             if contract_version >= 63 {
                 validate_supplemental_resources(&critique.evidence_gaps)?;
-                for reference in &critique.supporting_refs {
-                    let artifact = store.artifact(&reference.evidence.artifact_id)?;
-                    let payload = serde_json::from_slice(&store.read_blob(&artifact.blob)?)?;
-                    if !news_source_verified(&payload) {
-                        return Err(ResearchError::InvalidOutput("unverified news cannot appear in supporting_refs; model authority is not source verification".into()));
-                    }
+            }
+            for reference in &critique.supporting_refs {
+                let artifact = store.artifact(&reference.evidence.artifact_id)?;
+                let payload = serde_json::from_slice(&store.read_blob(&artifact.blob)?)?;
+                if contract_version >= 63 && !news_source_verified(&payload) {
+                    return Err(ResearchError::InvalidOutput("unverified news cannot appear in supporting_refs; model authority is not source verification".into()));
+                }
+                if let Some(reason) = fred_series_ground_gap(&payload) {
+                    return Err(ResearchError::InvalidOutput(format!(
+                        "FRED evidence {} cannot appear in supporting_refs ({reason})",
+                        reference.evidence.artifact_id
+                    )));
                 }
             }
             if contract_version >= akzio_domain::STRUCTURED_RESEARCH_CONTRACT_VERSION {
@@ -547,8 +559,13 @@ fn research_output_source_refs(
                 validate_critique_claim_scope(&critique, &claim, contract_version)?;
                 // Additional counterevidence is allowed but has to be lawful evidence
                 // in this Manifest; it cannot become a missing Analyst ground.
-                let review_claim = ResearchClaim { grounds: critique.grounds.clone(), ..claim };
-                validate_claim_ground_scopes(store, &review_claim, manifest, contract_version)?;
+                validate_claim_ground_scopes(
+                    store,
+                    &mut critique.grounds,
+                    manifest,
+                    contract_version,
+                    ClaimGroundValidation::NewSubmission,
+                )?;
             }
             critique.source_refs()
         }
@@ -707,13 +724,20 @@ fn research_output_source_refs(
                 let payload = store.read_blob(&artifact.blob)?;
                 let source_refs = match reference.kind {
                     ArtifactKind::Claim => {
-                        let claim: ResearchClaim = serde_json::from_slice(&payload)?;
+                        let mut claim: ResearchClaim = serde_json::from_slice(&payload)?;
                         claim
                             .validate()
                             .map_err(|error| ResearchError::InvalidOutput(error.to_string()))?;
-                        validate_claim_ground_scopes(store, &claim, manifest, contract_version)?;
-                        claims.push(claim.clone());
-                        claim.source_refs()
+                        let source_refs = claim.source_refs();
+                        validate_claim_ground_scopes(
+                            store,
+                            &mut claim.grounds,
+                            manifest,
+                            contract_version,
+                            ClaimGroundValidation::Committed,
+                        )?;
+                        claims.push(claim);
+                        source_refs
                     }
                     ArtifactKind::Critique => {
                         let critique: ResearchCritique = serde_json::from_slice(&payload)?;
@@ -897,11 +921,17 @@ fn validate_decision_source_closure(
     Ok(())
 }
 
+enum ClaimGroundValidation {
+    NewSubmission,
+    Committed,
+}
+
 fn validate_claim_ground_scopes(
     store: &Store,
-    claim: &ResearchClaim,
+    grounds: &mut [akzio_domain::EvidenceGround],
     manifest: &ContextManifest,
     contract_version: u32,
+    validation: ClaimGroundValidation,
 ) -> ResearchResult<()> {
     // 每个 ground 先按 artifact_id 精确匹配 Manifest，再从 Store 读取其 payload 推导资产
     // scope/domain；Directional ground 还必须是 citation-complete 的 NormalizedEvidence。
@@ -917,7 +947,7 @@ fn validate_claim_ground_scopes(
         })
         .collect::<BTreeMap<_, _>>();
 
-    for ground in &claim.grounds {
+    for ground in grounds {
         let Some(selected_ref) = selected.get(&ground.evidence.artifact_id) else {
             return Err(ResearchError::InvalidOutput(
                 "claim ground is outside ContextManifest".to_owned(),
@@ -931,86 +961,136 @@ fn validate_claim_ground_scopes(
 
         let artifact = store.artifact(&ground.evidence.artifact_id)?;
         let payload: Value = serde_json::from_slice(&store.read_blob(&artifact.blob)?)?;
-        let scope = evidence_asset_scope(&payload)?;
-        let domain = evidence_domain(&payload)?;
-        if ground.domain != domain
-            && (ground.role == EvidenceGroundRole::Directional
-                || (ground.domain.is_some() && domain.is_some()))
+        match validation {
+            ClaimGroundValidation::NewSubmission => {
+                validate_claim_ground_payload(ground, &payload, contract_version)?;
+            }
+            ClaimGroundValidation::Committed => {
+                validate_claim_ground_payload_scope(ground, &payload, contract_version)?;
+                if fred_series_ground_gap(&payload).is_some() {
+                    // Only the eligibility copy loses direction and allocation scope.
+                    ground.role = EvidenceGroundRole::Descriptive;
+                    ground.assets.clear();
+                    ground.domain = None;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_claim_ground_payload(
+    ground: &akzio_domain::EvidenceGround,
+    payload: &Value,
+    contract_version: u32,
+) -> ResearchResult<()> {
+    validate_claim_ground_payload_scope(ground, payload, contract_version)?;
+    if let Some(reason) = fred_series_ground_gap(payload) {
+        if ground.role != EvidenceGroundRole::Descriptive
+            || !ground.assets.is_empty()
+            || ground.domain.is_some()
         {
             return Err(ResearchError::InvalidOutput(format!(
-                "ground domain {:?} does not match evidence resource {} (expected {:?}); choose the selected artifact whose resource matches the declared domain",
-                ground.domain,
+                "FRED ground {} cannot supply directional evidence ({reason}). Use role=descriptive, assets=[] and domain=null",
+                ground.evidence.artifact_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_claim_ground_payload_scope(
+    ground: &akzio_domain::EvidenceGround,
+    payload: &Value,
+    contract_version: u32,
+) -> ResearchResult<()> {
+    let scope = evidence_asset_scope(payload)?;
+    let domain = evidence_domain(payload)?;
+    if ground.domain != domain
+        && (ground.role == EvidenceGroundRole::Directional
+            || (ground.domain.is_some() && domain.is_some()))
+    {
+        return Err(ResearchError::InvalidOutput(format!(
+            "ground domain {:?} does not match evidence resource {} (expected {:?}); choose the selected artifact whose resource matches the declared domain",
+            ground.domain,
+            payload
+                .get("resource")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            domain
+        )));
+    }
+
+    if contract_version >= 63
+        && !news_source_verified(payload)
+        && (ground.role != EvidenceGroundRole::Descriptive
+            || !ground.assets.is_empty()
+            || ground.domain.is_some())
+    {
+        return Err(ResearchError::InvalidOutput(format!(
+            "news ground {} is not source verified; citations_complete and model_reviewed do not grant direction. Use role=descriptive, assets=[] and domain=null", ground.evidence.artifact_id)));
+    }
+    if ground.role == EvidenceGroundRole::Directional {
+        if ground.evidence.kind != ArtifactKind::NormalizedEvidence
+            || !evidence_has_complete_citations(payload)
+            || domain.is_none()
+            || scope.is_none()
+            || ground.assets.is_empty()
+            || scope
+                .as_ref()
+                .is_some_and(|assets| !ground.assets.is_subset(assets))
+        {
+            // Name the rejected ground and the scope it left. A repair turn
+            // that is only told the rule has to guess which ground to edit.
+            return Err(ResearchError::InvalidOutput(format!(
+                "directional ground assets must stay within the scope of a citation-complete normalized evidence artifact: \
+                 ground evidence {} (kind {:?}, resource {}) declares assets {} but its payload scope is {} \
+                 (citations_complete={}, domain={:?}); keep only the assets in that scope or use role=descriptive with assets=[]",
+                ground.evidence.artifact_id.0,
+                ground.evidence.kind,
                 payload
                     .get("resource")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown"),
-                domain
+                describe_assets(&ground.assets),
+                scope.as_ref().map_or_else(|| "unknown".to_owned(), describe_assets),
+                evidence_has_complete_citations(payload),
+                domain,
             )));
         }
-
-        if contract_version >= 63 && !news_source_verified(&payload)
-            && (ground.role != EvidenceGroundRole::Descriptive
-                || !ground.assets.is_empty() || ground.domain.is_some()) {
+    } else if let Some(scope) = scope {
+        if !ground.assets.is_subset(&scope) {
             return Err(ResearchError::InvalidOutput(format!(
-                "news ground {} is not source verified; citations_complete and model_reviewed do not grant direction. Use role=descriptive, assets=[] and domain=null", ground.evidence.artifact_id)));
-        }
-        if ground.role == EvidenceGroundRole::Directional {
-            if ground.evidence.kind != ArtifactKind::NormalizedEvidence
-                || !evidence_has_complete_citations(&payload)
-                || domain.is_none()
-                || scope.is_none()
-                || ground.assets.is_empty()
-                || scope
-                    .as_ref()
-                    .is_some_and(|assets| !ground.assets.is_subset(assets))
-            {
-                // Name the rejected ground and the scope it left. A repair turn
-                // that is only told the rule has to guess which ground to edit.
-                return Err(ResearchError::InvalidOutput(format!(
-                    "directional ground assets must stay within the scope of a citation-complete normalized evidence artifact: \
-                     ground evidence {} (kind {:?}, resource {}) declares assets {} but its payload scope is {} \
-                     (citations_complete={}, domain={:?}); keep only the assets in that scope or use role=descriptive with assets=[]",
-                    ground.evidence.artifact_id.0,
-                    ground.evidence.kind,
-                    payload
-                        .get("resource")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown"),
-                    describe_assets(&ground.assets),
-                    scope.as_ref().map_or_else(|| "unknown".to_owned(), describe_assets),
-                    evidence_has_complete_citations(&payload),
-                    domain,
-                )));
-            }
-        } else if let Some(scope) = scope {
-            if !ground.assets.is_subset(&scope) {
-                return Err(ResearchError::InvalidOutput(format!(
-                    "descriptive ground assets exceed evidence payload scope: ground evidence {} (resource {}) \
-                     declares assets {} but its payload scope is {}; drop the assets outside that scope, \
-                     or use assets=[] for a scope-free descriptive document",
-                    ground.evidence.artifact_id.0,
-                    payload
-                        .get("resource")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown"),
-                    describe_assets(&ground.assets),
-                    describe_assets(&scope),
-                )));
-            }
-        } else if !ground.assets.is_empty() {
-            return Err(ResearchError::InvalidOutput(format!(
-                "unknown evidence scope cannot declare assets: ground evidence {} (resource {}) \
-                 declares assets {} but its payload has no asset scope; use assets=[] and domain=null",
+                "descriptive ground assets exceed evidence payload scope: ground evidence {} (resource {}) \
+                 declares assets {} but its payload scope is {}; drop the assets outside that scope, \
+                 or use assets=[] for a scope-free descriptive document",
                 ground.evidence.artifact_id.0,
                 payload
                     .get("resource")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown"),
                 describe_assets(&ground.assets),
+                describe_assets(&scope),
             )));
         }
+    } else if !ground.assets.is_empty() {
+        return Err(ResearchError::InvalidOutput(format!(
+            "unknown evidence scope cannot declare assets: ground evidence {} (resource {}) \
+             declares assets {} but its payload has no asset scope; use assets=[] and domain=null",
+            ground.evidence.artifact_id.0,
+            payload
+                .get("resource")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            describe_assets(&ground.assets),
+        )));
     }
     Ok(())
+}
+
+fn fred_series_ground_gap(payload: &Value) -> Option<&'static str> {
+    let resource = payload.get("resource")?.as_str()?;
+    akzio_ingest::fred_series_direction_gap(resource, &payload["value"])
 }
 
 fn evidence_has_complete_citations(payload: &Value) -> bool {
@@ -1251,19 +1331,226 @@ summary: "research only".to_owned(),
         assert!(message.contains("nonempty abstention_reason"));
     }
 
-    fn allocate_qqq(draft: &mut DecisionDraft) {
-        // helper 只给 QQQ 配置 10% 目标、T1 和 claim ref，并把现金降为 90%；它不创建订单。
+    fn allocate(draft: &mut DecisionDraft, asset: Asset) {
+        // 给指定资产配置 10% 目标、T1 和 claim ref，并把现金降为 90%。
         let plan = draft.research_allocation.as_mut().unwrap();
         plan.cash_weight_ppm = WeightPpm(900_000);
         let row = plan
             .allocations
             .iter_mut()
-            .find(|row| row.asset == Asset::Qqq)
+            .find(|row| row.asset == asset)
             .unwrap();
         row.target_weight_ppm = WeightPpm(100_000);
         row.supporting_horizons = vec![DecisionHorizon::T1];
         row.evidence_refs = draft.claims.clone();
         row.abstention_reason = None;
+    }
+
+    /// WHY THIS TEST EXISTS (Task #15): recovery must retain an accepted Claim's exact weak FRED citation without using it for direction.
+    #[test]
+    fn committed_weak_fred_claim_closes_neutral_proposal() {
+        use crate::quality::{attempt, case_material, persist};
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/fred-claim-recovery-tests")
+            .join(RunId::new().0);
+        let store = Store::open(root).unwrap();
+        let (runtime, attempt) = attempt(
+            &store,
+            RESEARCH_SYNTHESIZER_RECIPE_ID,
+            "FRED recovery fixture",
+        )
+        .unwrap();
+        let persist = |kind, producer, payload: &Value, refs| {
+            let artifact = persist(&store, &attempt.permit, kind, producer, payload, refs).unwrap();
+            ArtifactRef {
+                artifact_id: artifact.artifact_id,
+                kind,
+            }
+        };
+        let price = persist(
+            ArtifactKind::NormalizedEvidence,
+            "evidence.normalize",
+            &json!({"source":"alpaca","resource":"bars:QQQ:2026-09-01:2026-09-15:1Day",
+                "quality":{"citations_complete":true},"value":{}}),
+            vec![],
+        );
+        let fred = persist(
+            ArtifactKind::NormalizedEvidence,
+            "evidence.normalize",
+            &json!({"source":"fred","resource":"series:DFII10:2026-09-01:2026-09-15:2026-09-15",
+                "quality":{"citations_complete":true},"value":{"realtime_start":"2026-09-15",
+                    "realtime_end":"2026-09-15","offset":0,"limit":1000,"count":0,"observations":[]}}),
+            vec![],
+        );
+        let soxx_price = persist(
+            ArtifactKind::NormalizedEvidence,
+            "evidence.normalize",
+            &json!({"source":"alpaca","resource":"bars:SOXX:2026-09-01:2026-09-15:1Day",
+                "quality":{"citations_complete":true},"value":{}}),
+            vec![],
+        );
+        let usable_fred = persist(
+            ArtifactKind::NormalizedEvidence,
+            "evidence.normalize",
+            &json!({"source":"fred","resource":"series:DFF:2026-09-01:2026-09-15:2026-09-15",
+            "quality":{"citations_complete":true},"value":{"realtime_start":"2026-09-15",
+                "realtime_end":"2026-09-15","offset":0,"limit":1000,"count":1,"observations":[{
+                    "date":"2026-09-14","value":"4","realtime_start":"2026-09-15","realtime_end":"2026-09-15"
+                }]}}),
+            vec![],
+        );
+        let (_, mut claims, mut critiques) = fixture();
+        let claim = &mut claims[0].1;
+        claim.grounds[0].evidence = price.clone();
+        claim.grounds[1].evidence = fred.clone();
+        claim.grounds[1].assets.insert(Asset::Soxx);
+        claim.grounds.extend([
+            akzio_domain::EvidenceGround {
+                evidence: soxx_price.clone(),
+                assets: BTreeSet::from([Asset::Soxx]),
+                ..claim.grounds[0].clone()
+            },
+            akzio_domain::EvidenceGround {
+                evidence: usable_fred.clone(),
+                assets: BTreeSet::from([Asset::Soxx]),
+                ..claim.grounds[1].clone()
+            },
+        ]);
+        let claim_payload = serde_json::to_value(&claim).unwrap();
+        let claim_ref = persist(
+            ArtifactKind::Claim,
+            "agent.research.analyst",
+            &claim_payload,
+            claim.source_refs(),
+        );
+        let critique = &mut critiques[0];
+        critique.target = claim_ref.clone();
+        critique.grounds.clone_from(&claim.grounds);
+        critique.supporting_refs[0].evidence = price.clone();
+        for evidence in [&fred, &soxx_price, &usable_fred] {
+            let mut support = critique.supporting_refs[0].clone();
+            support.evidence = evidence.clone();
+            critique.supporting_refs.push(support);
+        }
+        let critique_payload = serde_json::to_value(&critique).unwrap();
+        let critique_ref = persist(
+            ArtifactKind::Critique,
+            "agent.research.critic",
+            &critique_payload,
+            critique.source_refs(),
+        );
+        let now = Utc::now();
+        let contract = &runtime
+            .catalogue
+            .contracts()
+            .find(|item| item.contract.purpose.as_str() == RESEARCH_SYNTHESIZER_RECIPE_ID)
+            .unwrap()
+            .contract;
+        let qualified_evidence = [&price, &soxx_price, &usable_fred];
+        let expected_refs = qualified_evidence
+            .into_iter()
+            .chain([&fred, &claim_ref, &critique_ref])
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let manifest = runtime
+            .context
+            .assemble(
+                &attempt.permit,
+                contract,
+                &akzio_domain::ContextQueryScope::for_node(&attempt.node),
+                expected_refs.iter().cloned(),
+                now,
+                Duration::minutes(5),
+            )
+            .unwrap();
+        let validate = |kind, payload: &Value| {
+            research_output_source_refs(&store, kind, payload, &manifest, now, contract.version)
+        };
+        let (mut proposal, _) = case_material(0, &price);
+        proposal["claims"] = json!([claim_ref]);
+        proposal["critiques"] = json!([critique_ref]);
+        proposal["evidence"] = json!([price, soxx_price, usable_fred, fred]);
+
+        let accepted_refs = validate(ArtifactKind::DecisionProposal, &proposal).unwrap();
+        assert_eq!(
+            accepted_refs.into_iter().collect::<BTreeSet<_>>(),
+            expected_refs
+        );
+        let stored = store.artifact(&claim_ref.artifact_id).unwrap();
+        let stored_claim: ResearchClaim =
+            serde_json::from_slice(&store.read_blob(&stored.blob).unwrap()).unwrap();
+        assert_eq!(&stored_claim, claim);
+
+        let mut missing_fred = proposal.clone();
+        missing_fred["evidence"] = json!(qualified_evidence);
+        let error = validate(ArtifactKind::DecisionProposal, &missing_fred).unwrap_err();
+        let error = error.to_string();
+        assert!(
+            error.contains("evidence does not close over claim/critique grounds"),
+            "{error}"
+        );
+        assert!(error.contains(&fred.artifact_id.to_string()), "{error}");
+
+        let mut directional: DecisionDraft = serde_json::from_value(proposal).unwrap();
+        let neutral_forecasts = directional.forecasts.clone();
+        let set_direction = |draft: &mut DecisionDraft, asset| {
+            let forecast = draft
+                .forecasts
+                .iter_mut()
+                .find(|f| f.asset == asset && f.horizon == DecisionHorizon::T1)
+                .unwrap();
+            forecast.positive_return_probability_ppm = 700_000;
+            forecast.expected_return_ppm = 10_000;
+        };
+        let validate_proposal = |draft: &DecisionDraft| {
+            validate(
+                ArtifactKind::DecisionProposal,
+                &serde_json::to_value(draft).unwrap(),
+            )
+        };
+        set_direction(&mut directional, Asset::Qqq);
+        let error = validate_proposal(&directional).unwrap_err();
+        assert!(matches!(error, ResearchError::InvalidOutput(message)
+            if message == akzio_domain::DomainError::InsufficientDecisionEvidence.to_string()));
+
+        directional.forecasts = neutral_forecasts;
+        set_direction(&mut directional, Asset::Soxx);
+        allocate(&mut directional, Asset::Soxx);
+        validate_proposal(&directional).unwrap();
+        let soxx = directional
+            .research_allocation
+            .as_mut()
+            .unwrap()
+            .allocations
+            .iter_mut()
+            .find(|row| row.asset == Asset::Soxx)
+            .unwrap();
+        soxx.evidence_refs = vec![fred];
+        let error = validate_proposal(&directional).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("allocation must cite its Rust-eligible Claim"),
+            "{error}"
+        );
+
+        let error = validate(ArtifactKind::Claim, &claim_payload).unwrap_err();
+        assert!(
+            error.to_string().contains("fred_no_usable_observations"),
+            "{error}"
+        );
+        let mut descriptive_critique = critique_payload;
+        descriptive_critique["grounds"][1]["role"] = json!("descriptive");
+        descriptive_critique["grounds"][1]["assets"] = json!([]);
+        descriptive_critique["grounds"][1]["domain"] = Value::Null;
+        let error = validate(ArtifactKind::Critique, &descriptive_critique).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot appear in supporting_refs (fred_no_usable_observations)"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1278,7 +1565,7 @@ summary: "research only".to_owned(),
         // 正确 T1/正收益/同一 claim 可通过；期限错配、中性 forecast、无关引用、缺失 claim
         // 或 bearish stance 都必须阻断非零 allocation。
         let (mut draft, mut claims, critiques) = fixture();
-        allocate_qqq(&mut draft);
+        allocate(&mut draft, Asset::Qqq);
         assert!(validate_research_allocation_sufficiency(&draft, &claims, &critiques).is_ok());
         let mut wrong_horizon = draft.clone();
         wrong_horizon
@@ -1349,6 +1636,87 @@ fn validate_supplemental_resources(gaps: &[akzio_domain::EvidenceGap]) -> Resear
 #[cfg(test)]
 mod review_submission_tests {
     use super::*;
+    /// WHY THIS TEST EXISTS (Task #15): citations and a matching FRED envelope cannot grant direction to an unusable series.
+    /// Do not weaken or delete this assertion.
+    #[test]
+    fn macro_direction_requires_usable_fred_rows() {
+        let resource = "series:DFII10:2026-09-01:2026-09-15:2026-09-15";
+        let mut ground: akzio_domain::EvidenceGround = serde_json::from_value(json!({
+            "evidence":{"artifact_id":"fixture-fred-rows","kind":"normalized_evidence"},
+            "role":"directional","domain":"macro","assets":["QQQ"],"support":"fixture macro level"
+        }))
+        .unwrap();
+        let row = |value: &str| {
+            json!({"date":"2026-09-02","value":value,
+            "realtime_start":"2026-09-15","realtime_end":"2026-09-15"})
+        };
+        let envelope = |rows: Vec<Value>, count: usize| {
+            json!({"realtime_start":"2026-09-15",
+            "realtime_end":"2026-09-15","offset":0,"limit":1000,"count":count,"observations":rows})
+        };
+        let normalized = |vendor: &Value| {
+            let (value, quality) = akzio_ingest::FredDirectTransport::normalize_response(
+                resource,
+                &serde_json::to_vec(vendor).unwrap(),
+            )
+            .unwrap();
+            json!({"source":"fred","resource":resource,"value":value,"quality":quality})
+        };
+        let known = envelope(vec![row("0")], 1);
+        let missing = normalized(&envelope(vec![row(".")], 1));
+        let empty = normalized(&envelope(vec![], 0));
+        let truncated = normalized(&envelope(vec![row("0")], 2));
+        let mut missing_page = known.clone();
+        for field in ["count", "offset", "limit"] {
+            missing_page.as_object_mut().unwrap().remove(field);
+        }
+        let unreported = normalized(&missing_page);
+        assert!(validate_claim_ground_payload(
+            &ground,
+            &normalized(&known),
+            ACTIVE_CONTRACT_VERSION
+        )
+        .is_ok());
+        for (payload, reason) in [
+            (&missing, "fred_no_usable_observations"),
+            (&empty, "fred_no_usable_observations"),
+            (&truncated, "fred_observation_page_truncated"),
+            (&unreported, "fred_observation_pagination_unreported"),
+        ] {
+            let error = validate_claim_ground_payload(&ground, payload, ACTIVE_CONTRACT_VERSION)
+                .unwrap_err();
+            assert!(error.to_string().contains(reason), "{error}");
+        }
+
+        // Older direct captures already contain the untouched vendor observation rows.
+        let legacy = |value: Value| {
+            json!({"source":"fred","resource":resource,"value":value,
+            "quality":{"citations_complete":true}})
+        };
+        let mut ordinary_missing = row(".");
+        ordinary_missing["date"] = json!("2026-09-03");
+        let known_with_ordinary_missing = legacy(envelope(vec![row("0"), ordinary_missing], 2));
+        assert!(validate_claim_ground_payload(
+            &ground,
+            &known_with_ordinary_missing,
+            ACTIVE_CONTRACT_VERSION
+        )
+        .is_ok());
+        let uncertain = legacy(json!({"observations":[row("0")]}));
+        assert!(
+            validate_claim_ground_payload(&ground, &uncertain, ACTIVE_CONTRACT_VERSION).is_err()
+        );
+        let malformed = legacy(envelope(vec![row("NaN")], 1));
+        assert!(
+            validate_claim_ground_payload(&ground, &malformed, ACTIVE_CONTRACT_VERSION).is_err()
+        );
+        ground.role = EvidenceGroundRole::Descriptive;
+        ground.domain = None;
+        ground.assets.clear();
+        assert!(validate_claim_ground_payload(&ground, &missing, ACTIVE_CONTRACT_VERSION).is_ok());
+    }
+
+
     #[test]
     fn model_review_and_complete_citations_do_not_grant_news_direction() {
         // citations_complete/model_reviewed 只能证明 payload 形状或模型审查状态；方向性资格

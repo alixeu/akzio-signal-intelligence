@@ -64,6 +64,7 @@ pub mod evaluation;
 pub mod event;
 pub mod execution;
 pub mod experiment;
+pub mod fred_observations;
 pub mod ids;
 pub mod instrument_evidence;
 pub mod lesson;

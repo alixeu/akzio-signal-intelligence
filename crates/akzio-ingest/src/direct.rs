@@ -368,37 +368,26 @@ impl FredDirectTransport {
         Ok((request_url, public_url, kind))
     }
 
-    async fn acquire_inner(
-        &self,
-        source: EvidenceSource,
+    /// Decode a FRED response against the same governed resource used for its request.
+    pub fn normalize_response(
         resource: &str,
-    ) -> Result<AcquiredEvidence, EvidenceAdapterError> {
-        // FRED 流程在请求中加入 key，读取后验证 JSON kind/vintage/release window，再以不含
-        // key 的 public_url 写入 provenance，避免凭据进入 Artifact source_uri。
-        if source != EvidenceSource::Fred {
-            return Err(EvidenceAdapterError::SourceMismatch);
-        }
-        let (mut request_url, public_url, kind) = Self::request_for(resource)?;
-        request_url
-            .query_pairs_mut()
-            .append_pair("api_key", &self.api_key);
-        self.gate.wait().await;
-        let response = self
-            .client
-            .get(request_url)
-            .send()
-            .await
-            .map_err(|_| EvidenceAdapterError::Transport("FRED request failed".to_owned()))?;
-        crate::runtime::classify_evidence_response(&response)?;
-        let body = response
-            .bytes()
-            .await
-            .map_err(|_| EvidenceAdapterError::Transport("FRED response read failed".to_owned()))?;
-        let mut normalized: Value = serde_json::from_slice(&body)
+        body: &[u8],
+    ) -> Result<(Value, EvidenceQuality), EvidenceAdapterError> {
+        let mut normalized: Value = serde_json::from_slice(body)
             .map_err(|_| EvidenceAdapterError::DataQuality("invalid FRED JSON".to_owned()))?;
-        validate_fred_payload(kind, &normalized)?;
         let governed = GovernedResource::parse(EvidenceSource::Fred, resource)
             .map_err(|_| EvidenceAdapterError::DataQuality("invalid FRED resource".to_owned()))?;
+        let kind = match &governed {
+            GovernedResource::Fred { .. } => FredPayloadKind::Observations,
+            GovernedResource::FredVintages { .. } => FredPayloadKind::Vintages,
+            GovernedResource::FredReleaseCalendar { .. } => FredPayloadKind::ReleaseCalendar,
+            _ => {
+                return Err(EvidenceAdapterError::DataQuality(
+                    "invalid FRED resource".to_owned(),
+                ))
+            }
+        };
+        validate_fred_payload(kind, &normalized)?;
         if let GovernedResource::Fred {
             vintage: Some(vintage),
             ..
@@ -427,6 +416,41 @@ impl FredDirectTransport {
                     .is_some_and(|date| (*window_start..=*window_end).contains(&date))
             });
         }
+        let quality = if kind == FredPayloadKind::Observations {
+            crate::fred_observations::normalize_observations(&governed, &mut normalized)?
+        } else {
+            EvidenceQuality::default()
+        };
+        Ok((normalized, quality))
+    }
+
+    async fn acquire_inner(
+        &self,
+        source: EvidenceSource,
+        resource: &str,
+    ) -> Result<AcquiredEvidence, EvidenceAdapterError> {
+        // FRED 流程在请求中加入 key，读取后验证 JSON kind/vintage/release window，再以不含
+        // key 的 public_url 写入 provenance，避免凭据进入 Artifact source_uri。
+        if source != EvidenceSource::Fred {
+            return Err(EvidenceAdapterError::SourceMismatch);
+        }
+        let (mut request_url, public_url, _) = Self::request_for(resource)?;
+        request_url
+            .query_pairs_mut()
+            .append_pair("api_key", &self.api_key);
+        self.gate.wait().await;
+        let response = self
+            .client
+            .get(request_url)
+            .send()
+            .await
+            .map_err(|_| EvidenceAdapterError::Transport("FRED request failed".to_owned()))?;
+        crate::runtime::classify_evidence_response(&response)?;
+        let body = response
+            .bytes()
+            .await
+            .map_err(|_| EvidenceAdapterError::Transport("FRED response read failed".to_owned()))?;
+        let (normalized, quality) = Self::normalize_response(resource, &body)?;
         let observed_at = Utc::now();
         let source_uri = public_url.to_string();
         Ok(AcquiredEvidence {
@@ -444,7 +468,7 @@ impl FredDirectTransport {
                 dedupe_key: format!("fred:{}", ContentHash::of_bytes(&body)),
                 citations: vec![],
             },
-            quality: EvidenceQuality::default(),
+            quality,
         })
     }
 }
@@ -590,6 +614,72 @@ mod tests {
         // FRED 生产构造器同样不能把 key 跟随重定向泄露到未知 host。
         let transport = FredDirectTransport::new("offline-fixture-key").unwrap();
         assert_direct_client_rejects_redirect(transport.client).await;
+    }
+
+    /// WHY THIS TEST EXISTS (Task #15): a matching FRED envelope can still contain unusable rows.
+    /// Do not weaken or delete this assertion.
+    #[test]
+    fn fred_observation_response_reports_usable_coverage() {
+        let resource = "series:DFII10:2026-09-01:2026-09-15:2026-09-15";
+        let row = |date: &str, value: Value| json!({"date":date,"value":value,"realtime_start":"2026-09-12","realtime_end":"2026-09-16"});
+        let rows = [
+            row("2026-09-03", json!("1.25")),
+            row("2026-09-02", json!("0")),
+            row("2026-09-04", json!(".")),
+            row("2026-09-06", json!("NaN")),
+            row("2026-09-07", json!("1e9999")),
+            row("2026-09-08", json!("3.25")),
+            row("2026-09-08", json!("4.50")),
+            row("2026-09-16", json!("9.00")),
+            json!({"date":"2026-09-10","value":"7.00","realtime_start":"2026-09-16","realtime_end":"2026-09-16"}),
+            json!({"date":"2026-09-11","realtime_start":"2026-09-15","realtime_end":"2026-09-15"}),
+            row("2026-09-12", json!(9)),
+            row("2026-02-30", json!("9")),
+        ];
+        let response = |rows: &[Value], count: usize| {
+            serde_json::to_vec(
+                &json!({"realtime_start":"2026-09-15","realtime_end":"2026-09-15",
+                "count":count,"offset":0,"limit":1000,"observations":rows}),
+            )
+            .unwrap()
+        };
+        let (mixed, quality) =
+            FredDirectTransport::normalize_response(resource, &response(&rows, rows.len()))
+                .unwrap();
+        assert_eq!(mixed["observations"], json!([rows[1], rows[0]]));
+        assert_eq!(quality.completeness_ppm, 166_666);
+        assert_eq!(
+            mixed["observation_quality"],
+            json!({"version":1,"raw_rows":12,"usable_rows":2,
+            "missing_rows":2,"malformed_rows":4,"duplicate_rows":2,"out_of_window_rows":1,
+            "wrong_vintage_rows":1,"out_of_order_rows":2,"pagination":"complete"})
+        );
+        let (partial, _) =
+            FredDirectTransport::normalize_response(resource, &response(&rows, rows.len() + 1))
+                .unwrap();
+        assert_eq!(partial["observation_quality"]["pagination"], "truncated");
+        assert_eq!(crate::fred_series_direction_gap(resource, &mixed), None);
+        let only_known = &rows[0..1];
+        let unreported = serde_json::to_vec(&json!({"realtime_start":"2026-09-15",
+            "realtime_end":"2026-09-15","observations":only_known}))
+        .unwrap();
+        let (unreported, _) =
+            FredDirectTransport::normalize_response(resource, &unreported).unwrap();
+        assert_eq!(
+            unreported["observation_quality"]["pagination"],
+            "unreported"
+        );
+        let (invalid_page, _) =
+            FredDirectTransport::normalize_response(resource, &response(only_known, 0)).unwrap();
+        assert_eq!(invalid_page["observation_quality"]["pagination"], "invalid");
+        for (input, missing) in [(&rows[0..0], 0), (&rows[2..3], 1)] {
+            let (normalized, quality) =
+                FredDirectTransport::normalize_response(resource, &response(input, input.len()))
+                    .unwrap();
+            assert_eq!(quality.completeness_ppm, 0);
+            assert_eq!(normalized["observations"], json!([]));
+            assert_eq!(normalized["observation_quality"]["missing_rows"], missing);
+        }
     }
 
     #[test]

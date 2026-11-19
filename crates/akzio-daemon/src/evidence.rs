@@ -129,8 +129,27 @@ impl Daemon {
                 });
                 let status = match result {
                     Ok(bundle) => {
+                        let status = if need.source_family == "fred"
+                            && need.resource.starts_with("series:")
+                        {
+                            let payload: NormalizedEvidencePayload = serde_json::from_slice(
+                                &self.store.read_blob(&bundle.2.normalized.blob)?,
+                            )?;
+                            match akzio_ingest::fred_series_direction_gap(
+                                &payload.resource,
+                                &payload.value,
+                            ) {
+                                Some(reason) => ("unavailable", reason),
+                                None if payload.quality.completeness_ppm < 1_000_000 => {
+                                    ("available", "fred_observation_row_losses")
+                                }
+                                None => ("available", "none"),
+                            }
+                        } else {
+                            ("available", "none")
+                        };
                         acquisitions.push(bundle);
-                        ("available", "none")
+                        status
                     }
                     Err(
                         error @ DaemonError::Evidence(

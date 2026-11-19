@@ -84,6 +84,8 @@ impl ContextBroker {
             ledger.push(metadata);
         }
 
+        project_fred_claim_scope(&mut must_read);
+
         // task_contract 同时描述角色、Context policy、可用工具和两类预算；provider 的累计
         // Task token 用量与 Context 字节/Token 上限分开呈现。下方 budget_semantics
         // 字符串是既有模型输入，不能把其中的 Attempt 字样当成重试后重新拨款。
@@ -505,6 +507,13 @@ fn compact_governed_projection(kind: ArtifactKind, value: Value) -> Value {
             return option_chain_projection(value);
         }
         let mut summary = value.get("value").cloned().unwrap_or(Value::Null);
+        let mut time_basis = value["time_basis"].clone();
+        if value["source"] == "fred"
+            && summary.get("observation_quality").is_none()
+            && value["resource"].as_str().is_some_and(|resource| resource.starts_with("series:"))
+        {
+            project_legacy_fred_observations(&value, &mut summary, &mut time_basis);
+        }
         if let Some(object) = summary.as_object_mut() {
             for key in ["bars", "observations"] {
                 if let Some(rows) = object.get_mut(key).and_then(Value::as_array_mut) {
@@ -522,9 +531,15 @@ fn compact_governed_projection(kind: ArtifactKind, value: Value) -> Value {
             compact_fund_holdings(object);
         }
         let mut projected = serde_json::json!({"projection_version":1,"source":value["source"],
-            "resource":value["resource"],"time_basis":value["time_basis"],"quality":value["quality"],
+            "resource":value["resource"],"time_basis":time_basis,"quality":value["quality"],
             "quant_features":value["quant_features"],"value_summary":summary,
             "full_document":"read_document or read_range using the metadata document_id"});
+        if value["source"] == "fred" {
+            let resource = value["resource"].as_str().unwrap_or_default();
+            if let Some(reason) = akzio_domain::fred_observations::fred_series_direction_gap(resource, &value["value"]) {
+                projected["fred_directional_gap"] = serde_json::json!(reason);
+            }
+        }
         abbreviate_narrative(&mut projected);
         return projected;
     }
@@ -554,6 +569,51 @@ fn compact_governed_projection(kind: ArtifactKind, value: Value) -> Value {
         abbreviate_narrative(&mut value);
     }
     value
+}
+
+fn project_fred_claim_scope(documents: &mut [ContextMustReadDocument]) {
+    let unqualified = documents
+        .iter()
+        .filter(|document| {
+            document.metadata.kind == ArtifactKind::NormalizedEvidence
+                && document.value["source"] == "fred"
+                && document.value["fred_directional_gap"].is_string()
+        })
+        .map(|document| document.metadata.document_id.0.as_str().to_owned())
+        .collect::<BTreeSet<_>>();
+    if unqualified.is_empty() {
+        return;
+    }
+    for document in documents.iter_mut().filter(|d| d.metadata.kind == ArtifactKind::Claim) {
+        let Some(grounds) = document.value["grounds"].as_array_mut() else { continue };
+        for ground in grounds {
+            let Some(id) = ground.pointer("/evidence/artifact_id").and_then(Value::as_str) else { continue };
+            if unqualified.contains(id) {
+                ground["role"] = serde_json::json!("descriptive");
+                ground["assets"] = serde_json::json!([]);
+                ground["domain"] = Value::Null;
+            }
+        }
+    }
+}
+
+fn project_legacy_fred_observations(value: &Value, summary: &mut Value, time_basis: &mut Value) {
+    let Some(object) = summary.as_object_mut() else { return };
+    let resource = value["resource"].as_str().unwrap_or_default();
+    let rows = if let Some((rows, quality)) =
+        akzio_domain::fred_observations::legacy_fred_observations(resource, &value["value"])
+    {
+        object.insert("observation_quality".to_owned(), serde_json::json!(quality));
+        rows
+    } else {
+        Vec::new()
+    };
+    if let Some(basis) = time_basis.as_object_mut() {
+        let event_time = rows.last().and_then(|row| row["date"].as_str())
+            .map(|date| format!("{date}T00:00:00Z"));
+        basis.insert("event_time".to_owned(), serde_json::json!(event_time));
+    }
+    object.insert("observations".to_owned(), Value::Array(rows.into_iter().cloned().collect()));
 }
 
 /// Column name fragments that identify a holdings row's portfolio weight, in
@@ -959,6 +1019,79 @@ fn abbreviate_narrative(value: &mut Value) {
 mod compact_context_tests {
     // 测试职责：验证 coverage closure、producer scope 和 metadata/事实去重，不创建真实 Agent 或 Paper 状态。
     use super::*;
+    /// WHY THIS TEST EXISTS (Task #15): a FRED projection must preserve series coverage while showing only the latest known observations.
+    /// Do not weaken or delete this assertion.
+    #[test]
+    fn fred_projection_preserves_coverage_with_latest_five_observations() {
+        let observations = (1..=6)
+            .map(|day| serde_json::json!({"date":format!("2026-09-{day:02}"),"value":day.to_string()}))
+            .collect::<Vec<_>>();
+        let quality = serde_json::json!({"version":1,"raw_rows":8,"usable_rows":6,"missing_rows":1,
+            "malformed_rows":1,"duplicate_rows":0,"out_of_window_rows":0,"wrong_vintage_rows":0,
+            "out_of_order_rows":0,"pagination":"complete"});
+        let time_basis = serde_json::json!({"vintage":"2026-09-15","event_time":"2026-09-06T00:00:00Z"});
+        let projected = compact_governed_projection(ArtifactKind::NormalizedEvidence, serde_json::json!({
+            "source":"fred","resource":"series:DFII10:2026-09-01:2026-09-15:2026-09-15",
+            "quality":{"completeness_ppm":750_000},"time_basis":time_basis,
+            "value":{"observations":observations,"observation_quality":quality}
+        }));
+        assert_eq!(projected["value_summary"]["observation_quality"], quality);
+        assert_eq!(projected["value_summary"]["observations"], serde_json::json!(observations[1..]));
+        assert_eq!(projected["value_summary"]["observations_projection"]["original_count"], 6);
+        assert_eq!(projected["quality"]["completeness_ppm"], 750_000);
+        assert_eq!(projected["time_basis"], time_basis);
+    }
+
+    /// WHY THIS TEST EXISTS (Task #15): old FRED missing rows can hide an authorized value and move its shown event date.
+    /// Do not weaken or delete this assertion.
+    #[test]
+    fn legacy_fred_projection_shows_latest_known_value_and_actual_event_date() {
+        let known = serde_json::json!({"date":"2026-09-01","value":"1.25",
+            "realtime_start":"2026-09-15","realtime_end":"2026-09-15"});
+        let mut observations = vec![known.clone()];
+        observations.extend((2..=6).map(|day| serde_json::json!({"date":format!("2026-09-{day:02}"),"value":".",
+            "realtime_start":"2026-09-15","realtime_end":"2026-09-15"})));
+        let stored = serde_json::json!({"source":"fred","resource":"series:DFII10:2026-09-01:2026-09-15:2026-09-15",
+            "time_basis":{"vintage":"2026-09-15","event_time":"2026-09-06T00:00:00Z"},
+            "value":{"realtime_start":"2026-09-15","realtime_end":"2026-09-15","count":6,"offset":0,"limit":1000,
+                "observations":observations}});
+        let projected = compact_governed_projection(ArtifactKind::NormalizedEvidence, stored.clone());
+        assert_eq!(projected["value_summary"]["observations"], serde_json::json!([known]));
+        assert_eq!(projected["time_basis"]["event_time"], "2026-09-01T00:00:00Z");
+        assert_eq!(stored["time_basis"]["event_time"], "2026-09-06T00:00:00Z");
+        assert_eq!(stored["value"]["observations"].as_array().unwrap().len(), 6);
+        assert_eq!(projected["fred_directional_gap"], Value::Null);
+    }
+
+    /// WHY THIS TEST EXISTS (Task #15): a recovered Claim keeps its exact FRED reference without advertising a weak series as directional.
+    /// Do not weaken or delete this assertion.
+    #[test]
+    fn legacy_fred_claim_projection_keeps_the_reference_without_direction() {
+        let hash = content_hash_json(&serde_json::json!("legacy-fred")).unwrap();
+        let evidence = ArtifactRef { artifact_id: ArtifactId(hash.clone()), kind: ArtifactKind::NormalizedEvidence };
+        let metadata = ContextDocumentMetadata { document_id: evidence.artifact_id.clone(), kind: evidence.kind,
+            source:"fred".into(), observed_at:None, published_at:None, estimated_tokens:1, relevance:1,
+            reason:"required".into(), must_read:true, read_grant_identity:hash.clone() };
+        let series = compact_governed_projection(ArtifactKind::NormalizedEvidence, serde_json::json!({
+            "source":"fred","resource":"series:DFII10:2026-09-01:2026-09-15:2026-09-15",
+            "value":{"realtime_start":"2026-09-15","realtime_end":"2026-09-15","count":0,"offset":0,"limit":1000,"observations":[]}
+        }));
+        let mut claim_metadata = metadata.clone();
+        claim_metadata.document_id = ArtifactId(content_hash_json(&serde_json::json!("claim-fixture")).unwrap());
+        claim_metadata.kind = ArtifactKind::Claim;
+        let claim = serde_json::json!({"horizon":"t3","grounds":[{"evidence":evidence,
+            "role":"directional","assets":["QQQ"],"domain":"macro","support":"old descriptive value"}]});
+        let mut docs = [ContextMustReadDocument{class:"claim".into(),metadata:claim_metadata,value:claim.clone()},
+            ContextMustReadDocument{class:"evidence".into(),metadata,value:series}];
+        project_fred_claim_scope(&mut docs);
+        let ground = &docs[0].value["grounds"][0];
+        assert_eq!(ground["evidence"], serde_json::json!(evidence));
+        assert_eq!(ground["role"], "descriptive");
+        assert_eq!(ground["assets"], serde_json::json!([]));
+        assert_eq!(ground["domain"], Value::Null);
+        assert_eq!(claim["grounds"][0]["role"], "directional");
+    }
+
     // 测试无参数并以断言为输出，使用内存中的 ContextMaterialization 检查精确 evidence 闭包。
     #[test]
     fn synthesizer_matrix_lists_exact_selected_evidence_closure() {
