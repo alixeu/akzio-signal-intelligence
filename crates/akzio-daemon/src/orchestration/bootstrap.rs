@@ -243,6 +243,8 @@ impl Daemon {
             paper: DaemonPaperState {
                 paper_broker: None,
                 session_clock: None,
+                #[cfg(test)]
+                fixture_session_clock: None,
                 scheduler,
                 auto_paper: config.auto_paper,
                 runtime_identity_hash: config.runtime_identity_hash,

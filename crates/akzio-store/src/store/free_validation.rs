@@ -304,6 +304,18 @@ CREATE TABLE IF NOT EXISTS rebuild_session_slots (
     commitment_artifact_id TEXT REFERENCES rebuild_artifacts(artifact_id),
     committed_at TEXT
 );
+-- Optional launch lookup data. Trading, ownership and approval do not read this table.
+CREATE TABLE IF NOT EXISTS rebuild_paper_launch_requests_v1 (
+    request_id TEXT PRIMARY KEY NOT NULL CHECK (
+        length(request_id) = 36 AND length(replace(request_id, '-', '')) = 32
+        AND substr(request_id, 9, 1) = '-' AND substr(request_id, 14, 1) = '-'
+        AND substr(request_id, 19, 1) = '-' AND substr(request_id, 24, 1) = '-'
+        AND substr(request_id, 15, 1) = '4' AND substr(request_id, 20, 1) IN ('8','9','a','b')
+        AND request_id NOT GLOB '*[^0-9a-f-]*'
+    ),
+    session_key TEXT NOT NULL,
+    recorded_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS rebuild_paper_approval_consumptions (
     approval_artifact_id TEXT PRIMARY KEY REFERENCES rebuild_artifacts(artifact_id),
     runtime_manifest_artifact_id TEXT NOT NULL REFERENCES rebuild_artifacts(artifact_id),

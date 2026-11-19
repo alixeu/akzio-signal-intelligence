@@ -37,6 +37,10 @@ pub const SCHEDULER_LEASE_NAME: &str = "akzio.local.scheduler";
 
 #[derive(Debug, Error)]
 pub enum SchedulerError {
+    #[error("Paper launch request is already bound to a session")]
+    PaperLaunchRequestAlreadyBound,
+    #[error("Paper launch request binding is unavailable")]
+    PaperLaunchRequestBinding(#[source] Box<SchedulerError>),
     #[error("Paper reservation result is unknown; inspect the original session before retrying")]
     SubmissionUnknown {
         run_id: Option<RunId>,

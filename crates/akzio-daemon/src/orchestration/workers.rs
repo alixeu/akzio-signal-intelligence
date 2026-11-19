@@ -199,12 +199,12 @@ impl Daemon {
 
     pub(crate) fn prepare_position_plan(
         &self,
+        run_id: RunId,
         session_key: &str,
         now: DateTime<Utc>,
     ) -> Result<(akzio_store::WorkflowCommit, Vec<Artifact>)> {
         // 准备四十项 session Need 后按 criticality 保留研究侧 34 项，过滤 ExecutionSafety；
         // 这些 Artifact 与 graph 暂时只作为返回值，调用方再用 Store commit 一起发布。
-        let run_id = RunId::new();
         let setup = self
             .paper
             .scheduler

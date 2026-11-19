@@ -34,6 +34,8 @@ impl Daemon {
     pub(crate) async fn submit_formal_run(
         &self,
         purpose: RunPurpose,
+        requested_run_id: Option<RunId>,
+        paper_request_id: Option<uuid::Uuid>,
         source: &'static str,
     ) -> std::result::Result<FormalRunSubmission, FormalRunLaunchError> {
         let task = {
@@ -44,7 +46,11 @@ impl Daemon {
                 return Err(DaemonError::Unavailable("Core is shutting down".into()).into());
             }
             let daemon = self.clone();
-            tracker.spawn(async move { daemon.launch_formal_run(purpose, source).await })
+            tracker.spawn(async move {
+                daemon
+                    .launch_formal_run(purpose, requested_run_id, paper_request_id, source)
+                    .await
+            })
         };
         task.await.map_err(|_| FormalRunLaunchError::Unknown {
             run_id: None,
@@ -66,6 +72,8 @@ impl Daemon {
     pub(crate) async fn launch_formal_run(
         &self,
         purpose: RunPurpose,
+        requested_run_id: Option<RunId>,
+        paper_request_id: Option<uuid::Uuid>,
         source: &'static str,
     ) -> std::result::Result<FormalRunSubmission, FormalRunLaunchError> {
         self.ensure_run_log_ready()?;
@@ -90,18 +98,31 @@ impl Daemon {
                     .execute(
                         move |store| -> std::result::Result<_, FormalRunLaunchError> {
                             operation.ensure_run_log_ready()?;
+                            if let Some(id) = &requested_run_id {
+                                match store.run_purpose(id) {
+                                    Ok(_) => {
+                                        return Err(DaemonError::InvalidInput(
+                                            "requested_run_id already exists; inspect the original Run".into(),
+                                        ).into());
+                                    }
+                                    Err(StoreError::MissingRun(_)) => {}
+                                    Err(error) => return Err(DaemonError::from(error).into()),
+                                }
+                            }
                             let now = Utc::now();
                             let session = now
                                 .with_timezone(&chrono_tz::America::New_York)
                                 .date_naive()
                                 .to_string();
+                            let run_id = requested_run_id.unwrap_or_default();
                             let (workflow, setup) =
-                                operation.prepare_position_plan(&session, now)?;
+                                operation.prepare_position_plan(run_id, &session, now)?;
                             if let Err(error) = store.commit_position_plan(&workflow, &setup) {
                                 return Err(FormalRunLaunchError::Unknown {
                                     run_id: store
                                         .workflow_snapshot(&workflow.run.run_id)
                                         .ok()
+                                        .filter(|snapshot| snapshot.run.purpose == RunPurpose::PositionPlan)
                                         .map(|snapshot| snapshot.run.run_id),
                                     error: Box::new(error.into()),
                                 });
@@ -117,7 +138,14 @@ impl Daemon {
                 (run_id, true)
             }
             RunPurpose::Paper => {
-                let clock = self.paper.session_clock.as_ref().ok_or_else(|| {
+                let clock = self
+                    .paper
+                    .session_clock
+                    .as_ref()
+                    .map(|clock| clock as &dyn BrokerSessionClock);
+                #[cfg(test)]
+                let clock = self.paper.fixture_session_clock.as_deref().or(clock);
+                let clock = clock.ok_or_else(|| {
                     DaemonError::InvalidInput(
                         "完整模式尚未启用：配置 daemon.manual_paper=true 后重启 Core".into(),
                     )
@@ -131,7 +159,12 @@ impl Daemon {
                 let reservation = self
                     .paper
                     .scheduler
-                    .tick(clock, &self.paper_workflow_source(), Utc::now())
+                    .tick_with_request(
+                        clock,
+                        &self.paper_workflow_source(),
+                        Utc::now(),
+                        paper_request_id,
+                    )
                     .await
                     .map_err(classify_scheduler_error)?
                     .ok_or_else(|| {

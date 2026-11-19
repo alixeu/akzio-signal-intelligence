@@ -88,6 +88,9 @@ impl Daemon {
             },
             store_scope: store_scope.to_owned(),
             formal_run_bundle_supported: store_scope == "canonical",
+            position_plan_requested_run_id_supported: store_scope == "canonical",
+            paper_launch_request_lookup_supported: store_scope == "canonical"
+                && self.store.paper_launch_request_lookup_supported()?,
             run_log_ready: self
                 .run_log
                 .as_ref()

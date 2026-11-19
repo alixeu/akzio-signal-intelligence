@@ -83,7 +83,7 @@ impl Daemon {
             .with_timezone(&chrono_tz::America::New_York)
             .date_naive()
             .to_string();
-        let (workflow, setup) = self.prepare_position_plan(&session, now)?;
+        let (workflow, setup) = self.prepare_position_plan(RunId::new(), &session, now)?;
         self.store.commit_position_plan(&workflow, &setup)?;
         if let Some(logger) = &self.run_log {
             logger.record(
@@ -223,7 +223,12 @@ mod replay_tests {
         )
         .unwrap();
         let run = daemon
-            .launch_formal_run(RunPurpose::PositionPlan, "replay-snapshot-fixture")
+            .launch_formal_run(
+                RunPurpose::PositionPlan,
+                None,
+                None,
+                "replay-snapshot-fixture",
+            )
             .await
             .unwrap()
             .run_id;

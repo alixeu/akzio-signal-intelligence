@@ -375,6 +375,8 @@ struct DaemonTransport {
 struct DaemonPaperState {
     paper_broker: Option<Arc<dyn CommittedPaperBroker>>,
     session_clock: Option<AlpacaPaperSessionClock>,
+    #[cfg(test)]
+    fixture_session_clock: Option<Arc<dyn BrokerSessionClock>>,
     scheduler: PaperScheduler,
     auto_paper: bool,
     runtime_identity_hash: Option<ContentHash>,
@@ -444,6 +446,12 @@ pub struct DaemonHealth {
     /// Native clients require this before submitting a Run they intend to export.
     #[serde(default)]
     pub formal_run_bundle_supported: bool,
+    /// The formal PositionPlan endpoint accepts a client-generated original Run ID.
+    #[serde(default)]
+    pub position_plan_requested_run_id_supported: bool,
+    /// The running canonical Core supports Paper request-to-session lookup.
+    #[serde(default)]
+    pub paper_launch_request_lookup_supported: bool,
     #[serde(default)]
     pub run_log_ready: bool,
     #[serde(default)]

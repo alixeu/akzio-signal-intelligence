@@ -8,6 +8,10 @@
 use super::*;
 
 impl SchedulerError {
+    fn paper_request_binding(error: impl Into<Self>) -> Self {
+        Self::PaperLaunchRequestBinding(Box::new(error.into()))
+    }
+
     // The Store distinguishes commit or readback errors from preflight failures.
     // An interrupted executor at this boundary may also have completed the write.
     pub(super) fn during_reservation(error: impl Into<Self>) -> Self {
@@ -39,13 +43,56 @@ impl PaperScheduler {
         C: BrokerSessionClock + ?Sized,
         P: PaperWorkflowSource + ?Sized,
     {
+        self.tick_with_request(clock, source, now, None).await
+    }
+
+    pub(crate) async fn tick_with_request<C, P>(
+        &self,
+        clock: &C,
+        source: &P,
+        now: DateTime<Utc>,
+        paper_request_id: Option<uuid::Uuid>,
+    ) -> SchedulerResult<Option<SessionSlotReservation>>
+    where
+        C: BrokerSessionClock + ?Sized,
+        P: PaperWorkflowSource + ?Sized,
+    {
         // tick 的每个早退都是明确的等待/复用语义：闭市、已有 slot、staged canary、缺
         // approval/proposal 或 identity 不匹配均不创建新 Run，也不发送 broker 写请求。
         self.require_run_log()?;
+        if let Some(request_id) = paper_request_id {
+            let known = self
+                .store_executor
+                .execute(move |store| store.paper_launch_request_session(&request_id.to_string()))
+                .await
+                .map_err(SchedulerError::paper_request_binding)?
+                .map_err(SchedulerError::paper_request_binding)?;
+            if known.is_some() {
+                return Err(SchedulerError::PaperLaunchRequestAlreadyBound);
+            }
+        }
         let Some(session_key) = clock.open_session_key().await? else {
             eprintln!("Paper scheduler waiting: broker market is closed");
             return Ok(None);
         };
+        if let Some(request_id) = paper_request_id {
+            let resolved_session = session_key.clone();
+            let bound = self
+                .store_executor
+                .execute(move |store| {
+                    store.bind_paper_launch_request(
+                        &request_id.to_string(),
+                        &resolved_session,
+                        Utc::now(),
+                    )
+                })
+                .await
+                .map_err(SchedulerError::paper_request_binding)?
+                .map_err(SchedulerError::paper_request_binding)?;
+            if !bound {
+                return Err(SchedulerError::PaperLaunchRequestAlreadyBound);
+            }
+        }
         let stored_session_key = session_key.clone();
         if let Some(slot) = self
             .store_executor

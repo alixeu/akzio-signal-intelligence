@@ -8,6 +8,30 @@
 #[serde(deny_unknown_fields)]
 struct RunLaunchRequest {
     purpose: RunPurpose,
+    #[serde(default, deserialize_with = "deserialize_launch_uuid")]
+    requested_run_id: Option<uuid::Uuid>,
+    #[serde(default, deserialize_with = "deserialize_launch_uuid")]
+    paper_request_id: Option<uuid::Uuid>,
+}
+
+fn canonical_launch_uuid(raw: &str) -> Option<uuid::Uuid> {
+    uuid::Uuid::parse_str(raw).ok().filter(|id| {
+        id.get_variant() == uuid::Variant::RFC4122
+            && id.get_version() == Some(uuid::Version::Random)
+            && id.to_string() == raw
+    })
+}
+
+fn deserialize_launch_uuid<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<uuid::Uuid>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    canonical_launch_uuid(&raw)
+        .map(Some)
+        .ok_or_else(|| serde::de::Error::custom("launch request ID must be a canonical UUID v4"))
 }
 
 type RunHttpResult =
@@ -19,9 +43,9 @@ fn run_http_error(error: DaemonError) -> (StatusCode, Json<serde_json::Value>) {
             StatusCode::NOT_FOUND
         }
         DaemonError::RunLogUnavailable(_)
-        | DaemonError::Scheduler(SchedulerError::RunLogUnavailable(_)) => {
-            StatusCode::SERVICE_UNAVAILABLE
-        }
+        | DaemonError::Scheduler(
+            SchedulerError::RunLogUnavailable(_) | SchedulerError::PaperLaunchRequestBinding(_),
+        ) => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::CONFLICT,
     };
     (status, Json(serde_json::json!({"error":error.to_string()})))
@@ -33,8 +57,26 @@ async fn http_launch_run(
 ) -> RunHttpResult {
     // PositionPlan 用 StoreExecutor 提交新图，Paper 向 scheduler 请求真实 session slot。
     // 两者均不在 handler 内直接跑 worker。
+    if request.requested_run_id.is_some() && request.purpose != RunPurpose::PositionPlan {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"requested_run_id_requires_position_plan"})),
+        ));
+    }
+    if request.paper_request_id.is_some() && request.purpose != RunPurpose::Paper {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"paper_request_id_requires_paper"})),
+        ));
+    }
+    let requested_run_id = request.requested_run_id.map(|id| RunId(id.to_string()));
     let submission = daemon
-        .submit_formal_run(request.purpose, "http")
+        .submit_formal_run(
+            request.purpose,
+            requested_run_id,
+            request.paper_request_id,
+            "http",
+        )
         .await
         .map_err(|error| match error {
             crate::launch::FormalRunLaunchError::Rejected(error) => run_http_error(error),
@@ -57,6 +99,54 @@ async fn http_launch_run(
         })?;
     // 保留已有 REST wire shape。
     Ok(Json(serde_json::json!({"run_id":submission.run_id})))
+}
+
+async fn http_paper_launch_lookup(
+    State(daemon): State<Arc<Daemon>>,
+    Path(request_id): Path<String>,
+) -> RunHttpResult {
+    if canonical_launch_uuid(&request_id).is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"invalid_paper_request_id"})),
+        ));
+    }
+    let query_id = request_id.clone();
+    let unavailable = || {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"lookup_status":"unavailable"})),
+        )
+    };
+    let result = daemon
+        .store_executor
+        .execute(move |store| -> akzio_store::Result<_> {
+            if store.debug_environment()?.is_some()
+                || !store.paper_launch_request_lookup_supported()?
+            {
+                return Ok(None);
+            }
+            store.paper_launch_request_session(&query_id).map(Some)
+        })
+        .await
+        .map_err(|_| unavailable())?
+        .map_err(|_| unavailable())?
+        .ok_or_else(unavailable)?;
+    let (session_key, run_id) = match result {
+        Some((session, run)) => (Some(session), run),
+        None => (None, None),
+    };
+    let status = if run_id.is_some() {
+        "session_run_found"
+    } else {
+        "unknown"
+    };
+    Ok(Json(serde_json::json!({
+        "request_id": request_id,
+        "lookup_status": status,
+        "session_key": session_key,
+        "run_id": run_id,
+    })))
 }
 
 #[cfg(test)]
@@ -93,9 +183,10 @@ mod formal_launch_tests {
     }
 
     fn fixture_with_log(prepare_log: impl FnOnce(&crate::RunLogger)) -> Arc<Daemon> {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/formal-run-http-tests")
-            .join(RunId::new().0);
+        let parent = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/formal-run-http-tests");
+        std::fs::create_dir_all(&parent).unwrap();
+        let root = parent.join(RunId::new().0);
         let run_log = crate::RunLogger::for_test(root.join("log"));
         prepare_log(&run_log);
         Arc::new(
@@ -198,9 +289,392 @@ mod formal_launch_tests {
         assert_eq!(readiness.status, "run_log_blocked");
         assert!(!readiness.run_log_ready);
         assert!(matches!(
-            daemon.submit_formal_run(RunPurpose::PositionPlan, "test").await,
+            daemon
+                .submit_formal_run(RunPurpose::PositionPlan, None, None, "test")
+                .await,
             Err(crate::launch::FormalRunLaunchError::Rejected(DaemonError::RunLogUnavailable(_)))
         ));
+    }
+
+    async fn drop_launch_response(
+        request: axum::extract::Request,
+        next: axum::middleware::Next,
+    ) -> axum::response::Response {
+        let disconnect = request
+            .headers()
+            .contains_key("x-test-lose-launch-response");
+        let mut response = next.run(request).await;
+        if disconnect && response.status().is_success() {
+            response
+                .headers_mut()
+                .remove(axum::http::header::CONTENT_LENGTH);
+            *response.body_mut() =
+                axum::body::Body::from_stream(futures::stream::once(std::future::ready(Err::<
+                    axum::body::Bytes,
+                    _,
+                >(
+                    std::io::Error::other("injected post-commit disconnect"),
+                ))));
+        }
+        response
+    }
+
+    struct AdvancingPaperClock {
+        day: std::sync::Mutex<String>,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::BrokerSessionClock for AdvancingPaperClock {
+        fn open_session_key(
+            &self,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = SchedulerResult<Option<String>>> + Send + '_>,
+        > {
+            Box::pin(async {
+                self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Some(self.day.lock().unwrap().clone()))
+            })
+        }
+
+        fn paper_account_id(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SchedulerResult<String>> + Send + '_>>
+        {
+            Box::pin(async { panic!("cold-start Paper must not look up an approval account") })
+        }
+    }
+
+    /// WHY THIS TEST EXISTS (Task #8): A lost Paper response must leave its originally bound Session and committed Run inspectable after the Broker session changes.
+    /// Do not weaken or delete this assertion.
+    #[tokio::test]
+    async fn task8_paper_locator_survives_post_commit_disconnect() {
+        use std::sync::atomic::Ordering;
+        let day = Utc::now()
+            .with_timezone(&chrono_tz::America::New_York)
+            .date_naive();
+        let next_day = day.succ_opt().unwrap().to_string();
+        let original_day = day.to_string();
+        let clock = Arc::new(AdvancingPaperClock {
+            day: std::sync::Mutex::new(original_day.clone()),
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut daemon = fixture();
+        let local = Arc::get_mut(&mut daemon).unwrap();
+        local.paper.runtime_identity_hash = Some(ContentHash::of_bytes(b"test-paper-runtime"));
+        local.paper.fixture_session_clock = Some(clock.clone());
+        let store = daemon.store.clone();
+        let router = daemon
+            .router()
+            .layer(axum::middleware::from_fn(drop_launch_response));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .retry(reqwest::retry::never())
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let request_id = "1856d70a-8701-4bb9-8d07-d93a05c607c8";
+        let launch = || {
+            client
+                .post(format!("{base}/runs"))
+                .header("x-akzio-token", "test-formal-token")
+                .json(&serde_json::json!({"purpose":"paper","paper_request_id":request_id}))
+        };
+        let lookup = |id: &str| client.get(format!("{base}/v1/runs/submissions/{id}"));
+        let read = |id: &str| lookup(id).header("x-akzio-token", "test-formal-token");
+        let ready = client
+            .get(format!("{base}/ready"))
+            .header("x-akzio-token", "test-formal-token")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap();
+        assert_eq!(ready["paper_launch_request_lookup_supported"], true);
+        assert_eq!(
+            lookup(request_id).send().await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            read(request_id)
+                .header("origin", "http://127.0.0.1")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            read(&request_id.to_uppercase())
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let unknown = read(request_id)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap();
+        assert_eq!(unknown["lookup_status"], "unknown");
+        assert!(unknown["session_key"].is_null());
+        assert!(unknown["run_id"].is_null());
+        assert_eq!(clock.reads.load(Ordering::SeqCst), 0);
+        assert!(store
+            .daemon_lease(crate::SCHEDULER_LEASE_NAME)
+            .unwrap()
+            .is_none());
+        let response = launch()
+            .header("x-test-lose-launch-response", "1")
+            .send()
+            .await;
+        if let Ok(response) = response {
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(response.bytes().await.is_err());
+        }
+        let slot = store
+            .session_slot(&original_day)
+            .unwrap()
+            .expect("Paper must persist the original research slot first");
+        let run_id = slot.workflow.run.run_id;
+        assert_eq!(store.run_purpose(&run_id).unwrap(), RunPurpose::Paper);
+        assert!(store.paper_approval_for_run(&run_id).unwrap().is_none());
+        assert!(slot.commitment_artifact_id.is_none());
+        assert_eq!(clock.reads.load(Ordering::SeqCst), 1);
+        let first_lookup = read(request_id)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap();
+        assert_eq!(first_lookup["lookup_status"], "session_run_found");
+        assert_eq!(first_lookup["request_id"], request_id);
+        assert_eq!(first_lookup["session_key"], original_day);
+        assert_eq!(first_lookup["run_id"], run_id.0);
+        assert!(first_lookup.get("submission_status").is_none());
+        assert_eq!(
+            launch().send().await.unwrap().status(),
+            StatusCode::CONFLICT
+        );
+        *clock.day.lock().unwrap() = next_day.clone();
+        let lease_before = store.daemon_lease(crate::SCHEDULER_LEASE_NAME).unwrap();
+        assert_eq!(
+            launch().send().await.unwrap().status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            read(request_id)
+                .send()
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap(),
+            first_lookup
+        );
+        assert_eq!(clock.reads.load(Ordering::SeqCst), 1);
+        assert!(store.session_slot(&next_day).unwrap().is_none());
+        assert_eq!(store.recent_workflows(2).unwrap().len(), 1);
+        assert_eq!(
+            store.daemon_lease(crate::SCHEDULER_LEASE_NAME).unwrap(),
+            lease_before
+        );
+        let reopened = akzio_store::Store::open_existing(store.root()).unwrap();
+        assert_eq!(
+            reopened.paper_launch_request_session(request_id).unwrap(),
+            Some((original_day, Some(run_id)))
+        );
+        let pending_id = "7f9630d8-a86b-4b42-908e-f9568dc85b05";
+        assert!(store
+            .bind_paper_launch_request(pending_id, &next_day, Utc::now())
+            .unwrap());
+        daemon
+            .run_log
+            .as_ref()
+            .unwrap()
+            .mark_unavailable("test lookup with blocked run log")
+            .unwrap();
+        let pending = read(pending_id)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap();
+        assert_eq!(pending["lookup_status"], "unknown");
+        assert_eq!(pending["session_key"], next_day);
+        assert!(pending["run_id"].is_null());
+        assert_eq!(clock.reads.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store.daemon_lease(crate::SCHEDULER_LEASE_NAME).unwrap(),
+            lease_before
+        );
+        server.abort();
+    }
+
+    /// WHY THIS TEST EXISTS (Task #8): A lost launch response must leave the requested RunId independently inspectable with its original committed graph.
+    /// Do not weaken or delete this assertion.
+    #[tokio::test]
+    async fn task8_position_plan_id_survives_post_commit_disconnect() {
+        let daemon = fixture();
+        let router = daemon.router().layer(axum::middleware::from_fn(drop_launch_response));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .retry(reqwest::retry::never())
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let run_id = "b302f57d-53be-4a10-9b27-8c37de95d2f6";
+        let inspect = || {
+            client
+                .get(format!("{base}/v1/observer/runs/{run_id}/inspection"))
+                .header("x-akzio-token", "test-formal-token")
+        };
+        let launch = || {
+            client
+                .post(format!("{base}/runs"))
+                .header("x-akzio-token", "test-formal-token")
+                .json(&serde_json::json!({"purpose":"position_plan","requested_run_id":run_id}))
+        };
+        assert_eq!(
+            inspect().send().await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+        let response = launch()
+            .header("x-test-lose-launch-response", "1")
+            .send()
+            .await;
+        if let Ok(response) = response {
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(response.bytes().await.is_err());
+        }
+        let inspection = inspect()
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap();
+        assert_eq!(inspection["workflow"]["run"]["run_id"], run_id);
+        assert_eq!(inspection["workflow"]["run"]["purpose"], "position_plan");
+        assert!(!inspection["workflow"]["tasks"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            daemon
+                .store
+                .run_artifacts_by_kind(&RunId(run_id.into()), ArtifactKind::EvidenceNeed)
+                .unwrap()
+                .len(),
+            34
+        );
+        let duplicate = launch().send().await.unwrap();
+        assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+        let original = inspect()
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap();
+        assert_eq!(original["workflow"], inspection["workflow"]);
+        assert_eq!(daemon.store.recent_workflows(2).unwrap().len(), 1);
+        server.abort();
+    }
+
+    /// WHY THIS TEST EXISTS (Task #8): Invalid, noncanonical, or cross-purpose IDs must fail before formal Run admission or publication.
+    /// Do not weaken or delete this assertion.
+    #[tokio::test]
+    async fn task8_launch_rejects_invalid_requested_run_ids_before_effects() {
+        let daemon = fixture();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stop, receiver) = watch::channel(false);
+        let service = daemon.clone();
+        let server =
+            tokio::spawn(async move { service.serve_http_listener(listener, receiver).await });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let run_id = "b302f57d-53be-4a10-9b27-8c37de95d2f6";
+        for (purpose, id) in [
+            ("position_plan", serde_json::json!("not-a-uuid")),
+            ("position_plan", serde_json::json!(run_id.to_uppercase())),
+            ("position_plan", serde_json::json!(run_id.replace('-', ""))),
+            (
+                "position_plan",
+                serde_json::json!(run_id.replace("-4a10-", "-5a10-")),
+            ),
+            (
+                "position_plan",
+                serde_json::json!(run_id.replace("-9b27-", "-1b27-")),
+            ),
+            ("position_plan", serde_json::Value::Null),
+            ("position_plan", serde_json::json!(1)),
+            ("paper", serde_json::json!(run_id)),
+            ("shadow", serde_json::json!(run_id)),
+        ] {
+            let response = client
+                .post(format!("http://{address}/runs"))
+                .header("x-akzio-token", "test-formal-token")
+                .json(&serde_json::json!({"purpose":purpose,"requested_run_id":id}))
+                .send()
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    response.status(),
+                    StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
+                ),
+                "{purpose} {id}: {}",
+                response.status()
+            );
+        }
+        for body in [
+            serde_json::json!({"purpose":"position_plan","paper_request_id":run_id}),
+            serde_json::json!({"purpose":"paper","paper_request_id":null}),
+            serde_json::json!({"purpose":"paper","paper_request_id":"bad"}),
+            serde_json::json!({"purpose":"paper","paper_request_id":run_id.to_uppercase()}),
+            serde_json::json!({"purpose":"paper","requested_run_id":run_id,"paper_request_id":run_id}),
+        ] {
+            let response = client
+                .post(format!("http://{address}/runs"))
+                .header("x-akzio-token", "test-formal-token")
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    response.status(),
+                    StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
+                ),
+                "{body}: {}",
+                response.status()
+            );
+        }
+        assert!(daemon.store.recent_workflows(1).unwrap().is_empty());
+        stop.send(true).unwrap();
+        server.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -228,6 +702,7 @@ mod formal_launch_tests {
             .unwrap();
         assert_eq!(readiness["store_scope"], "canonical");
         assert_eq!(readiness["formal_run_bundle_supported"], true);
+        assert_eq!(readiness["position_plan_requested_run_id_supported"], true);
         let retired = client
             .post(format!("http://{address}/v1/debug/runs"))
             .header("x-akzio-token", "test-formal-token")
@@ -373,7 +848,7 @@ mod formal_launch_tests {
         daemon.model = crate::ModelClientAdapter::new(ModelClient::fixture_by_purpose_phase(first));
 
         let run = daemon
-            .launch_formal_run(RunPurpose::PositionPlan, "decision-lineage-fixture")
+            .launch_formal_run(RunPurpose::PositionPlan, None, None, "decision-lineage-fixture")
             .await
             .unwrap()
             .run_id;

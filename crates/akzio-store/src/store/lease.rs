@@ -5,6 +5,53 @@
 use super::*;
 
 impl Store {
+    /// Optional lookup capability on Stores initialized by the current writer.
+    pub fn paper_launch_request_lookup_supported(&self) -> StoreResult<bool> {
+        let connection = self.connection()?;
+        migration::table_exists(&connection, "rebuild_paper_launch_requests_v1")
+    }
+
+    /// Record the clock-resolved session once. A duplicate preserves the
+    /// original session and returns false, regardless of its reservation state.
+    pub fn bind_paper_launch_request(
+        &self,
+        request_id: &str,
+        session_key: &str,
+        now: DateTime<Utc>,
+    ) -> StoreResult<bool> {
+        let day = chrono::NaiveDate::parse_from_str(session_key, "%Y-%m-%d")
+            .map_err(|_| StoreError::InvalidSessionSlot(session_key.to_owned()))?;
+        if session_key.len() != 10 || day.format("%Y-%m-%d").to_string() != session_key {
+            return Err(StoreError::InvalidSessionSlot(session_key.to_owned()));
+        }
+        let connection = self.connection()?;
+        Ok(connection.execute(
+            "INSERT INTO rebuild_paper_launch_requests_v1 (request_id, session_key, recorded_at)
+             VALUES (?1, ?2, ?3) ON CONFLICT(request_id) DO NOTHING",
+            params![request_id, session_key, now.to_rfc3339()],
+        )? == 1)
+    }
+
+    /// Read the bound session and any Paper Run reserved for it in one snapshot.
+    /// The Run may have been reserved by another request or the scheduler.
+    pub fn paper_launch_request_session(
+        &self,
+        request_id: &str,
+    ) -> StoreResult<Option<(String, Option<RunId>)>> {
+        let connection = self.connection()?;
+        Ok(connection
+            .query_row(
+                "SELECT request.session_key, run.run_id
+             FROM rebuild_paper_launch_requests_v1 AS request
+             LEFT JOIN rebuild_session_slots AS slot ON slot.session_key = request.session_key
+             LEFT JOIN rebuild_runs AS run ON run.run_id = slot.run_id AND run.purpose = 'paper'
+             WHERE request.request_id = ?1",
+                params![request_id],
+                |row| Ok((row.get(0)?, row.get::<_, Option<String>>(1)?.map(RunId))),
+            )
+            .optional()?)
+    }
+
     // 在 reservation 前同时验证 approval、manifest session date/expiry/notional，再绑定二者。
     // 先解码并校验 manifest/approval 的来源/hash、session 日期授权和 expiry；buy notional 留到
     // ExecutionPlan/Commitment 校验阶段。成功后把 binding 交给事务化写入入口，返回 slot reservation，
@@ -373,4 +420,68 @@ pub(super) fn paper_approval_for_run_with_connection(
         return Err(StoreError::InvalidSessionSlot(run_id.0.clone()));
     }
     Ok(Some((manifest, approval)))
+}
+
+#[cfg(test)]
+mod paper_launch_lookup_tests {
+    use super::*;
+
+    /// WHY THIS TEST EXISTS (Task #8): The optional lookup table must leave old v18 readers usable and preserve the first binding across writer reopens.
+    /// Do not weaken or delete this assertion.
+    #[test]
+    fn task8_paper_request_binding_is_optional_and_immutable() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/paper-launch-lookup-tests")
+            .join(RunId::new().0);
+        let writer = Store::open(&root).unwrap();
+        writer
+            .connection()
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE rebuild_paper_launch_requests_v1;
+                 DROP TABLE rebuild_paper_submission_transitions;
+                 DROP TABLE rebuild_paper_submission_batches;
+                 UPDATE rebuild_metadata SET value = '18' WHERE key = 'schema_version';",
+            )
+            .unwrap();
+        drop(writer);
+        let old = Store::open_existing(&root).unwrap();
+        assert!(!old.paper_launch_request_lookup_supported().unwrap());
+        assert!(old.session_slot("2026-10-14").unwrap().is_none());
+        assert!(!old.paper_launch_request_lookup_supported().unwrap());
+        assert_eq!(
+            verify_readable_store_schema(&old.connection().unwrap(), &root).unwrap(),
+            18
+        );
+        drop(old);
+        let request_id = "1856d70a-8701-4bb9-8d07-d93a05c607c8";
+        let writer = Store::open(&root).unwrap();
+        assert_eq!(
+            verify_readable_store_schema(&writer.connection().unwrap(), &root).unwrap(),
+            STORE_SCHEMA_VERSION
+        );
+        assert!(writer.paper_launch_request_lookup_supported().unwrap());
+        assert!(writer
+            .paper_launch_request_session(request_id)
+            .unwrap()
+            .is_none());
+        assert!(writer
+            .bind_paper_launch_request(request_id, "2026-1-14", Utc::now())
+            .is_err());
+        assert!(writer
+            .bind_paper_launch_request("not-a-uuid", "2026-10-14", Utc::now())
+            .is_err());
+        assert!(writer
+            .bind_paper_launch_request(request_id, "2026-10-14", Utc::now())
+            .unwrap());
+        assert!(!writer
+            .bind_paper_launch_request(request_id, "2026-10-15", Utc::now())
+            .unwrap());
+        drop(writer);
+        let reader = Store::open_existing(&root).unwrap();
+        assert_eq!(
+            reader.paper_launch_request_session(request_id).unwrap(),
+            Some(("2026-10-14".to_owned(), None))
+        );
+    }
 }

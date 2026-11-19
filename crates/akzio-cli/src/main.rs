@@ -278,6 +278,10 @@ enum RunCommand {
         run_id: String,
         target: PathBuf,
     },
+    /// Read the bound Paper Session and any Run reserved for it.
+    Submission {
+        request_id: String,
+    },
     Inspect {
         run_id: String,
     },

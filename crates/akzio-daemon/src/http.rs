@@ -89,6 +89,11 @@ impl Daemon {
             ("/ready", get(http_ready), Read),
             ("/v1/observer/runs/{run_id}", get(http_observer_run), Read),
             (
+                "/v1/runs/submissions/{request_id}",
+                get(http_paper_launch_lookup),
+                Read,
+            ),
+            (
                 "/v1/workflows/blueprint",
                 get(http_workflow_blueprint),
                 Read,

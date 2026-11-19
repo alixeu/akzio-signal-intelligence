@@ -42,7 +42,10 @@ async fn dispatch_control(command: Command, config: &Config, config_path: &Path)
             // 子命令保留服务端返回的完整研究/Decision/Execution 生命周期信息。
             let checkpoint_only = matches!(command, RunCommand::Checkpoint { .. });
             match command {
-                RunCommand::Start { .. } | RunCommand::Detail { .. } | RunCommand::ExportBundle { .. } => {
+                RunCommand::Start { .. }
+                | RunCommand::Detail { .. }
+                | RunCommand::ExportBundle { .. }
+                | RunCommand::Submission { .. } => {
                     bail!("formal run client must be dispatched before runtime config loading")
                 }
                 RunCommand::Inspect { run_id } | RunCommand::Checkpoint { run_id } => {

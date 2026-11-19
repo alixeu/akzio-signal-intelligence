@@ -21,7 +21,10 @@ impl FormalPurpose {
 pub(crate) fn handles(command: &RunCommand) -> bool {
     matches!(
         command,
-        RunCommand::Start { .. } | RunCommand::Detail { .. } | RunCommand::ExportBundle { .. }
+        RunCommand::Start { .. }
+            | RunCommand::Detail { .. }
+            | RunCommand::ExportBundle { .. }
+            | RunCommand::Submission { .. }
     )
 }
 
@@ -187,7 +190,7 @@ where
     }
 }
 
-async fn require_formal_ready(client: &ControlApiClient) -> Result<()> {
+async fn require_formal_ready(client: &ControlApiClient) -> Result<serde_json::Value> {
     // 有意读取最小 JSON 投影；旧版 Core 缺字段时明确拒绝，不用默认值推断 canonical。
     let ready: serde_json::Value = client
         .json_with_timeout(
@@ -205,53 +208,133 @@ async fn require_formal_ready(client: &ControlApiClient) -> Result<()> {
     if ready["run_log_ready"] != true {
         bail!("Core 缺少完整私有运行日志能力或日志已阻断；未提交 Run");
     }
-    Ok(())
+    Ok(ready)
+}
+
+fn unknown_submission(
+    status: Option<reqwest::StatusCode>,
+    requested_run_id: Option<&str>,
+    paper_request_id: Option<&str>,
+    confirmed_run_id: Option<&str>,
+) -> anyhow::Error {
+    let status = status
+        .map(|status| format!(" (HTTP {status})"))
+        .unwrap_or_default();
+    let recovery = match (confirmed_run_id, requested_run_id, paper_request_id) {
+        (Some(id), _, _) => format!("Core 已确认原 Run ID；请使用同一配置执行 `akzio run inspect {id}` 只读查询"),
+        (None, Some(id), _) => format!("请使用同一配置执行 `akzio run inspect {id}` 只读查询候选 Run；HTTP 404 表示当前暂无法判定"),
+        (None, None, Some(id)) => format!("请使用同一配置执行 `akzio run submission {id}` 只读定位原 Paper Session。`unknown` 表示目前无法判定"),
+        (None, None, None) => "Core 未确认原 Run ID；请先在原 Store/Session 中只读核对".to_owned(),
+    };
+    anyhow::anyhow!(
+        "RUN_SUBMISSION=unknown_after_post{status}；可能已创建 Run；{recovery}，勿直接重试"
+    )
 }
 
 async fn start(client: &ControlApiClient, purpose: FormalPurpose) -> Result<serde_json::Value> {
-    require_formal_ready(client).await?;
-    const AMBIGUOUS: &str =
-        "RUN_SUBMISSION=unknown_after_post；可能已创建 Run，请先查询原 Store/Session，勿直接重试";
-    // 仅一次 POST。Paper 同 Session 的复用属于 Rust scheduler；PositionPlan 没有客户端幂等性。
+    let ready = require_formal_ready(client).await?;
+    let mut request = serde_json::json!({ "purpose": purpose.wire() });
+    // 分别协商两种请求关联能力。Paper 请求 UUID 只用于定位原 Session。
+    let requested_run_id = (matches!(purpose, FormalPurpose::PositionPlan)
+        && ready["position_plan_requested_run_id_supported"] == true)
+        .then(|| uuid::Uuid::new_v4().to_string());
+    if let Some(id) = &requested_run_id {
+        request["requested_run_id"] = serde_json::json!(id);
+    }
+    let paper_request_id = (matches!(purpose, FormalPurpose::Paper)
+        && ready["paper_launch_request_lookup_supported"] == true)
+        .then(|| uuid::Uuid::new_v4().to_string());
+    if let Some(id) = &paper_request_id {
+        request["paper_request_id"] = serde_json::json!(id);
+    }
+    let requested_run_id = requested_run_id.as_deref();
+    let paper_request_id = paper_request_id.as_deref();
+    let ambiguous = || unknown_submission(None, requested_run_id, paper_request_id, None);
+    // 提交只发送一次，读取结果由操作员主动发起。
     let response = client
         .request(Method::POST, client.endpoint(&["runs"]))
         .timeout(Duration::from_secs(60))
-        .json(&serde_json::json!({ "purpose": purpose.wire() }))
+        .json(&request)
         .send()
         .await
-        .map_err(|_| anyhow::anyhow!(AMBIGUOUS))?;
+        .map_err(|_| ambiguous())?;
     let status = response.status();
     if status.is_server_error() {
-        // 只读取稳定状态字段；不回显服务端正文，避免 token/provider 文本进入终端。
+        // 只使用稳定状态与可安全复制到命令行的 Run ID，避免回显服务端正文。
         let body: serde_json::Value = response.json().await.unwrap_or_default();
-        if let Some(run_id) = body["run_id"]
-            .as_str()
-            .filter(|id| !id.trim().is_empty() && body["submission_status"] == "not_submitted")
-        {
-            bail!(
-                "RUN_SUBMISSION=not_submitted (HTTP {status})；Core 已预约 Run {run_id:?}，但写入提交日志失败；请先 run replay 查询原 Run"
-            );
-        }
-        bail!("{AMBIGUOUS} (HTTP {status})");
+        let run_id = body["run_id"].as_str().filter(|id| {
+            id.len() <= 128
+                && id.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+                && requested_run_id.is_none_or(|requested| requested == *id)
+        });
+        let confirmed_run_id = match (body["submission_status"].as_str(), run_id) {
+            (Some("not_submitted"), Some(id)) => bail!(
+                "RUN_SUBMISSION=not_submitted (HTTP {status})；Core 已预约 Run {id:?}，但写入提交日志失败；请使用同一配置执行 `akzio run inspect {id}` 只读查询原 Run，勿直接重试"
+            ),
+            (Some("unknown_after_post"), Some(id)) => Some(id),
+            _ => None,
+        };
+        return Err(unknown_submission(
+            Some(status),
+            requested_run_id,
+            paper_request_id,
+            confirmed_run_id,
+        ));
     }
     if !status.is_success() {
         // 不回显服务端正文，避免 token/provider 敏感文本被错误响应带回终端。
         bail!("RUN_SUBMISSION=rejected (HTTP {status})；请检查 Core 的交易时段、审批及错误日志");
     }
-    let result: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|_| anyhow::anyhow!(AMBIGUOUS))?;
+    let result: serde_json::Value = response.json().await.map_err(|_| ambiguous())?;
     let run_id = result["run_id"]
         .as_str()
-        .filter(|id| !id.trim().is_empty())
-        .ok_or_else(|| anyhow::anyhow!(AMBIGUOUS))?;
+        .filter(|id| {
+            !id.trim().is_empty() && requested_run_id.is_none_or(|requested| requested == *id)
+        })
+        .ok_or_else(ambiguous)?;
     Ok(serde_json::json!({
         "run_id": run_id,
         "purpose": purpose.wire(),
         "submission_status": "submitted_or_reused",
         "note": "这里只确认提交/复用；用 run replay/detail/retrospectives 检查研究、Decision、执行和 Outcome"
     }))
+}
+
+async fn inspect_paper_submission(
+    client: &ControlApiClient,
+    request_id: &str,
+) -> Result<serde_json::Value> {
+    let valid = uuid::Uuid::parse_str(request_id).is_ok_and(|id| {
+        id.get_variant() == uuid::Variant::RFC4122
+            && id.get_version() == Some(uuid::Version::Random)
+            && id.to_string() == request_id
+    });
+    if !valid {
+        bail!("Paper request ID 必须为规范 UUID v4");
+    }
+    let lookup: serde_json::Value = client
+        .json_with_timeout(
+            client.request(
+                Method::GET,
+                client.endpoint(&["v1", "runs", "submissions", request_id]),
+            ),
+            Duration::from_secs(30),
+        )
+        .await
+        .context("无法只读查询原 Paper 请求，请检查同一配置下的 Core")?;
+    if lookup["request_id"].as_str() != Some(request_id) {
+        bail!("Core 返回的 Paper request ID 不匹配");
+    }
+    let session = lookup["session_key"].as_str();
+    let run_id = lookup["run_id"].as_str();
+    match lookup["lookup_status"].as_str() {
+        Some("session_run_found") if session.is_some() && run_id.is_some() => Ok(lookup),
+        Some("unknown") if lookup["run_id"].is_null() => Ok(lookup),
+        _ => bail!("Core 返回的 Paper 请求查询状态无效"),
+    }
 }
 
 fn validate_export_target(target: &Path) -> Result<()> {
@@ -317,6 +400,9 @@ pub(crate) async fn execute(command: &RunCommand, config_path: &Path) -> Result<
     };
     match command {
         RunCommand::Start { purpose, .. } => print_json(&start(&client, *purpose).await?),
+        RunCommand::Submission { request_id } => {
+            print_json(&inspect_paper_submission(&client, request_id).await?)
+        }
         RunCommand::Detail { run_id } => {
             require_formal_ready(&client).await?;
             let detail: serde_json::Value = client
@@ -382,6 +468,19 @@ mod tests {
         }
 
         fn on(listener: TcpListener, replies: Vec<Option<(u16, &'static str)>>) -> Self {
+            let mut replies = replies.into_iter();
+            Self::on_with_response(listener, move |_| {
+                replies
+                    .next()
+                    .unwrap_or(Some((500, "{}")))
+                    .map(|(status, body)| (status, body.to_owned()))
+            })
+        }
+
+        fn on_with_response(
+            listener: TcpListener,
+            mut respond: impl FnMut(&str) -> Option<(u16, String)> + Send + 'static,
+        ) -> Self {
             let address = listener.local_addr().unwrap();
             listener.set_nonblocking(true).unwrap();
             let requests = Arc::new(Mutex::new(Vec::new()));
@@ -389,7 +488,6 @@ mod tests {
             let stop = Arc::new(AtomicBool::new(false));
             let stopped = stop.clone();
             let thread = std::thread::spawn(move || {
-                let mut replies = replies.into_iter();
                 while !stopped.load(Ordering::SeqCst) {
                     let (mut stream, _) = match listener.accept() {
                         Ok(accepted) => accepted,
@@ -430,11 +528,10 @@ mod tests {
                     if bytes.is_empty() {
                         continue;
                     }
-                    recorded
-                        .lock()
-                        .unwrap()
-                        .push(String::from_utf8(bytes).unwrap());
-                    if let Some((status, body)) = replies.next().unwrap_or(Some((500, "{}"))) {
+                    let request = String::from_utf8(bytes).unwrap();
+                    let reply = respond(&request);
+                    recorded.lock().unwrap().push(request);
+                    if let Some((status, body)) = reply {
                         // Location 指向同一替身也不允许跟随；否则会记录第三次请求。
                         write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nLocation: http://{address}/capture\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
                     }
@@ -660,8 +757,12 @@ mod tests {
     #[tokio::test]
     async fn formal_submission_uses_one_post_and_does_not_claim_completion() {
         for purpose in [FormalPurpose::PositionPlan, FormalPurpose::Paper] {
+            let ready = match purpose {
+                FormalPurpose::PositionPlan => READY,
+                FormalPurpose::Paper => CORRELATION_READY,
+            };
             let core = Core::new(vec![
-                Some((200, READY)),
+                Some((200, ready)),
                 Some((200, r#"{"run_id":"run-1"}"#)),
             ]);
             let response = start(&core.client(), purpose).await.unwrap();
@@ -721,6 +822,207 @@ mod tests {
         assert!(!message.contains("unknown_after_post"), "{message}");
         assert!(message.contains("run-1"), "{message}");
         assert_eq!(core.requests.lock().unwrap().len(), 2);
+    }
+
+    const PAPER_LOOKUP_READY: &str = r#"{"status":"ok","store_scope":"canonical","formal_run_bundle_supported":true,"run_log_ready":true,"paper_launch_request_lookup_supported":true}"#;
+
+    /// WHY THIS TEST EXISTS (Task #8): Losing the whole Paper reply must expose the original request UUID and a single explicit read-only lookup without a second POST.
+    /// Do not weaken or delete this assertion.
+    #[tokio::test]
+    async fn task8_paper_disconnect_uses_original_request_for_read_only_lookup() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let core = Core::on_with_response(listener, |request| {
+            if request.starts_with("GET /ready ") {
+                return Some((200, PAPER_LOOKUP_READY.into()));
+            }
+            if request.starts_with("POST /runs ") {
+                return None;
+            }
+            let path = request.split_ascii_whitespace().nth(1).unwrap();
+            let id = path.strip_prefix("/v1/runs/submissions/").unwrap();
+            Some((200, serde_json::json!({"request_id":id,"lookup_status":"unknown","session_key":null,"run_id":null}).to_string()))
+        });
+        let (root, _) = test_config(core.address);
+        let message = start(&core.client(), FormalPurpose::Paper)
+            .await
+            .unwrap_err()
+            .to_string();
+        let request: serde_json::Value = {
+            let requests = core.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(requests[1].starts_with("POST /runs "));
+            serde_json::from_str(requests[1].split_once("\r\n\r\n").unwrap().1).unwrap()
+        };
+        let id = request["paper_request_id"]
+            .as_str()
+            .expect("correlated Paper POST must carry its request ID");
+        let parsed = uuid::Uuid::parse_str(id).unwrap();
+        assert_eq!(parsed.to_string(), id);
+        assert_eq!(parsed.get_version(), Some(uuid::Version::Random));
+        assert!(request.get("requested_run_id").is_none());
+        assert!(
+            message.contains("RUN_SUBMISSION=unknown_after_post"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("akzio run submission {id}")),
+            "{message}"
+        );
+        let cli = Cli::try_parse_from(["akzio", "run", "submission", id]).unwrap();
+        let Command::Run { command } = cli.command else {
+            panic!("expected a Run command")
+        };
+        execute(&command, &root.join("config.toml")).await.unwrap();
+        {
+            let requests = core.requests.lock().unwrap();
+            assert_eq!(requests.len(), 3);
+            assert!(requests[2].starts_with(&format!("GET /v1/runs/submissions/{id} ")));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    const CORRELATION_READY: &str = r#"{"status":"ok","store_scope":"canonical","formal_run_bundle_supported":true,"run_log_ready":true,"position_plan_requested_run_id_supported":true}"#;
+
+    /// WHY THIS TEST EXISTS (Task #8): A disconnected PositionPlan must report the same canonical ID sent by its single POST, and inspection may still return 404.
+    /// Do not weaken or delete this assertion.
+    #[tokio::test]
+    async fn task8_position_plan_disconnect_reports_candidate_for_read_only_lookup() {
+        let core = Core::new(vec![
+            Some((200, CORRELATION_READY)),
+            None,
+            Some((404, "{}")),
+        ]);
+        let (root, config) = test_config(core.address);
+        let error = start(&core.client(), FormalPurpose::PositionPlan)
+            .await
+            .unwrap_err();
+        let request: serde_json::Value = {
+            let requests = core.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(requests[1].starts_with("POST /runs "));
+            serde_json::from_str(requests[1].split_once("\r\n\r\n").unwrap().1).unwrap()
+        };
+        assert_eq!(request["purpose"], "position_plan");
+        let id = request["requested_run_id"]
+            .as_str()
+            .expect("PositionPlan POST must carry the candidate ID");
+        let parsed = uuid::Uuid::parse_str(id).unwrap();
+        assert_eq!(parsed.get_version_num(), 4);
+        assert_eq!(parsed.to_string(), id);
+        let message = error.to_string();
+        assert!(
+            message.contains("RUN_SUBMISSION=unknown_after_post"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("akzio run inspect {id}")),
+            "{message}"
+        );
+        assert!(message.contains("404"), "{message}");
+        let lookup = dispatch_control(
+            Command::Run {
+                command: RunCommand::Inspect { run_id: id.into() },
+            },
+            &config,
+            &root.join("config.toml"),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{lookup:#}").contains("404"));
+        {
+            let requests = core.requests.lock().unwrap();
+            assert_eq!(requests.len(), 3);
+            assert!(requests[2].starts_with(&format!("GET /v1/observer/runs/{id}/inspection ")));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// WHY THIS TEST EXISTS (Task #8): A success response naming a different Run must leave the requested PositionPlan ID as the only recovery target.
+    /// Do not weaken or delete this assertion.
+    #[tokio::test]
+    async fn task8_position_plan_success_must_echo_requested_run_id() {
+        for matches in [true, false] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let core = Core::on_with_response(listener, move |request| {
+                if request.starts_with("GET /ready ") {
+                    return Some((200, CORRELATION_READY.into()));
+                }
+                let request: serde_json::Value =
+                    serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+                let id = if matches {
+                    request["requested_run_id"].as_str().unwrap()
+                } else {
+                    "other-run"
+                };
+                Some((200, serde_json::json!({"run_id":id}).to_string()))
+            });
+            let result = start(&core.client(), FormalPurpose::PositionPlan).await;
+            let requests = core.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            let request: serde_json::Value =
+                serde_json::from_str(requests[1].split_once("\r\n\r\n").unwrap().1).unwrap();
+            let id = request["requested_run_id"].as_str().unwrap();
+            if matches {
+                let success = result.unwrap();
+                assert_eq!(success["run_id"], id);
+                assert_eq!(success["submission_status"], "submitted_or_reused");
+            } else {
+                let message = result.unwrap_err().to_string();
+                assert!(
+                    message.contains("RUN_SUBMISSION=unknown_after_post"),
+                    "{message}"
+                );
+                assert!(
+                    message.contains(&format!("akzio run inspect {id}")),
+                    "{message}"
+                );
+                assert!(!message.contains("other-run"));
+            }
+        }
+    }
+
+    /// WHY THIS TEST EXISTS (Task #8): A structured unknown response may retain a known original Run in either mode, while unconfirmed fields cannot become recovery commands.
+    /// Do not weaken or delete this assertion.
+    #[tokio::test]
+    async fn task8_unknown_response_exposes_only_a_confirmed_safe_original_run_id() {
+        for purpose in [FormalPurpose::PositionPlan, FormalPurpose::Paper] {
+            for (body, expected_id) in [
+                (
+                    r#"{"error":"private-test-token","submission_status":"unknown_after_post","run_id":"run-original"}"#,
+                    Some("run-original"),
+                ),
+                (
+                    r#"{"submission_status":"unknown_after_post","run_id":"run;untrusted"}"#,
+                    None,
+                ),
+                (r#"{"run_id":"run-unconfirmed"}"#, None),
+            ] {
+                let ready = match purpose {
+                    FormalPurpose::Paper => PAPER_LOOKUP_READY,
+                    FormalPurpose::PositionPlan => READY,
+                };
+                let core = Core::new(vec![Some((200, ready)), Some((503, body))]);
+                let error = start(&core.client(), purpose).await.unwrap_err();
+                let message = error.to_string();
+                assert!(
+                    message.contains("RUN_SUBMISSION=unknown_after_post"),
+                    "{message}"
+                );
+                if let Some(id) = expected_id {
+                    assert!(
+                        message.contains(&format!("akzio run inspect {id}")),
+                        "{message}"
+                    );
+                    assert!(!message.contains("akzio run submission"));
+                } else {
+                    assert!(!message.contains("akzio run inspect "), "{message}");
+                }
+                assert!(!message.contains("private-test-token"));
+                assert!(!message.contains("untrusted"));
+                assert!(!message.contains("unconfirmed"));
+                assert_eq!(core.requests.lock().unwrap().len(), 2);
+            }
+        }
     }
 
     #[tokio::test]
