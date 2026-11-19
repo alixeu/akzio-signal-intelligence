@@ -4,7 +4,7 @@
 
 ## 协议与冻结身份
 
-- 研究 Contract **65**、PromptBundle **36**、Analyst freshness candidate **66**。研究请求从 Submit 开始，仅提供授权 projections 和 `submit_result`，输出 `result + deliberation`。
+- 研究 Contract **69**、PromptBundle **38**、Analyst freshness candidate **70**。研究请求从 Submit 开始，仅提供授权 projections 和 `submit_result`，输出 `result + deliberation`。
 - Outcome 保持 Contract **63**、PromptBundle **35**；Contract 哈希为 `c9556a7ca9000cd06b96e385876013e3ce06a330fb4d01a473a43ef2db067ddf`。Draft、受控读取、Submit、阶段恢复和累计预算继续保留。
 - 引用闭包、方向资格、补采约束、Rust 日历绑定及冻结 result 的 deliberation 修复继续由 Rust 管理。研究角色的旧 Draft 指导、分阶段预算、reasoning 覆盖和整段压缩重提分支已删除。
 - t1/t3/t5 明确表示基准 Session 后第 1/3/5 个共同完成的交易 Session。研究反馈报告 deliberation 数组长度和权重总和的实际错误；Synthesizer wire Schema 要求保留全部已选 Claim/Critique，包括受限期限，并区分零仓位理由与非零仓位支持条件。重试恢复重建与原请求相同的拒绝反馈，不改变累计预算或历史记录。

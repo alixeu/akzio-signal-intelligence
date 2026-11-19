@@ -56,7 +56,7 @@
 
 ## 二、系统目标架构与数据流向
 
-系统以 **Rust 2021/2024 (固定版本 `1.96.0`)** 为绝对权威，模型仅作为无副作用的研究计算单元：
+系统以 **Rust 2021 edition (固定版本 `1.96.0`)** 为绝对权威，模型仅作为无副作用的研究计算单元：
 
 ```mermaid
 flowchart TD
@@ -160,7 +160,7 @@ Outcome Draft 使用最多一半输出预算与 70% 墙钟时限，必须先保�
 - **默认 Fail-Closed 策略**：Store 没有已激活的预校准 `DecisionPolicy` 时，默认可用样本数为 0，**执行目标仓位强制为 0**。零目标不直接授权平仓；只有原审批及全部 ExecutionGate 检查通过后才能生成订单，缺审批的冷启动保留 `NoOrder`，不进入 Allocator。canonical Store 数据库不存在时由 Rust 自动初始化 schema，但不会自动生成 policy；运行时仅接受 SQL Store 的 active head。候选 Policy 由 SQL 校准流程生成，操作员显式按 Artifact ID 执行 `calibration activate`；PositionPlan 不从文件导入 Policy。
 
 ### 5.2 ExecutionGate (决策到执行)
-- **原子幂等 Commitment**：在实际向 Alpaca 发起请求前，Rust 先向 SQLite 写入确定性 `client_order_id` 与 `ExecutionCommitment`。即便进程崩溃重启，也能保证不发生重复下单。
+- **原子幂等 Commitment**：在实际向 Alpaca 发起请求前，Rust 先向 SQLite 写入确定性 `client_order_id` 与 `ExecutionCommitment`。即使进程崩溃重启，也会复用同一确定性 ID 并先查询/对账，已知路径不重复下单；外部副作用不承诺 exactly-once，结果未知时先查询原 Run/Session，不得自动重发。
 - **无订单仍予评估**：即使执行判定为 `NoOrder`，其预测仍会被封装为 `OutcomeSchedule`，在 T+1/T+3/T+5 进行真实市场表现校验。
 
 ### 5.3 校准数据准备与政策状态
@@ -206,7 +206,7 @@ target/debug/akzio calibration readiness --store ~/.akzio/store --min-samples 30
 1. **默认不会自动发起 Paper Session**：
    - 示例配置中 `daemon.auto_paper = false`。直接启动只会开启 HTTP/SSE 守护进程与存储服务，不会连接 Alpaca Paper 调度。只有显式配置 `auto_paper = true` 且提供合规凭据与市场钟处于开盘期时，调度器才会工作。
 2. **默认策略下不会建立多头头寸**：
-   - 缺省决策策略时，校准样本不足，Rust 决策闸门遵循 Fail-Closed 原则将目标头寸设定为 0。若账户为空仓，系统产出 `NoOrder`；若账户原有多头，系统会自动触发卖出平仓至 0 敞口。
+   - 缺省决策策略时，校准样本不足，Rust 决策闸门遵循 Fail-Closed 原则将目标头寸设定为 0。若账户为空仓，系统产出 `NoOrder`；若账户原有多头，只有在原审批与全部 ExecutionGate 检查通过后，系统才会生成卖出订单并尝试平仓至 0 敞口；缺审批的冷启动仍保留 `NoOrder`。
 3. **初次运行会产出大量中性预测**：
    - 正式 Paper 与 PositionPlan 共享固定三组 Analyst/Critic，分别覆盖 T1/T3/T5。资料获取成功不等于方向命题获得支持；没有对应资产、期限和方向的充分依据时，Forecast 必须保持中性。不能把中性输出解释为只有单个 Analyst，也不能强迫模型产生非零仓位。
 
@@ -240,30 +240,33 @@ cargo run --locked -p akzio-cli -- observatory-config \
 
 ## 九、CLI 操作与运维指令大全
 
-常驻服务的控制与查询通过认证的回环 HTTP API 完成，通信令牌存放于 Store Root 的 `.daemon-token`（权限 0600）。离线拓扑验证在 Rust workspace 测试中完成：
+常驻服务的控制与查询通过认证的回环 HTTP API 完成，通信令牌存放于 Store Root 的 `.daemon-token`（权限 0600）。CLI 的 `--config` 默认是仓库内 fixture 配置 `config/akzio.toml`（`experiment_profile=fixture`、`store_root=.akzio/store`），不是 `~/.akzio/config.toml`；操作本机正式 Store 时必须显式传入 home 配置。离线拓扑验证在 Rust workspace 测试中完成：
 
 ```bash
+# 本机正式配置；若使用其他路径请同步替换
+AKZIO_CONFIG="$HOME/.akzio/config.toml"
+
 # 1. 启动本地守护进程（监听 127.0.0.1:7342）
-cargo run -p akzio-cli -- daemon serve
+cargo run -p akzio-cli -- --config "$AKZIO_CONFIG" daemon serve
 
 # 2. 检查守护进程健康状态与租约
-cargo run -p akzio-cli -- daemon health
+cargo run -p akzio-cli -- --config "$AKZIO_CONFIG" daemon health
 
 # 3. 正式图、归档与故障边界的离线回归（不调用真实模型/Broker）
 cargo test --workspace --locked
 
 # 4. 从耐久事件重放并验证指定 Run（只读诊断）
-cargo run -p akzio-cli -- run replay <run-id>
+cargo run -p akzio-cli -- --config "$AKZIO_CONFIG" run replay <run-id>
 
 # 5. 监听 Run 的实时生命周期事件流 (SSE)
-cargo run -p akzio-cli -- run events <run-id>
+cargo run -p akzio-cli -- --config "$AKZIO_CONFIG" run events <run-id>
 
 # 6. 系统紧急冻结与解冻（安全干预）
-cargo run -p akzio-cli -- daemon freeze "操作员维护"
-cargo run -p akzio-cli -- daemon unfreeze "恢复运行"
+cargo run -p akzio-cli -- --config "$AKZIO_CONFIG" daemon freeze "操作员维护"
+cargo run -p akzio-cli -- --config "$AKZIO_CONFIG" daemon unfreeze "恢复运行"
 
 # 7. 本地统一 CAS 数据库完整性巡检
-cargo run -p akzio-cli -- store doctor
+cargo run -p akzio-cli -- --config "$AKZIO_CONFIG" store doctor
 ```
 
 ---
@@ -280,18 +283,21 @@ cargo run -p akzio-cli -- store doctor
 # 格式化检查
 cargo fmt --all -- --check
 
-# 全工作区静态分析与全目标 Clippy
-cargo check --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+# 日常脚本语法
+bash -n scripts/run_core.sh
+
+# 全工作区静态分析与全目标 Clippy（与 CI 一致，启用 --locked 与全部 features）
+cargo check --workspace --locked
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
 # 单元测试与集成测试
-cargo test --workspace
-
-# 正式图、Run 日志和权限回归；不依赖真实模型配置
 cargo test --workspace --locked
+
 # 独立 store doctor 命令要求对应配置的认证 daemon 正在运行
-cargo run -p akzio-cli -- store doctor
+cargo run -p akzio-cli -- --config "$HOME/.akzio/config.toml" store doctor
 ```
+
+CI 还检查 Markdown 本地链接，并独立运行 audit 与 SBOM 生成；上述命令是本地交付前的最低离线门槛。
 
 ### 交付报告分级标准
 - **implemented**：功能代码完成并通过本地语法检查。

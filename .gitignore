@@ -32,7 +32,3 @@ __pycache__/
 # Editor state
 .idea/
 .vscode/
-
-# Akzio Observatory (SwiftUI presentation shell)
-apps/.build/
-apps/dist/

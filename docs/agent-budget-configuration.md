@@ -39,7 +39,7 @@ output 为 `1..=1000000` 的整数；input/timeout 保留既有 `1..=4294967295`
 
 ## 冻结与执行
 
-- 新 Run 默认值定义在 `akzio-domain::budget::default_agent_budget`。当前研究 Contract 67 / PromptBundle 37 / candidate 68 沿用既有单任务预算，终稿 Reviewer 继承 Critic 的有效配置；每个预编译修订节点分别冻结预算，并共同计入 Run 成本；Outcome 保持 Contract 63 / PromptBundle 35。`versioned_contract_budget` 构造当前 Contract，`legacy_contract_budget` 只为历史解码、完整性校验和历史边界测试保留；不改写已存 Contract/Workflow 哈希。
+- 新 Run 默认值定义在 `akzio-domain::budget::default_agent_budget`。当前研究 Contract 69 / PromptBundle 38 / candidate 70 沿用既有单任务预算，终稿 Reviewer 继承 Critic 的有效配置；每个预编译修订节点分别冻结预算，并共同计入 Run 成本；Outcome 保持 Contract 63 / PromptBundle 35。`versioned_contract_budget` 构造当前 Contract，`legacy_contract_budget` 只为历史解码、完整性校验和历史边界测试保留；不改写已存 Contract/Workflow 哈希。
 - Rust 创建 Run 的 WorkflowGraph 时写入 `agent_budgets`，包含四个原有 Role 和继承 Critic 的 proposal_reviewer resolved budget。每个任务节点的 `budget` 和 Store 的 `budget_json` 保存实际预算；配置中的 `timeout_seconds` 对应既有持久化字段 `max_wall_time_secs`。
 - 创建 Attempt 时从持久化任务取得预算。AgentRuntime 校验传入预算与持久化任务一致；之后仅使用冻结值执行 Task 累计 input/output、只读工具次数及单 Attempt 墙钟时限检查。发起请求前检查累计输入和剩余输出，Draft、Submit、Retry 和 Recovery 共用 Task token 额度，失败调用仍按既有规则记账。
 - 恢复继续执行原有累计用量恢复协议，不因配置重载、阶段切换或恢复重新分配预算。Outcome 各期限保留现有独立额度机制，额度上限来自原 Run 快照。

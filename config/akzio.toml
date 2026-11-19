@@ -37,7 +37,7 @@ response_language = "简体中文"
 # Input/output accumulate per Task across Draft, Submit, Retry and Recovery.
 # These are not a Provider context window or a whole-Run token allowance.
 # Research roles default to 1000000 Task output tokens (application max).
-# Wall time is separate: 120 seconds per research Attempt, 180 for Outcome.
+# Wall time is separate: 180 seconds per research Attempt, 180 for Outcome.
 # Outcome Worker keeps 4000; explicit role overrides retain precedence. Output
 # does not change input, context, tools, wall time or retries. Historical frozen
 # Contracts and Runs keep their original budgets.

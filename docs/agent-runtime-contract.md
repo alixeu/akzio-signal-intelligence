@@ -36,7 +36,7 @@ Alpaca 股票研究捕获先核验资产，保留市场时钟、交易日历、�
 
 ## 1. 项目定位与核心红线
 
-- **定位**：本仓库是 Rust 2021/2024 (固定构建 Rust `1.96.0`) workspace，构建本地常驻、仅支持 Alpaca Paper 的多智能体量化投研系统（Multi-Agent Research System）。
+- **定位**：本仓库是 Rust 2021 edition (固定构建 Rust `1.96.0`) workspace，构建本地常驻、仅支持 Alpaca Paper 的多智能体量化投研系统（Multi-Agent Research System）。
 - **标的范围**：系统限定可执行资产严格为 4 只美股 ETF：`TQQQ`、`QQQ`、`SOXX`、`SOXL`。
 - **纯 v2 架构**：项目只维护 v2；严禁恢复旧 `orchestrator-*` crates、Phase 0–8、FileStore、旧 prompts 或 `outputs/store` 兼容路径。
 - **物理绝缘实盘**：Live Trading 永不实现；`AlpacaPaper::new` 必须在发生任何实际 HTTP I/O 前强制校验并拒绝非 Paper endpoint。
@@ -200,9 +200,9 @@ DecisionProposal (LLM: Forecast + research_allocation)
 |---|---|---|
 | `rebuild_blobs` | 存储所有 JSON 强类型负载（Zstd 压缩） | `blob_hash`, `logical_bytes`, `stored_bytes`, `payload` |
 | `rebuild_artifacts` | 统一 Artifact 元数据与生命周期 | `artifact_id`, `kind`, `blob_hash`, `lifecycle`, `provenance_json` |
-| `rebuild_artifact_refs` | Artifact 之间的全量 DAG 依赖血缘关系 | `source_artifact_id`, `target_artifact_id`, `ref_type` |
+| `rebuild_artifact_refs` | Artifact 之间的全量 DAG 依赖血缘关系 | `artifact_id`, `source_artifact_id`, `source_kind` |
 | `rebuild_runs` | Run 生命周期与图拓扑元信息 | `run_id`, `purpose`, `topology_id`, `graph_artifact_id`, `status` |
-| `rebuild_tasks` | Task 调度、Contract 校验与 Lease 租约 | `recipe_id`, `objective`, `contract_hash`, `budget`, `status`, `lease` |
+| `rebuild_tasks` | Task 调度、Contract 校验与 Lease 租约 | `task_id`, `run_id`, `recipe_id`, `contract_hash`, `budget_json`, `retry_json`, `node_spec_json`, `status`, `lease_id`, `lease_epoch`, `lease_until` |
 | `rebuild_attempts` | 任务单次尝试的执行状态与重试记录 | `attempt_id`, `task_id`, `status`, `error_json` |
 | `rebuild_attempt_outputs`| 成功 Attempt 产生的正式输出映射 | `attempt_id`, `artifact_id` |
 | `rebuild_session_slots` | Paper 交易 Session 的排他性原子插槽 | `session_key`, `run_id`, `commitment_artifact_id` |
@@ -221,7 +221,7 @@ DecisionProposal (LLM: Forecast + research_allocation)
 - 40 项证据逐项留状态：前置 EvidenceGate 将六项 ExecutionSafety 标记 deferred_to_execution 且不采集；ExecutionGate 原 refresh_execution_snapshots 即时获取并继续 fail closed。研究和增强数据失败保留成功项与缺口。新鲜度看内容可用时间，日线以交易所收盘（美东 DST/提前收盘）加 20 分钟余量判断；不以下载时间或 UTC 日期替代 Session。
 - 每个 Outcome 是同 Run 的 post-terminal 工作；先检查未完成阶段再调用模型，迟到补跑按各阶段自己的 cutoff 截断事实。每 Outcome 租约单写，争用 Deferred；完成、报错及取消时按 epoch 释放租约。Deferred 不进入失败预算，已提交的阶段事件为下一阶段建立独立额度；Outcome 重试从 30 秒指数退避，最多 5 分钟。Worker 对 Session/Outcome 进行服务保留或单 Worker 交错。
 - 执行后持仓按数量和现金重建，Receipt 去重并验证实际成交。Outcome 是冻结执行后敞口（metric v3），不代表真实后续账户 NAV；按当前阶段实际计价窗口检查公司行动，窗口内无调整账本则不可用，禁止推测调整因子。
-- Decision 生产成本取依赖任务闭包；Outcome/叙事成本与生命周期总成本分开。Experience 保留 producer Run/Contracts/Workflow revision 与 evaluator Contract。行情完整、研究充分、叙事有效、风险真值已测量分别记录。缺失风险真值继续为 None，不得填满分。
+- Decision 生产成本取依赖任务闭包；Outcome/叙事成本与生命周期总成本分开。Experience 保留 producer Run/Contracts/Workflow revision 与 evaluator Contract。行情完整、研究充分、叙事有效（结构合格的 T5 Retrospective，不做独立语义质量评分）、风险真值已测量分别记录。缺失风险真值继续为 None，不得填满分。
 - Rust-only T5 不取得学习资格。叙事修复在原 Run 上提交可追溯 revision，保留原数值 CAS；修复后复用密封 Outcome，经原资格检查幂等补评估；不得直接写入 Proven。LessonProposal 显式声明资产、horizon、排除条件与证据，只有 Draft/quarantine 权限。
 - 当前版本：Domain schema 10（兼容可选字段）；Store 18；WorkflowDefinition 1；研究 Contract 69 / Prompt bundle 38 / freshness candidate 70；Outcome Contract 63 / Prompt bundle 35，metric `frozen_post_execution_exposure_v3`；evaluation context 1；benchmark definition 1。旧未知口径和 v2 数据不自动改标 v3。
 - v14→v15 迁移只新增 Run/kind 表达式索引。旧 Contract 的未完成任务会在写新 Store 版本前阻断升级；旧任务哈希不改写，旧 CAS/Commitment 不改写。停止旧 worker 并合法处理旧任务之后再升级。RuntimeIdentity 与旧审批不自动复用。
