@@ -306,6 +306,31 @@ impl Store {
         Ok(())
     }
 
+    /// Read the authoritative execution freeze using the Store's canonical-first
+    /// artifact ordering. Missing history means execution has not been frozen.
+    pub fn read_execution_freeze_state(&self) -> StoreResult<Option<FreezeState>> {
+        let Some(artifact) = self.latest_artifact_by_kind(ArtifactKind::FreezeState)? else {
+            return Ok(None);
+        };
+        artifact.validate()?;
+        if artifact.kind != ArtifactKind::FreezeState
+            || artifact.lifecycle != ArtifactLifecycle::Canonical
+            || artifact.origin.is_some()
+        {
+            return Err(StoreError::Integrity(
+                "invalid execution freeze artifact".to_owned(),
+            ));
+        }
+        let state: FreezeState = serde_json::from_slice(&self.read_blob(&artifact.blob)?)?;
+        state.validate()?;
+        if state.changed_at != artifact.created_at {
+            return Err(StoreError::Integrity(
+                "execution freeze timestamp mismatch".to_owned(),
+            ));
+        }
+        Ok(Some(state))
+    }
+
     /// 追加一条不可变的操作员 `FreezeState` Artifact；执行侧读取最新
     /// canonical 冻结状态，而不是在这里维护可变布尔开关。
     pub fn write_freeze_state(
@@ -316,8 +341,7 @@ impl Store {
     ) -> StoreResult<Artifact> {
         // `impl Into<String>` 接受调用方可转换为 String 的具体类型，
         // `reason.into()` 在这里取得 payload 所需的拥有型文本；不借用临时调用参数。
-        // 先校验并暂存 JSON，再复用窄权限 bootstrap 写入 canonical Artifact；返回 Artifact
-        // 表示该行已提交，但不会连带修改其他开关或跨进程状态。
+        // 先校验并暂存 JSON，再在同一写事务中发布 canonical Artifact 并确认它成为权威状态。
         let payload = FreezeState {
             schema_version: DOMAIN_SCHEMA_VERSION,
             frozen,
@@ -342,7 +366,25 @@ impl Store {
             Vec::new(),
             changed_at,
         )?;
-        self.write_bootstrap_artifact(&artifact)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        insert_artifact(&transaction, &artifact)?;
+        // After inserting a canonical candidate, this is the canonical tier of
+        // latest_artifact_by_kind: creation time, then content ID. Reject lost
+        // publication before commit so an operator never gets false success.
+        let head: String = transaction.query_row(
+            "SELECT artifact_id FROM rebuild_artifacts
+             WHERE kind = ?1 AND lifecycle = 'canonical'
+             ORDER BY created_at DESC, artifact_id DESC LIMIT 1",
+            params![enum_name(ArtifactKind::FreezeState)],
+            |row| row.get(0),
+        )?;
+        if head != artifact.artifact_id.0.as_str() {
+            return Err(StoreError::Integrity(
+                "execution freeze did not become the authoritative state".to_owned(),
+            ));
+        }
+        transaction.commit()?;
         Ok(artifact)
     }
 
@@ -549,5 +591,74 @@ impl Store {
             _ => {}
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod freeze_publication_tests {
+    use super::*;
+
+    fn freeze_store() -> Store {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/freeze-publication-tests")
+            .join(RunId::new().0);
+        Store::open(root).unwrap()
+    }
+
+    /// WHY THIS TEST EXISTS (Task #27): A freeze write must fail when it would not become the authoritative head.
+    /// Do not weaken or delete this assertion.
+    #[test]
+    fn freeze_publication_refuses_a_losing_timestamp_or_tie() {
+        let now = Utc::now();
+        let first = freeze_store();
+        let second = freeze_store();
+        let frozen = first.write_freeze_state(true, "freeze", now).unwrap();
+        let unfrozen = second.write_freeze_state(false, "unfreeze", now).unwrap();
+        let (winner, winner_artifact, losing_artifact, losing_frozen, losing_reason) =
+            if frozen.artifact_id > unfrozen.artifact_id {
+                (first, frozen, unfrozen, false, "unfreeze")
+            } else {
+                (second, unfrozen, frozen, true, "freeze")
+            };
+        let other_connection = Store::open(winner.root()).unwrap();
+        assert!(other_connection
+            .write_freeze_state(losing_frozen, losing_reason, now)
+            .is_err());
+        assert!(matches!(
+            winner.artifact(&losing_artifact.artifact_id),
+            Err(StoreError::MissingArtifact(_))
+        ));
+        assert!(other_connection
+            .write_freeze_state(
+                losing_frozen,
+                "clock moved back",
+                now - Duration::seconds(1)
+            )
+            .is_err());
+        let authoritative = winner
+            .latest_artifact_by_kind(ArtifactKind::FreezeState)
+            .unwrap()
+            .unwrap();
+        assert_eq!(authoritative.artifact_id, winner_artifact.artifact_id);
+        assert_eq!(
+            winner
+                .read_execution_freeze_state()
+                .unwrap()
+                .unwrap()
+                .frozen,
+            !losing_frozen
+        );
+        let next = other_connection
+            .write_freeze_state(losing_frozen, losing_reason, now + Duration::seconds(1))
+            .unwrap();
+        assert_ne!(next.artifact_id, winner_artifact.artifact_id);
+        assert_eq!(
+            winner
+                .read_execution_freeze_state()
+                .unwrap()
+                .unwrap()
+                .frozen,
+            losing_frozen
+        );
     }
 }

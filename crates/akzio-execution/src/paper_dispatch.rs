@@ -43,6 +43,8 @@ pub enum PaperDispatchError {
     NonPaperRun(RunPurpose),
     #[error("execution is frozen")]
     Frozen,
+    #[error("frozen Paper reconciliation is temporarily unavailable: {0}")]
+    FrozenReconciliationUnavailable(#[source] PaperError),
     #[error("commitment is not the durable session commitment")]
     CommitmentNotDurable,
     #[error("commitment does not retain its execution context")]
@@ -59,6 +61,17 @@ pub enum PaperDispatchError {
     UnsupportedReceiptStatus(String),
     #[error("broker returned replacement order for {0} without durable reprice intent")]
     ReplacementWithoutIntent(Asset),
+}
+
+impl PaperDispatchError {
+    fn with_frozen_receipts(self, execution: &PaperExecution) -> Self {
+        match self {
+            Self::Frozen | Self::Broker(PaperError::Frozen) if !execution.orders.is_empty() => {
+                Self::Broker(PaperError::FrozenAfterReceipts(execution.clone()))
+            }
+            error => error,
+        }
+    }
 }
 
 pub type PaperDispatchResult<T> = std::result::Result<T, PaperDispatchError>;
@@ -127,13 +140,22 @@ struct DurableOrderActions {
 }
 
 impl PaperDispatchRuntime {
-    /// Emergency continuation after a logging failure: no new submission,
-    /// or replacement is created. Only an already recorded Commitment effect
-    /// can be observed; a Store-approved cancel intent may be continued.
+    /// Safety continuation for an already recorded Commitment effect.
+    /// Observe existing orders and continue Store-approved protective cancels.
     pub async fn reconcile_existing_only<B: CommittedPaperBroker + ?Sized>(
         &self,
         broker: &B,
         input: &PaperDispatchInput,
+    ) -> PaperDispatchResult<PaperDispatchOutput> {
+        self.reconcile_existing_with_known(broker, input, None)
+            .await
+    }
+
+    async fn reconcile_existing_with_known<B: CommittedPaperBroker + ?Sized>(
+        &self,
+        broker: &B,
+        input: &PaperDispatchInput,
+        known: Option<PaperExecution>,
     ) -> PaperDispatchResult<PaperDispatchOutput> {
         self.require_paper_run(&input.permit)?;
         self.store
@@ -154,29 +176,48 @@ impl PaperDispatchRuntime {
         } = self.load_committed_plan(&input.permit, &input.commitment)?;
         self.store.validate_daemon_lease(&input.lease, Utc::now())?;
         self.store.validate_task_permit(&input.permit)?;
-        let mut execution = broker.observe_existing_commitment(&commitment).await?;
-        if execution.plan_hash != commitment.plan_hash {
-            return Err(PaperDispatchError::BrokerPlanHashMismatch);
+        let reconciliation_runtime = ReconciliationRuntime::new(self.store.clone());
+        if let Some(known) = &known {
+            // The final write guard can stop a batch after real receipts have
+            // arrived. Persist them before a lagging or unavailable read can
+            // erase that evidence from this attempt.
+            let output =
+                self.reconcile_known_execution(&reconciliation_runtime, input, &commitment, known)?;
+            if self.reconciliation_is_settled(&output)? {
+                for receipt in output.receipts {
+                    self.store.write_task_artifact_fenced(
+                        Some(&input.lease),
+                        &input.permit,
+                        &receipt,
+                        akzio_domain::LifecycleEventType::ArtifactCommitted,
+                        Utc::now(),
+                    )?;
+                }
+            } else {
+                reconciliation_runtime.write_progress(
+                    &input.lease,
+                    &input.permit,
+                    &output,
+                    Utc::now(),
+                )?;
+            }
         }
+        let mut execution = broker.observe_existing_commitment(&commitment).await?;
+        execution_is_settled(&commitment, &execution)?;
         let actions = self.durable_order_actions(&input.commitment, &execution)?;
         self.resume_existing_cancels(broker, input, &actions.cancels, &mut execution)
             .await?;
-        execution = broker.observe_existing_commitment(&commitment).await?;
-        let actions = self.durable_order_actions(&input.commitment, &execution)?;
-        let receipts = execution
-            .orders
-            .iter()
-            .map(|receipt| broker_receipt(receipt, &commitment, input.now))
-            .collect::<PaperDispatchResult<Vec<_>>>()?;
-        let reconciliation_runtime = ReconciliationRuntime::new(self.store.clone());
-        let reconciliation = reconciliation_runtime.reconcile(&ReconciliationInput {
-            permit: input.permit.clone(),
-            commitment: input.commitment.clone(),
-            reprices: actions.reprices,
-            cancels: actions.cancels,
-            broker_receipts: receipts,
-            now: input.now,
-        })?;
+        // Cancel confirmation is returned by the adapter. Use fresh receipts
+        // for protective actions, then restore known evidence missing from GET.
+        if let Some(known) = known {
+            merge_known_receipts(&mut execution, known);
+        }
+        let reconciliation = self.reconcile_known_execution(
+            &reconciliation_runtime,
+            input,
+            &commitment,
+            &execution,
+        )?;
         let settled = self.reconciliation_is_settled(&reconciliation)?;
         if settled {
             reconciliation_runtime.commit_with_effect(
@@ -202,6 +243,32 @@ impl PaperDispatchRuntime {
             settled,
         })
     }
+    fn reconcile_known_execution(
+        &self,
+        runtime: &ReconciliationRuntime,
+        input: &PaperDispatchInput,
+        commitment: &PaperCommitment,
+        execution: &PaperExecution,
+    ) -> PaperDispatchResult<ReconciliationOutput> {
+        if execution.plan_hash != commitment.plan_hash {
+            return Err(PaperDispatchError::BrokerPlanHashMismatch);
+        }
+        let actions = self.durable_order_actions(&input.commitment, execution)?;
+        let receipts = execution
+            .orders
+            .iter()
+            .map(|receipt| broker_receipt(receipt, commitment, input.now))
+            .collect::<PaperDispatchResult<Vec<_>>>()?;
+        Ok(runtime.reconcile(&ReconciliationInput {
+            permit: input.permit.clone(),
+            commitment: input.commitment.clone(),
+            reprices: actions.reprices,
+            cancels: actions.cancels,
+            broker_receipts: receipts,
+            now: input.now,
+        })?)
+    }
+
     pub fn new(store: Store) -> Self {
         // Store 按值移入并由 runtime 持有；设置默认执行策略与观察时限，不执行 Store/Broker I/O。
         Self {
@@ -249,6 +316,39 @@ impl PaperDispatchRuntime {
             )
             .into());
         }
+        let result = match self.ensure_unfrozen() {
+            Ok(()) => self.dispatch_unfrozen(broker, input).await,
+            Err(error) => Err(error),
+        };
+        let known = match result {
+            Err(PaperDispatchError::Frozen | PaperDispatchError::Broker(PaperError::Frozen)) => {
+                None
+            }
+            Err(PaperDispatchError::Broker(PaperError::FrozenAfterReceipts(known))) => Some(known),
+            result => return result,
+        };
+        if !self
+            .store
+            .paper_effect_intent_recorded(&input.permit.run_id, &input.commitment.artifact_id)?
+        {
+            return Err(PaperDispatchError::Frozen);
+        }
+        match self
+            .reconcile_existing_with_known(broker, input, known)
+            .await
+        {
+            Err(PaperDispatchError::Broker(
+                error @ (PaperError::Transport { .. } | PaperError::Http { .. }),
+            )) => Err(PaperDispatchError::FrozenReconciliationUnavailable(error)),
+            result => result,
+        }
+    }
+
+    async fn dispatch_unfrozen<B: CommittedPaperBroker + ?Sized>(
+        &self,
+        broker: &B,
+        input: &PaperDispatchInput,
+    ) -> PaperDispatchResult<PaperDispatchOutput> {
         // 先从 durable commitment 闭包加载拥有的三项数据，再根据冻结 Decision/approval/
         // snapshots 构造临时授权；授权缺 window 时仍可恢复读取但无法 POST/PATCH。
         let CommittedPlanContext {
@@ -278,10 +378,13 @@ impl PaperDispatchRuntime {
         if execution.plan_hash != commitment.plan_hash {
             return Err(PaperDispatchError::BrokerPlanHashMismatch);
         }
+        self.ensure_unfrozen()
+            .map_err(|error| error.with_frozen_receipts(&execution))?;
         // 执行回执必须与 plan_hash 相同；再从 Store 重建已有 reprice/cancel intents，并恢复它们。
         let mut actions = self.durable_order_actions(&input.commitment, &execution)?;
         self.resume_durable_order_actions(broker, input, &actions, &authorization, &mut execution)
-            .await?;
+            .await
+            .map_err(|error| error.with_frozen_receipts(&execution))?;
         // 完成可能阻塞的 Broker/action 阶段后重新校验 lease，再开始轮询对账；
         // lease 失效时拒绝提交新的持久化结果。
         self.store.validate_daemon_lease(&input.lease, Utc::now())?;
@@ -297,6 +400,8 @@ impl PaperDispatchRuntime {
         if execution.plan_hash != commitment.plan_hash {
             return Err(PaperDispatchError::BrokerPlanHashMismatch);
         }
+        self.ensure_unfrozen()
+            .map_err(|error| error.with_frozen_receipts(&execution))?;
         // 将 adapter receipt 映射成领域 OrderReceipt；未知状态/资产/client ID 错误会阻断
         // reconciliation，不把 broker accepted 解释为成交完成。
         let broker_receipts = execution
@@ -340,7 +445,8 @@ impl PaperDispatchRuntime {
                 &reconciliation,
                 &mut execution,
             )
-            .await?;
+            .await
+            .map_err(|error| error.with_frozen_receipts(&execution))?;
             // action 后只做零时长的即时刷新，避免在同一 stale 分支再次等待；结果仍可能未 settled。
             execution = reconcile_until_settled(
                 &self.store,
@@ -445,6 +551,7 @@ impl PaperDispatchRuntime {
         // 异步 Future 顺序处理已有 intents；reference/authorization/execution 都借用传入对象，
         // await 时不持有本地 Mutex。每个外部调用前后都以 lease fence Store 写入。
         for reference in &actions.reprices {
+            self.ensure_unfrozen()?;
             let artifact = self.load_expected(reference, ArtifactKind::ExecutionReprice)?;
             let intent: PaperReprice =
                 serde_json::from_slice(&self.store.read_blob(&artifact.blob)?)?;
@@ -676,6 +783,7 @@ impl PaperDispatchRuntime {
                     vec![input.commitment.clone(), prior_receipt],
                     now,
                 )?;
+                self.ensure_unfrozen()?;
                 let committed = self.store.commit_execution_reprice_intent(
                     &input.lease,
                     &input.permit,
@@ -734,6 +842,7 @@ impl PaperDispatchRuntime {
                 vec![input.commitment.clone(), prior_receipt],
                 now,
             )?;
+            self.ensure_unfrozen()?;
             let committed = self.store.commit_execution_cancel_intent(
                 &input.lease,
                 &input.permit,
@@ -944,23 +1053,30 @@ impl PaperDispatchRuntime {
     }
 
     fn ensure_unfrozen(&self) -> PaperDispatchResult<()> {
-        // 全局 FreezeState 是本次 dispatch 的前置开关；冻结时当前方法在 Broker 查询
-        // 之前就返回 Frozen。既有外部效果仍在 Broker/Store，但此路径此刻不继续对账。
-        // None 表示 Store 当前无 FreezeState；Some 时读取并 Domain validate，true 才拒绝。
-        // 此方法只读状态，不清除或改写冻结记录。
-        let Some(freeze_artifact) = self
+        if self
             .store
-            .latest_artifact_by_kind(ArtifactKind::FreezeState)?
-        else {
-            return Ok(());
-        };
-        let freeze: FreezeState =
-            serde_json::from_slice(&self.store.read_blob(&freeze_artifact.blob)?)?;
-        freeze.validate()?;
-        if freeze.frozen {
+            .read_execution_freeze_state()?
+            .is_some_and(|state| state.frozen)
+        {
             return Err(PaperDispatchError::Frozen);
         }
         Ok(())
+    }
+}
+
+fn merge_known_receipts(execution: &mut PaperExecution, known: PaperExecution) {
+    for receipt in known.orders {
+        match execution
+            .orders
+            .iter_mut()
+            .find(|fresh| fresh.symbol == receipt.symbol)
+        {
+            Some(fresh)
+                if (fresh.reprice_count, fresh.broker_updated_at)
+                    >= (receipt.reprice_count, receipt.broker_updated_at) => {}
+            Some(fresh) => *fresh = receipt,
+            None => execution.orders.push(receipt),
+        }
     }
 }
 
@@ -1140,7 +1256,11 @@ mod safety_only_tests {
         DOMAIN_SCHEMA_VERSION,
     };
     use akzio_store::{StoredRun, WorkflowCommit};
-    use std::{future::Future, pin::Pin};
+    use std::{
+        future::Future,
+        pin::Pin,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     struct PanicOnBrokerIo;
 
@@ -1190,8 +1310,7 @@ mod safety_only_tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_commitment_without_a_broker_effect_cannot_enter_safety_reconciliation() {
+    fn paper_workflow() -> (Store, WorkflowCommit) {
         let now = Utc::now();
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/paper-log-safety-tests")
@@ -1247,19 +1366,26 @@ mod safety_only_tests {
             now,
         )
         .unwrap();
-        store
-            .commit_workflow(&WorkflowCommit {
-                run: StoredRun {
-                    run_id: run_id.clone(),
-                    purpose: RunPurpose::Paper,
-                    topology_id: graph.topology_id,
-                    graph_artifact_id: artifact.artifact_id.clone(),
-                    created_at: now,
-                },
-                graph: artifact,
-                nodes: vec![node.clone()],
-            })
-            .unwrap();
+        let workflow = WorkflowCommit {
+            run: StoredRun {
+                run_id,
+                purpose: RunPurpose::Paper,
+                topology_id: graph.topology_id,
+                graph_artifact_id: artifact.artifact_id.clone(),
+                created_at: now,
+            },
+            graph: artifact,
+            nodes: vec![node],
+        };
+        (store, workflow)
+    }
+
+    fn paper_run_without_effect() -> (Store, PaperDispatchInput) {
+        let (store, workflow) = paper_workflow();
+        store.commit_workflow(&workflow).unwrap();
+        let now = workflow.run.created_at;
+        let run_id = workflow.run.run_id;
+        let task_id = workflow.nodes[0].task_id.clone();
         assert!(store
             .claim_next_task_for_workload(
                 "safety-only",
@@ -1269,35 +1395,768 @@ mod safety_only_tests {
             )
             .unwrap()
             .is_none());
-        let error = PaperDispatchRuntime::new(store)
-            .reconcile_existing_only(
-                &PanicOnBrokerIo,
-                &PaperDispatchInput {
-                    lease: DaemonLease {
-                        lease_name: "test".into(),
-                        owner_id: "test".into(),
-                        epoch: 1,
-                        expires_at: now + chrono::Duration::minutes(1),
-                    },
-                    permit: TaskWritePermit {
-                        run_id,
-                        task_id: node.task_id,
-                        attempt_id: AttemptId::new(),
-                        lease_id: LeaseId::new(),
-                        epoch: 1,
-                        contract_hash: None,
-                    },
-                    commitment: ArtifactRef {
-                        artifact_id: akzio_domain::ArtifactId(ContentHash::of_bytes(
-                            b"not-submitted",
-                        )),
-                        kind: ArtifactKind::ExecutionCommitment,
-                    },
+        (
+            store,
+            PaperDispatchInput {
+                lease: DaemonLease {
+                    lease_name: "test".into(),
+                    owner_id: "test".into(),
+                    epoch: 1,
+                    expires_at: now + chrono::Duration::minutes(1),
+                },
+                permit: TaskWritePermit {
+                    run_id,
+                    task_id,
+                    attempt_id: AttemptId::new(),
+                    lease_id: LeaseId::new(),
+                    epoch: 1,
+                    contract_hash: None,
+                },
+                commitment: ArtifactRef {
+                    artifact_id: akzio_domain::ArtifactId(ContentHash::of_bytes(b"not-submitted")),
+                    kind: ArtifactKind::ExecutionCommitment,
+                },
+                now,
+            },
+        )
+    }
+
+    fn reserve_fixture_session(store: &Store, workflow: WorkflowCommit, lease: &DaemonLease) {
+        use akzio_domain::{
+            ModelQualificationEvidence, ModelQualificationReport, PaperApprovalScope,
+            PaperLaunchApproval, RuntimeManifest, WorkflowProposal,
+        };
+        let now = workflow.run.created_at;
+        let hash = ContentHash::of_bytes(b"offline fixture");
+        let expires_at = now + chrono::Duration::minutes(10);
+        let components = [("default".to_owned(), hash.clone())].into();
+        let bundle_hash = akzio_domain::runtime_component_bundle_hash(&components).unwrap();
+        let manifest: RuntimeManifest = serde_json::from_value(serde_json::json!({
+            "schema_version": DOMAIN_SCHEMA_VERSION,
+            "code_revision": "fixture", "rust_toolchain": "1.96.0",
+            "experiment_profile": "paper-engineering",
+            "model_capability_hashes": components, "model_capability_bundle_hash": bundle_hash,
+            "governance_component_hashes": components, "governance_bundle_hash": bundle_hash,
+            "cargo_lock_hash": hash, "config_hash": hash,
+            "provider_id": "fixture", "model_id": "fixture",
+            "prompt_hash": hash, "contract_hash": hash, "topology_hash": hash,
+            "decision_policy_hash": hash, "execution_policy_hash": hash,
+            "evaluation_policy_hash": hash,
+            "market_data_feed": "iex", "broker_account_id": "offline-account",
+            "maximum_notional": 10_000_000,
+            "allowed_session_start": now.date_naive(), "allowed_session_end": now.date_naive(),
+            "expires_at": expires_at, "created_at": now,
+        }))
+        .unwrap();
+        let provenance = ArtifactProvenance {
+            source_family: "fixture".into(),
+            observed_at: None,
+            retrieved_at: now,
+            source_uri: None,
+            confidence_ppm: 1_000_000,
+            producer_contract_hash: None,
+        };
+        let manifest_artifact = Artifact::new(
+            ArtifactKind::RuntimeManifest,
+            store.stage_json(&manifest).unwrap(),
+            "runtime.manifest",
+            ArtifactLifecycle::Canonical,
+            provenance.clone(),
+            None,
+            vec![],
+            now,
+        )
+        .unwrap();
+        let evidence_ref = |kind| ArtifactRef {
+            artifact_id: akzio_domain::ArtifactId(hash.clone()),
+            kind,
+        };
+        let evaluation = evidence_ref(ArtifactKind::Evaluation);
+        let mut qualification = ModelQualificationReport {
+            key: manifest.runtime_identity().qualification_key().unwrap(),
+            behavior_fingerprint: hash.clone(),
+            evidence: ModelQualificationEvidence {
+                frozen_context_manifest: evidence_ref(ArtifactKind::ContextManifest),
+                replay_evaluation: evaluation.clone(),
+                adversarial_evaluation: evaluation.clone(),
+                execution_simulation_evaluation: evaluation.clone(),
+                shadow_evaluation: evaluation.clone(),
+                canary_evaluation: evaluation,
+            },
+            replay_passed: true,
+            adversarial_passed: true,
+            execution_simulation_passed: true,
+            shadow_passed: true,
+            canary_passed: true,
+            critical_regressions: 0,
+            approved_by: "fixture".into(),
+            qualified_at: now,
+            expires_at,
+            report_hash: hash.clone(),
+        };
+        qualification.report_hash = qualification.unsigned_hash();
+        let mut approval = PaperLaunchApproval {
+            schema_version: DOMAIN_SCHEMA_VERSION,
+            operator_identity: "fixture".into(),
+            runtime_manifest: artifact_ref(&manifest_artifact),
+            runtime_manifest_hash: manifest.manifest_hash().unwrap(),
+            scope: PaperApprovalScope::Canary,
+            reason: "offline freeze regression".into(),
+            behavior_bundle_hash: None,
+            approved_at: now,
+            expires_at,
+            qualification,
+            mandate: crate::ExecutionGatePolicy::default().mandate,
+            approval_hash: hash,
+        };
+        approval.approval_hash = approval.unsigned_hash().unwrap();
+        let approval = Artifact::new(
+            ArtifactKind::PaperLaunchApproval,
+            store.stage_json(&approval).unwrap(),
+            "operator.paper_approval",
+            ArtifactLifecycle::Canonical,
+            provenance.clone(),
+            None,
+            vec![artifact_ref(&manifest_artifact)],
+            now,
+        )
+        .unwrap();
+        let proposal = Artifact::new(
+            ArtifactKind::WorkflowProposal,
+            store
+                .stage_json(&WorkflowProposal {
+                    schema_version: DOMAIN_SCHEMA_VERSION,
+                    topology_id: workflow.run.topology_id.clone(),
+                    tasks: Default::default(),
+                    stop_reason: None,
+                })
+                .unwrap(),
+            "runtime.paper_provisioning",
+            ArtifactLifecycle::RunScoped,
+            provenance,
+            workflow.graph.origin.clone(),
+            vec![],
+            now,
+        )
+        .unwrap();
+        let reservation = akzio_store::SessionReservation {
+            session_key: now.date_naive().to_string(),
+            workflow,
+            setup_artifacts: vec![],
+            reserved_at: now,
+        };
+        store
+            .reserve_paper_session_with_approval(
+                lease,
+                &reservation,
+                &proposal,
+                &manifest_artifact,
+                &approval,
+            )
+            .unwrap();
+    }
+
+    fn paper_run_with_commitment() -> (Store, PaperDispatchInput) {
+        use akzio_domain::{
+            DependencyClosure, ExecutionVerdict, FactorExposure, LifecycleEventType,
+            MandateAssessment, PreTradeSafetySnapshot, TargetPortfolio,
+        };
+        let (store, mut workflow) = paper_workflow();
+        let now = workflow.run.created_at;
+        let run_id = workflow.run.run_id.clone();
+        let mut commit_node = workflow.nodes[0].clone();
+        commit_node.task_id = TaskId::new();
+        commit_node.recipe_id = TaskRecipeId::new("gate.paper_commit").unwrap();
+        workflow.nodes[0]
+            .dependencies
+            .push(commit_node.task_id.clone());
+        workflow.nodes.insert(0, commit_node);
+        let mut graph: WorkflowGraph =
+            serde_json::from_slice(&store.read_blob(&workflow.graph.blob).unwrap()).unwrap();
+        graph.nodes = workflow.nodes.clone();
+        workflow.graph = Artifact::new(
+            ArtifactKind::WorkflowGraph,
+            store.stage_json(&graph).unwrap(),
+            "runtime.workflow",
+            ArtifactLifecycle::RunScoped,
+            workflow.graph.provenance.clone(),
+            workflow.graph.origin.clone(),
+            vec![],
+            now,
+        )
+        .unwrap();
+        workflow.run.graph_artifact_id = workflow.graph.artifact_id.clone();
+        let until = now + chrono::Duration::minutes(2);
+        let lease = store
+            .acquire_daemon_lease("scheduler", "fixture", now, until)
+            .unwrap()
+            .unwrap();
+        reserve_fixture_session(&store, workflow, &lease);
+        let claim = || {
+            store
+                .claim_next_task_for_workload(
+                    "freeze-fixture",
+                    Utc::now(),
+                    chrono::Duration::minutes(1),
+                    akzio_store::TaskWorkload::Session,
+                )
+                .unwrap()
+                .unwrap()
+                .permit
+        };
+        let permit = claim();
+        let stage = |kind, blob, source_refs| {
+            Artifact::new(
+                kind,
+                blob,
+                "fixture.execution",
+                ArtifactLifecycle::Canonical,
+                crate::trusted_execution_provenance(&permit, now),
+                Some(permit.artifact_origin()),
+                source_refs,
+                now,
+            )
+            .unwrap()
+        };
+        let persist = |artifact: Artifact| {
+            store
+                .write_task_artifact(
+                    &permit,
+                    &artifact,
+                    LifecycleEventType::ArtifactCommitted,
                     now,
+                )
+                .unwrap();
+            artifact_ref(&artifact)
+        };
+        let broker_session = now.date_naive().to_string();
+        let hash = ContentHash::of_bytes(b"offline fixture");
+        let target = TargetPortfolio::zeroed();
+        let decision = persist(stage(
+            ArtifactKind::DecisionContext,
+            store.stage_json(&serde_json::json!({
+                "schema_version": DOMAIN_SCHEMA_VERSION,
+                "decision_id": "fixture-decision", "run_id": run_id,
+                "claims": [], "critiques": [], "evidence": [], "policy_influences": [],
+                "material_conflicts": [], "hard_blockers": [akzio_domain::HardBlocker::MissingEvidence],
+                "soft_warnings": [],
+                "decision_policy_hash": hash, "target": target, "created_at": now,
+            })).unwrap(),
+            vec![],
+        ));
+        let snapshot = |value: serde_json::Value| {
+            persist(stage(
+                ArtifactKind::NormalizedEvidence,
+                store.stage_json(&value).unwrap(),
+                vec![],
+            ))
+        };
+        let account = snapshot(serde_json::json!({
+            "schema_version": DOMAIN_SCHEMA_VERSION,
+            "broker_session": broker_session, "observed_at": now,
+            "equity": 10_000_000, "buying_power": 10_000_000, "day_turnover": 0,
+            "active": true, "trading_blocked": false,
+            "positions": {}, "external_positions": [], "open_order_ids": [],
+        }));
+        let quotes = snapshot(serde_json::json!({
+            "schema_version": DOMAIN_SCHEMA_VERSION,
+            "broker_session": broker_session, "observed_at": now, "quotes": {},
+        }));
+        let clock = snapshot(serde_json::json!({
+            "schema_version": DOMAIN_SCHEMA_VERSION,
+            "broker_session": broker_session, "observed_at": now, "is_open": true,
+        }));
+        let sources = vec![
+            decision.clone(),
+            account.clone(),
+            quotes.clone(),
+            clock.clone(),
+        ];
+        let mut plan = ExecutionPlan {
+            schema_version: DOMAIN_SCHEMA_VERSION,
+            decision_context: decision.clone(),
+            account_snapshot: account.clone(),
+            quote_snapshot: quotes.clone(),
+            market_clock_snapshot: clock.clone(),
+            policy_hash: hash.clone(),
+            maximum_total_notional: MoneyMicros(10_000_000),
+            factor_exposure: FactorExposure::from_target(&target).unwrap(),
+            target,
+            orders: [Asset::Qqq, Asset::Soxx]
+                .into_iter()
+                .map(|asset| OrderIntent {
+                    asset,
+                    extended_hours: false,
+                    side: OrderSide::Sell,
+                    notional: MoneyMicros(1_000_000),
+                    limit_price: MoneyMicros(1_000_000),
+                })
+                .collect(),
+            gross_exposure_ppm: 0,
+            net_exposure_ppm: 0,
+            turnover_ppm: 0,
+            broker_session: broker_session.clone(),
+            created_at: now,
+            plan_hash: hash.clone(),
+        };
+        plan.refresh_hash().unwrap();
+        let plan_ref = persist(stage(
+            ArtifactKind::ExecutionPlan,
+            store.stage_json(&plan).unwrap(),
+            sources.clone(),
+        ));
+        let context = ExecutionContext {
+            schema_version: DOMAIN_SCHEMA_VERSION,
+            run_id,
+            decision_context: decision,
+            account_snapshot: Some(account),
+            quote_snapshot: Some(quotes),
+            market_clock_snapshot: Some(clock),
+            execution_plan: Some(plan_ref.clone()),
+            factor_exposure: Some(plan.factor_exposure),
+            turnover_ppm: Some(0),
+            plan_hash: Some(plan.plan_hash.clone()),
+            broker_session: Some(broker_session.clone()),
+            mandate_assessment: Some(MandateAssessment {
+                mandate_hash: hash,
+                violations: Default::default(),
+                distance_before_ppm: 0,
+                distance_after_ppm: 0,
+            }),
+            pretrade_safety: Some(PreTradeSafetySnapshot {
+                ordered_assets: [Asset::Qqq, Asset::Soxx].into(),
+                information_classifications: Default::default(),
+                recent_compliance_activity: Default::default(),
+                dependency_closure: DependencyClosure {
+                    captured_at: now,
+                    dependencies: Default::default(),
+                },
+                capacity_scenario: None,
+                missing_average_daily_dollar_volume: Default::default(),
+                compliance_violations_by_asset: [
+                    (Asset::Qqq, Default::default()),
+                    (Asset::Soxx, Default::default()),
+                ]
+                .into(),
+                missing_information_classifications: Default::default(),
+                risk_increasing: false,
+                dependency_permits_new_risk: false,
+                dependency_permits_risk_reduction: true,
+                permits_execution: true,
+                permits_risk_increasing: false,
+            }),
+            final_process_quality: None,
+            frozen: false,
+            created_at: now,
+        };
+        let context = persist(stage(
+            ArtifactKind::ExecutionContext,
+            store.stage_json(&context).unwrap(),
+            [sources, vec![plan_ref]].concat(),
+        ));
+        let verdict = persist(stage(
+            ArtifactKind::ExecutionVerdict,
+            store
+                .stage_json(&ExecutionVerdict::Accepted {
+                    execution_context: context.clone(),
+                })
+                .unwrap(),
+            vec![context.clone()],
+        ));
+        let commitment = PaperCommitment {
+            commitment_id: akzio_domain::PaperCommitmentId::new(),
+            execution_context: context.clone(),
+            plan_hash: plan.plan_hash,
+            broker_session: broker_session.clone(),
+            client_order_ids: [
+                (Asset::Qqq, "original-qqq".into()),
+                (Asset::Soxx, "original-soxx".into()),
+            ]
+            .into(),
+            created_at: now,
+        };
+        let commitment = stage(
+            ArtifactKind::ExecutionCommitment,
+            store.stage_json(&commitment).unwrap(),
+            vec![context, verdict],
+        );
+        let reference = artifact_ref(&commitment);
+        store
+            .commit_execution(
+                &lease,
+                &akzio_store::ExecutionCommit {
+                    session_key: broker_session,
+                    permit,
+                    commitment,
+                    committed_at: now,
                 },
             )
+            .unwrap();
+        let permit = claim();
+        (
+            store,
+            PaperDispatchInput {
+                lease,
+                permit,
+                commitment: reference,
+                now,
+            },
+        )
+    }
+
+    #[derive(Clone, Copy)]
+    enum FrozenLookup {
+        Visible,
+        Missing,
+        Unavailable,
+    }
+
+    struct FreezeDuringExecution {
+        store: Store,
+        observations: AtomicUsize,
+        freeze_at_write_admission: bool,
+        expected_cancel: Option<PaperCancelId>,
+        cancellations: AtomicUsize,
+        lookup: FrozenLookup,
+    }
+
+    impl FreezeDuringExecution {
+        fn observed_order(updated_at: DateTime<Utc>, status: &str) -> PaperOrderReceipt {
+            PaperOrderReceipt {
+                client_order_id: "original-qqq".into(),
+                broker_order_id: "original-broker-order".into(),
+                symbol: "QQQ".into(),
+                status: status.into(),
+                requested_quantity_micros: 1_000_000,
+                filled_quantity_micros: 0,
+                remaining_quantity_micros: 1_000_000,
+                average_fill_price: None,
+                broker_updated_at: updated_at,
+                reason: None,
+                reused: true,
+                reprice_count: 0,
+            }
+        }
+
+        fn existing_execution(&self, commitment: &PaperCommitment) -> PaperExecution {
+            assert_eq!(commitment.client_order_ids[&Asset::Qqq], "original-qqq");
+            assert_eq!(commitment.client_order_ids[&Asset::Soxx], "original-soxx");
+            let status = if self.cancellations.load(Ordering::SeqCst) == 0 {
+                "accepted"
+            } else {
+                "canceled"
+            };
+            PaperExecution {
+                plan_hash: commitment.plan_hash.clone(),
+                orders: vec![Self::observed_order(
+                    commitment.created_at - chrono::Duration::minutes(5),
+                    status,
+                )],
+            }
+        }
+    }
+
+    impl CommittedPaperBroker for FreezeDuringExecution {
+        fn observe_existing_commitment<'a>(
+            &'a self,
+            commitment: &'a PaperCommitment,
+        ) -> Pin<Box<dyn Future<Output = crate::paper::Result<PaperExecution>> + Send + 'a>>
+        {
+            self.observations.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                match self.lookup {
+                    FrozenLookup::Visible => Ok(self.existing_execution(commitment)),
+                    FrozenLookup::Missing => Ok(PaperExecution {
+                        plan_hash: commitment.plan_hash.clone(),
+                        orders: vec![],
+                    }),
+                    FrozenLookup::Unavailable => {
+                        let source = reqwest::Client::builder()
+                            .no_proxy()
+                            .redirect(reqwest::redirect::Policy::none())
+                            .timeout(std::time::Duration::from_secs(1))
+                            .build()
+                            .unwrap()
+                            .get("invalid-url")
+                            .build()
+                            .unwrap_err();
+                        Err(PaperError::Transport {
+                            url: "offline-order-lookup".into(),
+                            source,
+                        })
+                    }
+                }
+            })
+        }
+
+        fn execute_commitment<'a>(
+            &'a self,
+            commitment: &'a PaperCommitment,
+            _: &'a ExecutionPlan,
+            _: &'a PaperSubmissionAuthorization,
+        ) -> Pin<Box<dyn Future<Output = crate::paper::Result<PaperExecution>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                tokio::task::yield_now().await;
+                self.store
+                    .write_freeze_state(true, "freeze during broker I/O", Utc::now())
+                    .unwrap();
+                let execution = self.existing_execution(commitment);
+                if self.freeze_at_write_admission {
+                    return Err(PaperError::FrozenAfterReceipts(execution));
+                }
+                Ok(execution)
+            })
+        }
+
+        fn reconcile_commitment<'a>(
+            &'a self,
+            _: &'a PaperCommitment,
+            _: &'a PaperExecution,
+        ) -> Pin<Box<dyn Future<Output = crate::paper::Result<PaperExecution>> + Send + 'a>>
+        {
+            panic!("frozen dispatch must enter existing-only observation")
+        }
+
+        fn cancel_order<'a>(
+            &'a self,
+            intent: &'a PaperCancel,
+        ) -> Pin<Box<dyn Future<Output = crate::paper::Result<PaperOrderReceipt>> + Send + 'a>>
+        {
+            assert_eq!(Some(&intent.cancel_id), self.expected_cancel.as_ref());
+            assert_eq!(intent.broker_order_id, "original-broker-order");
+            assert_eq!(self.cancellations.fetch_add(1, Ordering::SeqCst), 0);
+            Box::pin(async move { Ok(Self::observed_order(intent.created_at, "canceled")) })
+        }
+
+        fn replace_order<'a>(
+            &'a self,
+            _: &'a PaperReprice,
+            _: &'a PaperSubmissionAuthorization,
+        ) -> Pin<Box<dyn Future<Output = crate::paper::Result<PaperOrderReceipt>> + Send + 'a>>
+        {
+            panic!("frozen dispatch must not create a replacement")
+        }
+    }
+
+    /// WHY THIS TEST EXISTS (Task #27): A freeze during broker lookup preserves the exact partial batch and creates no stale actions.
+    /// Do not weaken or delete this assertion.
+    #[tokio::test]
+    async fn frozen_dispatch_observes_existing_partial_effect_and_keeps_it_pending() {
+        assert_frozen_dispatch_recovers_partial_effect(false).await;
+    }
+
+    /// WHY THIS TEST EXISTS (Task #27): A typed late HTTP denial still recovers an earlier broker order from the batch.
+    /// Do not weaken or delete this assertion.
+    #[tokio::test]
+    async fn frozen_dispatch_recovers_after_final_write_admission_denial() {
+        assert_frozen_dispatch_recovers_partial_effect(true).await;
+    }
+
+    async fn assert_frozen_dispatch_recovers_partial_effect(freeze_at_write_admission: bool) {
+        let (store, input) = paper_run_with_commitment();
+        let broker = FreezeDuringExecution {
+            store: Store::open(store.root()).unwrap(),
+            observations: AtomicUsize::new(0),
+            freeze_at_write_admission,
+            expected_cancel: None,
+            cancellations: AtomicUsize::new(0),
+            lookup: FrozenLookup::Visible,
+        };
+        let runtime = PaperDispatchRuntime::new(store.clone());
+        // First call crosses the freeze during broker I/O. The next starts frozen.
+        for expected_observations in [1, 2] {
+            let output = runtime.dispatch(&broker, &input).await.unwrap();
+            assert!(!output.settled);
+            assert_eq!(output.execution.orders.len(), 1);
+            assert_eq!(output.execution.orders[0].client_order_id, "original-qqq");
+            assert_eq!(
+                output.execution.orders[0].broker_order_id,
+                "original-broker-order"
+            );
+            assert_eq!(
+                broker.observations.load(Ordering::SeqCst),
+                expected_observations
+            );
+            assert!(store
+                .paper_effect_intent_recorded(&input.permit.run_id, &input.commitment.artifact_id)
+                .unwrap());
+            for asset in [Asset::Qqq, Asset::Soxx] {
+                assert!(store
+                    .reprice_for(&input.commitment, asset)
+                    .unwrap()
+                    .is_none());
+                assert!(store
+                    .cancel_for(&input.commitment, asset)
+                    .unwrap()
+                    .is_none());
+            }
+        }
+    }
+
+    /// WHY THIS TEST EXISTS (Task #27): A prior broker receipt stays durable when the post-freeze GET returns 404 or fails.
+    /// Do not weaken or delete this assertion.
+    #[tokio::test]
+    async fn frozen_dispatch_persists_known_receipts_before_lookup_failure() {
+        for lookup in [FrozenLookup::Missing, FrozenLookup::Unavailable] {
+            let transport_error = matches!(lookup, FrozenLookup::Unavailable);
+            let (store, input) = paper_run_with_commitment();
+            let broker = FreezeDuringExecution {
+                store: Store::open(store.root()).unwrap(),
+                observations: AtomicUsize::new(0),
+                freeze_at_write_admission: transport_error,
+                expected_cancel: None,
+                cancellations: AtomicUsize::new(0),
+                lookup,
+            };
+            let output = PaperDispatchRuntime::new(store.clone())
+                .dispatch(&broker, &input)
+                .await;
+            let receipts = store
+                .run_artifacts_by_kind(&input.permit.run_id, ArtifactKind::OrderReceipt)
+                .unwrap();
+            assert_eq!(receipts.len(), 1, "{output:?}");
+            let receipt: OrderReceipt =
+                serde_json::from_slice(&store.read_blob(&receipts[0].blob).unwrap()).unwrap();
+            assert_eq!(receipt.client_order_id, "original-qqq");
+            assert_eq!(receipt.state, OrderReceiptState::Accepted);
+            assert_eq!(broker.cancellations.load(Ordering::SeqCst), 0);
+            assert!(store
+                .cancel_for(&input.commitment, Asset::Qqq)
+                .unwrap()
+                .is_none());
+            if !transport_error {
+                let output = output.unwrap();
+                assert!(!output.settled);
+                assert_eq!(output.execution.orders[0].client_order_id, "original-qqq");
+            } else {
+                assert!(matches!(
+                    output,
+                    Err(PaperDispatchError::FrozenReconciliationUnavailable(
+                        PaperError::Transport { .. }
+                    ))
+                ));
+            }
+        }
+    }
+
+    /// WHY THIS TEST EXISTS (Task #27): A freeze must allow an exact durable protective cancel to complete once while its batch is pending.
+    /// Do not weaken or delete this assertion.
+    #[tokio::test]
+    async fn frozen_dispatch_preserves_durable_protective_cancel() {
+        let (store, input) = paper_run_with_commitment();
+        let commitment = store.artifact(&input.commitment.artifact_id).unwrap();
+        let commitment: PaperCommitment =
+            serde_json::from_slice(&store.read_blob(&commitment.blob).unwrap()).unwrap();
+        store
+            .record_paper_effect_intent(&input.lease, &input.permit, &input.commitment, input.now)
+            .unwrap();
+        let mut broker = FreezeDuringExecution {
+            store: store.clone(),
+            observations: AtomicUsize::new(0),
+            freeze_at_write_admission: false,
+            expected_cancel: None,
+            cancellations: AtomicUsize::new(0),
+            lookup: FrozenLookup::Visible,
+        };
+        let reconciliation = ReconciliationRuntime::new(store.clone());
+        let execution = broker.existing_execution(&commitment);
+        let output = reconciliation
+            .reconcile(&ReconciliationInput {
+                permit: input.permit.clone(),
+                commitment: input.commitment.clone(),
+                reprices: vec![],
+                cancels: vec![],
+                broker_receipts: vec![
+                    broker_receipt(&execution.orders[0], &commitment, input.now).unwrap()
+                ],
+                now: input.now,
+            })
+            .unwrap();
+        reconciliation
+            .write_progress(&input.lease, &input.permit, &output, input.now)
+            .unwrap();
+        let prior_receipt = artifact_ref(&output.receipts[0]);
+        let cancel = PaperCancel {
+            schema_version: DOMAIN_SCHEMA_VERSION,
+            cancel_id: PaperCancelId::new(),
+            commitment: input.commitment.clone(),
+            prior_receipt: prior_receipt.clone(),
+            asset: Asset::Qqq,
+            client_order_id: "original-qqq".into(),
+            broker_order_id: "original-broker-order".into(),
+            reason: PaperCancelReason::RiskReduction,
+            created_at: input.now,
+        };
+        broker.expected_cancel = Some(cancel.cancel_id.clone());
+        let cancel = Artifact::new(
+            ArtifactKind::ExecutionCancel,
+            store.stage_json(&cancel).unwrap(),
+            "execution.cancel",
+            ArtifactLifecycle::Canonical,
+            crate::trusted_execution_provenance(&input.permit, input.now),
+            Some(input.permit.artifact_origin()),
+            vec![input.commitment.clone(), prior_receipt],
+            input.now,
+        )
+        .unwrap();
+        let stored = store
+            .commit_execution_cancel_intent(&input.lease, &input.permit, &cancel, input.now)
+            .unwrap();
+        assert_eq!(stored.artifact.artifact_id, cancel.artifact_id);
+        // A real receipt already known to this attempt must not substitute for
+        // a fresh observation when deciding whether to run the durable cancel.
+        broker.lookup = FrozenLookup::Missing;
+        broker.freeze_at_write_admission = true;
+        let runtime = PaperDispatchRuntime::new(store.clone());
+        let output = runtime.dispatch(&broker, &input).await.unwrap();
+        assert!(!output.settled);
+        assert_eq!(output.execution.orders[0].status, "accepted");
+        assert_eq!(broker.cancellations.load(Ordering::SeqCst), 0);
+        assert!(!store
+            .paper_effect_intent_recorded(&input.permit.run_id, &cancel.artifact_id)
+            .unwrap());
+
+        broker.lookup = FrozenLookup::Visible;
+        for _ in 0..2 {
+            let output = runtime.dispatch(&broker, &input).await.unwrap();
+            assert!(!output.settled);
+            assert_eq!(output.execution.orders[0].status, "canceled");
+            assert_eq!(broker.cancellations.load(Ordering::SeqCst), 1);
+        }
+        assert!(store
+            .cancel_for(&input.commitment, Asset::Soxx)
+            .unwrap()
+            .is_none());
+    }
+
+    /// WHY THIS TEST EXISTS (Task #27): The safety path must still reject a Commitment without its exact durable broker effect.
+    /// Do not weaken or delete this assertion.
+    #[tokio::test]
+    async fn a_commitment_without_a_broker_effect_cannot_enter_safety_reconciliation() {
+        let (store, input) = paper_run_without_effect();
+        let error = PaperDispatchRuntime::new(store)
+            .reconcile_existing_only(&PanicOnBrokerIo, &input)
             .await
             .unwrap_err();
         assert!(matches!(error, PaperDispatchError::CommitmentNotDurable));
+    }
+
+    /// WHY THIS TEST EXISTS (Task #27): A frozen run with no exact effect must defer without preparing or touching the broker.
+    /// Do not weaken or delete this assertion.
+    #[tokio::test]
+    async fn frozen_dispatch_with_no_effect_defers_without_broker_io() {
+        let (store, input) = paper_run_without_effect();
+        store
+            .write_freeze_state(true, "operator stop", input.now)
+            .unwrap();
+        let error = PaperDispatchRuntime::new(store.clone())
+            .dispatch(&PanicOnBrokerIo, &input)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, PaperDispatchError::Frozen), "{error:?}");
+        assert!(!store
+            .paper_effect_intent_recorded(&input.permit.run_id, &input.commitment.artifact_id)
+            .unwrap());
     }
 }

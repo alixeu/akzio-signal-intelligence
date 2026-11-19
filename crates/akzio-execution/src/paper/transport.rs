@@ -8,6 +8,20 @@ impl AlpacaPaper {
         if let Some(guard) = &self.write_guard {
             guard(kind)?;
         }
+        // The operator can commit a freeze while the audit callback runs.
+        // Selecting the authoritative head is the admission point. A freeze that
+        // commits later leaves an already admitted request to its original ID.
+        let Some(store) = &self.execution_freeze_store else {
+            return Ok(());
+        };
+        if kind != PaperWriteKind::Cancel
+            && store
+                .read_execution_freeze_state()
+                .map_err(PaperError::FreezeStateUnavailable)?
+                .is_some_and(|state| state.frozen)
+        {
+            return Err(PaperError::Frozen);
+        }
         Ok(())
     }
 
@@ -45,9 +59,9 @@ impl AlpacaPaper {
         // POST 不做自动重试；调用方必须已经完成 Commitment，网络不确定状态交给恢复查询。
         // body 所有权传入本 helper，但 reqwest 只借用它序列化本次请求；send 失败通过
         // `?` 返回，不保留本地重试循环，以免重复下单。
+        let request = self.authorized(self.client.post(url).json(&body));
         self.before_write(PaperWriteKind::Submit)?;
-        let response = self
-            .authorized(self.client.post(url).json(&body))
+        let response = request
             .send()
             .await
             .map_err(|source| PaperError::Transport {
@@ -60,9 +74,9 @@ impl AlpacaPaper {
     async fn patch_json(&self, url: &str, body: Value) -> Result<Value> {
         // PATCH 同样是显式替换副作用，失败时原样返回，避免传输层隐式重复改单。
         // PATCH 与 POST 一样把 body 作为单次请求内容；发送结果未知时交给确定性 successor ID 恢复。
+        let request = self.authorized(self.client.patch(url).json(&body));
         self.before_write(PaperWriteKind::Replace)?;
-        let response = self
-            .authorized(self.client.patch(url).json(&body))
+        let response = request
             .send()
             .await
             .map_err(|source| PaperError::Transport {

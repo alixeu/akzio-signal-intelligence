@@ -27,11 +27,18 @@ impl AlpacaPaper {
             base_url: "https://paper-api.alpaca.markets".to_owned(),
             credentials,
             write_guard: None,
+            execution_freeze_store: None,
         })
     }
 
     pub fn with_write_guard(mut self, guard: PaperWriteGuard) -> Self {
         self.write_guard = Some(guard);
+        self
+    }
+
+    /// Bind the authoritative Store used to admit new Paper orders and replacements.
+    pub fn with_execution_freeze_store(mut self, store: Store) -> Self {
+        self.execution_freeze_store = Some(store);
         self
     }
 
@@ -144,7 +151,16 @@ impl AlpacaPaper {
                 }
                 // POST 的传输错误可能留下远端未知状态；本层不重试，下一次 dispatch 用同一
                 // client_order_id 查询恢复。
-                orders[index] = Some(self.submit_order(order, client_order_id, 0).await?);
+                match self.submit_order(order, client_order_id, 0).await {
+                    Ok(receipt) => orders[index] = Some(receipt),
+                    Err(PaperError::Frozen) if orders.iter().any(Option::is_some) => {
+                        return Err(PaperError::FrozenAfterReceipts(PaperExecution {
+                            plan_hash: plan.plan_hash.clone(),
+                            orders: orders.into_iter().flatten().collect(),
+                        }));
+                    }
+                    Err(error) => return Err(error),
+                }
             }
         }
         // flatten 消费 Option 回执列表并丢弃仍未知的 None；返回可部分完成，settled 由外层

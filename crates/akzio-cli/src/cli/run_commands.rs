@@ -153,7 +153,7 @@ async fn serve(config: &Config, config_path: &Path) -> Result<()> {
         bail!("正式 Core 拒绝使用旧隔离 Debug Store；未发起模型或交易 I/O");
     }
     run_log.recover_orphans(&recovery_store)?;
-    run_log.attach_store(recovery_store)?;
+    run_log.attach_store(recovery_store.clone())?;
     // 组装并启动 daemon：先读取 SQL active Policy、校验 Debug/Paper 的启动前置，再探测
     // 模型能力和构造 RuntimeIdentity，最后才创建 HTTP/worker/scheduler。启动成功不等于
     // Run、Decision、ExecutionVerdict、PaperCommit 或成交已经完成。
@@ -296,7 +296,8 @@ async fn serve(config: &Config, config_path: &Path) -> Result<()> {
         Some(
             AlpacaPaper::from_env()
                 .context("construct Alpaca Paper client")?
-                .with_write_guard(guard),
+                .with_write_guard(guard)
+                .with_execution_freeze_store(recovery_store),
         )
     } else {
         None

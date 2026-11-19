@@ -699,7 +699,7 @@ impl<'a> PaperExecution<'a> {
             )
         })?;
         let lease = self.daemon.paper.scheduler.active_lease(now)?;
-        let output = self
+        let output = match self
             .daemon
             .paper_dispatch_runtime
             .dispatch(
@@ -711,7 +711,18 @@ impl<'a> PaperExecution<'a> {
                     now,
                 },
             )
-            .await?;
+            .await
+        {
+            Ok(output) => output,
+            Err(
+                PaperDispatchError::Frozen | PaperDispatchError::FrozenReconciliationUnavailable(_),
+            ) => {
+                return Ok(TaskCompletion::DeferredUntil(
+                    Utc::now() + Duration::seconds(30),
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        };
         if output.settled {
             Ok(TaskCompletion::Committed)
         } else {

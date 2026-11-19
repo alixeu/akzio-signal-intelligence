@@ -14,7 +14,7 @@ use std::{
 
 use akzio_domain::{
     Artifact, ArtifactKind, ArtifactLifecycle, ArtifactRef, Asset, ContentHash, DomainError,
-    ExecutionContext, FreezeState, OrderReceipt, OrderReceiptState, PaperCancel, PaperCancelId,
+    ExecutionContext, OrderReceipt, OrderReceiptState, PaperCancel, PaperCancelId,
     PaperCancelReason, PaperCommitment, PaperReprice, RunPurpose, TaskWritePermit,
 };
 use akzio_store::{DaemonLease, Store, StoreError};
@@ -70,6 +70,12 @@ pub enum PaperError {
     RunLogUnavailable(String),
     #[error("Run cancellation forbids new Paper orders and replacements")]
     RunCancelled,
+    #[error("Paper execution is frozen")]
+    Frozen,
+    #[error("Paper execution froze after observing order receipts")]
+    FrozenAfterReceipts(PaperExecution),
+    #[error("Paper execution freeze state is unavailable: {0}")]
+    FreezeStateUnavailable(#[source] StoreError),
     #[error("Paper commitment plan hash does not match the submitted plan")]
     CommitmentPlanHashMismatch,
     #[error("Paper commitment client order ID does not match plan order for {0}")]
@@ -245,6 +251,7 @@ pub struct AlpacaPaper {
     base_url: String,
     credentials: PaperCredentials,
     write_guard: Option<PaperWriteGuard>,
+    execution_freeze_store: Option<Store>,
 }
 
 impl std::fmt::Debug for AlpacaPaper {
@@ -283,6 +290,98 @@ include!("paper/protocol.rs");
 mod write_guard_tests {
     use super::*;
     use std::sync::Mutex;
+
+    const INVALID_ORDER_URL: &str = "invalid-order-url";
+
+    fn freeze_test_store() -> Store {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/paper-write-guard-tests")
+            .join(akzio_domain::RunId::new().0);
+        Store::open(root).unwrap()
+    }
+
+    fn freeze_test_client(store: Store) -> AlpacaPaper {
+        AlpacaPaper::new(
+            "https://paper-api.alpaca.markets",
+            PaperCredentials {
+                key_id: "test-only-key".into(),
+                secret_key: "test-only-secret".into(),
+            },
+        )
+        .unwrap()
+        .with_execution_freeze_store(store)
+    }
+
+    /// WHY THIS TEST EXISTS (Task #27): Freeze committed during write auditing must block
+    /// each new POST and PATCH before the transport attempts a send.
+    #[tokio::test]
+    async fn submit_and_replace_read_freeze_after_the_write_guard() {
+        for kind in [PaperWriteKind::Submit, PaperWriteKind::Replace] {
+            let store = freeze_test_store();
+            let paper =
+                freeze_test_client(store.clone()).with_write_guard(Arc::new(move |write| {
+                    assert_eq!(write, kind);
+                    store
+                        .write_freeze_state(true, "freeze during audit", Utc::now())
+                        .unwrap();
+                    Ok(())
+                }));
+
+            // A send attempt with this URL returns a builder error without network I/O.
+            let result = match kind {
+                PaperWriteKind::Submit => paper.post_json(INVALID_ORDER_URL, Value::Null).await,
+                PaperWriteKind::Replace => paper.patch_json(INVALID_ORDER_URL, Value::Null).await,
+                PaperWriteKind::Cancel => unreachable!(),
+            };
+            assert!(
+                matches!(result, Err(PaperError::Frozen)),
+                "{kind:?}: {result:?}"
+            );
+        }
+    }
+
+    /// WHY THIS TEST EXISTS (Task #27): A corrupt latest freeze state must block both
+    /// new write methods, while protective cancel remains able to reach its transport.
+    #[tokio::test]
+    async fn corrupt_freeze_fails_closed_for_submit_and_replace_and_allows_cancel() {
+        let store = freeze_test_store();
+        let now = Utc::now();
+        let previous = store
+            .write_freeze_state(
+                false,
+                "previously unfrozen",
+                now - chrono::Duration::seconds(1),
+            )
+            .unwrap();
+        let malformed = Artifact::new(
+            ArtifactKind::FreezeState,
+            store
+                .stage_json(&serde_json::json!({"frozen": "invalid"}))
+                .unwrap(),
+            previous.producer,
+            ArtifactLifecycle::Canonical,
+            previous.provenance,
+            None,
+            Vec::new(),
+            now,
+        )
+        .unwrap();
+        store.write_bootstrap_artifact(&malformed).unwrap();
+        let paper = freeze_test_client(store);
+
+        assert!(matches!(
+            paper.post_json(INVALID_ORDER_URL, Value::Null).await,
+            Err(PaperError::FreezeStateUnavailable(StoreError::Json(_)))
+        ));
+        assert!(matches!(
+            paper.patch_json(INVALID_ORDER_URL, Value::Null).await,
+            Err(PaperError::FreezeStateUnavailable(StoreError::Json(_)))
+        ));
+        assert!(matches!(
+            paper.delete_empty(INVALID_ORDER_URL).await,
+            Err(PaperError::Transport { source, .. }) if source.is_builder()
+        ));
+    }
 
     #[tokio::test]
     async fn every_submit_replace_and_cancel_checks_the_guard_before_http() {
