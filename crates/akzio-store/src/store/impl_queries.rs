@@ -46,6 +46,13 @@ impl Store {
     // 零行 None，选中 ID 后在同一连接中重建 Artifact。
     pub fn latest_artifact_by_kind(&self, kind: ArtifactKind) -> StoreResult<Option<Artifact>> {
         let connection = self.connection()?;
+        Self::latest_artifact_by_kind_with_connection(&connection, kind)
+    }
+
+    fn latest_artifact_by_kind_with_connection(
+        connection: &Connection,
+        kind: ArtifactKind,
+    ) -> StoreResult<Option<Artifact>> {
         let artifact_id = connection
             .query_row(
             "SELECT artifact_id FROM rebuild_artifacts WHERE kind = ?1 ORDER BY CASE WHEN lifecycle = 'canonical' THEN 0 ELSE 1 END, created_at DESC, artifact_id DESC LIMIT 1",
@@ -57,7 +64,7 @@ impl Store {
             .map(ContentHash::new)
             .transpose()?
             .map(ArtifactId)
-            .map(|artifact_id| read_artifact(&connection, &artifact_id))
+            .map(|artifact_id| read_artifact(connection, &artifact_id))
             .transpose()
     }
 

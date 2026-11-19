@@ -66,7 +66,11 @@ pub enum PaperDispatchError {
 impl PaperDispatchError {
     fn with_frozen_receipts(self, execution: &PaperExecution) -> Self {
         match self {
-            Self::Frozen | Self::Broker(PaperError::Frozen) if !execution.orders.is_empty() => {
+            Self::Frozen
+            | Self::Broker(PaperError::Frozen)
+            | Self::Store(StoreError::ExecutionFrozen { .. })
+                if !execution.orders.is_empty() =>
+            {
                 Self::Broker(PaperError::FrozenAfterReceipts(execution.clone()))
             }
             error => error,
@@ -321,9 +325,11 @@ impl PaperDispatchRuntime {
             Err(error) => Err(error),
         };
         let known = match result {
-            Err(PaperDispatchError::Frozen | PaperDispatchError::Broker(PaperError::Frozen)) => {
-                None
-            }
+            Err(
+                PaperDispatchError::Frozen
+                | PaperDispatchError::Broker(PaperError::Frozen)
+                | PaperDispatchError::Store(StoreError::ExecutionFrozen { .. }),
+            ) => None,
             Err(PaperDispatchError::Broker(PaperError::FrozenAfterReceipts(known))) => Some(known),
             result => return result,
         };
@@ -783,7 +789,6 @@ impl PaperDispatchRuntime {
                     vec![input.commitment.clone(), prior_receipt],
                     now,
                 )?;
-                self.ensure_unfrozen()?;
                 let committed = self.store.commit_execution_reprice_intent(
                     &input.lease,
                     &input.permit,
@@ -842,7 +847,6 @@ impl PaperDispatchRuntime {
                 vec![input.commitment.clone(), prior_receipt],
                 now,
             )?;
-            self.ensure_unfrozen()?;
             let committed = self.store.commit_execution_cancel_intent(
                 &input.lease,
                 &input.permit,
@@ -1815,6 +1819,7 @@ mod safety_only_tests {
         store: Store,
         observations: AtomicUsize,
         freeze_at_write_admission: bool,
+        freeze_during_cancel: bool,
         expected_cancel: Option<PaperCancelId>,
         cancellations: AtomicUsize,
         lookup: FrozenLookup,
@@ -1898,6 +1903,20 @@ mod safety_only_tests {
         {
             Box::pin(async move {
                 tokio::task::yield_now().await;
+                if self.freeze_during_cancel {
+                    let updated = commitment.created_at - chrono::Duration::minutes(5);
+                    let qqq = Self::observed_order(updated, "done_for_day");
+                    let soxx = PaperOrderReceipt {
+                        client_order_id: "original-soxx".into(),
+                        broker_order_id: "original-soxx-broker-order".into(),
+                        symbol: "SOXX".into(),
+                        ..qqq.clone()
+                    };
+                    return Ok(PaperExecution {
+                        plan_hash: commitment.plan_hash.clone(),
+                        orders: vec![qqq, soxx],
+                    });
+                }
                 self.store
                     .write_freeze_state(true, "freeze during broker I/O", Utc::now())
                     .unwrap();
@@ -1912,10 +1931,14 @@ mod safety_only_tests {
         fn reconcile_commitment<'a>(
             &'a self,
             _: &'a PaperCommitment,
-            _: &'a PaperExecution,
+            execution: &'a PaperExecution,
         ) -> Pin<Box<dyn Future<Output = crate::paper::Result<PaperExecution>> + Send + 'a>>
         {
-            panic!("frozen dispatch must enter existing-only observation")
+            assert!(
+                self.freeze_during_cancel,
+                "frozen dispatch must enter existing-only observation"
+            );
+            Box::pin(async { Ok(execution.clone()) })
         }
 
         fn cancel_order<'a>(
@@ -1923,10 +1946,21 @@ mod safety_only_tests {
             intent: &'a PaperCancel,
         ) -> Pin<Box<dyn Future<Output = crate::paper::Result<PaperOrderReceipt>> + Send + 'a>>
         {
-            assert_eq!(Some(&intent.cancel_id), self.expected_cancel.as_ref());
+            if self.freeze_during_cancel {
+                assert_eq!(intent.asset, Asset::Qqq);
+            } else {
+                assert_eq!(Some(&intent.cancel_id), self.expected_cancel.as_ref());
+            }
             assert_eq!(intent.broker_order_id, "original-broker-order");
             assert_eq!(self.cancellations.fetch_add(1, Ordering::SeqCst), 0);
-            Box::pin(async move { Ok(Self::observed_order(intent.created_at, "canceled")) })
+            Box::pin(async move {
+                if self.freeze_during_cancel {
+                    self.store
+                        .write_freeze_state(true, "freeze after first stale action", Utc::now())
+                        .unwrap();
+                }
+                Ok(Self::observed_order(intent.created_at, "canceled"))
+            })
         }
 
         fn replace_order<'a>(
@@ -1959,6 +1993,7 @@ mod safety_only_tests {
             store: Store::open(store.root()).unwrap(),
             observations: AtomicUsize::new(0),
             freeze_at_write_admission,
+            freeze_during_cancel: false,
             expected_cancel: None,
             cancellations: AtomicUsize::new(0),
             lookup: FrozenLookup::Visible,
@@ -2005,6 +2040,7 @@ mod safety_only_tests {
                 store: Store::open(store.root()).unwrap(),
                 observations: AtomicUsize::new(0),
                 freeze_at_write_admission: transport_error,
+                freeze_during_cancel: false,
                 expected_cancel: None,
                 cancellations: AtomicUsize::new(0),
                 lookup,
@@ -2040,6 +2076,65 @@ mod safety_only_tests {
         }
     }
 
+    /// WHY THIS TEST EXISTS (Task #25): A second stale action can be denied
+    /// by Store after the first returned a new broker receipt. Keep that
+    /// receipt durable even when the fresh lookup is empty or unavailable.
+    #[tokio::test]
+    async fn intent_freeze_keeps_receipt_from_the_preceding_stale_action() {
+        for lookup in [FrozenLookup::Missing, FrozenLookup::Unavailable] {
+            let (store, input) = paper_run_with_commitment();
+            let broker = FreezeDuringExecution {
+                store: Store::open(store.root()).unwrap(),
+                observations: AtomicUsize::new(0),
+                freeze_at_write_admission: false,
+                freeze_during_cancel: true,
+                expected_cancel: None,
+                cancellations: AtomicUsize::new(0),
+                lookup,
+            };
+            let mut runtime = PaperDispatchRuntime::new(store.clone());
+            runtime.settlement_timeout = std::time::Duration::ZERO;
+            runtime.settlement_action_grace = std::time::Duration::ZERO;
+            let output = runtime.dispatch(&broker, &input).await;
+            assert_eq!(broker.cancellations.load(Ordering::SeqCst), 1, "{output:?}");
+            assert_eq!(broker.observations.load(Ordering::SeqCst), 1);
+            assert!(store
+                .cancel_for(&input.commitment, Asset::Qqq)
+                .unwrap()
+                .is_some());
+            assert!(store
+                .cancel_for(&input.commitment, Asset::Soxx)
+                .unwrap()
+                .is_none());
+            let receipts = store
+                .run_artifacts_by_kind(&input.permit.run_id, ArtifactKind::OrderReceipt)
+                .unwrap()
+                .into_iter()
+                .map(|artifact| {
+                    serde_json::from_slice::<OrderReceipt>(
+                        &store.read_blob(&artifact.blob).unwrap(),
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                receipts.iter().any(|receipt| {
+                    receipt.client_order_id == "original-qqq"
+                        && receipt.state == OrderReceiptState::Canceled
+                }),
+                "first action's broker receipt missing: {receipts:?}"
+            );
+            if matches!(lookup, FrozenLookup::Unavailable) {
+                assert!(matches!(
+                    output,
+                    Err(PaperDispatchError::FrozenReconciliationUnavailable(_))
+                ));
+            } else {
+                assert!(!output.unwrap().settled);
+            }
+        }
+    }
+
     /// WHY THIS TEST EXISTS (Task #27): A freeze must allow an exact durable protective cancel to complete once while its batch is pending.
     /// Do not weaken or delete this assertion.
     #[tokio::test]
@@ -2055,6 +2150,7 @@ mod safety_only_tests {
             store: store.clone(),
             observations: AtomicUsize::new(0),
             freeze_at_write_admission: false,
+            freeze_during_cancel: false,
             expected_cancel: None,
             cancellations: AtomicUsize::new(0),
             lookup: FrozenLookup::Visible,

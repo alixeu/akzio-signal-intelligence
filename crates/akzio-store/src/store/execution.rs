@@ -428,6 +428,9 @@ impl Store {
         }
 
         assert_origin_matches(artifact.origin.as_ref(), permit)?;
+        // FreezeState writes also use Immediate transactions, so a newly authoritative
+        // freeze cannot commit between this read and the new intent insertion.
+        Self::assert_new_order_action_unfrozen(&transaction)?;
         insert_artifact(&transaction, artifact)?;
         let insert = format!(
             "INSERT INTO {table} \
@@ -458,6 +461,17 @@ impl Store {
             artifact: artifact.clone(),
             recovered: false,
         })
+    }
+
+    fn assert_new_order_action_unfrozen(connection: &Connection) -> StoreResult<()> {
+        if let Some(state) = Self::read_execution_freeze_state_with_connection(connection)?
+            .filter(|state| state.frozen)
+        {
+            return Err(StoreError::ExecutionFrozen {
+                reason: state.reason,
+            });
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -573,6 +587,11 @@ impl Store {
         if already_recorded {
             transaction.commit()?;
             return Ok(true);
+        }
+        // Reusing a durable reprice action must not create a new PATCH effect
+        // after freeze. Existing effects and protective cancels can recover.
+        if effect.kind == ArtifactKind::ExecutionReprice {
+            Self::assert_new_order_action_unfrozen(&transaction)?;
         }
         // Intent 与外部 HTTP 副作用分开提交；进程在提交后中断时，恢复逻辑能看到未终结的 intent。
         append_event(

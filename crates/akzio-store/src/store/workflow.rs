@@ -100,6 +100,247 @@ mod retired_debug_execution_tests {
         )
     }
 
+    /// WHY THIS TEST EXISTS (Task #25): A freeze committed by another Store
+    /// after the earlier admission read must prevent new action intents while
+    /// allowing exact recovery of intents already committed before freeze.
+    #[test]
+    fn paper_freeze_blocks_new_order_actions_and_preserves_existing_intents() {
+        use akzio_domain::{
+            MoneyMicros, OrderReceiptState, PaperCancelId, PaperCancelReason, PaperCommitmentId,
+            PaperRepriceId,
+        };
+
+        let (store, _, _, root) = formal_fixture();
+        let operator = Store::open(&root).unwrap();
+        let now = Utc::now();
+        let next_second = Duration::seconds(1);
+        let lease = store
+            .acquire_daemon_lease(
+                "scheduler",
+                "order-action-test",
+                now,
+                now + Duration::minutes(1),
+            )
+            .unwrap()
+            .unwrap();
+        let permit = store
+            .claim_next_task_for_workload(
+                "worker",
+                now,
+                Duration::minutes(1),
+                TaskWorkload::Session,
+            )
+            .unwrap()
+            .unwrap()
+            .permit;
+        let provenance = ArtifactProvenance {
+            source_family: "akzio.test".into(),
+            observed_at: None,
+            retrieved_at: now,
+            source_uri: None,
+            confidence_ppm: 1_000_000,
+            producer_contract_hash: None,
+        };
+        let make_artifact = |kind, blob, source_refs| {
+            Artifact::new(
+                kind,
+                blob,
+                "test.execution",
+                ArtifactLifecycle::Canonical,
+                provenance.clone(),
+                Some(permit.artifact_origin()),
+                source_refs,
+                now,
+            )
+            .unwrap()
+        };
+        let asset = Asset::Qqq;
+        let plan_hash = ContentHash::of_bytes(b"order-action test plan");
+        let client_id = "qqq-r0";
+        let broker_id = "broker-qqq";
+        let context = make_artifact(
+            ArtifactKind::ExecutionContext,
+            store.stage_json(&"fixture execution context").unwrap(),
+            vec![],
+        );
+        let context_ref = ArtifactRef {
+            artifact_id: context.artifact_id.clone(),
+            kind: context.kind,
+        };
+        let commitment = make_artifact(
+            ArtifactKind::ExecutionCommitment,
+            store
+                .stage_json(&PaperCommitment {
+                    commitment_id: PaperCommitmentId::new(),
+                    execution_context: context_ref.clone(),
+                    plan_hash: plan_hash.clone(),
+                    broker_session: now.date_naive().to_string(),
+                    client_order_ids: [(asset, client_id.into())].into(),
+                    created_at: now,
+                })
+                .unwrap(),
+            vec![context_ref],
+        );
+        let commitment_ref = ArtifactRef {
+            artifact_id: commitment.artifact_id.clone(),
+            kind: commitment.kind,
+        };
+        let receipt = make_artifact(
+            ArtifactKind::OrderReceipt,
+            store
+                .stage_json(&OrderReceipt {
+                    plan_hash,
+                    asset,
+                    client_order_id: client_id.into(),
+                    broker_order_id: broker_id.into(),
+                    state: OrderReceiptState::Accepted,
+                    requested_quantity_micros: 1_000_000,
+                    filled_quantity_micros: 0,
+                    remaining_quantity_micros: 1_000_000,
+                    average_fill_price: None,
+                    broker_updated_at: now,
+                    reason: None,
+                    observed_at: now,
+                })
+                .unwrap(),
+            vec![commitment_ref.clone()],
+        );
+        // The fixture seeds upstream outputs. Both action commits use the production entry points.
+        {
+            let mut connection = store.connection().unwrap();
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            insert_artifact(&transaction, &context).unwrap();
+            insert_artifact(&transaction, &commitment).unwrap();
+            insert_artifact(&transaction, &receipt).unwrap();
+            transaction.commit().unwrap();
+        }
+        let receipt_ref = ArtifactRef {
+            artifact_id: receipt.artifact_id,
+            kind: receipt.kind,
+        };
+        let refs = vec![commitment_ref.clone(), receipt_ref.clone()];
+        let cancel = make_artifact(
+            ArtifactKind::ExecutionCancel,
+            store
+                .stage_json(&PaperCancel {
+                    schema_version: DOMAIN_SCHEMA_VERSION,
+                    cancel_id: PaperCancelId::new(),
+                    commitment: commitment_ref.clone(),
+                    prior_receipt: receipt_ref.clone(),
+                    asset,
+                    client_order_id: client_id.into(),
+                    broker_order_id: broker_id.into(),
+                    reason: PaperCancelReason::SettlementTimeout,
+                    created_at: now,
+                })
+                .unwrap(),
+            refs.clone(),
+        );
+        let reprice = make_artifact(
+            ArtifactKind::ExecutionReprice,
+            store
+                .stage_json(&PaperReprice {
+                    schema_version: DOMAIN_SCHEMA_VERSION,
+                    reprice_id: PaperRepriceId::new(),
+                    commitment: commitment_ref.clone(),
+                    prior_receipt: receipt_ref,
+                    asset,
+                    prior_client_order_id: client_id.into(),
+                    replacement_client_order_id: "qqq-r1".into(),
+                    prior_broker_order_id: broker_id.into(),
+                    replacement_limit_price: MoneyMicros(100_000_000),
+                    created_at: now,
+                })
+                .unwrap(),
+            refs,
+        );
+        let commit_cancel = || store.commit_execution_cancel_intent(&lease, &permit, &cancel, now);
+        let commit_reprice =
+            || store.commit_execution_reprice_intent(&lease, &permit, &reprice, now);
+
+        assert!(store.read_execution_freeze_state().unwrap().is_none());
+        let freeze = operator.write_freeze_state(true, "stop", now).unwrap();
+        for result in [commit_reprice(), commit_cancel()] {
+            assert!(
+                matches!(result, Err(StoreError::ExecutionFrozen { reason }) if reason == "stop")
+            );
+        }
+        let unreadable_freeze = Artifact::new(
+            ArtifactKind::FreezeState,
+            operator.stage_json(&"invalid freeze payload").unwrap(),
+            &freeze.producer,
+            ArtifactLifecycle::Canonical,
+            freeze.provenance,
+            None,
+            vec![],
+            now + next_second,
+        )
+        .unwrap();
+        operator
+            .write_bootstrap_artifact(&unreadable_freeze)
+            .unwrap();
+        for result in [commit_reprice(), commit_cancel()] {
+            assert!(matches!(result, Err(StoreError::Json(_))));
+        }
+        assert!(store.cancel_for(&commitment_ref, asset).unwrap().is_none());
+        assert!(store.reprice_for(&commitment_ref, asset).unwrap().is_none());
+        for candidate in [&reprice, &cancel] {
+            assert!(matches!(
+                store.artifact(&candidate.artifact_id),
+                Err(StoreError::MissingArtifact(id)) if id == candidate.artifact_id
+            ));
+        }
+
+        operator
+            .write_freeze_state(false, "resume", now + next_second * 2)
+            .unwrap();
+        assert!(!commit_reprice().unwrap().recovered);
+        assert!(!commit_cancel().unwrap().recovered);
+        operator
+            .write_freeze_state(true, "stop again", now + next_second * 3)
+            .unwrap();
+        for (result, original) in [(commit_reprice(), &reprice), (commit_cancel(), &cancel)] {
+            let recovered = result.unwrap();
+            assert!(recovered.recovered);
+            assert_eq!(&recovered.artifact, original);
+        }
+        let reprice_ref = ArtifactRef {
+            artifact_id: reprice.artifact_id,
+            kind: reprice.kind,
+        };
+        let cancel_ref = ArtifactRef {
+            artifact_id: cancel.artifact_id,
+            kind: cancel.kind,
+        };
+        assert!(matches!(
+            store.record_paper_effect_intent(&lease, &permit, &reprice_ref, now),
+            Err(StoreError::ExecutionFrozen { .. })
+        ));
+        assert!(!store
+            .paper_effect_intent_recorded(&permit.run_id, &reprice_ref.artifact_id)
+            .unwrap());
+        assert!(!store
+            .record_paper_effect_intent(&lease, &permit, &cancel_ref, now)
+            .unwrap());
+        operator
+            .write_freeze_state(false, "resume effects", now + next_second * 4)
+            .unwrap();
+        assert!(!store
+            .record_paper_effect_intent(&lease, &permit, &reprice_ref, now)
+            .unwrap());
+        operator
+            .write_freeze_state(true, "stop new effects", now + next_second * 5)
+            .unwrap();
+        assert!(store
+            .record_paper_effect_intent(&lease, &permit, &reprice_ref, now)
+            .unwrap());
+        drop(operator);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn paper_reservation_readback_failure_preserves_committed_run_id() {
         let (store, workflow, root) = prepared_formal_fixture();

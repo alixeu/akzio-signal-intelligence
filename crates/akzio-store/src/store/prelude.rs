@@ -140,6 +140,8 @@ pub enum StoreError {
     InvalidExecutionReprice,
     #[error("invalid Paper cancel intent")]
     InvalidExecutionCancel,
+    #[error("Paper execution is frozen: {reason}")]
+    ExecutionFrozen { reason: String },
     #[error("invalid Paper effect artifact {0}")]
     InvalidPaperEffect(ArtifactId),
     #[error("lifecycle event {event_type} requires task, attempt and artifact lineage")]

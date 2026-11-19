@@ -309,7 +309,16 @@ impl Store {
     /// Read the authoritative execution freeze using the Store's canonical-first
     /// artifact ordering. Missing history means execution has not been frozen.
     pub fn read_execution_freeze_state(&self) -> StoreResult<Option<FreezeState>> {
-        let Some(artifact) = self.latest_artifact_by_kind(ArtifactKind::FreezeState)? else {
+        let connection = self.connection()?;
+        Self::read_execution_freeze_state_with_connection(&connection)
+    }
+
+    fn read_execution_freeze_state_with_connection(
+        connection: &Connection,
+    ) -> StoreResult<Option<FreezeState>> {
+        let Some(artifact) =
+            Self::latest_artifact_by_kind_with_connection(connection, ArtifactKind::FreezeState)?
+        else {
             return Ok(None);
         };
         artifact.validate()?;
@@ -321,7 +330,8 @@ impl Store {
                 "invalid execution freeze artifact".to_owned(),
             ));
         }
-        let state: FreezeState = serde_json::from_slice(&self.read_blob(&artifact.blob)?)?;
+        let state: FreezeState =
+            serde_json::from_slice(&blob::read_blob_with(connection, &artifact.blob)?)?;
         state.validate()?;
         if state.changed_at != artifact.created_at {
             return Err(StoreError::Integrity(
@@ -369,17 +379,9 @@ impl Store {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         insert_artifact(&transaction, &artifact)?;
-        // After inserting a canonical candidate, this is the canonical tier of
-        // latest_artifact_by_kind: creation time, then content ID. Reject lost
-        // publication before commit so an operator never gets false success.
-        let head: String = transaction.query_row(
-            "SELECT artifact_id FROM rebuild_artifacts
-             WHERE kind = ?1 AND lifecycle = 'canonical'
-             ORDER BY created_at DESC, artifact_id DESC LIMIT 1",
-            params![enum_name(ArtifactKind::FreezeState)],
-            |row| row.get(0),
-        )?;
-        if head != artifact.artifact_id.0.as_str() {
+        if Self::latest_artifact_by_kind_with_connection(&transaction, ArtifactKind::FreezeState)?
+            .is_none_or(|head| head.artifact_id != artifact.artifact_id)
+        {
             return Err(StoreError::Integrity(
                 "execution freeze did not become the authoritative state".to_owned(),
             ));
