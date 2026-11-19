@@ -8,10 +8,13 @@ pub(super) fn legacy_workflow(connection: &Connection, run: &RunId) -> StoreResu
         params![run.0], |row| row.get(0))?)
 }
 
-pub(super) fn assert_workflow_executable(connection: &Connection, run: &RunId) -> StoreResult<()> {
-    // Historical Debug identity and the isolated Store marker are permanent
-    // read-only provenance. Even an old control head marked "running" must
-    // never authorize a claim, recovery, or task-scoped write.
+const DEBUG_CONTROL_RETIRED: &str = "debug_control_retired";
+
+fn workflow_retirement_reason(
+    connection: &Connection,
+    run: &RunId,
+) -> StoreResult<Option<&'static str>> {
+    // 行级历史 Debug 身份只读，旧研究图也不再进入执行。
     let debug_run: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM rebuild_runs r \
          LEFT JOIN rebuild_run_controls c ON c.run_id=r.run_id \
@@ -19,11 +22,27 @@ pub(super) fn assert_workflow_executable(connection: &Connection, run: &RunId) -
         params![run.0],
         |row| row.get(0),
     )?;
-    if debug_run || debug::environment_identity(connection)?.is_some() {
-        return Err(StoreError::DebugControl("debug_control_retired".into()));
+    if debug_run {
+        return Ok(Some(DEBUG_CONTROL_RETIRED));
     }
-    // 旧研究图同样只能读取，不能借普通 worker 恢复执行。
-    if legacy_workflow(connection, run)? { return Err(StoreError::DebugControl("legacy_workflow_retired".into())); }
+    Ok(legacy_workflow(connection, run)?.then_some("legacy_workflow_retired"))
+}
+
+pub(super) fn workflow_execution_blocker(
+    connection: &Connection,
+    run: &RunId,
+) -> StoreResult<Option<&'static str>> {
+    // 隔离 Store 的历史标记包含整个 Store，不能获得正式执行权限。
+    if debug::environment_identity(connection)?.is_some() {
+        return Ok(Some(DEBUG_CONTROL_RETIRED));
+    }
+    workflow_retirement_reason(connection, run)
+}
+
+pub(super) fn assert_workflow_executable(connection: &Connection, run: &RunId) -> StoreResult<()> {
+    if let Some(reason) = workflow_execution_blocker(connection, run)? {
+        return Err(StoreError::DebugControl(reason.into()));
+    }
     Ok(())
 }
 

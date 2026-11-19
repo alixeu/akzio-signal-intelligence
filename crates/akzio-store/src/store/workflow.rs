@@ -24,6 +24,11 @@ mod retired_debug_execution_tests {
             .join("../../target/retired-debug-execution-tests")
             .join(RunId::new().0);
         let store = Store::open(&root).unwrap();
+        let workflow = formal_workflow(&store, RetryPolicy::none());
+        (store, workflow, root)
+    }
+
+    fn formal_workflow(store: &Store, retry: RetryPolicy) -> WorkflowCommit {
         let now = Utc::now();
         let run_id = RunId::new();
         let node = WorkflowNode {
@@ -41,7 +46,7 @@ mod retired_debug_execution_tests {
                 max_wall_time_secs: 1,
                 max_tool_calls: akzio_domain::budget::ToolCallLimit::Limited(0),
             },
-            retry: RetryPolicy::none(),
+            retry,
             on_failure: FailureDisposition::FailRun,
             parent_task_id: None,
         };
@@ -75,7 +80,7 @@ mod retired_debug_execution_tests {
             now,
         )
         .unwrap();
-        let workflow = WorkflowCommit {
+        WorkflowCommit {
             run: StoredRun {
                 run_id,
                 purpose: RunPurpose::Paper,
@@ -85,8 +90,7 @@ mod retired_debug_execution_tests {
             },
             graph: artifact,
             nodes: vec![node],
-        };
-        (store, workflow, root)
+        }
     }
 
     fn formal_fixture() -> (Store, RunId, ArtifactId, PathBuf) {
@@ -385,43 +389,152 @@ mod retired_debug_execution_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// WHY THIS TEST EXISTS (Task #18): An expired retired Run must not prevent
+    /// recovery of a formal Run in the same Store or change the retired Run's history.
+    /// Do not weaken or delete this assertion.
     #[test]
-    fn historical_debug_purpose_cannot_be_claimed_or_recovered() {
+    fn retired_runs_do_not_block_expired_formal_task_recovery() {
+        for (purpose, stored_purpose, reason) in [
+            (RunPurpose::Debug, "debug", "debug_control_retired"),
+            (
+                RunPurpose::PaperDryRun,
+                "paper_dry_run",
+                "legacy_workflow_retired",
+            ),
+        ] {
+            let (store, run_id, _, root) = formal_fixture();
+            let claimed = store
+                .claim_next_task_for_workload(
+                    "prior-worker",
+                    Utc::now(),
+                    Duration::minutes(2),
+                    TaskWorkload::Session,
+                )
+                .unwrap()
+                .unwrap();
+            store
+                .connection()
+                .unwrap()
+                .execute(
+                    "UPDATE rebuild_runs SET purpose=?1 WHERE run_id=?2",
+                    params![stored_purpose, run_id.0],
+                )
+                .unwrap();
+            assert!(matches!(
+                store.assert_workflow_executable(&run_id),
+                Err(StoreError::DebugControl(found)) if found == reason
+            ));
+            let before = store.workflow_snapshot(&run_id).unwrap();
+            assert_eq!(before.run.purpose, purpose);
+            assert!(matches!(
+                store.heartbeat_task(&claimed.permit, Utc::now() + Duration::minutes(3)),
+                Err(StoreError::DebugControl(found)) if found == reason
+            ));
+
+            let formal = formal_workflow(
+                &store,
+                RetryPolicy {
+                    max_attempts: 2,
+                    ..RetryPolicy::none()
+                },
+            );
+            store.commit_workflow(&formal).unwrap();
+            let formal_claim = store
+                .claim_next_task_for_workload(
+                    "formal-worker",
+                    Utc::now(),
+                    Duration::minutes(2),
+                    TaskWorkload::Session,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(formal_claim.run_id, formal.run.run_id);
+            let now = Utc::now() + Duration::minutes(3);
+            store
+                .connection()
+                .unwrap()
+                .execute_batch(
+                    "CREATE TEMP TRIGGER reject_formal_recovery BEFORE UPDATE ON rebuild_tasks
+                      WHEN NEW.status='queued' BEGIN
+                        SELECT RAISE(ABORT, 'fixture recovery write failure');
+                      END;",
+                )
+                .unwrap();
+            assert!(matches!(
+                store.recover_expired_tasks(now),
+                Err(StoreError::Sql(error)) if error.to_string().contains("fixture recovery write failure")
+            ));
+            store
+                .connection()
+                .unwrap()
+                .execute_batch("DROP TRIGGER reject_formal_recovery")
+                .unwrap();
+            assert_eq!(store.recover_expired_tasks(now).unwrap(), 1);
+            assert_eq!(store.recover_expired_tasks(now).unwrap(), 0);
+            let resumed = store
+                .claim_next_task_for_workload(
+                    "recovery-worker",
+                    now,
+                    Duration::minutes(2),
+                    TaskWorkload::Session,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(resumed.run_id, formal.run.run_id);
+            assert_eq!(resumed.permit.task_id, formal_claim.permit.task_id);
+            assert_ne!(resumed.permit.attempt_id, formal_claim.permit.attempt_id);
+            store
+                .finish_task(&resumed.permit, TaskStatus::Succeeded, now)
+                .unwrap();
+            assert!(store
+                .claim_next_task_for_workload(
+                    "no-retired-claim",
+                    now,
+                    Duration::minutes(2),
+                    TaskWorkload::Any,
+                )
+                .unwrap()
+                .is_none());
+
+            let inspection = store.inspect_run(&run_id).unwrap();
+            assert_eq!(inspection.recovery, reason);
+            assert!(inspection.allowed_actions.is_empty());
+            assert_eq!(inspection.workflow, before);
+            drop(store);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    /// WHY THIS TEST EXISTS (Task #18): Row-level retirement must never turn
+    /// an isolated Debug Store into a formal recovery target.
+    /// Do not weaken or delete this assertion.
+    #[test]
+    fn isolated_debug_store_still_refuses_expired_task_recovery() {
         let (store, run_id, _, root) = formal_fixture();
-        let claimed = store
+        let now = Utc::now();
+        store
             .claim_next_task_for_workload(
-                "prior-worker",
-                Utc::now(),
+                "historical-owner",
+                now,
                 Duration::minutes(2),
-                TaskWorkload::Session,
+                TaskWorkload::Any,
             )
             .unwrap()
             .unwrap();
-        {
-            let connection = store.connection().unwrap();
-            connection
-                .execute(
-                    "UPDATE rebuild_runs SET purpose='debug' WHERE run_id=?1",
-                    params![run_id.0],
-                )
-                .unwrap();
-        }
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO rebuild_metadata(key,value) VALUES('debug_environment','historical-fixture')",
+                [],
+            )
+            .unwrap();
+        let before = store.workflow_snapshot(&run_id).unwrap();
         assert!(matches!(
-            store.assert_workflow_executable(&run_id),
+            store.recover_expired_tasks(now + Duration::minutes(3)),
             Err(StoreError::DebugControl(reason)) if reason == "debug_control_retired"
         ));
-        assert!(matches!(
-            store.heartbeat_task(&claimed.permit, Utc::now() + Duration::minutes(3)),
-            Err(StoreError::DebugControl(reason)) if reason == "debug_control_retired"
-        ));
-        assert!(matches!(
-            store.recover_expired_tasks(Utc::now() + Duration::minutes(3)),
-            Err(StoreError::DebugControl(reason)) if reason == "debug_control_retired"
-        ));
-        assert_eq!(
-            store.workflow_snapshot(&run_id).unwrap().run.purpose,
-            RunPurpose::Debug
-        );
+        assert_eq!(store.workflow_snapshot(&run_id).unwrap(), before);
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }

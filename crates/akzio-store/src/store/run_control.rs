@@ -411,7 +411,9 @@ impl Store {
         let blueprint = workflow.revision.graph.blueprint(workflow.run.purpose)?;
         let control = read_control(tx, run)?;
         let checkpoint = latest_checkpoint(tx, run)?;
-        let recovery = if workflow
+        let recovery = if let Some(reason) = workflow::workflow_execution_blocker(tx, run)? {
+            reason
+        } else if workflow
             .tasks
             .iter()
             .any(|t| t.status == TaskStatus::Running)

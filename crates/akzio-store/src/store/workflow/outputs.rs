@@ -22,11 +22,12 @@ impl Store {
         Ok(())
     }
 
-    // 用 now 选 lease_until<now 的 running Task；单个 Immediate 事务内逐项检查 workflow 可执行、
-    // Run cancellation 和 durable retry budget，再恢复 queued 或终止失败。返回数是扫描出的过期行数。
+    // 同一 Immediate 事务内跳过独立的退役 Run，再按 cancellation 和 retry budget 恢复。
+    // 返回实际处理的过期 Task 数，历史 lease 与 attempt 均不写入。
     pub fn recover_expired_tasks(&self, now: DateTime<Utc>) -> StoreResult<u64> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let isolated = debug::environment_identity(&transaction)?.is_some();
         let expired = {
             let mut statement = transaction.prepare(
                 r#"SELECT task_id, run_id, recipe_id, active_attempt_id, lease_id, lease_epoch, contract_hash
@@ -34,22 +35,28 @@ impl Store {
                    WHERE status = 'running' AND lease_until < ?1
                    ORDER BY task_id"#,
             )?;
-            let rows = statement
-                .query_map(params![now.to_rfc3339()], |row| {
-                    Ok((
-                        TaskId(row.get::<_, String>(0)?),
-                        RunId(row.get::<_, String>(1)?),
-                        row.get::<_, String>(2)?,
-                        akzio_domain::AttemptId(row.get::<_, String>(3)?),
-                        akzio_domain::LeaseId(row.get::<_, String>(4)?),
-                        row.get::<_, u64>(5)?,
-                        row.get::<_, Option<String>>(6)?,
-                    ))
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            rows
+            let mut rows = statement.query(params![now.to_rfc3339()])?;
+            let mut expired = Vec::new();
+            while let Some(row) = rows.next()? {
+                if isolated {
+                    return Err(StoreError::DebugControl(DEBUG_CONTROL_RETIRED.into()));
+                }
+                let run_id = RunId(row.get(1)?);
+                if workflow_retirement_reason(&transaction, &run_id)?.is_some() {
+                    continue;
+                }
+                expired.push((
+                    TaskId(row.get(0)?),
+                    run_id,
+                    row.get::<_, String>(2)?,
+                    akzio_domain::AttemptId(row.get(3)?),
+                    akzio_domain::LeaseId(row.get(4)?),
+                    row.get::<_, u64>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ));
+            }
+            expired
         };
-        for (_, run_id, _, _, _, _, _) in &expired { assert_workflow_executable(&transaction, run_id)?; }
         for (task_id, run_id, recipe_id, attempt_id, lease_id, epoch, contract_hash) in &expired {
             // 从 SQL 行重建旧 permit；取消 Run 时直接收束 Cancelled，否则依 Task policy 决定 abandon/retry 或 fail。
             let permit = TaskWritePermit {
