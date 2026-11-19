@@ -35,13 +35,12 @@ pub(crate) fn trusted_learning_provenance(
 pub use campaign::{evaluate_canary_cohort, CanaryCampaignRuntime, CanaryError};
 pub use evaluation::{
     apply_risk_ground_truth_assessments, daily_observations, horizon_observations,
-    materialize_outcome, materialize_partial_outcome, realized_execution,
-    realized_execution_at_prices, realized_execution_target, CandidatePolicyInput, EvaluationError,
-    EvaluationInput, EvaluationPolicy, EvaluationResult, EvaluationRuntime,
-    EvaluationRuntimeResult, GovernedDailyObservation, GovernedHorizonObservation,
-    GovernedRiskRecall, ObservedExecutionMetrics, OutcomeMaterializationInput, RealizedExecution,
-    SealedEvaluationInput, ShadowObservation, AKZIO_MIN_CALIBRATION_SAMPLES,
-    AKZIO_MIN_FRESH_PAIRS_PER_HORIZON,
+    materialize_outcome, materialize_partial_outcome, realized_execution_at_prices,
+    CandidatePolicyInput, EvaluationError, EvaluationInput, EvaluationPolicy, EvaluationResult,
+    EvaluationRuntime, EvaluationRuntimeResult, GovernedDailyObservation,
+    GovernedHorizonObservation, GovernedRiskRecall, ObservedExecutionMetrics,
+    OutcomeMaterializationInput, RealizedExecution, SealedEvaluationInput, ShadowObservation,
+    AKZIO_MIN_CALIBRATION_SAMPLES, AKZIO_MIN_FRESH_PAIRS_PER_HORIZON,
 };
 pub use outcome_schedule::{
     OutcomeScheduleError, OutcomeScheduleInput, OutcomeScheduleOutput, OutcomeScheduleResult,

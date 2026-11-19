@@ -18,9 +18,8 @@ impl<'a> EvidenceAcquisition<'a> {
         Self { daemon }
     }
 
-    // 执行 Evidence Gate：Shadow canary 优先复用父 Attempt 的已成功标准化证据，
-    // 其他运行交给受治理采集器；空结果是 NoOutput，采到的 Artifact 才作为成功输出，
-    // 这里不把 Evidence Gate 的完成写成研究、Decision 或执行完成。
+    // 已注册的 Shadow canary 复用父 Attempt 的标准化证据。
+    // Paper/PositionPlan 采集当前 Run 的 EvidenceNeed 并提交采集状态。
     pub(crate) async fn execute(
         &self,
         task: &ClaimedAttempt,
@@ -71,14 +70,8 @@ impl<'a> EvidenceAcquisition<'a> {
             )?;
             return Ok(TaskCompletion::Succeeded(vec![artifact]));
         }
-        // 正式 Paper/PositionPlan 的 EvidenceNeed 校验、来源采集和部分成功语义在
-        // Daemon::acquire_evidence 内完成；本层只映射任务完成边界。
         let artifacts = self.daemon.acquire_evidence(task, now).await?;
-        Ok(if artifacts.is_empty() {
-            TaskCompletion::NoOutput
-        } else {
-            TaskCompletion::Succeeded(artifacts)
-        })
+        Ok(TaskCompletion::Succeeded(artifacts))
     }
 
     // 根据 Analyst 的阻塞性 EvidenceGap 准备最多一轮的类型化 EvidenceNeed，并由

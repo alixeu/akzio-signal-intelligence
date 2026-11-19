@@ -31,11 +31,11 @@ impl Store {
                 reservation.session_key.clone(),
             ));
         }
-        self.reserve_paper_session_with_binding(
+        self.validate_paper_session_reservation(reservation, proposal)?;
+        self.reserve_paper_session_transaction(
             lease,
             reservation,
-            proposal,
-            Some((runtime_manifest, approval)),
+            Some((proposal, runtime_manifest, approval)),
         )
     }
 
@@ -233,52 +233,7 @@ impl Store {
             }
             self.read_blob(&artifact.blob)?;
         }
-
-        let (run_id, newly_reserved) = {
-            let mut connection = self.connection()?;
-            let transaction =
-                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            assert_daemon_lease(&transaction, lease, reservation.reserved_at)?;
-            let existing_run = transaction
-                .query_row(
-                    "SELECT run_id FROM rebuild_session_slots WHERE session_key = ?1",
-                    params![reservation.session_key],
-                    |row| row.get(0).map(RunId),
-                )
-                .optional()?;
-            let (run_id, newly_reserved) = if let Some(run_id) = existing_run {
-                (run_id, false)
-            } else {
-                for artifact in &reservation.setup_artifacts {
-                    insert_artifact(&transaction, artifact)?;
-                }
-                Self::commit_workflow_transaction(&transaction, &reservation.workflow)?;
-                Self::append_session_setup_events(&transaction, reservation, None)?;
-                assert_session_slot_run(
-                    &transaction,
-                    &reservation.session_key,
-                    &reservation.workflow.run.run_id,
-                )?;
-                transaction.execute(
-                    "INSERT INTO rebuild_session_slots (session_key, run_id, topology_id, graph_artifact_id, run_created_at, scheduler_epoch, reserved_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    params![
-                        reservation.session_key,
-                        reservation.workflow.run.run_id.0,
-                        reservation.workflow.run.topology_id,
-                        reservation.workflow.run.graph_artifact_id.0.as_str(),
-                        reservation.workflow.run.created_at.to_rfc3339(),
-                        lease.epoch,
-                        reservation.reserved_at.to_rfc3339(),
-                    ],
-                )?;
-                (reservation.workflow.run.run_id.clone(), true)
-            };
-            transaction
-                .commit()
-                .map_err(|error| StoreError::session_reservation_unknown(run_id.clone(), error))?;
-            (run_id, newly_reserved)
-        };
-        self.read_reserved_session_slot(&reservation.session_key, run_id, newly_reserved)
+        self.reserve_paper_session_transaction(lease, reservation, None)
     }
 
     // 由 slot 行读取 graph Artifact/CAS payload，再恢复 Paper WorkflowCommit 快照。

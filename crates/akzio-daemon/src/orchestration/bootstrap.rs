@@ -242,7 +242,7 @@ impl Daemon {
             outcome_scheduling_runtime: OutcomeSchedulingRuntime::new(store.clone()),
             paper: DaemonPaperState {
                 paper_broker: None,
-                paper_observer: None,
+                session_clock: None,
                 scheduler,
                 auto_paper: config.auto_paper,
                 runtime_identity_hash: config.runtime_identity_hash,
@@ -268,10 +268,10 @@ impl Daemon {
             .with_bootstrap(self.workflow.clone(), "active")
     }
 
-    /// Install a broker only through dependency injection. Construction of the
-    /// daemon itself never reads credentials or performs network I/O.
-    pub fn with_paper_broker(mut self, broker: Arc<dyn CommittedPaperBroker>) -> Self {
-        // 调用方转移一个共享 Broker trait object；本方法只注入依赖，不进行 HTTP I/O。
+    /// Attach the Paper client used for the session clock and guarded execution.
+    pub fn with_paper_client(mut self, paper: AlpacaPaper) -> Self {
+        self.paper.session_clock = Some(AlpacaPaperSessionClock::new(paper.clone()));
+        let broker: Arc<dyn CommittedPaperBroker> = Arc::new(paper);
         self.paper.paper_broker = Some(match &self.run_log {
             Some(logger) => Arc::new(crate::application::audited_broker::AuditedPaperBroker::new(
                 broker,
@@ -280,27 +280,5 @@ impl Daemon {
             None => broker,
         });
         self
-    }
-
-    pub fn with_paper_observer(mut self, paper: AlpacaPaper) -> Self {
-        // observer 持有 Paper API client，用于读取时钟/账户等受控状态；方法本身不调用接口。
-        self.paper.paper_observer = Some(paper);
-        self
-    }
-
-    /// Scheduler-only Paper entry point. HTTP and CLI never expose this;
-    /// callers must supply the broker-authoritative session key and a Rust
-    /// validated workflow proposal.
-    pub fn reserve_paper_session(
-        &self,
-        session_key: &str,
-        proposal: &WorkflowProposal,
-        now: DateTime<Utc>,
-    ) -> Result<akzio_store::SessionSlotReservation> {
-        // 只委托 lease-fenced reservation；返回已有/新建 slot 都不领取 graph 中的 task。
-        Ok(self
-            .paper
-            .scheduler
-            .reserve_session(session_key, proposal, now)?)
     }
 }

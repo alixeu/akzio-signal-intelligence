@@ -7,7 +7,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::{self, Read},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -16,10 +15,9 @@ use std::{
 
 use akzio_daemon::{
     contract_component_hash, prompt_component_hash, runtime_governance_identity,
-    runtime_policy_identity, topology_component_hash, AlpacaMarketDataFeed,
-    AlpacaPaperSessionClock, Daemon, DaemonConfig, DaemonHealth, PaperApprovalRequest,
-    PaperApprovalResponse, PaperWorkflowSource, ReplayReport, RetrospectiveView,
-    RunCancellationResponse, RunRetryResponse,
+    runtime_policy_identity, topology_component_hash, AlpacaMarketDataFeed, Daemon, DaemonConfig,
+    DaemonHealth, PaperApprovalRequest, PaperApprovalResponse, PaperWorkflowSource, ReplayReport,
+    RetrospectiveView, RunCancellationResponse, RunRetryResponse,
 };
 use akzio_domain::{
     content_hash_json, Asset, CanaryCampaignSpec, ContentHash, ExperimentCondition,
@@ -242,15 +240,12 @@ enum CanaryCommand {
 
 #[derive(Debug, Subcommand)]
 enum ObservatoryConfigCommand {
-    // ObservatoryConfig 负责本地配置文件工作流，敏感字段的读取/写入由专用 handler 处理。
     Init {
         #[arg(long)]
         template: PathBuf,
         #[arg(long)]
         store_root: PathBuf,
     },
-    Get,
-    Set,
 }
 
 #[derive(Debug, Subcommand)]
@@ -492,14 +487,14 @@ impl ExperimentProfile {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ObservatorySettings {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     sec_user_agent: Option<String>,
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CredentialsSettings {
     // 凭据在配置对象中只用于传递给受控客户端；Debug 输出通过自定义 fmt 永不回显 secret。
@@ -507,7 +502,7 @@ struct CredentialsSettings {
     alpaca_api_key: String,
     #[serde(default)]
     alpaca_api_secret: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     fred_api_key: Option<String>,
 }
 
@@ -525,30 +520,6 @@ impl std::fmt::Debug for CredentialsSettings {
             )
             .finish()
     }
-}
-
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ObservatoryEditableConfiguration {
-    // App/CLI 间的 camelCase 配置 wire model；Get 会原样序列化模型、Alpaca、FRED
-    // 的 key/secret 配置值（可能是明文，也可能是占位符），不是脱敏诊断格式。
-    // 字段投影本身不验证模型路由、Paper prerequisites 或权限。
-    provider: String,
-    #[serde(rename = "llmBaseURL")]
-    llm_base_url: String,
-    #[serde(rename = "llmAPIKey")]
-    llm_api_key: String,
-    global_model: String,
-    global_reasoning_effort: String,
-    global_response_language: String,
-    stage_models: BTreeMap<String, akzio_model::OpenAIResponsesRouteConfig>,
-    #[serde(rename = "alpacaAPIKey")]
-    alpaca_api_key: String,
-    #[serde(rename = "alpacaAPISecret")]
-    alpaca_api_secret: String,
-    #[serde(rename = "fredAPIKey")]
-    fred_api_key: Option<String>,
-    sec_user_agent: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

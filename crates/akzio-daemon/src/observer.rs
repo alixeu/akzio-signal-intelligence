@@ -1,111 +1,14 @@
-// 文件导读：observer 只把 Store/CAS、Run lifecycle、Paper 只读快照和学习 Artifact 组合
-// 为 UI/API 投影。它不领取 task、不改变 Gate、不发送订单；Available/Pending/Unavailable
-// 明确区分已观察事实、等待中的 Outcome 和 provider/权限缺口，不能把曲线或 200 响应写成
-// fill、账户 NAV、Policy 激活或 learning 完成。
-// Rust 机制：泛型 `ObserverSection<T>` 用 `Option<T>` 承载可选数据；observer 子模块通过
-// `#[path] mod` 共享私有类型；trait/泛型解析 payload，`tokio::join!/timeout` 并行且有界
-// 读取外部 Paper 数据，StoreExecutor 保持持久化读取串行。
+//! Bounded read-only projection for a specific Run.
 
 use super::*;
-use crate::observer_analytics::{
-    benchmark_equity_series, comparison_max_drawdown_ppm, compounded_ppm, managed_realized_pnl,
-    outcome_comparison, outcome_statistics, parse_bar_series, parse_fill_activities,
-    policy_exposure_ppm, portfolio_analytics, readiness_ppm, ObserverBrokerFill,
-    ObserverOutcomeComparisonPoint, ObserverOutcomeStatistics, ObserverPortfolioAnalytics,
-};
 use akzio_domain::{
-    DecisionProposal, Evaluation, Experience, Outcome, OutcomeHorizon, OutcomeWindow,
-    PaperLaunchApproval, PolicyState, PolicyTransition, ResearchCritique, RetrospectiveCategory,
-    RuntimeManifest, WorkflowProposalDraft,
+    DecisionProposal, Evaluation, Experience, Outcome, ResearchCritique, WorkflowProposalDraft,
 };
-use chrono::Duration;
 use serde::de::DeserializeOwned;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
-const OBSERVER_RUN_LIMIT: usize = 20;
 const OBSERVER_EVENT_LIMIT: usize = 100;
 const OBSERVER_TRAJECTORY_LIMIT: usize = 200;
-const OBSERVER_LEARNING_LIMIT: usize = 100;
-const OBSERVER_BROKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
-
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ObserverSectionStatus {
-    Available,
-    Pending,
-    Unavailable,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct ObserverSection<T> {
-    pub status: ObserverSectionStatus,
-    pub observed_at: Option<DateTime<Utc>>,
-    pub reason: Option<String>,
-    pub data: Option<T>,
-}
-
-impl<T> ObserverSection<T> {
-    fn available(observed_at: DateTime<Utc>, data: T) -> Self {
-        // Available 同时携带 observation time 和拥有的 T；None 只用于明确无数据的 section。
-        Self {
-            status: ObserverSectionStatus::Available,
-            observed_at: Some(observed_at),
-            reason: None,
-            data: Some(data),
-        }
-    }
-
-    fn unavailable(reason: impl Into<String>) -> Self {
-        // Unavailable 保留原因而不构造默认对象，避免 UI 把 provider/权限失败看成零值。
-        Self {
-            status: ObserverSectionStatus::Unavailable,
-            observed_at: None,
-            reason: Some(reason.into()),
-            data: None,
-        }
-    }
-
-    fn pending(reason: impl Into<String>) -> Self {
-        // Pending 表示流程尚未产生足够 durable Outcome/portfolio 事实，与 unavailable 不同。
-        Self {
-            status: ObserverSectionStatus::Pending,
-            observed_at: None,
-            reason: Some(reason.into()),
-            data: None,
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct ObserverSnapshot {
-    pub schema_version: u32,
-    pub generated_at: DateTime<Utc>,
-    pub event_cursor: i64,
-    pub core: ObserverCoreStatus,
-    pub current_run: Option<ObserverRunDetail>,
-    pub recent_runs: Vec<WorkflowSnapshot>,
-    pub run_summaries: Vec<ObserverRunSummary>,
-    pub portfolio: ObserverSection<ObserverPortfolio>,
-    pub outcome: ObserverSection<ObserverOutcome>,
-    pub learning: ObserverSection<ObserverLearning>,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct ObserverCoreStatus {
-    pub ready: bool,
-    pub readiness_ppm: u32,
-    pub auto_paper: bool,
-    pub health: DaemonHealth,
-    pub approval: ObserverApprovalStatus,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct ObserverApprovalStatus {
-    pub status: String,
-    pub operator_identity: Option<String>,
-    pub reason: Option<String>,
-    pub expires_at: Option<DateTime<Utc>>,
-}
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ObserverRunDetail {
@@ -129,15 +32,6 @@ pub(crate) struct ObserverRunTelemetry {
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct ObserverRunSummary {
-    pub run_id: RunId,
-    pub model_id: Option<String>,
-    pub latency_millis: Option<u64>,
-    pub broker_session: Option<String>,
-    pub result_utility_ppm: Option<i64>,
-}
-
-#[derive(Debug, Serialize)]
 pub(crate) struct ObserverArtifactView {
     pub artifact_id: ArtifactId,
     pub kind: ArtifactKind,
@@ -148,174 +42,175 @@ pub(crate) struct ObserverArtifactView {
     pub payload: Value,
 }
 
-#[derive(Debug, Serialize)]
-pub(crate) struct ObserverLearning {
-    pub artifacts: Vec<ObserverArtifactView>,
-    pub policy_transitions: Vec<ObserverPolicyTransition>,
-    pub summary: ObserverLearningSummary,
-    pub policy_metrics: Vec<ObserverPolicyMetrics>,
-}
+impl Daemon {
+    pub(crate) fn observer_run_detail(&self, run_id: &RunId) -> Result<ObserverRunDetail> {
+        // detail 按 bounded event/trajectory/artifact limit 组装一次 Run 的审计视图；所有
+        // Artifact payload 仍经过白名单类型解码。
+        let workflow = self.store.workflow_snapshot(run_id)?;
+        let events = self
+            .store
+            .recent_events(run_id, OBSERVER_EVENT_LIMIT)?
+            .into_iter()
+            .map(|event| EventView {
+                cursor: event.cursor,
+                event_type: event.event_type,
+                task_id: event.task_id.map(|task| task.0),
+                created_at: event.created_at.to_rfc3339(),
+            })
+            .collect();
+        let trajectory = self
+            .store
+            .recent_trajectory(run_id, OBSERVER_TRAJECTORY_LIMIT)?;
+        let artifacts = self.observer_artifacts(&trajectory)?;
+        let telemetry = observer_run_telemetry(&trajectory);
 
-#[derive(Debug, Serialize)]
-pub(crate) struct ObserverLearningSummary {
-    pub range_days: u32,
-    pub attributed_utility_micros: Option<i64>,
-    pub attributed_utility_ppm: Option<i64>,
-    pub lesson_candidates: usize,
-    pub lesson_candidates_delta: i64,
-    pub policies_evolved: usize,
-    pub policies_evolved_delta: i64,
-    pub impact_areas: Vec<ObserverImpactArea>,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct ObserverImpactArea {
-    pub category: RetrospectiveCategory,
-    pub impact_ppm: i64,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct ObserverPolicyMetrics {
-    pub subject: PolicySubject,
-    pub state: PolicyState,
-    pub sample_count: usize,
-    pub win_rate_ppm: Option<i64>,
-    pub net_impact_ppm: Option<i64>,
-    pub stability_ppm: Option<i64>,
-    pub exposure_ppm: Option<u32>,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct ObserverPolicyTransition {
-    pub transition: PolicyTransition,
-    pub run_id: RunId,
-    pub revision: u64,
-    pub transition_cursor: i64,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct ObserverPortfolio {
-    pub broker_session: String,
-    pub market_open: bool,
-    pub status: String,
-    pub equity_micros: i64,
-    pub last_equity_micros: Option<i64>,
-    pub buying_power_micros: i64,
-    pub day_pnl_micros: Option<i64>,
-    pub day_pnl_ppm: Option<i64>,
-    pub realized_pnl_micros: Option<i64>,
-    pub realized_pnl_ppm: Option<i64>,
-    pub fills: ObserverSection<Vec<ObserverBrokerFill>>,
-    pub analytics: ObserverSection<ObserverPortfolioAnalytics>,
-    pub positions: Vec<ObserverPosition>,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct ObserverPosition {
-    pub symbol: String,
-    pub quantity_micros: i64,
-    pub market_value_micros: i64,
-    pub average_entry_price_micros: Option<i64>,
-    pub unrealized_pnl_micros: Option<i64>,
-    pub unrealized_pnl_ppm: Option<i64>,
-    pub sparkline_ppm: Vec<i64>,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct ObserverOutcome {
-    pub metric_basis: Option<akzio_domain::OutcomeMetricBasis>,
-    pub actual_account_nav_available: bool,
-    pub lifecycle: Option<akzio_store::RunLifecycleHealth>,
-    pub outcome_id: String,
-    pub completed_trading_sessions: u8,
-    pub horizons: Vec<ObserverOutcomeHorizon>,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct ObserverOutcomeHorizon {
-    pub horizon: OutcomeHorizon,
-    pub progress_ppm: u32,
-    pub window: Option<OutcomeWindow>,
-    pub sample_count: usize,
-    pub win_rate_ppm: Option<i64>,
-    pub profit_factor_ppm: Option<i64>,
-    pub sharpe_ppm: Option<i64>,
-    pub max_drawdown_ppm: Option<i64>,
-    pub comparison: Vec<ObserverOutcomeComparisonPoint>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum ObserverPortfolioRange {
-    #[serde(rename = "1d")]
-    OneDay,
-    #[serde(rename = "1w")]
-    OneWeek,
-    #[serde(rename = "1m")]
-    OneMonth,
-    #[serde(rename = "3m")]
-    ThreeMonths,
-}
-
-impl ObserverPortfolioRange {
-    fn paper_range(self) -> PortfolioHistoryRange {
-        // 显式映射 UI range 到 broker API enum，不让字符串直接进入外部请求。
-        match self {
-            Self::OneDay => PortfolioHistoryRange::OneDay,
-            Self::OneWeek => PortfolioHistoryRange::OneWeek,
-            Self::OneMonth => PortfolioHistoryRange::OneMonth,
-            Self::ThreeMonths => PortfolioHistoryRange::ThreeMonths,
-        }
+        Ok(ObserverRunDetail {
+            inspection: self.runtime_inspection(run_id)?,
+            research_audit: self.store.research_audit(run_id)?,
+            workflow,
+            events,
+            trajectory,
+            artifacts,
+            telemetry,
+        })
     }
 
-    fn as_query_value(self) -> &'static str {
-        // 返回静态 query 值，避免把 range 序列化成不受支持的任意窗口。
-        match self {
-            Self::OneDay => "1d",
-            Self::OneWeek => "1w",
-            Self::OneMonth => "1m",
-            Self::ThreeMonths => "3m",
+    fn observer_artifacts(
+        &self,
+        trajectory: &[TrajectoryEntry],
+    ) -> Result<Vec<ObserverArtifactView>> {
+        // 只检查当前 Run 轨迹记录的 Artifact，正文由下方类型白名单限制。
+        let mut seen = BTreeSet::new();
+        let mut artifacts = Vec::new();
+        for entry in trajectory {
+            let Some(artifact_id) = entry
+                .artifact_id
+                .as_ref()
+                .filter(|_| entry.artifact_kind.is_some())
+            else {
+                continue;
+            };
+            if !seen.insert(artifact_id.clone()) {
+                continue;
+            }
+            let artifact = self.store.artifact(artifact_id)?;
+            if let Some(view) = self.observer_artifact_view(&artifact)? {
+                artifacts.push(view);
+            }
         }
+        artifacts.sort_by_key(|artifact| artifact.created_at);
+        Ok(artifacts)
     }
 
-    fn benchmark_start(self, now: DateTime<Utc>) -> NaiveDate {
-        // 这是 observer 查询的有界起点；实际交易日过滤仍由 provider/bar 对齐逻辑决定，
-        // 不是 Outcome 的交易 Session 计数。
-        let days = match self {
-            Self::OneDay => 1,
-            Self::OneWeek => 8,
-            Self::OneMonth => 35,
-            Self::ThreeMonths => 100,
+    fn observer_artifact_view(&self, artifact: &Artifact) -> Result<Option<ObserverArtifactView>> {
+        // 只有白名单业务 Artifact kind 才反序列化为 observer payload；未知 kind 保持 None，
+        // runtime_manifest/approval 另从对应绑定读取，避免把非公开原文泄露给 UI。
+        let payload = match artifact.kind {
+            ArtifactKind::WorkflowProposalDraft => {
+                self.typed_observer_payload::<WorkflowProposalDraft>(artifact)?
+            }
+            ArtifactKind::Claim => self.typed_observer_payload::<ResearchClaim>(artifact)?,
+            ArtifactKind::Critique => self.typed_observer_payload::<ResearchCritique>(artifact)?,
+            ArtifactKind::DecisionProposal => {
+                self.typed_observer_payload::<DecisionProposal>(artifact)?
+            }
+            ArtifactKind::DecisionContext => {
+                self.typed_observer_payload::<DecisionContext>(artifact)?
+            }
+            ArtifactKind::Decision => self.typed_observer_payload::<Decision>(artifact)?,
+            ArtifactKind::ExecutionContext => {
+                self.typed_observer_payload::<ExecutionContext>(artifact)?
+            }
+            ArtifactKind::ExecutionVerdict => {
+                self.typed_observer_payload::<ExecutionVerdict>(artifact)?
+            }
+            ArtifactKind::ExecutionPlan => {
+                self.typed_observer_payload::<ExecutionPlan>(artifact)?
+            }
+            ArtifactKind::OrderReceipt => self.typed_observer_payload::<OrderReceipt>(artifact)?,
+            ArtifactKind::Reconciliation => {
+                self.typed_observer_payload::<Reconciliation>(artifact)?
+            }
+            ArtifactKind::OutcomeSchedule => {
+                self.typed_observer_payload::<OutcomeSchedule>(artifact)?
+            }
+            ArtifactKind::Outcome => self.typed_observer_payload::<Outcome>(artifact)?,
+            ArtifactKind::RetrospectiveDraft => {
+                self.typed_observer_payload::<RetrospectiveDraft>(artifact)?
+            }
+            ArtifactKind::Retrospective => {
+                self.typed_observer_payload::<Retrospective>(artifact)?
+            }
+            ArtifactKind::Experience => self.typed_observer_payload::<Experience>(artifact)?,
+            ArtifactKind::Evaluation => self.typed_observer_payload::<Evaluation>(artifact)?,
+            _ => return Ok(None),
         };
-        (now - Duration::days(days)).date_naive()
+        let run_id = artifact
+            .origin
+            .as_ref()
+            .and_then(|origin| origin.run_id.clone());
+        let (runtime_manifest, runtime_identity_hash) = if let Some(run_id) = &run_id {
+            match self.store.paper_approval_for_run(run_id)? {
+                Some((manifest, approval)) => (
+                    Some(approval.runtime_manifest),
+                    Some(manifest.runtime_identity_hash()?),
+                ),
+                None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
+        Ok(Some(ObserverArtifactView {
+            artifact_id: artifact.artifact_id.clone(),
+            kind: artifact.kind,
+            created_at: artifact.created_at,
+            run_id,
+            runtime_manifest,
+            runtime_identity_hash,
+            payload,
+        }))
+    }
+
+    fn typed_observer_payload<T>(&self, artifact: &Artifact) -> Result<Value>
+    where
+        T: DeserializeOwned + Serialize,
+    {
+        // 泛型 T 同时约束反序列化和重新序列化，使 view 经过结构化 serde 解码而非
+        // 直接透传 blob；此 helper 没调用 T 的领域 `validate()`，不能宣称业务有效。
+        Ok(serde_json::to_value(serde_json::from_slice::<T>(
+            &self.store.read_blob(&artifact.blob)?,
+        )?)?)
     }
 }
 
-#[derive(Debug, Serialize)]
-pub(crate) struct ObserverPortfolioHistory {
-    pub range: ObserverPortfolioRange,
-    pub benchmark_symbol: &'static str,
-    pub points: Vec<ObserverPortfolioHistoryPoint>,
+fn observer_run_telemetry(trajectory: &[TrajectoryEntry]) -> ObserverRunTelemetry {
+    // 从轨迹中取最新 model/latency，只累计已有的 token 字段并用 checked_add 防溢出。
+    // `filter_map` 会跳过缺失字段，全部缺失时 `try_fold` 返回 Some(0)：此值不是已核实的
+    // 完整模型调用成本，UI 不应把它当完整账单。
+    ObserverRunTelemetry {
+        model_id: trajectory
+            .iter()
+            .rev()
+            .find_map(|entry| entry.model.as_ref()?.model_id.clone()),
+        latency_millis: trajectory
+            .iter()
+            .rev()
+            .find_map(|entry| entry.latency_millis),
+        input_tokens: trajectory
+            .iter()
+            .filter_map(|entry| entry.input_tokens)
+            .try_fold(0_u64, u64::checked_add),
+        output_tokens: trajectory
+            .iter()
+            .filter_map(|entry| entry.output_tokens)
+            .try_fold(0_u64, u64::checked_add),
+        tool_calls: trajectory
+            .iter()
+            .filter(|entry| entry.tool.is_some() && entry.event_type.contains("called"))
+            .count(),
+        turns: trajectory
+            .iter()
+            .filter(|entry| entry.turn.is_some() && entry.model.is_some())
+            .count(),
+    }
 }
-
-#[derive(Debug, Serialize)]
-pub(crate) struct ObserverPortfolioHistoryPoint {
-    pub timestamp: DateTime<Utc>,
-    pub equity_micros: i64,
-    pub profit_loss_micros: Option<i64>,
-    pub profit_loss_ppm: Option<i64>,
-    pub benchmark_equity_micros: Option<i64>,
-}
-
-#[path = "observer/broker.rs"]
-mod broker;
-#[path = "observer/helpers.rs"]
-mod helpers;
-#[path = "observer/learning.rs"]
-mod learning;
-#[path = "observer/runs.rs"]
-mod runs;
-#[path = "observer/snapshot.rs"]
-mod snapshot;
-
-use helpers::*;

@@ -807,7 +807,7 @@ pub(crate) use adapters::classify_evidence_response;
 pub use adapters::validate_outcome_price_window;
 pub use adapters::{
     AlpacaMarketDataFeed, AlpacaOptionDataFeed, AlpacaPaperEvidenceTransport, AsyncEvidenceAdapter,
-    EvidenceAdapter, EvidenceAdapterError, FixtureEvidenceAdapter, NativeWebFailureKind,
+    EvidenceAdapterError, FixtureEvidenceAdapter, NativeWebFailureKind,
 };
 
 pub fn model_native_web_evidence_transport(

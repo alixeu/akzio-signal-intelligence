@@ -48,21 +48,13 @@ impl Daemon {
         task: &ClaimedAttempt,
         now: DateTime<Utc>,
     ) -> Result<Vec<akzio_domain::Artifact>> {
-        // 按 Run purpose 选择严格的 Paper/PositionPlan 证据政策或通用 Debug/历史采集路径；
-        // bundle 成功输出交给 TaskRuntime 与 Attempt 绑定，collection status/污染诊断可先单独持久化。
-        if task.node.input_artifacts.is_empty() {
-            return match self.store.run_purpose(&task.run_id)? {
-                RunPurpose::Debug => Ok(Vec::new()),
-                RunPurpose::Paper | RunPurpose::PositionPlan => Err(DaemonError::InvalidInput(
-                    "Research evidence gate requires at least one EvidenceNeed".to_owned(),
-                )),
-                purpose => Err(DaemonError::InvalidInput(format!(
-                    "unsupported empty evidence gate for {purpose:?} run"
-                ))),
-            };
-        }
         let purpose = self.store.run_purpose(&task.run_id)?;
         if matches!(purpose, RunPurpose::Paper | RunPurpose::PositionPlan) {
+            if task.node.input_artifacts.is_empty() {
+                return Err(DaemonError::InvalidInput(
+                    "Research evidence gate requires at least one EvidenceNeed".to_owned(),
+                ));
+            }
             self.validate_paper_evidence_policy(task)?;
             let mut research_inputs = Vec::new();
             let mut statuses = Vec::new();
@@ -210,121 +202,9 @@ impl Daemon {
             return Ok(artifacts.into_values().collect());
         }
 
-        let mut artifacts = BTreeMap::new();
-        let mut paper_account_components = BTreeMap::new();
-        for need_reference in &task.node.input_artifacts {
-            if need_reference.kind != ArtifactKind::EvidenceNeed {
-                return Err(DaemonError::InvalidInput(format!(
-                    "evidence task {} has non-EvidenceNeed input",
-                    task.node.task_id
-                )));
-            }
-            let need_artifact = self.store.artifact(&need_reference.artifact_id)?;
-            let need: EvidenceNeed =
-                serde_json::from_slice(&self.store.read_blob(&need_artifact.blob)?)?;
-            need.validate()
-                .map_err(|error| DaemonError::InvalidInput(error.to_string()))?;
-            let source = evidence_source(&need.source_family)?;
-            let max_age_secs = i64::try_from(need.max_age_secs).map_err(|_| {
-                DaemonError::InvalidInput("EvidenceNeed max_age_secs exceeds i64".to_owned())
-            })?;
-            let runtime = EvidenceRuntime::new(self.store.clone(), [source]);
-            let purpose = self.store.run_purpose(&task.run_id)?;
-            let request = EvidenceRequest {
-                source,
-                resource: need.resource.clone(),
-                max_age: Duration::seconds(max_age_secs),
-                acquisition_mode: evidence_acquisition_mode(purpose, &need),
-            };
-            let use_fixture_adapter = self.fixture_mode;
-            let production_adapter = (!use_fixture_adapter)
-                .then(|| self.production_evidence.get(&source))
-                .flatten();
-            let bundle = if let Some(adapter) = production_adapter {
-                runtime
-                    .acquire_and_normalize_async(
-                        &task.permit,
-                        need_reference,
-                        &request,
-                        adapter.as_ref(),
-                        now,
-                    )
-                    .await?
-            } else {
-                if matches!(purpose, RunPurpose::Debug | RunPurpose::PositionPlan)
-                    && !self.fixture_mode
-                {
-                    return Err(DaemonError::Unavailable(format!(
-                        "real Debug evidence adapter is not configured for source {}",
-                        source.as_str()
-                    )));
-                }
-                let mut responses = self
-                    .fixture_evidence
-                    .get(&source)
-                    .cloned()
-                    .unwrap_or_default();
-                let allow_fixture_evidence = self.fixture_mode;
-                if allow_fixture_evidence {
-                    responses
-                        .entry(need.resource.clone())
-                        .or_insert_with(|| debug_fixture_evidence(source, &need.resource, now));
-                }
-                if responses.is_empty() {
-                    return Err(DaemonError::Unavailable(format!(
-                        "no governed evidence adapter configured for source {}",
-                        source.as_str()
-                    )));
-                }
-                let adapter = FixtureEvidenceAdapter::new(
-                    source,
-                    responses
-                        .iter()
-                        .map(|(resource, evidence)| (resource.clone(), evidence.clone())),
-                );
-                runtime.acquire_and_normalize(
-                    &task.permit,
-                    need_reference,
-                    &request,
-                    &adapter,
-                    now,
-                )?
-            };
-            if matches!(
-                need.resource.as_str(),
-                PAPER_ACCOUNT_RESOURCE | PAPER_POSITIONS_RESOURCE | PAPER_OPEN_ORDERS_RESOURCE
-            ) || need.resource.starts_with("paper.fills:")
-            {
-                paper_account_components.insert(
-                    need.resource.clone(),
-                    (need_artifact.clone(), bundle.normalized.clone()),
-                );
-            } else if let Some(snapshot) = self.materialize_paper_single_snapshot(
-                task,
-                &need_artifact,
-                &need,
-                &bundle.normalized,
-                now,
-            )? {
-                artifacts.insert(snapshot.artifact_id.clone(), snapshot);
-            }
-            artifacts.insert(bundle.raw.artifact_id.clone(), bundle.raw);
-            artifacts.insert(bundle.normalized.artifact_id.clone(), bundle.normalized);
-        }
-        if !paper_account_components.is_empty() {
-            if let Some(snapshot) =
-                self.materialize_paper_account_components(task, &paper_account_components, now)?
-            {
-                artifacts.insert(snapshot.artifact_id.clone(), snapshot);
-            }
-        }
-        if artifacts.is_empty() {
-            return Err(DaemonError::InvalidInput(format!(
-                "evidence task {} has no EvidenceNeed inputs",
-                task.node.task_id
-            )));
-        }
-        Ok(artifacts.into_values().collect())
+        Err(DaemonError::InvalidInput(format!(
+            "unsupported evidence gate for {purpose:?} run"
+        )))
     }
 
     /// Research identity is frozen in scheduler-owned needs, independent of market openness.

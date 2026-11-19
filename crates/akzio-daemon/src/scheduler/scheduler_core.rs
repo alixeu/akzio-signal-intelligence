@@ -97,19 +97,6 @@ impl PaperScheduler {
         self.acquire_or_renew(now)
     }
 
-    pub fn reserve_canary_session(
-        &self,
-        reservation: &akzio_domain::CanarySessionReservation,
-    ) -> SchedulerResult<StoredCanarySession> {
-        // Canary reservation 必须使用 reservation 内冻结的 scheduler_epoch；epoch 变化表示
-        // 失去领导权，拒绝写入而不重试旧 reservation。
-        let lease = self.acquire_or_renew(reservation.reserved_at)?;
-        if lease.epoch != reservation.scheduler_epoch {
-            return Err(SchedulerError::NotLeader);
-        }
-        Ok(self.store.reserve_canary_session(&lease, reservation)?)
-    }
-
     pub(crate) fn paper_snapshot_artifacts(
         &self,
         run_id: &RunId,
@@ -125,7 +112,7 @@ impl PaperScheduler {
                     ArtifactKind::EvidenceNeed,
                     // The returned Artifact must be committed by this scheduler's Store.
                     self.store.stage_json(&need)?,
-                    "scheduler.paper_snapshot",
+                    PAPER_SNAPSHOT_PRODUCER,
                     ArtifactLifecycle::RunScoped,
                     ArtifactProvenance {
                         source_family: "akzio.scheduler".to_owned(),
@@ -146,59 +133,5 @@ impl PaperScheduler {
                 )?)
             })
             .collect()
-    }
-
-    pub fn reserve_session(
-        &self,
-        session_key: &str,
-        proposal: &WorkflowProposal,
-        now: DateTime<Utc>,
-    ) -> SchedulerResult<SessionSlotReservation> {
-        // 无额外 setup 的简化入口仍先校验日期并取得 lease，再交给 WorkflowRuntime 原子预约。
-        self.reserve_session_with_inputs(session_key, proposal, &[], now)
-    }
-
-    pub fn reserve_session_with_inputs(
-        &self,
-        session_key: &str,
-        proposal: &WorkflowProposal,
-        setup_artifacts: &[Artifact],
-        now: DateTime<Utc>,
-    ) -> SchedulerResult<SessionSlotReservation> {
-        self.require_run_log()?;
-        // setup Artifact 与 proposal 一起进入 Store 事务，避免先有 slot 后丢输入。
-        NaiveDate::parse_from_str(session_key, "%Y-%m-%d")
-            .map_err(|_| SchedulerError::InvalidSessionKey(session_key.to_owned()))?;
-        let lease = self.acquire_or_renew(now)?;
-        Ok(self.workflow.reserve_paper_session_with_inputs(
-            &lease,
-            session_key,
-            proposal,
-            setup_artifacts,
-            now,
-        )?)
-    }
-
-    pub fn reserve_session_with_inputs_for_run(
-        &self,
-        run_id: RunId,
-        session_key: &str,
-        proposal: &WorkflowProposal,
-        setup_artifacts: &[Artifact],
-        now: DateTime<Utc>,
-    ) -> SchedulerResult<SessionSlotReservation> {
-        self.require_run_log()?;
-        // caller 指定 RunId 时保持 lineage；日期/lease 仍由 scheduler 再次验证，不能复用旧 epoch。
-        NaiveDate::parse_from_str(session_key, "%Y-%m-%d")
-            .map_err(|_| SchedulerError::InvalidSessionKey(session_key.to_owned()))?;
-        let lease = self.acquire_or_renew(now)?;
-        Ok(self.workflow.reserve_paper_session_with_inputs_for_run(
-            &lease,
-            run_id,
-            session_key,
-            proposal,
-            setup_artifacts,
-            now,
-        )?)
     }
 }

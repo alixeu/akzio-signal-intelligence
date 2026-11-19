@@ -136,17 +136,4 @@ impl Store {
             .map(|run_id| self.workflow_snapshot_with_connection(&connection, &RunId(run_id)))
             .collect()
     }
-
-    /// Monotonic cursor used by observer SSE as an invalidation signal.
-    // 返回全局 MAX(event_id)，空表用 0；它只用于观察端失效通知，不代表业务完成。
-    pub fn event_cursor(&self) -> StoreResult<i64> {
-        let connection = self.connection()?;
-        connection
-            .query_row(
-                "SELECT COALESCE(MAX(event_id), 0) FROM rebuild_events",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(StoreError::from)
-    }
 }

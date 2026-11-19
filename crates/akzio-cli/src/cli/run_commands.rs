@@ -300,36 +300,21 @@ async fn serve(config: &Config, config_path: &Path) -> Result<()> {
     } else {
         None
     };
-    let clock = paper
-        .as_ref()
-        .map(|paper| AlpacaPaperSessionClock::new(paper.clone()));
-    let daemon = match paper {
-        // Arc 克隆只共享已构造的 daemon；with_paper_* 注册观察器和 Broker 边界，实际订单
-        // 仍须通过运行时 Gate、Commitment 和 Store effect intent。
-        Some(paper) => Arc::new(
-            daemon
-                .with_paper_observer(paper.clone())
-                .with_paper_broker(Arc::new(paper)),
-        ),
-        None => Arc::new(daemon),
-    };
+    let daemon = Arc::new(match paper {
+        Some(paper) => daemon.with_paper_client(paper),
+        None => daemon,
+    });
     let http_daemon = daemon.clone();
     if auto_paper {
-        // Scheduler 启动前必须能加载 Paper workflow proposal；随后 HTTP 与 Paper scheduler
-        // 并行运行。proposal 被加载不代表某个 Run 已完成或订单已提交。
         let source = daemon.paper_workflow_source();
         source
             .proposal("preflight")
             .await
             .map_err(|error| anyhow::anyhow!(error.to_string()))
             .context("load Paper workflow proposal")?;
-        let clock = clock
-            .as_ref()
-            .context("Paper scheduler clock was not initialized")?;
         tokio::try_join!(
             http_daemon.serve_http(config.daemon.http_addr, shutdown_rx.clone()),
-            daemon
-                .serve_with_paper_scheduler(clock, &source, Duration::from_secs(30), shutdown_rx.clone(),),
+            daemon.serve_with_paper_scheduler(&source, Duration::from_secs(30), shutdown_rx.clone()),
             daemon.supervise_run_archives(shutdown_rx),
         )?;
     } else {
@@ -346,8 +331,6 @@ async fn serve(config: &Config, config_path: &Path) -> Result<()> {
 }
 
 async fn wait_for_shutdown_signal() -> Result<()> {
-    // 统一等待 Ctrl-C、SIGTERM（Unix）或显式开启的父进程 stdin EOF；返回只表示收到
-    // 停止信号，调用方负责把 watch 值传播给服务组件。
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
@@ -356,36 +339,11 @@ async fn wait_for_shutdown_signal() -> Result<()> {
         tokio::select! {
             result = tokio::signal::ctrl_c() => result.context("wait for Ctrl-C"),
             _ = terminate.recv() => Ok(()),
-            result = wait_for_parent_stdin_eof() => result,
         }
     }
 
     #[cfg(not(unix))]
-    {
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => result.context("wait for Ctrl-C"),
-            result = wait_for_parent_stdin_eof() => result,
-        }
-    }
-}
-
-async fn wait_for_parent_stdin_eof() -> Result<()> {
-    // 默认永久等待且不读取 stdin；只有 AKZIO_EXIT_ON_STDIN_EOF=1 时才把父进程 EOF
-    // 作为关闭信号，避免普通管道状态意外终止 daemon。
-    if std::env::var_os("AKZIO_EXIT_ON_STDIN_EOF").as_deref() != Some(std::ffi::OsStr::new("1")) {
-        std::future::pending::<()>().await;
-        unreachable!();
-    }
-    use tokio::io::AsyncReadExt;
-    let mut stdin = tokio::io::stdin();
-    let mut byte = [0_u8; 1];
-    while stdin
-        .read(&mut byte)
-        .await
-        .context("wait for parent stdin EOF")?
-        != 0
-    {}
-    Ok(())
+    tokio::signal::ctrl_c().await.context("wait for Ctrl-C")
 }
 
 fn print_json<T: Serialize>(response: &T) -> Result<()> {

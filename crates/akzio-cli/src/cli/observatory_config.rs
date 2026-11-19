@@ -1,192 +1,52 @@
-// 文件导读：Observatory 配置命令只维护本地 TOML 和 UI 可编辑投影，不启动
-// daemon、不创建 Run、不读取 Store active head，也不授予 Paper/Decision/Execution 权限。
-// Get 的 JSON 不脱敏地包含模型和行情 API key/secret 配置值，可能泄露明文；
-// 它不是可公开分享的安全诊断结果。
-// 写回采用临时文件后 rename；配置成功保存与模型能力探测、Paper submission、fill、
-// Outcome 完成是独立事实。
-// Rust 机制：`&Path` 和 `&Command` 让入口只借用输入；serde/toml 的反序列化用
-// `Result` fail closed，`Option` 保留可选凭据，`toml::Value` 的可变借用只修改指定 table。
+// 文件导读：配置初始化从模板创建本地 TOML。Paper 审批组装模型资格与运行身份，
+// 再向 daemon 提交审批请求。
 
-fn handle_observatory_config(config_path: &Path, command: &ObservatoryConfigCommand) -> Result<()> {
-    // 配置入口只负责本地 TOML 的创建、读取和更新；它不启动 daemon、不创建 Run，
-    // 也不把编辑后的模型字段视为已经通过 Paper/Decision Gate。
-    match command {
-        ObservatoryConfigCommand::Init {
-            template,
-            store_root,
-        } => {
-            // Init 只在目标不存在时从模板生成新配置；已存在的文件保持不变并返回 created=false。
-            if config_path.exists() {
-                return print_json(&serde_json::json!({ "created": false }));
-            }
-            let template_config = read_config_file(template)?;
-            let mut document = read_config_document(template)?;
-            toml_section_mut(&mut document, "daemon")?.insert(
-                "store_root".to_owned(),
-                toml::Value::String(store_root.to_string_lossy().into_owned()),
-            );
-            if let Some(model) = template_config.model.as_ref() {
-                let model_table = toml_section_mut(&mut document, "model")?;
-                model_table.insert(
-                    "provider".to_owned(),
-                    toml::Value::String(model.provider_identity().as_str().to_owned()),
-                );
-                model_table.insert(
-                    "base_url".to_owned(),
-                    toml::Value::String(initial_config_value(&model.base_url)),
-                );
-                model_table.insert(
-                    "api_key".to_owned(),
-                    toml::Value::String(initial_config_value(&model.api_key)),
-                );
-            }
-            let credentials = toml_section_mut(&mut document, "credentials")?;
-            // 凭据来源是当前进程环境，写入前仍受配置文件权限保护；未提供的可选凭据保持缺省。
-            credentials.insert(
-                "alpaca_api_key".to_owned(),
-                toml::Value::String(std::env::var("ALPACA_API_KEY").unwrap_or_default()),
-            );
-            credentials.insert(
-                "alpaca_api_secret".to_owned(),
-                toml::Value::String(std::env::var("ALPACA_API_SECRET").unwrap_or_default()),
-            );
-            set_optional_toml_string(
-                credentials,
-                "fred_api_key",
-                std::env::var("FRED_API_KEY").ok(),
-            );
-            set_optional_toml_string(
-                toml_section_mut(&mut document, "observatory")?,
-                "sec_user_agent",
-                std::env::var("SEC_USER_AGENT").ok(),
-            );
-            write_config_file(config_path, &document)?;
-            print_json(&serde_json::json!({ "created": true }))
-        }
-        ObservatoryConfigCommand::Get => {
-            // Get 原样返回 llm_api_key/alpaca_api_secret 等配置值，可能是明文凭据；
-            // stdout/调用方必须按敏感数据处理，读取本身不做运行时探测。
-            let config = read_config_file(config_path)?;
-            print_json(&editable_observatory_configuration(&config)?)
-        }
-        ObservatoryConfigCommand::Set => {
-            // Set 从 stdin 接收完整编辑对象，更新前由 update_observatory_configuration 做
-            // provider/模型字段校验，解析或校验失败都不会写回文件。
-            let mut payload = String::new();
-            io::stdin()
-                .read_to_string(&mut payload)
-                .context("read Observatory configuration from stdin")?;
-            let configuration: ObservatoryEditableConfiguration =
-                serde_json::from_str(&payload).context("parse Observatory configuration JSON")?;
-            update_observatory_configuration(config_path, configuration)?;
-            print_json(&serde_json::json!({ "ok": true }))
-        }
+fn init_observatory_config(config_path: &Path, template: &Path, store_root: &Path) -> Result<()> {
+    if config_path.exists() {
+        return print_json(&serde_json::json!({ "created": false }));
     }
-}
-
-fn editable_observatory_configuration(config: &Config) -> Result<ObservatoryEditableConfiguration> {
-    // 将 Config 映射为包含原样凭据字段的 UI 可编辑投影，不能作脱敏分享；
-    // release/cutoff 不在这个结构中，后续 Set 从现有配置保留它们。
-    let model = config
-        .model
-        .as_ref()
-        .context("Observatory configuration requires [model]")?;
-    Ok(ObservatoryEditableConfiguration {
-        provider: model.provider_identity().as_str().to_owned(),
-        llm_base_url: model.base_url.clone(),
-        llm_api_key: model.api_key.clone(),
-        global_model: model.model.clone(),
-        global_reasoning_effort: model.reasoning_effort.clone(),
-        global_response_language: model.response_language.clone(),
-        stage_models: model.routes.clone(),
-        alpaca_api_key: config.credentials.alpaca_api_key.clone(),
-        alpaca_api_secret: config.credentials.alpaca_api_secret.clone(),
-        fred_api_key: config.credentials.fred_api_key.clone(),
-        sec_user_agent: config.observatory.sec_user_agent.clone(),
-    })
-}
-
-fn update_observatory_configuration(
-    config_path: &Path,
-    configuration: ObservatoryEditableConfiguration,
-) -> Result<()> {
-    // 只允许当前支持的 OpenAI Responses provider；新模型/路由替换后先做基础设置校验，
-    // 再把模型、凭据和 SEC user-agent 一并写回，不能通过此入口激活 Policy 或批准 Paper。
-    let provider = configuration.provider.trim();
-    if provider != OPENAI_RESPONSES_PROVIDER_ID {
-        bail!(
-            "unsupported model provider {provider}; only {OPENAI_RESPONSES_PROVIDER_ID} is supported"
+    let template_config = read_config_file(template)?;
+    let mut document = read_config_document(template)?;
+    toml_section_mut(&mut document, "daemon")?.insert(
+        "store_root".to_owned(),
+        toml::Value::String(store_root.to_string_lossy().into_owned()),
+    );
+    if let Some(model) = template_config.model.as_ref() {
+        let model_table = toml_section_mut(&mut document, "model")?;
+        model_table.insert(
+            "provider".to_owned(),
+            toml::Value::String(model.provider_identity().as_str().to_owned()),
+        );
+        model_table.insert(
+            "base_url".to_owned(),
+            toml::Value::String(initial_config_value(&model.base_url)),
+        );
+        model_table.insert(
+            "api_key".to_owned(),
+            toml::Value::String(initial_config_value(&model.api_key)),
         );
     }
-
-    let config = read_config_file(config_path)?;
-    let current_model = config
-        .model
-        .as_ref()
-        .context("Observatory configuration requires [model]")?;
-    let model = OpenAIResponsesConfig {
-        // 身份相关 release_date/knowledge_cutoff/debug 从现有配置继承，避免编辑界面
-        // 意外清空历史校准所依赖的时间字段。
-        base_url: configuration.llm_base_url.trim().to_owned(),
-        model: configuration.global_model.trim().to_owned(),
-        release_date: current_model.release_date.clone(),
-        knowledge_cutoff: current_model.knowledge_cutoff.clone(),
-        api_key: configuration.llm_api_key,
-        reasoning_effort: configuration.global_reasoning_effort.trim().to_owned(),
-        response_language: configuration.global_response_language.trim().to_owned(),
-        debug: current_model.debug,
-        routes: configuration.stage_models,
-    };
-    validate_model_settings(&model)?;
-
-    let mut document = read_config_document(config_path)?;
-    let model_table = toml_section_mut(&mut document, "model")?;
-    model_table.insert(
-        "provider".to_owned(),
-        toml::Value::String(model.provider_identity().as_str().to_owned()),
-    );
-    model_table.insert("base_url".to_owned(), toml::Value::String(model.base_url));
-    model_table.insert("model".to_owned(), toml::Value::String(model.model));
-    set_optional_toml_string(
-        model_table,
-        "release_date",
-        model.release_date,
-    );
-    set_optional_toml_string(
-        model_table,
-        "knowledge_cutoff",
-        model.knowledge_cutoff,
-    );
-    model_table.insert("api_key".to_owned(), toml::Value::String(model.api_key));
-    model_table.insert(
-        "reasoning_effort".to_owned(),
-        toml::Value::String(model.reasoning_effort),
-    );
-    model_table.insert(
-        "response_language".to_owned(),
-        toml::Value::String(model.response_language),
-    );
-    model_table.insert(
-        "routes".to_owned(),
-        toml::Value::try_from(model.routes).context("serialize model routes")?,
-    );
-
     let credentials = toml_section_mut(&mut document, "credentials")?;
     credentials.insert(
         "alpaca_api_key".to_owned(),
-        toml::Value::String(configuration.alpaca_api_key),
+        toml::Value::String(std::env::var("ALPACA_API_KEY").unwrap_or_default()),
     );
     credentials.insert(
         "alpaca_api_secret".to_owned(),
-        toml::Value::String(configuration.alpaca_api_secret),
+        toml::Value::String(std::env::var("ALPACA_API_SECRET").unwrap_or_default()),
     );
-    set_optional_toml_string(credentials, "fred_api_key", configuration.fred_api_key);
+    set_optional_toml_string(
+        credentials,
+        "fred_api_key",
+        std::env::var("FRED_API_KEY").ok(),
+    );
     set_optional_toml_string(
         toml_section_mut(&mut document, "observatory")?,
         "sec_user_agent",
-        configuration.sec_user_agent,
+        std::env::var("SEC_USER_AGENT").ok(),
     );
-    write_config_file(config_path, &document)
+    write_config_file(config_path, &document)?;
+    print_json(&serde_json::json!({ "created": true }))
 }
 
 #[allow(clippy::too_many_arguments)]

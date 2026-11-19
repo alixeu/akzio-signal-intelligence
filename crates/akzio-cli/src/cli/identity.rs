@@ -335,7 +335,7 @@ fn read_config_file(path: &Path) -> Result<Config> {
 }
 
 fn read_config_document(path: &Path) -> Result<toml::Value> {
-    // 保留 TOML 通用树以支持 Observatory 的局部编辑；这里不执行 Config 级业务校验。
+    // 读取通用 TOML 树，供配置初始化与身份哈希使用。
     fs::read_to_string(path)
         .with_context(|| format!("read config {}", path.display()))
         .and_then(|text| toml::from_str::<toml::Value>(&text).context("parse config TOML"))
@@ -404,60 +404,6 @@ fn set_optional_toml_string(
     }
 }
 
-fn validate_model_settings(model: &OpenAIResponsesConfig) -> Result<()> {
-    // Observatory 编辑入口只校验模型基础字段、日期格式和受支持路由；执行 profile、
-    // Paper 成本和资产约束仍由 load_config 负责，不能把此校验当作可运行性证明。
-    if model.base_url.trim().is_empty()
-        || model.model.trim().is_empty()
-        || model.reasoning_effort.trim().is_empty()
-        || model.response_language.trim().is_empty()
-    {
-        bail!("model base_url, model, reasoning_effort, and response_language must be non-empty");
-    }
-    for (field, date) in [
-        ("release_date", model.release_date.as_deref()),
-        ("knowledge_cutoff", model.knowledge_cutoff.as_deref()),
-    ] {
-        if let Some(date) = date {
-            NaiveDate::parse_from_str(date, "%Y-%m-%d")
-                .with_context(|| format!("model.{field} must be YYYY-MM-DD, got {date}"))?;
-        }
-    }
-    for (purpose, route) in &model.routes {
-        if !matches!(
-            purpose.as_str(),
-            "research.analyst"
-                | "research.critic"
-                | "research.synthesizer"
-                | "learning.outcome_worker"
-                | "evidence.news_web"
-        ) {
-            bail!("unsupported model route {purpose}");
-        }
-        if route.model.trim().is_empty() || route.reasoning_effort.trim().is_empty() {
-            bail!("model route {purpose} contains an empty value");
-        }
-        if route
-            .response_language
-            .as_deref()
-            .is_some_and(|value| value.trim().is_empty())
-        {
-            bail!("model route {purpose} contains empty response_language");
-        }
-        for (field, date) in [
-            ("release_date", route.release_date.as_deref()),
-            ("knowledge_cutoff", route.knowledge_cutoff.as_deref()),
-        ] {
-            if let Some(date) = date {
-                NaiveDate::parse_from_str(date, "%Y-%m-%d").with_context(|| {
-                    format!("model route {purpose}.{field} must be YYYY-MM-DD, got {date}")
-                })?;
-            }
-        }
-    }
-    Ok(())
-}
-
 const CANONICAL_RESEARCH_ROUTES: [&str; 3] = [
     "research.analyst",
     "research.critic",
@@ -465,8 +411,7 @@ const CANONICAL_RESEARCH_ROUTES: [&str; 3] = [
 ];
 
 fn validate_canonical_model_identity(model: &OpenAIResponsesConfig) -> Result<()> {
-    // PaperResearch/HistoricalEval 需要模型发布日期和知识截止日，以便构造可审计身份和
-    // 历史时间语义；这里只检查字段存在，具体日期格式由 validate_model_settings 负责。
+    // PaperResearch 和 HistoricalEval 都要求显式提供模型发布日期和知识截止日。
     if model.release_date.is_none() || model.knowledge_cutoff.is_none() {
         bail!("canonical research profiles require model.release_date and model.knowledge_cutoff");
     }

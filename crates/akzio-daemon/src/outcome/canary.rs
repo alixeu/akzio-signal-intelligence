@@ -318,7 +318,7 @@ impl Daemon {
             .map(|head| head.state)
             .unwrap_or_else(|| contract_subject.initial_state());
         evaluation.evaluate_sealed_with_retrospective(
-            Some(lease),
+            lease,
             akzio_learning::SealedEvaluationInput {
                 complete_task: false,
                 permit: task.permit.clone(),
@@ -355,7 +355,7 @@ impl Daemon {
             .map(|head| head.state)
             .unwrap_or_else(|| topology_subject.initial_state());
         evaluation.evaluate_sealed_with_retrospective(
-            Some(lease),
+            lease,
             akzio_learning::SealedEvaluationInput {
                 complete_task: false,
                 permit: task.permit.clone(),
@@ -404,7 +404,7 @@ impl Daemon {
             latency_millis: producer_usage.latency_millis_if_complete(),
         };
         evaluation.evaluate_sealed_with_retrospective(
-            Some(lease),
+            lease,
             bundle_input,
             draft,
             if verdict == akzio_domain::CanaryVerdict::Advance {

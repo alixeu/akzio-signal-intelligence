@@ -229,26 +229,6 @@ pub struct MarketClock {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PortfolioHistoryRange {
-    OneDay,
-    OneWeek,
-    OneMonth,
-    ThreeMonths,
-}
-
-impl PortfolioHistoryRange {
-    fn path(self) -> &'static str {
-        // range 只选择固定 Alpaca history endpoint/query，调用方仍需独立处理缺失 benchmark/样本。
-        match self {
-            Self::OneDay => "/v2/account/portfolio/history?period=1D&timeframe=5Min",
-            Self::OneWeek => "/v2/account/portfolio/history?period=1W&timeframe=1H",
-            Self::OneMonth => "/v2/account/portfolio/history?period=1M&timeframe=1D",
-            Self::ThreeMonths => "/v2/account/portfolio/history?period=3M&timeframe=1D",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaperWriteKind {
     Submit,
     Replace,

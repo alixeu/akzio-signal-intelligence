@@ -7,16 +7,6 @@
 use super::*;
 
 impl Daemon {
-    pub(crate) fn realized_execution_target(
-        &self,
-        schedule: &OutcomeSchedule,
-        execution_context: &ExecutionContext,
-    ) -> Result<TargetPortfolio> {
-        // 只返回同一 realized_execution 重建出的 target，避免调用方从 Decision target
-        // 误读成交后敞口。
-        Ok(self.realized_execution(schedule, execution_context)?.target)
-    }
-
     pub(crate) fn realized_execution(
         &self,
         schedule: &OutcomeSchedule,

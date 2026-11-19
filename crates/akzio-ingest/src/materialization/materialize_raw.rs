@@ -1,7 +1,6 @@
-// 文件导读：EvidenceRuntime 的入口层把 permit、EvidenceNeed、EvidenceRequest 和 adapter
-// 绑定起来。同步入口直接获取并 materialize；异步入口先在不写 CAS 的阶段完成 provider
-// 校验，允许调用方检查多资源完整性后再 materialize_validated。authorize_request 每次都
-// 重新读取 Store 中本 Run 的 Need，避免调用方用任意 resource/source 越过 allowlist。
+// 文件导读：EvidenceRuntime 把 permit、EvidenceNeed、EvidenceRequest 和 adapter 绑定起来。
+// provider 数据在物化前获取和校验，调用方可先检查多资源完整性。authorize_request 每次都
+// 重新读取 Store 中本 Run 的 Need，验证资源和来源的授权。
 
 impl EvidenceRuntime {
     pub fn new(store: Store, allowed_sources: impl IntoIterator<Item = EvidenceSource>) -> Self {
@@ -20,21 +19,6 @@ impl EvidenceRuntime {
 
     /// Construct raw and normalized evidence artifacts. The caller returns
     /// them to `TaskRuntime`, which atomically commits the attempt.
-    pub fn acquire_and_normalize<A: EvidenceAdapter + ?Sized>(
-        &self,
-        permit: &TaskWritePermit,
-        need: &ArtifactRef,
-        request: &EvidenceRequest,
-        adapter: &A,
-        now: DateTime<Utc>,
-    ) -> EvidenceRuntimeResult<EvidenceBundle> {
-        // 同步路径：授权 Need→调用 adapter→用完整置信度 materialize Raw/Normalized；返回值
-        // 仍待 TaskRuntime 原子提交，调用本身不改变 task terminal state。
-        self.authorize_request(permit, need, request, adapter.source())?;
-        let acquired = adapter.acquire(request)?;
-        self.materialize_acquired(permit, need, request, acquired, 1_000_000, now)
-    }
-
     pub async fn acquire_and_normalize_async<A: AsyncEvidenceAdapter + ?Sized>(
         &self,
         permit: &TaskWritePermit,

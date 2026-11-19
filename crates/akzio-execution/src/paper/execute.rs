@@ -48,18 +48,6 @@ impl AlpacaPaper {
         self.get_json("/v2/account").await
     }
 
-    pub async fn positions(&self) -> Result<Value> {
-        // async Future 被调用方 await 时执行 GET；持仓 JSON 保留给后续 ingest/快照标准化，
-        // 本方法不改变 Broker 状态。
-        self.get_json("/v2/positions").await
-    }
-
-    pub async fn portfolio_history(&self, range: PortfolioHistoryRange) -> Result<Value> {
-        // range 按 Copy 枚举值映射为固定 URL path，避免用户任意字符串进入外部请求路径；
-        // Future 完成只代表取得 history 响应，不代表校准样本合格。
-        self.get_json(range.path()).await
-    }
-
     pub async fn market_clock(&self) -> Result<MarketClock> {
         // 先取 Alpaca clock，再以其美东日期请求相邻日历，最后由领域 TradingSession
         // 计算 Regular/Extended/Overnight/Closed；is_open 本身不单独决定可提交性。

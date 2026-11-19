@@ -1,9 +1,6 @@
-# 文件导读：CLI 初始化用户配置时使用的 Paper-engineering 模板；初始化入口将本文件
-# 派生成用户配置，再由 Core 读取 daemon、execution、model、credential 与展示偏好各节。
-# CLI 复制并替换环境占位符；它不代表已经通过审批、校准或 Paper Gate。
+# 正式 Paper-engineering 配置模板，由 CLI 根据 Store 路径和环境变量初始化。
 [daemon]
-# Overridden at launch with AKZIO_STORE_ROOT so Finder launches never depend
-# on the current working directory.
+# `observatory-config init --store-root` replaces this value.
 store_root = ".akzio/store"
 http_addr = "127.0.0.1:7342"
 # The formal Core reads or creates the same `.daemon-token` file before launch;
@@ -40,5 +37,5 @@ alpaca_api_key = ""
 alpaca_api_secret = ""
 fred_api_key = ""
 
+# 兼容既有配置节名。CLI 初始化时可在此保存 SEC_USER_AGENT。
 [observatory]
-# 以下是展示偏好，与 Core 的交易/研究状态相互独立。

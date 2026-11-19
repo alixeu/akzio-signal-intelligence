@@ -385,7 +385,7 @@ impl Daemon {
         // 普通 canonical Paper 在 T5 才走 evaluation：有有效 draft 则一并评估；没有 draft
         // 仍只封存 Rust 数值和 Rust-only retrospective，资格由 EvaluationRuntime 决定。
         if let Some(draft) = retrospective_draft.as_ref() {
-            evaluation.evaluate_with_lease_and_retrospective(Some(&outcome_lease), input, draft)?;
+            evaluation.evaluate_with_lease_and_retrospective(&outcome_lease, input, draft)?;
         } else {
             evaluation.seal_outcome_with_rust_retrospective_fenced(
                 &outcome_lease,

@@ -31,11 +31,10 @@ pub use runtime::validate_outcome_price_window;
 pub use runtime::{
     model_native_web_evidence_transport, validate_daily_bar_payload, AcquiredEvidence,
     AlpacaMarketDataFeed, AlpacaOptionDataFeed, AlpacaPaperEvidenceTransport, AsyncEvidenceAdapter,
-    EvidenceAdapter, EvidenceAdapterError, EvidenceBundle, EvidenceCitation,
-    EvidenceContaminationCertificate, EvidenceProvenance, EvidenceQuality, EvidenceRequest,
-    EvidenceRuntime, EvidenceRuntimeError, EvidenceRuntimeResult, EvidenceSource,
-    EvidenceTimeBasis, FixtureEvidenceAdapter, GovernedResource, NativeWebFailureKind,
-    NormalizedEvidencePayload,
+    EvidenceAdapterError, EvidenceBundle, EvidenceCitation, EvidenceContaminationCertificate,
+    EvidenceProvenance, EvidenceQuality, EvidenceRequest, EvidenceRuntime, EvidenceRuntimeError,
+    EvidenceRuntimeResult, EvidenceSource, EvidenceTimeBasis, FixtureEvidenceAdapter,
+    GovernedResource, NativeWebFailureKind, NormalizedEvidencePayload,
 };
 
 /// US ETF session date, including UTC evening/day-boundary differences.

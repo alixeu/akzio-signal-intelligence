@@ -211,13 +211,6 @@ fn native_web_failure_kind_for_response(
     fallback
 }
 
-pub trait EvidenceAdapter: Send + Sync {
-    // 同步 adapter 只获取 AcquiredEvidence；Need 授权、Artifact 和 Store 提交归 runtime。
-    fn source(&self) -> EvidenceSource;
-
-    fn acquire(&self, request: &EvidenceRequest) -> Result<AcquiredEvidence, EvidenceAdapterError>;
-}
-
 pub trait AsyncEvidenceAdapter: Send + Sync {
     // 异步 adapter 通过 BoxFuture 借用 request/self，适合 provider I/O 与 Tokio 任务协作。
     fn source(&self) -> EvidenceSource;
@@ -466,39 +459,6 @@ impl AlpacaPaperEvidenceTransport {
                     "/v2/account/activities/FILL?date={session_key}&direction=asc&page_size=100"
                 ))
             }
-            value if value.starts_with("observer.qqq_history:") => {
-                // 历史观察只固定查询 QQQ，并将 1d/1w/1m/3m 映射到有限 bar timeframe；
-                // 多余分段或未知区间在构造 URL 前失败。
-                let mut parts = value.split(':');
-                let _ = parts.next();
-                let range = parts.next().ok_or_else(|| {
-                    EvidenceAdapterError::Transport("invalid observer QQQ range".to_owned())
-                })?;
-                let start = parts.next().ok_or_else(|| {
-                    EvidenceAdapterError::Transport("invalid observer QQQ start".to_owned())
-                })?;
-                if parts.next().is_some() {
-                    return Err(EvidenceAdapterError::Transport(
-                        "invalid observer QQQ resource".to_owned(),
-                    ));
-                }
-                chrono::NaiveDate::parse_from_str(start, "%Y-%m-%d").map_err(|_| {
-                    EvidenceAdapterError::Transport("invalid observer QQQ start".to_owned())
-                })?;
-                let timeframe = match range {
-                    "1d" => "5Min",
-                    "1w" => "1Hour",
-                    "1m" | "3m" => "1Day",
-                    _ => {
-                        return Err(EvidenceAdapterError::Transport(
-                            "invalid observer QQQ range".to_owned(),
-                        ));
-                    }
-                };
-                Ok(format!(
-                    "/v2/stocks/QQQ/bars?timeframe={timeframe}&limit=1000&adjustment=all&sort=asc&start={start}"
-                ))
-            }
             _ => Err(EvidenceAdapterError::Transport(
                 "Alpaca resource is not allowlisted".to_owned(),
             )),
@@ -512,15 +472,13 @@ impl AlpacaPaperEvidenceTransport {
             || resource.starts_with("bars:")
             || resource.starts_with("corporate_actions:")
             || resource.starts_with("option_chain:")
-            || resource.starts_with("observer.qqq_history:")
     }
 
     fn uses_equity_feed(resource: &str) -> bool {
-        // 只有 equity quote/bars/history 资源附加 IEX/SIP feed，期权和 corporate actions 不复用。
+        // 只有 equity quote/bars 资源附加 IEX/SIP feed，期权和 corporate actions 不复用。
         resource == "paper.quotes"
             || resource.starts_with("quote:")
             || resource.starts_with("bars:")
-            || resource.starts_with("observer.qqq_history:")
     }
 
     pub(super) fn configured_path_for(
@@ -1654,23 +1612,6 @@ impl FixtureEvidenceAdapter {
     }
 }
 
-impl EvidenceAdapter for FixtureEvidenceAdapter {
-    fn source(&self) -> EvidenceSource {
-        self.source
-    }
-
-    fn acquire(&self, request: &EvidenceRequest) -> Result<AcquiredEvidence, EvidenceAdapterError> {
-        // source 必须匹配且 resource 必须显式存在；缺 fixture 不返回默认空值。
-        if request.source != self.source {
-            return Err(EvidenceAdapterError::SourceMismatch);
-        }
-        self.responses
-            .get(&request.resource)
-            .cloned()
-            .ok_or_else(|| EvidenceAdapterError::MissingFixture(request.resource.clone()))
-    }
-}
-
 impl AsyncEvidenceAdapter for FixtureEvidenceAdapter {
     fn source(&self) -> EvidenceSource {
         self.source
@@ -1680,7 +1621,7 @@ impl AsyncEvidenceAdapter for FixtureEvidenceAdapter {
         &'a self,
         request: &'a EvidenceRequest,
     ) -> BoxFuture<'a, Result<AcquiredEvidence, EvidenceAdapterError>> {
-        // async move 只包装无 I/O 的同一 lookup 语义，保持同步/异步 fixture 一致。
+        // fixture 只在内存中查找响应，并要求 source 匹配、resource 显式存在。
         Box::pin(async move {
             if request.source != self.source {
                 return Err(EvidenceAdapterError::SourceMismatch);

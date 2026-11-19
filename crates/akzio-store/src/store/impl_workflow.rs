@@ -1,20 +1,13 @@
 // 文件导读：这里串起 Paper session slot、Run graph、ExecutionCommitment lineage 和
 // specialized Artifact 校验；调用方传入的 graph/approval 不会绕过 Store 的事务边界。
-// Paper reservation 的调用方在 lease.rs/debug.rs/canary 中；先读 reserve_paper_session_with_binding
-// 再读 commit_workflow_transaction，最后沿 execution commitment lineage 向上游核验 plan/context/verdict。
+// Paper reservation 经 lease.rs 或 Canary 入口校验，再由这里写入 slot 和 workflow。
 impl Store {
-    fn reserve_paper_session_with_binding(
+    fn reserve_paper_session_transaction(
         &self,
         lease: &DaemonLease,
         reservation: &SessionReservation,
-        proposal: &Artifact,
-        binding: Option<(&Artifact, &Artifact)>,
+        approved_proposal: Option<(&Artifact, &Artifact, &Artifact)>,
     ) -> StoreResult<SessionSlotReservation> {
-        // 输入 lease、冻结 reservation/proposal 和可选 approval binding；图/来源先校验，
-        // Immediate 事务中再验证 daemon epoch 并按 session_key 查重，提交后重读 slot 投影。
-        // 已有 key 返回 newly_reserved=false，不写新的 proposal 或替换原 graph。
-        self.validate_paper_session_reservation(reservation, proposal)?;
-
         let (run_id, newly_reserved) = {
             let mut connection = self.connection()?;
             let transaction =
@@ -34,8 +27,7 @@ impl Store {
                     &transaction,
                     lease,
                     reservation,
-                    proposal,
-                    binding,
+                    approved_proposal,
                 )?;
                 (reservation.workflow.run.run_id.clone(), true)
             };
@@ -67,49 +59,47 @@ impl Store {
         })
     }
 
-    pub(super) fn commit_session_slot_transaction(
-        transaction: &Transaction<'_>,
-        lease: &DaemonLease,
-        reservation: &SessionReservation,
-        proposal: &Artifact,
-        binding: Option<(&Artifact, &Artifact)>,
-    ) -> StoreResult<()> {
-        // 供 Canary 等组合事务复用：只重验 lease 并调用内部写 helper；借用调用方 Transaction，
-        // 不获取 mutex、不自行 commit，reservation 和 slot 留待外层一起提交。
-        assert_daemon_lease(transaction, lease, reservation.reserved_at)?;
-        Self::insert_session_slot_transaction(transaction, lease, reservation, proposal, binding)
-    }
-
     // Callers retain their lease check and duplicate-session handling before writing.
     fn insert_session_slot_transaction(
         transaction: &Transaction<'_>,
         lease: &DaemonLease,
         reservation: &SessionReservation,
-        proposal: &Artifact,
-        binding: Option<(&Artifact, &Artifact)>,
+        approved_proposal: Option<(&Artifact, &Artifact, &Artifact)>,
     ) -> StoreResult<()> {
-        // 顺序是 setup Artifact→proposal→可选 manifest/approval→workflow rows→setup events→slot/consumption。
-        // 每步复用同一事务，唯一键/外键或任一 `?` 失败时外层不能提交部分 reservation。
         for artifact in &reservation.setup_artifacts {
             insert_artifact(transaction, artifact)?;
         }
-        insert_artifact(transaction, proposal)?;
-        if let Some((runtime_manifest, approval)) = binding {
+        if let Some((proposal, runtime_manifest, approval)) = approved_proposal {
+            insert_artifact(transaction, proposal)?;
             insert_artifact(transaction, runtime_manifest)?;
             insert_artifact(transaction, approval)?;
         }
         Self::commit_workflow_transaction(transaction, &reservation.workflow)?;
-        Self::append_session_setup_events(transaction, reservation, Some(proposal))?;
-        assert_session_slot_run(
+        // Run-level setup events follow WorkflowCreated in reservation input order.
+        let run_id = &reservation.workflow.run.run_id;
+        Self::append_run_setup_events(
             transaction,
-            &reservation.session_key,
-            &reservation.workflow.run.run_id,
+            run_id,
+            &reservation.setup_artifacts,
+            reservation.reserved_at,
         )?;
+        if let Some((proposal, _, _)) = approved_proposal {
+            append_event(
+                transaction,
+                run_id,
+                None,
+                None,
+                LifecycleEventType::SchedulerWorkflowProposalCreated,
+                Some(&proposal.artifact_id),
+                reservation.reserved_at,
+            )?;
+        }
+        assert_session_slot_run(transaction, &reservation.session_key, run_id)?;
         transaction.execute(
             "INSERT INTO rebuild_session_slots (session_key, run_id, topology_id, graph_artifact_id, run_created_at, scheduler_epoch, reserved_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 reservation.session_key,
-                reservation.workflow.run.run_id.0,
+                run_id.0,
                 reservation.workflow.run.topology_id,
                 reservation.workflow.run.graph_artifact_id.0.as_str(),
                 reservation.workflow.run.created_at.to_rfc3339(),
@@ -117,7 +107,7 @@ impl Store {
                 reservation.reserved_at.to_rfc3339(),
             ],
         )?;
-        if let Some((runtime_manifest, approval)) = binding {
+        if let Some((_, runtime_manifest, approval)) = approved_proposal {
             transaction.execute(
                 "INSERT INTO rebuild_paper_approval_consumptions (approval_artifact_id, runtime_manifest_artifact_id, session_key, consumed_at) VALUES (?1, ?2, ?3, ?4)",
                 params![
@@ -126,34 +116,6 @@ impl Store {
                     reservation.session_key,
                     reservation.reserved_at.to_rfc3339(),
                 ],
-            )?;
-        }
-        Ok(())
-    }
-
-    /// Record run-level facts for the artifacts a session reservation writes
-    /// before any task row exists: the scheduler's session-scoped
-    /// `EvidenceNeed`s and, where present, the frozen `WorkflowProposal`. They
-    /// are bound to the run, so without these events the Doctor cannot observe
-    /// them in the run's event log at all.
-    pub(super) fn append_session_setup_events(
-        transaction: &Transaction<'_>,
-        reservation: &SessionReservation,
-        proposal: Option<&Artifact>,
-    ) -> StoreResult<()> {
-        // 把 reservation 阶段尚无 Task/Attempt 的 EvidenceNeed 以及可选 proposal 纳入 Run event log；
-        // None proposal 时只写 snapshot-need events，不创建新的 Artifact。
-        Self::append_run_setup_events(transaction, &reservation.workflow.run.run_id,
-            &reservation.setup_artifacts, reservation.reserved_at)?;
-        if let Some(proposal) = proposal {
-            append_event(
-                transaction,
-                &reservation.workflow.run.run_id,
-                None,
-                None,
-                LifecycleEventType::SchedulerWorkflowProposalCreated,
-                Some(&proposal.artifact_id),
-                reservation.reserved_at,
             )?;
         }
         Ok(())

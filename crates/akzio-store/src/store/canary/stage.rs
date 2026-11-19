@@ -139,44 +139,6 @@ impl Store {
         transaction.commit()?;
         Ok(updated)
     }
-
-    pub fn reserve_canary_session(
-        &self,
-        lease: &DaemonLease,
-        reservation: &CanarySessionReservation,
-    ) -> StoreResult<StoredCanarySession> {
-        // 将 scheduler 预留绑定到 lease epoch；在 Immediate 事务中重验 daemon lease 并写 session，
-        // commit 后释放当前连接锁，再按 paired/legacy 表读取结果，避免 Store Mutex 重入。
-        reservation.validate()?;
-        if reservation.scheduler_epoch != lease.epoch {
-            return Err(StoreError::SchedulerFenced(lease.lease_name.clone()));
-        }
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        assert_daemon_lease(&transaction, lease, reservation.reserved_at)?;
-        Self::commit_canary_session_transaction(&transaction, reservation)?;
-        transaction.commit()?;
-        drop(connection);
-        if let Some(cohort_id) = &reservation.cohort_id {
-            // paired session 以 cohort key 回读；legacy session 则用当前阶段的兼容读取器回读。
-            return self
-                .canary_session_by_key(
-                    &reservation.campaign_id,
-                    reservation.level,
-                    &reservation.session_key,
-                )?
-                .ok_or_else(|| {
-                    StoreError::Integrity(format!(
-                        "canary cohort session {cohort_id}/{} missing after commit",
-                        reservation.session_key
-                    ))
-                });
-        }
-        let connection = self.connection()?;
-        read_session(&connection, &reservation.campaign_id, reservation.level)?.ok_or_else(|| {
-            StoreError::Integrity("legacy canary session missing after commit".to_owned())
-        })
-    }
 }
 
 fn idempotent_transition(

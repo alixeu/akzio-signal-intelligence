@@ -4,13 +4,12 @@
 // 再对照 outcome worker 调用，可区分 T+5 的 sealed Outcome 与模型叙事、资格和 Policy 更新。
 
 impl EvaluationRuntime {
-    // lease 可选借用、input 按值消费、draft 只借用；先验证 Paper Run 并生成数值 Outcome，
-    // 后将输入身份转移进 SealedEvaluationInput。既有同 ID Outcome 会复用，不覆盖其冻结事实。
-    fn evaluate_with_retrospective(
+    /// Materializes the governed T5 outcome and evaluates it under the daemon lease.
+    pub fn evaluate_with_lease_and_retrospective(
         &self,
-        lease: Option<&DaemonLease>,
+        lease: &DaemonLease,
         input: EvaluationInput,
-        retrospective_draft: Option<&RetrospectiveDraft>,
+        draft: &RetrospectiveDraft,
     ) -> EvaluationRuntimeResult<EvaluationResult> {
         // 入口先锁定 Paper purpose，再由 Rust 从原始观察密封 Outcome；已存在同一
         // outcome_id 的 Artifact 会复用，避免重试产生第二份数值事实。
@@ -48,7 +47,7 @@ impl EvaluationRuntime {
             token_cost: input.token_cost,
             latency_millis: input.latency_millis,
         };
-        self.evaluate_frozen(lease, sealed, artifact, retrospective_draft, None)
+        self.evaluate_frozen(lease, sealed, artifact, draft, None)
     }
 
     /// Uses the same eligibility, pair-consumption and policy transaction as T5.
@@ -56,24 +55,22 @@ impl EvaluationRuntime {
     // Result 只有在资格计算与 fenced Store 提交均成功后才返回。
     pub fn evaluate_sealed_with_retrospective(
         &self,
-        lease: Option<&DaemonLease>,
+        lease: &DaemonLease,
         input: SealedEvaluationInput,
         draft: &RetrospectiveDraft,
         target_state: Option<PolicyState>,
     ) -> EvaluationRuntimeResult<EvaluationResult> {
         let artifact = self.store.artifact(&input.outcome.artifact_id)?;
-        self.evaluate_frozen(lease, input, artifact, Some(draft), target_state)
+        self.evaluate_frozen(lease, input, artifact, draft, target_state)
     }
 
-    // 这是学习资格与持久化的核心：消费 input，借用可选 lease/draft，先重新读取并验证 CAS
-    // 闭包，再计算资格/状态，最后单次调用 Store 提交。任何前置 Err 都不会返回成功的
-    // EvaluationResult；Store 事务的原子范围以 record_policy_evaluation_fenced 为准。
+    // 先复核 CAS 闭包和 T5 叙事，再计算资格与策略状态，最后交给 Store 原子提交。
     fn evaluate_frozen(
         &self,
-        lease: Option<&DaemonLease>,
+        lease: &DaemonLease,
         input: SealedEvaluationInput,
         outcome_artifact: Artifact,
-        retrospective_draft: Option<&RetrospectiveDraft>,
+        draft: &RetrospectiveDraft,
         target_state: Option<PolicyState>,
     ) -> EvaluationRuntimeResult<EvaluationResult> {
         // 这里重新从 CAS 读取 OutcomeSchedule、Outcome 和 retrospective draft，并逐项
@@ -97,10 +94,6 @@ impl EvaluationRuntime {
             serde_json::from_slice(&self.store.read_blob(&schedule_artifact.blob)?)?;
         schedule.validate()?;
         self.require_paper(&input.permit.run_id)?;
-        let draft = retrospective_draft.ok_or(EvaluationError::InvalidMaterialization(
-            "valid governed retrospective required for learning",
-        ))?;
-        // Option::ok_or 把缺失叙事转换成明确错误；T+5 sealed 数值本身不自动取得学习资格。
         draft.validate()?;
 
         if input.hypothesis_id.trim().is_empty() {
@@ -271,65 +264,43 @@ impl EvaluationRuntime {
             // 已有完整叙事时保留原 Artifact；不以新的 draft 覆盖已密封历史。
             existing_retrospective.expect("complete retrospective")
         } else {
-            // 数值 Outcome 已存在但叙事不完整时，构造待提交 T5 叙事；可选 draft 仍需匹配
-            // 同一 outcome/T5，来源引用合并后排序去重以保留可审计闭包。
-            let mut retrospective = Retrospective {
+            // 合并叙事来源、已提交的 Draft、数值 Outcome 与先前复盘的血缘。
+            let mut source_refs = draft.source_refs.clone();
+            source_refs.extend(self.committed_draft_refs(&input.permit, draft)?);
+            source_refs.extend(
+                draft
+                    .lesson_proposals
+                    .iter()
+                    .flat_map(|p| p.evidence_refs.iter().cloned()),
+            );
+            source_refs.extend(
+                draft
+                    .findings
+                    .iter()
+                    .flat_map(|finding| finding.artifact_refs.iter().cloned()),
+            );
+            source_refs.push(outcome_ref.clone());
+            for prior in self.store.retrospectives(&input.permit.run_id)? {
+                source_refs.push(reference(&prior));
+            }
+            source_refs.sort();
+            source_refs.dedup();
+            let retrospective = Retrospective {
                 schema_version: DOMAIN_SCHEMA_VERSION,
                 outcome_id: outcome.outcome_id.clone(),
                 horizon: OutcomeHorizon::T5,
                 status: RetrospectiveStatus::Complete,
-                summary:
-                    "Rust-sealed outcome retrospective; model narrative unavailable in this commit"
-                        .to_owned(),
-                findings: Vec::new(),
-                counterfactuals: Vec::new(),
-                lesson_candidates: Vec::new(),
-                lesson_proposals: Vec::new(),
-                diagnostic_gaps: vec![
-                    "governed retrospective model narrative not installed".to_owned(),
-                ],
-                source_refs: vec![outcome_ref.clone()],
+                summary: draft.summary.clone(),
+                findings: draft.findings.clone(),
+                counterfactuals: draft.counterfactuals.clone(),
+                lesson_candidates: draft.lesson_candidates.clone(),
+                lesson_proposals: draft.lesson_proposals.clone(),
+                diagnostic_gaps: draft.diagnostic_gaps.clone(),
+                source_refs,
                 outcome: outcome_ref.clone(),
                 created_at,
                 sealed_at: Some(created_at),
             };
-            if let Some(draft) = retrospective_draft {
-                if draft.outcome_id != outcome.outcome_id || draft.horizon != OutcomeHorizon::T5 {
-                    return Err(EvaluationError::InvalidMaterialization(
-                        "retrospective draft identity",
-                    ));
-                }
-                retrospective.summary = draft.summary.clone();
-                retrospective.findings = draft.findings.clone();
-                retrospective.counterfactuals = draft.counterfactuals.clone();
-                retrospective.lesson_candidates = draft.lesson_candidates.clone();
-                retrospective.lesson_proposals = draft.lesson_proposals.clone();
-                retrospective.diagnostic_gaps = draft.diagnostic_gaps.clone();
-                retrospective.source_refs = draft.source_refs.clone();
-                retrospective
-                    .source_refs
-                    .extend(self.committed_draft_refs(&input.permit, draft)?);
-                retrospective.source_refs.extend(
-                    draft
-                        .lesson_proposals
-                        .iter()
-                        .flat_map(|p| p.evidence_refs.iter().cloned()),
-                );
-                retrospective.source_refs.extend(
-                    draft
-                        .findings
-                        .iter()
-                        .flat_map(|finding| finding.artifact_refs.iter().cloned()),
-                );
-                retrospective.source_refs.push(outcome_ref.clone());
-                retrospective.source_refs.sort();
-                retrospective.source_refs.dedup();
-            }
-            for prior in self.store.retrospectives(&input.permit.run_id)? {
-                retrospective.source_refs.push(reference(&prior));
-            }
-            retrospective.source_refs.sort();
-            retrospective.source_refs.dedup();
             retrospective.validate()?;
             self.artifact(
                 ArtifactKind::Retrospective,
@@ -491,7 +462,7 @@ impl EvaluationRuntime {
         let policy_head = self
             .store
             .record_policy_evaluation_fenced(
-                lease,
+                Some(lease),
                 &PolicyEvaluationCommit {
                     complete_task: input.complete_task,
                     permit: input.permit,

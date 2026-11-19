@@ -1,101 +1,34 @@
 // 文件导读：control 暴露 scheduler/worker 的启动、取消、retry、replay 和 freeze 操作。
 // retry 只允许明确的 PositionPlan，Paper 由 scheduler/Session slot 管理；serve 成功只
 // 表示后台服务存活，Run、Decision、Paper submission、fill 和 Outcome 仍由各自事件证明。
-// Rust 机制：泛型 `C: BrokerSessionClock + ?Sized`/`P: PaperWorkflowSource + ?Sized` 接受
-// trait object；`tokio::try_join!` 并行等待 scheduler 与 worker，共享 `watch::Receiver` 的
-// clone 传播停止信号，`&RunId` 借用避免控制接口夺取 ID 所有权。
+// 调度器与 Worker 共用停止信号。Paper 入口使用 Core 持有的 Broker 会话时钟。
 
 use super::*;
 
 impl Daemon {
-    // 把 setup Artifact 和 proposal 一起交由 scheduler reservation；参数均借用，持久化由
-    // WorkflowRuntime/Store 的 reservation 事务完成。
-    pub fn reserve_paper_session_with_inputs(
+    pub async fn serve_with_paper_scheduler(
         &self,
-        session_key: &str,
-        proposal: &WorkflowProposal,
-        setup_artifacts: &[Artifact],
-        now: DateTime<Utc>,
-    ) -> Result<akzio_store::SessionSlotReservation> {
-        if let Some(logger) = &self.run_log {
-            logger.assert_available()?;
-        }
-        Ok(self.paper.scheduler.reserve_session_with_inputs(
-            session_key,
-            proposal,
-            setup_artifacts,
-            now,
-        )?)
-    }
-
-    // 与上个入口相同，但保留调用方生成的 RunId，以便 RunScoped Need 与 Run 绑定。
-    pub fn reserve_paper_session_with_inputs_for_run(
-        &self,
-        run_id: RunId,
-        session_key: &str,
-        proposal: &WorkflowProposal,
-        setup_artifacts: &[Artifact],
-        now: DateTime<Utc>,
-    ) -> Result<akzio_store::SessionSlotReservation> {
-        if let Some(logger) = &self.run_log {
-            logger.assert_available()?;
-        }
-        Ok(self.paper.scheduler.reserve_session_with_inputs_for_run(
-            run_id,
-            session_key,
-            proposal,
-            setup_artifacts,
-            now,
-        )?)
-    }
-
-    pub async fn serve_scheduler<C, P>(
-        &self,
-        clock: &C,
-        source: &P,
+        source: &StorePaperWorkflowSource,
         poll_interval: std::time::Duration,
         shutdown: watch::Receiver<bool>,
-    ) -> Result<()>
-    where
-        C: BrokerSessionClock + ?Sized,
-        P: PaperWorkflowSource + ?Sized,
-    {
-        // Paper scheduler 只能在显式 auto_paper 配置下运行；await 驱动长期 tick Future，
-        // 关闭信号由 scheduler 自身观察，返回不代表当日 workflow 完成。
+    ) -> Result<()> {
         if !self.paper.auto_paper {
             return Err(DaemonError::InvalidInput(
                 "Paper scheduler requires auto_paper=true".to_owned(),
             ));
         }
-        self.paper
-            .scheduler
-            .serve(clock, source, poll_interval, shutdown)
-            .await?;
-        Ok(())
-    }
-
-    /// Runs the only automatic Paper entrypoint: a broker-authoritative clock,
-    /// a Rust-validated workflow source, and the worker pool share shutdown.
-    pub async fn serve_with_paper_scheduler<C, P>(
-        &self,
-        clock: &C,
-        source: &P,
-        poll_interval: std::time::Duration,
-        shutdown: watch::Receiver<bool>,
-    ) -> Result<()>
-    where
-        C: BrokerSessionClock + ?Sized,
-        P: PaperWorkflowSource + ?Sized,
-    {
-        // 同时 await scheduler 与 worker；任一 Future 失败会通过 try_join! 结束服务，
-        // watch receiver 的 clone 让两边共享同一关闭状态。
-        if !self.paper.auto_paper {
-            return Err(DaemonError::InvalidInput(
-                "Paper scheduler requires auto_paper=true".to_owned(),
-            ));
-        }
+        let clock = self.paper.session_clock.as_ref().ok_or_else(|| {
+            DaemonError::InvalidInput("Paper scheduler clock was not initialized".to_owned())
+        })?;
+        let scheduler_shutdown = shutdown.clone();
         tokio::try_join!(
-            self.serve_scheduler(clock, source, poll_interval, shutdown.clone()),
+            async move {
+                self.paper
+                    .scheduler
+                    .serve(clock, source, poll_interval, scheduler_shutdown)
+                    .await
+                    .map_err(DaemonError::from)
+            },
             self.serve_worker_pool(shutdown),
         )?;
         Ok(())

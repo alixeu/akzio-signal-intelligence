@@ -28,7 +28,7 @@ use akzio_domain::{
 use akzio_execution::paper::AlpacaPaper;
 use akzio_ingest::AlpacaMarketDataFeed;
 use akzio_runtime::{RuntimeError, StoreExecutor, WorkflowRuntime};
-use akzio_store::{DaemonLease, SessionSlotReservation, Store, StoreError, StoredCanarySession};
+use akzio_store::{DaemonLease, SessionSlotReservation, Store, StoreError};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use thiserror::Error;
 use tokio::sync::watch;
@@ -96,7 +96,8 @@ pub trait BrokerSessionClock: Send + Sync {
 /// Production adapter over the already fail-closed Alpaca Paper client. Its
 /// constructor is deliberately injected, so daemon construction does not read
 /// credentials or perform network I/O.
-pub struct AlpacaPaperSessionClock {
+#[derive(Clone)]
+pub(crate) struct AlpacaPaperSessionClock {
     paper: AlpacaPaper,
 }
 

@@ -192,12 +192,11 @@ impl Store {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_daemon_lease(&transaction, lease, parent.reserved_at)?;
         // session slot、parent workflow、Shadow workflow 和 Canary session 必须原子提交，不能部分成功。
-        Self::commit_session_slot_transaction(
+        Self::insert_session_slot_transaction(
             &transaction,
             lease,
             parent,
-            proposal,
-            Some((runtime_manifest, approval)),
+            Some((proposal, runtime_manifest, approval)),
         )?;
         for shadow in shadow_workflows {
             Self::commit_workflow_transaction(&transaction, shadow)?;

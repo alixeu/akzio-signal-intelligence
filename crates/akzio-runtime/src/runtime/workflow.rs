@@ -5,21 +5,6 @@ use super::*;
 // 单独重新 prepare/lower 仍会分配新 TaskId，只有 Store slot 事务保证重复调度不替换旧图。
 // approved proposal 是研究拓扑，不是模型已完成的结论。
 impl WorkflowRuntime {
-    pub fn submit(
-        &self,
-        run_id: RunId,
-        purpose: RunPurpose,
-        graph: WorkflowGraph,
-        now: DateTime<Utc>,
-    ) -> RuntimeResult<Artifact> {
-        // prepare 先做 graph/compiled invariants，commit 才让 Run/Task 出现在 durable
-        // journal；返回 graph Artifact 仍只说明提交成功，不代表节点已领取或执行。
-        let commit = self.prepare_workflow_commit(run_id, purpose, graph, now)?;
-        let graph_artifact = commit.graph.clone();
-        self.store.commit_workflow(&commit)?;
-        Ok(graph_artifact)
-    }
-
     pub fn prepare_workflow_commit(
         &self,
         run_id: RunId,
@@ -44,88 +29,6 @@ impl WorkflowRuntime {
             graph: graph_artifact,
             nodes: graph.nodes,
         })
-    }
-
-    /// Freeze one fully compiled Paper workflow into its broker-session slot.
-    /// A duplicate session returns the already durable graph and task IDs; it
-    /// never regenerates a replacement graph after a scheduler restart.
-    pub fn reserve_paper_session(
-        &self,
-        lease: &DaemonLease,
-        session_key: impl Into<String>,
-        proposal: &WorkflowProposal,
-        now: DateTime<Utc>,
-    ) -> RuntimeResult<SessionSlotReservation> {
-        self.reserve_paper_session_with_inputs(lease, session_key, proposal, &[], now)
-    }
-
-    /// As [`Self::reserve_paper_session`], but atomically installs the
-    /// scheduler-owned immutable `EvidenceNeed` artifacts referenced by the
-    /// compiled graph.
-    pub fn reserve_paper_session_with_inputs(
-        &self,
-        lease: &DaemonLease,
-        session_key: impl Into<String>,
-        proposal: &WorkflowProposal,
-        setup_artifacts: &[Artifact],
-        now: DateTime<Utc>,
-    ) -> RuntimeResult<SessionSlotReservation> {
-        // `impl Into<String>` 让调用方传 &str 或 String，所有权在下游转换后归 reservation；
-        // `&[Artifact]` 只借用 setup 输入，真正的持久化仍在 Store 的 reservation 事务。
-        self.reserve_paper_session_with_inputs_for_run(
-            lease,
-            RunId::new(),
-            session_key,
-            proposal,
-            setup_artifacts,
-            now,
-        )
-    }
-
-    /// Reserve the exact caller-allocated run identity. This exists for the
-    /// scheduler's preflight transaction, which binds immutable evidence need
-    /// artifacts to the same Run before it becomes visible.
-    pub fn reserve_paper_session_with_inputs_for_run(
-        &self,
-        lease: &DaemonLease,
-        run_id: RunId,
-        session_key: impl Into<String>,
-        proposal: &WorkflowProposal,
-        setup_artifacts: &[Artifact],
-        now: DateTime<Utc>,
-    ) -> RuntimeResult<SessionSlotReservation> {
-        self.reserve_paper_session_with_inputs_for_run_binding(
-            lease,
-            run_id,
-            session_key,
-            proposal,
-            setup_artifacts,
-            None,
-            now,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn reserve_paper_session_with_inputs_for_run_approved(
-        &self,
-        lease: &DaemonLease,
-        run_id: RunId,
-        session_key: impl Into<String>,
-        proposal: &WorkflowProposal,
-        setup_artifacts: &[Artifact],
-        runtime_manifest: &Artifact,
-        approval: &Artifact,
-        now: DateTime<Utc>,
-    ) -> RuntimeResult<SessionSlotReservation> {
-        self.reserve_paper_session_with_inputs_for_run_binding(
-            lease,
-            run_id,
-            session_key,
-            proposal,
-            setup_artifacts,
-            Some((runtime_manifest, approval)),
-            now,
-        )
     }
 
     /// Prepare a Paper session for an approved-path transaction without
@@ -155,20 +58,19 @@ impl WorkflowRuntime {
         ))
     }
 
+    /// Freezes the scheduler's allocated Run and setup artifacts in its Paper
+    /// session. A repeated reservation returns the original Run and task IDs.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn reserve_paper_session_with_inputs_for_run_binding(
+    pub fn reserve_scheduled_paper_session(
         &self,
         lease: &DaemonLease,
         run_id: RunId,
-        session_key: impl Into<String>,
+        session_key: String,
         proposal: &WorkflowProposal,
-        setup_artifacts: &[Artifact],
-        binding: Option<(&Artifact, &Artifact)>,
+        setup_artifacts: Vec<Artifact>,
+        binding: Option<(Artifact, Artifact)>,
         now: DateTime<Utc>,
     ) -> RuntimeResult<SessionSlotReservation> {
-        // 先查 session slot，重复 scheduler tick 直接返回既有 reservation；新 session
-        // 才编译一次 Paper graph，并在有 approval binding 时由 Store 原子消费审批。
-        let session_key = session_key.into();
         if let Some(slot) = self.store.session_slot(&session_key)? {
             return Ok(SessionSlotReservation {
                 slot,
@@ -176,35 +78,38 @@ impl WorkflowRuntime {
             });
         }
 
-        // `Option<(&Artifact, &Artifact)>` 是可选绑定，两个引用都不把审批 Artifact
-        // 所有权交给 Runtime；无 binding 的冷启动不会虚构一个批准的 proposal Artifact。
-        let proposal_artifact = if binding.is_some() {
-            Some(self.paper_proposal_artifact(&run_id, proposal, now)?)
-        } else {
-            None
+        let approved_proposal = match binding {
+            Some((manifest, approval)) => Some((
+                self.paper_proposal_artifact(&run_id, proposal, now)?,
+                manifest,
+                approval,
+            )),
+            None => None,
         };
-        let workflow =
-            self.prepare_paper_workflow_commit(run_id, proposal, proposal_artifact.as_ref(), now)?;
+        let workflow = self.prepare_paper_workflow_commit(
+            run_id,
+            proposal,
+            approved_proposal.as_ref().map(|(proposal, _, _)| proposal),
+            now,
+        )?;
         let reservation = SessionReservation {
             session_key,
             workflow,
-            setup_artifacts: setup_artifacts.to_vec(),
+            setup_artifacts,
             reserved_at: now,
         };
-        // 同时匹配两个 Option：只有审批和 proposal Artifact 均存在才消费审批；
-        // 否则仅预留 session，后续 Gate 仍按缺少审批 fail closed。
-        Ok(match (binding, proposal_artifact.as_ref()) {
-            (Some((runtime_manifest, approval)), Some(proposal_artifact)) => {
+        Ok(match &approved_proposal {
+            Some((proposal, runtime_manifest, approval)) => {
                 self.store.reserve_paper_session_with_approval(
                     lease,
                     &reservation,
-                    proposal_artifact,
+                    proposal,
                     runtime_manifest,
                     approval,
-                )?
+                )
             }
-            _ => self.store.reserve_session_slot(lease, &reservation)?,
-        })
+            None => self.store.reserve_session_slot(lease, &reservation),
+        }?)
     }
 
     /// Build the Rust-owned, precompiled Paper proposal used for the first

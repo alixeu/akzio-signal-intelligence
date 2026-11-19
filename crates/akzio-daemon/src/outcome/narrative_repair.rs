@@ -170,7 +170,7 @@ impl Daemon {
             })?;
         EvaluationRuntime::new(self.store.clone(), EvaluationPolicy::default())?
             .evaluate_sealed_with_retrospective(
-                Some(&lease),
+                &lease,
                 akzio_learning::SealedEvaluationInput {
                     complete_task: true,
                     permit: task.permit.clone(),

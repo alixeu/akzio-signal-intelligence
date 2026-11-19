@@ -117,7 +117,7 @@ impl Daemon {
                 (run_id, true)
             }
             RunPurpose::Paper => {
-                let paper = self.paper.paper_observer.clone().ok_or_else(|| {
+                let clock = self.paper.session_clock.as_ref().ok_or_else(|| {
                     DaemonError::InvalidInput(
                         "完整模式尚未启用：配置 daemon.manual_paper=true 后重启 Core".into(),
                     )
@@ -128,11 +128,10 @@ impl Daemon {
                     )
                     .into());
                 }
-                let clock = AlpacaPaperSessionClock::new(paper);
                 let reservation = self
                     .paper
                     .scheduler
-                    .tick(&clock, &self.paper_workflow_source(), Utc::now())
+                    .tick(clock, &self.paper_workflow_source(), Utc::now())
                     .await
                     .map_err(classify_scheduler_error)?
                     .ok_or_else(|| {

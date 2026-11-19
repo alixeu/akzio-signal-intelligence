@@ -7,9 +7,7 @@
 // `command` 由调用方 move 进来并在 match 中拆出拥有的 ID/字符串；配置和路径只读借用。
 // 每个 `await` 才会驱动对应 HTTP Future；成功只表示该 endpoint 返回并解码了结果。
 async fn dispatch_control(command: Command, config: &Config, config_path: &Path) -> Result<()> {
-    // 将需要 daemon 控制面的 Workflow/Run/Canary/Daemon 命令统一转为 HTTP 请求；
-    // 本地处理的 ObservatoryConfig、Calibration、Evidence 和 ModelQualification 在这里
-    // 明确拒绝，避免在配置已加载后误走远端路径。
+    // 将 Workflow、Run、Canary 和 Daemon 的控制命令统一转为 HTTP 请求。
     match command {
         Command::Workflow { command: WorkflowCommand::Blueprint { purpose, format } } => {
             // Blueprint 是服务端根据 purpose 生成的拓扑投影；Mermaid 只改变输出格式，
@@ -96,7 +94,6 @@ async fn dispatch_control(command: Command, config: &Config, config_path: &Path)
             }
         }
         Command::ObservatoryConfig { .. } => {
-            // 配置初始化/读取/编辑必须在 main 的早期分支完成，避免加载旧配置或环境覆盖。
             bail!("ObservatoryConfig is handled before control dispatch")
         }
         Command::Store { .. } => {

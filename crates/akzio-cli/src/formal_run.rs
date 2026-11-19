@@ -114,8 +114,7 @@ fn spawn_formal_core(config_path: &Path, store_root: &Path) -> Result<impl FnMut
         .context("定位正式 Core 配置路径")?;
     let binary = std::env::current_exe().context("定位当前 Rust CLI 二进制")?;
 
-    // nohup + 独立进程组让 Core 在脚本返回和终端断开后继续处理 T1/T3/T5。
-    // stdin EOF 退出仅供受控 child 使用；CLI 自动启动不继承这一行为。
+    // nohup + 独立进程组让 Core 在终端断开后继续处理 T1/T3/T5。
     let mut command = std::process::Command::new("nohup");
     command
         .arg(binary)
@@ -124,7 +123,6 @@ fn spawn_formal_core(config_path: &Path, store_root: &Path) -> Result<impl FnMut
         .arg("daemon")
         .arg("serve")
         .current_dir(config.parent().context("配置缺少父目录")?)
-        .env("AKZIO_EXIT_ON_STDIN_EOF", "0")
         .stdin(std::process::Stdio::null())
         .stdout(output.try_clone().context("复制 Core 日志句柄")?)
         .stderr(output);

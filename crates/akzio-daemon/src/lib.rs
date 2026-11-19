@@ -20,16 +20,16 @@ mod evidence;
 mod http;
 mod launch;
 mod observer;
-mod observer_analytics;
 mod outcome;
 mod run_log;
 mod scheduler;
 mod worker;
 
 pub use run_log::{ArchiveReceipt, RunLogError, RunLogger};
+use scheduler::AlpacaPaperSessionClock;
 pub use scheduler::{
-    AlpacaPaperSessionClock, BrokerSessionClock, PaperScheduler, PaperWorkflowSource,
-    SchedulerError, StorePaperWorkflowSource, SCHEDULER_LEASE_NAME,
+    BrokerSessionClock, PaperScheduler, PaperWorkflowSource, SchedulerError,
+    StorePaperWorkflowSource, SCHEDULER_LEASE_NAME,
 };
 
 pub use worker::{TaskHandler, WorkerPool, WorkerPoolConfig};
@@ -54,12 +54,12 @@ use akzio_domain::{
     PaperApprovalScope, PaperLaunchApproval, PolicySubject, QuoteSnapshot, Reconciliation,
     ReconciliationState, ResearchClaim, ResearchIntent, Retrospective, RetrospectiveDraft,
     RiskGroundTruthAssessment, RunId, RunPurpose, RuntimeIdentity, RuntimeManifest,
-    RuntimeTaskClass, TargetPortfolio, TaskId, TaskStatus, TaskWritePermit, TopologyId,
-    WorkflowGraph, WorkflowProposal, WorkflowStatus, DOMAIN_SCHEMA_VERSION,
+    RuntimeTaskClass, TaskId, TaskStatus, TaskWritePermit, TopologyId, WorkflowGraph,
+    WorkflowStatus, DOMAIN_SCHEMA_VERSION,
 };
 use akzio_execution::{
     materialize_snapshot_artifact,
-    paper::{AlpacaPaper, CommittedPaperBroker, PortfolioHistoryRange},
+    paper::{AlpacaPaper, CommittedPaperBroker},
     DecisionGateError, DecisionGateInput, DecisionPolicy, DecisionRuntime, ExecutionGateError,
     ExecutionGateInput, ExecutionGatePolicy, ExecutionPlan, ExecutionPolicy, ExecutionRuntime,
     PaperCommitmentError, PaperCommitmentInput, PaperCommitmentRuntime, PaperDispatchError,
@@ -69,11 +69,10 @@ use akzio_execution::{
 pub use akzio_ingest::AlpacaMarketDataFeed;
 use akzio_ingest::{
     common_bar_dates, decode_paper_account, decode_paper_clock, decode_paper_quotes,
-    parse_daily_bars, parse_money_micros, provider_money, AcquiredEvidence,
-    AlpacaPaperEvidenceTransport, AsyncEvidenceAdapter, EvidenceBundle, EvidenceProvenance,
-    EvidenceQuality, EvidenceRequest, EvidenceRuntime, EvidenceRuntimeError, EvidenceSource,
-    FixtureEvidenceAdapter, FredDirectTransport, NormalizedEvidencePayload, PaperDecodeError,
-    SecEdgarDirectTransport,
+    parse_daily_bars, AcquiredEvidence, AlpacaPaperEvidenceTransport, AsyncEvidenceAdapter,
+    EvidenceBundle, EvidenceProvenance, EvidenceQuality, EvidenceRequest, EvidenceRuntime,
+    EvidenceRuntimeError, EvidenceSource, FixtureEvidenceAdapter, FredDirectTransport,
+    NormalizedEvidencePayload, PaperDecodeError, SecEdgarDirectTransport,
 };
 use akzio_learning::{
     apply_risk_ground_truth_assessments, daily_observations, evaluate_canary_cohort,
@@ -392,7 +391,7 @@ struct DaemonTransport {
 #[derive(Clone)]
 struct DaemonPaperState {
     paper_broker: Option<Arc<dyn CommittedPaperBroker>>,
-    paper_observer: Option<AlpacaPaper>,
+    session_clock: Option<AlpacaPaperSessionClock>,
     scheduler: PaperScheduler,
     auto_paper: bool,
     runtime_identity_hash: Option<ContentHash>,
@@ -479,11 +478,6 @@ pub struct DaemonHealth {
     pub scheduler_epoch: Option<u64>,
     pub metrics: StoreMetrics,
     pub alerts: Vec<StoreAlert>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ObserverInvalidation {
-    pub cursor: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -144,7 +144,6 @@ impl PaperScheduler {
         let lease = self.acquire_or_renew_async().await?;
         self.require_run_log()?;
         let run_id = RunId::new();
-        let mut setup_artifacts = Vec::new();
         let mut proposal = proposal;
 
         for task in proposal.tasks.values_mut() {
@@ -195,66 +194,35 @@ impl PaperScheduler {
             .tasks
             .get_mut(&snapshot_alias)
             .ok_or(SchedulerError::WorkflowUnavailable)?;
-        for need in paper_session_evidence_needs(&session_key) {
-            need.validate()?;
-            let artifact = Artifact::new(
-                ArtifactKind::EvidenceNeed,
-                self.store_executor
-                    .execute({
-                        let need = need.clone();
-                        // The later reservation runs on the same serialized Store executor.
-                        move |store| store.stage_json(&need)
-                    })
-                    .await??,
-                PAPER_SNAPSHOT_PRODUCER,
-                ArtifactLifecycle::RunScoped,
-                ArtifactProvenance {
-                    source_family: "akzio.scheduler".to_owned(),
-                    observed_at: None,
-                    retrieved_at: now,
-                    source_uri: None,
-                    confidence_ppm: 1_000_000,
-                    producer_contract_hash: None,
-                },
-                Some(ArtifactOrigin {
-                    run_id: Some(run_id.clone()),
-                    task_id: None,
-                    attempt_id: None,
-                    contract_hash: None,
-                }),
-                Vec::new(),
-                now,
-            )?;
-            first_task.evidence_needs.push(ArtifactRef {
+        let scheduler = self.clone();
+        let snapshot_run_id = run_id.clone();
+        let snapshot_session_key = session_key.clone();
+        let setup_artifacts = self
+            .store_executor
+            .execute(move |_| {
+                scheduler.paper_snapshot_artifacts(&snapshot_run_id, &snapshot_session_key, now)
+            })
+            .await??;
+        first_task
+            .evidence_needs
+            .extend(setup_artifacts.iter().map(|artifact| ArtifactRef {
                 artifact_id: artifact.artifact_id.clone(),
-                kind: ArtifactKind::EvidenceNeed,
-            });
-            setup_artifacts.push(artifact);
-        }
+                kind: artifact.kind,
+            }));
 
         let workflow = self.workflow.clone();
         let reservation = self
             .store_executor
-            .execute(move |_| match binding {
-                Some((runtime_manifest, approval)) => workflow
-                    .reserve_paper_session_with_inputs_for_run_approved(
-                        &lease,
-                        run_id,
-                        &session_key,
-                        &proposal,
-                        &setup_artifacts,
-                        &runtime_manifest,
-                        &approval,
-                        now,
-                    ),
-                None => workflow.reserve_paper_session_with_inputs_for_run(
+            .execute(move |_| {
+                workflow.reserve_scheduled_paper_session(
                     &lease,
                     run_id,
-                    &session_key,
+                    session_key,
                     &proposal,
-                    &setup_artifacts,
+                    setup_artifacts,
+                    binding,
                     now,
-                ),
+                )
             })
             .await
             .map_err(SchedulerError::during_reservation)?

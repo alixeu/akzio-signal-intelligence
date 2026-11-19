@@ -16,11 +16,16 @@ async fn main() -> Result<()> {
             return formal_run::execute(command, &cli.config).await;
         }
     }
-    // 先处理不需要常规运行时配置的本地入口，避免离线质量报告、配置编辑、校准和
-    // fixture 验证被模型凭据、Paper 环境或 daemon 启动前置条件阻断。
-    if let Command::ObservatoryConfig { config, command } = &cli.command {
-        // Observatory 配置命令直接读写指定文件，不加载常规 daemon 配置，也不启动服务。
-        return handle_observatory_config(config, command);
+    // 本地配置初始化、资格报告和校准在常规运行时配置加载前分派。
+    if let Command::ObservatoryConfig {
+        config,
+        command: ObservatoryConfigCommand::Init {
+            template,
+            store_root,
+        },
+    } = &cli.command
+    {
+        return init_observatory_config(config, template, store_root);
     }
     if let Command::ModelQualification { command } = &cli.command {
         // 模型资格报告是本地离线数据处理，输入输出由子命令自行管理。

@@ -1,10 +1,7 @@
 //! Authenticated loopback HTTP transport.
 
-// 文件导读：HTTP transport 是 CLI/Observatory 到 daemon 的回环入口。handler 普遍做
-// token 校验，正式运行入口另查 native-client 与 canonical Store 边界；部分外部
-// observer 与审批请求不是 StoreExecutor 内的纯 Store 查询。SSE 发送
-// reasoning/event invalidation。HTTP 200、SSE event 或 Store maintenance 完成只证明该
-// transport 操作有界结束，不证明研究/Decision/Execution、Paper submission/fill 或 Outcome。
+// 文件导读：HTTP transport 为 CLI 提供认证的回环接口。正式运行入口校验 native-client
+// 与 canonical Store，SSE 按 Run 发送 reasoning 与生命周期事件。
 // Rust 机制：Axum extractor/Router 宏把 Path/Query/Json/State 组合成 handler；SSE 用
 // `async_stream::stream!` 生成 Stream，`select!` 同时监听 broadcast、poll 和 shutdown；
 // generic `run_store_operation<T, F>` 以 `Send + 'static` 闭包跨 StoreExecutor 线程。
@@ -12,16 +9,7 @@
 use super::*;
 include!("http_runtime.rs");
 include!("http_launch.rs");
-use crate::observer::{
-    ObserverPortfolioHistory, ObserverPortfolioRange, ObserverRunDetail, ObserverSection,
-    ObserverSnapshot,
-};
-
-#[derive(Debug, Deserialize)]
-// Observer query 只选择已支持的历史区间；值由 serde 反序列化为强类型枚举。
-struct ObserverPortfolioHistoryQuery {
-    range: ObserverPortfolioRange,
-}
+use crate::observer::ObserverRunDetail;
 
 #[derive(Debug, Deserialize)]
 // 只绑定 campaign 内容哈希；未启用 deny_unknown_fields，serde 默认忽略未映射字段，handler
@@ -85,7 +73,6 @@ impl Daemon {
             .route("/runs", post(http_launch_run))
             .route("/health", get(http_health))
             .route("/ready", get(http_ready))
-            .route("/v1/observer/snapshot", get(http_observer_snapshot))
             .route("/v1/observer/runs/{run_id}", get(http_observer_run))
             .route("/v1/workflows/blueprint", get(http_workflow_blueprint))
             .route(
@@ -93,11 +80,6 @@ impl Daemon {
                 get(http_run_inspection),
             )
             .route("/v1/observer/runs/{run_id}/journal", get(http_run_journal))
-            .route(
-                "/v1/observer/portfolio/history",
-                get(http_observer_portfolio_history),
-            )
-            .route("/v1/observer/events", get(http_observer_events))
             .route("/runs/{run_id}/events", get(http_events))
             .route("/runs/{run_id}/trajectory", get(http_trajectory))
             .route("/runs/{run_id}/retrospectives", get(http_retrospectives))
@@ -251,18 +233,6 @@ async fn http_ready(
         })
 }
 
-async fn http_observer_snapshot(
-    State(daemon): State<Arc<Daemon>>,
-    headers: HeaderMap,
-) -> std::result::Result<Json<ObserverSnapshot>, StatusCode> {
-    // Snapshot 合并 durable observer 与有界外部观察；失败返回 500，不用空 JSON 掩盖未知。
-    authorize(&daemon, &headers)?;
-    daemon.observer_snapshot().await.map(Json).map_err(|error| {
-        eprintln!("observer snapshot failed: {error}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })
-}
-
 async fn http_observer_run(
     State(daemon): State<Arc<Daemon>>,
     Path(run_id): Path<String>,
@@ -285,84 +255,6 @@ async fn http_observer_run(
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
     })
-}
-
-async fn http_observer_portfolio_history(
-    State(daemon): State<Arc<Daemon>>,
-    Query(query): Query<ObserverPortfolioHistoryQuery>,
-    headers: HeaderMap,
-) -> std::result::Result<Json<ObserverSection<ObserverPortfolioHistory>>, StatusCode> {
-    // Portfolio history 只读取 Paper provider 并标记 section 状态；图表/点数不是后续账户
-    // NAV 完整账本或 fill 证明。
-    authorize(&daemon, &headers)?;
-    Ok(Json(daemon.observer_portfolio_history(query.range).await))
-}
-
-async fn http_observer_events(
-    State(daemon): State<Arc<Daemon>>,
-    Query(query): Query<EventQuery>,
-    headers: HeaderMap,
-    shutdown: Option<axum::Extension<watch::Receiver<bool>>>,
-) -> std::result::Result<
-    Sse<impl futures::Stream<Item = std::result::Result<Event, Infallible>>>,
-    StatusCode,
-> {
-    // 全局 SSE 同时监听 reasoning broadcast 与 Store event cursor；cursor 只用于增量观察，
-    // Lagged/Closed 被显式写成 error/结束，不伪造丢失事件。
-    authorize(&daemon, &headers)?;
-    let mut cursor = query.after.unwrap_or(0);
-    let mut reasoning_events = daemon.reasoning_events.subscribe();
-    let mut poll = tokio::time::interval(std::time::Duration::from_millis(500));
-    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // stream! 返回惰性事件流；客户端持续拉取时 select 才轮询 Store cursor/接收广播，
-    // cursor 在该连接局部递增，不建立跨连接确认或消费语义。
-    let stream = stream! {
-        loop {
-            tokio::select! {
-                _ = wait_for_stream_shutdown(&shutdown) => break,
-                event = reasoning_events.recv() => match event {
-                    Ok(event) => match serde_json::to_string(&event) {
-                        Ok(data) => yield Ok(Event::default()
-                            .event(event.event_name())
-                            .data(data)),
-                        Err(error) => yield Ok(Event::default()
-                            .event("error")
-                            .data(error.to_string())),
-                    },
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => yield Ok(Event::default()
-                        .event("error")
-                        .data(format!("reasoning stream lagged by {skipped} events"))),
-                    Err(broadcast::error::RecvError::Closed) => {}
-                },
-                _ = poll.tick() => match daemon
-                    .store_executor
-                    .execute(|store| store.event_cursor())
-                    .await
-                {
-                    Ok(Ok(next)) if next > cursor => {
-                        cursor = next;
-                        match serde_json::to_string(&ObserverInvalidation { cursor }) {
-                            Ok(data) => yield Ok(Event::default()
-                                .id(cursor.to_string())
-                                .event("invalidate")
-                                .data(data)),
-                            Err(error) => yield Ok(Event::default()
-                                .event("error")
-                                .data(error.to_string())),
-                        }
-                    }
-                    Ok(Ok(_)) => yield Ok(Event::default().comment("keepalive")),
-                    Ok(Err(error)) => yield Ok(Event::default()
-                        .event("error")
-                        .data(error.to_string())),
-                    Err(error) => yield Ok(Event::default()
-                        .event("error")
-                        .data(error.to_string())),
-                }
-            }
-        }
-    };
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
 async fn http_events(
