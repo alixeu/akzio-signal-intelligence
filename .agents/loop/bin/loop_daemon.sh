@@ -17,8 +17,9 @@ Usage: bash .agents/loop/bin/loop_daemon.sh <command> [options]
 Commands:
   init            Initialize local state and print the queue JSON
   status          Print the local queue JSON
-  wave            Run one Leader wave if the SQLite lease is available
-  daemon          Run waves on a cadence and generate due reports locally
+  wave            Run one Leader wave and perform configured delivery
+  daemon          Run waves, deliver accepted work, and generate due reports
+  deliver         Retry delivery to origin/main and the configured GitHub issue
   daily-report    Generate a local report now (or only if due with --if-due)
   publish-log     Append pending audit events to an existing GitHub issue
                   Usage: publish-log --repo OWNER/REPO --issue N
@@ -27,8 +28,9 @@ Environment overrides:
   AGY_BIN=agy                  Path or command name of the Antigravity CLI
   LEADER_MODEL=<model>         Optional AGY model slug; otherwise use the agent configuration
   WAVE_INTERVAL_SECS=900       Seconds between daemon ticks
-  AKZIO_LOOP_AUDIT_REPO         Optional daemon audit destination (OWNER/REPO)
-  AKZIO_LOOP_AUDIT_ISSUE        Existing issue number in that repository; set both audit variables
+  AKZIO_LOOP_AUDIT_REPO         GitHub OWNER/REPO (Git config: akzioLoop.auditRepo)
+  AKZIO_LOOP_AUDIT_ISSUE        Existing issue number (Git config: akzioLoop.auditIssue)
+  Configure both values to enable automatic delivery to origin/main and the issue.
 EOF
 }
 
@@ -107,17 +109,28 @@ AGY_RESULT
   python3 "$ISSUE_HUB" finish-wave --wave "$wave"
 }
 
-publish_configured_log() {
+deliver_configured() {
   local repo="${AKZIO_LOOP_AUDIT_REPO:-}"
   local issue="${AKZIO_LOOP_AUDIT_ISSUE:-}"
-  if [[ -z "$repo" && -z "$issue" ]]; then
+  local required="${1:-false}"
+  if [[ -z "$repo" ]]; then
+    repo="$(git config --local --get akzioLoop.auditRepo || true)"
+  fi
+  if [[ -z "$issue" ]]; then
+    issue="$(git config --local --get akzioLoop.auditIssue || true)"
+  fi
+  if [[ -z "$repo" && -z "$issue" && "$required" == false ]]; then
     return 0
   fi
-  if [[ -z "$repo" || -z "$issue" ]]; then
-    printf 'WARN: Set both AKZIO_LOOP_AUDIT_REPO and AKZIO_LOOP_AUDIT_ISSUE to publish audit events.\n' >&2
-  elif ! python3 "$ISSUE_HUB" publish-log --repo "$repo" --issue "$issue"; then
-    printf 'WARN: Audit publishing failed. The next tick will retry pending events.\n' >&2
+  if [[ ! "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ || ! "$issue" =~ ^0*[1-9][0-9]*$ ]]; then
+    printf 'ERROR: Set a GitHub repository (OWNER/REPO) and issue number to enable Loop delivery.\n' >&2
+    return 1
   fi
+
+  local failed=0
+  python3 "$ISSUE_HUB" deliver-main || failed=1
+  python3 "$ISSUE_HUB" publish-log --repo "$repo" --issue "$issue" || failed=1
+  return "$failed"
 }
 
 cmd="${1:-help}"
@@ -131,7 +144,13 @@ case "$cmd" in
     python3 "$ISSUE_HUB" poll "$@"
     ;;
   wave)
-    run_single_wave
+    failed=0
+    run_single_wave || failed=1
+    deliver_configured || failed=1
+    exit "$failed"
+    ;;
+  deliver)
+    deliver_configured true
     ;;
   daily-report)
     python3 "$ISSUE_HUB" daily-report "$@"
@@ -148,7 +167,9 @@ case "$cmd" in
       if ! run_single_wave; then
         printf 'WARN: Wave failed. The daemon will try again on its next tick.\n' >&2
       fi
-      publish_configured_log &
+      if ! deliver_configured; then
+        printf 'WARN: Delivery is pending. The next tick will retry.\n' >&2
+      fi
       sleep "$WAVE_INTERVAL_SECS"
     done
     ;;

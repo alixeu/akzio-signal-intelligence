@@ -1,15 +1,15 @@
 ---
 name: autonomous-loop
-description: Akzio 单机本地研发循环。使用 SQLite 任务与租约调度 Leader、Scout、Worker、Verifier，生成本地日报，并可将审计事件追加到指定 GitHub Issue。
+description: Akzio 单机研发循环。使用 SQLite 任务与租约调度 Leader、Scout、Worker、Verifier，生成本地日报，交付已验收提交和 GitHub 审计记录。
 ---
 
 # Akzio 单机研发循环
 
-`outputs/loop/state/loop.sqlite3` 是任务、wave 租约、验证证据和审计事件的权威状态。`issue_hub.py` 负责状态迁移与 Git 操作。任务 worktree 位于 `outputs/loop/worktrees/task-N`，集成分支为本地 `loop/nightly`。主工作区仅供巡检和设计时核对。旧 GitHub Issue、`ledger.jsonl` 和 `issue-N` worktree 保留在原处，如需恢复其中的工作，应按证据重新登记任务。
+`outputs/loop/state/loop.sqlite3` 是任务、wave 租约、验证证据和审计事件的权威状态。`issue_hub.py` 负责状态迁移与 Git 操作。新任务 worktree 位于 `outputs/loop/worktrees/task-N-QUEUE`，`QUEUE` 是 SQLite 队列标识。旧任务继续使用已登记的路径。Leader 在本地 `loop/nightly` 集成，启动器使用主工作区交付到 `main`。旧 GitHub Issue、`ledger.jsonl` 和 `issue-N` worktree 保留在原处，如需恢复其中的工作，应按证据重新登记任务。
 
 ## 启动与恢复
 
-从仓库根目录运行。`init` 初始化本地状态，`status` 返回本地队列和 `dirty_main_files`。`wave` 启动一次队列动作，`daemon` 在每次轮询执行 `daily-report --if-due` 并尝试启动一轮。`daily-report` 立即写本地报告，报告保存在 `outputs/loop/reports/`。
+从仓库根目录运行。`init` 初始化本地状态，`status` 返回本地队列和 `dirty_main_files`。`wave` 启动一次队列动作并执行已配置的交付，`daemon` 每轮还会检查日报是否到期。`daily-report` 立即写本地报告，报告保存在 `outputs/loop/reports/`。
 
 ```bash
 bash .agents/loop/bin/loop_daemon.sh init
@@ -62,11 +62,22 @@ stateDiagram-v2
 - `claim --task N --wave W` 创建或接管 worktree。Worker 通过 `worker-test --task N --wave W --attempt A --crate CRATE` 运行定向回归，必要时追加 `--filter NAME`。`worker-commit --task N --wave W --attempt A --message MESSAGE` 记录候选提交。
 - `verify-worktree --task N --wave W --attempt A` 记录当前尝试的离线门禁和机械验证。候选提交缺失或 worktree 存在未提交改动也会判为失败。退出码 `2` 表示该失败已计入任务预算，`show --task N` 返回 `last_failure` 供恢复或重试。
 - Verifier 用 `show-diff --task N --wave W` 读取已验证的完整差异，再用 `review --task N --wave W --head SHA --verdict PASS|REJECT --summary SUMMARY` 记录同一提交的独立裁决。Verifier 结束后仍为同一 `verified_head` 的 `verified` 状态时，Leader 用 `review-missing --task N --wave W --head SHA` 记录缺失裁决。累计两次验证或审查失败后，hub 将任务置为 `blocked` 并保留 worktree。
-- `worktree-land --task N --wave W` 核对机械验证和审查对应同一 SHA，记录合入意图，再推进本地 `loop/nightly` 并持久化 `done` 记录。日报为完成任务标注 `offline-verified`，hub 根据已保存的合入意图恢复中断。
+- `worktree-land --task N --wave W` 核对机械验证和审查对应同一 SHA，记录合入意图，再推进本地 `loop/nightly` 并持久化 `done` 记录。日报为完成任务标注 `offline-verified`。Hub 根据合入意图恢复中断，并在任务提交进入集成分支后清理干净的任务 worktree 和已合入的任务分支。
 
-## 可选 GitHub 审计
+## 发布到 main 和 GitHub Issue
 
-为 daemon 同时设置 `AKZIO_LOOP_AUDIT_REPO=OWNER/REPO` 与 `AKZIO_LOOP_AUDIT_ISSUE=N`，即可在后台将本地事件按检查点追加到一个现有 Issue。也可手动执行以下命令。发布失败时保留待发布事件，任务状态和日报仍由本地 SQLite 独立维护。
+在本地 Git 配置中指定一个现有审计 Issue，也可使用 `AKZIO_LOOP_AUDIT_REPO` 与 `AKZIO_LOOP_AUDIT_ISSUE` 覆盖这两个值。启用后，`wave` 和 `daemon` 都会尝试交付。`deliver` 专门重试待交付记录，可独立于 Leader 执行。
+
+```bash
+# 把 OWNER/REPO 和 N 替换为仓库及审计 Issue 编号
+git config --local akzioLoop.auditRepo OWNER/REPO
+git config --local akzioLoop.auditIssue N
+bash .agents/loop/bin/loop_daemon.sh deliver
+```
+
+启动器在租约释放后，将已通过机械验证和独立审查的提交快进到本地 `main`，再推送到 `origin/main`。快进要求主工作区处于干净的 `main`。远端推进只经过 Loop 已验收的提交链。SQLite 在两处 `main` 都包含提交后记录 `task_published`。没有待恢复任务且集成提交已进入本地和远端 `main` 时，Hub 删除 `loop/nightly`。
+
+审计发布器按批次追加待发布事件。推送或评论失败时，`daemon` 在下轮重试，`wave` 和 `deliver` 返回失败状态。只需补发审计时运行 `publish-log`。
 
 ```bash
 bash .agents/loop/bin/loop_daemon.sh publish-log --repo OWNER/REPO --issue N

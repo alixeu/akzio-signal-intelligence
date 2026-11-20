@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local Akzio development loop. GitHub is an optional receiver of audit events."""
+"""Akzio development loop with local verification and operator delivery."""
 
 from __future__ import annotations
 
@@ -27,6 +27,8 @@ TMP_DIR = OUTPUT_ROOT / "tmp"
 REPORTS_DIR = OUTPUT_ROOT / "reports"
 DB_PATH = STATE_DIR / "loop.sqlite3"
 INTEGRATION_REF = "refs/heads/loop/nightly"
+MAIN_REF = "refs/heads/main"
+REMOTE_MAIN_REF = "refs/remotes/origin/main"
 WAVE_SECONDS = 2 * 60 * 60
 MAX_ATTEMPTS = 2
 RESUMABLE = ("landing", "reviewed", "verified", "in_progress")
@@ -68,7 +70,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     checks TEXT,
     review_summary TEXT,
     last_failure TEXT,
-    blocked_reason TEXT
+    blocked_reason TEXT,
+    checkout TEXT
 );
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY,
@@ -135,6 +138,9 @@ def open_db(*, readonly=False):
         if not readonly:
             db.execute("PRAGMA synchronous = FULL")
             db.executescript(SCHEMA)
+            with transaction(db):
+                if "checkout" not in {column["name"] for column in db.execute("PRAGMA table_info(tasks)")}:
+                    db.execute("ALTER TABLE tasks ADD COLUMN checkout TEXT")
             db.execute(
                 "INSERT OR IGNORE INTO loop_info VALUES (1, ?, ?)",
                 (uuid.uuid4().hex, utc_timestamp()),
@@ -180,8 +186,13 @@ def task_row(db, task_id):
     return row
 
 
-def worktree_path(task_id) -> Path:
-    path = WORKTREES_DIR / f"task-{task_id}"
+def checkout_name(task):
+    name = task["checkout"] if "checkout" in task.keys() else None
+    return name or f"task-{task['id']}"
+
+
+def worktree_path(task) -> Path:
+    path = WORKTREES_DIR / checkout_name(task)
     if path.resolve() != path:
         raise RuntimeError(f"Invalid task worktree path: {path}")
     return path
@@ -190,11 +201,12 @@ def worktree_path(task_id) -> Path:
 def task_view(row):
     result = dict(row)
     del result["wave"]
+    result.pop("checkout", None)
     for field in ("candidate_files", "allowed_files", "checks", "last_failure"):
         if result[field] is not None:
             result[field] = json.loads(result[field])
     if row["base_sha"]:
-        result["worktree_path"] = str(worktree_path(row["id"]))
+        result["worktree_path"] = str(worktree_path(row))
     return result
 
 
@@ -229,7 +241,7 @@ def loop_scope(role: str, wave: str, task_id: int | None, version: str) -> dict:
         if task["wave"] != wave or task["status"] != expected_stage or version != expected_version:
             raise RuntimeError("This role no longer owns the task stage or version.")
         return {
-            "worktree": str(worktree_path(task_id)),
+            "worktree": str(worktree_path(task)),
             "allowed_files": json.loads(task["allowed_files"]),
         }
 
@@ -389,36 +401,45 @@ def ref_commit(ref):
     return result.stdout.strip() if result.returncode == 0 else None
 
 
+def branch_checked_out(ref):
+    branches = git("worktree", "list", "--porcelain", "-z").stdout.split("\0")
+    return f"branch {ref}" in branches
+
+
 def integration_base():
-    value = ref_commit(INTEGRATION_REF)
-    if value:
-        return value
-    head = git("rev-parse", "HEAD").stdout.strip()
-    created = git("update-ref", INTEGRATION_REF, head, "0" * len(head), check=False)
-    if created.returncode:
-        value = ref_commit(INTEGRATION_REF)
-        if not value:
-            raise RuntimeError(f"Could not create {INTEGRATION_REF}: {created.stderr.strip()}")
-        return value
-    return head
+    main = ref_commit(MAIN_REF)
+    if not main:
+        raise RuntimeError("The local main branch is required to claim a task.")
+    current = ref_commit(INTEGRATION_REF)
+    if current and is_ancestor(main, current):
+        return current
+    if current and not is_ancestor(current, main):
+        raise RuntimeError("The local main and loop/nightly branches have diverged.")
+    if branch_checked_out(INTEGRATION_REF):
+        raise RuntimeError("The integration branch is checked out in a worktree.")
+    git("update-ref", INTEGRATION_REF, main, current or "0" * len(main))
+    return main
 
 
-def task_branch(task_id):
-    return f"loop/task-{task_id}"
+def task_branch(task):
+    return f"loop/{checkout_name(task)}"
 
 
 def check_worktree(task):
-    path = worktree_path(task["id"])
+    path = worktree_path(task)
     if not path.is_dir() or Path(git("rev-parse", "--show-toplevel", cwd=path).stdout.strip()) != path:
         raise RuntimeError(f"The registered worktree is missing or invalid: {path}")
-    if git("symbolic-ref", "--quiet", "HEAD", cwd=path).stdout.strip() != f"refs/heads/{task_branch(task['id'])}":
+    git_dir_args = ("rev-parse", "--path-format=absolute", "--git-common-dir")
+    if git(*git_dir_args, cwd=path).stdout != git(*git_dir_args).stdout:
+        raise RuntimeError(f"The registered worktree is missing or invalid: {path}")
+    if git("symbolic-ref", "--quiet", "HEAD", cwd=path).stdout.strip() != f"refs/heads/{task_branch(task)}":
         raise RuntimeError(f"Unexpected branch in {path}.")
     return path
 
 
 def create_or_resume_worktree(task):
-    path = worktree_path(task["id"])
-    branch = task_branch(task["id"])
+    path = worktree_path(task)
+    branch = task_branch(task)
     if not path.exists():
         if ref_commit(f"refs/heads/{branch}"):
             git("worktree", "add", str(path), branch)
@@ -439,10 +460,12 @@ def cmd_claim(args):
                 if active:
                     raise RuntimeError(f"Resume task #{active['id']} before claiming a new task.")
                 base = integration_base()
+                identity = db.execute("SELECT identity FROM loop_info").fetchone()[0]
+                checkout = f"task-{args.task}-{identity}"
                 db.execute(
                     """UPDATE tasks SET status = 'in_progress', wave = ?, base_sha = ?,
-                       attempt = 1, attempt_base = ? WHERE id = ?""",
-                    (args.wave, base, base, args.task),
+                       attempt = 1, attempt_base = ?, checkout = ? WHERE id = ?""",
+                    (args.wave, base, base, checkout, args.task),
                 )
                 event(db, "task_claimed", args.task, base_sha=base, attempt=1)
             elif task["status"] in RESUMABLE:
@@ -570,10 +593,7 @@ def recover_candidate(db, task, path):
     head = git("rev-parse", "HEAD", cwd=path).stdout.strip()
     if head == task["attempt_base"]:
         return task
-    git_dir_args = ("rev-parse", "--path-format=absolute", "--git-common-dir")
-    if git(*git_dir_args, cwd=path).stdout != git(*git_dir_args).stdout:
-        raise RuntimeError(f"The registered worktree is missing or invalid: {path}")
-    branch = f"refs/heads/{task_branch(task['id'])}"
+    branch = f"refs/heads/{task_branch(task)}"
     worktrees = git("worktree", "list", "--porcelain", "-z").stdout.split("\0\0")
     expected = [f"worktree {path}", f"HEAD {head}", f"branch {branch}"]
     if not any(entry.split("\0")[:3] == expected for entry in worktrees):
@@ -832,8 +852,7 @@ def cmd_land(args):
         if current == base:
             if not is_ancestor(base, head):
                 raise RuntimeError("The candidate cannot fast-forward the frozen base.")
-            branches = git("worktree", "list", "--porcelain", "-z").stdout.split("\0")
-            if f"branch {INTEGRATION_REF}" in branches:
+            if branch_checked_out(INTEGRATION_REF):
                 raise RuntimeError("The integration branch is checked out in a worktree.")
             moved = git("update-ref", INTEGRATION_REF, head, base, check=False)
             current = head if moved.returncode == 0 else ref_commit(INTEGRATION_REF)
@@ -847,12 +866,98 @@ def cmd_land(args):
             else:
                 db.execute("UPDATE tasks SET status = 'blocked', blocked_reason = 'integration_advanced' WHERE id = ?", (args.task,))
                 event(db, "task_blocked", args.task, reason="integration_advanced", base_sha=base, head_sha=head)
-        path = worktree_path(args.task)
-        if landed and path.is_dir():
-            cleaned = git("worktree", "remove", str(path), check=False)
-            if cleaned.returncode:
-                print(f"Task #{args.task} is done; retained worktree at {path}.", file=sys.stderr)
+        if landed:
+            cleanup_task_checkout(task)
         return emit(task_view(task_row(db, args.task)))
+
+
+def cleanup_task_checkout(task):
+    ref = f"refs/heads/{task_branch(task)}"
+    head = task["verified_head"]
+    if not head or ref_commit(ref) != head:
+        return
+    path = worktree_path(task)
+    if path.is_dir():
+        try:
+            check_worktree(task)
+            if git("rev-parse", "HEAD", cwd=path).stdout.strip() != head:
+                raise RuntimeError("The task branch changed after landing.")
+            if git("status", "--porcelain=v1", "--untracked-files=all", "--ignored",
+                   "--ignore-submodules=none", cwd=path).stdout:
+                raise RuntimeError("The worktree contains local files or changes.")
+            git("worktree", "remove", str(path))
+        except RuntimeError as exc:
+            print(f"Retained task #{task['id']} worktree {path}: {exc}", file=sys.stderr)
+            return
+    if not branch_checked_out(ref):
+        git("update-ref", "-d", ref, head)
+
+
+def fetch_remote_main():
+    git("fetch", "--no-tags", "--no-write-fetch-head", "origin", f"{MAIN_REF}:{REMOTE_MAIN_REF}")
+    return git("rev-parse", "--verify", REMOTE_MAIN_REF).stdout.strip()
+
+
+def cmd_deliver_main(_args):
+    if not DB_PATH.exists():
+        return emit({"status": "up_to_date"})
+    with process_lock("control"), open_db() as db:
+        if db.execute("SELECT 1 FROM wave WHERE expires_at > ?", (utc_timestamp(),)).fetchone():
+            return emit({"status": "busy"})
+        pending = db.execute(
+            """SELECT t.* FROM tasks t JOIN events e ON e.task_id = t.id AND e.kind = 'task_landed'
+               WHERE t.status = 'done' AND NOT EXISTS (
+                   SELECT 1 FROM events p WHERE p.task_id = t.id AND p.kind = 'task_published'
+               ) ORDER BY e.id""",
+        ).fetchall()
+        integration = ref_commit(INTEGRATION_REF)
+        if not pending and not integration:
+            return emit({"status": "up_to_date"})
+
+        main = git("rev-parse", "--verify", MAIN_REF).stdout.strip()
+        remote = fetch_remote_main()
+        target = remote
+        for task in pending:
+            head = task["verified_head"]
+            if is_ancestor(head, remote):
+                continue
+            if task["base_sha"] != target or not is_ancestor(target, head):
+                raise RuntimeError("origin/main cannot reach the candidate through approved Loop tasks.")
+            target = head
+
+        if pending:
+            head = pending[-1]["verified_head"]
+            if not is_ancestor(head, main):
+                if not is_ancestor(main, head):
+                    raise RuntimeError("Local main diverged from the approved Loop commits.")
+                checkout = git("symbolic-ref", "--quiet", "HEAD", check=False).stdout.strip()
+                if checkout != MAIN_REF or git("status", "--porcelain=v1", "--untracked-files=all").stdout:
+                    raise RuntimeError("Delivery requires main checked out in a clean primary worktree.")
+                git("merge", "--ff-only", "--no-autostash", "--no-overwrite-ignore", head)
+                main = git("rev-parse", "--verify", MAIN_REF).stdout.strip()
+            if target != remote:
+                if not is_ancestor(target, main):
+                    raise RuntimeError("Local main changed before the approved commit could be pushed.")
+                git("push", "--no-follow-tags", "origin", f"{target}:{MAIN_REF}")
+                remote = fetch_remote_main()
+            for task in pending:
+                head = task["verified_head"]
+                if not is_ancestor(head, main) or not is_ancestor(head, remote):
+                    raise RuntimeError("An approved commit is missing from local main or origin/main.")
+                cleanup_task_checkout(task)
+            with transaction(db):
+                for task in pending:
+                    event(db, "task_published", task["id"], head_sha=task["verified_head"])
+
+        active = db.execute(
+            "SELECT 1 FROM tasks WHERE status IN ('in_progress', 'verified', 'reviewed', 'landing')"
+        ).fetchone()
+        if (integration and not active and is_ancestor(integration, main)
+                and is_ancestor(integration, remote) and not branch_checked_out(INTEGRATION_REF)):
+            git("update-ref", "-d", INTEGRATION_REF, integration)
+    if pending:
+        return emit({"status": "published", "head_sha": pending[-1]["verified_head"], "tasks": len(pending)})
+    return emit({"status": "up_to_date"})
 
 
 def cmd_daily_report(args):
@@ -873,6 +978,9 @@ def cmd_daily_report(args):
             if row["kind"] == "task_landed":
                 details = json.loads(row["details"])
                 lines.append(f"- Task #{row['task_id']} → `{details['head_sha']}` (`offline-verified`)")
+            if row["kind"] == "task_published":
+                details = json.loads(row["details"])
+                lines.append(f"- Task #{row['task_id']} → `origin/main` · `{details['head_sha']}`")
             if row["kind"] == "task_blocked":
                 details = json.loads(row["details"])
                 lines.append(f"- Task #{row['task_id']} · `{details['reason']}`")
@@ -906,7 +1014,7 @@ def cmd_publish_log(args):
         rows = db.execute(
             """SELECT e.* FROM events e WHERE NOT EXISTS (
                 SELECT 1 FROM deliveries d WHERE d.destination = ? AND d.event_id = e.id
-            ) ORDER BY e.id LIMIT 25""", (destination,),
+            ) ORDER BY e.id""", (destination,),
         ).fetchall()
         if not rows:
             return emit({"status": "up_to_date", "events": 0})
@@ -919,25 +1027,31 @@ def cmd_publish_log(args):
                 if (comment.get("user") or {}).get("id") == actor_id:
                     for marker in re.findall(r"<!-- akzio-loop-event:[0-9a-f]{32}:\d+ -->", comment.get("body") or ""):
                         observed[marker] = comment["id"]
-        receipts = {
-            row["id"]: observed[audit_marker(identity, row["id"])]
-            for row in rows if audit_marker(identity, row["id"]) in observed
-        }
-        pending = [row for row in rows if row["id"] not in receipts]
-        if pending:
-            body = "## Akzio Loop 审计日志\n\n" + "\n".join(
-                f"{audit_line(row)}\n{audit_marker(identity, row['id'])}" for row in pending
-            )
-            posted = run_cmd(["gh", "api", "--method", "POST", endpoint, "--input", "-"], timeout=30,
-                             input_text=json.dumps({"body": body}, ensure_ascii=False))
-            comment_id = json.loads(posted.stdout)["id"]
-            receipts.update((row["id"], comment_id) for row in pending)
-        with transaction(db):
-            db.executemany(
-                "INSERT OR IGNORE INTO deliveries (destination, event_id, comment_id) VALUES (?, ?, ?)",
-                [(destination, event_id, comment_id) for event_id, comment_id in receipts.items()],
-            )
-    return emit({"status": "published", "events": len(rows), "new_events": len(pending)})
+        new_events = 0
+        for offset in range(0, len(rows), 25):
+            receipts = {}
+            pending = []
+            for row in rows[offset:offset + 25]:
+                comment_id = observed.get(audit_marker(identity, row["id"]))
+                if comment_id is None:
+                    pending.append(row)
+                else:
+                    receipts[row["id"]] = comment_id
+            if pending:
+                body = "## Akzio Loop 审计日志\n\n" + "\n".join(
+                    f"{audit_line(row)}\n{audit_marker(identity, row['id'])}" for row in pending
+                )
+                posted = run_cmd(["gh", "api", "--method", "POST", endpoint, "--input", "-"], timeout=30,
+                                 input_text=json.dumps({"body": body}, ensure_ascii=False))
+                comment_id = json.loads(posted.stdout)["id"]
+                receipts.update((row["id"], comment_id) for row in pending)
+                new_events += len(pending)
+            with transaction(db):
+                db.executemany(
+                    "INSERT OR IGNORE INTO deliveries (destination, event_id, comment_id) VALUES (?, ?, ?)",
+                    [(destination, event_id, comment_id) for event_id, comment_id in receipts.items()],
+                )
+    return emit({"status": "published", "events": len(rows), "new_events": new_events})
 
 
 def cmd_init(args):
@@ -989,6 +1103,7 @@ def build_parser():
     review.add_argument("--summary", required=True)
     command("review-missing", cmd_review_missing, task=True, wave=True).add_argument("--head", required=True)
     command("worktree-land", cmd_land, task=True, wave=True)
+    command("deliver-main", cmd_deliver_main)
     block = command("block", cmd_block, task=True, wave=True)
     block.add_argument("--reason-code", choices=("needs_product_decision", "contract_boundary"), required=True)
     block.add_argument("--report-file", required=True)

@@ -184,7 +184,7 @@ def _repo_relative_path(target: Path) -> Optional[str]:
 
 
 def _strip_worktree_prefix(rel_path: str) -> str:
-    m = re.match(r"^outputs/loop/worktrees/(?:issue|task)-\d+/(.+)$", rel_path)
+    m = re.match(r"^outputs/loop/worktrees/(?:issue-\d+|task-\d+(?:-[0-9a-f]{32})?)/(.+)$", rel_path)
     return m.group(1) if m else rel_path
 
 

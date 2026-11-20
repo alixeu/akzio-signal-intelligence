@@ -7,6 +7,7 @@ import io
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -467,7 +468,7 @@ class LocalLoopTests(unittest.TestCase):
         task, wave, worktree = self.claim()
         (worktree / self.SOURCE).write_text(self.FIXED_SOURCE, encoding="utf-8")
         self.git("commit", "-qam", "Correct the fixture answer", cwd=worktree)
-        task_branch = f"loop/task-{task}"
+        task_branch = self.git("symbolic-ref", "--short", "HEAD", cwd=worktree)
         self.git("switch", "-c", "other-fixture-branch", cwd=worktree)
         self.assertIn("Unexpected branch", self.task_cmd("claim", task, wave, code=1)["error"])
         self.git("switch", task_branch, cwd=worktree)
@@ -553,6 +554,92 @@ class LocalLoopTests(unittest.TestCase):
         counts = self.hub("daily-report")["counts"]
         self.assertEqual((counts["landing_intent"], counts["task_landed"]), (1, 1))
 
+    def origin(self):
+        remote = self.repo.parent / "origin.git"
+        self.git("init", "--bare", "--quiet", "--initial-branch=main", "--template=", str(remote))
+        self.git("remote", "add", "origin", str(remote))
+        self.git("push", "--quiet", "origin", "main")
+        return remote
+
+    def test_delivery_publishes_reviewed_head_and_retires_managed_refs(self):
+        remote = self.origin()
+        task, wave, worktree, head = self.reviewed_candidate()
+        branch = self.git("symbolic-ref", "HEAD", cwd=worktree)
+        self.task_cmd("worktree-land", task, wave)
+        self.hub("finish-wave", "--wave", wave)
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.base)
+        self.assertEqual(self.git("rev-parse", "main", cwd=remote), self.base)
+
+        delivered = self.hub("deliver-main")
+        self.assertEqual((delivered["status"], delivered["head_sha"]), ("published", head))
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+        self.assertEqual(self.git("rev-parse", "main", cwd=remote), head)
+        self.assertEqual(self.git("for-each-ref", "--format=%(refname)", branch, self.INTEGRATION_REF), "")
+        self.assertFalse(worktree.exists())
+        self.assertEqual(self.hub("deliver-main")["status"], "up_to_date")
+        self.assertEqual(self.hub("daily-report")["counts"]["task_published"], 1)
+
+    def test_delivery_retries_a_failed_push_after_local_fast_forward(self):
+        remote = self.origin()
+        task, wave, _, head = self.reviewed_candidate()
+        self.task_cmd("worktree-land", task, wave)
+        self.hub("finish-wave", "--wave", wave)
+        pre_receive = remote / "hooks" / "pre-receive"
+        pre_receive.parent.mkdir()
+        pre_receive.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        pre_receive.chmod(0o700)
+        self.assertIn("rejected", self.hub("deliver-main", code=1)["error"])
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+        self.assertEqual(self.git("rev-parse", "main", cwd=remote), self.base)
+        self.assertEqual(self.git("rev-parse", self.INTEGRATION_REF), head)
+        self.assertNotIn("task_published", self.hub("daily-report")["counts"])
+        pre_receive.unlink()
+        self.assertEqual(self.hub("deliver-main")["status"], "published")
+        self.assertEqual(self.git("rev-parse", "main", cwd=remote), head)
+
+    def test_delivery_preserves_dirty_main_and_refuses_unpublished_base_commits(self):
+        remote = self.origin()
+        task, wave, _, head = self.reviewed_candidate()
+        self.task_cmd("worktree-land", task, wave)
+        self.hub("finish-wave", "--wave", wave)
+        local_file = self.repo / "operator.txt"
+        local_file.write_text("operator's work\n", encoding="utf-8")
+        self.assertIn("clean", self.hub("deliver-main", code=1)["error"])
+        self.assertEqual(local_file.read_text(encoding="utf-8"), "operator's work\n")
+        self.assertEqual(self.git("rev-parse", "main", cwd=remote), self.base)
+        local_file.unlink()
+        self.assertEqual(self.hub("deliver-main")["head_sha"], head)
+
+        self.git("commit", "--allow-empty", "-qm", "Unpublished operator commit")
+        next_task = self.propose("second-fixture")["task"]
+        next_wave = self.hub("start-wave")["wave"]
+        self.design(next_task, next_wave)
+        second_tree = Path(self.task_cmd("claim", next_task, next_wave)["worktree_path"])
+        (second_tree / self.SOURCE).write_text(self.INITIAL_SOURCE, encoding="utf-8")
+        next_head = self.task_cmd(
+            "worker-commit", next_task, next_wave, "--attempt", 1, "--message", "Update fixture answer",
+        )["candidate_head"]
+        self.verify(next_task, next_wave)
+        self.review(next_task, next_wave, next_head)
+        self.task_cmd("worktree-land", next_task, next_wave)
+        self.hub("finish-wave", "--wave", next_wave)
+        self.assertIn("approved", self.hub("deliver-main", code=1)["error"])
+        self.assertEqual(self.git("rev-parse", "main", cwd=remote), head)
+
+    def test_fresh_database_does_not_adopt_existing_task_checkout(self):
+        old_branch = "loop/task-1"
+        old_tree = self.worktrees / "task-1"
+        old_tree.parent.mkdir(parents=True)
+        self.git("worktree", "add", "-b", old_branch, str(old_tree), self.base)
+        (old_tree / self.SOURCE).write_text(self.FIXED_SOURCE, encoding="utf-8")
+        self.git("commit", "-qam", "Unrelated prior task", cwd=old_tree)
+        old_head = self.git("rev-parse", "HEAD", cwd=old_tree)
+        task, _, worktree = self.claim()
+        self.assertEqual(task, 1)
+        self.assertNotEqual(worktree, old_tree)
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=worktree), self.base)
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=old_tree), old_head)
+
     def test_two_attempt_breaker_counts_missing_candidate_and_rejected_review(self):
         task, wave, worktree = self.claim()
         failed = self.verify(task, wave, code=2)
@@ -576,7 +663,7 @@ class LocalLoopTests(unittest.TestCase):
         counts = self.hub("daily-report")["counts"]
         self.assertEqual((counts["gate_failed"], counts["review_rejected"], counts["task_blocked"]), (1, 1, 1))
 
-    def test_audit_retains_events_and_recovers_ambiguous_delivery(self):
+    def install_audit_provider(self):
         mode_path = self.providers / "gh-mode"
         comments_path = self.providers / "gh-comments.json"
         provider = textwrap.dedent("""\
@@ -608,6 +695,10 @@ class LocalLoopTests(unittest.TestCase):
         """)
         launcher = shlex.join([sys.executable, "-c", provider, str(self.providers)])
         self.install_provider("gh", f"#!/bin/sh\nexec {launcher} \"$@\"\n")
+        return mode_path, comments_path
+
+    def test_audit_retains_events_and_recovers_ambiguous_delivery(self):
+        mode_path, comments_path = self.install_audit_provider()
         audit = ("publish-log", "--repo", "fixture/loop", "--issue", 42)
         task = self.propose()["task"]
         mode_path.write_text("offline", encoding="utf-8")
@@ -627,6 +718,44 @@ class LocalLoopTests(unittest.TestCase):
         self.assertEqual(self.hub(*audit), {"status": "published", "events": 2, "new_events": 0})
         self.assertEqual(self.hub(*audit), {"status": "up_to_date", "events": 0})
         self.assertEqual(json.loads(comments_path.read_text(encoding="utf-8")), delivered)
+
+
+    def test_wave_delivers_to_main_and_drains_the_configured_audit(self):
+        source = Path(__file__).resolve().parent
+        destination = self.repo / ".agents/loop/bin"
+        destination.mkdir(parents=True)
+        for name in ("issue_hub.py", "loop_daemon.sh"):
+            shutil.copy2(source / name, destination / name)
+        self.git("add", ".agents")
+        self.git("commit", "-qm", "Install fixture launcher")
+        remote = self.origin()
+        self.git("config", "--local", "akzioLoop.auditRepo", "fixture/loop")
+        self.git("config", "--local", "akzioLoop.auditIssue", "42")
+        mode_path, comments_path = self.install_audit_provider()
+        mode_path.write_text("online", encoding="utf-8")
+        start = {
+            "event": "init", "conversation_id": "fixture",
+            "init": {"cwd": str(self.repo), "agent": "loop-leader"},
+        }
+        end = {"event": "result", "result": {"conversation_id": "fixture", "status": "SUCCESS"}}
+        self.install_provider("agy", f"#!/bin/sh\ncat <<'EVENTS'\n{json.dumps(start)}\n{json.dumps(end)}\nEVENTS\n")
+        task, wave, _, head = self.reviewed_candidate()
+        self.task_cmd("worktree-land", task, wave)
+        self.hub("finish-wave", "--wave", wave)
+        for index in range(25):
+            self.propose(f"backlog-{index}")
+
+        launcher = destination / "loop_daemon.sh"
+        for command in ("wave", "deliver"):
+            result = subprocess.run(
+                ["bash", str(launcher), command], cwd=self.repo, capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(self.git("rev-parse", "main", cwd=remote), head)
+            comments = json.loads(comments_path.read_text(encoding="utf-8"))
+            self.assertEqual(len(comments), 2)
+            self.assertIn("`task_published`", comments[-1]["body"])
+            self.assertIn(head, comments[-1]["body"])
 
 
 if __name__ == "__main__":

@@ -75,4 +75,4 @@ python3 .agents/loop/bin/issue_hub.py claim --task N --wave W
 
 4. **机械验证失败、审查退回或缺失裁决**时，hub 会累加失败次数。任务仍为 `in_progress` 时，按 SQLite 返回的新 `attempt` 派发新的 Worker，传递先前失败证据并复用 worktree。任务进入 `blocked` 后结束本轮，保留 worktree 供检查。任务状态为 `done` 时，以持久化记录的提交和 `offline-verified` 证据汇报。
 
-确认本轮子智能体均已结束、任务状态已持久化后返回。阻塞式启动器会在 AGY 成功返回后释放本轮租约。若租约已失效，结束当前对话，由后续波次领取已保存的任务。
+确认本轮子智能体均已结束、任务状态已持久化后返回。阻塞式启动器会在 AGY 成功返回后释放本轮租约，然后执行已配置的 `main` 交付和 GitHub 审计。若租约已失效，结束当前对话，由后续波次领取已保存的任务。
