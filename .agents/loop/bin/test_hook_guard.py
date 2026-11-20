@@ -39,6 +39,9 @@ class GitHubFixture:
         self.git = git
         self.issues = {}
         self.pulls = []
+        self.ci_runs = []
+        self.merge_calls = []
+        self.lose_merge_reply = False
         self.comments = []
         self.lose_issue_reply = False
         self.lose_pr_reply = False
@@ -107,6 +110,7 @@ class GitHubFixture:
         number = len(self.pulls) + 100
         self.pulls.append({
             "number": number, "title": title, "body": body, "state": "open", "merged": False,
+            "draft": False, "mergeable": True, "mergeable_state": "clean",
             "head": {"repo": {"full_name": self.repo}, "ref": branch, "sha": head},
             "base": {"repo": {"full_name": self.repo}, "ref": "main"},
         })
@@ -117,6 +121,38 @@ class GitHubFixture:
 
     def pull(self, number):
         return copy.deepcopy(next(pr for pr in self.pulls if pr["number"] == number))
+
+
+    def add_ci_run(self, pr, **overrides):
+        run = {
+            "id": 9000 + len(self.ci_runs), "run_number": 1 + len(self.ci_runs),
+            "run_attempt": 1, "event": "pull_request",
+            "path": ".github/workflows/ci.yml", "status": "completed", "conclusion": "success",
+            "head_sha": pr["head"]["sha"], "head_branch": pr["head"]["ref"],
+            "head_repository": {"full_name": self.repo},
+            "pull_requests": [{"number": pr["number"], "head": copy.deepcopy(pr["head"]), "base": copy.deepcopy(pr["base"])}],
+        }
+        run.update(overrides)
+        self.ci_runs.append(run)
+        return run
+
+    def pull_ci_runs(self, head, branch):
+        return copy.deepcopy(self.ci_runs)
+
+    def merge_pull(self, number, head):
+        self.merge_calls.append((number, head))
+        pr = next(pr for pr in self.pulls if pr["number"] == number)
+        if pr["head"]["sha"] != head:
+            raise AssertionError("Merge API was called for an unapproved head")
+        tree = self.git("rev-parse", f"{head}^{{tree}}")
+        base = self.git("ls-remote", "--refs", "origin", "refs/heads/main").split()[0]
+        squash = self.git("commit-tree", tree, "-p", base, "-m", "GitHub squash merge")
+        self.git("push", "origin", f"{squash}:refs/heads/main")
+        pr.update(merged=True, state="closed", merge_commit_sha=squash)
+        if self.lose_merge_reply:
+            self.lose_merge_reply = False
+            raise RuntimeError("Lost merge response")
+        return {"sha": squash, "merged": True}
 
 
 class HookGuardTests(unittest.TestCase):
@@ -1027,7 +1063,73 @@ class LocalLoopTests(unittest.TestCase):
         self.assertEqual(self.hub("deliver-main")["head_sha"], new)
         self.assertEqual(self.git("rev-parse", "main", cwd=remote), new)
 
-    def test_issue_bridge_delivers_a_reviewed_pr_and_observes_manual_merge(self):
+    def test_issue_bridge_auto_merges_only_after_ci_on_the_verified_pr_head(self):
+        remote, github, task, head = self.issue_pr_candidate()
+        self.github_sync(github)
+        pr = github.pulls[0]
+        self.assertFalse(github.merge_calls)
+        self.assertEqual(self.git("rev-parse", "main", cwd=remote), self.base)
+        github.add_ci_run(pr, event="push")
+        github.add_ci_run(pr, head_sha=self.base)
+        github.add_ci_run(pr, pull_requests=[{"number": 99}])
+        github.add_ci_run(pr, conclusion="failure")
+        self.github_sync(github)
+        self.assertFalse(github.merge_calls)
+        self.assertTrue(any("ci_failed" in row["body"] for row in github.comments))
+        github.add_ci_run(pr)
+        latest = github.add_ci_run(pr, status="queued", conclusion=None)
+        self.github_sync(github)
+        self.assertFalse(github.merge_calls)
+        latest.update(status="completed", conclusion="success")
+        pr["draft"] = True
+        self.github_sync(github)
+        pr["draft"] = False
+        pr["mergeable_state"] = "blocked"
+        self.github_sync(github)
+        self.assertFalse(github.merge_calls)
+        pr["mergeable_state"] = "clean"
+
+        github.lose_merge_reply = True
+        self.assertEqual(self.github_sync(github)["status"], "pending")
+        self.assertEqual(github.merge_calls, [(pr["number"], head)])
+        self.assertEqual(github.issue(2)["state"], "open")
+        report = self.github_sync(github)
+        self.assertEqual(report["pull_requests"]["merged"], 1, report)
+        self.assertEqual(github.merge_calls, [(pr["number"], head)])
+        self.assertEqual(github.issue(2)["state"], "closed")
+        self.assertEqual(self.hub("show", "--task", task)["status"], "done")
+        self.assertEqual(self.git("rev-parse", "main", cwd=remote), pr["merge_commit_sha"])
+
+    def test_issue_bridge_completes_successful_auto_merge_in_one_sync(self):
+        remote, github, task, head = self.issue_pr_candidate()
+        self.github_sync(github)
+        pr = github.pulls[0]
+        github.add_ci_run(pr)
+        report = self.github_sync(github)
+        self.assertEqual(report["status"], "synced", report)
+        self.assertEqual(report["pull_requests"]["merged"], 1)
+        self.assertEqual(github.merge_calls, [(pr["number"], head)])
+        self.assertEqual(self.hub("show", "--task", task)["status"], "done")
+        self.assertEqual(self.git("rev-parse", "main", cwd=remote), pr["merge_commit_sha"])
+
+    def test_issue_bridge_refuses_to_merge_a_changed_pr_head(self):
+        _, github, _, head = self.issue_pr_candidate()
+        self.github_sync(github)
+        pr = github.pulls[0]
+        github.add_ci_run(pr)
+        def advance_while_waiting_for_ci(*args):
+            pr["head"]["sha"] = self.base
+            return copy.deepcopy(github.ci_runs)
+
+        with patch.object(github, "pull_ci_runs", side_effect=advance_while_waiting_for_ci):
+            report = self.github_sync(github)
+        self.assertEqual(report["status"], "pending")
+        self.assertIn("verified SHA", report["pull_requests"]["errors"][0]["error"])
+        self.assertTrue(any("pr_head_changed" in row["body"] for row in github.comments))
+        self.assertFalse(github.merge_calls)
+        self.assertNotEqual(pr["head"]["sha"], head)
+
+    def issue_pr_candidate(self):
         remote = self.origin()
         github = GitHubFixture(self.git)
         github.add_issue(2)
@@ -1047,7 +1149,12 @@ class LocalLoopTests(unittest.TestCase):
         self.hub("finish-wave", "--wave", wave)
         self.assertEqual(self.hub("deliver-main")["status"], "up_to_date")
         self.assertEqual(self.git("for-each-ref", "--format=%(refname)", self.INTEGRATION_REF), "")
+        self.assertTrue(worktree.exists())
+        return remote, github, task, head
 
+    def test_issue_bridge_delivers_a_reviewed_pr_and_observes_manual_merge(self):
+        remote, github, task, head = self.issue_pr_candidate()
+        worktree = Path(self.hub("show", "--task", task)["worktree_path"])
         github.lose_pr_reply = True
         self.assertEqual(self.github_sync(github)["status"], "pending")
         self.assertEqual(self.hub("show", "--task", task)["status"], "awaiting_pr")

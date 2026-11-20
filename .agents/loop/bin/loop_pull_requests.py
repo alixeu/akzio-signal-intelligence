@@ -7,7 +7,11 @@ import re
 import subprocess
 
 import issue_hub as hub
-from loop_github import positive_id
+from loop_github import CI_WORKFLOW, positive_id
+
+
+class PullHeadChanged(RuntimeError):
+    pass
 
 
 def _verified_head(db, task):
@@ -50,8 +54,10 @@ def _validate_pull(pull, repo, branch, head, marker, *, number=None):
     if (not isinstance(base_repo, str) or base_repo.lower() != repo.lower()
             or not isinstance(head_repo, str) or head_repo.lower() != repo.lower()
             or base.get("ref") != "main" or source.get("ref") != branch
-            or source.get("sha") != head or not _has_marker(pull.get("body"), marker)):
-        raise RuntimeError(f"PR #{actual_number} does not match its repository, branch, verified SHA, or task marker.")
+            or not _has_marker(pull.get("body"), marker)):
+        raise RuntimeError(f"PR #{actual_number} does not match its repository, branch, or task marker.")
+    if source.get("sha") != head:
+        raise PullHeadChanged(f"PR #{actual_number} no longer matches the verified SHA.")
     return actual_number
 
 
@@ -114,7 +120,7 @@ def _read_pull(github, number, branch, head, marker):
     _validate_pull(pull, github.repo, branch, head, marker, number=number)
     if pull.get("state") == "open" and pull.get("merged") is False:
         if _remote_branch(f"refs/heads/{branch}") != head:
-            raise RuntimeError(f"Open PR #{number} no longer has its verified origin branch.")
+            raise PullHeadChanged(f"Open PR #{number} no longer has its verified SHA on origin.")
     elif pull.get("state") != "closed" or type(pull.get("merged")) is not bool:
         raise RuntimeError(f"PR #{number} has an unexpected state.")
     return pull
@@ -135,6 +141,61 @@ def _ensure_pull(db, github, task, branch, head, marker):
         proposed = github.create_pull(task["title"], body, branch)
     number = _validate_pull(proposed, github.repo, branch, head, marker)
     return _read_pull(github, number, branch, head, marker)
+
+
+def _latest_ci_run(github, number, branch, head):
+    matching = []
+    for run in github.pull_ci_runs(head, branch):
+        repository = (run.get("head_repository") or {}).get("full_name")
+        if (run.get("event") != "pull_request" or run.get("path") != CI_WORKFLOW
+                or run.get("head_branch") != branch or run.get("head_sha") != head
+                or not isinstance(repository, str) or repository.lower() != github.repo.lower()):
+            continue
+        if any(pull.get("number") == number and (pull.get("base") or {}).get("ref") == "main"
+               and (pull.get("head") or {}).get("sha") == head for pull in (run.get("pull_requests") or [])):
+            matching.append(run)
+    return max(matching, key=lambda run: (positive_id(run.get("run_number")), positive_id(run.get("run_attempt"))),
+               default=None)
+
+
+def _record_merge_gate(db, task, number, reason, run):
+    fields = {"repo": task["repo"], "issue": task["issue"], "pr": number, "head_sha": task["verified_head"],
+              "reason": reason, "ci_run": positive_id(run.get("id")) if run else None,
+              "ci_attempt": positive_id(run.get("run_attempt")) if run else None}
+    old = db.execute(
+        "SELECT details FROM events WHERE task_id = ? AND kind = 'task_pr_merge_gate' ORDER BY id DESC LIMIT 1",
+        (task["id"],),
+    ).fetchone()
+    if old is None or json.loads(old["details"]) != fields:
+        with hub.transaction(db):
+            hub.event(db, "task_pr_merge_gate", task["id"], **fields)
+
+
+def _try_auto_merge(db, github, task, pull, branch, head, marker):
+    number = pull["number"]
+    run = _latest_ci_run(github, number, branch, head)
+    if run is None or run.get("status") != "completed":
+        _record_merge_gate(db, task, number, "waiting_for_ci", run)
+        return pull
+    if run.get("conclusion") != "success":
+        _record_merge_gate(db, task, number, "ci_failed", run)
+        return pull
+    # Fetch the PR again after checking CI, then require the same SHA in the merge request itself.
+    pull = _read_pull(github, number, branch, head, marker)
+    if pull["state"] != "open":
+        return pull
+    if pull.get("draft") is not False or pull.get("mergeable") is not True or pull.get("mergeable_state") != "clean":
+        _record_merge_gate(db, task, number, "github_merge_blocked", run)
+        return pull
+    _record_merge_gate(db, task, number, "ci_passed", run)
+    receipt = github.merge_pull(number, head)
+    merge = receipt.get("sha")
+    if receipt.get("merged") is not True or not isinstance(merge, str) or not hub.SHA.fullmatch(merge):
+        raise RuntimeError(f"GitHub did not confirm automatic merge of PR #{number}.")
+    pull = _read_pull(github, number, branch, head, marker)
+    if pull.get("merged") is not True or pull.get("merge_commit_sha") != merge:
+        raise RuntimeError(f"The automatic merge receipt for PR #{number} is not visible yet.")
+    return pull
 
 
 def _confirmed_merge(pull, task):
@@ -225,6 +286,8 @@ def _sync_task(db, github, task, identity, counts, snapshot_matches):
     else:
         number = positive_id(task["pr"])
         pull = _read_pull(github, number, branch, head, marker)
+    if task["status"] != "done" and pull["state"] == "open":
+        pull = _try_auto_merge(db, github, task, pull, branch, head, marker)
     if pull["merged"] is not True:
         if task["status"] == "done":
             raise RuntimeError(f"Previously merged PR #{number} is no longer reported as merged.")
@@ -283,5 +346,7 @@ def sync_pull_requests(db, github, snapshot_matches):
         try:
             _sync_task(db, github, task, identity, counts, snapshot_matches)
         except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired) as exc:
+            if isinstance(exc, PullHeadChanged) and task["pr"] and task["status"] != "done":
+                _record_merge_gate(db, task, task["pr"], "pr_head_changed", None)
             counts["errors"].append({"task": task["id"], "issue": task["issue"], "error": str(exc)})
     return counts

@@ -60,7 +60,7 @@ stateDiagram-v2
     landing --> done: 核对证据并推进集成分支
     reviewed --> awaiting_pr: 保存 PR 交付意图
     awaiting_pr --> awaiting_merge: 创建 PR
-    awaiting_merge --> done: 确认人工合并
+    awaiting_merge --> done: CI 通过并确认远端合并
 ```
 
 - `poll` 输出 `recommended_action`、`target_task` 和 `dirty_main_files`。选择 `design_inbox`、`execute_ready`、`resume_task` 或 `scout_needed`。`show --task N` 查看冻结设计、候选 SHA 和当前验证状态。
@@ -81,7 +81,7 @@ git config --local akzioLoop.auditIssue N
 bash .agents/loop/bin/loop_daemon.sh deliver
 ```
 
-启动器在租约释放后交付本地任务的已验收提交。准备快进时，主工作区须处于干净的 `main`。启动器先把验收链推到 `origin/main`，确认后快进本地 `main`，并登记 `task_published`。没有待恢复任务且集成提交已进入本地和远端 `main` 时，Hub 删除 `loop/nightly`。如果人工合并先推进了远端，可证明属于当前 Loop 的未发布旧集成链会归档，相关任务回到 `inbox`，在新基线重新验收。
+启动器在租约释放后交付本地任务的已验收提交。准备快进时，主工作区须处于干净的 `main`。启动器先把验收链推到 `origin/main`，确认后快进本地 `main`，并登记 `task_published`。没有待恢复任务且集成提交已进入本地和远端 `main` 时，Hub 删除 `loop/nightly`。如果 PR 合并先推进了远端，可证明属于当前 Loop 的未发布旧集成链会归档，相关任务回到 `inbox`，在新基线重新验收。
 
 审计发布器按批次追加待发布事件。推送或评论失败时，`daemon` 在下轮重试，`wave` 和 `deliver` 返回失败状态。只需补发审计时运行 `publish-log`。
 
@@ -91,7 +91,7 @@ bash .agents/loop/bin/loop_daemon.sh publish-log --repo OWNER/REPO --issue N
 
 ## GitHub 任务和人工裁决
 
-配置已存在的审计 Issue，以及允许启动任务和答复裁决的 GitHub 数字用户 ID。同步程序绑定 `origin` 的 fetch 和 push 地址，首次同步开始接收新命令。运行端 `gh` 凭据需要读取仓库、写入 Issue 和 PR 的权限，Git 凭据需要推送 PR 分支。验证真实邮件通知时，优先让发布端用有权限的独立账号，审批人在 GitHub 启用参与讨论的邮件通知。发布者和审批人是同一个账号时，按 GitHub 的通知设置确认能否收到自己的更新。
+配置已存在的审计 Issue，以及允许启动任务和答复裁决的 GitHub 数字用户 ID。同步程序绑定 `origin` 的 fetch 和 push 地址，首次同步开始接收新命令。运行端 `gh` 凭据需要读取 Actions、写入 Issue 和 PR、合并 PR 的权限，Git 凭据需要推送 PR 分支。验证真实邮件通知时，优先让发布端用有权限的独立账号，审批人在 GitHub 启用参与讨论的邮件通知。发布者和审批人是同一个账号时，按 GitHub 的通知设置确认能否收到自己的更新。
 
 ```bash
 git config --local akzioLoop.operatorId GITHUB_USER_ID
@@ -110,7 +110,8 @@ bash .agents/loop/bin/loop_daemon.sh sync-issues
    ```
 
 3. 同步程序核对账号、评论及 Issue 快照摘要，每个 Issue 只登记一次。正文变动时重新生成授权命令。Leader 按现有规则规划，Worker 在隔离 worktree 实现，Verifier 审查机械检查通过的同一个提交。
-4. 通过后由启动器推送专用分支并创建 PR。收到人工合并的回执，并确认合并提交已在 `origin/main` 后，回写原 Issue。原 Issue 内容仍与已批准快照一致时才关闭它。手动关闭未合并的 PR 会暂停该任务，重新打开经过验收的 PR 后可以继续等待合并。专用分支确认未被修改后自动清理。
+4. 通过后由启动器推送专用分支并创建 PR。`sync-issues` 等同一个 PR 和验收 SHA 对应的最新 `ci` 工作流全部成功。CI 失败、PR 提交变更、草稿或 GitHub 合并规则阻塞时，PR 保持开放，自动合并检查结果写回 Issue。通过后，启动器带经过验收的 SHA 调用 GitHub squash merge 接口。 [Actions 工作流记录](https://docs.github.com/en/rest/actions/workflow-runs#list-workflow-runs-for-a-workflow) · [GitHub 合并接口](https://docs.github.com/en/rest/pulls/pulls#merge-a-pull-request)
+5. 确认合并提交已在 `origin/main` 后，回写原 Issue。原 Issue 内容仍与已批准快照一致时才关闭它。手动关闭未合并的 PR 会暂停该任务，重新打开经过验收的 PR 后可继续。专用分支确认未被修改后自动清理。
 
 ### 从裁决到恢复
 

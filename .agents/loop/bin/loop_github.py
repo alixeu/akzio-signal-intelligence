@@ -9,6 +9,8 @@ from urllib.parse import urlencode
 
 REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*/[A-Za-z0-9_.-]+")
 ISSUE_URL = re.compile(r"https://api\.github\.com/repos/([^/]+/[^/]+)/issues/([1-9][0-9]*)")
+CI_WORKFLOW = ".github/workflows/ci.yml"
+COMMIT = re.compile(r"[0-9a-f]{40}")
 
 
 def normalize_repo(repo: str) -> str:
@@ -63,10 +65,14 @@ class GitHub:
             raise RuntimeError("GitHub returned a response other than a JSON object.")
         return value
 
-    def _pages(self, endpoint, **query) -> list[dict]:
+    def _pages(self, endpoint, *, collection=None, **query) -> list[dict]:
         endpoint = f"{endpoint}?{urlencode(dict(query, per_page=100))}"
         pages = self._request("--paginate", "--slurp", endpoint, timeout=30)
-        if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+        if not isinstance(pages, list):
+            raise RuntimeError("GitHub returned malformed JSON pages.")
+        if collection:
+            pages = [page.get(collection) if isinstance(page, dict) else None for page in pages]
+        if any(not isinstance(page, list) for page in pages):
             raise RuntimeError("GitHub returned malformed JSON pages.")
         rows = [row for page in pages for row in page]
         if any(not isinstance(row, dict) for row in rows):
@@ -118,6 +124,23 @@ class GitHub:
 
     def pull(self, number: int) -> dict:
         return self._object(f"{self.endpoint}/pulls/{positive_id(number)}")
+
+    def pull_ci_runs(self, head: str, branch: str) -> list[dict]:
+        if not isinstance(head, str) or not COMMIT.fullmatch(head):
+            raise ValueError("GitHub CI requires a full commit SHA.")
+        workflow = CI_WORKFLOW.split("/")[-1]
+        return self._pages(
+            f"{self.endpoint}/actions/workflows/{workflow}/runs", collection="workflow_runs",
+            event="pull_request", head_sha=head, branch=_local_branch(branch),
+        )
+
+    def merge_pull(self, number: int, head: str) -> dict:
+        if not isinstance(head, str) or not COMMIT.fullmatch(head):
+            raise ValueError("GitHub merge requires the full verified commit SHA.")
+        return self._object(
+            f"{self.endpoint}/pulls/{positive_id(number)}/merge", method="PUT",
+            payload={"merge_method": "squash", "sha": head},
+        )
 
     def close_issue(self, number: int, *, completed: bool = True) -> dict:
         return self._object(

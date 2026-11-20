@@ -1260,7 +1260,7 @@ def audit_marker(identity, event_id):
 def audit_line(row):
     data = json.loads(row["details"])
     fields = ("priority", "attempt", "base_sha", "head_sha", "reason", "landed", "blocked",
-              "decision_id", "choice", "next_stage", "issue", "pr", "merge_sha")
+              "decision_id", "choice", "next_stage", "issue", "pr", "merge_sha", "ci_run", "ci_attempt")
     details = " · ".join(f"{key}=`{data[key]}`" for key in fields if key in data)
     task = f" · Task #{row['task_id']}" if row["task_id"] else ""
     return f"- `{iso_time(row['created_at'])}` · `{row['kind']}`{task}" + (f" · {details}" if details else "")

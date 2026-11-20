@@ -31,8 +31,9 @@ ISSUE_EVENTS = {
     "gate_passed": "机械门禁通过",
     "review_passed": "独立审查通过",
     "task_blocked": "任务已阻塞",
-    "task_pr_created": "已创建 PR，等待人工合并",
-    "task_pr_reopened": "已重新打开经验证的 PR，等待人工合并",
+    "task_pr_created": "已创建 PR，通过 CI 和 GitHub 合并门禁后自动合并",
+    "task_pr_reopened": "已重新打开经验证的 PR，通过门禁后自动合并",
+    "task_pr_merge_gate": "自动合并检查",
 }
 
 
@@ -295,8 +296,11 @@ def publish_issue_updates(db, github, actor):
         message = ISSUE_EVENTS[row["kind"]]
         if row["kind"] in ("task_pr_created", "task_pr_reopened"):
             message += f" [PR #{int(details['pr'])}](https://github.com/{github.repo}/pull/{int(details['pr'])})"
-        elif row["kind"] == "task_blocked":
+        elif row["kind"] in ("task_blocked", "task_pr_merge_gate"):
             message += f"（`{details['reason']}`）"
+            if details.get("ci_run"):
+                run = int(details["ci_run"])
+                message += f" [CI #{run}](https://github.com/{github.repo}/actions/runs/{run})"
         number = row["issue"]
         marker = hub.audit_marker(identity, row["id"])
         cid = post_once(github, number, actor, marker, f"Akzio Loop 任务 {row['task_id']} · {message}。")
