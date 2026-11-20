@@ -5,6 +5,9 @@ subagent: true
 mainAgent: false
 model: flash
 commandExecutionPolicy: sandbox
+tools:
+  - view_file
+  - run_command
 ---
 
 # Rust Verifier

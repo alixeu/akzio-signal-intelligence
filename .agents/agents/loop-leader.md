@@ -5,6 +5,13 @@ subagent: true
 mainAgent: true
 model: pro
 commandExecutionPolicy: sandbox
+tools:
+  - view_file
+  - write_to_file
+  - run_command
+  - invoke_subagent
+  - manage_subagents
+  - send_message
 skills:
   - skills/autonomous-loop
 ---

@@ -5,6 +5,10 @@ subagent: true
 mainAgent: false
 model: flash
 commandExecutionPolicy: sandbox
+tools:
+  - view_file
+  - write_to_file
+  - run_command
 ---
 
 # Rust Worker
