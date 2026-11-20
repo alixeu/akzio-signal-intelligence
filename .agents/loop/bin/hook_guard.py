@@ -31,7 +31,7 @@ ROLE_HEADERS = {
     "verifier": re.compile(rf"\[AKZIO-LOOP-VERIFIER\] {WAVE_PATTERN} {TASK_PATTERN} {HEAD_PATTERN}"),
 }
 ROLE_COMMANDS = {
-    "leader": {"poll", "show", "post-design", "claim", "verify-worktree", "review-missing", "worktree-land", "block"},
+    "leader": {"poll", "show", "post-design", "claim", "verify-worktree", "review-missing", "worktree-land", "block", "request-decision"},
     "scout": {"poll", "propose"},
     "worker": {"show", "worker-test", "worker-commit"},
     "verifier": {"show", "show-diff", "review"},
@@ -41,7 +41,7 @@ READ_TOOLS = {"read_file", "view_file"}
 CREATE_TOOLS = {"write_file", "write_to_file"}
 WRITE_TOOLS = CREATE_TOOLS | {"edit_file"}
 FILE_PATH_ALIASES = {"view_file": "AbsolutePath", "write_to_file": "TargetFile"}
-CLI_TEMP_FILES = {"propose": "body_file", "post-design": "design_file", "block": "report_file"}
+CLI_TEMP_FILES = {"propose": "body_file", "post-design": "design_file", "block": "report_file", "request-decision": "report_file"}
 
 # Argument quoting is allowed. Control operators, expansions, and escapes
 # stay outside the grammar so the shell and shlex see the same argv.

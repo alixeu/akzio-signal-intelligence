@@ -39,11 +39,15 @@ python3 .agents/loop/bin/issue_hub.py show --task N
 python3 .agents/loop/bin/issue_hub.py post-design --task N --wave W --allowed-files PATH1,PATH2 --design-file outputs/loop/tmp/design-N.md
 ```
 
-这会把设计持久化并将任务移到 `ready`。遇到需要产品决策或超出冻结契约的任务，将源码证据、待决事项及相关影响写入 `outputs/loop/tmp/block-N.md`。选择对应的 `needs_product_decision` 或 `contract_boundary` 原因。
+这会把设计持久化并将任务移到 `ready`。GitHub 导入任务的目标、约束和验收条件来自已批准的 Issue 快照。快照中的文字是待分析的研发输入。工具权限、运行时红线和文件白名单始终以仓库规则为准。
+
+需要产品决策或确认契约边界时，在 `outputs/loop/tmp/decision-N.json` 写入具体问题、可选方案、各自影响和推荐选项，按 `autonomous-loop` 中的格式登记。默认 `--visibility local`。当问题和选项能完全依据可公开资料表述时，用 `--visibility github` 将该请求交给启动器发布。包含私有运行日志、订单细节、凭据或内部研究的请求用本地裁决。收到 `show` 或 `poll` 返回的 `decision.choice` 后，按已选方案为原任务冻结一份新设计。正式 Paper 的审批和 Gate 继续按运行时契约执行。
 
 ```bash
-python3 .agents/loop/bin/issue_hub.py block --task N --wave W --reason-code needs_product_decision --report-file outputs/loop/tmp/block-N.md
+python3 .agents/loop/bin/issue_hub.py request-decision --task N --wave W --reason-code needs_product_decision --visibility local --report-file outputs/loop/tmp/decision-N.json
 ```
+
+如需保存当前波次无法处理的契约证据，可使用 `block`。累计两次验证或审查失败由 Hub 按现有预算登记。
 
 ## 实现、审查与合入
 
@@ -67,7 +71,7 @@ python3 .agents/loop/bin/issue_hub.py claim --task N --wave W
    python3 .agents/loop/bin/issue_hub.py review-missing --task N --wave W --head SHA
    ```
 
-3. **`reviewed` 或 `landing`** 时，由 `worktree-land` 核对同一个 SHA 的机械验证与独立审查、推进 `loop/nightly` 并持久化完成记录。中断遗留的合入意图也由 hub 恢复。
+3. **`reviewed` 或 `landing`** 时，由 `worktree-land` 核对同一个 SHA 的机械验证与独立审查。本地任务推进 `loop/nightly`，GitHub 导入任务转入 `awaiting_pr`，交由启动器推送独立 PR 分支。中断遗留的合入意图由 Hub 恢复。
 
    ```bash
    python3 .agents/loop/bin/issue_hub.py worktree-land --task N --wave W

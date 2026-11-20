@@ -33,6 +33,10 @@ WAVE_SECONDS = 2 * 60 * 60
 MAX_ATTEMPTS = 2
 RESUMABLE = ("landing", "reviewed", "verified", "in_progress")
 PRIORITIES = ("P1", "P2", "P3")
+WAITING = ("awaiting_input", "awaiting_pr", "awaiting_merge")
+VISIBLE_STATUS = "CASE WHEN status = 'blocked' AND blocked_reason IN ('awaiting_input', 'awaiting_pr', 'awaiting_merge') THEN blocked_reason ELSE status END"
+DECISION_TTL = 7 * 24 * 3600
+DECISION_REASONS = ("needs_product_decision", "contract_boundary")
 SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 BANNED_ATTRIBUTES = re.compile(r"#\s*!?\s*\[\s*(?:allow\s*\(|ignore\b)")
 TEST_ATTRIBUTE = re.compile(r"#\s*\[\s*(?:tokio::)?test\b")
@@ -85,6 +89,48 @@ CREATE TABLE IF NOT EXISTS deliveries (
     event_id INTEGER NOT NULL REFERENCES events(id),
     comment_id INTEGER NOT NULL,
     PRIMARY KEY (destination, event_id)
+);
+CREATE TABLE IF NOT EXISTS github_tasks (
+    task_id INTEGER PRIMARY KEY REFERENCES tasks(id),
+    repo TEXT NOT NULL,
+    issue INTEGER NOT NULL,
+    start_comment INTEGER NOT NULL,
+    snapshot_sha TEXT NOT NULL,
+    base_sha TEXT NOT NULL,
+    pr INTEGER,
+    merge_sha TEXT,
+    acknowledged INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(repo, issue)
+);
+CREATE TABLE IF NOT EXISTS decision_requests (
+    id TEXT PRIMARY KEY,
+    task_id INTEGER NOT NULL REFERENCES tasks(id),
+    version INTEGER NOT NULL,
+    requested_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    visibility TEXT NOT NULL CHECK (visibility IN ('local', 'github')),
+    request TEXT NOT NULL,
+    repo TEXT,
+    issue INTEGER,
+    opened_at INTEGER,
+    public_body_sha TEXT,
+    approver INTEGER,
+    invalidated INTEGER NOT NULL DEFAULT 0,
+    notified INTEGER NOT NULL DEFAULT 0,
+    closed INTEGER NOT NULL DEFAULT 0,
+    choice TEXT,
+    decided_at INTEGER,
+    actor INTEGER,
+    comment INTEGER,
+    UNIQUE(task_id, version),
+    UNIQUE(repo, issue),
+    UNIQUE(repo, comment)
+);
+CREATE TABLE IF NOT EXISTS github_sync (
+    repo TEXT PRIMARY KEY,
+    enabled_at INTEGER NOT NULL,
+    synced_at INTEGER NOT NULL
 );
 """
 
@@ -198,7 +244,7 @@ def worktree_path(task) -> Path:
     return path
 
 
-def task_view(row):
+def task_view(db, row):
     result = dict(row)
     del result["wave"]
     result.pop("checkout", None)
@@ -207,6 +253,22 @@ def task_view(row):
             result[field] = json.loads(result[field])
     if row["base_sha"]:
         result["worktree_path"] = str(worktree_path(row))
+    if row["status"] == "blocked" and row["blocked_reason"] in WAITING:
+        result["status"] = row["blocked_reason"]
+    # Read-only status must also work before the first writable upgrade of an old queue.
+    tables = {item[0] for item in db.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('github_tasks', 'decision_requests')"
+    )}
+    if "github_tasks" in tables:
+        origin = db.execute("SELECT * FROM github_tasks WHERE task_id = ?", (row["id"],)).fetchone()
+        if origin:
+            result["github"] = dict(origin)
+    if "decision_requests" in tables:
+        decision = db.execute(
+            "SELECT * FROM decision_requests WHERE task_id = ? ORDER BY version DESC LIMIT 1", (row["id"],),
+        ).fetchone()
+        if decision:
+            result["decision"] = {**dict(decision), "request": json.loads(decision["request"])}
     return result
 
 
@@ -282,9 +344,10 @@ def get_dirty_main_files():
 def cmd_poll(_args):
     counts = {}
     target = None
+    target_view = None
     if DB_PATH.exists():
         with open_db(readonly=True) as db:
-            counts = dict(db.execute("SELECT status, count(*) FROM tasks GROUP BY status").fetchall())
+            counts = dict(db.execute(f"SELECT {VISIBLE_STATUS} AS stage, count(*) FROM tasks GROUP BY stage"))
             target = db.execute(
                 """SELECT * FROM tasks
                    WHERE status IN ('landing', 'reviewed', 'verified', 'in_progress', 'ready', 'inbox')
@@ -292,12 +355,13 @@ def cmd_poll(_args):
                        WHEN 'verified' THEN 2 WHEN 'in_progress' THEN 3 WHEN 'ready' THEN 4 ELSE 5 END,
                        priority, id LIMIT 1"""
             ).fetchone()
+            target_view = task_view(db, target) if target else None
     action = "scout_needed"
     if target:
         action = {"ready": "execute_ready", "inbox": "design_inbox"}.get(target["status"], "resume_task")
     return emit({
         "recommended_action": action,
-        "target_task": task_view(target) if target else None,
+        "target_task": target_view,
         "counts": counts,
         "dirty_main_files": get_dirty_main_files(),
     })
@@ -305,7 +369,7 @@ def cmd_poll(_args):
 
 def cmd_show(args):
     with open_db(readonly=True) as db:
-        return emit(task_view(task_row(db, args.task)))
+        return emit(task_view(db, task_row(db, args.task)))
 
 
 def cmd_list(args):
@@ -313,8 +377,8 @@ def cmd_list(args):
         return emit({"tasks": []})
     with open_db(readonly=True) as db:
         rows = db.execute(
-            """SELECT id, title, priority, status, attempt, verified_head, blocked_reason
-               FROM tasks WHERE (? IS NULL OR status = ?) ORDER BY id""",
+            f"""SELECT id, title, priority, {VISIBLE_STATUS} AS status, attempt, verified_head, blocked_reason
+                FROM tasks WHERE (? IS NULL OR {VISIBLE_STATUS} = ?) ORDER BY id""",
             (args.status, args.status),
         ).fetchall()
     return emit({"tasks": [dict(row) for row in rows]})
@@ -388,6 +452,9 @@ def cmd_post_design(args):
         task = task_row(db, args.task)
         if task["status"] != "inbox":
             raise RuntimeError("Only an inbox task can receive a design.")
+        if db.execute("SELECT 1 FROM github_tasks WHERE task_id = ?", (args.task,)).fetchone():
+            if any(PurePosixPath(name).parts[0] == ".github" for name in allowed):
+                raise ValueError("GitHub tasks cannot change repository workflow or collaboration configuration.")
         db.execute(
             "UPDATE tasks SET status = 'ready', design_body = ?, allowed_files = ? WHERE id = ?",
             (design, json.dumps(allowed), args.task),
@@ -459,9 +526,13 @@ def cmd_claim(args):
                 ).fetchone()
                 if active:
                     raise RuntimeError(f"Resume task #{active['id']} before claiming a new task.")
-                base = integration_base()
+                github_task = db.execute("SELECT base_sha FROM github_tasks WHERE task_id = ?", (args.task,)).fetchone()
+                base = github_task["base_sha"] if github_task else integration_base()
+                if github_task and ref_commit(base) != base:
+                    raise RuntimeError("The frozen base of this GitHub task is unavailable.")
                 identity = db.execute("SELECT identity FROM loop_info").fetchone()[0]
-                checkout = f"task-{args.task}-{identity}"
+                suffix = uuid.uuid4().hex if task["checkout"] else identity
+                checkout = f"task-{args.task}-{suffix}"
                 db.execute(
                     """UPDATE tasks SET status = 'in_progress', wave = ?, base_sha = ?,
                        attempt = 1, attempt_base = ?, checkout = ? WHERE id = ?""",
@@ -479,7 +550,7 @@ def cmd_claim(args):
             path = create_or_resume_worktree(task)
             if task["candidate_head"] is None:
                 task = recover_candidate(db, task, path)
-        return emit(task_view(task))
+        return emit(task_view(db, task))
 
 
 def cmd_block(args):
@@ -494,6 +565,119 @@ def cmd_block(args):
         db.execute("UPDATE tasks SET status = 'blocked', blocked_reason = ? WHERE id = ?", (args.reason_code, args.task))
         event(db, "task_blocked", args.task, reason=args.reason_code, note=note)
     return emit({"status": "blocked", "task": args.task, "reason": args.reason_code})
+
+
+def decision_request(raw):
+    def field(value, limit):
+        if not isinstance(value, str) or not value.strip() or len(value) > limit:
+            raise ValueError("Decision text is missing or exceeds its length limit.")
+        return value.replace("\r\n", "\n").strip()
+
+    request = json.loads(raw)
+    if not isinstance(request, dict) or set(request) != {"question", "options", "recommendation"}:
+        raise ValueError("A decision needs question, options and recommendation fields.")
+    choices = request["options"]
+    if not isinstance(choices, dict) or not 2 <= len(choices) <= 5 or not set(choices) <= set("ABCDE"):
+        raise ValueError("Use two to five decision options labelled A through E.")
+    options = {}
+    for key, option in sorted(choices.items()):
+        if not isinstance(option, dict) or set(option) != {"label", "impact", "resume"} or type(option["resume"]) is not bool:
+            raise ValueError("Each decision option needs label, impact and a boolean resume field.")
+        options[key] = {"label": field(option["label"], 160), "impact": field(option["impact"], 800),
+                        "resume": option["resume"]}
+    recommendation = request["recommendation"]
+    if not isinstance(recommendation, str) or recommendation not in options:
+        raise ValueError("The recommendation must be one of the declared options.")
+    return {"question": field(request["question"], 2000), "options": options, "recommendation": recommendation}
+
+
+def cmd_request_decision(args):
+    request = decision_request(read_note(args.report_file))
+    with process_lock("control"), open_db() as db, transaction(db):
+        require_wave(db, args.wave, renew=True)
+        task = task_row(db, args.task)
+        now = utc_timestamp()
+        if task["status"] == "blocked" and task["blocked_reason"] == "awaiting_input":
+            prior = db.execute(
+                "SELECT id, visibility, reason, request, expires_at FROM decision_requests WHERE task_id = ? ORDER BY version DESC LIMIT 1",
+                (args.task,),
+            ).fetchone()
+            if prior and prior["expires_at"] > now:
+                matching = (prior["visibility"], prior["reason"], json.loads(prior["request"]))
+                if matching == (args.visibility, args.reason_code, request):
+                    return emit({"status": "awaiting_input", "task": args.task, "decision_id": prior["id"]})
+                raise RuntimeError("Resolve the pending decision before opening another one.")
+        elif task["status"] in ("in_progress", "verified"):
+            owned_task(db, args.task, args.wave, ("in_progress", "verified"))
+        elif not (task["status"] in ("inbox", "ready") or
+                  (task["status"] == "blocked" and task["blocked_reason"] in (*DECISION_REASONS, "decision_expired", "decision_changed"))):
+            raise RuntimeError(f"Cannot request input in stage {task['status']}.")
+        version = db.execute(
+            "SELECT coalesce(max(version), 0) + 1 FROM decision_requests WHERE task_id = ?", (args.task,),
+        ).fetchone()[0]
+        decision_id = f"AZ-{args.task}-R{version}-{uuid.uuid4().hex[:12]}"
+        db.execute(
+            """INSERT INTO decision_requests
+               (id, task_id, version, requested_at, expires_at, reason, visibility, request)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (decision_id, args.task, version, now, now + DECISION_TTL, args.reason_code, args.visibility,
+             json.dumps(request, ensure_ascii=False)),
+        )
+        db.execute("UPDATE tasks SET status = 'blocked', blocked_reason = 'awaiting_input', wave = NULL WHERE id = ?", (args.task,))
+        event(db, "decision_requested", args.task, decision_id=decision_id, reason=args.reason_code,
+              previous_stage=task["status"], candidate_head=task["candidate_head"], checkout=task["checkout"],
+              visibility=args.visibility)
+    return emit({"status": "awaiting_input", "task": args.task, "decision_id": decision_id})
+
+
+def reset_for_design(db, task_id):
+    db.execute(
+        """UPDATE tasks SET status = 'inbox', blocked_reason = NULL, wave = NULL, design_body = NULL,
+           allowed_files = NULL, base_sha = NULL, attempt = 0, attempt_base = NULL,
+           candidate_head = NULL, verified_head = NULL, checks = NULL, review_summary = NULL,
+           last_failure = NULL WHERE id = ?""", (task_id,),
+    )
+
+
+def apply_decision(db, decision_id, choice, *, actor=None, comment=None, received_at=None):
+    decision = db.execute("SELECT * FROM decision_requests WHERE id = ?", (decision_id,)).fetchone()
+    if not decision:
+        raise ValueError("Unknown decision request.")
+    if db.execute("SELECT 1 FROM decision_requests WHERE task_id = ? AND version > ?",
+                  (decision["task_id"], decision["version"])).fetchone():
+        raise ValueError("This decision request has been superseded.")
+    if decision["invalidated"]:
+        raise ValueError("This decision request is no longer valid. Request a new version.")
+    if decision["choice"] is not None:
+        if decision["choice"] == choice and (decision["actor"], decision["comment"]) == (actor, comment):
+            return "already_resolved"
+        raise ValueError("This decision has already been recorded.")
+    now = utc_timestamp()
+    decided_at = now if received_at is None else received_at
+    if not decision["requested_at"] <= decided_at <= now or decided_at >= decision["expires_at"]:
+        raise ValueError("This decision was submitted outside the request's validity period.")
+    options = json.loads(decision["request"])["options"]
+    if choice not in options:
+        raise ValueError("The selected option is not in the request.")
+    task = task_row(db, decision["task_id"])
+    if (task["status"], task["blocked_reason"]) != ("blocked", "awaiting_input"):
+        raise ValueError("The original task is no longer awaiting this decision.")
+    db.execute("UPDATE decision_requests SET choice = ?, decided_at = ?, actor = ?, comment = ? WHERE id = ?",
+               (choice, decided_at, actor, comment, decision_id))
+    stage = "inbox" if options[choice]["resume"] else "blocked"
+    if stage == "inbox":
+        reset_for_design(db, task["id"])
+    else:
+        db.execute("UPDATE tasks SET blocked_reason = 'decision_declined' WHERE id = ?", (task["id"],))
+    event(db, "decision_recorded", task["id"], decision_id=decision_id, choice=choice, next_stage=stage,
+          actor=actor, comment=comment, visibility=decision["visibility"])
+    return stage
+
+
+def cmd_resolve_decision(args):
+    with process_lock("control"), open_db() as db, transaction(db):
+        stage = apply_decision(db, args.id, args.choice)
+    return emit({"status": stage, "decision_id": args.id})
 
 
 def nul_files(output):
@@ -838,13 +1022,21 @@ def cmd_land(args):
         with transaction(db):
             require_wave(db, args.wave, renew=True)
             task = task_row(db, args.task)
-            if task["status"] == "done":
-                return emit(task_view(task))
+            if task["status"] == "done" or (task["status"] == "blocked" and task["blocked_reason"] in ("awaiting_pr", "awaiting_merge")):
+                return emit(task_view(db, task))
             owned_task(db, args.task, args.wave, ("reviewed", "landing"))
             head = task["verified_head"]
             base = task["base_sha"]
             if not head or not task["review_summary"] or not task["checks"]:
                 raise RuntimeError("Landing requires both gate and review evidence for the candidate.")
+            if db.execute("SELECT 1 FROM github_tasks WHERE task_id = ?", (args.task,)).fetchone():
+                if task["status"] != "reviewed" or task["candidate_head"] != head or not is_ancestor(base, head):
+                    raise RuntimeError("A GitHub task needs the reviewed candidate based on its frozen origin/main.")
+                if any(code != 0 for name, code in json.loads(task["checks"]).items() if name != "changed_files"):
+                    raise RuntimeError("A GitHub task must pass its recorded offline gates.")
+                db.execute("UPDATE tasks SET status = 'blocked', blocked_reason = 'awaiting_pr', wave = NULL WHERE id = ?", (args.task,))
+                event(db, "task_pr_queued", args.task, base_sha=base, head_sha=head)
+                return emit(task_view(db, task_row(db, args.task)))
             if task["status"] == "reviewed":
                 db.execute("UPDATE tasks SET status = 'landing' WHERE id = ?", (args.task,))
                 event(db, "landing_intent", args.task, base_sha=base, head_sha=head)
@@ -868,7 +1060,7 @@ def cmd_land(args):
                 event(db, "task_blocked", args.task, reason="integration_advanced", base_sha=base, head_sha=head)
         if landed:
             cleanup_task_checkout(task)
-        return emit(task_view(task_row(db, args.task)))
+        return emit(task_view(db, task_row(db, args.task)))
 
 
 def cleanup_task_checkout(task):
@@ -898,18 +1090,60 @@ def fetch_remote_main():
     return git("rev-parse", "--verify", REMOTE_MAIN_REF).stdout.strip()
 
 
+def pending_main_tasks(db):
+    return db.execute(
+        """SELECT t.* FROM tasks t JOIN events e ON e.task_id = t.id AND e.kind = 'task_landed'
+           AND json_extract(e.details, '$.head_sha') = t.verified_head
+           WHERE t.status = 'done' AND NOT EXISTS (SELECT 1 FROM github_tasks g WHERE g.task_id = t.id)
+           AND NOT EXISTS (SELECT 1 FROM events p WHERE p.task_id = t.id AND p.kind = 'task_published'
+                           AND json_extract(p.details, '$.head_sha') = t.verified_head)
+           ORDER BY e.id"""
+    ).fetchall()
+
+
+def requeue_stale_main(db, remote):
+    """Preserve and reschedule an unpublished integration chain after remote main advances."""
+    integration = ref_commit(INTEGRATION_REF)
+    main = ref_commit(MAIN_REF)
+    if (not integration or not main or not is_ancestor(main, remote)
+            or is_ancestor(integration, remote) or is_ancestor(remote, integration)
+            or branch_checked_out(INTEGRATION_REF)):
+        return 0
+    if db.execute("SELECT 1 FROM tasks WHERE status IN ('in_progress', 'verified', 'reviewed', 'landing')").fetchone():
+        return 0
+    if db.execute(
+        "SELECT 1 FROM events WHERE kind = 'direct_batch_superseded' AND json_extract(details, '$.head_sha') = ?",
+        (integration,),
+    ).fetchone():
+        git("update-ref", "-d", INTEGRATION_REF, integration)
+        return 0
+    stale = [task for task in pending_main_tasks(db) if not is_ancestor(task["verified_head"], remote)]
+    tip = git("merge-base", integration, remote).stdout.strip()
+    for task in stale:
+        if task["base_sha"] != tip or not is_ancestor(tip, task["verified_head"]):
+            return 0
+        tip = task["verified_head"]
+    if not stale or tip != integration:
+        return 0
+    identity = db.execute("SELECT identity FROM loop_info").fetchone()[0]
+    archive = f"refs/archive/akzio-loop/superseded/{identity}/{integration}"
+    git("update-ref", archive, integration)
+    with transaction(db):
+        for task in stale:
+            reset_for_design(db, task["id"])
+            event(db, "task_requeued_after_main_advanced", task["id"], head_sha=task["verified_head"], base_sha=remote)
+        event(db, "direct_batch_superseded", head_sha=integration, base_sha=remote)
+    git("update-ref", "-d", INTEGRATION_REF, integration)
+    return len(stale)
+
+
 def cmd_deliver_main(_args):
     if not DB_PATH.exists():
         return emit({"status": "up_to_date"})
     with process_lock("control"), open_db() as db:
         if db.execute("SELECT 1 FROM wave WHERE expires_at > ?", (utc_timestamp(),)).fetchone():
             return emit({"status": "busy"})
-        pending = db.execute(
-            """SELECT t.* FROM tasks t JOIN events e ON e.task_id = t.id AND e.kind = 'task_landed'
-               WHERE t.status = 'done' AND NOT EXISTS (
-                   SELECT 1 FROM events p WHERE p.task_id = t.id AND p.kind = 'task_published'
-               ) ORDER BY e.id""",
-        ).fetchall()
+        pending = pending_main_tasks(db)
         integration = ref_commit(INTEGRATION_REF)
         if not pending and not integration:
             return emit({"status": "up_to_date"})
@@ -927,19 +1161,22 @@ def cmd_deliver_main(_args):
 
         if pending:
             head = pending[-1]["verified_head"]
-            if not is_ancestor(head, main):
+            needs_merge = not is_ancestor(head, main)
+            if needs_merge:
                 if not is_ancestor(main, head):
                     raise RuntimeError("Local main diverged from the approved Loop commits.")
                 checkout = git("symbolic-ref", "--quiet", "HEAD", check=False).stdout.strip()
                 if checkout != MAIN_REF or git("status", "--porcelain=v1", "--untracked-files=all").stdout:
                     raise RuntimeError("Delivery requires main checked out in a clean primary worktree.")
+            if target != remote:
+                # Git rejects a concurrent origin update before it can strand the primary checkout.
+                git("push", "--no-follow-tags", "--recurse-submodules=no", "origin", f"{target}:{MAIN_REF}")
+                remote = fetch_remote_main()
+            if needs_merge:
+                if not is_ancestor(head, remote):
+                    raise RuntimeError("Origin did not retain the approved commit.")
                 git("merge", "--ff-only", "--no-autostash", "--no-overwrite-ignore", head)
                 main = git("rev-parse", "--verify", MAIN_REF).stdout.strip()
-            if target != remote:
-                if not is_ancestor(target, main):
-                    raise RuntimeError("Local main changed before the approved commit could be pushed.")
-                git("push", "--no-follow-tags", "origin", f"{target}:{MAIN_REF}")
-                remote = fetch_remote_main()
             for task in pending:
                 head = task["verified_head"]
                 if not is_ancestor(head, main) or not is_ancestor(head, remote):
@@ -998,7 +1235,8 @@ def audit_marker(identity, event_id):
 
 def audit_line(row):
     data = json.loads(row["details"])
-    fields = ("priority", "attempt", "base_sha", "head_sha", "reason", "landed", "blocked")
+    fields = ("priority", "attempt", "base_sha", "head_sha", "reason", "landed", "blocked",
+              "decision_id", "choice", "next_stage", "issue", "pr", "merge_sha")
     details = " · ".join(f"{key}=`{data[key]}`" for key in fields if key in data)
     task = f" · Task #{row['task_id']}" if row["task_id"] else ""
     return f"- `{iso_time(row['created_at'])}` · `{row['kind']}`{task}" + (f" · {details}" if details else "")
@@ -1012,7 +1250,8 @@ def cmd_publish_log(args):
     with process_lock("publish"), open_db() as db:
         identity = db.execute("SELECT identity FROM loop_info").fetchone()[0]
         rows = db.execute(
-            """SELECT e.* FROM events e WHERE NOT EXISTS (
+            """SELECT e.* FROM events e
+            WHERE coalesce(json_extract(e.details, '$.visibility'), 'github') <> 'local' AND NOT EXISTS (
                 SELECT 1 FROM deliveries d WHERE d.destination = ? AND d.event_id = e.id
             ) ORDER BY e.id""", (destination,),
         ).fetchall()
@@ -1078,7 +1317,7 @@ def build_parser():
     command("finish-wave", cmd_finish_wave, wave=True)
     command("poll", cmd_poll)
     command("show", cmd_show, task=True)
-    command("list", cmd_list).add_argument("--status", choices=("inbox", "ready", *RESUMABLE, "done", "blocked"))
+    command("list", cmd_list).add_argument("--status", choices=("inbox", "ready", *RESUMABLE, *WAITING, "done", "blocked"))
     propose = command("propose", cmd_propose)
     for option in ("title", "area", "fingerprint", "candidate-files", "body-file"):
         propose.add_argument(f"--{option}", required=True)
@@ -1105,8 +1344,15 @@ def build_parser():
     command("worktree-land", cmd_land, task=True, wave=True)
     command("deliver-main", cmd_deliver_main)
     block = command("block", cmd_block, task=True, wave=True)
-    block.add_argument("--reason-code", choices=("needs_product_decision", "contract_boundary"), required=True)
+    block.add_argument("--reason-code", choices=DECISION_REASONS, required=True)
     block.add_argument("--report-file", required=True)
+    decision = command("request-decision", cmd_request_decision, task=True, wave=True)
+    decision.add_argument("--reason-code", choices=DECISION_REASONS, required=True)
+    decision.add_argument("--visibility", choices=("local", "github"), default="local")
+    decision.add_argument("--report-file", required=True)
+    resolve = command("resolve-decision", cmd_resolve_decision)
+    resolve.add_argument("--id", required=True)
+    resolve.add_argument("--choice", choices=tuple("ABCDE"), required=True)
     command("daily-report", cmd_daily_report).add_argument("--if-due", action="store_true")
     audit = command("publish-log", cmd_publish_log)
     audit.add_argument("--repo", required=True)

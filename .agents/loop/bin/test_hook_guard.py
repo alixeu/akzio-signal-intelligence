@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
+import copy
 import io
 import json
 import os
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -19,7 +21,102 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import hook_guard  # noqa: E402
+import issue_bridge  # noqa: E402
 import issue_hub  # noqa: E402
+
+
+class GitHubFixture:
+    repo = "fixture/loop"
+    operator = 42
+    bot = {"id": 17, "login": "loop-bot"}
+    issue_body = (
+        "## Objective\nCorrect the answer.\n\n"
+        "## Constraints\nPreserve the existing interface.\n\n"
+        "## Acceptance criteria\nThe fixture returns 42.\n"
+    )
+
+    def __init__(self, git):
+        self.git = git
+        self.issues = {}
+        self.pulls = []
+        self.comments = []
+        self.lose_issue_reply = False
+        self.lose_pr_reply = False
+        self.lose_comment_reply = False
+
+    def actor(self):
+        return self.bot
+
+    def user_login(self, user):
+        if user != self.operator:
+            raise AssertionError("Unexpected approver requested")
+        return "fixture-owner"
+
+    def issue(self, number):
+        return copy.deepcopy(self.issues[number])
+
+    def issues_by_creator(self, login):
+        return [copy.deepcopy(value) for value in self.issues.values() if value["user"].get("login") == login]
+
+    def add_issue(self, number, *, author=None, title="Correct the fixture", body=None):
+        self.issues[number] = {
+            "number": number, "state": "open", "user": author or {"id": self.operator}, "title": title,
+            "body": self.issue_body if body is None else body, "created_at": issue_hub.iso_time(issue_hub.utc_timestamp()),
+        }
+        return self.issue(number)
+
+    def create_issue(self, title, body):
+        created = self.add_issue(max(self.issues, default=0) + 1, author=self.bot, title=title, body=body)
+        if self.lose_issue_reply:
+            self.lose_issue_reply = False
+            raise RuntimeError("Lost Issue creation response")
+        return created
+
+    def close_issue(self, number, **_kwargs):
+        self.issues[number]["state"] = "closed"
+        return self.issue(number)
+
+    def add_comment(self, number, body, *, author=None, created=None, edited=False):
+        now = issue_hub.utc_timestamp() if created is None else created
+        comment = {
+            "id": 1000 + len(self.comments), "issue_url": f"https://api.github.com/repos/{self.repo}/issues/{number}",
+            "user": author or {"id": self.operator}, "body": body,
+            "created_at": issue_hub.iso_time(now), "updated_at": issue_hub.iso_time(now + int(edited)),
+        }
+        self.comments.append(comment)
+        return copy.deepcopy(comment)
+
+    def repository_comments(self, since):
+        return [copy.deepcopy(row) for row in self.comments if row["updated_at"] > since]
+
+    def issue_comments(self, number):
+        return [copy.deepcopy(row) for row in self.comments if row["issue_url"].endswith(f"/issues/{number}")]
+
+    def create_comment(self, number, body):
+        comment = self.add_comment(number, body, author=self.bot)
+        if self.lose_comment_reply:
+            self.lose_comment_reply = False
+            raise RuntimeError("Lost comment creation response")
+        return comment
+
+    def pulls_by_head(self, branch):
+        return [copy.deepcopy(pr) for pr in self.pulls if pr["head"]["ref"] == branch]
+
+    def create_pull(self, title, body, branch):
+        head = self.git("ls-remote", "--refs", "origin", f"refs/heads/{branch}").split()[0]
+        number = len(self.pulls) + 100
+        self.pulls.append({
+            "number": number, "title": title, "body": body, "state": "open", "merged": False,
+            "head": {"repo": {"full_name": self.repo}, "ref": branch, "sha": head},
+            "base": {"repo": {"full_name": self.repo}, "ref": "main"},
+        })
+        if self.lose_pr_reply:
+            self.lose_pr_reply = False
+            raise RuntimeError("Lost PR creation response")
+        return self.pull(number)
+
+    def pull(self, number):
+        return copy.deepcopy(next(pr for pr in self.pulls if pr["number"] == number))
 
 
 class HookGuardTests(unittest.TestCase):
@@ -579,7 +676,7 @@ class LocalLoopTests(unittest.TestCase):
         self.assertEqual(self.hub("deliver-main")["status"], "up_to_date")
         self.assertEqual(self.hub("daily-report")["counts"]["task_published"], 1)
 
-    def test_delivery_retries_a_failed_push_after_local_fast_forward(self):
+    def test_delivery_retries_a_failed_push_without_stranding_local_main(self):
         remote = self.origin()
         task, wave, _, head = self.reviewed_candidate()
         self.task_cmd("worktree-land", task, wave)
@@ -589,7 +686,7 @@ class LocalLoopTests(unittest.TestCase):
         pre_receive.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
         pre_receive.chmod(0o700)
         self.assertIn("rejected", self.hub("deliver-main", code=1)["error"])
-        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.base)
         self.assertEqual(self.git("rev-parse", "main", cwd=remote), self.base)
         self.assertEqual(self.git("rev-parse", self.INTEGRATION_REF), head)
         self.assertNotIn("task_published", self.hub("daily-report")["counts"])
@@ -756,6 +853,223 @@ class LocalLoopTests(unittest.TestCase):
             self.assertEqual(len(comments), 2)
             self.assertIn("`task_published`", comments[-1]["body"])
             self.assertIn(head, comments[-1]["body"])
+
+
+    def github_sync(self, github):
+        with issue_hub.process_lock("control"), issue_hub.open_db() as db:
+            return issue_bridge.synchronize(db, github, github.operator, 1)
+
+    def decision(self, task, wave, *, visibility="github"):
+        data = {
+            "question": "Which approach should the fixture use?",
+            "options": {
+                "A": {"label": "Continue", "impact": "Use the existing interface.", "resume": True},
+                "B": {"label": "Decline", "impact": "Keep the existing behavior.", "resume": False},
+            },
+            "recommendation": "A",
+        }
+        return self.task_cmd(
+            "request-decision", task, wave, "--reason-code", "needs_product_decision", "--visibility", visibility,
+            "--report-file", self.note(f"decision-{task}.json", json.dumps(data)),
+        )["decision_id"]
+
+    def test_issue_bridge_recovers_a_lost_decision_issue_and_records_one_authorized_reply(self):
+        github = GitHubFixture(self.git)
+        github.add_issue(1)
+        task = self.propose()["task"]
+        other = self.propose("independent-fixture")["task"]
+        wave = self.hub("start-wave")["wave"]
+        identifier = self.decision(task, wave)
+        self.assertEqual(self.decision(task, wave), identifier)
+        self.assertEqual(self.hub("list", "--status", "awaiting_input")["tasks"][0]["id"], task)
+        self.assertEqual(self.hub("poll")["target_task"]["id"], other)
+        self.hub("finish-wave", "--wave", wave)
+
+        github.lose_issue_reply = True
+        self.assertEqual(self.github_sync(github)["status"], "pending")
+        self.assertEqual(len(github.issues), 2)
+        self.assertEqual(self.github_sync(github)["decisions_opened"], 1)
+        request = self.hub("show", "--task", task)["decision"]
+        number = request["issue"]
+        self.assertIn(f"CHOOSE {identifier} A", github.issue(number)["body"])
+        github.add_comment(1, f"CHOOSE {identifier} A")
+        github.add_comment(number, f"CHOOSE {identifier} A", author={"id": 77})
+        github.add_comment(number, f"CHOOSE {identifier} B", edited=True)
+        github.add_comment(number, f"CHOOSE {identifier} E")
+        self.assertEqual(self.github_sync(github)["replies"]["resolved"], 0)
+
+        accepted = github.add_comment(number, f"CHOOSE {identifier} A\n\n> Quoted notification")
+        github.add_comment(number, f"CHOOSE {identifier} B")
+        github.lose_comment_reply = True
+        self.assertEqual(self.github_sync(github)["status"], "pending")
+        current = self.hub("show", "--task", task)
+        self.assertEqual((current["status"], current["decision"]["choice"], current["decision"]["comment"]),
+                         ("inbox", "A", accepted["id"]))
+        self.assertEqual(self.github_sync(github)["decisions_closed"], 1)
+        self.assertEqual(self.github_sync(github)["replies"]["resolved"], 0)
+        self.assertEqual(github.issue(number)["state"], "closed")
+        self.assertEqual(sum("akzio-loop-decision-result" in row["body"] for row in github.comments), 1)
+
+    def test_issue_bridge_keeps_read_only_status_available_before_schema_upgrade(self):
+        task = self.propose()["task"]
+        with sqlite3.connect(issue_hub.DB_PATH) as db:
+            for table in ("decision_requests", "github_tasks", "github_sync"):
+                db.execute(f"DROP TABLE {table}")
+        self.assertEqual(self.hub("poll")["target_task"]["id"], task)
+        self.assertEqual(self.hub("show", "--task", task)["status"], "inbox")
+        self.assertEqual(self.hub("init")["target_task"]["id"], task)
+        with issue_hub.open_db(readonly=True) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM github_tasks").fetchone()[0], 0)
+
+    def test_issue_bridge_invalidates_a_changed_decision_even_if_the_text_is_restored(self):
+        github = GitHubFixture(self.git)
+        task = self.propose()["task"]
+        wave = self.hub("start-wave")["wave"]
+        identifier = self.decision(task, wave)
+        self.hub("finish-wave", "--wave", wave)
+        self.github_sync(github)
+        number = self.hub("show", "--task", task)["decision"]["issue"]
+        original = github.issues[number]["body"]
+        github.issues[number]["body"] += "The wording of option A changed."
+        github.add_comment(number, f"CHOOSE {identifier} A")
+        self.assertEqual(self.github_sync(github)["replies"]["resolved"], 0)
+        github.issues[number]["body"] = original
+        self.assertEqual(self.github_sync(github)["replies"]["resolved"], 0)
+        self.assertEqual(self.hub("show", "--task", task)["blocked_reason"], "decision_changed")
+        wave = self.hub("start-wave")["wave"]
+        self.assertNotEqual(self.decision(task, wave), identifier)
+
+    def test_issue_bridge_local_decision_timeout_reissues_without_publishing(self):
+        github = GitHubFixture(self.git)
+        task, wave, worktree = self.claim()
+        self.commit(task, wave, worktree)
+        old_id = self.decision(task, wave, visibility="local")
+        self.hub("finish-wave", "--wave", wave)
+        request = self.hub("show", "--task", task)["decision"]
+        self.assertEqual(self.github_sync(github)["decisions_opened"], 0)
+        with patch.object(issue_hub, "utc_timestamp", return_value=request["expires_at"]):
+            self.assertIn("validity period", self.hub("resolve-decision", "--id", old_id, "--choice", "A", code=1)["error"])
+            next_wave = self.hub("start-wave")["wave"]
+            new_id = self.decision(task, next_wave, visibility="local")
+            self.assertNotEqual(old_id, new_id)
+            self.assertIn("superseded", self.hub("resolve-decision", "--id", old_id, "--choice", "A", code=1)["error"])
+            self.assertEqual(self.hub("resolve-decision", "--id", new_id, "--choice", "A")["status"], "inbox")
+            self.design(task, next_wave)
+            next_tree = Path(self.task_cmd("claim", task, next_wave)["worktree_path"])
+        self.assertNotEqual(next_tree, worktree)
+        self.assertTrue(worktree.is_dir())
+        self.assertFalse(github.issues)
+
+    def test_issue_bridge_only_imports_authorized_unchanged_task_snapshots(self):
+        self.origin()
+        github = GitHubFixture(self.git)
+        github.add_issue(1)
+        github.add_issue(2, author={"id": 88})
+        github.add_issue(3)
+        self.github_sync(github)
+        _, original = issue_bridge.issue_snapshot(github.issue(2), 2)
+        github.issues[2]["body"] += "An additional requirement.\n"
+        github.add_comment(1, f"/agent start {original}")
+        github.add_comment(2, "/agent start")
+        github.add_comment(2, f"/agent start {original}")
+        github.add_comment(3, f"/agent start {original}", edited=True)
+        github.add_comment(3, f"/agent start {original}", author={"id": 99})
+        self.assertEqual(self.github_sync(github)["inbound"]["imported"], 0)
+        _, current = issue_bridge.issue_snapshot(github.issue(2), 2)
+        start = github.add_comment(2, f"/agent start {current}")
+        self.assertEqual(self.github_sync(github)["inbound"]["imported"], 1)
+        github.issues[2]["body"] = "New text that should not reach the frozen task."
+        github.add_comment(2, "/agent start")
+        self.assertEqual(self.github_sync(github)["inbound"]["imported"], 0)
+        task = self.hub("poll")["target_task"]
+        self.assertEqual((task["github"]["snapshot_sha"], task["github"]["start_comment"]), (current, start["id"]))
+        self.assertIn("An additional requirement.", task["body"])
+        self.assertNotIn("New text", task["body"])
+
+    def test_issue_bridge_requeues_superseded_direct_delivery_without_losing_evidence(self):
+        remote = self.origin()
+        task, wave, _, old = self.reviewed_candidate()
+        self.task_cmd("worktree-land", task, wave)
+        self.hub("finish-wave", "--wave", wave)
+        tree = self.git("rev-parse", f"{self.base}^{{tree}}")
+        merged = self.git("commit-tree", tree, "-p", self.base, "-m", "An independent PR merged first")
+        self.git("push", "origin", f"{merged}:refs/heads/main")
+        self.assertIn("approved Loop tasks", self.hub("deliver-main", code=1)["error"])
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.base)
+        with issue_hub.process_lock("control"), issue_hub.open_db() as db:
+            self.assertEqual(issue_hub.requeue_stale_main(db, merged), 1)
+            self.assertEqual(issue_hub.requeue_stale_main(db, merged), 0)
+        issue_bridge.advance_local_main(merged)
+        self.assertEqual(self.hub("show", "--task", task)["status"], "inbox")
+        self.assertIn(old, self.git("for-each-ref", "--format=%(objectname)", "refs/archive/akzio-loop/superseded"))
+        wave = self.hub("start-wave")["wave"]
+        self.design(task, wave)
+        worktree = Path(self.task_cmd("claim", task, wave)["worktree_path"])
+        new = self.commit(task, wave, worktree)
+        self.verify(task, wave)
+        self.review(task, wave, new)
+        self.task_cmd("worktree-land", task, wave)
+        self.hub("finish-wave", "--wave", wave)
+        self.assertEqual(self.hub("deliver-main")["head_sha"], new)
+        self.assertEqual(self.git("rev-parse", "main", cwd=remote), new)
+
+    def test_issue_bridge_delivers_a_reviewed_pr_and_observes_manual_merge(self):
+        remote = self.origin()
+        github = GitHubFixture(self.git)
+        github.add_issue(2)
+        self.github_sync(github)
+        _, digest = issue_bridge.issue_snapshot(github.issue(2), 2)
+        github.add_comment(2, f"/agent start {digest}")
+        self.assertEqual(self.github_sync(github)["inbound"]["imported"], 1)
+        task = self.hub("poll")["target_task"]["id"]
+        wave = self.hub("start-wave")["wave"]
+        self.design(task, wave)
+        worktree = Path(self.task_cmd("claim", task, wave)["worktree_path"])
+        head = self.commit(task, wave, worktree)
+        self.verify(task, wave)
+        self.assertEqual(self.task_cmd("worktree-land", task, wave, code=1)["status"], "error")
+        self.review(task, wave, head)
+        self.assertEqual(self.task_cmd("worktree-land", task, wave)["status"], "awaiting_pr")
+        self.hub("finish-wave", "--wave", wave)
+        self.assertEqual(self.hub("deliver-main")["status"], "up_to_date")
+        self.assertEqual(self.git("for-each-ref", "--format=%(refname)", self.INTEGRATION_REF), "")
+
+        github.lose_pr_reply = True
+        self.assertEqual(self.github_sync(github)["status"], "pending")
+        self.assertEqual(self.hub("show", "--task", task)["status"], "awaiting_pr")
+        report = self.github_sync(github)
+        self.assertEqual(report["pull_requests"]["created"], 1, report)
+        self.assertEqual(len(github.pulls), 1)
+        pr = github.pulls[0]
+        self.assertEqual((pr["head"]["sha"], pr["base"]["ref"], self.git("rev-parse", "main", cwd=remote)),
+                         (head, "main", self.base))
+        self.assertEqual(self.hub("show", "--task", task)["status"], "awaiting_merge")
+        self.assertEqual(github.issue(2)["state"], "open")
+
+        pr["state"] = "closed"
+        self.assertEqual(self.github_sync(github)["status"], "synced")
+        self.assertEqual(self.hub("show", "--task", task)["blocked_reason"], "pr_closed")
+        self.assertEqual(github.issue(2)["state"], "open")
+        pr["state"] = "open"
+        self.assertEqual(self.github_sync(github)["status"], "synced")
+        self.assertEqual(self.hub("show", "--task", task)["status"], "awaiting_merge")
+        tree = self.git("rev-parse", f"{head}^{{tree}}")
+        squash = self.git("commit-tree", tree, "-p", self.base, "-m", "Human squash merge")
+        pr.update(merged=True, state="closed", merge_commit_sha=squash)
+        self.assertEqual(self.github_sync(github)["status"], "pending")
+        self.assertEqual(github.issue(2)["state"], "open")
+        self.git("push", "origin", f"{squash}:refs/heads/main")
+        report = self.github_sync(github)
+        self.assertEqual(report["pull_requests"]["merged"], 1, report)
+        current = self.hub("show", "--task", task)
+        self.assertEqual((current["status"], current["github"]["merge_sha"], github.issue(2)["state"]),
+                         ("done", squash, "closed"))
+        self.assertIn(head, self.git("for-each-ref", "--format=%(objectname)", "refs/archive/akzio-loop/pr"))
+        self.assertFalse(worktree.exists())
+        self.assertEqual(self.hub("deliver-main")["status"], "up_to_date")
+        self.assertEqual(self.github_sync(github)["pull_requests"]["merged"], 0)
+        self.assertEqual(sum("akzio-loop-pr-merged" in row["body"] for row in github.comments), 1)
+        self.assertEqual(self.git("ls-remote", "--refs", "origin", f"refs/heads/{pr['head']['ref']}"), "")
 
 
 if __name__ == "__main__":

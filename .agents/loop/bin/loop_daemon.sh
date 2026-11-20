@@ -5,6 +5,7 @@ umask 077
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$REPO_ROOT"
 ISSUE_HUB="$REPO_ROOT/.agents/loop/bin/issue_hub.py"
+ISSUE_BRIDGE="$REPO_ROOT/.agents/loop/bin/issue_bridge.py"
 AGY_BIN="${AGY_BIN:-agy}"
 LEADER_MODEL="${LEADER_MODEL:-}"
 WAVE_INTERVAL_SECS="${WAVE_INTERVAL_SECS:-900}"
@@ -20,6 +21,7 @@ Commands:
   wave            Run one Leader wave and perform configured delivery
   daemon          Run waves, deliver accepted work, and generate due reports
   deliver         Retry delivery to origin/main and the configured GitHub issue
+  sync-issues     Process authorized Issue commands, decision replies, and PR deliveries
   daily-report    Generate a local report now (or only if due with --if-due)
   publish-log     Append pending audit events to an existing GitHub issue
                   Usage: publish-log --repo OWNER/REPO --issue N
@@ -31,6 +33,7 @@ Environment overrides:
   AKZIO_LOOP_AUDIT_REPO         GitHub OWNER/REPO (Git config: akzioLoop.auditRepo)
   AKZIO_LOOP_AUDIT_ISSUE        Existing issue number (Git config: akzioLoop.auditIssue)
   Configure both values to enable automatic delivery to origin/main and the issue.
+  akzioLoop.operatorId         Numeric GitHub user ID, set in local Git config to enable Issue sync
 EOF
 }
 
@@ -133,6 +136,21 @@ deliver_configured() {
   return "$failed"
 }
 
+sync_configured_issues() {
+  local operator repo issue required="${1:-false}"
+  operator="$(git config --local --get akzioLoop.operatorId || true)"
+  if [[ -z "$operator" && "$required" == false ]]; then
+    return 0
+  fi
+  repo="${AKZIO_LOOP_AUDIT_REPO:-$(git config --local --get akzioLoop.auditRepo || true)}"
+  issue="${AKZIO_LOOP_AUDIT_ISSUE:-$(git config --local --get akzioLoop.auditIssue || true)}"
+  if [[ -z "$operator" || -z "$repo" || -z "$issue" ]]; then
+    printf 'ERROR: Configure akzioLoop.operatorId, the GitHub repository, and the audit Issue.\n' >&2
+    return 1
+  fi
+  python3 "$ISSUE_BRIDGE" sync --repo "$repo" --operator "$operator" --audit-issue "$issue"
+}
+
 cmd="${1:-help}"
 shift || true
 
@@ -145,12 +163,17 @@ case "$cmd" in
     ;;
   wave)
     failed=0
+    sync_configured_issues || failed=1
     run_single_wave || failed=1
+    sync_configured_issues || failed=1
     deliver_configured || failed=1
     exit "$failed"
     ;;
   deliver)
     deliver_configured true
+    ;;
+  sync-issues)
+    sync_configured_issues true
     ;;
   daily-report)
     python3 "$ISSUE_HUB" daily-report "$@"
@@ -164,8 +187,14 @@ case "$cmd" in
       if ! python3 "$ISSUE_HUB" daily-report --if-due; then
         printf 'WARN: Local daily report failed. The next tick will retry.\n' >&2
       fi
+      if ! sync_configured_issues; then
+        printf 'WARN: Issue synchronization is pending. The next tick will retry.\n' >&2
+      fi
       if ! run_single_wave; then
         printf 'WARN: Wave failed. The daemon will try again on its next tick.\n' >&2
+      fi
+      if ! sync_configured_issues; then
+        printf 'WARN: Issue synchronization is pending. The next tick will retry.\n' >&2
       fi
       if ! deliver_configured; then
         printf 'WARN: Delivery is pending. The next tick will retry.\n' >&2
