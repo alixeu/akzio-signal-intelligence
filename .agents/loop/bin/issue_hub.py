@@ -1,1377 +1,1010 @@
 #!/usr/bin/env python3
-"""
-Akzio 24h Autonomous Agent Loop — GitHub Issues Hub & Backpressure Engine.
-
-Responsibilities:
-1. GitHub Issues state-machine routing (`loop:inbox` -> `loop:ready` -> `loop:in-progress` -> `loop:done` / `loop:blocked`).
-2. Issue proposing (`propose`) with fingerprint deduplication and file-existence anti-hallucination checks.
-3. Stage 1 Design contract publishing (`post-design`) with machine-readable `allowed_files` metadata.
-4. Isolated Git Worktree lifecycle (`worktree-create`, `verify-worktree`, `worktree-land`, `worktree-discard`)
-   that NEVER touches uncommitted files in the developer's main working directory.
-5. Deterministic Agent Backpressure (`verify-worktree`): whitelist check, anti-reward-hacking diff scan,
-   `include!` fragment `rustfmt` check, and Cargo workspace gates (`fmt`, `check`, `clippy -D warnings`, `test`).
-6. Stage 3 Completion (`complete`), 2-Round Circuit Breaker (`block`), and 24h Daily Digest (`daily-report`).
-"""
+"""Local Akzio development loop. GitHub is an optional receiver of audit events."""
 
 from __future__ import annotations
 
 import argparse
 import datetime as dt
-import hashlib
+import fcntl
 import json
 import os
 import re
-import shutil
+import sqlite3
 import subprocess
 import sys
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+import tempfile
+import time
+import uuid
+from collections import Counter
+from contextlib import contextmanager
+from pathlib import Path, PurePosixPath
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-SHARED_CARGO_TARGET_DIR = REPO_ROOT / "target"
 OUTPUT_ROOT = REPO_ROOT / "outputs" / "loop"
 STATE_DIR = OUTPUT_ROOT / "state"
 WORKTREES_DIR = OUTPUT_ROOT / "worktrees"
-REPORTS_DIR = OUTPUT_ROOT / "reports"
 TMP_DIR = OUTPUT_ROOT / "tmp"
-LEDGER_PATH = STATE_DIR / "ledger.jsonl"
-QUEUE_CACHE_PATH = STATE_DIR / "queue_cache.json"
-LESSONS_PATH = REPO_ROOT / ".agents" / "loop" / "agent-lessons.md"
+REPORTS_DIR = OUTPUT_ROOT / "reports"
+DB_PATH = STATE_DIR / "loop.sqlite3"
+INTEGRATION_REF = "refs/heads/loop/nightly"
+WAVE_SECONDS = 2 * 60 * 60
+MAX_ATTEMPTS = 2
+RESUMABLE = ("landing", "reviewed", "verified", "in_progress")
+PRIORITIES = ("P1", "P2", "P3")
+SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+BANNED_ATTRIBUTES = re.compile(r"#\s*!?\s*\[\s*(?:allow\s*\(|ignore\b)")
+TEST_ATTRIBUTE = re.compile(r"#\s*\[\s*(?:tokio::)?test\b")
 
-INTEGRATION_BRANCH = "loop/nightly"
-LEASE_TIMEOUT_MINUTES = 90
-DAILY_REPORT_INTERVAL_HOURS = 24
-DAILY_REPORT_ISSUE_TITLE = "📊 [Akzio Loop] 24h 无人值守研发日报汇总"
-
-LOOP_LABELS = [
-    ("loop:inbox", "0E8A16", "Proposed issue awaiting Leader Stage-1 [LOOP-DESIGN] contract"),
-    ("loop:ready", "1D76DB", "Stage-1 [LOOP-DESIGN] approved; ready for isolated Flash Worker"),
-    ("loop:in-progress", "FBCA04", "Currently claimed by an active Leader/Worker wave"),
-    ("loop:done", "5319E7", "Verified by Cargo gates + Fresh-Context Verifier and landed on loop/nightly"),
-    ("loop:blocked", "D93F0B", "Circuit breaker tripped or awaiting human product/security decision"),
-    ("loop:daily-report", "0052CC", "Pinned tracking issue for 24h autonomous loop daily reports"),
-    ("P1", "B60205", "Priority 1: Execution safety / reconciliation / critical invariant"),
-    ("P2", "D93F0B", "Priority 2: Engineering risk / test gap / contract alignment"),
-    ("P3", "0E8A16", "Priority 3: Low-risk hardening / documentation / cleanup"),
-]
-
-FORBIDDEN_PATH_PATTERNS = [
-    r"(^|/)\.akzio(/|$)",
-    r"^~",
-    r"(^|/)\.env($|\.)",
-]
-
-BANNED_DIFF_PATTERNS = [
-    (r"#\s*\[\s*allow\s*\(", "Adding #[allow(...)] is forbidden (Reward-Hacking rule)"),
-    (r"#\s*!\s*\[\s*allow\s*\(", "Adding #![allow(...)] is forbidden (Reward-Hacking rule)"),
-    (r"#\s*\[\s*ignore\b", "Adding #[ignore] to skip tests is forbidden (Reward-Hacking rule)"),
-]
-
-
-def ensure_dirs() -> None:
-    for d in (STATE_DIR, WORKTREES_DIR, REPORTS_DIR, TMP_DIR):
-        d.mkdir(parents=True, exist_ok=True)
-
-
-def utc_now() -> dt.datetime:
-    return dt.datetime.now(dt.timezone.utc)
-
-
-def iso_now() -> str:
-    return utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def append_ledger(event_type: str, payload: Dict[str, Any]) -> None:
-    ensure_dirs()
-    record = {
-        "timestamp": iso_now(),
-        "event": event_type,
-        **payload,
-    }
-    with LEDGER_PATH.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-
-def read_ledger() -> List[Dict[str, Any]]:
-    if not LEDGER_PATH.exists():
-        return []
-    records: List[Dict[str, Any]] = []
-    for line in LEDGER_PATH.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            records.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return records
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS loop_info (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    identity TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS wave (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    token TEXT NOT NULL,
+    expires_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tasks (
+    id INTEGER PRIMARY KEY,
+    fingerprint TEXT NOT NULL UNIQUE,
+    title TEXT NOT NULL,
+    priority TEXT NOT NULL CHECK (priority IN ('P1', 'P2', 'P3')),
+    area TEXT NOT NULL,
+    candidate_files TEXT NOT NULL,
+    body TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'inbox' CHECK (status IN (
+        'inbox', 'ready', 'in_progress', 'verified', 'reviewed', 'landing', 'done', 'blocked'
+    )),
+    design_body TEXT,
+    allowed_files TEXT,
+    wave TEXT,
+    base_sha TEXT,
+    attempt INTEGER NOT NULL DEFAULT 0,
+    attempt_base TEXT,
+    candidate_head TEXT,
+    verified_head TEXT,
+    checks TEXT,
+    review_summary TEXT,
+    last_failure TEXT,
+    blocked_reason TEXT
+);
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY,
+    created_at INTEGER NOT NULL,
+    task_id INTEGER REFERENCES tasks(id),
+    kind TEXT NOT NULL,
+    details TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS deliveries (
+    destination TEXT NOT NULL,
+    event_id INTEGER NOT NULL REFERENCES events(id),
+    comment_id INTEGER NOT NULL,
+    PRIMARY KEY (destination, event_id)
+);
+"""
 
 
-def notify_human(subject: str, body: str, metadata: Optional[Dict[str, Any]] = None) -> None:
-    """
-    Reserved hook for notifying the human operator when `loop:blocked` or `daily-report` fires.
-    Currently writes to `outputs/loop/state/notifications.jsonl` and optionally posts to
-    `AKZIO_LOOP_WEBHOOK_URL` if configured later by the user.
-    """
-    ensure_dirs()
-    notif_file = STATE_DIR / "notifications.jsonl"
-    entry = {
-        "timestamp": iso_now(),
-        "subject": subject,
-        "body": body,
-        "metadata": metadata or {},
-    }
-    with notif_file.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+def utc_timestamp() -> int:
+    return int(time.time())
 
 
-def run_cmd(
-    cmd: List[str],
-    cwd: Optional[Path] = None,
-    check: bool = True,
-    timeout: int = 600,
-    env: Optional[Dict[str, str]] = None,
-) -> subprocess.CompletedProcess[str]:
+def iso_time(timestamp: int) -> str:
+    return dt.datetime.fromtimestamp(timestamp, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def emit(value) -> int:
+    print(json.dumps(value, ensure_ascii=False, indent=2))
+    return 0
+
+
+def run_cmd(cmd, cwd=None, *, check=True, timeout=120, env=None, input_text=None):
     proc = subprocess.run(
-        cmd,
-        cwd=str(cwd or REPO_ROOT),
-        text=True,
-        capture_output=True,
-        timeout=timeout,
-        env=env,
+        cmd, cwd=cwd or REPO_ROOT, text=True, capture_output=True, input=input_text,
+        timeout=timeout, env=env,
     )
-    if check and proc.returncode != 0:
-        raise RuntimeError(
-            f"Command failed (exit {proc.returncode}): {' '.join(cmd)}\n"
-            f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
-        )
+    if check and proc.returncode:
+        detail = (proc.stderr or proc.stdout).strip()[-1200:]
+        raise RuntimeError(f"{cmd[0]} exited {proc.returncode}: {detail}")
     return proc
 
 
-def gh_json(args: List[str]) -> Any:
-    proc = run_cmd(["gh", *args], check=True)
-    out = proc.stdout.strip()
-    return json.loads(out) if out else None
+def git(*args, cwd=None, check=True):
+    return run_cmd(["git", "--literal-pathspecs", *args], cwd, check=check)
 
 
-def get_dirty_main_files() -> Dict[str, List[str]]:
-    """Inspect uncommitted/untracked files in the main working tree without modifying anything."""
-    proc = run_cmd(["git", "status", "--porcelain"], cwd=REPO_ROOT, check=False)
-    modified: List[str] = []
-    untracked: List[str] = []
-    for raw in proc.stdout.splitlines():
-        if len(raw) < 4:
-            continue
-        code = raw[:2]
-        path = raw[3:].strip()
-        if path.startswith("outputs/"):
-            continue
-        if code == "??":
-            untracked.append(path)
-        else:
-            modified.append(path)
-    return {"modified": modified, "untracked": untracked}
+def ensure_dirs() -> None:
+    for path in (STATE_DIR, WORKTREES_DIR, TMP_DIR, REPORTS_DIR):
+        if path.resolve() != path:
+            raise RuntimeError(f"Loop output directory must not traverse a symlink: {path}")
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
 
 
-def sync_queue_cache(
-    delta_ready: int = 0,
-    delta_inbox: int = 0,
-    daily_report_due: Optional[bool] = None,
-) -> None:
-    """Keep `queue_cache.json` synchronized after transitions so `Stop` hook never reads stale counts."""
-    if not QUEUE_CACHE_PATH.exists():
-        return
+@contextmanager
+def open_db(*, readonly=False):
+    if not readonly:
+        ensure_dirs()
+    if DB_PATH.resolve() != DB_PATH:
+        raise RuntimeError("The loop database path must not traverse a symlink.")
+    uri = f"{DB_PATH.as_uri()}?mode=ro" if readonly else str(DB_PATH)
+    db = sqlite3.connect(uri, uri=readonly, isolation_level=None, timeout=15)
+    db.row_factory = sqlite3.Row
     try:
-        cache = json.loads(QUEUE_CACHE_PATH.read_text(encoding="utf-8"))
-        counts = cache.setdefault("counts", {})
-        counts["ready"] = max(0, int(counts.get("ready") or 0) + delta_ready)
-        counts["inbox"] = max(0, int(counts.get("inbox") or 0) + delta_inbox)
-        if daily_report_due is not None:
-            cache["daily_report_due"] = daily_report_due
-        cache["stale"] = False
-        QUEUE_CACHE_PATH.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        pass
+        db.execute("PRAGMA foreign_keys = ON")
+        if not readonly:
+            db.execute("PRAGMA synchronous = FULL")
+            db.executescript(SCHEMA)
+            db.execute(
+                "INSERT OR IGNORE INTO loop_info VALUES (1, ?, ?)",
+                (uuid.uuid4().hex, utc_timestamp()),
+            )
+        yield db
+    finally:
+        db.close()
 
 
-def set_issue_labels(issue_num: int, add_labels: List[str], remove_labels: List[str]) -> None:
-    """Safely update GitHub issue labels so missing remove-labels never abort adding the target label."""
-    issue_info = gh_json(["issue", "view", str(issue_num), "--json", "labels"]) or {}
-    current = {lbl.get("name", "") for lbl in issue_info.get("labels", [])}
-    to_remove = [lbl for lbl in remove_labels if lbl in current]
-    to_add = [lbl for lbl in add_labels if lbl not in current]
-    if not to_remove and not to_add:
-        return
-    cmd = ["gh", "issue", "edit", str(issue_num)]
-    if to_remove:
-        cmd.extend(["--remove-label", ",".join(to_remove)])
-    if to_add:
-        cmd.extend(["--add-label", ",".join(to_add)])
-    run_cmd(cmd, check=True)
+@contextmanager
+def transaction(db):
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+        db.execute("COMMIT")
+    except BaseException:
+        db.execute("ROLLBACK")
+        raise
 
 
-def parse_design_meta(comments: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    pattern = re.compile(r"<!--\s*loop-design-meta:\s*(\{.*?\})\s*-->", re.DOTALL)
-    for comment in reversed(comments or []):
-        body = comment.get("body") or ""
-        m = pattern.search(body)
-        if m:
-            try:
-                return json.loads(m.group(1))
-            except json.JSONDecodeError:
-                continue
+@contextmanager
+def process_lock(name):
+    ensure_dirs()
+    path = STATE_DIR / f"{name}.lock"
+    if path.resolve() != path:
+        raise RuntimeError(f"Invalid loop lock path: {path}")
+    with path.open("a", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        yield
+
+
+def event(db, kind, task_id=None, **details):
+    db.execute(
+        "INSERT INTO events (created_at, task_id, kind, details) VALUES (?, ?, ?, ?)",
+        (utc_timestamp(), task_id, kind, json.dumps(details, ensure_ascii=False)),
+    )
+
+
+def task_row(db, task_id):
+    row = db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None:
+        raise RuntimeError(f"Unknown task #{task_id}.")
+    return row
+
+
+def worktree_path(task_id) -> Path:
+    path = WORKTREES_DIR / f"task-{task_id}"
+    if path.resolve() != path:
+        raise RuntimeError(f"Invalid task worktree path: {path}")
+    return path
+
+
+def task_view(row):
+    result = dict(row)
+    del result["wave"]
+    for field in ("candidate_files", "allowed_files", "checks", "last_failure"):
+        if result[field] is not None:
+            result[field] = json.loads(result[field])
+    if row["base_sha"]:
+        result["worktree_path"] = str(worktree_path(row["id"]))
+    return result
+
+
+def require_wave(db, token, *, renew=False):
+    row = db.execute("SELECT token, expires_at FROM wave WHERE singleton = 1").fetchone()
+    now = utc_timestamp()
+    if not row or row["token"] != token or row["expires_at"] <= now:
+        raise RuntimeError("This loop wave is absent, finished, or expired.")
+    if renew:
+        db.execute("UPDATE wave SET expires_at = ? WHERE singleton = 1", (now + WAVE_SECONDS,))
+
+
+def owned_task(db, task_id, wave, statuses):
+    require_wave(db, wave, renew=True)
+    task = task_row(db, task_id)
+    if task["wave"] != wave or task["status"] not in statuses:
+        raise RuntimeError(f"Task #{task_id} is not owned in the required stage by this wave.")
+    return task
+
+
+def loop_scope(role: str, wave: str, task_id: int | None, version: str) -> dict:
+    """Read-only scope for Antigravity tooling. OS sandbox policy is configured by the runtime."""
+    with open_db(readonly=True) as db:
+        require_wave(db, wave)
+        if role in ("leader", "scout"):
+            return {}
+        if role not in ("worker", "verifier"):
+            raise RuntimeError("Unknown loop role.")
+        task = task_row(db, task_id)
+        expected_stage = "in_progress" if role == "worker" else "verified"
+        expected_version = str(task["attempt"]) if role == "worker" else task["verified_head"]
+        if task["wave"] != wave or task["status"] != expected_stage or version != expected_version:
+            raise RuntimeError("This role no longer owns the task stage or version.")
+        return {
+            "worktree": str(worktree_path(task_id)),
+            "allowed_files": json.loads(task["allowed_files"]),
+        }
+
+
+def cmd_start_wave(_args):
+    with process_lock("control"), open_db() as db, transaction(db):
+        now = utc_timestamp()
+        current = db.execute("SELECT expires_at FROM wave WHERE singleton = 1").fetchone()
+        if current and current["expires_at"] > now:
+            return emit({"status": "busy", "expires_at": iso_time(current["expires_at"])})
+        token = uuid.uuid4().hex
+        db.execute("INSERT OR REPLACE INTO wave VALUES (1, ?, ?)", (token, now + WAVE_SECONDS))
+    return emit({"status": "started", "wave": token, "expires_at": iso_time(now + WAVE_SECONDS)})
+
+
+def cmd_finish_wave(args):
+    with process_lock("control"), open_db() as db, transaction(db):
+        closed = db.execute("DELETE FROM wave WHERE token = ?", (args.wave,)).rowcount
+    return emit({"status": "finished" if closed else "stale"})
+
+
+def get_dirty_main_files():
+    status = git("status", "--porcelain=v1", "-z", "--untracked-files=all").stdout.split("\0")
+    files = {"modified": [], "untracked": []}
+    index = 0
+    while index < len(status) and status[index]:
+        row = status[index]
+        paths = [row[3:]]
+        index += 1
+        if any(code in row[:2] for code in "RC") and index < len(status):
+            paths.append(status[index])
+            index += 1
+        bucket = "untracked" if row.startswith("??") else "modified"
+        files[bucket].extend(path for path in paths if not path.startswith("outputs/"))
+    return files
+
+
+def cmd_poll(_args):
+    counts = {}
+    target = None
+    if DB_PATH.exists():
+        with open_db(readonly=True) as db:
+            counts = dict(db.execute("SELECT status, count(*) FROM tasks GROUP BY status").fetchall())
+            target = db.execute(
+                """SELECT * FROM tasks
+                   WHERE status IN ('landing', 'reviewed', 'verified', 'in_progress', 'ready', 'inbox')
+                   ORDER BY CASE status WHEN 'landing' THEN 0 WHEN 'reviewed' THEN 1
+                       WHEN 'verified' THEN 2 WHEN 'in_progress' THEN 3 WHEN 'ready' THEN 4 ELSE 5 END,
+                       priority, id LIMIT 1"""
+            ).fetchone()
+    action = "scout_needed"
+    if target:
+        action = {"ready": "execute_ready", "inbox": "design_inbox"}.get(target["status"], "resume_task")
+    return emit({
+        "recommended_action": action,
+        "target_task": task_view(target) if target else None,
+        "counts": counts,
+        "dirty_main_files": get_dirty_main_files(),
+    })
+
+
+def cmd_show(args):
+    with open_db(readonly=True) as db:
+        return emit(task_view(task_row(db, args.task)))
+
+
+def cmd_list(args):
+    if not DB_PATH.exists():
+        return emit({"tasks": []})
+    with open_db(readonly=True) as db:
+        rows = db.execute(
+            """SELECT id, title, priority, status, attempt, verified_head, blocked_reason
+               FROM tasks WHERE (? IS NULL OR status = ?) ORDER BY id""",
+            (args.status, args.status),
+        ).fetchall()
+    return emit({"tasks": [dict(row) for row in rows]})
+
+
+def read_note(raw_path):
+    path = REPO_ROOT / raw_path
+    resolved = path.resolve()
+    if not resolved.is_relative_to(TMP_DIR) or not resolved.is_file() or resolved != path.absolute():
+        raise ValueError("Notes must be regular files under outputs/loop/tmp/.")
+    text = resolved.read_text(encoding="utf-8").strip()
+    if not text:
+        raise ValueError("The note is empty.")
+    return text
+
+
+def validate_relative_path(name):
+    path = PurePosixPath(name)
+    if (
+        not name or path.is_absolute() or path.as_posix() != name or name == "."
+        or any(part in ("..", ".git", ".akzio", ".agents", "outputs", "target") for part in path.parts)
+        or any(part == ".env" or part.startswith(".env.") for part in path.parts)
+        or "\\" in name or any(ord(char) < 32 for char in name)
+    ):
+        raise ValueError(f"Unsafe or reserved repository path: {name!r}")
+    target = REPO_ROOT / name
+    if target.resolve() != target or target.is_dir():
+        raise ValueError(f"Expected a regular repository file path: {name!r}")
+    return target
+
+
+def file_list(csv, *, existing):
+    files = list(dict.fromkeys(item.strip() for item in csv.split(",") if item.strip()))
+    if not files:
+        raise ValueError("At least one repository file is required.")
+    for name in files:
+        target = validate_relative_path(name)
+        if not target.is_file() and (existing or not target.parent.is_dir()):
+            raise ValueError(f"File or parent directory missing: {name}")
+    return files
+
+
+def cmd_propose(args):
+    fingerprint = args.fingerprint.strip()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{3,79}", fingerprint):
+        raise ValueError("Fingerprint must be 4–80 lowercase alphanumeric, dash, or underscore characters.")
+    files = file_list(args.candidate_files, existing=True)
+    title, area = args.title.strip(), args.area.strip()
+    if not title or not area:
+        raise ValueError("A title and area are required.")
+    body = read_note(args.body_file)
+    if args.dry_run:
+        return emit({"status": "dry_run_valid", "fingerprint": fingerprint, "candidate_files": files})
+    with open_db() as db, transaction(db):
+        previous = db.execute("SELECT id FROM tasks WHERE fingerprint = ?", (fingerprint,)).fetchone()
+        if previous:
+            return emit({"status": "skipped_duplicate", "task": previous["id"]})
+        task_id = db.execute(
+            "INSERT INTO tasks (fingerprint, title, priority, area, candidate_files, body) VALUES (?, ?, ?, ?, ?, ?)",
+            (fingerprint, title, args.priority, area, json.dumps(files), body),
+        ).lastrowid
+        event(db, "task_proposed", task_id, priority=args.priority)
+    return emit({"status": "created", "task": task_id})
+
+
+def cmd_post_design(args):
+    allowed = file_list(args.allowed_files, existing=False)
+    design = read_note(args.design_file)
+    with process_lock("control"), open_db() as db, transaction(db):
+        require_wave(db, args.wave, renew=True)
+        task = task_row(db, args.task)
+        if task["status"] != "inbox":
+            raise RuntimeError("Only an inbox task can receive a design.")
+        db.execute(
+            "UPDATE tasks SET status = 'ready', design_body = ?, allowed_files = ? WHERE id = ?",
+            (design, json.dumps(allowed), args.task),
+        )
+        event(db, "task_designed", args.task)
+    return emit({"status": "ready", "task": args.task})
+
+
+def ref_commit(ref):
+    result = git("rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def integration_base():
+    value = ref_commit(INTEGRATION_REF)
+    if value:
+        return value
+    head = git("rev-parse", "HEAD").stdout.strip()
+    created = git("update-ref", INTEGRATION_REF, head, "0" * len(head), check=False)
+    if created.returncode:
+        value = ref_commit(INTEGRATION_REF)
+        if not value:
+            raise RuntimeError(f"Could not create {INTEGRATION_REF}: {created.stderr.strip()}")
+        return value
+    return head
+
+
+def task_branch(task_id):
+    return f"loop/task-{task_id}"
+
+
+def check_worktree(task):
+    path = worktree_path(task["id"])
+    if not path.is_dir() or Path(git("rev-parse", "--show-toplevel", cwd=path).stdout.strip()) != path:
+        raise RuntimeError(f"The registered worktree is missing or invalid: {path}")
+    if git("symbolic-ref", "--quiet", "HEAD", cwd=path).stdout.strip() != f"refs/heads/{task_branch(task['id'])}":
+        raise RuntimeError(f"Unexpected branch in {path}.")
+    return path
+
+
+def create_or_resume_worktree(task):
+    path = worktree_path(task["id"])
+    branch = task_branch(task["id"])
+    if not path.exists():
+        if ref_commit(f"refs/heads/{branch}"):
+            git("worktree", "add", str(path), branch)
+        else:
+            git("worktree", "add", "-b", branch, str(path), task["base_sha"])
+    return check_worktree(task)
+
+
+def cmd_claim(args):
+    with process_lock("control"), open_db() as db:
+        with transaction(db):
+            require_wave(db, args.wave, renew=True)
+            task = task_row(db, args.task)
+            if task["status"] == "ready":
+                active = db.execute(
+                    "SELECT id FROM tasks WHERE status IN ('in_progress', 'verified', 'reviewed', 'landing')"
+                ).fetchone()
+                if active:
+                    raise RuntimeError(f"Resume task #{active['id']} before claiming a new task.")
+                base = integration_base()
+                db.execute(
+                    """UPDATE tasks SET status = 'in_progress', wave = ?, base_sha = ?,
+                       attempt = 1, attempt_base = ? WHERE id = ?""",
+                    (args.wave, base, base, args.task),
+                )
+                event(db, "task_claimed", args.task, base_sha=base, attempt=1)
+            elif task["status"] in RESUMABLE:
+                if task["wave"] != args.wave:
+                    db.execute("UPDATE tasks SET wave = ? WHERE id = ?", (args.wave, args.task))
+                    event(db, "task_resumed", args.task, attempt=task["attempt"])
+            else:
+                raise RuntimeError(f"Task #{args.task} cannot be claimed in stage {task['status']}.")
+            task = task_row(db, args.task)
+        if task["status"] == "in_progress":
+            path = create_or_resume_worktree(task)
+            if task["candidate_head"] is None:
+                task = recover_candidate(db, task, path)
+        return emit(task_view(task))
+
+
+def cmd_block(args):
+    note = read_note(args.report_file)
+    with process_lock("control"), open_db() as db, transaction(db):
+        require_wave(db, args.wave, renew=True)
+        task = task_row(db, args.task)
+        if task["status"] not in ("inbox", "ready", "in_progress", "verified"):
+            raise RuntimeError(f"Cannot block a task in stage {task['status']}.")
+        if task["status"] in ("in_progress", "verified") and task["wave"] != args.wave:
+            raise RuntimeError("Claim the task before blocking it.")
+        db.execute("UPDATE tasks SET status = 'blocked', blocked_reason = ? WHERE id = ?", (args.reason_code, args.task))
+        event(db, "task_blocked", args.task, reason=args.reason_code, note=note)
+    return emit({"status": "blocked", "task": args.task, "reason": args.reason_code})
+
+
+def nul_files(output):
+    return [path for path in output.split("\0") if path]
+
+
+def pending_files(path):
+    tracked = git("diff", "--name-only", "--no-renames", "-z", "HEAD", "--", cwd=path).stdout
+    untracked = git("ls-files", "--others", "--exclude-standard", "-z", cwd=path).stdout
+    return sorted(set(nul_files(tracked) + nul_files(untracked)))
+
+
+def validate_changes(task, names, path):
+    allowed = set(json.loads(task["allowed_files"]))
+    extra = sorted(set(names) - allowed)
+    if extra:
+        raise RuntimeError(f"Changes outside the frozen design: {extra}")
+    for name in names:
+        if (path / name).resolve() != path / name or (path / name).is_dir():
+            raise RuntimeError(f"Task changes must be regular files: {name}")
+
+
+def cargo_env():
+    keep = {
+        "PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "TMP", "TEMP", "CARGO_HOME", "RUSTUP_HOME",
+        "SSL_CERT_FILE", "SSL_CERT_DIR", "SSL_CERT_CRLFILE", "CARGO_HTTP_PROXY", "ALL_PROXY",
+        "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "all_proxy", "http_proxy", "https_proxy", "no_proxy",
+    }
+    env = {key: val for key, val in os.environ.items() if key in keep or key == "LANG" or key.startswith("LC_")}
+    env["CARGO_TARGET_DIR"] = str(OUTPUT_ROOT / "target")
+    return env
+
+
+def worker_task(db, args):
+    task = owned_task(db, args.task, args.wave, ("in_progress",))
+    if task["attempt"] != args.attempt:
+        raise RuntimeError("This Worker attempt is no longer current.")
+    return task
+
+
+def cmd_worker_test(args):
+    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_-]*", args.crate):
+        raise ValueError("Invalid Cargo package name.")
+    if args.filter and not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_:.-]*", args.filter):
+        raise ValueError("Invalid Rust test filter.")
+    with process_lock("control"), open_db() as db:
+        with transaction(db):
+            task = worker_task(db, args)
+        path = check_worktree(task)
+        validate_changes(task, pending_files(path), path)
+        cmd = ["cargo", "test", "-p", args.crate, "--locked"]
+        if args.filter:
+            cmd.append(args.filter)
+        proc = run_cmd(cmd, path, check=False, timeout=900, env=cargo_env())
+        emit({"exit_code": proc.returncode, "stdout": proc.stdout[-4000:], "stderr": proc.stderr[-4000:]})
+        return proc.returncode
+
+
+def is_ancestor(base, head):
+    result = git("merge-base", "--is-ancestor", base, head, check=False)
+    if result.returncode not in (0, 1):
+        raise RuntimeError(f"Could not compare Git commits: {result.stderr.strip()}")
+    return result.returncode == 0
+
+
+def cmd_worker_commit(args):
+    message = args.message.strip()
+    if not message:
+        raise ValueError("A commit message is required.")
+    with process_lock("control"), open_db() as db:
+        with transaction(db):
+            task = worker_task(db, args)
+        path = check_worktree(task)
+        changes = pending_files(path)
+        validate_changes(task, changes, path)
+        if changes:
+            git("add", "-A", "--", *changes, cwd=path)
+            git("commit", "-m", message, cwd=path)
+        head = git("rev-parse", "HEAD", cwd=path).stdout.strip()
+        if head == task["attempt_base"] or not is_ancestor(task["attempt_base"], head) or pending_files(path):
+            raise RuntimeError("This attempt needs a new commit and a clean worktree.")
+        committed = changed_files(task["base_sha"], head)
+        validate_changes(task, committed, path)
+        with transaction(db):
+            require_wave(db, args.wave, renew=True)
+            if task["candidate_head"] != head:
+                db.execute("UPDATE tasks SET candidate_head = ? WHERE id = ?", (head, args.task))
+                event(db, "candidate_committed", args.task, head_sha=head, attempt=args.attempt)
+    return emit({"status": "committed", "task": args.task, "candidate_head": head, "changed_files": committed})
+
+
+def changed_files(base, head):
+    return nul_files(git("diff", "--name-only", "--no-renames", "--ignore-submodules=none", "-z", base, head, "--").stdout)
+
+
+def recover_candidate(db, task, path):
+    head = git("rev-parse", "HEAD", cwd=path).stdout.strip()
+    if head == task["attempt_base"]:
+        return task
+    git_dir_args = ("rev-parse", "--path-format=absolute", "--git-common-dir")
+    if git(*git_dir_args, cwd=path).stdout != git(*git_dir_args).stdout:
+        raise RuntimeError(f"The registered worktree is missing or invalid: {path}")
+    branch = f"refs/heads/{task_branch(task['id'])}"
+    worktrees = git("worktree", "list", "--porcelain", "-z").stdout.split("\0\0")
+    expected = [f"worktree {path}", f"HEAD {head}", f"branch {branch}"]
+    if not any(entry.split("\0")[:3] == expected for entry in worktrees):
+        raise RuntimeError(f"The registered worktree is missing or invalid: {path}")
+
+    # Status checks the index and worktree separately, including untracked files.
+    if git("status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none", cwd=path).stdout:
+        return task
+    if not is_ancestor(task["attempt_base"], head):
+        return task
+    files = changed_files(task["base_sha"], head)
+    if not files:
+        return task
+    try:
+        validate_changes(task, files, path)
+    except RuntimeError:
+        return task
+
+    with transaction(db):
+        require_wave(db, task["wave"])
+        updated = db.execute(
+            """UPDATE tasks SET candidate_head = ? WHERE id = ? AND status = 'in_progress'
+               AND wave = ? AND attempt = ? AND candidate_head IS NULL""",
+            (head, task["id"], task["wave"], task["attempt"]),
+        ).rowcount
+        if updated != 1:
+            raise RuntimeError("This task attempt is no longer current.")
+        event(db, "candidate_recovered", task["id"], head_sha=head, attempt=task["attempt"])
+        return task_row(db, task["id"])
+
+
+def rust_diff_failures(base, head, path, files, task_id):
+    failures = []
+    marker = f"/// WHY THIS TEST EXISTS (Task #{task_id}):"
+    for file in files:
+        if not file.endswith(".rs") or not (path / file).is_file():
+            continue
+        diff = git("diff", "--no-color", "--no-ext-diff", "--no-textconv", "-U0", base, head, "--", file).stdout
+        added = []
+        new_line = 0
+        lines = (path / file).read_text(encoding="utf-8").splitlines()
+        for line in diff.splitlines():
+            hunk = re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+            if hunk:
+                new_line = int(hunk.group(1))
+            elif new_line and line.startswith("+"):
+                content = line[1:]
+                added.append(content)
+                if TEST_ATTRIBUTE.search(content):
+                    before = new_line - 2
+                    while before >= 0 and lines[before].lstrip().startswith(("//", "#[")):
+                        before -= 1
+                    after = new_line
+                    while after < len(lines) and lines[after].lstrip().startswith(("//", "#[")):
+                        after += 1
+                    if not any(row.lstrip().startswith(marker) for row in lines[before + 1:after]):
+                        failures.append(f"{file}:{new_line} needs {marker}")
+                new_line += 1
+        if BANNED_ATTRIBUTES.search("\n".join(added)):
+            failures.append(f"{file} adds a forbidden allow or ignore attribute.")
+    return failures
+
+
+def rustfmt_needs_formatting(tree, file):
+    """Distinguish a named formatting diff from a formatter failure."""
+    path = str(tree / file)
+    check = run_cmd(["rustfmt", "--edition", "2021", "--check", "--files-with-diff", path], tree, check=False)
+    if check.returncode == 0:
+        return False
+    if check.returncode == 1 and path in check.stdout.splitlines():
+        return True
     return None
 
 
-def priority_rank(labels: List[str]) -> int:
-    if "P1" in labels:
-        return 1
-    if "P2" in labels:
-        return 2
-    if "P3" in labels:
-        return 3
-    return 4
+def include_format_failures(base, path, files):
+    included = set()
+    for source in (path / "crates").rglob("*.rs"):
+        if source.is_symlink():
+            continue
+        for name in re.findall(r'include!\s*\(\s*"([^"]+)"\s*\)', source.read_text(encoding="utf-8")):
+            target = (source.parent / name).resolve()
+            if target.is_relative_to(path):
+                included.add(target.relative_to(path).as_posix())
+    failures = []
+    unformatted = []
+    for file in files:
+        if file not in included or not (path / file).is_file():
+            continue
+        needs_formatting = rustfmt_needs_formatting(path, file)
+        if needs_formatting is None:
+            failures.append(f"{file} failed standalone rustfmt.")
+        elif needs_formatting:
+            unformatted.append(file)
+    if not unformatted:
+        return failures
+
+    # stdin check can exit successfully even when rustfmt would change the input.
+    # Use the named file and formatter configuration from the frozen baseline.
+    with detached_snapshot(base) as baseline:
+        for file in unformatted:
+            old = baseline / file
+            if old.resolve() != old or not old.is_file() or not rustfmt_needs_formatting(baseline, file):
+                failures.append(f"{file} failed standalone rustfmt.")
+    return failures
 
 
-def is_safe_repo_path(rel_path: str) -> bool:
-    rel_path = rel_path.strip()
-    if not rel_path or rel_path.startswith("/"):
-        return False
-    for pat in FORBIDDEN_PATH_PATTERNS:
-        if re.search(pat, rel_path):
-            return False
-    resolved = (REPO_ROOT / rel_path).resolve()
+@contextmanager
+def detached_snapshot(head):
+    with tempfile.TemporaryDirectory(prefix="verify-", dir=WORKTREES_DIR) as directory:
+        path = Path(directory) / "tree"
+        git("worktree", "add", "--detach", str(path), head)
+        try:
+            yield path
+        finally:
+            git("worktree", "remove", "--force", str(path))
+
+
+def check_candidate(task, path, head):
+    base = task["base_sha"]
+    if head == base or not is_ancestor(base, head):
+        return ["The candidate must advance the frozen base."], {}
+    files = changed_files(base, head)
+    checks = {"changed_files": files}
     try:
-        resolved.relative_to(REPO_ROOT.resolve())
-    except ValueError:
-        return False
-    return True
-
-
-def cmd_init_labels(args: argparse.Namespace) -> int:
-    created = []
-    for name, color, desc in LOOP_LABELS:
-        if args.dry_run:
-            created.append({"name": name, "color": color, "description": desc, "dry_run": True})
-            continue
-        run_cmd(["gh", "label", "create", name, "--color", color, "--description", desc, "--force"])
-        created.append({"name": name, "color": color})
-    print(json.dumps({"status": "ok", "labels": created}, ensure_ascii=False, indent=2))
-    return 0
-
-
-def cmd_propose(args: argparse.Namespace) -> int:
-    ensure_dirs()
-    fingerprint = args.fingerprint.strip()
-    if not re.match(r"^[a-z0-9][a-z0-9\-_]{3,80}$", fingerprint):
-        raise ValueError("Invalid --fingerprint: use lowercase alphanumeric/kebab-case (4..80 chars).")
-
-    candidate_files = [f.strip() for f in args.candidate_files.split(",") if f.strip()]
-    if not candidate_files:
-        raise ValueError("--candidate-files must specify at least one existing repository file.")
-
-    for fpath in candidate_files:
-        if not is_safe_repo_path(fpath):
-            raise ValueError(f"Unsafe or forbidden path in --candidate-files: {fpath}")
-        if not (REPO_ROOT / fpath).exists():
-            raise ValueError(
-                f"Anti-Hallucination Guard: candidate file '{fpath}' does not exist in {REPO_ROOT}."
-            )
-
-    body_text = Path(args.body_file).read_text(encoding="utf-8").strip()
-    marker = f"<!-- loop-fingerprint: {fingerprint} -->"
-
-    if not args.dry_run:
-        # 1. Exact local ledger deduplication (guards against GitHub search index lag)
-        for rec in read_ledger():
-            if rec.get("event") == "issue_proposed" and rec.get("fingerprint") == fingerprint:
-                print(
-                    json.dumps(
-                        {
-                            "status": "skipped_duplicate",
-                            "source": "local_ledger",
-                            "fingerprint": fingerprint,
-                            "existing_issue": {
-                                "number": rec.get("issue"),
-                                "title": rec.get("title"),
-                                "url": rec.get("url"),
-                            },
-                        },
-                        ensure_ascii=False,
-                        indent=2,
-                    )
-                )
-                return 0
-
-        # 2. Exact GitHub issue body marker check across recent open+closed issues
-        recent_issues = (
-            gh_json(
-                [
-                    "issue",
-                    "list",
-                    "--state",
-                    "all",
-                    "--limit",
-                    "200",
-                    "--json",
-                    "number,title,state,url,body",
-                ]
-            )
-            or []
-        )
-        exact_matches = [
-            {k: it.get(k) for k in ("number", "title", "state", "url")}
-            for it in recent_issues
-            if marker in (it.get("body") or "")
-        ]
-        if not exact_matches:
-            search_hits = (
-                gh_json(
-                    [
-                        "issue",
-                        "list",
-                        "--state",
-                        "all",
-                        "--search",
-                        f'"{fingerprint}" in:body',
-                        "--json",
-                        "number,title,state,url,body",
-                    ]
-                )
-                or []
-            )
-            exact_matches = [
-                {k: it.get(k) for k in ("number", "title", "state", "url")}
-                for it in search_hits
-                if marker in (it.get("body") or "")
-            ]
-        if exact_matches:
-            print(
-                json.dumps(
-                    {
-                        "status": "skipped_duplicate",
-                        "source": "github",
-                        "fingerprint": fingerprint,
-                        "existing_issue": exact_matches[0],
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                )
-            )
-            return 0
-
-    meta_header = (
-        f"{marker}\n"
-        f"> **Loop Metadata**: `priority={args.priority}` · `area={args.area}` · "
-        f"`candidate_files={', '.join(candidate_files)}`\n\n"
-    )
-    full_body = meta_header + body_text
-
-    if args.dry_run:
-        print(
-            json.dumps(
-                {
-                    "status": "dry_run_valid",
-                    "title": args.title,
-                    "priority": args.priority,
-                    "area": args.area,
-                    "fingerprint": fingerprint,
-                    "candidate_files": candidate_files,
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
-        )
-        return 0
-
-    labels = ["loop:inbox", args.priority]
-    proc = run_cmd(
-        [
-            "gh",
-            "issue",
-            "create",
-            "--title",
-            args.title,
-            "--body",
-            full_body,
-            "--label",
-            ",".join(labels),
-        ]
-    )
-    issue_url = proc.stdout.strip().splitlines()[-1]
-    issue_num_match = re.search(r"/issues/(\d+)$", issue_url)
-    issue_num = int(issue_num_match.group(1)) if issue_num_match else None
-
-    append_ledger(
-        "issue_proposed",
-        {
-            "issue": issue_num,
-            "title": args.title,
-            "priority": args.priority,
-            "area": args.area,
-            "fingerprint": fingerprint,
-            "candidate_files": candidate_files,
-            "url": issue_url,
-        },
-    )
-    sync_queue_cache(delta_inbox=1)
-    print(
-        json.dumps(
-            {
-                "status": "created",
-                "issue": issue_num,
-                "url": issue_url,
-                "fingerprint": fingerprint,
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-    )
-    return 0
-
-
-def check_daily_report_due(records: List[Dict[str, Any]]) -> bool:
-    for rec in reversed(records):
-        if rec.get("event") == "daily_report_generated":
-            ts = rec.get("timestamp")
-            if ts:
-                try:
-                    last_dt = dt.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(
-                        tzinfo=dt.timezone.utc
-                    )
-                    return (utc_now() - last_dt).total_seconds() >= DAILY_REPORT_INTERVAL_HOURS * 3600
-                except ValueError:
-                    pass
-    for rec in records:
-        ts = rec.get("timestamp")
-        if ts:
-            try:
-                first_dt = dt.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(
-                    tzinfo=dt.timezone.utc
-                )
-                return (utc_now() - first_dt).total_seconds() >= DAILY_REPORT_INTERVAL_HOURS * 3600
-            except ValueError:
-                continue
-    return False
-
-
-def cmd_poll(args: argparse.Namespace) -> int:
-    ensure_dirs()
-    records = read_ledger()
-
-    if args.offline:
-        issues = []
-    else:
-        issues = (
-            gh_json(
-                [
-                    "issue",
-                    "list",
-                    "--state",
-                    "open",
-                    "--limit",
-                    "50",
-                    "--json",
-                    "number,title,labels,body,updatedAt,comments,url",
-                ]
-            )
-            or []
-        )
-
-    ready_list: List[Dict[str, Any]] = []
-    inbox_list: List[Dict[str, Any]] = []
-    in_progress_list: List[Dict[str, Any]] = []
-    blocked_list: List[Dict[str, Any]] = []
-
-    for item in issues:
-        label_names = [lbl.get("name", "") for lbl in item.get("labels", [])]
-        if "loop:daily-report" in label_names or item.get("title") == DAILY_REPORT_ISSUE_TITLE:
-            continue
-
-        design_meta = parse_design_meta(item.get("comments", []))
-        summary = {
-            "number": item["number"],
-            "title": item["title"],
-            "labels": label_names,
-            "priority_rank": priority_rank(label_names),
-            "updated_at": item.get("updatedAt"),
-            "url": item.get("url"),
-            "design_meta": design_meta,
-        }
-
-        if "loop:blocked" in label_names:
-            blocked_list.append(summary)
-        elif "loop:in-progress" in label_names:
-            # Check if stale (> LEASE_TIMEOUT_MINUTES)
-            updated_str = item.get("updatedAt")
-            is_stale = False
-            if updated_str:
-                try:
-                    upd_dt = dt.datetime.strptime(updated_str, "%Y-%m-%dT%H:%M:%SZ").replace(
-                        tzinfo=dt.timezone.utc
-                    )
-                    is_stale = (utc_now() - upd_dt).total_seconds() > LEASE_TIMEOUT_MINUTES * 60
-                except ValueError:
-                    pass
-            summary["stale_lease"] = is_stale
-            if is_stale and design_meta:
-                ready_list.append(summary)
-            else:
-                in_progress_list.append(summary)
-        elif "loop:ready" in label_names and design_meta:
-            ready_list.append(summary)
-        else:
-            inbox_list.append(summary)
-
-    ready_list.sort(key=lambda x: (x["priority_rank"], x["number"]))
-    inbox_list.sort(key=lambda x: (x["priority_rank"], x["number"]))
-
-    if ready_list:
-        recommended_action = "execute_ready"
-        target_issue = ready_list[0]
-    elif inbox_list:
-        recommended_action = "design_inbox"
-        target_issue = inbox_list[0]
-    else:
-        recommended_action = "scout_needed"
-        target_issue = None
-
-    dirty_main = get_dirty_main_files()
-    result = {
-        "timestamp": iso_now(),
-        "recommended_action": recommended_action,
-        "target_issue": target_issue,
-        "counts": {
-            "ready": len(ready_list),
-            "inbox": len(inbox_list),
-            "in_progress": len(in_progress_list),
-            "blocked": len(blocked_list),
-        },
-        "ready_queue": ready_list,
-        "inbox_queue": inbox_list,
-        "blocked_queue": blocked_list,
-        "dirty_main_files": dirty_main,
-        "daily_report_due": check_daily_report_due(records),
-    }
-    QUEUE_CACHE_PATH.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps(result, ensure_ascii=False, indent=2))
-    return 0
-
-
-def cmd_post_design(args: argparse.Namespace) -> int:
-    ensure_dirs()
-    allowed_files = [f.strip() for f in args.allowed_files.split(",") if f.strip()]
-    if args.verdict == "ready":
-        if not allowed_files:
-            raise ValueError("--allowed-files is required when --verdict=ready")
-        for fpath in allowed_files:
-            if not is_safe_repo_path(fpath):
-                raise ValueError(f"Forbidden or unsafe path in --allowed-files: {fpath}")
-            target = REPO_ROOT / fpath
-            if not target.exists() and not target.parent.exists():
-                raise ValueError(f"Path '{fpath}' (and parent dir) does not exist in repository.")
-
-    design_body = Path(args.design_file).read_text(encoding="utf-8").strip()
-    meta = {
-        "issue": args.issue,
-        "verdict": args.verdict,
-        "allowed_files": allowed_files,
-        "designed_at": iso_now(),
-    }
-    comment_body = (
-        f"## 📐 `[LOOP-DESIGN]` Pre-Implementation Contract\n\n"
-        f"<!-- loop-design-meta: {json.dumps(meta, ensure_ascii=False)} -->\n\n"
-        f"- **Verdict**: `{args.verdict.upper()}`\n"
-        f"- **Allowed Files Whitelist (`Seams`)**: {', '.join(f'`{p}`' for p in allowed_files) if allowed_files else 'N/A'}\n\n"
-        f"---\n\n"
-        f"{design_body}\n"
-    )
-
-    if not args.dry_run:
-        run_cmd(["gh", "issue", "comment", str(args.issue), "--body", comment_body])
-        new_label = "loop:ready" if args.verdict == "ready" else "loop:blocked"
-        set_issue_labels(
-            args.issue,
-            add_labels=[new_label],
-            remove_labels=["loop:inbox", "loop:in-progress"],
-        )
-
-    append_ledger(
-        "issue_designed",
-        {
-            "issue": args.issue,
-            "verdict": args.verdict,
-            "allowed_files": allowed_files,
-        },
-    )
-    if not args.dry_run:
-        sync_queue_cache(delta_inbox=-1, delta_ready=(1 if args.verdict == "ready" else 0))
-    print(json.dumps({"status": "ok", **meta}, ensure_ascii=False, indent=2))
-    return 0
-
-
-def cmd_claim(args: argparse.Namespace) -> int:
-    ensure_dirs()
-    if not args.dry_run:
-        set_issue_labels(
-            args.issue,
-            add_labels=["loop:in-progress"],
-            remove_labels=["loop:ready", "loop:inbox"],
-        )
-        sync_queue_cache(delta_ready=-1)
-    append_ledger("issue_claimed", {"issue": args.issue})
-    print(json.dumps({"status": "claimed", "issue": args.issue, "timestamp": iso_now()}, indent=2))
-    return 0
-
-
-def ensure_integration_branch() -> str:
-    proc = run_cmd(["git", "rev-parse", "--verify", INTEGRATION_BRANCH], check=False)
-    if proc.returncode != 0:
-        head_sha = run_cmd(["git", "rev-parse", "HEAD"]).stdout.strip()
-        run_cmd(["git", "branch", INTEGRATION_BRANCH, head_sha])
-    return run_cmd(["git", "rev-parse", INTEGRATION_BRANCH]).stdout.strip()
-
-
-def cmd_worktree_create(args: argparse.Namespace) -> int:
-    ensure_dirs()
-    base_sha = ensure_integration_branch()
-    wt_path = WORKTREES_DIR / f"issue-{args.issue}"
-    branch_name = f"loop/issue-{args.issue}"
-
-    if wt_path.exists():
-        run_cmd(["git", "worktree", "remove", "--force", str(wt_path)], check=False)
-        if wt_path.exists():
-            shutil.rmtree(wt_path)
-
-    run_cmd(["git", "branch", "-D", branch_name], check=False)
-    run_cmd(["git", "worktree", "add", "-b", branch_name, str(wt_path), INTEGRATION_BRANCH])
-
-    append_ledger(
-        "worktree_created",
-        {
-            "issue": args.issue,
-            "worktree": str(wt_path),
-            "branch": branch_name,
-            "base_branch": INTEGRATION_BRANCH,
-            "base_sha": base_sha,
-        },
-    )
-    print(
-        json.dumps(
-            {
-                "status": "ok",
-                "issue": args.issue,
-                "worktree_path": str(wt_path),
-                "branch": branch_name,
-                "base_branch": INTEGRATION_BRANCH,
-                "base_sha": base_sha,
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-    )
-    return 0
-
-
-def load_allowed_files_for_issue(issue_num: int, explicit_csv: Optional[str]) -> List[str]:
-    if explicit_csv:
-        return [f.strip() for f in explicit_csv.split(",") if f.strip()]
-    # Fallback 1: check ledger
-    for rec in reversed(read_ledger()):
-        if rec.get("event") == "issue_designed" and rec.get("issue") == issue_num:
-            files = rec.get("allowed_files") or []
-            if files:
-                return files
-    # Fallback 2: query GitHub issue comments
-    issue_data = gh_json(["issue", "view", str(issue_num), "--json", "comments"])
-    if issue_data:
-        meta = parse_design_meta(issue_data.get("comments", []))
-        if meta and meta.get("allowed_files"):
-            return meta["allowed_files"]
-    raise RuntimeError(
-        f"Could not find [LOOP-DESIGN] allowed_files for issue #{issue_num}. Run post-design first."
-    )
-
-
-def cmd_verify_worktree(args: argparse.Namespace) -> int:
-    ensure_dirs()
-    wt_path = Path(args.worktree) if args.worktree else (WORKTREES_DIR / f"issue-{args.issue}")
-    if not wt_path.exists():
-        raise RuntimeError(f"Worktree does not exist: {wt_path}")
-
-    allowed_files = load_allowed_files_for_issue(args.issue, args.allowed_files)
-    base_ref = args.base_ref or INTEGRATION_BRANCH
-
-    base_sha = run_cmd(["git", "rev-parse", base_ref], cwd=wt_path).stdout.strip()
-    head_sha = run_cmd(["git", "rev-parse", "HEAD"], cwd=wt_path).stdout.strip()
-
-    failures: List[str] = []
-    checks: Dict[str, Any] = {}
-
-    # 1. Check that Worker actually created a commit and working tree is clean
-    status_out = run_cmd(["git", "status", "--porcelain"], cwd=wt_path).stdout.strip()
-    if status_out:
-        failures.append(f"Worktree has uncommitted changes:\n{status_out}")
-    if head_sha == base_sha:
-        failures.append(f"No new commit on branch (HEAD {head_sha} == {base_ref}).")
-
-    # 2. Check both source and destination paths of moved files against the whitelist.
-    changed_paths = run_cmd(
-        ["git", "diff", "--name-only", "--no-renames", "-z", f"{base_ref}...HEAD"],
-        cwd=wt_path,
-    ).stdout
-    changed_files = [path for path in changed_paths.split("\0") if path]
-    checks["changed_files"] = changed_files
-    checks["allowed_files"] = allowed_files
-
-    unauthorized = [f for f in changed_files if f not in allowed_files]
-    if unauthorized:
-        failures.append(
-            f"Modified files outside [LOOP-DESIGN] whitelist: {unauthorized} (allowed: {allowed_files})"
-        )
-
-    # 3. Anti-Reward-Hacking diff scan (scoped strictly to `.rs` files)
-    diff_text = run_cmd(["git", "diff", f"{base_ref}...HEAD"], cwd=wt_path).stdout
-    current_file = ""
-    new_line_no = 0
-    added_rs_lines: List[str] = []
-    added_test_locations: List[Tuple[str, int]] = []
-
-    for raw_line in diff_text.splitlines():
-        if raw_line.startswith("diff --git "):
-            current_file = ""
-            new_line_no = 0
-            continue
-        if raw_line.startswith("+++ b/"):
-            current_file = raw_line[6:].strip()
-            continue
-        if raw_line.startswith("+++ /dev/null"):
-            current_file = ""
-            continue
-        m_hunk = re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", raw_line)
-        if m_hunk:
-            new_line_no = int(m_hunk.group(1))
-            continue
-        if not current_file.endswith(".rs"):
-            continue
-        if raw_line.startswith("+") and not raw_line.startswith("+++"):
-            content = raw_line[1:]
-            added_rs_lines.append(content)
-            if re.search(r"#\s*\[\s*(?:tokio::)?test\b", content):
-                added_test_locations.append((current_file, new_line_no))
-            new_line_no += 1
-        elif not raw_line.startswith("-"):
-            new_line_no += 1
-
-    added_rs_blob = "\n".join(added_rs_lines)
-    for pattern, reason in BANNED_DIFF_PATTERNS:
-        if re.search(pattern, added_rs_blob):
-            failures.append(reason)
-
-    # Check EVERY added #[test] / #[tokio::test] in .rs files has a WHY THIS TEST EXISTS comment attached to it
-    for test_file, test_line in added_test_locations:
-        file_abs = wt_path / test_file
-        if not file_abs.is_file():
-            continue
-        file_lines = file_abs.read_text(encoding="utf-8", errors="replace").splitlines()
-        idx = test_line - 1
-        attached: List[str] = []
-        # Walk upwards across contiguous comment / attribute lines (stop at blank line or code like `}` / `;`)
-        up = idx - 1
-        while up >= 0:
-            s = file_lines[up].strip()
-            if s.startswith("//") or s.startswith("#["):
-                attached.append(file_lines[up])
-                up -= 1
-            else:
-                break
-        # Also walk downwards until the `fn ` declaration in case doc comment sits between #[test] and fn
-        down = idx + 1
-        while down < len(file_lines):
-            s = file_lines[down].strip()
-            if s.startswith("//") or s.startswith("#["):
-                attached.append(file_lines[down])
-                down += 1
-            else:
-                break
-        if "WHY THIS TEST EXISTS" not in "\n".join(attached):
-            failures.append(
-                f"New #[test] at {test_file}:{test_line} lacks mandatory '/// WHY THIS TEST EXISTS (Issue #<N>): ...' docstring."
-            )
-
-    # 4. Check ALL `include!` fragment formatting across all crates (Lesson 002)
-    #    without breaking on pre-existing unformatted legacy files
-    discovered_includes = set()
-    crates_dir = wt_path / "crates"
-    if crates_dir.is_dir():
-        for rs_file in crates_dir.rglob("*.rs"):
-            rs_text = rs_file.read_text(encoding="utf-8", errors="replace")
-            for m in re.finditer(r'include!\s*\(\s*"([^"]+)"\s*\)', rs_text):
-                inc_target = (rs_file.parent / m.group(1)).resolve(strict=False)
-                try:
-                    discovered_includes.add(str(inc_target.relative_to(wt_path.resolve(strict=False))).replace("\\", "/"))
-                except ValueError:
-                    continue
-
-    include_rs_files = [
-        f
-        for f in changed_files
-        if f.endswith(".rs") and (f in discovered_includes or f.startswith("crates/akzio-store/src/store/"))
-    ]
-    for inc_file in include_rs_files:
-        base_blob_proc = run_cmd(
-            ["git", "show", f"{base_ref}:{inc_file}"], cwd=wt_path, check=False
-        )
-        base_formatted = False
-        if base_blob_proc.returncode == 0:
-            base_fmt_proc = subprocess.run(
-                ["rustfmt", "--edition", "2021", "--check"],
-                input=base_blob_proc.stdout,
-                text=True,
-                capture_output=True,
-                cwd=str(wt_path),
-            )
-            base_formatted = base_fmt_proc.returncode == 0
-
-        if not base_formatted:
-            checks[f"rustfmt_include:{inc_file}"] = "preexisting_unformatted_base_skipped"
-            continue
-
-        proc = run_cmd(
-            ["rustfmt", "--edition", "2021", "--check", inc_file],
-            cwd=wt_path,
-            check=False,
-        )
-        checks[f"rustfmt_include:{inc_file}"] = proc.returncode
-        if proc.returncode != 0:
-            failures.append(f"include! fragment '{inc_file}' failed rustfmt --edition 2021 --check.")
-
-    # 5. Deterministic Cargo & Shell gates
-    gate_commands: List[Tuple[str, List[str]]] = [
+        validate_changes(task, files, path)
+    except RuntimeError as exc:
+        return [str(exc)], checks
+    if not files:
+        return ["The candidate contains no file changes."], checks
+    failures = rust_diff_failures(base, head, path, files, task["id"])
+    for file in files:
+        entry = git("ls-tree", head, "--", file).stdout
+        if entry.startswith(("120000 ", "160000 ")):
+            failures.append(f"{file} introduces a symlink or submodule.")
+    if failures:
+        return failures, checks
+    failures += include_format_failures(base, path, files)
+    for name, command in (
         ("bash_syntax", ["bash", "-n", "scripts/run_core.sh"]),
-        ("git_diff_check", ["git", "diff", "--check", f"{base_ref}...HEAD"]),
+        ("git_diff_check", ["git", "diff", "--check", base, head, "--"]),
         ("cargo_fmt", ["cargo", "fmt", "--all", "--", "--check"]),
         ("cargo_check", ["cargo", "check", "--workspace", "--locked"]),
-        (
-            "cargo_clippy",
-            [
-                "cargo",
-                "clippy",
-                "--workspace",
-                "--all-targets",
-                "--all-features",
-                "--locked",
-                "--",
-                "-D",
-                "warnings",
-            ],
-        ),
+        ("cargo_clippy", ["cargo", "clippy", "--workspace", "--all-targets", "--all-features", "--locked", "--", "-D", "warnings"]),
         ("cargo_test", ["cargo", "test", "--workspace", "--locked"]),
-    ]
-
-    cargo_env = {
-        **os.environ,
-        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR") or str(SHARED_CARGO_TARGET_DIR),
-    }
-    for gate_name, gate_cmd in gate_commands:
-        cmd_env = cargo_env if gate_cmd[0] == "cargo" else None
-        proc = run_cmd(gate_cmd, cwd=wt_path, check=False, timeout=900, env=cmd_env)
-        checks[gate_name] = {
-            "exit_code": proc.returncode,
-            "command": " ".join(gate_cmd),
-        }
-        if proc.returncode != 0:
-            tail = (proc.stderr or proc.stdout)[-1200:]
-            failures.append(f"Gate '{gate_name}' failed (exit {proc.returncode}):\n{tail}")
-
-    verdict = "PASS" if not failures else "FAIL"
-    cert = {
-        "issue": args.issue,
-        "verdict": verdict,
-        "head_sha": head_sha,
-        "base_sha": base_sha,
-        "worktree": str(wt_path),
-        "timestamp": iso_now(),
-        "checks": checks,
-        "failures": failures,
-    }
-    cert_path = STATE_DIR / f"cert-issue-{args.issue}.json"
-    cert_path.write_text(json.dumps(cert, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    append_ledger(
-        "worktree_verified",
-        {
-            "issue": args.issue,
-            "verdict": verdict,
-            "head_sha": head_sha,
-            "changed_files": changed_files,
-            "failure_count": len(failures),
-        },
-    )
-    print(json.dumps(cert, ensure_ascii=False, indent=2))
-    return 0 if verdict == "PASS" else 2
-
-
-def load_verified_certificate(issue: int) -> Dict[str, Any]:
-    path = STATE_DIR / f"cert-issue-{issue}.json"
-    if not path.is_file():
-        raise RuntimeError(f"Verification certificate missing ({path}). Run verify-worktree first.")
-    cert = json.loads(path.read_text(encoding="utf-8"))
-    checks = cert.get("checks", {})
-    required_checks = ("bash_syntax", "git_diff_check", "cargo_fmt", "cargo_check", "cargo_clippy", "cargo_test")
-    if (
-        cert.get("issue") != issue
-        or cert.get("verdict") != "PASS"
-        or not cert.get("head_sha")
-        or any(checks.get(name, {}).get("exit_code") != 0 for name in required_checks)
     ):
-        raise RuntimeError(f"Run verify-worktree with all gates before accepting issue #{issue}.")
-    return cert
+        if failures:
+            break
+        proc = run_cmd(command, path, check=False, timeout=900, env=cargo_env())
+        checks[name] = proc.returncode
+        if proc.returncode:
+            failures.append(f"{name} exited {proc.returncode}: {(proc.stderr or proc.stdout)[-2400:]}")
+    return failures, checks
 
 
-def cmd_worktree_land(args: argparse.Namespace) -> int:
-    ensure_dirs()
-    wt_path = WORKTREES_DIR / f"issue-{args.issue}"
-    if not wt_path.exists():
-        raise RuntimeError(f"Worktree not found: {wt_path}")
-
-    cert = load_verified_certificate(args.issue)
-    head_sha = run_cmd(["git", "rev-parse", "HEAD"], cwd=wt_path).stdout.strip()
-    if cert["head_sha"] != head_sha:
-        raise RuntimeError(
-            f"Refusing to land unverified commit {head_sha} (cert_sha={cert['head_sha']})."
-        )
-
-    # Verify fast-forward safety so we never overwrite newer commits on INTEGRATION_BRANCH
-    is_ff = run_cmd(
-        ["git", "merge-base", "--is-ancestor", INTEGRATION_BRANCH, head_sha], check=False
+def record_failure(db, task, kind, head, *, checks=None, summary=None):
+    details = {"head_sha": head, "attempt": task["attempt"], "checks": checks, "summary": summary}
+    event(db, kind, task["id"], **details)
+    blocked = task["attempt"] >= MAX_ATTEMPTS
+    db.execute(
+        """UPDATE tasks SET status = ?, attempt = ?, attempt_base = ?, candidate_head = NULL,
+           verified_head = NULL, checks = NULL, review_summary = NULL, last_failure = ?, blocked_reason = ?
+           WHERE id = ?""",
+        ("blocked" if blocked else "in_progress", task["attempt"] + (not blocked), head,
+         json.dumps({"kind": kind, **details}, ensure_ascii=False),
+         "circuit_breaker_2_rounds" if blocked else None, task["id"]),
     )
-    if is_ff.returncode != 0:
-        raise RuntimeError(
-            f"Refusing non-fast-forward land: '{INTEGRATION_BRANCH}' has advanced beyond base of {head_sha}. "
-            f"Rebase onto '{INTEGRATION_BRANCH}' and re-run verify-worktree."
-        )
-
-    # Update INTEGRATION_BRANCH ref to head_sha without touching main working tree
-    run_cmd(["git", "branch", "-f", INTEGRATION_BRANCH, head_sha])
-    run_cmd(["git", "worktree", "remove", "--force", str(wt_path)], check=False)
-
-    append_ledger(
-        "worktree_landed",
-        {
-            "issue": args.issue,
-            "commit": head_sha,
-            "target_branch": INTEGRATION_BRANCH,
-        },
-    )
-    print(
-        json.dumps(
-            {
-                "status": "landed",
-                "issue": args.issue,
-                "commit": head_sha,
-                "target_branch": INTEGRATION_BRANCH,
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-    )
-    return 0
-
-
-def cmd_worktree_discard(args: argparse.Namespace) -> int:
-    ensure_dirs()
-    wt_path = WORKTREES_DIR / f"issue-{args.issue}"
-    branch_name = f"loop/issue-{args.issue}"
-    if wt_path.exists():
-        run_cmd(["git", "worktree", "remove", "--force", str(wt_path)], check=False)
-        if wt_path.exists():
-            shutil.rmtree(wt_path)
-    run_cmd(["git", "branch", "-D", branch_name], check=False)
-    append_ledger("worktree_discarded", {"issue": args.issue, "branch": branch_name})
-    print(json.dumps({"status": "discarded", "issue": args.issue, "branch": branch_name}, indent=2))
-    return 0
-
-
-def cmd_complete(args: argparse.Namespace) -> int:
-    ensure_dirs()
-    cert = load_verified_certificate(args.issue)
-    commit_sha = cert["head_sha"]
-    if args.commit and args.commit != commit_sha:
-        raise RuntimeError(f"Completion commit {args.commit} differs from verified commit {commit_sha}.")
-    summary_md = Path(args.summary_file).read_text(encoding="utf-8").strip()
-
-    report_comment = (
-        f"## ✅ `[LOOP-REPORT]` Autonomous Implementation & Verification Complete\n\n"
-        f"- **Issue**: `#{args.issue}`\n"
-        f"- **Landed Branch**: `{INTEGRATION_BRANCH}`\n"
-        f"- **Commit SHA**: `{commit_sha}`\n"
-        f"- **Changed Files**: {', '.join(f'`{f}`' for f in cert.get('checks', {}).get('changed_files', []))}\n"
-        f"- **Verification Level**: `{args.verification_level}`\n"
-        f"- **Timestamp**: `{iso_now()}`\n\n"
-        f"---\n\n"
-        f"{summary_md}\n"
-    )
-
-    if not args.dry_run:
-        issue_info = gh_json(["issue", "view", str(args.issue), "--json", "labels"]) or {}
-        prev_labels = {lbl.get("name", "") for lbl in issue_info.get("labels", [])}
-        run_cmd(["gh", "issue", "comment", str(args.issue), "--body", report_comment])
-        set_issue_labels(
-            args.issue,
-            add_labels=["loop:done"],
-            remove_labels=["loop:in-progress", "loop:ready", "loop:inbox"],
-        )
-        if args.close:
-            run_cmd(["gh", "issue", "close", str(args.issue)])
-        sync_queue_cache(
-            delta_ready=(-1 if "loop:ready" in prev_labels else 0),
-            delta_inbox=(-1 if "loop:inbox" in prev_labels else 0),
-        )
-
-    append_ledger(
-        "issue_completed",
-        {
-            "issue": args.issue,
-            "commit": commit_sha,
-            "branch": INTEGRATION_BRANCH,
-            "verification_level": args.verification_level,
-            "closed": bool(args.close),
-        },
-    )
-    print(
-        json.dumps(
-            {
-                "status": "completed",
-                "issue": args.issue,
-                "commit": commit_sha,
-                "branch": INTEGRATION_BRANCH,
-                "closed": bool(args.close),
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-    )
-    return 0
-
-
-def cmd_block(args: argparse.Namespace) -> int:
-    ensure_dirs()
-    reason_text = Path(args.report_file).read_text(encoding="utf-8").strip()
-    comment_body = (
-        f"## 🛑 `[LOOP-BLOCKED]` Non-Blocking Circuit Breaker / Human Decision Needed\n\n"
-        f"- **Issue**: `#{args.issue}`\n"
-        f"- **Reason Code**: `{args.reason_code}`\n"
-        f"- **Timestamp**: `{iso_now()}`\n"
-        f"- **Loop Action**: Skipped automatically to keep the 24h queue moving (`0-human-blocking`).\n\n"
-        f"---\n\n"
-        f"{reason_text}\n"
-    )
-
-    if not args.dry_run:
-        issue_info = gh_json(["issue", "view", str(args.issue), "--json", "labels"]) or {}
-        prev_labels = {lbl.get("name", "") for lbl in issue_info.get("labels", [])}
-        run_cmd(["gh", "issue", "comment", str(args.issue), "--body", comment_body])
-        set_issue_labels(
-            args.issue,
-            add_labels=["loop:blocked"],
-            remove_labels=["loop:in-progress", "loop:ready", "loop:inbox"],
-        )
-        sync_queue_cache(
-            delta_ready=(-1 if "loop:ready" in prev_labels else 0),
-            delta_inbox=(-1 if "loop:inbox" in prev_labels else 0),
-        )
-
-    append_ledger(
-        "issue_blocked",
-        {
-            "issue": args.issue,
-            "reason_code": args.reason_code,
-        },
-    )
-    notify_human(
-        subject=f"[Akzio Loop Blocked] Issue #{args.issue} ({args.reason_code})",
-        body=reason_text,
-        metadata={"issue": args.issue, "reason_code": args.reason_code},
-    )
-    print(
-        json.dumps(
-            {"status": "blocked", "issue": args.issue, "reason_code": args.reason_code},
-            ensure_ascii=False,
-            indent=2,
-        )
-    )
-    return 0
-
-
-def ensure_daily_report_issue() -> Optional[int]:
-    issues = (
-        gh_json(
-            [
-                "issue",
-                "list",
-                "--state",
-                "open",
-                "--label",
-                "loop:daily-report",
-                "--json",
-                "number,title",
-            ]
-        )
-        or []
-    )
-    if issues:
-        return int(issues[0]["number"])
-
-    proc = run_cmd(
-        [
-            "gh",
-            "issue",
-            "create",
-            "--title",
-            DAILY_REPORT_ISSUE_TITLE,
-            "--label",
-            "loop:daily-report",
-            "--body",
-            (
-                "# 📊 Akzio 24h Autonomous Agent Loop — Daily Reports\n\n"
-                "本 Issue 由 `.agents/loop/bin/issue_hub.py daily-report` 自动维护，"
-                "每日汇总 24h 无人值守研发 Loop 的设计、验证、提交、熔断与待人工决策事项。\n"
-            ),
-        ]
-    )
-    url = proc.stdout.strip().splitlines()[-1]
-    m = re.search(r"/issues/(\d+)$", url)
-    return int(m.group(1)) if m else None
-
-
-def cmd_daily_report(args: argparse.Namespace) -> int:
-    ensure_dirs()
-    cutoff = utc_now() - dt.timedelta(hours=args.hours)
-    records = read_ledger()
-
-    window_records = []
-    for rec in records:
-        ts = rec.get("timestamp")
-        if not ts:
-            continue
-        try:
-            rec_dt = dt.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(
-                tzinfo=dt.timezone.utc
-            )
-            if rec_dt >= cutoff:
-                window_records.append(rec)
-        except ValueError:
-            continue
-
-    completed = [r for r in window_records if r.get("event") == "issue_completed"]
-    designed = [r for r in window_records if r.get("event") == "issue_designed"]
-    proposed = [r for r in window_records if r.get("event") == "issue_proposed"]
-    blocked = [r for r in window_records if r.get("event") == "issue_blocked"]
-    verified = [r for r in window_records if r.get("event") == "worktree_verified"]
-    failed_verifications = [r for r in verified if r.get("verdict") == "FAIL"]
-
-    date_str = utc_now().strftime("%Y-%m-%d")
-    report_lines = [
-        f"# 📊 Akzio 24h Agent Loop 日报 ({date_str})",
-        "",
-        f"- **统计窗口**: 过去 `{args.hours}` 小时（截至 `{iso_now()}`）",
-        f"- **集成分支**: `{INTEGRATION_BRANCH}`",
-        "",
-        "## 1. 核心吞吐与质量概览",
-        "",
-        "| 指标 | 数量 | 说明 |",
-        "|---|---|---|",
-        f"| 🔍 新发现并提单 (`issue_proposed`) | {len(proposed)} | 由 `issue-scout` 或人工通过指纹去重提单 |",
-        f"| 📐 完成架构设计 (`issue_designed`) | {len(designed)} | Leader 发布 `[LOOP-DESIGN]` 契约并锁定白名单 |",
-        f"| 🛡️ 反压门禁执行 (`worktree_verified`) | {len(verified)} | 拦截不合规/未过测提交 `{len(failed_verifications)}` 次 |",
-        f"| ✅ 完成并合入 (`issue_completed`) | {len(completed)} | 通过 Cargo 全门禁 + 双轴盲审并合入 `{INTEGRATION_BRANCH}` |",
-        f"| 🛑 触发熔断/待决策 (`issue_blocked`) | {len(blocked)} | 0 人工阻塞自动跳过，等待后续拍板 |",
-        "",
-        "## 2. 本周期已完成 Issues (`loop:done`)",
-        "",
-    ]
-
-    if completed:
-        for item in completed:
-            report_lines.append(
-                f"- **Issue #{item.get('issue')}** — Commit `{item.get('commit')}` "
-                f"(`{item.get('verification_level')}`)"
-            )
-    else:
-        report_lines.append("- 本周期暂无新合入的 Issue。")
-
-    report_lines.extend(["", "## 3. 阻塞与待人类拍板项 (`loop:blocked`)", ""])
     if blocked:
-        for item in blocked:
-            report_lines.append(
-                f"- **Issue #{item.get('issue')}** — 原因: `{item.get('reason_code')}` "
-                f"（详见对应 Issue 下方的 `[LOOP-BLOCKED]` 评论）"
-            )
-    else:
-        report_lines.append("- 本周期无新增阻塞项。")
+        event(db, "task_blocked", task["id"], reason="circuit_breaker_2_rounds", attempt=task["attempt"])
+    return "blocked" if blocked else "in_progress"
 
-    report_lines.extend(["", "## 4. 新提单与下一周期预告 (`loop:inbox` / `loop:ready`)", ""])
-    if proposed:
-        for item in proposed:
-            report_lines.append(
-                f"- **Issue #{item.get('issue')}** (`{item.get('priority')}` / `{item.get('area')}`): "
-                f"{item.get('title')}"
-            )
-    else:
-        report_lines.append("- 本周期无新提单。")
 
-    report_md = "\n".join(report_lines) + "\n"
-    report_path = Path(args.output) if args.output else (REPORTS_DIR / f"daily-{date_str}.md")
-    report_path.write_text(report_md, encoding="utf-8")
+def cmd_verify(args):
+    with process_lock("control"), open_db() as db:
+        with transaction(db):
+            task = worker_task(db, args)
+        path = check_worktree(task)
+        head = task["candidate_head"]
+        if not head or git("rev-parse", "HEAD", cwd=path).stdout.strip() != head or pending_files(path):
+            failures = ["The Worker did not leave a recorded candidate commit and a clean worktree."]
+            checks = {}
+            head = head or task["attempt_base"]
+        else:
+            with detached_snapshot(head) as snapshot:
+                try:
+                    failures, checks = check_candidate(task, snapshot, head)
+                except subprocess.TimeoutExpired as exc:
+                    failures = [f"The {exc.cmd[0]} verification command timed out after {exc.timeout:g}s."]
+                    checks = {}
+        with transaction(db):
+            require_wave(db, args.wave, renew=True)
+            if failures:
+                status = record_failure(db, task, "gate_failed", head, checks=checks, summary=failures)
+            else:
+                status = "verified"
+                db.execute(
+                    "UPDATE tasks SET status = 'verified', verified_head = ?, checks = ? WHERE id = ?",
+                    (head, json.dumps(checks), args.task),
+                )
+                event(db, "gate_passed", args.task, head_sha=head, attempt=task["attempt"])
+    emit({"status": status, "verdict": "FAIL" if failures else "PASS", "head_sha": head, "checks": checks, "failures": failures})
+    return 2 if failures else 0
 
-    published_issue = None
-    if args.publish_github and not args.dry_run:
-        published_issue = ensure_daily_report_issue()
-        if published_issue:
-            run_cmd(["gh", "issue", "comment", str(published_issue), "--body", report_md])
 
-    append_ledger(
-        "daily_report_generated",
-        {
-            "report_path": str(report_path),
-            "published_issue": published_issue,
-            "completed_count": len(completed),
-            "blocked_count": len(blocked),
-        },
-    )
-    if not args.dry_run:
-        sync_queue_cache(daily_report_due=False)
-    notify_human(
-        subject=f"[Akzio Loop Daily Report] {date_str}",
-        body=report_md,
-        metadata={"report_path": str(report_path), "published_issue": published_issue},
-    )
-    print(
-        json.dumps(
-            {
-                "status": "ok",
-                "report_path": str(report_path),
-                "published_issue": published_issue,
-                "summary": {
-                    "proposed": len(proposed),
-                    "designed": len(designed),
-                    "completed": len(completed),
-                    "blocked": len(blocked),
-                },
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-    )
+def cmd_show_diff(args):
+    with open_db(readonly=True) as db:
+        require_wave(db, args.wave)
+        task = task_row(db, args.task)
+        if task["wave"] != args.wave or task["status"] != "verified":
+            raise RuntimeError("Only the current verified candidate can be reviewed.")
+    print(git("diff", "--no-ext-diff", "--no-textconv", task["base_sha"], task["verified_head"], "--").stdout, end="")
     return 0
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Akzio 24h Autonomous Loop — GitHub Issues Hub & Backpressure CLI"
-    )
+def cmd_review(args):
+    if not SHA.fullmatch(args.head) or not args.summary.strip():
+        raise ValueError("A full reviewed commit SHA and a nonempty review are required.")
+    with process_lock("control"), open_db() as db, transaction(db):
+        task = owned_task(db, args.task, args.wave, ("verified",))
+        if task["verified_head"] != args.head:
+            raise RuntimeError("The independently reviewed SHA differs from the mechanically verified SHA.")
+        if args.verdict == "REJECT":
+            status = record_failure(db, task, "review_rejected", args.head, summary=args.summary)
+        else:
+            status = "reviewed"
+            db.execute("UPDATE tasks SET status = 'reviewed', review_summary = ? WHERE id = ?", (args.summary, args.task))
+            event(db, "review_passed", args.task, head_sha=args.head, attempt=task["attempt"])
+    return emit({"status": status, "task": args.task, "head_sha": args.head})
+
+
+def cmd_review_missing(args):
+    with process_lock("control"), open_db() as db, transaction(db):
+        task = owned_task(db, args.task, args.wave, ("verified",))
+        if task["verified_head"] != args.head:
+            raise RuntimeError("This attempt is no longer awaiting that review.")
+        status = record_failure(db, task, "review_missing", args.head,
+                                summary="Verifier finished without recording a verdict.")
+    return emit({"status": status, "task": args.task, "head_sha": args.head})
+
+
+def cmd_land(args):
+    with process_lock("control"), open_db() as db:
+        with transaction(db):
+            require_wave(db, args.wave, renew=True)
+            task = task_row(db, args.task)
+            if task["status"] == "done":
+                return emit(task_view(task))
+            owned_task(db, args.task, args.wave, ("reviewed", "landing"))
+            head = task["verified_head"]
+            base = task["base_sha"]
+            if not head or not task["review_summary"] or not task["checks"]:
+                raise RuntimeError("Landing requires both gate and review evidence for the candidate.")
+            if task["status"] == "reviewed":
+                db.execute("UPDATE tasks SET status = 'landing' WHERE id = ?", (args.task,))
+                event(db, "landing_intent", args.task, base_sha=base, head_sha=head)
+        current = ref_commit(INTEGRATION_REF)
+        if current == base:
+            if not is_ancestor(base, head):
+                raise RuntimeError("The candidate cannot fast-forward the frozen base.")
+            branches = git("worktree", "list", "--porcelain", "-z").stdout.split("\0")
+            if f"branch {INTEGRATION_REF}" in branches:
+                raise RuntimeError("The integration branch is checked out in a worktree.")
+            moved = git("update-ref", INTEGRATION_REF, head, base, check=False)
+            current = head if moved.returncode == 0 else ref_commit(INTEGRATION_REF)
+            if current == base:
+                raise RuntimeError(f"Could not update the integration ref: {moved.stderr.strip()}")
+        landed = current is not None and is_ancestor(head, current)
+        with transaction(db):
+            if landed:
+                db.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (args.task,))
+                event(db, "task_landed", args.task, base_sha=base, head_sha=head)
+            else:
+                db.execute("UPDATE tasks SET status = 'blocked', blocked_reason = 'integration_advanced' WHERE id = ?", (args.task,))
+                event(db, "task_blocked", args.task, reason="integration_advanced", base_sha=base, head_sha=head)
+        path = worktree_path(args.task)
+        if landed and path.is_dir():
+            cleaned = git("worktree", "remove", str(path), check=False)
+            if cleaned.returncode:
+                print(f"Task #{args.task} is done; retained worktree at {path}.", file=sys.stderr)
+        return emit(task_view(task_row(db, args.task)))
+
+
+def cmd_daily_report(args):
+    with process_lock("report"), open_db() as db, transaction(db):
+        now = utc_timestamp()
+        if args.if_due:
+            since = db.execute("SELECT max(created_at) FROM events WHERE kind = 'daily_report'").fetchone()[0]
+            if since is None:
+                since = db.execute("SELECT created_at FROM loop_info").fetchone()[0]
+            if now - since < 24 * 3600:
+                return emit({"status": "not_due"})
+        rows = db.execute("SELECT * FROM events WHERE created_at >= ? ORDER BY id", (now - 24 * 3600,)).fetchall()
+        counts = Counter(row["kind"] for row in rows)
+        date = iso_time(now)[:10]
+        lines = [f"# Akzio Loop 日报 {date}", "", f"截至 `{iso_time(now)}` 的过去 24 小时。", ""]
+        lines.extend(f"- `{kind}` × {count}" for kind, count in sorted(counts.items()))
+        for row in rows:
+            if row["kind"] == "task_landed":
+                details = json.loads(row["details"])
+                lines.append(f"- Task #{row['task_id']} → `{details['head_sha']}` (`offline-verified`)")
+            if row["kind"] == "task_blocked":
+                details = json.loads(row["details"])
+                lines.append(f"- Task #{row['task_id']} · `{details['reason']}`")
+        path = REPORTS_DIR / f"daily-{date}.md"
+        with tempfile.NamedTemporaryFile(mode="w", dir=REPORTS_DIR, encoding="utf-8", delete=False) as report:
+            report.write("\n".join(lines) + "\n")
+        os.replace(report.name, path)
+        event(db, "daily_report", landed=counts["task_landed"], blocked=counts["task_blocked"])
+    return emit({"status": "generated", "path": str(path), "counts": dict(counts)})
+
+
+def audit_marker(identity, event_id):
+    return f"<!-- akzio-loop-event:{identity}:{event_id} -->"
+
+
+def audit_line(row):
+    data = json.loads(row["details"])
+    fields = ("priority", "attempt", "base_sha", "head_sha", "reason", "landed", "blocked")
+    details = " · ".join(f"{key}=`{data[key]}`" for key in fields if key in data)
+    task = f" · Task #{row['task_id']}" if row["task_id"] else ""
+    return f"- `{iso_time(row['created_at'])}` · `{row['kind']}`{task}" + (f" · {details}" if details else "")
+
+
+def cmd_publish_log(args):
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", args.repo) or args.issue <= 0:
+        raise ValueError("The audit destination requires OWNER/REPO and a positive Issue number.")
+    destination = f"{args.repo.lower()}#{args.issue}"
+    endpoint = f"repos/{args.repo}/issues/{args.issue}/comments"
+    with process_lock("publish"), open_db() as db:
+        identity = db.execute("SELECT identity FROM loop_info").fetchone()[0]
+        rows = db.execute(
+            """SELECT e.* FROM events e WHERE NOT EXISTS (
+                SELECT 1 FROM deliveries d WHERE d.destination = ? AND d.event_id = e.id
+            ) ORDER BY e.id LIMIT 25""", (destination,),
+        ).fetchall()
+        if not rows:
+            return emit({"status": "up_to_date", "events": 0})
+        actor = run_cmd(["gh", "api", "user"], timeout=15)
+        actor_id = json.loads(actor.stdout)["id"]
+        comments = run_cmd(["gh", "api", "--paginate", "--slurp", f"{endpoint}?per_page=100"], timeout=30)
+        observed = {}
+        for page in json.loads(comments.stdout):
+            for comment in page:
+                if (comment.get("user") or {}).get("id") == actor_id:
+                    for marker in re.findall(r"<!-- akzio-loop-event:[0-9a-f]{32}:\d+ -->", comment.get("body") or ""):
+                        observed[marker] = comment["id"]
+        receipts = {
+            row["id"]: observed[audit_marker(identity, row["id"])]
+            for row in rows if audit_marker(identity, row["id"]) in observed
+        }
+        pending = [row for row in rows if row["id"] not in receipts]
+        if pending:
+            body = "## Akzio Loop 审计日志\n\n" + "\n".join(
+                f"{audit_line(row)}\n{audit_marker(identity, row['id'])}" for row in pending
+            )
+            posted = run_cmd(["gh", "api", "--method", "POST", endpoint, "--input", "-"], timeout=30,
+                             input_text=json.dumps({"body": body}, ensure_ascii=False))
+            comment_id = json.loads(posted.stdout)["id"]
+            receipts.update((row["id"], comment_id) for row in pending)
+        with transaction(db):
+            db.executemany(
+                "INSERT OR IGNORE INTO deliveries (destination, event_id, comment_id) VALUES (?, ?, ?)",
+                [(destination, event_id, comment_id) for event_id, comment_id in receipts.items()],
+            )
+    return emit({"status": "published", "events": len(rows), "new_events": len(pending)})
+
+
+def cmd_init(args):
+    with open_db():
+        pass
+    return cmd_poll(args)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_init = sub.add_parser("init-labels", help="Create/sync loop:* and priority labels on GitHub")
-    p_init.add_argument("--dry-run", action="store_true")
-    p_init.set_defaults(func=cmd_init_labels)
+    def command(name, func, *, task=False, wave=False):
+        child = sub.add_parser(name, allow_abbrev=False)
+        child.set_defaults(func=func)
+        if task:
+            child.add_argument("--task", type=int, required=True)
+        if wave:
+            child.add_argument("--wave", required=True)
+        return child
 
-    p_poll = sub.add_parser("poll", help="Fetch GitHub Issues queue and compute next Leader action")
-    p_poll.add_argument("--offline", action="store_true", help="Do not call gh; inspect local ledger only")
-    p_poll.set_defaults(func=cmd_poll)
-
-    p_prop = sub.add_parser("propose", help="Propose a deduplicated, grounded issue into loop:inbox")
-    p_prop.add_argument("--title", required=True)
-    p_prop.add_argument("--priority", choices=["P1", "P2", "P3"], default="P2")
-    p_prop.add_argument("--area", required=True)
-    p_prop.add_argument("--fingerprint", required=True)
-    p_prop.add_argument("--candidate-files", required=True, help="Comma-separated existing repo files")
-    p_prop.add_argument("--body-file", required=True)
-    p_prop.add_argument("--dry-run", action="store_true")
-    p_prop.set_defaults(func=cmd_propose)
-
-    p_design = sub.add_parser("post-design", help="Publish Stage-1 [LOOP-DESIGN] contract onto an issue")
-    p_design.add_argument("--issue", type=int, required=True)
-    p_design.add_argument("--allowed-files", default="", help="Comma-separated repo-relative paths")
-    p_design.add_argument("--design-file", required=True)
-    p_design.add_argument("--verdict", choices=["ready", "blocked"], default="ready")
-    p_design.add_argument("--dry-run", action="store_true")
-    p_design.set_defaults(func=cmd_post_design)
-
-    p_claim = sub.add_parser("claim", help="Mark a loop:ready issue as loop:in-progress")
-    p_claim.add_argument("--issue", type=int, required=True)
-    p_claim.add_argument("--dry-run", action="store_true")
-    p_claim.set_defaults(func=cmd_claim)
-
-    p_wt_create = sub.add_parser(
-        "worktree-create", help="Create isolated Git worktree branched from loop/nightly"
-    )
-    p_wt_create.add_argument("--issue", type=int, required=True)
-    p_wt_create.set_defaults(func=cmd_worktree_create)
-
-    p_verify = sub.add_parser(
-        "verify-worktree", help="Run deterministic Agent Backpressure checks on an issue worktree"
-    )
-    p_verify.add_argument("--issue", type=int, required=True)
-    p_verify.add_argument("--worktree", default="")
-    p_verify.add_argument("--base-ref", default="")
-    p_verify.add_argument("--allowed-files", default="")
-    p_verify.set_defaults(func=cmd_verify_worktree)
-
-    p_land = sub.add_parser(
-        "worktree-land", help="Land a verified issue worktree commit onto loop/nightly"
-    )
-    p_land.add_argument("--issue", type=int, required=True)
-    p_land.set_defaults(func=cmd_worktree_land)
-
-    p_discard = sub.add_parser(
-        "worktree-discard", help="Discard an unmerged issue worktree (2-round circuit breaker)"
-    )
-    p_discard.add_argument("--issue", type=int, required=True)
-    p_discard.set_defaults(func=cmd_worktree_discard)
-
-    p_comp = sub.add_parser(
-        "complete", help="Post [LOOP-REPORT] to GitHub Issue and transition to loop:done"
-    )
-    p_comp.add_argument("--issue", type=int, required=True)
-    p_comp.add_argument("--commit", default="")
-    p_comp.add_argument("--summary-file", required=True)
-    p_comp.add_argument("--verification-level", default="offline-verified")
-    p_comp.add_argument("--close", action="store_true")
-    p_comp.add_argument("--dry-run", action="store_true")
-    p_comp.set_defaults(func=cmd_complete)
-
-    p_block = sub.add_parser(
-        "block", help="Post [LOOP-BLOCKED] to GitHub Issue and transition to loop:blocked"
-    )
-    p_block.add_argument("--issue", type=int, required=True)
-    p_block.add_argument(
-        "--reason-code",
-        choices=["circuit_breaker_2_rounds", "needs_product_decision", "contract_boundary"],
-        required=True,
-    )
-    p_block.add_argument("--report-file", required=True)
-    p_block.add_argument("--dry-run", action="store_true")
-    p_block.set_defaults(func=cmd_block)
-
-    p_daily = sub.add_parser("daily-report", help="Generate and optionally publish 24h daily report")
-    p_daily.add_argument("--hours", type=int, default=24)
-    p_daily.add_argument("--output", default="")
-    p_daily.add_argument("--publish-github", action="store_true")
-    p_daily.add_argument("--dry-run", action="store_true")
-    p_daily.set_defaults(func=cmd_daily_report)
-
+    command("init", cmd_init)
+    command("start-wave", cmd_start_wave)
+    command("finish-wave", cmd_finish_wave, wave=True)
+    command("poll", cmd_poll)
+    command("show", cmd_show, task=True)
+    command("list", cmd_list).add_argument("--status", choices=("inbox", "ready", *RESUMABLE, "done", "blocked"))
+    propose = command("propose", cmd_propose)
+    for option in ("title", "area", "fingerprint", "candidate-files", "body-file"):
+        propose.add_argument(f"--{option}", required=True)
+    propose.add_argument("--priority", choices=PRIORITIES, default="P2")
+    propose.add_argument("--dry-run", action="store_true")
+    design = command("post-design", cmd_post_design, task=True, wave=True)
+    design.add_argument("--allowed-files", required=True)
+    design.add_argument("--design-file", required=True)
+    command("claim", cmd_claim, task=True, wave=True)
+    test = command("worker-test", cmd_worker_test, task=True, wave=True)
+    test.add_argument("--attempt", type=int, required=True)
+    test.add_argument("--crate", required=True)
+    test.add_argument("--filter")
+    commit = command("worker-commit", cmd_worker_commit, task=True, wave=True)
+    commit.add_argument("--attempt", type=int, required=True)
+    commit.add_argument("--message", required=True)
+    command("verify-worktree", cmd_verify, task=True, wave=True).add_argument("--attempt", type=int, required=True)
+    command("show-diff", cmd_show_diff, task=True, wave=True)
+    review = command("review", cmd_review, task=True, wave=True)
+    review.add_argument("--head", required=True)
+    review.add_argument("--verdict", choices=("PASS", "REJECT"), required=True)
+    review.add_argument("--summary", required=True)
+    command("review-missing", cmd_review_missing, task=True, wave=True).add_argument("--head", required=True)
+    command("worktree-land", cmd_land, task=True, wave=True)
+    block = command("block", cmd_block, task=True, wave=True)
+    block.add_argument("--reason-code", choices=("needs_product_decision", "contract_boundary"), required=True)
+    block.add_argument("--report-file", required=True)
+    command("daily-report", cmd_daily_report).add_argument("--if-due", action="store_true")
+    audit = command("publish-log", cmd_publish_log)
+    audit.add_argument("--repo", required=True)
+    audit.add_argument("--issue", type=int, required=True)
     return parser
 
 
-def main() -> int:
-    parser = build_parser()
-    args = parser.parse_args()
+def main():
+    args = build_parser().parse_args()
     try:
         return args.func(args)
-    except Exception as exc:
-        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
+    except (RuntimeError, ValueError, KeyError, OSError, sqlite3.Error, subprocess.TimeoutExpired) as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False), file=sys.stderr)
         return 1
 
 

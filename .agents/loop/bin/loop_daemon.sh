@@ -1,152 +1,162 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
-# Akzio 24h Unattended Agent Loop Runner
-# Coordinates fresh-context Leader waves via Antigravity `agentapi new-conversation`
-# and bridges everything through GitHub Issues (`issue_hub.py`).
+umask 077
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
+cd "$REPO_ROOT"
 ISSUE_HUB="$REPO_ROOT/.agents/loop/bin/issue_hub.py"
-AGENTAPI_BIN="${AGENTAPI_BIN:-$HOME/.gemini/antigravity/bin/agentapi}"
-LEADER_MODEL="${LEADER_MODEL:-pro}"
+AGY_BIN="${AGY_BIN:-agy}"
+LEADER_MODEL="${LEADER_MODEL:-}"
 WAVE_INTERVAL_SECS="${WAVE_INTERVAL_SECS:-900}"
-STATE_DIR="$REPO_ROOT/outputs/loop/state"
 LOG_DIR="$REPO_ROOT/outputs/loop/logs"
-LOCK_DIR="$STATE_DIR/wave.lock"
-mkdir -p "$STATE_DIR" "$LOG_DIR"
 
 usage() {
   cat <<'EOF'
 Usage: bash .agents/loop/bin/loop_daemon.sh <command> [options]
 
 Commands:
-  init            Initialize GitHub labels (loop:inbox, loop:ready, loop:done, loop:blocked, etc.)
-  status          Poll GitHub Issues queue and print current state JSON
-  wave            Launch a single fresh-context Leader wave via Antigravity `agentapi`
-  daemon          Run the 24h continuous unattended loop (wakes Leader on each interval + daily report)
-  daily-report    Generate the 24h daily report immediately and publish to GitHub Issues
+  init            Initialize local state and print the queue JSON
+  status          Print the local queue JSON
+  wave            Run one Leader wave if the SQLite lease is available
+  daemon          Run waves on a cadence and generate due reports locally
+  daily-report    Generate a local report now (or only if due with --if-due)
+  publish-log     Append pending audit events to an existing GitHub issue
+                  Usage: publish-log --repo OWNER/REPO --issue N
 
 Environment overrides:
-  LEADER_MODEL=pro              Model tier or explicit model ID (e.g. default/gemini-4-hydrogen:xhigh)
-                                Note: `agentapi` falls back to `flash` if a specified model ID is unavailable.
-  WAVE_INTERVAL_SECS=900        Seconds between waves in `daemon` mode (default: 900s = 15m)
-  AGENTAPI_BIN=/path/agentapi   Path to Antigravity `agentapi` binary
+  AGY_BIN=agy                  Path or command name of the Antigravity CLI
+  LEADER_MODEL=<model>         Optional AGY model slug; otherwise use the agent configuration
+  WAVE_INTERVAL_SECS=900       Seconds between daemon ticks
+  AKZIO_LOOP_AUDIT_REPO         Optional daemon audit destination (OWNER/REPO)
+  AKZIO_LOOP_AUDIT_ISSUE        Existing issue number in that repository; set both audit variables
 EOF
 }
 
-acquire_wave_lock() {
-  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-    local old_pid=""
-    if [[ -f "$LOCK_DIR/pid" ]]; then
-      old_pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
-    fi
-    if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
-      echo "[SKIP] Another loop wave (pid=$old_pid) is still running; skipping overlapping tick." >&2
-      return 1
-    fi
-
-    echo "[WARN] Removing stale wave lock (pid=${old_pid:-unknown})." >&2
-    rm -rf "$LOCK_DIR" || return
-    mkdir "$LOCK_DIR" || return
-  fi
-
-  trap 'rm -rf "$LOCK_DIR"' EXIT
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
-  printf '%s\n' "${BASHPID:-$$}" >"$LOCK_DIR/pid"
-}
-
-build_wave_prompt() {
-  local poll_json="$1"
-  cat <<EOF
-[AKZIO-AUTONOMOUS-LOOP]
-你是 Akzio 24h 无人值守研发循环的 Loop Leader。请严格按照 \`.agents/agents/loop-leader.md\` 与 \`.agents/skills/autonomous-loop/SKILL.md\` 执行本轮波次（One Issue Per Wave Step）：
-
-当前 \`issue_hub.py poll\` 快照：
-\`\`\`json
-$poll_json
-\`\`\`
-
-执行要求：
-1. 派发任何子智能体（\`issue-scout\` / \`rust-worker\` / \`rust-verifier\`）时，必须在子智能体 Prompt 首行写入 \`[AKZIO-LOOP-SUBAGENT]\`（**禁止**把 \`[AKZIO-AUTONOMOUS-LOOP]\` 传给子智能体，以免误触发 Leader 的 \`Stop\` 续跑钩子）。
-2. 若 \`recommended_action == "design_inbox"\`：对目标 Issue 执行 Stage 1 设计，核查源码与红线（参考 \`dirty_main_files\`，避免与主工作区未提交修改冲突），通过 \`python3 .agents/loop/bin/issue_hub.py post-design\` 发布 \`[LOOP-DESIGN]\`（或遇到产品决策项通过 \`issue_hub.py block\` 标记 \`loop:blocked\`）。
-3. 若 \`recommended_action == "execute_ready"\`：先运行 \`issue_hub.py claim\` 与 \`issue_hub.py worktree-create\` 创建隔离工作区 \`outputs/loop/worktrees/issue-<N>\`（绝不改动主工作区未提交文件），再通过 \`invoke_subagent(TypeName="rust-worker", Model="flash")\` 派发实现；随后运行 \`issue_hub.py verify-worktree\` 确定性反压检查，并派发 \`invoke_subagent(TypeName="rust-verifier", Model="flash")\` 双轴盲审；通过后执行 \`worktree-land\` 与 \`complete --close\` 发布 \`[LOOP-REPORT]\`，连续 2 轮不过则触发熔断 \`worktree-discard\` + \`block\`。
-4. 若 \`recommended_action == "scout_needed"\`：唤醒 \`invoke_subagent(TypeName="issue-scout", Model="flash")\` 按巡检指南核对代码库和可用的本地审计台账，排除已有修复并调用 \`issue_hub.py propose\` 提交 1~3 个带去重指纹的新 Issue，随后为首个新 Issue 完成 Stage 1 \`[LOOP-DESIGN]\`。
-5. 若 \`daily_report_due == true\`（仅当外部未提前发布时为 true）：在本轮末尾运行 \`python3 .agents/loop/bin/issue_hub.py daily-report --hours 24 --publish-github\`。
-EOF
-}
-
-# Run each wave in a subshell so its EXIT trap releases the lock before the next wave.
-run_single_wave() (
-  acquire_wave_lock || return 0
-
-  local ts
-  ts="$(date -u +%Y%m%dT%H%M%SZ)"
-  local wave_log="$LOG_DIR/wave-$ts.log"
-
-  echo "[$ts] Polling GitHub Issues queue..." | tee -a "$wave_log"
-  local poll_json
-  poll_json="$(python3 "$ISSUE_HUB" poll)" || return
-  echo "$poll_json" >>"$wave_log"
-
-  local action
-  action="$(printf '%s' "$poll_json" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("recommended_action",""))')" || return
-  local daily_due
-  daily_due="$(printf '%s' "$poll_json" | python3 -c 'import sys,json; print(str(json.load(sys.stdin).get("daily_report_due",False)).lower())')" || return
-
-  if [[ "$daily_due" == "true" ]]; then
-    echo "[$ts] 24h Daily Report is due; generating and publishing to GitHub Issues..." | tee -a "$wave_log"
-    python3 "$ISSUE_HUB" daily-report --hours 24 --publish-github | tee -a "$wave_log" || return
-    # Refresh poll snapshot so Leader does not emit a duplicate daily report in the same wave
-    poll_json="$(python3 "$ISSUE_HUB" poll)" || return
-    echo "$poll_json" >>"$wave_log"
-  fi
-
-  local prompt
-  prompt="$(build_wave_prompt "$poll_json")" || return
-
-  if [[ ! -x "$AGENTAPI_BIN" ]]; then
-    echo "ERROR: agentapi binary not found at $AGENTAPI_BIN" | tee -a "$wave_log" >&2
+run_single_wave() {
+  local agy_bin wave_json wave timestamp log prompt
+  if ! agy_bin="$(type -P "$AGY_BIN")"; then
+    printf 'ERROR: Antigravity CLI %s is unavailable. Set AGY_BIN to its executable.\n' "$AGY_BIN" >&2
     return 1
   fi
+  mkdir -p "$LOG_DIR" || return
+  timestamp="$(date -u +%Y%m%dT%H%M%SZ)" || return
 
-  echo "[$ts] Launching fresh-context Leader wave (profile=loop-leader, action=$action, model=$LEADER_MODEL)..." | tee -a "$wave_log"
-  "$AGENTAPI_BIN" new-conversation \
-    --profile="loop-leader" \
-    --model="$LEADER_MODEL" \
-    --title="Akzio Loop Wave ($ts · $action)" \
-    -- "$prompt" | tee -a "$wave_log"
-)
+  wave_json="$(python3 "$ISSUE_HUB" start-wave)" || return
+  wave="$(python3 -c '
+import json
+import re
+import sys
+
+result = json.load(sys.stdin)
+if isinstance(result, dict) and result.get("status") == "busy":
+    print("busy")
+elif isinstance(result, dict) and result.get("status") == "started":
+    wave = result.get("wave")
+    if not isinstance(wave, str) or not re.fullmatch(r"[0-9a-f]{32}", wave):
+        sys.exit("Invalid wave token from issue_hub.py start-wave")
+    print(wave)
+else:
+    sys.exit("Unexpected response from issue_hub.py start-wave")
+' <<< "$wave_json")" || return
+  if [[ "$wave" == busy ]]; then
+    printf 'Another wave owns the SQLite lease. Skipping this tick.\n'
+    return 0
+  fi
+
+  log="$LOG_DIR/wave-$timestamp-$$.jsonl"
+  prompt="[AKZIO-LOOP-LEADER] $wave
+请从仓库根目录按 .agents/agents/loop-leader.md 和 autonomous-loop 技能执行本轮的一个队列动作。
+等本轮子智能体结束并确认任务状态已写入 SQLite 后再返回。"
+  # The default SQLite lease lasts two hours. Bound the blocking CLI turn within it.
+  local -a agy_args=(--agent loop-leader --sandbox --print-timeout 110m --output-format stream-json)
+  if [[ -n "$LEADER_MODEL" ]]; then
+    agy_args+=(--model "$LEADER_MODEL")
+  fi
+  printf '[%s] Running Leader wave\n' "$timestamp"
+  if ! "$agy_bin" "${agy_args[@]}" -p "$prompt" 2> >(tee -a "$log.stderr" >&2) | tee "$log"; then
+    printf 'WARN: Leader exited unsuccessfully. The lease will expire.\n' >&2
+    return 1
+  fi
+  if ! python3 - "$REPO_ROOT" "$log" <<'AGY_RESULT'
+import json
+from pathlib import Path
+import sys
+
+root, output = map(Path, sys.argv[1:])
+with output.open(encoding="utf-8") as stream:
+    events = [json.loads(line) for line in stream if line.strip()]
+starts = [event for event in events if event.get("event") == "init"]
+ends = [event["result"] for event in events if event.get("event") == "result"]
+if len(starts) != 1 or len(ends) != 1:
+    sys.exit("Expected one Antigravity init and one final result.")
+start, result = starts[0], ends[0]
+metadata = start["init"]
+if (
+    Path(metadata["cwd"]).resolve() != root.resolve()
+    or metadata.get("agent") != "loop-leader"
+    or not start.get("conversation_id")
+    or start["conversation_id"] != result.get("conversation_id")
+    or result.get("status") != "SUCCESS"
+):
+    sys.exit("The Antigravity result did not confirm a completed Leader turn here.")
+AGY_RESULT
+  then
+    printf 'WARN: Leader completion could not be confirmed. The lease will expire.\n' >&2
+    return 1
+  fi
+  python3 "$ISSUE_HUB" finish-wave --wave "$wave"
+}
+
+publish_configured_log() {
+  local repo="${AKZIO_LOOP_AUDIT_REPO:-}"
+  local issue="${AKZIO_LOOP_AUDIT_ISSUE:-}"
+  if [[ -z "$repo" && -z "$issue" ]]; then
+    return 0
+  fi
+  if [[ -z "$repo" || -z "$issue" ]]; then
+    printf 'WARN: Set both AKZIO_LOOP_AUDIT_REPO and AKZIO_LOOP_AUDIT_ISSUE to publish audit events.\n' >&2
+  elif ! python3 "$ISSUE_HUB" publish-log --repo "$repo" --issue "$issue"; then
+    printf 'WARN: Audit publishing failed. The next tick will retry pending events.\n' >&2
+  fi
+}
 
 cmd="${1:-help}"
 shift || true
 
 case "$cmd" in
   init)
-    python3 "$ISSUE_HUB" init-labels "$@"
+    python3 "$ISSUE_HUB" init "$@"
     ;;
   status)
     python3 "$ISSUE_HUB" poll "$@"
     ;;
   wave)
-    run_single_wave "$@"
+    run_single_wave
     ;;
   daily-report)
-    python3 "$ISSUE_HUB" daily-report --hours 24 --publish-github "$@"
+    python3 "$ISSUE_HUB" daily-report "$@"
+    ;;
+  publish-log)
+    python3 "$ISSUE_HUB" publish-log "$@"
     ;;
   daemon)
-    echo "Starting Akzio 24h Unattended Loop Daemon (interval=${WAVE_INTERVAL_SECS}s, leader=${LEADER_MODEL})..."
+    printf 'Starting Akzio Loop Daemon (interval=%ss)\n' "$WAVE_INTERVAL_SECS"
     while true; do
-      if ! run_single_wave; then
-        echo "[WARN] Wave exited non-zero; backing off for 120s..." >&2
-        sleep 120
+      if ! python3 "$ISSUE_HUB" daily-report --if-due; then
+        printf 'WARN: Local daily report failed. The next tick will retry.\n' >&2
       fi
+      if ! run_single_wave; then
+        printf 'WARN: Wave failed. The daemon will try again on its next tick.\n' >&2
+      fi
+      publish_configured_log &
       sleep "$WAVE_INTERVAL_SECS"
     done
     ;;
-  *)
+  help|-h|--help)
     usage
+    ;;
+  *)
+    usage >&2
     exit 1
     ;;
 esac

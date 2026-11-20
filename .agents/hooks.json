@@ -23,6 +23,16 @@
         ]
       },
       {
+        "matcher": "write_to_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ./loop/bin/hook_guard.py",
+            "timeout": 10
+          }
+        ]
+      },
+      {
         "matcher": "edit_file",
         "hooks": [
           {
@@ -31,13 +41,56 @@
             "timeout": 10
           }
         ]
-      }
-    ],
-    "Stop": [
+      },
       {
-        "type": "command",
-        "command": "python3 ./loop/bin/hook_guard.py",
-        "timeout": 10
+        "matcher": "read_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ./loop/bin/hook_guard.py",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "view_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ./loop/bin/hook_guard.py",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "invoke_subagent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ./loop/bin/hook_guard.py",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "send_message",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ./loop/bin/hook_guard.py",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "manage_subagents",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ./loop/bin/hook_guard.py",
+            "timeout": 10
+          }
+        ]
       }
     ]
   }

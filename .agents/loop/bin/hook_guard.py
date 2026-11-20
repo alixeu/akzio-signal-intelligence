@@ -1,51 +1,94 @@
 #!/usr/bin/env python3
-"""
-Antigravity Lifecycle Hook Guard (`PreToolUse` & `Stop`) for Akzio 24h Autonomous Loop.
-
-- In `PreToolUse` (for `run_command`):
-  1. Distinguishes Loop Leader (`[AKZIO-AUTONOMOUS-LOOP]`), Loop Subagents (`[AKZIO-LOOP-SUBAGENT]`),
-     and normal interactive conversations (`in_loop == False`).
-  2. When `in_loop` is False (normal interactive user sessions), returns `{"decision": "ask"}`
-     without imposing loop-only denials (preserving user-approved `run_core.sh paper` or `~/.akzio` checks
-     and Antigravity's normal Always-Allow / Turbo permissions).
-  3. When `in_loop` is True:
-     - Hard-denies (`"decision": "deny"`) touching `~/.akzio` paths (excluding commit/issue text),
-       force-pushing, pushing directly to `main`/`master`, launching `scripts/run_core.sh paper`,
-       or running destructive/mutating git commands outside `outputs/loop/worktrees/`.
-     - Auto-allows (`"decision": "allow"`) verified safe loop commands (after parsing shell chains
-       and validating every segment) so unattended overnight waves and subagents never hang on prompts.
-     - Returns `{"decision": "ask"}` for anything outside the allowlist.
-
-- In `Stop`:
-  1. Only activates for the Loop Leader (`[AKZIO-AUTONOMOUS-LOOP]` in `lastUserInput` AND
-     `[AKZIO-LOOP-SUBAGENT]` NOT in `lastUserInput`), so subagents are never hijacked to run `poll`.
-  2. Checks `outputs/loop/state/queue_cache.json` (kept synchronized by `issue_hub.py`);
-     if `terminationReason == "NO_TOOL_CALL"`, `not continuationActive`, `executionNum < 2`,
-     and actionable items remain (`ready > 0` or `inbox > 0`), continues for at most 1 more step.
-"""
+"""Enforce the Akzio loop policy on Antigravity PreToolUse payloads."""
 
 from __future__ import annotations
 
+import argparse
+import io
 import json
 import re
+import shlex
+import sqlite3
 import sys
+from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-SHARED_CARGO_TARGET_DIR = str(REPO_ROOT / "target")
-QUEUE_CACHE_PATH = REPO_ROOT / "outputs" / "loop" / "state" / "queue_cache.json"
+HUB_RELATIVE = ".agents/loop/bin/issue_hub.py"
+TMP_ROOT = REPO_ROOT / "outputs/loop/tmp"
+WORKTREES_ROOT = REPO_ROOT / "outputs/loop/worktrees"
+LESSONS_PATH = REPO_ROOT / ".agents/loop/agent-lessons.md"
 
-LEADER_TOKEN = "[AKZIO-AUTONOMOUS-LOOP]"
-SUBAGENT_TOKEN = "[AKZIO-LOOP-SUBAGENT]"
+WAVE_PATTERN = r"(?P<wave>[0-9a-f]{32})"
+TASK_PATTERN = r"(?P<task>[0-9]+)"
+HEAD_PATTERN = r"(?P<version>[0-9a-f]{40}(?:[0-9a-f]{24})?)"
+ROLE_HEADERS = {
+    "leader": re.compile(rf"\[AKZIO-LOOP-LEADER\] {WAVE_PATTERN}"),
+    "scout": re.compile(rf"\[AKZIO-LOOP-SCOUT\] {WAVE_PATTERN}"),
+    "worker": re.compile(rf"\[AKZIO-LOOP-WORKER\] {WAVE_PATTERN} {TASK_PATTERN} (?P<version>[0-9]+)"),
+    "verifier": re.compile(rf"\[AKZIO-LOOP-VERIFIER\] {WAVE_PATTERN} {TASK_PATTERN} {HEAD_PATTERN}"),
+}
+ROLE_COMMANDS = {
+    "leader": {"poll", "show", "post-design", "claim", "verify-worktree", "review-missing", "worktree-land", "block"},
+    "scout": {"poll", "propose"},
+    "worker": {"show", "worker-test", "worker-commit"},
+    "verifier": {"show", "show-diff", "review"},
+}
+DELEGATE_ROLES = {"issue-scout": "scout", "rust-worker": "worker", "rust-verifier": "verifier"}
+READ_TOOLS = {"read_file", "view_file"}
+CREATE_TOOLS = {"write_file", "write_to_file"}
+WRITE_TOOLS = CREATE_TOOLS | {"edit_file"}
+FILE_PATH_ALIASES = {"view_file": "AbsolutePath", "write_to_file": "TargetFile"}
+CLI_TEMP_FILES = {"propose": "body_file", "post-design": "design_file", "block": "report_file"}
 
-AKZIO_PATH_RE = re.compile(r"(?:~|\$HOME|\$\{HOME\}|/Users/[^/\s'\";&|]+)/\.akzio(?:/|\b)")
-QUOTED_MSG_RE = re.compile(r"""(?:^|\s)(?:-m|--title|--message)\s+(?:"[^"]*"|'[^']*')""")
+# Argument quoting is allowed. Control operators, expansions, and escapes
+# stay outside the grammar so the shell and shlex see the same argv.
+QUOTED_PART = r'''(?:'[^'\x00-\x1f\x7f]*'|"[^"$`\\!\x00-\x1f\x7f]*")'''
+BARE_CHAR = r"[A-Za-z0-9_./:@%+,\-]"
+LITERAL_WORD = rf"(?:{BARE_CHAR}|{QUOTED_PART})+"
+# zsh can expand an unquoted leading '=' even after an empty quoted fragment.
+# Limit bare '=' to the option separator in an explicit --name=value argument.
+LITERAL_ARG = rf"(?:--[a-z][a-z0-9-]*=)?{LITERAL_WORD}"
+LITERAL_COMMAND = re.compile(rf"[ \t]*{LITERAL_ARG}(?:[ \t]+{LITERAL_ARG})*[ \t]*")
 
 
-def strip_commit_or_title_strings(cmd_line: str) -> str:
-    """Remove `-m "..."` / `--title "..."` string literals before scanning for `~/.akzio` path usage."""
-    return QUOTED_MSG_RE.sub(" ", cmd_line)
+@dataclass(frozen=True)
+class LoopHeader:
+    role: str
+    wave: str
+    task_id: Optional[int]
+    version: str
+
+
+@dataclass(frozen=True)
+class LoopScope:
+    worktree: Optional[Path] = None
+    allowed_files: frozenset[str] = frozenset()
+
+
+def _deny(reason: str) -> Dict[str, str]:
+    return {"decision": "deny", "reason": reason}
+
+
+def _parse_loop_header(prompt: Any) -> Optional[LoopHeader]:
+    if not isinstance(prompt, str):
+        return None
+    line = prompt.partition("\n")[0].removesuffix("\r")
+    for role, pattern in ROLE_HEADERS.items():
+        match = pattern.fullmatch(line)
+        if match is None:
+            continue
+        fields = match.groupdict()
+        task_id = int(fields["task"]) if "task" in fields else None
+        version = fields.get("version", "")
+        if role == "worker":
+            version = str(int(version))
+        return LoopHeader(role, fields["wave"], task_id, version)
+    if re.match(r"[\s\ufeff]*\[AKZIO-(?:LOOP|AUTONOMOUS-LOOP)", line, re.IGNORECASE):
+        raise ValueError("Malformed or legacy Akzio loop role header.")
+    return None
 
 
 def split_shell_segments(cmd_line: str) -> Optional[List[str]]:
@@ -122,137 +165,6 @@ def split_shell_segments(cmd_line: str) -> Optional[List[str]]:
     return segments
 
 
-def has_unsafe_redirection(seg: str) -> bool:
-    """Reject output redirection except benign `2>&1`, `>/dev/null`, `2>/dev/null`, or `> outputs/loop/...`."""
-    in_single = False
-    in_double = False
-    escaped = False
-    i = 0
-    n = len(seg)
-    while i < n:
-        ch = seg[i]
-        if escaped:
-            escaped = False
-            i += 1
-            continue
-        if ch == "\\" and not in_single:
-            escaped = True
-            i += 1
-            continue
-        if ch == "'" and not in_double:
-            in_single = not in_single
-            i += 1
-            continue
-        if ch == '"' and not in_single:
-            in_double = not in_double
-            i += 1
-            continue
-        if not in_single and not in_double and ch == ">":
-            rest = seg[max(0, i - 1) :].lstrip()
-            if rest.startswith("2>&1") or rest.startswith(">&1"):
-                i += 1
-                continue
-            after = seg[i + 1 :].lstrip()
-            if after.startswith(">"):
-                after = after[1:].lstrip()
-            target = after.split()[0] if after.split() else ""
-            if target == "/dev/null" or target.startswith("outputs/loop/tmp/") or target.startswith(
-                f"{REPO_ROOT}/outputs/loop/tmp/"
-            ):
-                i += 1
-                continue
-            return True
-        i += 1
-    return False
-
-
-def is_in_worktree(path_hint: str) -> bool:
-    return "outputs/loop/worktrees/" in path_hint
-
-
-def is_safe_segment(seg: str, active_cwd: str) -> Tuple[bool, str]:
-    """
-    Validate a single shell segment and return `(allowed, updated_cwd)`.
-    """
-    if has_unsafe_redirection(seg):
-        return False, active_cwd
-
-    # Strip trailing benign redirections like `2>&1`, `>/dev/null`, `2>/dev/null`
-    cleaned = re.sub(r"\s+(?:[12]?>>?\s*/dev/null|2>&1)\s*$", "", seg).strip()
-
-    # Handle `cd <dir>`
-    m_cd = re.match(r"^cd\s+(.+)$", cleaned)
-    if m_cd:
-        target = m_cd.group(1).strip().strip("'\"")
-        if target.startswith("/"):
-            next_cwd = target
-        else:
-            next_cwd = str((Path(active_cwd or REPO_ROOT) / target).resolve())
-        return True, next_cwd
-
-    # issue_hub.py (always runs against repo root or explicit path)
-    if re.match(r"^python3\s+(?:\./)?(?:\S*/)?\.agents/loop/bin/issue_hub\.py\b", cleaned):
-        return True, active_cwd
-
-    # Cargo / rustfmt gates (allow sharing main repo target dir to avoid per-worktree bloat)
-    target_dir_re = re.escape(SHARED_CARGO_TARGET_DIR)
-    if re.match(rf"^export\s+CARGO_TARGET_DIR=[\"']?{target_dir_re}[\"']?$", cleaned):
-        return True, active_cwd
-    if re.match(
-        rf"^(?:CARGO_TARGET_DIR=[\"']?{target_dir_re}[\"']?\s+)?cargo\s+(?:fmt|check|clippy|test|metadata|version)\b",
-        cleaned,
-    ):
-        return True, active_cwd
-    if re.match(r"^rustfmt\s+(?:--edition\s+\S+\s+)?(?:--check\s+)?\S+", cleaned):
-        return True, active_cwd
-
-    # Shell syntax check in CI
-    if re.match(r"^bash\s+-n\s+scripts/run_core\.sh\b", cleaned):
-        return True, active_cwd
-
-    # GitHub CLI issue/label transitions
-    if re.match(r"^gh\s+(?:issue|label)\s+(?:list|view|comment|edit|create|close)\b", cleaned):
-        return True, active_cwd
-
-    # Read-only git inspection
-    if re.match(r"^git\s+(?:status|diff|show|log|rev-parse|merge-base)\b", cleaned):
-        return True, active_cwd
-    if re.match(r"^git\s+branch\s*(?:--show-current|-a|-r|--list)?$", cleaned):
-        return True, active_cwd
-
-    # Write git commands strictly restricted to isolated issue worktrees
-    if re.match(r"^git\s+(?:add|commit)\b", cleaned):
-        if is_in_worktree(active_cwd) or re.search(r"-C\s+\S*outputs/loop/worktrees/", cleaned):
-            return True, active_cwd
-        return False, active_cwd
-
-    # Read-only inspection tools (forbid `find ... -exec/-delete` and `sed -i`)
-    if re.match(r"^(?:ls|cat|head|tail|wc|rg|grep|pwd|which|sort|uniq|echo|printf)\b", cleaned):
-        return True, active_cwd
-    if re.match(r"^find\b", cleaned) and not re.search(r"\s-(?:exec|execdir|delete|ok)\b", cleaned):
-        return True, active_cwd
-    if re.match(r"^sed\s+-n\b", cleaned):
-        return True, active_cwd
-
-    # Scoped loop temp directory ops
-    if re.match(r"^mkdir\s+-p\s+(?:\S*/)?outputs/loop/(?:tmp|state|reports|logs)(?:/\S*)?$", cleaned):
-        return True, active_cwd
-
-    return False, active_cwd
-
-
-def is_safe_loop_command(cmd_line: str, cwd: str) -> bool:
-    segments = split_shell_segments(cmd_line)
-    if not segments:
-        return False
-    active_cwd = cwd or str(REPO_ROOT)
-    for seg in segments:
-        ok, active_cwd = is_safe_segment(seg, active_cwd)
-        if not ok:
-            return False
-    return True
-
-
 def _resolve_target_path(raw_path: str, cwd: str) -> Optional[Path]:
     if not raw_path:
         return None
@@ -272,7 +184,7 @@ def _repo_relative_path(target: Path) -> Optional[str]:
 
 
 def _strip_worktree_prefix(rel_path: str) -> str:
-    m = re.match(r"^outputs/loop/worktrees/issue-\d+/(.+)$", rel_path)
+    m = re.match(r"^outputs/loop/worktrees/(?:issue|task)-\d+/(.+)$", rel_path)
     return m.group(1) if m else rel_path
 
 
@@ -305,13 +217,7 @@ def _check_markdown_policy(
     is_new_file = is_create_tool and not target.exists()
     if is_new_file:
         if in_loop:
-            return {
-                "decision": "deny",
-                "reason": (
-                    f"Creating new Markdown file '{logical_rel}' is forbidden in autonomous loop mode "
-                    f"(only outputs/loop/tmp/ and outputs/loop/reports/ are allowed)."
-                ),
-            }
+            return _deny(f"Creating new Markdown file '{logical_rel}' is forbidden for loop workers.")
         if "/" not in logical_rel or (
             logical_rel.startswith("crates/") and not _is_crate_prompt_or_fixture_md(logical_rel)
         ):
@@ -374,191 +280,265 @@ def _find_shell_markdown_write(cmd_line: str, cwd: str) -> Optional[str]:
     return None
 
 
-def handle_file_write_tool(
-    payload: Dict[str, Any],
+def _file_tool_path(tool_name: str, args: Dict[str, Any]) -> Any:
+    path = args.get("Path")
+    alias = FILE_PATH_ALIASES.get(tool_name)
+    if alias is not None and alias in args:
+        if path is not None and path != args[alias]:
+            raise ValueError("Conflicting file tool paths.")
+        return args[alias]
+    return path
+
+
+def _handle_interactive(payload: Dict[str, Any], tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    cwd = str(payload.get("cwd") or "")
+    if tool_name == "run_command":
+        blocked_md = _find_shell_markdown_write(str(args.get("CommandLine") or ""), cwd)
+        if blocked_md:
+            return _deny(
+                f"Creating unsolicited Markdown file '{blocked_md}' via shell is forbidden "
+                "(anti-doc-slop guardrail)."
+            )
+    elif tool_name in WRITE_TOOLS:
+        try:
+            raw_path = _file_tool_path(tool_name, args)
+        except ValueError:
+            return {"decision": "ask"}
+        target = _resolve_target_path(str(raw_path or "").strip(), cwd)
+        if target is not None:
+            artifact_dir = str(payload.get("artifactDirectoryPath") or "").strip()
+            if artifact_dir and target.is_relative_to(Path(artifact_dir).expanduser().resolve()):
+                return {"decision": "ask"}
+            rel = _repo_relative_path(target)
+            if rel is not None:
+                decision = _check_markdown_policy(target, rel, tool_name in CREATE_TOOLS, in_loop=False)
+                if decision is not None:
+                    return decision
+    return {"decision": "ask"}
+
+
+def _canonical_path(raw_path: Any, cwd: Path) -> Path:
+    if not isinstance(raw_path, str) or not raw_path or "\x00" in raw_path:
+        raise ValueError("Missing or invalid path.")
+    if raw_path.startswith(("~", "$")) or "://" in raw_path:
+        raise ValueError("Loop tools require literal filesystem paths.")
+    path = cwd / raw_path
+    if path != path.resolve():
+        raise ValueError("Loop paths must be canonical and cannot traverse symlinks.")
+    return path
+
+
+def _relative_file(path: Path, root: Path) -> Optional[Path]:
+    if path == root or not path.is_relative_to(root):
+        return None
+    return path.relative_to(root)
+
+
+def _protected_path(relative: Path) -> bool:
+    parts = [part.casefold() for part in relative.parts]
+    if any(part in {".git", ".akzio", ".gemini", ".env"} or part.startswith(".env.") for part in parts):
+        return True
+    if parts[0] == "config" and len(parts) > 1:
+        filename = parts[-1]
+        return filename.endswith((".local.yaml", ".local.toml")) or (
+            filename.startswith("local") and filename.endswith(".yaml")
+        )
+    return False
+
+
+def _is_source(relative: Optional[Path]) -> bool:
+    return (
+        relative is not None
+        and relative.parts[0].casefold() not in {"outputs", "report", "target", "tmp"}
+        and not _protected_path(relative)
+    )
+
+
+def _is_loop_temp(path: Path) -> bool:
+    relative = _relative_file(path, TMP_ROOT)
+    return relative is not None and not _protected_path(relative)
+
+
+def _read_scope(header: LoopHeader) -> LoopScope:
+    from issue_hub import loop_scope
+
+    scope = loop_scope(header.role, header.wave, header.task_id, header.version)
+    if not isinstance(scope, dict):
+        raise ValueError("Invalid loop scope.")
+    if header.role in {"leader", "scout"}:
+        return LoopScope()
+    raw_worktree = scope.get("worktree")
+    if not isinstance(raw_worktree, str) or not Path(raw_worktree).is_absolute():
+        raise ValueError("Loop scope is missing an absolute worktree.")
+    tree = _canonical_path(raw_worktree, REPO_ROOT)
+    if _relative_file(tree, WORKTREES_ROOT) is None:
+        raise ValueError("Loop worktree lies outside the managed root.")
+    files = scope.get("allowed_files")
+    if not isinstance(files, list) or not all(isinstance(file, str) for file in files):
+        raise ValueError("Loop scope is missing its allowed files.")
+    return LoopScope(tree, frozenset(files))
+
+
+def _handle_loop_file(
+    header: LoopHeader,
+    scope: LoopScope,
     tool_name: str,
     args: Dict[str, Any],
-    last_input: str,
-    in_loop: bool,
+    cwd: Path,
 ) -> Dict[str, Any]:
-    raw_path = str(args.get("Path") or "").strip()
-    if in_loop and AKZIO_PATH_RE.search(raw_path):
-        return {
-            "decision": "deny",
-            "reason": "Touching ~/.akzio is strictly forbidden in autonomous loop mode (AGENTS.md §1).",
-        }
+    path = _canonical_path(_file_tool_path(tool_name, args), cwd)
+    is_read = tool_name in READ_TOOLS
+    if scope.worktree is None:
+        if _is_loop_temp(path) or (is_read and _is_source(_relative_file(path, REPO_ROOT))):
+            return {"decision": "allow"}
+        return _deny("This loop role may read repository source and use managed loop temporary files.")
 
-    cwd = str(payload.get("cwd") or "")
-    target = _resolve_target_path(raw_path, cwd)
-    if target is None:
-        return {"decision": "ask"}
+    relative = _relative_file(path, scope.worktree)
+    if is_read:
+        if path == LESSONS_PATH or _is_source(relative):
+            return {"decision": "allow"}
+        return _deny("This loop role may read only its assigned worktree and the shared lesson document.")
+    if header.role != "worker":
+        return _deny("The loop verifier has read-only file access.")
+    if relative is None or not _is_source(relative) or relative.as_posix() not in scope.allowed_files:
+        return _deny("Worker file writes require a canonical path on the assigned worktree whitelist.")
+    return _check_markdown_policy(path, relative.as_posix(), tool_name in CREATE_TOOLS, in_loop=True) or {
+        "decision": "allow"
+    }
 
-    # Do not block Antigravity artifact directory writes outside the repository.
-    artifact_dir_raw = str(payload.get("artifactDirectoryPath") or "").strip()
-    if artifact_dir_raw:
-        artifact_root = Path(artifact_dir_raw).expanduser().resolve(strict=False)
+
+def _parse_cli(arguments: List[str]) -> Optional[argparse.Namespace]:
+    from issue_hub import build_parser
+
+    # argparse emits usage and help text before SystemExit. The Hook's stdout
+    # must contain a single JSON decision, even for rejected CLI grammar.
+    with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
         try:
-            target.relative_to(artifact_root)
-            return {"decision": "ask"}
-        except ValueError:
-            pass
+            return build_parser().parse_args(arguments)
+        except SystemExit:
+            return None
 
-    rel = _repo_relative_path(target)
-    if rel is None:
-        return {"decision": "ask"}
 
-    if in_loop:
-        is_leader = (LEADER_TOKEN in last_input) and (SUBAGENT_TOKEN not in last_input)
-        if is_leader and not rel.startswith("outputs/loop/"):
-            return {
-                "decision": "deny",
-                "reason": (
-                    f"Loop Leader must not directly edit '{rel}'. "
-                    f"Delegate edits to rust-worker inside outputs/loop/worktrees/issue-<N>."
-                ),
-            }
-        if not is_leader and not rel.startswith(("outputs/loop/worktrees/", "outputs/loop/tmp/")):
-            return {
-                "decision": "deny",
-                "reason": (
-                    f"Loop subagent write to '{rel}' is outside outputs/loop/worktrees/ and outputs/loop/tmp/."
-                ),
-            }
+def _matches_cli_option(arguments: List[str], parsed: argparse.Namespace, name: str, expected: str) -> bool:
+    values = []
+    for index, arg in enumerate(arguments):
+        flag, separator, value = arg.partition("=")
+        if flag == f"--{name}":
+            if not separator and index + 1 < len(arguments):
+                value = arguments[index + 1]
+            values.append(value)
+    return values == [expected] and str(getattr(parsed, name, None)) == expected
 
-    md_decision = _check_markdown_policy(
-        target=target,
-        rel_path=rel,
-        is_create_tool=(tool_name == "write_file"),
-        in_loop=in_loop,
-    )
-    if md_decision is not None:
-        return md_decision
 
-    if in_loop:
-        return {"decision": "allow"}
-    return {"decision": "ask"}
+def _handle_loop_command(header: LoopHeader, cmd_line: Any, cwd: Path) -> Dict[str, Any]:
+    if not isinstance(cmd_line, str) or not LITERAL_COMMAND.fullmatch(cmd_line):
+        return _deny("Loop shell accepts a single literal issue_hub.py invocation.")
+    argv = shlex.split(cmd_line)
+    script = REPO_ROOT / HUB_RELATIVE
+    if (
+        len(argv) < 3
+        or argv[0] != "python3"
+        or argv[1] not in {HUB_RELATIVE, f"./{HUB_RELATIVE}", str(script)}
+        or _canonical_path(argv[1], cwd) != script
+    ):
+        return _deny("Loop shell accepts only python3 with the canonical issue_hub.py script.")
+    command = argv[2]
+    if command not in ROLE_COMMANDS[header.role]:
+        return _deny("This issue_hub.py command is unavailable to the current loop role.")
+    parsed = _parse_cli(argv[2:])
+    if parsed is None:
+        return _deny("Invalid issue_hub.py command arguments.")
+
+    required_options = {}
+    if command not in {"poll", "show", "propose"} or getattr(parsed, "wave", None) is not None:
+        required_options["wave"] = header.wave
+    if header.task_id is not None:
+        required_options["task"] = str(header.task_id)
+    if command in {"worker-test", "worker-commit"}:
+        required_options["attempt"] = header.version
+    if command == "review":
+        required_options["head"] = header.version
+    for name, expected in required_options.items():
+        if not _matches_cli_option(argv[3:], parsed, name, expected):
+            return _deny(f"Loop command --{name} must match the active role header.")
+
+    note_option = CLI_TEMP_FILES.get(command)
+    if note_option is not None and not _is_loop_temp(_canonical_path(getattr(parsed, note_option, None), REPO_ROOT)):
+        return _deny("Loop notes must be canonical files in outputs/loop/tmp.")
+    return {"decision": "allow"}
+
+
+def _validate_child(header: LoopHeader, prompt: Any, role: Optional[str] = None) -> bool:
+    child = _parse_loop_header(prompt)
+    if child is None or child.wave != header.wave or child.role == "leader" or (role is not None and child.role != role):
+        return False
+    _read_scope(child)
+    return True
+
+
+def _handle_loop_subagent(header: LoopHeader, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    if header.role != "leader":
+        return _deny("Only the loop leader may delegate or manage loop subagents.")
+    if tool_name == "invoke_subagent":
+        type_name = args.get("TypeName")
+        role = DELEGATE_ROLES.get(type_name) if isinstance(type_name, str) else None
+        if not role or args.get("Workspace") not in (None, "inherit"):
+            return _deny("The leader may invoke known loop subagent types in the current workspace.")
+        if not _validate_child(header, args.get("Prompt"), role):
+            return _deny("Subagent Prompt must start with a verified same-wave header for the requested role.")
+    elif tool_name == "send_message":
+        recipient = args.get("Recipient")
+        if not isinstance(recipient, str) or not recipient.strip():
+            return _deny("Loop subagent messages require a recipient.")
+        if not _validate_child(header, args.get("Message")):
+            return _deny("Loop subagent messages must start with a verified same-wave child header.")
+    elif args.get("Action") not in ("list", "kill", "kill_all"):
+        return _deny("Unknown subagent management action.")
+    return {"decision": "allow"}
 
 
 def handle_pre_tool_use(payload: Dict[str, Any]) -> Dict[str, Any]:
-    tool_call = payload.get("toolCall") or {}
+    tool_call = payload.get("toolCall")
+    if not isinstance(tool_call, dict):
+        tool_call = {}
     tool_name = str(tool_call.get("name") or "")
-    args = tool_call.get("args") or {}
-    last_input = str(payload.get("lastUserInput") or "")
-    in_loop = (LEADER_TOKEN in last_input) or (SUBAGENT_TOKEN in last_input)
+    args = tool_call.get("args")
+    if not isinstance(args, dict):
+        args = {}
 
-    if tool_name in ("write_file", "edit_file"):
-        return handle_file_write_tool(payload, tool_name, args, last_input, in_loop)
+    try:
+        header = _parse_loop_header(payload.get("lastUserInput"))
+    except ValueError:
+        return _deny("Malformed or legacy Akzio loop role header.")
+    if header is None:
+        return _handle_interactive(payload, tool_name, args)
 
-    if tool_name != "run_command":
-        return {"decision": "ask"}
-
-    cmd_line = str(args.get("CommandLine") or "")
-    cwd = str(payload.get("cwd") or "")
-
-    # Interactive sessions: preserve user permissions, except block unsolicited shell .md creation in root/crates.
-    if not in_loop:
-        blocked_md = _find_shell_markdown_write(cmd_line, cwd)
-        if blocked_md:
-            return {
-                "decision": "deny",
-                "reason": (
-                    f"Creating unsolicited Markdown file '{blocked_md}' via shell is forbidden "
-                    f"(anti-doc-slop guardrail)."
-                ),
-            }
-        return {"decision": "ask"}
-
-    # Hard denials in autonomous loop mode
-    stripped_for_akzio = strip_commit_or_title_strings(cmd_line)
-    if AKZIO_PATH_RE.search(stripped_for_akzio):
-        return {
-            "decision": "deny",
-            "reason": "Touching ~/.akzio is strictly forbidden in autonomous loop mode (AGENTS.md §1/§5).",
-        }
-
-    if re.search(r"\bgit\s+push\b.*--force", cmd_line):
-        return {"decision": "deny", "reason": "Force-pushing is forbidden in autonomous loop."}
-    if re.search(r"\bgit\s+push\b.*\b(?:main|master)\b", cmd_line):
-        return {"decision": "deny", "reason": "Direct push to main/master is forbidden."}
-    if re.search(r"\bscripts/run_core\.sh\s+paper\b", cmd_line):
-        return {"decision": "deny", "reason": "Unattended loop must not launch real Alpaca Paper runs."}
-
-    # Prevent git write/destructive commands from touching the developer's main working directory
-    if re.search(r"\bgit\s+(?:reset\s+--hard|clean\s+-[fd]|checkout\s+--|stash\b)", cmd_line):
-        if not is_in_worktree(cmd_line) and not is_in_worktree(cwd):
-            return {
-                "decision": "deny",
-                "reason": "Destructive git reset/clean/checkout/stash is blocked in the main workspace. Operate inside outputs/loop/worktrees/issue-<N>.",
-            }
-    if re.search(r"\bgit\s+(?:add|commit)\b", cmd_line):
-        if not is_in_worktree(cmd_line) and not is_in_worktree(cwd):
-            return {
-                "decision": "deny",
-                "reason": "git add/commit is blocked in the main workspace. Operate inside outputs/loop/worktrees/issue-<N>.",
-            }
-
-    if is_safe_loop_command(cmd_line, cwd):
-        return {"decision": "allow"}
-
-    return {"decision": "ask"}
-
-
-def handle_stop(payload: Dict[str, Any]) -> Dict[str, Any]:
-    last_input = str(payload.get("lastUserInput") or "")
-    # Never hijack subagents (`[AKZIO-LOOP-SUBAGENT]`) to run Leader polling
-    if LEADER_TOKEN not in last_input or SUBAGENT_TOKEN in last_input:
-        return {"decision": "stop"}
-
-    term_reason = str(payload.get("terminationReason") or "")
-    continuation_active = bool(payload.get("continuationActive"))
-    exec_num = int(payload.get("executionNum") or 0)
-
-    if term_reason != "NO_TOOL_CALL" or continuation_active or exec_num >= 2:
-        return {"decision": "stop"}
-
-    if QUEUE_CACHE_PATH.exists():
-        try:
-            cache = json.loads(QUEUE_CACHE_PATH.read_text(encoding="utf-8"))
-            if cache.get("stale"):
-                return {"decision": "stop"}
-            counts = cache.get("counts") or {}
-            ready_cnt = int(counts.get("ready") or 0)
-            inbox_cnt = int(counts.get("inbox") or 0)
-            if ready_cnt > 0 or inbox_cnt > 0:
-                return {
-                    "decision": "continue",
-                    "reason": (
-                        f"Queue still has actionable items (ready={ready_cnt}, inbox={inbox_cnt}) "
-                        f"and wave step count is within budget (executionNum={exec_num} < 2). "
-                        f"Run `python3 .agents/loop/bin/issue_hub.py poll` to process one more item before context reset."
-                    ),
-                }
-        except Exception:
-            pass
-
-    return {"decision": "stop"}
+    try:
+        scope = _read_scope(header)
+    except (ImportError, OSError, OverflowError, RuntimeError, ValueError, sqlite3.Error):
+        return _deny("The Akzio loop role is outside its active wave or task scope.")
+    try:
+        cwd = Path(payload.get("cwd") or REPO_ROOT).resolve()
+        if tool_name in READ_TOOLS | WRITE_TOOLS:
+            return _handle_loop_file(header, scope, tool_name, args, cwd)
+        if tool_name == "run_command":
+            return _handle_loop_command(header, args.get("CommandLine"), cwd)
+        if tool_name in {"invoke_subagent", "send_message", "manage_subagents"}:
+            return _handle_loop_subagent(header, tool_name, args)
+    except (ImportError, OSError, OverflowError, RuntimeError, TypeError, ValueError, sqlite3.Error):
+        return _deny("Loop tool scope or tool arguments could not be verified.")
+    return _deny("This tool is unavailable in the Akzio loop.")
 
 
 def main() -> int:
-    raw = sys.stdin.read().strip()
-    if not raw:
-        print("{}")
-        return 0
     try:
-        payload = json.loads(raw)
+        payload = json.load(sys.stdin)
     except json.JSONDecodeError:
-        print("{}")
-        return 0
-
-    event_name = payload.get("hookEventName")
-    if event_name == "PreToolUse":
-        out = handle_pre_tool_use(payload)
-    elif event_name == "Stop":
-        out = handle_stop(payload)
-    else:
-        out = {}
-
-    print(json.dumps(out, ensure_ascii=False))
+        payload = None
+    decision = {}
+    if isinstance(payload, dict) and payload.get("hookEventName") == "PreToolUse":
+        decision = handle_pre_tool_use(payload)
+    print(json.dumps(decision, ensure_ascii=False))
     return 0
 
 

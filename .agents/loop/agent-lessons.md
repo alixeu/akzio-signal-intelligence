@@ -1,41 +1,33 @@
 # Akzio Agent Loop — Mechanism-Enforced Lessons Ledger (`agent-lessons.md`)
 
-> **Rule (adapted from `glows777/Vela` & Geoffrey Huntley's Backpressure principle)**:
-> Every time an agent miss, hallucination, hollow test, or review bounce is confirmed, record a lesson here with:
-> 1. **Trigger Path**: Who did what, in which crate/file, and what went wrong.
-> 2. **Missed Layer**: Which layer should have caught it (`Pre-Commit Backpressure`, `Fresh-Context Verifier`, `CI`, or `Leader Design`).
-> 3. **Mechanism Patch**: Which deterministic script check in `.agents/loop/bin/issue_hub.py`, `.agents/loop/bin/hook_guard.py`, or rule in `.agents/agents/*.md` was updated.
-> **A lesson without a deterministic mechanism patch is NOT closed.**
-
----
+> **Rule (adapted from `glows777/Vela` and Geoffrey Huntley's Backpressure principle)**
+>
+> When an agent miss, hallucination, hollow test, or review bounce is confirmed, record the trigger path, the layer that should have caught it, and the mechanism patch. Close a lesson after the corresponding deterministic check is in place.
 
 ## Lesson 001 — Hollow Error-Mapping Tests (Tautological Unit Test)
-- **Source**: Akzio Round 1 (`P2-6`, `crates/akzio-daemon/src/launch.rs` / `scheduler_tick.rs`)
-- **Trigger Path**: An initial test `post_reservation_run_log_failure_is_not_unknown_submission` constructed `SchedulerError::RunLogUnavailable` directly in the test body and asserted it did not match `SubmissionUnknown`, without calling any production mapping function.
-- **Missed Layer**: `Fresh-Context Verifier` & `Worker TDD`
-- **Mechanism Patch**:
-  - Added explicit rule in `.agents/agents/rust-worker.md` and `.agents/agents/rust-verifier.md`: Every regression test must invoke the **production entry point or extracted pure production mapper** (e.g., `classify_scheduler_error`), never assert on a locally constructed struct/enum variant in isolation.
-  - Every new `#[test]` / `#[tokio::test]` in `.rs` diffs must carry a preceding `/// WHY THIS TEST EXISTS (Issue #<N>): ...` doc comment, checked per-test by `.agents/loop/bin/issue_hub.py verify-worktree`.
 
-## Lesson 002 — `cargo fmt` Blindspot on Pre-Existing Unformatted `include!` Fragments
-- **Source**: Akzio Audit `P2-10` (`crates/akzio-store/src/store/prelude.rs` and `crates/akzio-store/src/store.rs:49-66`)
-- **Trigger Path**: `cargo fmt --all -- --check` exits `0` even when files pulled in via `include!(...)` are unformatted, while running `rustfmt --edition 2021 --check` unconditionally on all 11 legacy `include!` files causes a guaranteed deadlock unless untouched lines are mass-reformatted.
-- **Missed Layer**: `Pre-Commit Backpressure`
-- **Mechanism Patch**:
-  - `.agents/loop/bin/issue_hub.py verify-worktree` inspects `git show <base_ref>:<file>` via `rustfmt --edition 2021 --check` first: if the base file was already formatted, the modified file must pass `rustfmt`; if the base file was legacy-unformatted, it avoids forcing mass reformatting and enforces `git diff --check` + clean formatting on newly touched lines.
+- **Source** Akzio Round 1 (`P2-6`, `crates/akzio-daemon/src/launch.rs` / `scheduler_tick.rs`).
+- **Trigger path** The initial `post_reservation_run_log_failure_is_not_unknown_submission` test constructed `SchedulerError::RunLogUnavailable` directly in the test body and asserted that it did not match `SubmissionUnknown`, missing the production mapping function.
+- **Missed layer** Fresh-Context Verifier and Worker TDD.
+- **Mechanism patch** Worker and Verifier require every regression test to invoke the production entry point or extracted pure production mapper, such as `classify_scheduler_error`, and assert an independently known result. `issue_hub.py verify-worktree` checks that every new `#[test]` and `#[tokio::test]` has a `/// WHY THIS TEST EXISTS (Task #<id>): ...` comment with the local task ID.
 
-## Lesson 003 — Optimizing for Checker Output Instead of Fixing Behavior (Reward-Hacking)
-- **Source**: `glows777/Vela` (`Issue #137 / PR #136`) & X Agent Backpressure research
-- **Trigger Path**: Cheap worker models sometimes silence compiler/clippy/test failures by adding `#[allow(...)]`, `#[ignore]`, changing visibility across architectural seams, or altering test expectations to match buggy output.
-- **Missed Layer**: `Pre-Commit Backpressure` & `Fresh-Context Verifier`
-- **Mechanism Patch**:
-  - `.agents/loop/bin/issue_hub.py verify-worktree` deterministically scans added `.rs` diff lines and hard-fails if `#[allow(`, `#![allow(`, `#[ignore]`, or unauthorized file edits outside the `[LOOP-DESIGN]` `allowed_files` whitelist appear.
+## Lesson 002 — `cargo fmt` Blind Spot on Legacy `include!` Fragments
 
-## Lesson 004 — Main Working Tree Contamination & Subagent Hook Interference
-- **Source**: Akzio Workspace Safety Rule (`AGENTS.md` §5) & Prompt Interference Audit (`2026-11-17`)
-- **Trigger Path**: (1) Running mutating `git` commands in the primary working directory mixes or wipes uncommitted human work; (2) using a single `[AKZIO-AUTONOMOUS-LOOP]` token for both Leader and Subagents causes `Stop` hooks to hijack subagents or `PreToolUse` to stall subagents on `"ask"`; (3) mounting interactive `tdd` / multi-subagent `code-review` skills onto isolated Flash subagents causes premature human prompts or nested subagent loops.
-- **Missed Layer**: `Hook Guard` & `Agent Isolation`
-- **Mechanism Patch**:
-  - `.agents/loop/bin/issue_hub.py worktree-create` creates isolated Git worktrees under `outputs/loop/worktrees/issue-<N>` branched from `loop/nightly` and checks fast-forward ancestry in `worktree-land`.
-  - `.agents/loop/bin/hook_guard.py` separates `LEADER_TOKEN` (`[AKZIO-AUTONOMOUS-LOOP]`) and `SUBAGENT_TOKEN` (`[AKZIO-LOOP-SUBAGENT]`), enforces root-workspace git & `~/.akzio` path safety only in loop mode without breaking interactive sessions, and keeps `queue_cache.json` synchronized across state transitions.
-  - `.agents/agents/rust-worker.md` and `.agents/agents/rust-verifier.md` inline self-contained Red-Green & dual-axis verification protocols instead of mounting conflicting interactive skills, and `AGENTS.md` stays under Antigravity's 24 KB rule limit.
+- **Source** Akzio Audit `P2-10` (`crates/akzio-store/src/store/prelude.rs` and `crates/akzio-store/src/store.rs:49-66`).
+- **Trigger path** `cargo fmt --all -- --check` can exit `0` when files pulled in via `include!(...)` are unformatted. Running `rustfmt --edition 2021 --check` unconditionally on all 11 legacy fragments would force mass reformatting of untouched lines.
+- **Missed layer** Pre-Commit Backpressure.
+- **Mechanism patch** `verify-worktree` checks the frozen base version of each modified fragment first. A formatted baseline requires the modified file to pass `rustfmt`. The diff check guards new whitespace errors in unformatted fragments, and the Verifier checks that the surrounding code keeps its existing formatting.
+
+## Lesson 003 — Optimizing for Checker Output Instead of Fixing Behavior
+
+- **Source** `glows777/Vela` (`Issue #137` and `PR #136`) and research on agent backpressure.
+- **Trigger path** A Worker can silence compiler, Clippy, or test failures by adding `#[allow(...)]` or `#[ignore]`, changing visibility across architectural seams, or altering test expectations to match buggy output.
+- **Missed layer** Pre-Commit Backpressure and Fresh-Context Verifier.
+- **Mechanism patch** `verify-worktree` detects changed files outside the design and checks added Rust diff lines for lint and test suppressions. The Verifier reviews the fixed base-to-head diff for altered expectations and weakened assertions. Landing requires both results for the same SHA.
+
+## Lesson 004 — Main Worktree Contamination and Stale Agent Actions
+
+- **Source** Akzio workspace safety rules and Prompt Interference Audit (`2026-11-17`).
+- **Trigger path** Git mutations in the main worktree can mix or overwrite the owner's uncommitted changes. Generic role markers and continuation hooks previously allowed the Leader and its children to interfere with one another. Mounting interactive TDD or multi-agent review skills also interrupted isolated roles. Interrupted launches can leave work and commands tied to an expired wave.
+- **Missed layer** Hook Guard and Agent Isolation.
+- **Mechanism patch** `claim` assigns an isolated `outputs/loop/worktrees/task-N` worktree. Role headers and hub actions bind each session to the current SQLite lease, task attempt, or verified SHA as appropriate. The blocking launcher releases the current lease when the Leader and its children finish and AGY confirms completion. An interrupted wave can be recovered after its lease expires, using the saved worktree and task state. The Worker and Verifier prompts include their own test and review protocols.
