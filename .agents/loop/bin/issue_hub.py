@@ -308,6 +308,16 @@ def loop_scope(role: str, wave: str, task_id: int | None, version: str) -> dict:
         }
 
 
+def next_task(db):
+    return db.execute(
+        """SELECT * FROM tasks
+           WHERE status IN ('landing', 'reviewed', 'verified', 'in_progress', 'ready', 'inbox')
+           ORDER BY CASE status WHEN 'landing' THEN 0 WHEN 'reviewed' THEN 1
+               WHEN 'verified' THEN 2 WHEN 'in_progress' THEN 3 WHEN 'ready' THEN 4 ELSE 5 END,
+               priority, id LIMIT 1"""
+    ).fetchone()
+
+
 def cmd_start_wave(_args):
     with process_lock("control"), open_db() as db, transaction(db):
         now = utc_timestamp()
@@ -315,14 +325,34 @@ def cmd_start_wave(_args):
         if current and current["expires_at"] > now:
             return emit({"status": "busy", "expires_at": iso_time(current["expires_at"])})
         token = uuid.uuid4().hex
+        task = next_task(db)
+        checkpoint = db.execute("SELECT coalesce(max(id), 0) FROM events").fetchone()[0]
         db.execute("INSERT OR REPLACE INTO wave VALUES (1, ?, ?)", (token, now + WAVE_SECONDS))
-    return emit({"status": "started", "wave": token, "expires_at": iso_time(now + WAVE_SECONDS)})
+    return emit({"status": "started", "wave": token, "expires_at": iso_time(now + WAVE_SECONDS),
+                 "expected_task": task["id"] if task else None, "event_checkpoint": checkpoint})
 
 
 def cmd_finish_wave(args):
+    if (args.expect_task is None) != (args.after_event is None):
+        raise ValueError("Provide both the expected task and the event checkpoint.")
+    if args.expect_task is not None and (args.expect_task < 1 or args.after_event < 0):
+        raise ValueError("The expected task must be positive and the event checkpoint nonnegative.")
     with process_lock("control"), open_db() as db, transaction(db):
         closed = db.execute("DELETE FROM wave WHERE token = ?", (args.wave,)).rowcount
-    return emit({"status": "finished" if closed else "stale"})
+        if not closed:
+            return emit({"status": "stale"})
+        if args.expect_task is not None:
+            progress = db.execute(
+                """SELECT 1 FROM events WHERE task_id = ? AND id > ? AND kind IN (
+                   'task_designed', 'task_claimed', 'candidate_committed', 'candidate_recovered',
+                   'gate_failed', 'gate_passed', 'review_passed', 'review_rejected', 'review_missing',
+                   'landing_intent', 'task_landed', 'task_pr_queued', 'task_blocked', 'decision_requested'
+                ) LIMIT 1""", (args.expect_task, args.after_event),
+            ).fetchone()
+            if not progress:
+                emit({"status": "no_progress", "task": args.expect_task})
+                return 1
+    return emit({"status": "finished"})
 
 
 def get_dirty_main_files():
@@ -348,13 +378,7 @@ def cmd_poll(_args):
     if DB_PATH.exists():
         with open_db(readonly=True) as db:
             counts = dict(db.execute(f"SELECT {VISIBLE_STATUS} AS stage, count(*) FROM tasks GROUP BY stage"))
-            target = db.execute(
-                """SELECT * FROM tasks
-                   WHERE status IN ('landing', 'reviewed', 'verified', 'in_progress', 'ready', 'inbox')
-                   ORDER BY CASE status WHEN 'landing' THEN 0 WHEN 'reviewed' THEN 1
-                       WHEN 'verified' THEN 2 WHEN 'in_progress' THEN 3 WHEN 'ready' THEN 4 ELSE 5 END,
-                       priority, id LIMIT 1"""
-            ).fetchone()
+            target = next_task(db)
             target_view = task_view(db, target) if target else None
     action = "scout_needed"
     if target:
@@ -1314,7 +1338,9 @@ def build_parser():
 
     command("init", cmd_init)
     command("start-wave", cmd_start_wave)
-    command("finish-wave", cmd_finish_wave, wave=True)
+    finish = command("finish-wave", cmd_finish_wave, wave=True)
+    finish.add_argument("--expect-task", type=int)
+    finish.add_argument("--after-event", type=int)
     command("poll", cmd_poll)
     command("show", cmd_show, task=True)
     command("list", cmd_list).add_argument("--status", choices=("inbox", "ready", *RESUMABLE, *WAITING, "done", "blocked"))

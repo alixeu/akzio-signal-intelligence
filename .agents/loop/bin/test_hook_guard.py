@@ -839,8 +839,8 @@ class LocalLoopTests(unittest.TestCase):
         task, wave, _, head = self.reviewed_candidate()
         self.task_cmd("worktree-land", task, wave)
         self.hub("finish-wave", "--wave", wave)
-        for index in range(25):
-            self.propose(f"backlog-{index}")
+        for _ in range(25):
+            self.hub("daily-report")
 
         launcher = destination / "loop_daemon.sh"
         for command in ("wave", "deliver"):
@@ -854,6 +854,20 @@ class LocalLoopTests(unittest.TestCase):
             self.assertIn("`task_published`", comments[-1]["body"])
             self.assertIn(head, comments[-1]["body"])
 
+
+    def test_finished_wave_needs_progress_for_its_scheduled_task(self):
+        task = self.propose()["task"]
+        started = self.hub("start-wave")
+        self.assertEqual(started["expected_task"], task)
+        expected = ("--expect-task", task, "--after-event", started["event_checkpoint"])
+        self.propose("independent-fixture")
+        self.assertEqual(self.hub("finish-wave", "--wave", started["wave"], *expected, code=1)["status"],
+                         "no_progress")
+        self.assertEqual(self.hub("show", "--task", task)["status"], "inbox")
+        started = self.hub("start-wave")
+        self.design(task, started["wave"])
+        self.assertEqual(self.hub("finish-wave", "--wave", started["wave"], "--expect-task", task,
+                                  "--after-event", started["event_checkpoint"])["status"], "finished")
 
     def github_sync(self, github):
         with issue_hub.process_lock("control"), issue_hub.open_db() as db:

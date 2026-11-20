@@ -27,7 +27,7 @@ python3 .agents/loop/bin/issue_hub.py list --status blocked
 
 启动器使用本机已配置的 `agy`，可通过 `AGY_BIN` 指定其路径，通过 `LEADER_MODEL` 指定 AGY 模型标识。`WAVE_INTERVAL_SECS` 默认 `900` 秒。`start-wave` 取得两小时的 SQLite 租约后，启动器从仓库根目录运行带 `--sandbox` 的阻塞式 headless 会话，单次等待上限 110 分钟。`busy` 表示已有 wave 持有租约，此时跳过启动。
 
-会话日志位于 `outputs/loop/logs/`。启动器以 `stream-json` 的 `init` 事件核对工作目录和 `loop-leader` 角色，确认同一会话的最终结果为 `SUCCESS` 后，凭本轮标识调用 `finish-wave`。会话中断或终态无法确认时，租约到期后由下一轮接管任务。每轮使用新的租约，已有候选提交与 worktree 由 `claim` 接管。
+会话日志位于 `outputs/loop/logs/`。启动器以 `stream-json` 的 `init` 事件核对工作目录和 `loop-leader` 角色，确认同一会话的最终结果为 `SUCCESS` 后，凭本轮标识调用 `finish-wave`。队列中已有指定任务时，还须核对该任务在 SQLite 中新增的设计、实现、验证或阻塞记录。空转会释放租约并返回 `no_progress`。会话中断或终态无法确认时，租约到期后由下一轮接管任务。每轮使用新的租约，已有候选提交与 worktree 由 `claim` 接管。
 
 ## 角色约定
 

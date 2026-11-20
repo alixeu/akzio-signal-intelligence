@@ -38,7 +38,7 @@ EOF
 }
 
 run_single_wave() {
-  local agy_bin wave_json wave timestamp log prompt
+  local agy_bin wave_json wave_info wave expected_task event_checkpoint timestamp log prompt
   if ! agy_bin="$(type -P "$AGY_BIN")"; then
     printf 'ERROR: Antigravity CLI %s is unavailable. Set AGY_BIN to its executable.\n' "$AGY_BIN" >&2
     return 1
@@ -47,7 +47,7 @@ run_single_wave() {
   timestamp="$(date -u +%Y%m%dT%H%M%SZ)" || return
 
   wave_json="$(python3 "$ISSUE_HUB" start-wave)" || return
-  wave="$(python3 -c '
+  wave_info="$(python3 -c '
 import json
 import re
 import sys
@@ -59,18 +59,23 @@ elif isinstance(result, dict) and result.get("status") == "started":
     wave = result.get("wave")
     if not isinstance(wave, str) or not re.fullmatch(r"[0-9a-f]{32}", wave):
         sys.exit("Invalid wave token from issue_hub.py start-wave")
-    print(wave)
+    task, checkpoint = result.get("expected_task"), result.get("event_checkpoint")
+    if (task is not None and (type(task) is not int or task < 1)) or type(checkpoint) is not int or checkpoint < 0:
+        sys.exit("Invalid task checkpoint from issue_hub.py start-wave")
+    print(wave, task or 0, checkpoint)
 else:
     sys.exit("Unexpected response from issue_hub.py start-wave")
 ' <<< "$wave_json")" || return
-  if [[ "$wave" == busy ]]; then
+  if [[ "$wave_info" == busy ]]; then
     printf 'Another wave owns the SQLite lease. Skipping this tick.\n'
     return 0
   fi
 
+  IFS=' ' read -r wave expected_task event_checkpoint <<< "$wave_info"
   log="$LOG_DIR/wave-$timestamp-$$.jsonl"
   prompt="[AKZIO-LOOP-LEADER] $wave
 请从仓库根目录按 .agents/agents/loop-leader.md 和 autonomous-loop 技能执行本轮的一个队列动作。
+读取规程后，先调用终端工具执行 python3 .agents/loop/bin/issue_hub.py poll。若工具调用失败，以实际错误为准。
 等本轮子智能体结束并确认任务状态已写入 SQLite 后再返回。"
   # The default SQLite lease lasts two hours. Bound the blocking CLI turn within it.
   local -a agy_args=(--agent loop-leader --sandbox --print-timeout 110m --output-format stream-json)
@@ -109,7 +114,11 @@ AGY_RESULT
     printf 'WARN: Leader completion could not be confirmed. The lease will expire.\n' >&2
     return 1
   fi
-  python3 "$ISSUE_HUB" finish-wave --wave "$wave"
+  local -a finish_args=(finish-wave --wave "$wave")
+  if [[ "$expected_task" != 0 ]]; then
+    finish_args+=(--expect-task "$expected_task" --after-event "$event_checkpoint")
+  fi
+  python3 "$ISSUE_HUB" "${finish_args[@]}"
 }
 
 deliver_configured() {
